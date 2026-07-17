@@ -1,0 +1,11 @@
+# Pinned to the GNU host toolchain, not MSVC (the Rust default on Windows).
+# This machine's Visual Studio Build Tools install is missing the Windows SDK
+# (no Lib/Include under "Windows Kits/10") and isn't even registered with
+# vswhere, so linking against the MSVC target fails. The GNU host toolchain
+# ships a fully self-contained linker + import libs (rustup's "rust-mingw"
+# component: lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained/*.a), so it
+# needs no external Windows SDK or Visual Studio install at all. Revisit if a
+# working MSVC toolchain is ever set up and there's a concrete reason to prefer
+# it (e.g. an MSVC-only dependency).
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"

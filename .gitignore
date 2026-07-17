@@ -1,0 +1,24 @@
+# >>> AI WORKFLOW MANAGED >>>
+# Installed by ai-dev-workflow-template install.sh — keeps the workflow
+# footprint out of this project's git history.
+.ai/
+.claude/
+.agents/
+# <<< AI WORKFLOW MANAGED <<<
+
+# ─────────────────────────────────────────────────────────────
+# Rust + Tauri + Node build artifacts
+# ─────────────────────────────────────────────────────────────
+/target/
+/shell/node_modules/
+/shell/dist/
+/shell/src-tauri/target/
+*.db
+*.db-journal
+
+# ─────────────────────────────────────────────────────────────
+# Agent instruction files — local only, never committed
+# (patterns without a leading slash match at every depth)
+# ─────────────────────────────────────────────────────────────
+AGENTS.md
+CLAUDE.md
