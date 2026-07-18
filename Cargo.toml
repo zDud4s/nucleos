@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["core"]
+# The Tauri shell's Rust side (shell/src-tauri) is a standalone package, deliberately
+# NOT a member of this workspace — it keeps its own Cargo.lock so the daemon's deps
+# (sqlx/axum/...) and the shell's (tauri/wry/...) resolve independently. Excluding it
+# also lets `npm run tauri dev` build it without the "package believes it's in a
+# workspace" error.
+exclude = ["shell/src-tauri"]
