@@ -89,6 +89,8 @@ pub async fn create_run_inner(
     let runner = state.runner.clone();
     let cwd = cwd.map(std::path::PathBuf::from);
     let plan_only = mode == "shadow";
+    let feed_project_id = project_id.clone();
+    let append_shadow_summary = plan_only;
     let run_timeout = state.run_timeout;
     let handles = state.run_handles.clone();
     let env = vec![
@@ -111,7 +113,7 @@ pub async fn create_run_inner(
         let completed_at = chrono::Utc::now().to_rfc3339();
         match result {
             Ok(Ok(o)) => {
-                let _ = sqlx::query(
+                let completed = sqlx::query(
                     "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ?",
                 )
                 .bind(o.exit_code)
@@ -123,6 +125,16 @@ pub async fn create_run_inner(
                 .bind(id)
                 .execute(&pool)
                 .await;
+                if completed.is_ok() && append_shadow_summary {
+                    let _ = crate::feed::append(
+                        &pool,
+                        feed_project_id.as_deref(),
+                        "shadow_run_completed",
+                        "shadow run completed",
+                        Some(id),
+                    )
+                    .await;
+                }
             }
             Ok(Err(e)) => {
                 let _ = sqlx::query(
@@ -220,13 +232,24 @@ pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> S
 /// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
 pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
-    let result = sqlx::query(
-        "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'",
+    let reconciled: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'
+         RETURNING id, project_id",
     )
     .bind(&now)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(result.rows_affected())
+    for (id, project_id) in &reconciled {
+        let _ = crate::feed::append(
+            pool,
+            project_id.as_deref(),
+            "run_interrupted",
+            "run interrupted during startup recovery",
+            Some(*id),
+        )
+        .await;
+    }
+    Ok(reconciled.len() as u64)
 }
 
 #[cfg(test)]
@@ -270,6 +293,19 @@ mod tests {
                 mode TEXT NOT NULL DEFAULT 'real',
                 created_at TEXT NOT NULL,
                 completed_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE feed (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                run_id INTEGER,
+                created_at TEXT NOT NULL
             )",
         )
         .execute(&pool)
@@ -390,6 +426,19 @@ mod tests {
             .unwrap();
         assert_eq!(shadow_mode, "shadow");
         assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(true));
+        let mut shadow_feed = None;
+        for _ in 0..20 {
+            let entries = crate::feed::list_feed(&state.pool, None, 50).await.unwrap();
+            if !entries.is_empty() {
+                shadow_feed = Some(entries);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let shadow_feed = shadow_feed.expect("shadow completion did not append a feed entry");
+        assert_eq!(shadow_feed.len(), 1);
+        assert_eq!(shadow_feed[0].kind, "shadow_run_completed");
+        assert_eq!(shadow_feed[0].run_id, Some(shadow_id));
 
         let real_id = create_run_inner(&state, "real".into(), None, None, "real")
             .await
@@ -407,6 +456,15 @@ mod tests {
             .unwrap();
         assert_eq!(real_mode, "real");
         assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(false));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            crate::feed::list_feed(&state.pool, None, 50)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "real completion must not append a feed entry"
+        );
 
         let app = test_router(state.clone());
         let default_id = create_run_via_http(&app, "default mode").await.id;
@@ -554,5 +612,9 @@ mod tests {
                 ("y".to_string(), "completed".to_string()),
             ]
         );
+        let entries = crate::feed::list_feed(&pool, None, 50).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "run_interrupted");
+        assert_eq!(entries[0].run_id, Some(1));
     }
 }

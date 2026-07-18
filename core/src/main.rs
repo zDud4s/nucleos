@@ -2,6 +2,7 @@ mod auth;
 mod autostart;
 mod classifier;
 mod config;
+mod feed;
 mod hooks;
 mod http;
 mod logging;

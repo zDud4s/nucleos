@@ -8,6 +8,7 @@ use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
+use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
 use crate::runs::{cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
@@ -24,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route("/feed", get(get_feed))
         .route("/runs", post(create_run))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
@@ -57,8 +59,23 @@ struct ProjectQuery {
 }
 
 #[derive(Deserialize)]
+struct FeedQuery {
+    project_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct VerdictRequest {
     verdict: String,
+}
+
+async fn get_feed(
+    State(state): State<AppState>,
+    Query(query): Query<FeedQuery>,
+) -> Result<Json<Vec<FeedEntry>>, StatusCode> {
+    feed::list_feed(&state.pool, query.project_id.as_deref(), 50)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn get_unreviewed_shadow_decisions(
