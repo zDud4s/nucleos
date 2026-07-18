@@ -42,7 +42,12 @@ impl CommandRunner for ClaudeCliRunner {
         cwd: Option<&Path>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
-        let mut cmd = Command::new("claude");
+        // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
+        // npm-installed `claude` is a `.cmd` shim that Rust's `Command` can't spawn by name — the
+        // daemon points this at the real `claude.exe`. Defaults to `claude` where it's on PATH.
+        let claude_bin =
+            std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let mut cmd = Command::new(&claude_bin);
         cmd.arg("-p").arg(prompt);
         cmd.arg("--output-format")
             .arg("stream-json")
