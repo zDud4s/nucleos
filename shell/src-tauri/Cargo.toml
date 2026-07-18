@@ -12,7 +12,12 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "shell_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop (Windows-only, spec §2) links the lib into the bin as an rlib. The `cdylib`
+# from the default Tauri template is only needed for mobile targets and, on windows-gnu,
+# blows past the PE format's 65535-export-per-DLL limit (it exports ~90k transitive public
+# symbols), so it is dropped here. Re-add `"cdylib", "staticlib"` if/when mobile is targeted
+# (and expect to need MSVC or an export filter for the cdylib on Windows).
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
