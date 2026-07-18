@@ -5,6 +5,7 @@ mod logging;
 mod runner;
 mod runs;
 mod secrets;
+mod sidecar;
 mod state;
 mod storage;
 
@@ -79,5 +80,11 @@ async fn main() {
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
     );
+    let sidecar_path = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("echo-sidecar.exe");
+    tokio::spawn(sidecar::supervise("echo".to_string(), sidecar_path));
     axum::serve(listener, app).await.unwrap();
 }
