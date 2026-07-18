@@ -35,4 +35,39 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, 0);
     }
+
+    #[tokio::test]
+    async fn open_creates_runs_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nucleos.db");
+
+        let pool = open(&db_path).await.unwrap();
+
+        // Insert a row exercising every Autopilot-support column (project_id/cwd/session_id/cost_usd)
+        // and read them back — proves the columns exist with the right types.
+        sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, cost_usd, created_at)
+             VALUES (?, ?, ?, 'running', ?, ?, ?)",
+        )
+        .bind("proj-1")
+        .bind("/tmp/proj-1")
+        .bind("hello")
+        .bind("sess-abc")
+        .bind(0.42_f64)
+        .bind("2026-07-17T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT project_id, cwd, session_id, cost_usd FROM runs WHERE prompt = 'hello'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("proj-1"));
+        assert_eq!(row.1.as_deref(), Some("/tmp/proj-1"));
+        assert_eq!(row.2.as_deref(), Some("sess-abc"));
+        assert_eq!(row.3, Some(0.42));
+    }
 }
