@@ -1,5 +1,6 @@
 mod auth;
 mod autostart;
+mod classifier;
 mod config;
 mod hooks;
 mod http;
