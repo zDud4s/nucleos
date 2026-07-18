@@ -17,6 +17,11 @@
 *.db-journal
 sidecars/**/*.exe
 
+# TypeScript incremental-build artifacts (emitted by `tsc -b`)
+*.tsbuildinfo
+/shell/vite.config.js
+/shell/vite.config.d.ts
+
 # ─────────────────────────────────────────────────────────────
 # Agent instruction files — local only, never committed
 # (patterns without a leading slash match at every depth)
