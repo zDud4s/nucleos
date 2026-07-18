@@ -12,6 +12,7 @@ keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }
 rand = "0.10.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+serde_yaml = "0.9.34"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1.53.0", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }

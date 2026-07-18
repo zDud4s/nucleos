@@ -1,5 +1,6 @@
 mod auth;
 mod autostart;
+mod config;
 mod hooks;
 mod http;
 mod logging;
@@ -76,10 +77,18 @@ async fn main() {
         };
     tracing::info!("nucleos-core token loaded from Credential Manager");
 
+    let models_config_path = std::path::PathBuf::from(".ai/nucleos-models.yaml");
+    let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
+        tracing::warn!("failed to parse .ai/nucleos-models.yaml ({e}), using defaults");
+        config::ModelsConfig::default()
+    });
+
     let state = AppState {
         token: Token(token_value),
         pool,
-        runner: Arc::new(runner::ClaudeCliRunner),
+        runner: Arc::new(runner::ClaudeCliRunner {
+            model: models_config.claude_model.clone(),
+        }),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };

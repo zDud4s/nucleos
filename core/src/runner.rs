@@ -31,7 +31,9 @@ pub trait CommandRunner: Send + Sync {
     ) -> std::io::Result<RunOutcome>;
 }
 
-pub struct ClaudeCliRunner;
+pub struct ClaudeCliRunner {
+    pub model: String,
+}
 
 #[async_trait]
 impl CommandRunner for ClaudeCliRunner {
@@ -49,6 +51,7 @@ impl CommandRunner for ClaudeCliRunner {
             std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&claude_bin);
         cmd.arg("-p").arg(prompt);
+        cmd.arg("--model").arg(&self.model);
         cmd.arg("--output-format")
             .arg("stream-json")
             .arg("--verbose");
