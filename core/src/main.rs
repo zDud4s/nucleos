@@ -9,6 +9,7 @@ mod http;
 mod logging;
 mod runner;
 mod runs;
+mod scheduler;
 mod secrets;
 mod shadow;
 mod sidecar;
@@ -97,7 +98,7 @@ async fn main() {
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
 
-    let app = http::build_router(state);
+    let app = http::build_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8791")
         .await
         .unwrap();
@@ -111,5 +112,6 @@ async fn main() {
         .unwrap()
         .join("echo-sidecar.exe");
     tokio::spawn(sidecar::supervise("echo".to_string(), sidecar_path));
+    tokio::spawn(scheduler::run_scheduler(state.clone()));
     axum::serve(listener, app).await.unwrap();
 }
