@@ -38,6 +38,30 @@ pub fn discover_autopilot_config(
     Ok(Some(value))
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ScheduleRule {
+    pub name: String,
+    pub cron: String,
+    pub prompt: String,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct AutopilotRules {
+    #[serde(default)]
+    pub schedules: Vec<ScheduleRule>,
+}
+
+pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRules> {
+    let path = project_root.join(".ai").join("autopilot.yaml");
+    if !path.exists() {
+        return Ok(AutopilotRules::default());
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    serde_yaml::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +119,74 @@ mod tests {
             value.get("placeholder_field").and_then(|v| v.as_str()),
             Some("placeholder_value")
         );
+    }
+
+    #[test]
+    fn schedule_rules_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_schedule_rules(dir.path()).unwrap(),
+            AutopilotRules::default()
+        );
+    }
+
+    #[test]
+    fn schedule_rules_parses_two_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::write(
+            dir.path().join(".ai").join("autopilot.yaml"),
+            "schedules:\n\
+             \x20\x20- name: nightly-build\n\
+             \x20\x20\x20\x20cron: \"0 2 * * *\"\n\
+             \x20\x20\x20\x20prompt: \"run the nightly build\"\n\
+             \x20\x20\x20\x20cwd: /repo\n\
+             \x20\x20- name: morning-report\n\
+             \x20\x20\x20\x20cron: \"0 8 * * *\"\n\
+             \x20\x20\x20\x20prompt: \"summarize overnight activity\"\n",
+        )
+        .unwrap();
+
+        let rules = load_schedule_rules(dir.path()).unwrap();
+        assert_eq!(rules.schedules.len(), 2);
+
+        assert_eq!(rules.schedules[0].name, "nightly-build");
+        assert_eq!(rules.schedules[0].cron, "0 2 * * *");
+        assert_eq!(rules.schedules[0].prompt, "run the nightly build");
+        assert_eq!(rules.schedules[0].cwd, Some("/repo".to_string()));
+
+        assert_eq!(rules.schedules[1].name, "morning-report");
+        assert_eq!(rules.schedules[1].cron, "0 8 * * *");
+        assert_eq!(rules.schedules[1].prompt, "summarize overnight activity");
+    }
+
+    #[test]
+    fn schedule_rules_entry_without_cwd_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::write(
+            dir.path().join(".ai").join("autopilot.yaml"),
+            "schedules:\n\
+             \x20\x20- name: morning-report\n\
+             \x20\x20\x20\x20cron: \"0 8 * * *\"\n\
+             \x20\x20\x20\x20prompt: \"summarize overnight activity\"\n",
+        )
+        .unwrap();
+
+        let rules = load_schedule_rules(dir.path()).unwrap();
+        assert_eq!(rules.schedules[0].cwd, None);
+    }
+
+    #[test]
+    fn schedule_rules_malformed_yaml_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::write(
+            dir.path().join(".ai").join("autopilot.yaml"),
+            "schedules: [not, valid, for this struct",
+        )
+        .unwrap();
+
+        assert!(load_schedule_rules(dir.path()).is_err());
     }
 }
