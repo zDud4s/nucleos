@@ -8,6 +8,7 @@ use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
+use crate::autopilot::{self, ActivationError, Mode};
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
 use crate::runs::{cancel_run, create_run, get_run};
@@ -25,6 +26,11 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route(
+            "/autopilot/state",
+            get(get_autopilot_state).post(post_autopilot_state),
+        )
+        .route("/autopilot/kill", post(post_autopilot_kill))
         .route("/feed", get(get_feed))
         .route("/runs", post(create_run))
         .route("/runs/{id}", get(get_run))
@@ -66,6 +72,76 @@ struct FeedQuery {
 #[derive(Deserialize)]
 struct VerdictRequest {
     verdict: String,
+}
+
+#[derive(Deserialize)]
+struct AutopilotStateRequest {
+    project_id: String,
+    mode: String,
+    project_root: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AutopilotStateResponse {
+    project_id: String,
+    mode: Mode,
+}
+
+#[derive(Deserialize)]
+struct AutopilotKillRequest {
+    engaged: bool,
+}
+
+async fn get_autopilot_state(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<AutopilotStateResponse>, StatusCode> {
+    let mode = autopilot::project_mode(&state.pool, &query.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(AutopilotStateResponse {
+        project_id: query.project_id,
+        mode,
+    }))
+}
+
+async fn post_autopilot_state(
+    State(state): State<AppState>,
+    Json(body): Json<AutopilotStateRequest>,
+) -> Result<Json<AutopilotStateResponse>, StatusCode> {
+    let mode = Mode::from_db_str(&body.mode).ok_or(StatusCode::BAD_REQUEST)?;
+    let project_root = body.project_root.as_deref().map(std::path::Path::new);
+    autopilot::set_project_mode(&state.pool, &body.project_id, mode, project_root)
+        .await
+        .map_err(activation_status)?;
+    let mode = autopilot::project_mode(&state.pool, &body.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(AutopilotStateResponse {
+        project_id: body.project_id,
+        mode,
+    }))
+}
+
+async fn post_autopilot_kill(
+    State(state): State<AppState>,
+    Json(body): Json<AutopilotKillRequest>,
+) -> Result<StatusCode, StatusCode> {
+    autopilot::set_kill_switch(&state.pool, body.engaged)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn activation_status(error: ActivationError) -> StatusCode {
+    match error {
+        ActivationError::ActiveReserved => StatusCode::CONFLICT,
+        ActivationError::ProjectRootRequired
+        | ActivationError::NotOnboarded
+        | ActivationError::HookNotRegistered => StatusCode::UNPROCESSABLE_ENTITY,
+        ActivationError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 async fn get_feed(

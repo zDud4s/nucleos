@@ -1,4 +1,5 @@
 mod auth;
+mod autopilot;
 mod autostart;
 mod classifier;
 mod config;
