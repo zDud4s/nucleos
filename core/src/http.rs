@@ -1,12 +1,16 @@
+use axum::Json;
 use axum::Router;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
 use crate::hooks::pretooluse_decision;
 use crate::runs::{cancel_run, create_run, get_run};
+use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -23,6 +27,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs", post(create_run))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
+        .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
+        .route("/scoreboard", get(get_scoreboard))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -42,6 +49,52 @@ async fn health() -> impl IntoResponse {
 
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+#[derive(Deserialize)]
+struct ProjectQuery {
+    project_id: String,
+}
+
+#[derive(Deserialize)]
+struct VerdictRequest {
+    verdict: String,
+}
+
+async fn get_unreviewed_shadow_decisions(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Vec<ShadowDecision>>, StatusCode> {
+    shadow::list_unreviewed(&state.pool, &query.project_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn post_shadow_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !matches!(body.verdict.as_str(), "approve" | "reject") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match shadow::set_verdict(&state.pool, id, &body.verdict).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn get_scoreboard(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Vec<ClassTally>>, StatusCode> {
+    shadow::scoreboard(&state.pool, &query.project_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[cfg(test)]

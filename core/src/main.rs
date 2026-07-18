@@ -8,6 +8,7 @@ mod logging;
 mod runner;
 mod runs;
 mod secrets;
+mod shadow;
 mod sidecar;
 mod state;
 mod storage;
