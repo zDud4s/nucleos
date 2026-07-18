@@ -21,6 +21,14 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "PLACEHOLDER_REPLACE_WITH_REAL_KEY_WHEN_SIGNING_IS_SET_UP",
+      "endpoints": [
+        "https://example.invalid/nucleos/updates/{{target}}/{{arch}}/{{current_version}}"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

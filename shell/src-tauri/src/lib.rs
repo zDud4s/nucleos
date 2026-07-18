@@ -27,6 +27,7 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Shell-GUI autostart convenience only — the daemon owns its OWN persistence via a
             // Windows Scheduled Task (Part A), independent of this. Enable on first run.
