@@ -1,4 +1,5 @@
 mod auth;
+mod hooks;
 mod http;
 mod logging;
 mod runner;

@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
+use crate::hooks::pretooluse_decision;
 use crate::runs::{cancel_run, create_run, get_run};
 use crate::state::AppState;
 
@@ -22,6 +23,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs", post(create_run))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,

@@ -70,11 +70,21 @@ pub async fn create_run(
     let cwd = req.cwd.clone().map(std::path::PathBuf::from);
     let run_timeout = state.run_timeout;
     let handles = state.run_handles.clone();
+    let env = vec![
+        (
+            "NUCLEOS_DAEMON_URL".to_string(),
+            "http://127.0.0.1:8791".to_string(),
+        ),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
+        // run_id == runs.id (spec §3.3) — the hook echoes it back in its decision request, so the
+        // core can validate it and, for a `pending_approval`, terminate the right run.
+        ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
+    ];
 
     let join_handle = tokio::spawn(async move {
         let result = tokio::time::timeout(
             run_timeout,
-            runner.run_prompt(&prompt, &[], cwd.as_deref(), session_tx),
+            runner.run_prompt(&prompt, &env, cwd.as_deref(), session_tx),
         )
         .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
