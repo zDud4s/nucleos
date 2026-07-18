@@ -1,4 +1,5 @@
 mod auth;
+mod autostart;
 mod hooks;
 mod http;
 mod logging;
@@ -37,6 +38,17 @@ async fn main() {
 
     let log_dir = dirs.data_local_dir().join("logs");
     let _log_guard = logging::init(&log_dir);
+
+    match std::env::current_exe() {
+        Ok(exe_path) => {
+            if let Err(e) = autostart::ensure_registered(&exe_path) {
+                tracing::warn!("failed to self-register Windows autostart task: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to resolve current exe path for autostart registration: {e}")
+        }
+    }
 
     let db_path = dirs.data_local_dir().join("nucleos.db");
     let pool = storage::open(&db_path)
