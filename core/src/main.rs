@@ -2,6 +2,7 @@ mod auth;
 mod http;
 mod logging;
 mod runner;
+mod runs;
 mod secrets;
 mod state;
 mod storage;
@@ -56,6 +57,8 @@ async fn main() {
         token: Token(token_value),
         pool,
         runner: Arc::new(runner::ClaudeCliRunner),
+        run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
 
     let app = http::build_router(state);

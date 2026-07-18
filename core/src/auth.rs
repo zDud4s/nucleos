@@ -60,6 +60,8 @@ mod tests {
             token: Token(token.to_string()),
             pool,
             runner: Arc::new(FakeCommandRunner::default()),
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }
 

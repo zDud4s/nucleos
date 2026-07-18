@@ -1,9 +1,11 @@
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Router, routing::get};
+use axum::routing::{get, post};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
+use crate::runs::{cancel_run, create_run, get_run};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -17,6 +19,9 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route("/runs", post(create_run))
+        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/cancel", post(cancel_run))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -61,6 +66,8 @@ mod tests {
             token: Token("test-token".into()),
             pool,
             runner: Arc::new(FakeCommandRunner::default()),
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }
 
