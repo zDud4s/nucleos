@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.89"
 axum = "0.8.9"
 directories = "6.0.0"
 keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }

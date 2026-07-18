@@ -1,6 +1,7 @@
 mod auth;
 mod http;
 mod logging;
+mod runner;
 mod secrets;
 mod storage;
 
@@ -10,7 +11,6 @@ const TOKEN_KEY: &str = "daemon-token";
 
 #[tokio::main]
 async fn main() {
-    // `--print-token` short-circuits BEFORE logging init so its stdout is only the token.
     if std::env::args().any(|a| a == "--print-token") {
         match secrets::load_secret(TOKEN_KEY) {
             Ok(Some(t)) => println!("{t}"),
