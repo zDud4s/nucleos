@@ -1,10 +1,12 @@
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::{StatusCode, header},
     middleware::Next,
     response::Response,
 };
 use rand::RngExt;
+
+use crate::state::AppState;
 
 #[derive(Clone)]
 pub struct Token(pub String);
@@ -18,7 +20,7 @@ pub fn generate_token() -> String {
 }
 
 pub async fn require_token(
-    axum::extract::State(expected): axum::extract::State<Token>,
+    State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
@@ -28,7 +30,7 @@ pub async fn require_token(
         .and_then(|v| v.to_str().ok());
 
     match header_value {
-        Some(v) if v == format!("Bearer {}", expected.0) => Ok(next.run(req).await),
+        Some(v) if v == format!("Bearer {}", state.token.0) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -36,25 +38,44 @@ pub async fn require_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::FakeCommandRunner;
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::routing::get;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
-    fn protected_router(token: Token) -> Router {
+    async fn test_state(token: &str) -> AppState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        AppState {
+            token: Token(token.to_string()),
+            pool,
+            runner: Arc::new(FakeCommandRunner::default()),
+        }
+    }
+
+    fn protected_router(state: AppState) -> Router {
         Router::new()
             .route("/secret", get(|| async { "top secret" }))
             .layer(axum::middleware::from_fn_with_state(
-                token.clone(),
+                state.clone(),
                 require_token,
             ))
-            .with_state(token)
+            .with_state(state)
     }
 
     #[tokio::test]
     async fn rejects_missing_token() {
-        let app = protected_router(Token("expected-token".into()));
+        let app = protected_router(test_state("expected-token").await);
         let response = app
             .oneshot(
                 HttpRequest::builder()
@@ -69,7 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_token() {
-        let app = protected_router(Token("expected-token".into()));
+        let app = protected_router(test_state("expected-token").await);
         let response = app
             .oneshot(
                 HttpRequest::builder()
@@ -85,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_correct_token() {
-        let app = protected_router(Token("expected-token".into()));
+        let app = protected_router(test_state("expected-token").await);
         let response = app
             .oneshot(
                 HttpRequest::builder()

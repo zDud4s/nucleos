@@ -3,9 +3,12 @@ mod http;
 mod logging;
 mod runner;
 mod secrets;
+mod state;
 mod storage;
 
 use auth::Token;
+use state::AppState;
+use std::sync::Arc;
 
 const TOKEN_KEY: &str = "daemon-token";
 
@@ -33,7 +36,7 @@ async fn main() {
     let _log_guard = logging::init(&log_dir);
 
     let db_path = dirs.data_local_dir().join("nucleos.db");
-    let _pool = storage::open(&db_path)
+    let pool = storage::open(&db_path)
         .await
         .expect("failed to open local database");
     tracing::info!("nucleos-core database ready at {}", db_path.display());
@@ -48,9 +51,14 @@ async fn main() {
             }
         };
     tracing::info!("nucleos-core token loaded from Credential Manager");
-    let token = Token(token_value);
 
-    let app = http::build_router(token);
+    let state = AppState {
+        token: Token(token_value),
+        pool,
+        runner: Arc::new(runner::ClaudeCliRunner),
+    };
+
+    let app = http::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8791")
         .await
         .unwrap();

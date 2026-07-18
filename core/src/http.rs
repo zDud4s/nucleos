@@ -3,9 +3,10 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::{Token, require_token};
+use crate::auth::require_token;
+use crate::state::AppState;
 
-pub fn build_router(token: Token) -> Router {
+pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin([
             "http://localhost:1420".parse().unwrap(), // Vite dev server (npm run tauri dev)
@@ -17,10 +18,10 @@ pub fn build_router(token: Token) -> Router {
     let protected = Router::new()
         .route("/status", get(status))
         .layer(axum::middleware::from_fn_with_state(
-            token.clone(),
+            state.clone(),
             require_token,
         ))
-        .with_state(token);
+        .with_state(state);
 
     Router::new()
         .route("/health", get(health))
@@ -39,13 +40,33 @@ async fn status() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Token;
+    use crate::runner::FakeCommandRunner;
     use axum::body::Body;
     use axum::http::Request;
-    use tower::ServiceExt; // for `oneshot`
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn test_state() -> AppState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        AppState {
+            token: Token("test-token".into()),
+            pool,
+            runner: Arc::new(FakeCommandRunner::default()),
+        }
+    }
 
     #[tokio::test]
     async fn health_returns_200_ok() {
-        let app = build_router(Token("test-token".into()));
+        let app = build_router(test_state().await);
         let response = app
             .oneshot(
                 Request::builder()
