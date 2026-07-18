@@ -15,6 +15,7 @@
 /shell/src-tauri/target/
 *.db
 *.db-journal
+sidecars/**/*.exe
 
 # ─────────────────────────────────────────────────────────────
 # Agent instruction files — local only, never committed
