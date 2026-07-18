@@ -2,7 +2,9 @@ use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 
+use crate::classifier;
 use crate::runs::finalize_termination;
 use crate::state::AppState;
 
@@ -32,37 +34,47 @@ pub async fn pretooluse_decision(
 ) -> Json<Decision> {
     // Validate run_id against runs actually in flight before trusting anything derived from it (spec
     // §3.4 — the hook's environment sits inside the same cooperative trust model as the token, so the
-    // core never blindly trusts what the hook sends). In the Foundation this only gates the
-    // active-termination path below; the richer per-project/mode resolution run_id enables is
-    // Autopilot-plan scope.
+    // core never blindly trusts what the hook sends).
     let is_in_flight = state
         .run_handles
         .lock()
         .unwrap()
         .contains_key(&payload.run_id);
 
-    let command = payload
-        .tool_input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let cwd = if is_in_flight {
+        match sqlx::query_scalar::<_, Option<String>>("SELECT cwd FROM runs WHERE id = ?")
+            .bind(payload.run_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(cwd) => cwd.flatten(),
+            Err(error) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    %error,
+                    "pretooluse-decision: failed to resolve cwd for in-flight run"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    // Stub policy — NOT the real §8.2 risk taxonomy (Autopilot-plan scope). Two illustrative rules,
-    // one per non-allow decision, so the whole mechanism is exercised end-to-end:
-    //   * `rm -rf`   -> "deny": a definitive refusal; the run continues/fails on its own.
-    //   * `git push` -> "pending_approval": high-risk, needs a human — the core actively terminates
-    //                   the run into `awaiting_approval` (spec §8.4) via the same path cancellation
-    //                   uses. (The real classifier deciding *which* actions pend approval, plus the
-    //                   resume-on-approval and single-use-authorization flow, are Autopilot-plan
-    //                   scope; this proves the Foundation mechanism they build on.)
-    if payload.tool_name == "Bash" && command.contains("rm -rf") {
-        return Json(Decision {
-            decision: "deny".into(),
-            reason: "stub policy (Foundation PoC only): rm -rf is denied".into(),
-        });
-    }
+    let classification = classifier::classify(
+        &payload.tool_name,
+        &payload.tool_input,
+        cwd.as_deref().map(Path::new),
+    );
+    tracing::info!(
+        tool_name = %payload.tool_name,
+        decision = %classification.decision.decision,
+        action_class = classification.action_class,
+        reason = %classification.reason,
+        "pretooluse-decision: classified action"
+    );
 
-    if payload.tool_name == "Bash" && command.contains("git push") {
+    if classification.decision.decision == "pending_approval" {
         // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
         // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
@@ -74,16 +86,9 @@ pub async fn pretooluse_decision(
                 payload.run_id
             );
         }
-        return Json(Decision {
-            decision: "pending_approval".into(),
-            reason: "stub policy (Foundation PoC only): git push needs approval".into(),
-        });
     }
 
-    Json(Decision {
-        decision: "allow".into(),
-        reason: "stub policy: default allow".into(),
-    })
+    Json(classification.decision)
 }
 
 #[cfg(test)]
@@ -115,6 +120,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 prompt TEXT NOT NULL,
                 status TEXT NOT NULL,
+                cwd TEXT,
                 created_at TEXT NOT NULL,
                 completed_at TEXT
             )",
@@ -166,17 +172,34 @@ mod tests {
         )
         .await;
         assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "destructive deletion commands are denied");
     }
 
     #[tokio::test]
-    async fn allows_everything_else() {
+    async fn allows_safe_read_command() {
+        let app = test_router(test_state().await);
+        let decision = decide(
+            &app,
+            r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"ls -la"}}"#,
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.reason, "recognized non-mutating shell command");
+    }
+
+    #[tokio::test]
+    async fn pends_unrecognized_command() {
+        let tool_input = serde_json::json!({"command": "echo hi"});
+        let classification = classifier::classify("Bash", &tool_input, None);
+        assert_eq!(classification.action_class, "unrecognized");
+
         let app = test_router(test_state().await);
         let decision = decide(
             &app,
             r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"echo hi"}}"#,
         )
         .await;
-        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.decision, "pending_approval");
     }
 
     #[tokio::test]
@@ -206,8 +229,50 @@ mod tests {
         );
         let decision = decide(&app, &body).await;
         assert_eq!(decision.decision, "pending_approval");
+        assert_eq!(
+            decision.reason,
+            "push, merge, deploy, publish, and tag actions require approval"
+        );
 
         // The run was actively terminated into awaiting_approval, and its handle removed (spec §8.4).
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn edit_to_autopilot_config_pends_approval_and_terminates_the_run() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, created_at) VALUES ('x', 'running', 'C:\\work\\repo', '2026-07-17T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+
+        let app = test_router(state.clone());
+        let body = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Edit","tool_input":{{"file_path":".ai/autopilot.yaml"}}}}"#
+        );
+        let decision = decide(&app, &body).await;
+        assert_eq!(decision.decision, "pending_approval");
+        assert_eq!(
+            decision.reason,
+            "changes to autopilot governance files require approval"
+        );
+
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(&state.pool)
