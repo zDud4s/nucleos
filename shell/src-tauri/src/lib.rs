@@ -9,6 +9,16 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[tauri::command]
+fn get_daemon_token() -> Result<String, String> {
+    // The token lives in the OS Credential Manager (spec §3.4/§5), written by the daemon's core under
+    // service "nucleos", key "daemon-token" (Chunk 1 Task 5). The shell runs as the same OS user, so
+    // it reads the same entry via keyring — no shared file, no path resolution.
+    keyring::Entry::new("nucleos", "daemon-token")
+        .and_then(|entry| entry.get_password())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -51,7 +61,7 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, get_daemon_token])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
