@@ -12,6 +12,12 @@ pub struct CreateRunRequest {
     pub project_id: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default = "default_run_mode")]
+    pub mode: String,
+}
+
+fn default_run_mode() -> String {
+    "real".to_owned()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,17 +41,32 @@ pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, StatusCode> {
+    let id = create_run_inner(&state, req.prompt, req.project_id, req.cwd, &req.mode)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(CreateRunResponse { id }))
+}
+
+pub async fn create_run_inner(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+) -> Result<i64, sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let id = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, created_at) VALUES (?, ?, ?, 'running', ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+         VALUES (?, ?, ?, 'running', ?, ?)",
     )
-    .bind(&req.project_id)
-    .bind(&req.cwd)
-    .bind(&req.prompt)
+    .bind(&project_id)
+    .bind(&cwd)
+    .bind(&prompt)
+    .bind(mode)
     .bind(&now)
     .execute(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .await?
     .last_insert_rowid();
 
     // Persist session_id the instant the runner parses it (spec §3.3) — a separate task, so it lands
@@ -66,8 +87,8 @@ pub async fn create_run(
 
     let pool = state.pool.clone();
     let runner = state.runner.clone();
-    let prompt = req.prompt.clone();
-    let cwd = req.cwd.clone().map(std::path::PathBuf::from);
+    let cwd = cwd.map(std::path::PathBuf::from);
+    let plan_only = mode == "shadow";
     let run_timeout = state.run_timeout;
     let handles = state.run_handles.clone();
     let env = vec![
@@ -84,7 +105,7 @@ pub async fn create_run(
     let join_handle = tokio::spawn(async move {
         let result = tokio::time::timeout(
             run_timeout,
-            runner.run_prompt(&prompt, &env, cwd.as_deref(), session_tx),
+            runner.run_prompt(&prompt, &env, cwd.as_deref(), plan_only, session_tx),
         )
         .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
@@ -133,7 +154,7 @@ pub async fn create_run(
         .unwrap()
         .insert(id, join_handle.abort_handle());
 
-    Ok(Json(CreateRunResponse { id }))
+    Ok(id)
 }
 
 pub async fn get_run(
@@ -221,7 +242,10 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    async fn test_state_with(delay: Option<Duration>, run_timeout: Duration) -> AppState {
+    async fn test_state_with_runner(
+        delay: Option<Duration>,
+        run_timeout: Duration,
+    ) -> (AppState, Arc<FakeCommandRunner>) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -243,6 +267,7 @@ mod tests {
                 stderr TEXT,
                 session_id TEXT,
                 cost_usd REAL,
+                mode TEXT NOT NULL DEFAULT 'real',
                 created_at TEXT NOT NULL,
                 completed_at TEXT
             )",
@@ -251,22 +276,29 @@ mod tests {
         .await
         .unwrap();
 
-        AppState {
+        let runner = Arc::new(FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(RunOutcome {
+                exit_code: 0,
+                stdout: "42".into(),
+                stderr: String::new(),
+                session_id: Some("fake-session-id".into()),
+                cost_usd: Some(0.05),
+            })),
+            delay: std::sync::Mutex::new(delay),
+            last_plan_only: std::sync::Mutex::new(None),
+        });
+        let state = AppState {
             token: Token("test-token".into()),
             pool,
-            runner: Arc::new(FakeCommandRunner {
-                canned: std::sync::Mutex::new(Some(RunOutcome {
-                    exit_code: 0,
-                    stdout: "42".into(),
-                    stderr: String::new(),
-                    session_id: Some("fake-session-id".into()),
-                    cost_usd: Some(0.05),
-                })),
-                delay: std::sync::Mutex::new(delay),
-            }),
+            runner: runner.clone(),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_timeout,
-        }
+        };
+        (state, runner)
+    }
+
+    async fn test_state_with(delay: Option<Duration>, run_timeout: Duration) -> AppState {
+        test_state_with_runner(delay, run_timeout).await.0
     }
 
     async fn test_state() -> AppState {
@@ -336,6 +368,54 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run did not reach completed status in time, last status: {status}");
+    }
+
+    #[tokio::test]
+    async fn create_run_inner_persists_mode_and_threads_plan_only_per_run() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+
+        let shadow_id = create_run_inner(&state, "shadow".into(), None, None, "shadow")
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            if runner.last_plan_only.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let shadow_mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
+            .bind(shadow_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(shadow_mode, "shadow");
+        assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(true));
+
+        let real_id = create_run_inner(&state, "real".into(), None, None, "real")
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            if *runner.last_plan_only.lock().unwrap() == Some(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let real_mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
+            .bind(real_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(real_mode, "real");
+        assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(false));
+
+        let app = test_router(state.clone());
+        let default_id = create_run_via_http(&app, "default mode").await.id;
+        let default_mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
+            .bind(default_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(default_mode, "real");
     }
 
     #[tokio::test]

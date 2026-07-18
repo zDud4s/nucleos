@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::classifier;
 use crate::runs::finalize_termination;
+use crate::shadow;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -41,24 +42,27 @@ pub async fn pretooluse_decision(
         .unwrap()
         .contains_key(&payload.run_id);
 
-    let cwd = if is_in_flight {
-        match sqlx::query_scalar::<_, Option<String>>("SELECT cwd FROM runs WHERE id = ?")
-            .bind(payload.run_id)
-            .fetch_optional(&state.pool)
-            .await
+    let (cwd, mode) = if is_in_flight {
+        match sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT cwd, mode FROM runs WHERE id = ?",
+        )
+        .bind(payload.run_id)
+        .fetch_optional(&state.pool)
+        .await
         {
-            Ok(cwd) => cwd.flatten(),
+            Ok(Some((cwd, mode))) => (cwd, mode),
+            Ok(None) => (None, "real".to_owned()),
             Err(error) => {
                 tracing::warn!(
                     run_id = payload.run_id,
                     %error,
                     "pretooluse-decision: failed to resolve cwd for in-flight run"
                 );
-                None
+                (None, "real".to_owned())
             }
         }
     } else {
-        None
+        (None, "real".to_owned())
     };
 
     let classification = classifier::classify(
@@ -73,6 +77,38 @@ pub async fn pretooluse_decision(
         reason = %classification.reason,
         "pretooluse-decision: classified action"
     );
+
+    if mode == "shadow" {
+        if let Err(error) = shadow::record_decision(
+            &state.pool,
+            payload.run_id,
+            &payload.tool_name,
+            &payload.tool_input,
+            &classification,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = payload.run_id,
+                %error,
+                "pretooluse-decision: failed to record shadow decision"
+            );
+        }
+
+        let read_only = matches!(payload.tool_name.as_str(), "Read" | "Grep" | "Glob")
+            || (payload.tool_name == "Bash" && classification.action_class == "read-local");
+        return if read_only {
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "shadow mode permits this read-only tool".to_owned(),
+            })
+        } else {
+            Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "shadow mode blocks tools that are not read-only".to_owned(),
+            })
+        };
+    }
 
     if classification.decision.decision == "pending_approval" {
         // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
@@ -121,8 +157,27 @@ mod tests {
                 prompt TEXT NOT NULL,
                 status TEXT NOT NULL,
                 cwd TEXT,
+                mode TEXT NOT NULL DEFAULT 'real',
                 created_at TEXT NOT NULL,
                 completed_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE shadow_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT,
+                decision TEXT NOT NULL,
+                reason TEXT,
+                action_class TEXT NOT NULL,
+                classifier_version INTEGER NOT NULL,
+                human_verdict TEXT,
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL
             )",
         )
         .execute(&pool)
@@ -280,5 +335,83 @@ mod tests {
             .unwrap();
         assert_eq!(status, "awaiting_approval");
         assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn shadow_read_only_brake_records_would_decisions_without_terminating() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'shadow', '2026-07-18T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let edit_input = serde_json::json!({"file_path": "src/ordinary.rs"});
+        let edit = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Edit",
+                "tool_input": edit_input
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(edit.decision, "deny");
+
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT decision, action_class, tool_input FROM shadow_decisions
+             WHERE run_id = ? AND tool_name = 'Edit'",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "allow");
+        assert_eq!(row.1, "read-local");
+        assert_eq!(row.2, edit_input.to_string());
+
+        let read = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/lib.rs"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(read.decision, "allow");
+
+        let push = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(push.decision, "deny");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(status, "awaiting_approval");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
     }
 }
