@@ -42,6 +42,15 @@ async fn main() {
         .expect("failed to open local database");
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
+    let interrupted = runs::reconcile_orphaned_runs(&pool)
+        .await
+        .expect("failed to reconcile orphaned runs on startup");
+    if interrupted > 0 {
+        tracing::warn!(
+            "reconciled {interrupted} run(s) left 'running' by a previous crash -> 'interrupted'"
+        );
+    }
+
     let token_value =
         match secrets::load_secret(TOKEN_KEY).expect("failed to read Credential Manager") {
             Some(existing) => existing,

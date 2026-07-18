@@ -185,6 +185,19 @@ pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> S
     }
 }
 
+/// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
+/// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
+pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +434,35 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("run did not reach timed_out status in time, last status: {status}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_only_running_runs_as_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::storage::open(&dir.path().join("nucleos.db"))
+            .await
+            .unwrap();
+
+        // One run in flight when the daemon "died", one already completed.
+        sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', '2026-07-17T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('y', 'completed', '2026-07-17T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+
+        let n = reconcile_orphaned_runs(&pool).await.unwrap();
+        assert_eq!(n, 1, "exactly the one running row should be reconciled");
+
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT prompt, status FROM runs ORDER BY prompt")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                ("x".to_string(), "interrupted".to_string()),
+                ("y".to_string(), "completed".to_string()),
+            ]
+        );
     }
 }
