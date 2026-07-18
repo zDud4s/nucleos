@@ -21,3 +21,33 @@ pub fn delete_secret(key: &str) -> keyring::Result<()> {
         Err(e) => Err(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // This test touches the real Windows Credential Manager — there is no fake/mock backend for
+    // `keyring`, and spec §5 chose the real OS store deliberately, so testing against a stub would
+    // not actually verify the integration works. Uses a namespaced test key and cleans up both
+    // before and after to tolerate a prior failed run leaving state behind.
+    //
+    // #[ignore] keeps this out of the default `cargo test` run (the ongoing gate used by every other
+    // task in this plan, which needs to stay runnable headlessly) — run it explicitly with
+    // `cargo test -- --include-ignored` on a real desktop session where Credential Manager is
+    // actually reachable.
+    #[test]
+    #[ignore = "touches the real Windows Credential Manager; run with --include-ignored on a desktop session"]
+    fn store_load_delete_roundtrip() {
+        let key = "test-roundtrip-secret";
+        let _ = delete_secret(key);
+
+        store_secret(key, "super-secret-value").unwrap();
+        assert_eq!(
+            load_secret(key).unwrap(),
+            Some("super-secret-value".to_string())
+        );
+
+        delete_secret(key).unwrap();
+        assert_eq!(load_secret(key).unwrap(), None);
+    }
+}
