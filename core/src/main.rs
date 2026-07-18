@@ -1,5 +1,6 @@
 mod auth;
 mod http;
+mod logging;
 mod secrets;
 mod storage;
 
@@ -9,8 +10,7 @@ const TOKEN_KEY: &str = "daemon-token";
 
 #[tokio::main]
 async fn main() {
-    // Dev affordance: `nucleos-core --print-token` reads the token back out of the OS Credential
-    // Manager and prints only that, so smoke tests can grab it without a plaintext token file.
+    // `--print-token` short-circuits BEFORE logging init so its stdout is only the token.
     if std::env::args().any(|a| a == "--print-token") {
         match secrets::load_secret(TOKEN_KEY) {
             Ok(Some(t)) => println!("{t}"),
@@ -29,14 +29,15 @@ async fn main() {
     let dirs = directories::ProjectDirs::from("dev", "nucleos", "NucleOS")
         .expect("could not resolve local app data directory");
 
+    let log_dir = dirs.data_local_dir().join("logs");
+    let _log_guard = logging::init(&log_dir);
+
     let db_path = dirs.data_local_dir().join("nucleos.db");
     let _pool = storage::open(&db_path)
         .await
         .expect("failed to open local database");
-    println!("nucleos-core database ready at {}", db_path.display());
+    tracing::info!("nucleos-core database ready at {}", db_path.display());
 
-    // The token lives in the OS Credential Manager (spec §3.4/§5), not a file on disk — generated
-    // once on first run, loaded back on every start after that.
     let token_value =
         match secrets::load_secret(TOKEN_KEY).expect("failed to read Credential Manager") {
             Some(existing) => existing,
@@ -46,14 +47,14 @@ async fn main() {
                 fresh
             }
         };
-    println!("nucleos-core token loaded from Credential Manager");
+    tracing::info!("nucleos-core token loaded from Credential Manager");
     let token = Token(token_value);
 
     let app = http::build_router(token);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8791")
         .await
         .unwrap();
-    println!(
+    tracing::info!(
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
     );
