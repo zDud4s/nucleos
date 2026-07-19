@@ -932,7 +932,7 @@ mod tests {
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
-        let non_repo_container = space_free_tempdir("nucleos-runs-non-repo-");
+        let non_repo_container = tempfile::tempdir().expect("create non-repository tempdir");
         let non_repo = non_repo_container.path().join("not-a-repo");
         std::fs::create_dir(&non_repo).expect("create non-repository directory");
         let state = test_state().await;
