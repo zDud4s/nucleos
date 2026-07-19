@@ -1,9 +1,16 @@
+use crate::feed;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+const GC_BACKOFF: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(25),
+];
 
 pub struct WorktreeInfo {
     pub path: PathBuf,
@@ -177,6 +184,119 @@ pub async fn gc_candidates(
     .await
 }
 
+fn retention() -> chrono::Duration {
+    std::env::var("NUCLEOS_WORKTREE_RETENTION_HOURS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(chrono::Duration::hours)
+        .unwrap_or_else(|| chrono::Duration::hours(72))
+}
+
+pub(crate) async fn gc_pass(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    retention: chrono::Duration,
+    backoff: &[Duration],
+) {
+    let candidates = gc_candidates(pool, now, retention)
+        .await
+        .unwrap_or_default();
+
+    let project_roots = candidates
+        .iter()
+        .map(|worktree| worktree.project_root.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for project_root in project_roots {
+        let _ = tokio::process::Command::new(git_bin())
+            .arg("-C")
+            .arg(project_root)
+            .arg("worktree")
+            .arg("prune")
+            .output()
+            .await;
+    }
+
+    for worktree in candidates {
+        match remove(
+            Path::new(&worktree.project_root),
+            Path::new(&worktree.path),
+            backoff,
+        )
+        .await
+        {
+            Ok(()) => {
+                if let Err(error) = mark_removed(pool, worktree.run_id).await {
+                    tracing::warn!(
+                        run_id = worktree.run_id,
+                        %error,
+                        "failed to mark collected worktree as removed"
+                    );
+                }
+
+                let branch_deleted = tokio::process::Command::new(git_bin())
+                    .arg("-C")
+                    .arg(&worktree.project_root)
+                    .arg("branch")
+                    .arg("-d")
+                    .arg(&worktree.branch)
+                    .output()
+                    .await
+                    .is_ok_and(|output| output.status.success());
+
+                if branch_deleted {
+                    let summary = format!("removed worktree + merged branch {}", worktree.branch);
+                    let _ = feed::append(
+                        pool,
+                        Some(&worktree.project_id),
+                        "worktree_removed",
+                        &summary,
+                        Some(worktree.run_id),
+                    )
+                    .await;
+                } else {
+                    let summary = format!("removed worktree {}", worktree.path);
+                    let _ = feed::append(
+                        pool,
+                        Some(&worktree.project_id),
+                        "worktree_removed",
+                        &summary,
+                        Some(worktree.run_id),
+                    )
+                    .await;
+                    let summary = format!("kept unmerged branch {}", worktree.branch);
+                    let _ = feed::append(
+                        pool,
+                        Some(&worktree.project_id),
+                        "worktree_branch_kept",
+                        &summary,
+                        Some(worktree.run_id),
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                let summary = format!("failed to remove worktree {}: {}", worktree.path, error);
+                let _ = feed::append(
+                    pool,
+                    Some(&worktree.project_id),
+                    "worktree_gc_failed",
+                    &summary,
+                    Some(worktree.run_id),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+pub async fn run_gc(pool: SqlitePool) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1800));
+    loop {
+        interval.tick().await;
+        gc_pass(&pool, Utc::now(), retention(), GC_BACKOFF).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +355,21 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    async fn create_and_record(pool: &sqlx::SqlitePool, repo: &Path, run_id: i64) -> WorktreeInfo {
+        let info = create(repo, run_id).await.expect("create worktree");
+        record(
+            pool,
+            run_id,
+            "project-a",
+            repo.to_str().expect("repository path should be UTF-8"),
+            info.path.to_str().expect("worktree path should be UTF-8"),
+            &info.branch,
+        )
+        .await
+        .expect("record worktree");
+        info
     }
 
     fn git_ok(dir: &Path, args: &[&OsStr]) -> bool {
@@ -669,6 +804,213 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_removes_an_expired_terminal_worktree_and_marks_and_feeds() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+        let now = timestamp("2026-07-19T00:00:00+00:00");
+
+        gc_pass(&pool, now, chrono::Duration::hours(72), &[]).await;
+
+        assert!(!info.path.exists());
+        let removed_at: Option<String> =
+            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed_at.is_some());
+        assert!(
+            gc_candidates(&pool, now, chrono::Duration::hours(72))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let entries = crate::feed::list_feed(&pool, Some("project-a"), 50)
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == "worktree_removed" && entry.run_id == Some(run_id))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_leaves_a_pinned_awaiting_approval_worktree() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+
+        gc_pass(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+            &[],
+        )
+        .await;
+
+        assert!(info.path.exists());
+        let removed_at: Option<String> =
+            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed_at.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_keeps_an_unmerged_branch_and_deletes_a_merged_branch() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let unmerged_run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        let unmerged = create_and_record(&pool, repo.path(), unmerged_run_id).await;
+        std::fs::write(unmerged.path.join("unmerged.txt"), "unreviewed\n")
+            .expect("write unmerged change");
+        assert!(git_ok(
+            &unmerged.path,
+            &[OsStr::new("add"), OsStr::new("-A")]
+        ));
+        assert!(git_ok(
+            &unmerged.path,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("unmerged work"),
+            ]
+        ));
+
+        let merged_run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        let merged = create_and_record(&pool, repo.path(), merged_run_id).await;
+
+        gc_pass(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+            &[],
+        )
+        .await;
+
+        assert!(!unmerged.path.exists());
+        assert!(!merged.path.exists());
+        assert!(
+            !git_stdout(
+                repo.path(),
+                &[
+                    OsStr::new("branch"),
+                    OsStr::new("--list"),
+                    OsStr::new(&unmerged.branch),
+                ],
+            )
+            .is_empty()
+        );
+        assert!(
+            git_stdout(
+                repo.path(),
+                &[
+                    OsStr::new("branch"),
+                    OsStr::new("--list"),
+                    OsStr::new(&merged.branch),
+                ],
+            )
+            .is_empty()
+        );
+        let entries = crate::feed::list_feed(&pool, Some("project-a"), 50)
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.kind == "worktree_branch_kept"
+                && entry.run_id == Some(unmerged_run_id)
+                && entry.summary.contains(&unmerged.branch)
+        }));
+        assert!(
+            entries.iter().any(
+                |entry| entry.kind == "worktree_removed" && entry.run_id == Some(merged_run_id)
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_reports_failure_and_keeps_the_row_when_removal_fails() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+        try_remove_once(repo.path(), &info.path)
+            .await
+            .expect("pre-remove worktree");
+
+        gc_pass(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+            &[],
+        )
+        .await;
+
+        let removed_at: Option<String> =
+            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed_at.is_none());
+        let entries = crate::feed::list_feed(&pool, Some("project-a"), 50)
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.kind == "worktree_gc_failed"
+                && entry.run_id == Some(run_id)
+                && entry.summary.contains(info.path.to_string_lossy().as_ref())
+        }));
     }
 
     #[cfg(windows)]
