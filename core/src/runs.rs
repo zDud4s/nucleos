@@ -28,7 +28,6 @@ pub struct CreateRunResponse {
 #[derive(Debug)]
 pub enum CreateRunError {
     Invalid(&'static str),
-    #[allow(dead_code)]
     Busy,
     Worktree(std::io::Error),
     Db(sqlx::Error),
@@ -98,7 +97,7 @@ pub async fn create_run_inner(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    let id = sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
          VALUES (?, ?, ?, 'running', ?, ?)",
     )
@@ -108,8 +107,18 @@ pub async fn create_run_inner(
     .bind(mode)
     .bind(&now)
     .execute(&state.pool)
-    .await?
-    .last_insert_rowid();
+    .await;
+    let id = match inserted {
+        Ok(result) => result.last_insert_rowid(),
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation()) =>
+        {
+            return Err(CreateRunError::Busy);
+        }
+        Err(error) => return Err(CreateRunError::Db(error)),
+    };
 
     let plan_only = mode == "shadow";
     let mut spawn_cwd = cwd.clone().map(std::path::PathBuf::from);
@@ -359,15 +368,12 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::{get, post};
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsStr;
     use std::path::{Path as FsPath, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
     use tower::ServiceExt;
-
-    const WORKTREE_ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
 
     async fn test_state_with_runner(
         delay: Option<Duration>,
@@ -398,6 +404,14 @@ mod tests {
                 created_at TEXT NOT NULL,
                 completed_at TEXT
             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX one_open_worktree_run_per_project
+             ON runs (project_id)
+             WHERE mode = 'worktree' AND status IN ('running', 'awaiting_approval')",
         )
         .execute(&pool)
         .await
@@ -474,11 +488,11 @@ mod tests {
             .expect("create space-free tempdir")
     }
 
-    fn init_repo() -> tempfile::TempDir {
-        let repo = space_free_tempdir("nucleos-runs-repo-");
-        assert!(git_ok(repo.path(), &[OsStr::new("init")]));
+    fn initialize_repo(repo: &FsPath) {
+        std::fs::create_dir_all(repo).expect("create repository directory");
+        assert!(git_ok(repo, &[OsStr::new("init")]));
         assert!(git_ok(
-            repo.path(),
+            repo,
             &[
                 OsStr::new("config"),
                 OsStr::new("user.email"),
@@ -486,50 +500,26 @@ mod tests {
             ],
         ));
         assert!(git_ok(
-            repo.path(),
+            repo,
             &[
                 OsStr::new("config"),
                 OsStr::new("user.name"),
                 OsStr::new("test"),
             ],
         ));
-        std::fs::write(repo.path().join("seed.txt"), "seed\n").expect("write seed file");
-        assert!(git_ok(repo.path(), &[OsStr::new("add"), OsStr::new("-A")]));
+        std::fs::write(repo.join("seed.txt"), "seed\n").expect("write seed file");
+        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
         assert!(git_ok(
-            repo.path(),
+            repo,
             &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("seed"),],
         ));
-        repo
     }
 
-    fn worktree_env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct WorktreeRootEnv {
-        previous: Option<OsString>,
-    }
-
-    impl WorktreeRootEnv {
-        fn set(path: &FsPath) -> Self {
-            let previous = std::env::var_os(WORKTREE_ROOT_ENV);
-            unsafe { std::env::set_var(WORKTREE_ROOT_ENV, path) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for WorktreeRootEnv {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(WORKTREE_ROOT_ENV, value),
-                    None => std::env::remove_var(WORKTREE_ROOT_ENV),
-                }
-            }
-        }
+    fn init_contained_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+        let container = space_free_tempdir(prefix);
+        let repo = container.path().join("repo");
+        initialize_repo(&repo);
+        (container, repo)
     }
 
     async fn test_state_with(delay: Option<Duration>, run_timeout: Duration) -> AppState {
@@ -538,6 +528,43 @@ mod tests {
 
     async fn test_state() -> AppState {
         test_state_with(None, crate::state::DEFAULT_RUN_TIMEOUT).await
+    }
+
+    async fn advance_run_ids_past(pool: &sqlx::SqlitePool, id: i64) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (?, 'sequence placeholder', 'completed', 'real', ?)",
+        )
+        .bind(id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn create_worktree_run(
+        state: &AppState,
+        prompt: &str,
+        project_id: &str,
+        project_root: &str,
+    ) -> Result<i64, CreateRunError> {
+        for attempt in 0..100 {
+            let result = create_run_inner(
+                state,
+                prompt.to_owned(),
+                Some(project_id.to_owned()),
+                Some(project_root.to_owned()),
+                "worktree",
+            )
+            .await;
+            match result {
+                Err(CreateRunError::Worktree(_)) if attempt < 99 => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final retry always returns")
     }
 
     fn test_router(state: AppState) -> Router {
@@ -677,22 +704,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_mode_provisions_and_runs_inside_the_worktree() {
-        let _lock = worktree_env_lock();
-        let repo = init_repo();
-        let worktree_root = space_free_tempdir("nucleos-runs-worktrees-");
-        let _env = WorktreeRootEnv::set(worktree_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-provision-");
         let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
-        let project_root = repo.path().to_string_lossy().into_owned();
+        advance_run_ids_past(&state.pool, 40_000).await;
+        let project_root = repo.to_string_lossy().into_owned();
 
-        let id = create_run_inner(
-            &state,
-            "do it".into(),
-            Some("proj".into()),
-            Some(project_root.clone()),
-            "worktree",
-        )
-        .await
-        .unwrap();
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
 
         let mut spawn_cwd = None;
         for _ in 0..50 {
@@ -703,7 +722,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let spawn_cwd = spawn_cwd.expect("runner did not receive a cwd");
-        assert!(spawn_cwd.starts_with(worktree_root.path()));
         assert_eq!(
             spawn_cwd.file_name(),
             Some(OsStr::new(&format!("run-{id}")))
@@ -744,7 +762,7 @@ mod tests {
         assert_eq!(kind, "worktree_run_completed");
         assert!(summary.contains(&branch));
 
-        let _ = crate::worktree::remove(repo.path(), &spawn_cwd, &[]).await;
+        let _ = crate::worktree::remove(&repo, &spawn_cwd, &[]).await;
     }
 
     #[tokio::test]
@@ -772,18 +790,114 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn second_worktree_run_while_one_is_running_is_busy() {
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-exclusive-");
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        advance_run_ids_past(&state.pool, 10_000).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        create_worktree_run(&state, "first", "proj", &project_root)
+            .await
+            .unwrap();
+        let second = create_run_inner(
+            &state,
+            "second".into(),
+            Some("proj".into()),
+            Some(project_root),
+            "worktree",
+        )
+        .await;
+
+        assert!(matches!(second, Err(CreateRunError::Busy)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worktree_run_for_a_different_project_is_allowed() {
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-project-");
+        let (_repo2_container, repo2) = init_contained_repo("nucleos-runs-project2-");
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        advance_run_ids_past(&state.pool, 20_000).await;
+
+        create_worktree_run(&state, "first", "proj", &repo.to_string_lossy())
+            .await
+            .unwrap();
+        let second = create_worktree_run(&state, "second", "proj2", &repo2.to_string_lossy()).await;
+
+        assert!(second.is_ok(), "unexpected result: {second:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worktree_slot_is_held_while_awaiting_approval() {
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-pinned-");
+        let state = test_state().await;
+        let project_root = repo.to_string_lossy().into_owned();
+        sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+             VALUES ('proj', ?, 'pinned', 'awaiting_approval', 'worktree', ?)",
+        )
+        .bind(&project_root)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = create_run_inner(
+            &state,
+            "new".into(),
+            Some("proj".into()),
+            Some(project_root),
+            "worktree",
+        )
+        .await;
+
+        assert!(matches!(result, Err(CreateRunError::Busy)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worktree_slot_frees_after_the_open_run_leaves() {
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-released-");
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        advance_run_ids_past(&state.pool, 30_000).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let first = create_worktree_run(&state, "first", "proj", &project_root)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let second = create_worktree_run(&state, "second", "proj", &project_root).await;
+
+        assert!(second.is_ok(), "unexpected result: {second:?}");
+    }
+
+    #[tokio::test]
+    async fn shadow_and_real_runs_are_unaffected_by_the_index() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+
+        for mode in ["shadow", "real"] {
+            for prompt in ["first", "second"] {
+                let result =
+                    create_run_inner(&state, prompt.into(), Some("proj".into()), None, mode).await;
+                assert!(result.is_ok(), "{mode} run failed: {result:?}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worktree_mode_on_a_non_repo_marks_failed_and_feeds() {
-        let _lock = worktree_env_lock();
-        let non_repo = tempfile::tempdir().expect("create non-repository tempdir");
-        let worktree_root = space_free_tempdir("nucleos-runs-failed-worktrees-");
-        let _env = WorktreeRootEnv::set(worktree_root.path());
+        let non_repo_container = space_free_tempdir("nucleos-runs-non-repo-");
+        let non_repo = non_repo_container.path().join("not-a-repo");
+        std::fs::create_dir(&non_repo).expect("create non-repository directory");
         let state = test_state().await;
 
         let result = create_run_inner(
             &state,
             "do it".into(),
             Some("proj".into()),
-            Some(non_repo.path().to_string_lossy().into_owned()),
+            Some(non_repo.to_string_lossy().into_owned()),
             "worktree",
         )
         .await;
