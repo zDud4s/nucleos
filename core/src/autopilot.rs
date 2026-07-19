@@ -255,6 +255,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_settings_json_rejects_shadow_and_leaves_mode_off() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(&root, "{ this is not valid json ");
+
+        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ActivationError::HookNotRegistered));
+        assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
+    }
+
+    #[tokio::test]
+    async fn settings_without_pretooluse_key_rejects_shadow_and_leaves_mode_off() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(&root, r#"{"hooks":{"PostToolUse":[{"command":"x"}]}}"#);
+
+        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ActivationError::HookNotRegistered));
+        assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
+    }
+
+    #[tokio::test]
     async fn empty_pretooluse_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
