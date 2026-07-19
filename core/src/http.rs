@@ -136,8 +136,8 @@ async fn post_autopilot_kill(
 
 fn activation_status(error: ActivationError) -> StatusCode {
     match error {
-        ActivationError::ActiveReserved => StatusCode::CONFLICT,
-        ActivationError::ProjectRootRequired
+        ActivationError::NotAGitRepo
+        | ActivationError::ProjectRootRequired
         | ActivationError::NotOnboarded
         | ActivationError::HookNotRegistered => StatusCode::UNPROCESSABLE_ENTITY,
         ActivationError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,

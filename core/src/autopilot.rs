@@ -33,7 +33,7 @@ impl Mode {
 
 #[derive(Debug)]
 pub enum ActivationError {
-    ActiveReserved,
+    NotAGitRepo,
     ProjectRootRequired,
     NotOnboarded,
     HookNotRegistered,
@@ -43,7 +43,7 @@ pub enum ActivationError {
 impl fmt::Display for ActivationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ActiveReserved => write!(formatter, "active mode is reserved for Phase 2"),
+            Self::NotAGitRepo => write!(formatter, "project root is not a git repository"),
             Self::ProjectRootRequired => {
                 write!(formatter, "project_root is required to enable shadow mode")
             }
@@ -92,7 +92,13 @@ pub async fn set_project_mode(
     project_root: Option<&Path>,
 ) -> Result<(), ActivationError> {
     match mode {
-        Mode::Active => return Err(ActivationError::ActiveReserved),
+        Mode::Active => {
+            let project_root = project_root.ok_or(ActivationError::ProjectRootRequired)?;
+            activation_prerequisites(project_root)?;
+            if !project_root.join(".git").exists() {
+                return Err(ActivationError::NotAGitRepo);
+            }
+        }
         Mode::Shadow => {
             activation_prerequisites(project_root.ok_or(ActivationError::ProjectRootRequired)?)?
         }
@@ -100,9 +106,8 @@ pub async fn set_project_mode(
     }
 
     let persisted_root = match mode {
-        Mode::Shadow => project_root.map(|root| root.to_string_lossy().into_owned()),
+        Mode::Shadow | Mode::Active => project_root.map(|root| root.to_string_lossy().into_owned()),
         Mode::Off => None,
-        Mode::Active => unreachable!("active mode is rejected before persistence"),
     };
 
     sqlx::query(
@@ -129,6 +134,27 @@ pub async fn shadow_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, Str
     )
     .fetch_all(pool)
     .await
+}
+
+pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String, Mode)>> {
+    let projects: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT project_id, project_root, mode
+         FROM autopilot_state
+         WHERE mode IN ('shadow', 'active') AND project_root IS NOT NULL
+         ORDER BY project_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    projects
+        .into_iter()
+        .map(|(project_id, project_root, mode)| {
+            let mode = Mode::from_db_str(&mode).ok_or_else(|| {
+                sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
+            })?;
+            Ok((project_id, project_root, mode))
+        })
+        .collect()
 }
 
 fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> {
@@ -194,6 +220,10 @@ mod tests {
         let claude_dir = root.path().join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         fs::write(claude_dir.join("settings.json"), contents).unwrap();
+    }
+
+    fn git_init(root: &TempDir) {
+        fs::create_dir_all(root.path().join(".git")).unwrap();
     }
 
     #[tokio::test]
@@ -298,15 +328,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_mode_is_rejected_and_leaves_mode_off() {
+    async fn active_mode_round_trips_with_all_prerequisites() {
         let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(
+            &root,
+            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
+        );
+        git_init(&root);
 
-        let error = set_project_mode(&pool, "project-a", Mode::Active, None)
+        set_project_mode(&pool, "project-a", Mode::Active, Some(root.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            project_mode(&pool, "project-a").await.unwrap(),
+            Mode::Active
+        );
+        assert_eq!(
+            autopilot_projects(&pool).await.unwrap(),
+            vec![(
+                "project-a".to_owned(),
+                root.path().to_string_lossy().into_owned(),
+                Mode::Active,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_mode_rejected_when_not_a_git_repo() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(
+            &root,
+            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
+        );
+
+        let error = set_project_mode(&pool, "project-a", Mode::Active, Some(root.path()))
             .await
             .unwrap_err();
 
-        assert!(matches!(error, ActivationError::ActiveReserved));
+        assert!(matches!(error, ActivationError::NotAGitRepo));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
+    }
+
+    #[tokio::test]
+    async fn active_mode_still_requires_onboarding_and_hook() {
+        let pool = test_pool().await;
+        let missing_workflow_root = tempfile::tempdir().unwrap();
+        write_settings(
+            &missing_workflow_root,
+            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
+        );
+        git_init(&missing_workflow_root);
+
+        let error = set_project_mode(
+            &pool,
+            "missing-workflow",
+            Mode::Active,
+            Some(missing_workflow_root.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ActivationError::NotOnboarded));
+
+        let missing_hook_root = tempfile::tempdir().unwrap();
+        write_workflow(&missing_hook_root);
+        write_settings(&missing_hook_root, r#"{"hooks":{"PreToolUse":[]}}"#);
+        git_init(&missing_hook_root);
+
+        let error = set_project_mode(
+            &pool,
+            "missing-hook",
+            Mode::Active,
+            Some(missing_hook_root.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ActivationError::HookNotRegistered));
+    }
+
+    #[tokio::test]
+    async fn autopilot_projects_lists_shadow_and_active() {
+        let pool = test_pool().await;
+        let shadow_root = tempfile::tempdir().unwrap();
+        write_workflow(&shadow_root);
+        write_settings(
+            &shadow_root,
+            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
+        );
+        let active_root = tempfile::tempdir().unwrap();
+        write_workflow(&active_root);
+        write_settings(
+            &active_root,
+            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
+        );
+        git_init(&active_root);
+
+        set_project_mode(
+            &pool,
+            "project-shadow",
+            Mode::Shadow,
+            Some(shadow_root.path()),
+        )
+        .await
+        .unwrap();
+        set_project_mode(
+            &pool,
+            "project-active",
+            Mode::Active,
+            Some(active_root.path()),
+        )
+        .await
+        .unwrap();
+        set_project_mode(&pool, "project-off", Mode::Off, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            autopilot_projects(&pool).await.unwrap(),
+            vec![
+                (
+                    "project-active".to_owned(),
+                    active_root.path().to_string_lossy().into_owned(),
+                    Mode::Active,
+                ),
+                (
+                    "project-shadow".to_owned(),
+                    shadow_root.path().to_string_lossy().into_owned(),
+                    Mode::Shadow,
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
