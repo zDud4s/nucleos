@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 1;
+pub const CLASSIFIER_VERSION: u32 = 2;
 
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
@@ -41,6 +41,14 @@ pub struct Classification {
 }
 
 pub fn classify(tool_name: &str, tool_input: &Value, cwd: Option<&Path>) -> Classification {
+    if WRITE_TOOLS.contains(&tool_name) && writes_outside_cwd(tool_input, cwd) {
+        return classification(
+            "deny",
+            "outside-workspace",
+            "writes outside the run's workspace are denied",
+        );
+    }
+
     if WRITE_TOOLS.contains(&tool_name) && targets_self_governing_file(tool_input, cwd) {
         return classification(
             "pending_approval",
@@ -174,6 +182,19 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
         .any(|suffix| path_has_suffix(&normalized, suffix))
         || normalized.contains("/.claude/hooks/")
         || normalized.starts_with(".claude/hooks/")
+}
+
+fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+        return false;
+    };
+
+    let target = normalize_path(file_path, Some(cwd));
+    let cwd = normalize_path(&cwd.to_string_lossy(), None);
+    target != cwd && !target.starts_with(&format!("{cwd}/"))
 }
 
 fn path_has_suffix(path: &str, suffix: &str) -> bool {
@@ -389,6 +410,69 @@ mod tests {
     }
 
     #[test]
+    fn denies_write_outside_cwd() {
+        assert_classification(
+            classify(
+                "Write",
+                &json!({"file_path": r"C:\other\evil.rs"}),
+                Some(Path::new(r"C:\work\repo")),
+            ),
+            "deny",
+            "outside-workspace",
+        );
+    }
+
+    #[test]
+    fn denies_edit_that_escapes_cwd_via_traversal() {
+        assert_classification(
+            classify(
+                "Edit",
+                &json!({"file_path": r"..\..\outside\x.rs"}),
+                Some(Path::new(r"C:\work\repo")),
+            ),
+            "deny",
+            "outside-workspace",
+        );
+    }
+
+    #[test]
+    fn denies_outside_cwd_in_backslash_form() {
+        assert_classification(
+            classify(
+                "Edit",
+                &json!({"file_path": r"C:\work\repo-sibling\x.rs"}),
+                Some(Path::new(r"C:\work\repo")),
+            ),
+            "deny",
+            "outside-workspace",
+        );
+    }
+
+    #[test]
+    fn allows_write_inside_cwd() {
+        for file_path in [r"C:\work\repo\src\main.rs", "src/main.rs"] {
+            assert_classification(
+                classify(
+                    "Write",
+                    &json!({"file_path": file_path}),
+                    Some(Path::new(r"C:\work\repo")),
+                ),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn containment_is_inert_without_cwd() {
+        assert_classification(
+            classify("Edit", &json!({"file_path": r"C:\anywhere\x.rs"}), None),
+            "allow",
+            "read-local",
+        );
+    }
+
+    #[test]
     fn recognizes_self_governing_paths_in_all_supported_forms() {
         let cases = [
             (r".claude\settings.json", Some(Path::new(r"C:\work\repo"))),
@@ -444,6 +528,6 @@ mod tests {
 
     #[test]
     fn exposes_initial_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 1);
+        assert_eq!(CLASSIFIER_VERSION, 2);
     }
 }
