@@ -21,6 +21,7 @@ pub struct ShadowDecision {
 
 #[derive(Debug, Clone, Serialize, PartialEq, FromRow)]
 pub struct ClassTally {
+    pub mode: String,
     pub action_class: String,
     pub total: i64,
     pub would_allow: i64,
@@ -91,6 +92,7 @@ pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Res
 pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<ClassTally>> {
     sqlx::query_as(
         "SELECT
+             runs.mode AS mode,
              shadow_decisions.action_class,
              COUNT(*) AS total,
              SUM(CASE WHEN shadow_decisions.decision = 'allow' THEN 1 ELSE 0 END) AS would_allow,
@@ -118,8 +120,8 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.project_id = ?
-         GROUP BY shadow_decisions.action_class
-         ORDER BY shadow_decisions.action_class",
+         GROUP BY runs.mode, shadow_decisions.action_class
+         ORDER BY runs.mode, shadow_decisions.action_class",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -154,6 +156,19 @@ mod tests {
              VALUES (?, 'test', 'running', '2026-07-18T00:00:00Z')",
         )
         .bind(project_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn insert_run_with_mode(pool: &sqlx::SqlitePool, project_id: &str, mode: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES (?, 'test', 'running', ?, '2026-07-18T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(mode)
         .execute(pool)
         .await
         .unwrap()
@@ -250,6 +265,7 @@ mod tests {
             tallies,
             vec![
                 ClassTally {
+                    mode: "real".to_owned(),
                     action_class: "destructive".to_owned(),
                     total: 1,
                     would_allow: 0,
@@ -260,10 +276,88 @@ mod tests {
                     disagree: 0,
                 },
                 ClassTally {
+                    mode: "real".to_owned(),
                     action_class: "read-local".to_owned(),
                     total: 2,
                     would_allow: 1,
                     would_pend: 1,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_splits_tallies_by_run_mode() {
+        let pool = test_pool().await;
+        let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        insert_shadow(&pool, shadow_run, "read-local", "allow", None).await;
+        insert_shadow(
+            &pool,
+            shadow_run,
+            "push-merge-deploy",
+            "pending_approval",
+            None,
+        )
+        .await;
+        insert_shadow(&pool, worktree_run, "read-local", "allow", None).await;
+        insert_shadow(
+            &pool,
+            worktree_run,
+            "push-merge-deploy",
+            "pending_approval",
+            None,
+        )
+        .await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(
+            tallies,
+            vec![
+                ClassTally {
+                    mode: "shadow".to_owned(),
+                    action_class: "push-merge-deploy".to_owned(),
+                    total: 1,
+                    would_allow: 0,
+                    would_pend: 1,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                },
+                ClassTally {
+                    mode: "shadow".to_owned(),
+                    action_class: "read-local".to_owned(),
+                    total: 1,
+                    would_allow: 1,
+                    would_pend: 0,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                },
+                ClassTally {
+                    mode: "worktree".to_owned(),
+                    action_class: "push-merge-deploy".to_owned(),
+                    total: 1,
+                    would_allow: 0,
+                    would_pend: 1,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                },
+                ClassTally {
+                    mode: "worktree".to_owned(),
+                    action_class: "read-local".to_owned(),
+                    total: 1,
+                    would_allow: 1,
+                    would_pend: 0,
                     would_deny: 0,
                     reviewed: 0,
                     agree: 0,
@@ -290,6 +384,7 @@ mod tests {
 
         let tallies = scoreboard(&pool, "project-a").await.unwrap();
 
+        assert_eq!(tallies[0].mode, "real");
         assert_eq!(tallies[0].reviewed, 3);
         assert_eq!(tallies[0].agree, 2);
         assert_eq!(tallies[0].disagree, 1);
@@ -334,6 +429,7 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some("approve"));
         chrono::DateTime::parse_from_rfc3339(row.1.as_deref().unwrap()).unwrap();
         let tally = &scoreboard(&pool, "project-a").await.unwrap()[0];
+        assert_eq!(tally.mode, "real");
         assert_eq!((tally.reviewed, tally.agree, tally.disagree), (1, 1, 0));
     }
 }
