@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Production PreToolUse hook for NucleOS-managed autopilot runs.
 
-Interactive/human sessions are identified by the absence of NUCLEOS_RUN_ID and
-are always allowed without contacting the daemon. Autopilot runs are identified
-by NUCLEOS_RUN_ID and must also provide NUCLEOS_DAEMON_URL and
-NUCLEOS_DAEMON_TOKEN; their tool calls are daemon-gated and fail closed.
-
-This intentionally differs from the proof-of-concept fixture: unconfigured here
-means an ordinary interactive session, not an autopilot run that may be gated.
+Interactive sessions (no NUCLEOS_RUN_ID) emit no output, expressing no opinion.
+Autopilot allows emit the recognized hookSpecificOutput approval contract, while
+autopilot denials and pending approvals emit the empirically proven legacy block
+contract. All malformed-input, configuration, and daemon errors still fail closed.
 """
 
 import json
@@ -16,8 +13,22 @@ import sys
 import urllib.request
 
 
-def allow() -> None:
-    print(json.dumps({"decision": "allow"}))
+def approve(reason: str = "autopilot: allowed") -> None:
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    sys.exit(0)
+
+
+def no_opinion() -> None:
     sys.exit(0)
 
 
@@ -30,8 +41,10 @@ def deny(reason: str) -> None:
 def main() -> None:
     run_id_raw = os.environ.get("NUCLEOS_RUN_ID")
     if run_id_raw is None:
-        # Autopilot never gates ordinary interactive/human Claude Code sessions.
-        allow()
+        # The spike proved legacy allow was only a non-blocking fall-through. Once
+        # registered repo-wide, emitting allow could auto-approve a human's tools;
+        # silence is the only safe "no opinion" for interactive sessions.
+        no_opinion()
 
     try:
         payload = json.load(sys.stdin)
@@ -81,11 +94,10 @@ def main() -> None:
 
     verdict = decision.get("decision")
     if verdict in ("deny", "pending_approval"):
-        print(json.dumps({"decision": "block", "reason": decision.get("reason", "")}))
-        sys.exit(0)
+        deny(decision.get("reason", ""))
     if verdict != "allow":
         deny(f"daemon returned an unrecognized decision {verdict!r} - failing closed")
-    allow()
+    approve(decision.get("reason", "autopilot: allowed"))
 
 
 if __name__ == "__main__":
