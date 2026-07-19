@@ -110,6 +110,24 @@ pub async fn pretooluse_decision(
         };
     }
 
+    if mode == "worktree" {
+        if let Err(error) = shadow::record_decision(
+            &state.pool,
+            payload.run_id,
+            &payload.tool_name,
+            &payload.tool_input,
+            &classification,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = payload.run_id,
+                %error,
+                "pretooluse-decision: failed to record shadow decision"
+            );
+        }
+    }
+
     if classification.decision.decision == "pending_approval" {
         // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
         // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
@@ -370,6 +388,164 @@ mod tests {
             .unwrap();
         assert_eq!(status, "running");
         assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn worktree_allows_and_records_an_ordinary_edit() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-18T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let tool_input = serde_json::json!({"file_path": "src/ordinary.rs"});
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Edit",
+                "tool_input": tool_input
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT decision, action_class, tool_input FROM shadow_decisions
+             WHERE run_id = ? AND tool_name = 'Edit'",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "allow");
+        assert_eq!(row.1, "read-local");
+        assert_eq!(row.2, tool_input.to_string());
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn worktree_denies_and_records_a_destructive_delete_without_terminating() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-18T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf target"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT decision, action_class FROM shadow_decisions
+             WHERE run_id = ? AND tool_name = 'Bash'",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "deny");
+        assert_eq!(row.1, "destructive");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn worktree_pends_and_terminates_on_git_push_and_records_it() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-18T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT decision, action_class FROM shadow_decisions
+             WHERE run_id = ? AND tool_name = 'Bash'",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "pending_approval");
+        assert_eq!(row.1, "push-merge-deploy");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
     }
 
     #[tokio::test]
