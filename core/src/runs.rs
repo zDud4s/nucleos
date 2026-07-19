@@ -368,7 +368,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::{get, post};
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path as FsPath, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -486,6 +486,31 @@ mod tests {
             .prefix(prefix)
             .tempdir_in(base)
             .expect("create space-free tempdir")
+    }
+
+    struct WorktreeRootEnv {
+        previous: Option<OsString>,
+    }
+
+    impl WorktreeRootEnv {
+        fn set(path: &FsPath) -> Self {
+            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            unsafe {
+                std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for WorktreeRootEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
+                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+                }
+            }
+        }
     }
 
     fn initialize_repo(repo: &FsPath) {
@@ -704,6 +729,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_mode_provisions_and_runs_inside_the_worktree() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-provision-");
         let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
         advance_run_ids_past(&state.pool, 40_000).await;
@@ -722,6 +750,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let spawn_cwd = spawn_cwd.expect("runner did not receive a cwd");
+        assert!(spawn_cwd.starts_with(wt_root.path()));
         assert_eq!(
             spawn_cwd.file_name(),
             Some(OsStr::new(&format!("run-{id}")))
@@ -791,6 +820,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn second_worktree_run_while_one_is_running_is_busy() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-exclusive-");
         let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         advance_run_ids_past(&state.pool, 10_000).await;
@@ -813,6 +845,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_run_for_a_different_project_is_allowed() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-project-");
         let (_repo2_container, repo2) = init_contained_repo("nucleos-runs-project2-");
         let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
@@ -828,6 +863,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_slot_is_held_while_awaiting_approval() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-pinned-");
         let state = test_state().await;
         let project_root = repo.to_string_lossy().into_owned();
@@ -855,6 +893,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_slot_frees_after_the_open_run_leaves() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-released-");
         let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         advance_run_ids_past(&state.pool, 30_000).await;
@@ -888,6 +929,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_mode_on_a_non_repo_marks_failed_and_feeds() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
         let non_repo_container = space_free_tempdir("nucleos-runs-non-repo-");
         let non_repo = non_repo_container.path().join("not-a-repo");
         std::fs::create_dir(&non_repo).expect("create non-repository directory");

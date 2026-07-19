@@ -364,14 +364,22 @@ pub async fn run_gc(pool: SqlitePool) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::ffi::{OsStr, OsString};
     use std::fs::OpenOptions;
     use std::process::Command;
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
 
@@ -507,10 +515,7 @@ mod tests {
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        super::test_env_lock()
     }
 
     struct WorktreeRootEnv {
