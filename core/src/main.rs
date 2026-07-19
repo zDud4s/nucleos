@@ -15,6 +15,7 @@ mod shadow;
 mod sidecar;
 mod state;
 mod storage;
+mod worktree;
 
 use auth::Token;
 use state::AppState;
