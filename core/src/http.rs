@@ -14,6 +14,7 @@ use crate::hooks::pretooluse_decision;
 use crate::runs::{CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
+use crate::worktree::{self, ReleaseOutcome};
 
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -35,6 +36,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs", post(create_run))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
         .route("/scoreboard", get(get_scoreboard))
@@ -160,6 +162,18 @@ async fn get_feed(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn post_worktree_release(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match worktree::release(&state.pool, run_id).await {
+        Ok(ReleaseOutcome::Released) => Ok(StatusCode::NO_CONTENT),
+        Ok(ReleaseOutcome::NotAwaitingApproval) => Err(StatusCode::CONFLICT),
+        Ok(ReleaseOutcome::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn get_unreviewed_shadow_decisions(

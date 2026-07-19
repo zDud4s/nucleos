@@ -131,6 +131,13 @@ pub struct WorktreeRow {
     pub branch: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    Released,
+    NotAwaitingApproval,
+    NotFound,
+}
+
 pub async fn record(
     pool: &SqlitePool,
     run_id: i64,
@@ -162,6 +169,65 @@ pub async fn mark_removed(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutcome> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(status) = status else {
+        return Ok(ReleaseOutcome::NotFound);
+    };
+    if status != "awaiting_approval" {
+        return Ok(ReleaseOutcome::NotAwaitingApproval);
+    }
+
+    let worktree: Option<WorktreeRow> = sqlx::query_as(
+        "SELECT run_id, project_id, project_root, path, branch
+         FROM worktrees
+         WHERE run_id = ? AND removed_at IS NULL",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(worktree) = &worktree {
+        if let Err(error) = remove(
+            Path::new(&worktree.project_root),
+            Path::new(&worktree.path),
+            GC_BACKOFF,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id,
+                %error,
+                "failed to remove released worktree; continuing with discard"
+            );
+        }
+        mark_removed(pool, run_id).await?;
+    }
+
+    sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+
+    if let Some(worktree) = worktree {
+        let summary = format!("released worktree {}", worktree.path);
+        let _ = feed::append(
+            pool,
+            Some(&worktree.project_id),
+            "worktree_released",
+            &summary,
+            Some(run_id),
+        )
+        .await;
+    }
+
+    Ok(ReleaseOutcome::Released)
 }
 
 pub async fn gc_candidates(
@@ -1011,6 +1077,120 @@ mod tests {
                 && entry.run_id == Some(run_id)
                 && entry.summary.contains(info.path.to_string_lossy().as_ref())
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_discards_a_pinned_worktree() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-19T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::Released
+        );
+
+        assert!(!info.path.exists());
+        let removed_at: Option<String> =
+            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed_at.is_some());
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        let entries = crate::feed::list_feed(&pool, Some("project-a"), 50)
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.kind == "worktree_released" && entry.run_id == Some(run_id) })
+        );
+    }
+
+    #[tokio::test]
+    async fn release_frees_the_exclusivity_slot() {
+        let pool = test_pool().await;
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-19T00:00:00+00:00",
+        )
+        .await;
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::Released
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_of_a_non_awaiting_run_is_rejected() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(&pool, "running", None, "2026-07-19T00:00:00+00:00").await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::NotAwaitingApproval
+        );
+
+        assert!(info.path.exists());
+        let removed_at: Option<String> =
+            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed_at.is_none());
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+
+        remove(repo.path(), &info.path, &[])
+            .await
+            .expect("remove worktree");
+    }
+
+    #[tokio::test]
+    async fn release_of_an_unknown_run_is_not_found() {
+        let pool = test_pool().await;
+
+        assert_eq!(
+            release(&pool, i64::MAX).await.unwrap(),
+            ReleaseOutcome::NotFound
+        );
     }
 
     #[cfg(windows)]
