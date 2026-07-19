@@ -125,17 +125,6 @@ pub async fn set_project_mode(
     Ok(())
 }
 
-pub async fn shadow_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String)>> {
-    sqlx::query_as(
-        "SELECT project_id, project_root
-         FROM autopilot_state
-         WHERE mode = 'shadow' AND project_root IS NOT NULL
-         ORDER BY project_id",
-    )
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String, Mode)>> {
     let projects: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT project_id, project_root, mode
