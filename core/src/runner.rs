@@ -133,6 +133,7 @@ pub struct FakeCommandRunner {
     // Set by Task 4's cancellation/timeout tests to simulate a slow/hung run.
     pub delay: std::sync::Mutex<Option<std::time::Duration>>,
     pub last_plan_only: std::sync::Mutex<Option<bool>>,
+    pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 #[async_trait]
@@ -141,10 +142,11 @@ impl CommandRunner for FakeCommandRunner {
         &self,
         _prompt: &str,
         _env: &[(String, String)],
-        _cwd: Option<&Path>,
+        cwd: Option<&Path>,
         plan_only: bool,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
+        *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());
         *self.last_plan_only.lock().unwrap() = Some(plan_only);
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
         let outcome = {

@@ -11,7 +11,7 @@ use crate::auth::require_token;
 use crate::autopilot::{self, ActivationError, Mode};
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
-use crate::runs::{cancel_run, create_run, get_run};
+use crate::runs::{CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
 
@@ -141,6 +141,14 @@ fn activation_status(error: ActivationError) -> StatusCode {
         | ActivationError::NotOnboarded
         | ActivationError::HookNotRegistered => StatusCode::UNPROCESSABLE_ENTITY,
         ActivationError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
+    match error {
+        CreateRunError::Invalid(_) => StatusCode::BAD_REQUEST,
+        CreateRunError::Busy => StatusCode::CONFLICT,
+        CreateRunError::Worktree(_) | CreateRunError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
