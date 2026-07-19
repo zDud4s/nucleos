@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -113,9 +115,72 @@ where
     Err(last_error)
 }
 
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq)]
+pub struct WorktreeRow {
+    pub run_id: i64,
+    pub project_id: String,
+    pub project_root: String,
+    pub path: String,
+    pub branch: String,
+}
+
+pub async fn record(
+    pool: &SqlitePool,
+    run_id: i64,
+    project_id: &str,
+    project_root: &str,
+    path: &str,
+    branch: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO worktrees
+         (run_id, project_id, project_root, path, branch, created_at, removed_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .bind(project_root)
+    .bind(path)
+    .bind(branch)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_removed(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE worktrees SET removed_at = ? WHERE run_id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn gc_candidates(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    retention: chrono::Duration,
+) -> sqlx::Result<Vec<WorktreeRow>> {
+    let cutoff = (now - retention).to_rfc3339();
+    sqlx::query_as(
+        "SELECT w.run_id, w.project_id, w.project_root, w.path, w.branch
+         FROM worktrees w
+         JOIN runs r ON r.id = w.run_id
+         WHERE w.removed_at IS NULL
+           AND r.status IN ('completed','failed','cancelled','timed_out','interrupted')
+           AND COALESCE(r.completed_at, w.created_at) <= ?
+         ORDER BY w.run_id",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::ffi::{OsStr, OsString};
     use std::fs::OpenOptions;
     use std::process::Command;
@@ -123,6 +188,54 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_run(
+        pool: &sqlx::SqlitePool,
+        status: &str,
+        completed_at: Option<&str>,
+        created_at: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, created_at, completed_at)
+             VALUES ('project-a', '/project/a', 'test', ?, ?, ?)",
+        )
+        .bind(status)
+        .bind(created_at)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    fn timestamp(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    async fn set_worktree_created_at(pool: &sqlx::SqlitePool, run_id: i64, created_at: &str) {
+        sqlx::query("UPDATE worktrees SET created_at = ? WHERE run_id = ?")
+            .bind(created_at)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 
     fn git_ok(dir: &Path, args: &[&OsStr]) -> bool {
         Command::new("git")
@@ -355,6 +468,207 @@ mod tests {
             "still locked"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gc_collects_an_old_terminal_worktree() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "completed", None, "2026-07-09T00:00:00+00:00").await;
+        record(
+            &pool,
+            run_id,
+            "project-a",
+            "/project/a",
+            "/worktrees/run-1",
+            "nucleos/run-1",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at(&pool, run_id, "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![WorktreeRow {
+                run_id,
+                project_id: "project-a".to_owned(),
+                project_root: "/project/a".to_owned(),
+                path: "/worktrees/run-1".to_owned(),
+                branch: "nucleos/run-1".to_owned(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_respects_retention_boundary() {
+        let pool = test_pool().await;
+        let run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-18T23:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            run_id,
+            "project-a",
+            "/project/a",
+            "/worktrees/run-2",
+            "nucleos/run-2",
+        )
+        .await
+        .unwrap();
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_never_collects_a_pinned_awaiting_approval_worktree() {
+        let pool = test_pool().await;
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            run_id,
+            "project-a",
+            "/project/a",
+            "/worktrees/run-3",
+            "nucleos/run-3",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at(&pool, run_id, "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_skips_already_removed_rows() {
+        let pool = test_pool().await;
+        let run_id = insert_run(
+            &pool,
+            "failed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            run_id,
+            "project-a",
+            "/project/a",
+            "/worktrees/run-4",
+            "nucleos/run-4",
+        )
+        .await
+        .unwrap();
+        mark_removed(&pool, run_id).await.unwrap();
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_never_collects_a_running_run() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "running", None, "2026-07-09T00:00:00+00:00").await;
+        record(
+            &pool,
+            run_id,
+            "project-a",
+            "/project/a",
+            "/worktrees/run-5",
+            "nucleos/run-5",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at(&pool, run_id, "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_then_mark_removed_roundtrips() {
+        let pool = test_pool().await;
+        let run_id = insert_run(
+            &pool,
+            "cancelled",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            run_id,
+            "project-a",
+            "/project/a",
+            "/worktrees/run-6",
+            "nucleos/run-6",
+        )
+        .await
+        .unwrap();
+        let now = timestamp("2026-07-19T00:00:00+00:00");
+
+        assert_eq!(
+            gc_candidates(&pool, now, chrono::Duration::hours(72))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        mark_removed(&pool, run_id).await.unwrap();
+
+        assert!(
+            gc_candidates(&pool, now, chrono::Duration::hours(72))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(windows)]
