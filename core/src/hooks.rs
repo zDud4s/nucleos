@@ -338,6 +338,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cwd_dependent_delete_outside_workspace_denies_through_the_handler() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, created_at) VALUES ('x', 'running', 'C:\\work\\repo', '2026-07-18T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+
+        let app = test_router(state.clone());
+        let body = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"rm ../outside/x"}}}}"#
+        );
+        let decision = decide(&app, &body).await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "destructive deletion commands are denied");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
     async fn shadow_read_only_brake_records_would_decisions_without_terminating() {
         let state = test_state().await;
         let run_id = sqlx::query(
