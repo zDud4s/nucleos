@@ -1,0 +1,318 @@
+use serde::Serialize;
+use sqlx::{FromRow, SqlitePool};
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Proposal {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub run_id: Option<i64>,
+    pub session_id: Option<String>,
+    pub project_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub reasoning: String,
+    pub tool_input: Option<String>,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+}
+
+pub async fn create_action_approval(
+    pool: &SqlitePool,
+    run_id: i64,
+    session_id: Option<&str>,
+    project_id: Option<&str>,
+    tool_name: &str,
+    reasoning: &str,
+    tool_input: Option<&str>,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('action-approval', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(session_id)
+    .bind(project_id)
+    .bind(tool_name)
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
+pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals
+         WHERE status = 'pending' AND kind = 'action-approval'
+         ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn transition(
+    pool: &SqlitePool,
+    id: i64,
+    to_status: &str,
+    note: &str,
+) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "UPDATE proposals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+    )
+    .bind(to_status)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, 'pending', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(to_status)
+    .bind(note)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn create_pending_proposal_records_row_and_initial_event() {
+        let pool = test_pool().await;
+
+        let id = create_action_approval(
+            &pool,
+            1,
+            Some("s1"),
+            Some("p"),
+            "Bash",
+            "push needs approval",
+            Some(r#"{"command":"git push"}"#),
+        )
+        .await
+        .unwrap();
+
+        let proposal = get(&pool, id).await.unwrap().unwrap();
+        assert_eq!(proposal.kind, "action-approval");
+        assert_eq!(proposal.status, "pending");
+        assert_eq!(proposal.run_id, Some(1));
+        assert_eq!(proposal.session_id.as_deref(), Some("s1"));
+        assert_eq!(proposal.tool_name.as_deref(), Some("Bash"));
+        assert!(!proposal.reasoning.is_empty());
+        assert_eq!(proposal.decided_at, None);
+
+        let events = sqlx::query_scalar::<_, String>(
+            "SELECT to_status FROM proposal_events WHERE proposal_id = ? ORDER BY id ASC",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, vec!["pending".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dedup_rejects_a_second_open_proposal_for_the_same_run() {
+        let pool = test_pool().await;
+
+        create_action_approval(
+            &pool,
+            7,
+            Some("s7"),
+            Some("p"),
+            "Bash",
+            "first approval",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let duplicate = create_action_approval(
+            &pool,
+            7,
+            Some("s7"),
+            Some("p"),
+            "Bash",
+            "second approval",
+            None,
+        )
+        .await;
+
+        assert!(duplicate.is_err());
+    }
+
+    #[tokio::test]
+    async fn transition_pending_to_approved_appends_event_and_sets_decided_at() {
+        let pool = test_pool().await;
+        let id = create_action_approval(
+            &pool,
+            20,
+            Some("s20"),
+            Some("p"),
+            "Bash",
+            "approval required",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(transition(&pool, id, "approved", "user approved")
+            .await
+            .unwrap());
+
+        let proposal = get(&pool, id).await.unwrap().unwrap();
+        assert_eq!(proposal.status, "approved");
+        assert!(proposal.decided_at.is_some());
+
+        let events = sqlx::query_as::<_, (Option<String>, String, String)>(
+            "SELECT from_status, to_status, note FROM proposal_events WHERE proposal_id = ? ORDER BY id ASC",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, None);
+        assert_eq!(events[0].1, "pending");
+        assert_eq!(events[1].0.as_deref(), Some("pending"));
+        assert_eq!(events[1].1, "approved");
+        assert_eq!(events[1].2, "user approved");
+    }
+
+    #[tokio::test]
+    async fn transition_of_a_missing_or_non_pending_proposal_is_false() {
+        let pool = test_pool().await;
+
+        assert!(!transition(&pool, 999_999, "approved", "missing")
+            .await
+            .unwrap());
+
+        let id = create_action_approval(
+            &pool,
+            30,
+            Some("s30"),
+            Some("p"),
+            "Bash",
+            "approval required",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(transition(&pool, id, "approved", "user approved")
+            .await
+            .unwrap());
+        assert!(!transition(&pool, id, "rejected", "too late")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_pending_returns_only_pending_action_approvals_ordered() {
+        let pool = test_pool().await;
+
+        let first = create_action_approval(
+            &pool,
+            10,
+            Some("s10"),
+            Some("p"),
+            "Bash",
+            "first pending",
+            None,
+        )
+        .await
+        .unwrap();
+        let second = create_action_approval(
+            &pool,
+            11,
+            Some("s11"),
+            Some("p"),
+            "Bash",
+            "second pending",
+            None,
+        )
+        .await
+        .unwrap();
+        let rejected = create_action_approval(
+            &pool,
+            12,
+            Some("s12"),
+            Some("p"),
+            "Bash",
+            "will be rejected",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(transition(&pool, rejected, "rejected", "user rejected")
+            .await
+            .unwrap());
+
+        let pending = list_pending(&pool).await.unwrap();
+        assert_eq!(
+            pending.iter().map(|proposal| proposal.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|proposal| proposal.kind == "action-approval" && proposal.status == "pending")
+        );
+    }
+}

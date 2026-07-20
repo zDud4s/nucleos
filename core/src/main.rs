@@ -7,6 +7,7 @@ mod feed;
 mod hooks;
 mod http;
 mod logging;
+mod proposals;
 mod runner;
 mod runs;
 mod scheduler;
