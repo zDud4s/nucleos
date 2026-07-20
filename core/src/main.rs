@@ -117,6 +117,7 @@ async fn main() {
         .join("echo-sidecar.exe");
     tokio::spawn(sidecar::supervise("echo".to_string(), sidecar_path));
     tokio::spawn(scheduler::run_scheduler(state.clone()));
+    tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
     axum::serve(listener, app).await.unwrap();
 }

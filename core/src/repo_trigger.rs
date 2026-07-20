@@ -89,6 +89,19 @@ pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Opti
     if sha.is_empty() { None } else { Some(sha) }
 }
 
+/// Interval between repo-event polls. `git fetch` is network-heavy, so this runs far less often than the
+/// 30s scheduler tick.
+const REPO_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Background loop: polls every managed project's repo triggers on a slow cadence.
+pub async fn run_repo_poller(state: crate::state::AppState) {
+    let mut interval = tokio::time::interval(REPO_POLL_INTERVAL);
+    loop {
+        interval.tick().await;
+        poll_tick(&state, chrono::Utc::now()).await;
+    }
+}
+
 /// One pass of the repo-event poller: for each autopilot project, fetch and read each watched branch,
 /// arm first-seen triggers without firing, and fire a run for any trigger whose branch SHA changed —
 /// gated by the same global/scoped kill switches and budget as the scheduler.
