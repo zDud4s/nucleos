@@ -74,6 +74,20 @@ export interface AwaitingRun {
   created_at: string;
 }
 
+export interface Proposal {
+  id: number;
+  kind: string;
+  status: string;
+  run_id: number | null;
+  session_id: string | null;
+  project_id: string | null;
+  tool_name: string | null;
+  reasoning: string;
+  tool_input: string | null;
+  created_at: string;
+  decided_at: string | null;
+}
+
 export type SetModeResult = { ok: true } | { ok: false; status: number };
 
 export async function getProjects(
@@ -175,6 +189,58 @@ export async function getAwaitingApproval(
     return await res.json();
   } catch {
     return null;
+  }
+}
+
+export async function getProposals(
+  token: string,
+): Promise<Proposal[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function approveProposal(
+  token: string,
+  id: number,
+): Promise<number | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/${id}/approve`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.resume_run_id;
+  } catch {
+    return null;
+  }
+}
+
+export async function rejectProposal(
+  token: string,
+  id: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/${id}/reject`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 

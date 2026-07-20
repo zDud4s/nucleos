@@ -6,6 +6,7 @@ import type {
   ClassTally,
   FeedEntry,
   ProjectSummary,
+  Proposal,
   ShadowDecision,
 } from "./api";
 
@@ -212,6 +213,54 @@ describe("daemon API client", () => {
     expectPostCall(1, `${DAEMON_URL}/worktrees/21/release`);
     await expect(api.releaseWorktree(TOKEN, 21)).resolves.toBe(false);
     expectPostCall(2, `${DAEMON_URL}/worktrees/21/release`);
+  });
+
+  it("gets pending proposals and returns null for a non-ok response", async () => {
+    const proposals = [
+      {
+        id: 5,
+        kind: "action-approval",
+        status: "pending",
+        run_id: 41,
+        session_id: "session-1",
+        project_id: "alpha",
+        tool_name: "Bash",
+        reasoning: "The command needs explicit approval",
+        tool_input: '{"command":"npm test"}',
+        created_at: "2026-07-20T10:00:00Z",
+        decided_at: null,
+      },
+    ] satisfies Proposal[];
+    fetchMock
+      .mockResolvedValueOnce(okJson(proposals))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(api.getProposals(TOKEN)).resolves.toEqual(proposals);
+    expectGetCall(1, `${DAEMON_URL}/proposals`);
+    await expect(api.getProposals(TOKEN)).resolves.toBeNull();
+    expectGetCall(2, `${DAEMON_URL}/proposals`);
+  });
+
+  it("approves a proposal and returns the resume run id, null when non-ok", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({ resume_run_id: 77 }))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(api.approveProposal(TOKEN, 5)).resolves.toBe(77);
+    expectPostCall(1, `${DAEMON_URL}/proposals/5/approve`);
+    await expect(api.approveProposal(TOKEN, 5)).resolves.toBeNull();
+    expectPostCall(2, `${DAEMON_URL}/proposals/5/approve`);
+  });
+
+  it("rejects a proposal and reflects response ok", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({}))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(api.rejectProposal(TOKEN, 21)).resolves.toBe(true);
+    expectPostCall(1, `${DAEMON_URL}/proposals/21/reject`);
+    await expect(api.rejectProposal(TOKEN, 21)).resolves.toBe(false);
+    expectPostCall(2, `${DAEMON_URL}/proposals/21/reject`);
   });
 
   it("gets the kill-switch engaged field and returns null when non-ok", async () => {
