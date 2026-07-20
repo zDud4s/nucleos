@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   approveProposal,
+  getBudget,
   getFeed,
   getKillSwitch,
   getProjects,
@@ -12,6 +13,7 @@ import {
   setProjectMode,
   setVerdict,
   type AutopilotMode,
+  type Budget,
   type ClassTally,
   type ConnectionState,
   type FeedEntry,
@@ -21,9 +23,12 @@ import {
 } from "./api";
 import {
   agreementRate,
+  budgetStatusLabel,
+  formatUsd,
   groupScoreboardByMode,
   killSwitchLabel,
   modeBadge,
+  periodLabel,
   totalPending,
 } from "./derive";
 
@@ -455,6 +460,58 @@ function ApprovalQueuePanel({
   );
 }
 
+interface BudgetPanelProps {
+  budget: Budget | null;
+  loading: boolean;
+}
+
+function BudgetPanel({ budget, loading }: BudgetPanelProps) {
+  return (
+    <section
+      className={budget?.paused ? "panel budget-panel paused" : "panel budget-panel"}
+    >
+      <h3>Budget</h3>
+      {budget === null ? (
+        !loading && (
+          <p className="muted error" role="alert">
+            Could not load the budget from the daemon.
+          </p>
+        )
+      ) : (
+        <>
+          <strong>{budgetStatusLabel(budget)}</strong>
+          {budget.paused && budget.reason !== null && (
+            <p className="error" role="alert">
+              {budget.reason}
+            </p>
+          )}
+          <dl className="budget-detail">
+            <div>
+              <dt>Spent {periodLabel(budget.period)}</dt>
+              <dd>
+                {formatUsd(budget.window_spend_usd)}
+                {budget.limit_usd !== null && ` / ${formatUsd(budget.limit_usd)}`}
+              </dd>
+            </div>
+            <div>
+              <dt>Spent in the last hour</dt>
+              <dd>
+                {formatUsd(budget.hourly_spend_usd)}
+                {budget.hourly_limit_usd !== null &&
+                  ` / ${formatUsd(budget.hourly_limit_usd)}`}
+              </dd>
+            </div>
+            <div>
+              <dt>Reserve per run</dt>
+              <dd>{formatUsd(budget.per_run_reserve_usd)}</dd>
+            </div>
+          </dl>
+        </>
+      )}
+    </section>
+  );
+}
+
 function Autopilot({ token, connection }: AutopilotProps) {
   const unavailable = connection !== "connected" || token === null;
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
@@ -465,6 +522,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     ShadowDecision[] | null
   >(null);
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
+  const [budget, setBudget] = useState<Budget | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [togglingKillSwitch, setTogglingKillSwitch] = useState(false);
@@ -475,7 +533,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     setLoading(true);
     setScoreboard(null);
     setShadowDecisions(null);
-    const [nextProjects, nextKillEngaged, nextFeed, nextProposals] =
+    const [nextProjects, nextKillEngaged, nextFeed, nextProposals, nextBudget] =
       await Promise.all([
         getProjects(token),
         getKillSwitch(token),
@@ -484,6 +542,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
           selectedProject ? { projectId: selectedProject } : { scope: "all" },
         ),
         getProposals(token),
+        getBudget(token),
       ]);
     let nextScoreboard: ClassTally[] | null = null;
     let nextShadowDecisions: ShadowDecision[] | null = null;
@@ -499,6 +558,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     setScoreboard(nextScoreboard);
     setShadowDecisions(nextShadowDecisions);
     setProposals(nextProposals);
+    setBudget(nextBudget);
     setLoading(false);
   }, [connection, selectedProject, token]);
 
@@ -510,6 +570,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
       setScoreboard(null);
       setShadowDecisions(null);
       setProposals(null);
+      setBudget(null);
       setLoading(true);
       return;
     }
@@ -546,6 +607,8 @@ function Autopilot({ token, connection }: AutopilotProps) {
               {killEngaged ? "Disengage" : "Engage"}
             </button>
           </div>
+
+          <BudgetPanel budget={budget} loading={loading} />
 
           <div className="autopilot-summary">
             <strong>
