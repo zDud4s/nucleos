@@ -115,6 +115,46 @@ pub async fn transition(
     Ok(true)
 }
 
+// Records a single-use authorization for a resume run.
+pub async fn grant_action(
+    pool: &SqlitePool,
+    resume_run_id: i64,
+    tool_name: &str,
+    proposal_id: i64,
+) -> sqlx::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO action_grants (run_id, tool_name, proposal_id, created_at, consumed_at)
+         VALUES (?, ?, ?, ?, NULL)",
+    )
+    .bind(resume_run_id)
+    .bind(tool_name)
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// Atomically consumes an unconsumed matching grant. Ok(true) iff one was consumed.
+pub async fn consume_matching_grant(
+    pool: &SqlitePool,
+    run_id: i64,
+    tool_name: &str,
+) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE action_grants SET consumed_at = ?
+         WHERE run_id = ? AND tool_name = ? AND consumed_at IS NULL",
+    )
+    .bind(&now)
+    .bind(run_id)
+    .bind(tool_name)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +354,52 @@ mod tests {
                 .iter()
                 .all(|proposal| proposal.kind == "action-approval" && proposal.status == "pending")
         );
+    }
+
+    #[tokio::test]
+    async fn grant_then_consume_matching_tool_succeeds_once() {
+        let pool = test_pool().await;
+
+        grant_action(&pool, 100, "Bash", 5).await.unwrap();
+
+        assert!(consume_matching_grant(&pool, 100, "Bash")
+            .await
+            .unwrap());
+
+        let consumed_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT consumed_at FROM action_grants WHERE run_id = ?",
+        )
+        .bind(100)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(consumed_at.is_some());
+
+        assert!(!consume_matching_grant(&pool, 100, "Bash")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn consume_with_non_matching_tool_returns_false_and_leaves_grant() {
+        let pool = test_pool().await;
+
+        grant_action(&pool, 101, "Bash", 6).await.unwrap();
+
+        assert!(!consume_matching_grant(&pool, 101, "Edit")
+            .await
+            .unwrap());
+        assert!(consume_matching_grant(&pool, 101, "Bash")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn consume_for_unknown_run_returns_false() {
+        let pool = test_pool().await;
+
+        assert!(!consume_matching_grant(&pool, 999_999, "Bash")
+            .await
+            .unwrap());
     }
 }
