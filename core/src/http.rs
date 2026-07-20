@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
-use crate::autopilot::{self, ActivationError, Mode};
+use crate::autopilot::{self, ActivationError, Mode, ProjectSummary};
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
 use crate::runs::{CreateRunError, cancel_run, create_run, get_run};
@@ -32,6 +32,7 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_state).post(post_autopilot_state),
         )
         .route("/autopilot/kill", post(post_autopilot_kill))
+        .route("/projects", get(get_projects))
         .route("/feed", get(get_feed))
         .route("/runs", post(create_run))
         .route("/runs/{id}", get(get_run))
@@ -146,6 +147,15 @@ fn activation_status(error: ActivationError) -> StatusCode {
     }
 }
 
+async fn get_projects(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ProjectSummary>>, StatusCode> {
+    autopilot::project_roster(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     match error {
         CreateRunError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -232,6 +242,7 @@ mod tests {
             )
             .await
             .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
         AppState {
             token: Token("test-token".into()),
             pool,
@@ -254,5 +265,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn projects_returns_json_array_with_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[tokio::test]
+    async fn projects_rejects_requests_without_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

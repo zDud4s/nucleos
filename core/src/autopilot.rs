@@ -12,6 +12,13 @@ pub enum Mode {
     Active,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub mode: Mode,
+    pub pending: i64,
+}
+
 impl Mode {
     pub fn as_db_str(self) -> &'static str {
         match self {
@@ -146,6 +153,40 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
         .collect()
 }
 
+pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummary>> {
+    let projects: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT state.project_id, state.mode,
+                (SELECT COUNT(*)
+                 FROM shadow_decisions
+                 JOIN runs ON shadow_decisions.run_id = runs.id
+                 WHERE runs.project_id = state.project_id
+                   AND shadow_decisions.human_verdict IS NULL)
+                +
+                (SELECT COUNT(*)
+                 FROM runs
+                 WHERE runs.project_id = state.project_id
+                   AND runs.status = 'awaiting_approval') AS pending
+         FROM autopilot_state AS state
+         ORDER BY state.project_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    projects
+        .into_iter()
+        .map(|(project_id, mode, pending)| {
+            let mode = Mode::from_db_str(&mode).ok_or_else(|| {
+                sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
+            })?;
+            Ok(ProjectSummary {
+                project_id,
+                mode,
+                pending,
+            })
+        })
+        .collect()
+}
+
 fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> {
     if !project_root.join(".ai/workflow/workflow.md").is_file() {
         return Err(ActivationError::NotOnboarded);
@@ -213,6 +254,143 @@ mod tests {
 
     fn git_init(root: &TempDir) {
         fs::create_dir_all(root.path().join(".git")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_roster_is_empty_without_autopilot_state_rows() {
+        let pool = test_pool().await;
+
+        assert_eq!(
+            project_roster(&pool).await.unwrap(),
+            Vec::<ProjectSummary>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roster_lists_every_mode_ordered_by_project_id() {
+        let pool = test_pool().await;
+
+        for (project_id, mode) in [
+            ("project-shadow", "shadow"),
+            ("project-off", "off"),
+            ("project-active", "active"),
+        ] {
+            sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES (?, ?)")
+                .bind(project_id)
+                .bind(mode)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            project_roster(&pool).await.unwrap(),
+            vec![
+                ProjectSummary {
+                    project_id: "project-active".to_owned(),
+                    mode: Mode::Active,
+                    pending: 0,
+                },
+                ProjectSummary {
+                    project_id: "project-off".to_owned(),
+                    mode: Mode::Off,
+                    pending: 0,
+                },
+                ProjectSummary {
+                    project_id: "project-shadow".to_owned(),
+                    mode: Mode::Shadow,
+                    pending: 0,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roster_counts_unreviewed_shadow_and_awaiting_approval() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES (?, ?)")
+            .bind("project-pending")
+            .bind("active")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let shadow_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, created_at, mode) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("project-pending")
+        .bind("classify this")
+        .bind("completed")
+        .bind("2026-07-20T10:00:00Z")
+        .bind("shadow")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        for (human_verdict, created_at) in [
+            (None, "2026-07-20T10:01:00Z"),
+            (Some("approve"), "2026-07-20T10:02:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO shadow_decisions \
+                 (run_id, tool_name, decision, action_class, classifier_version, human_verdict, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(shadow_run_id)
+            .bind("Bash")
+            .bind("allow")
+            .bind("read")
+            .bind(1_i64)
+            .bind(human_verdict)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        for prompt in ["approve one", "approve two"] {
+            sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, created_at, mode) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind("project-pending")
+            .bind(prompt)
+            .bind("awaiting_approval")
+            .bind("2026-07-20T10:03:00Z")
+            .bind("real")
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            project_roster(&pool).await.unwrap(),
+            vec![ProjectSummary {
+                project_id: "project-pending".to_owned(),
+                mode: Mode::Active,
+                pending: 3,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roster_keeps_projects_with_zero_pending() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES (?, ?)")
+            .bind("project-idle")
+            .bind("off")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            project_roster(&pool).await.unwrap(),
+            vec![ProjectSummary {
+                project_id: "project-idle".to_owned(),
+                mode: Mode::Off,
+                pending: 0,
+            }]
+        );
     }
 
     #[tokio::test]
