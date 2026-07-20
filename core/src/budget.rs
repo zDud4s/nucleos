@@ -36,6 +36,13 @@ pub struct BudgetConfig {
     pub time_cost_per_hour_usd: f64,
 }
 
+/// Whether autonomy may start a new proactive run under the current budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetDecision {
+    Allow,
+    Pause { reason: String },
+}
+
 /// One run's contribution to the budget, already parsed from the `runs` table.
 #[derive(Debug, Clone)]
 pub struct SpendRow {
@@ -197,6 +204,46 @@ pub async fn hourly_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result
         .filter(|row| row.created_at >= since)
         .collect();
     Ok(compute_spend(&rows, now, &cfg))
+}
+
+async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<BudgetDecision> {
+    let cfg = load_budget_config(pool).await?;
+
+    if let Some(limit) = cfg.limit_usd {
+        let spent = window_spend(pool, now).await?;
+        if spent + cfg.per_run_reserve_usd > limit {
+            return Ok(BudgetDecision::Pause {
+                reason: format!(
+                    "window spend ${spent:.2} + ${:.2} reserve would exceed the ${limit:.2} limit",
+                    cfg.per_run_reserve_usd
+                ),
+            });
+        }
+    }
+
+    if let Some(hourly_limit) = cfg.hourly_limit_usd {
+        let spent = hourly_spend(pool, now).await?;
+        if spent + cfg.per_run_reserve_usd > hourly_limit {
+            return Ok(BudgetDecision::Pause {
+                reason: format!(
+                    "hourly spend ${spent:.2} + ${:.2} reserve would exceed the ${hourly_limit:.2} hourly limit",
+                    cfg.per_run_reserve_usd
+                ),
+            });
+        }
+    }
+
+    Ok(BudgetDecision::Allow)
+}
+
+/// Whether the budget currently permits starting a new proactive run. Fails closed (Pause) on any error.
+pub async fn budget_permits_new_run(pool: &SqlitePool, now: DateTime<Utc>) -> BudgetDecision {
+    match evaluate_budget(pool, now).await {
+        Ok(decision) => decision,
+        Err(error) => BudgetDecision::Pause {
+            reason: format!("budget check failed, pausing to be safe: {error}"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -555,5 +602,148 @@ mod tests {
 
         approx(window_spend(&pool, now).await.unwrap(), 0.0); // before today's UTC midnight -> excluded
         approx(hourly_spend(&pool, now).await.unwrap(), 0.7); // within the trailing hour -> included
+    }
+
+    #[tokio::test]
+    async fn allows_when_no_limit_configured() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z");
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(100.0),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn pauses_when_window_spend_plus_reserve_exceeds_limit() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: Some(2.0),
+                period: BudgetPeriod::Monthly,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T12:00:00Z");
+        // 0.8 + 0.8 = 1.6; 1.6 + 0.5 reserve = 2.1 > 2.0 -> pause.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(0.8),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "worktree",
+            Some("b"),
+            Some(0.8),
+            "2026-07-11T09:00:00Z",
+            Some("2026-07-11T09:10:00Z"),
+        )
+        .await;
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Pause { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn allows_when_under_limit_with_reserve_headroom() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: Some(2.0),
+                period: BudgetPeriod::Monthly,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T12:00:00Z");
+        // 1.0 + 0.5 reserve = 1.5 <= 2.0 -> allow.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(1.0),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn pauses_when_hourly_spend_exceeds_hourly_limit() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: None,
+                period: BudgetPeriod::Monthly,
+                hourly_limit_usd: Some(1.0),
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T12:00:00Z");
+        // 0.7 in the last hour + 0.5 reserve = 1.2 > 1.0 hourly limit -> pause (window limit is None).
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(0.7),
+            "2026-07-20T11:30:00Z",
+            Some("2026-07-20T11:40:00Z"),
+        )
+        .await;
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Pause { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pauses_fail_safe_when_config_row_missing() {
+        let pool = test_pool().await;
+        sqlx::query("DELETE FROM autopilot_global")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = ts("2026-07-20T12:00:00Z");
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Pause { .. }
+        ));
     }
 }
