@@ -88,6 +88,26 @@ export interface Proposal {
   decided_at: string | null;
 }
 
+export interface Budget {
+  limit_usd: number | null;
+  period: "daily" | "weekly" | "monthly";
+  hourly_limit_usd: number | null;
+  per_run_reserve_usd: number;
+  time_cost_per_hour_usd: number;
+  window_spend_usd: number;
+  hourly_spend_usd: number;
+  paused: boolean;
+  reason: string | null;
+}
+
+export interface BudgetConfigInput {
+  limit_usd: number | null;
+  period: "daily" | "weekly" | "monthly";
+  hourly_limit_usd: number | null;
+  per_run_reserve_usd: number;
+  time_cost_per_hour_usd: number;
+}
+
 export type SetModeResult = { ok: true } | { ok: false; status: number };
 
 export async function getProjects(
@@ -316,5 +336,37 @@ export async function setProjectMode(
     return res.ok ? { ok: true } : { ok: false, status: res.status };
   } catch {
     return { ok: false, status: 0 };
+  }
+}
+
+export async function getBudget(token: string): Promise<Budget | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/budget`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function setBudget(
+  token: string,
+  config: BudgetConfigInput,
+): Promise<Budget | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/budget`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(config),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
   }
 }

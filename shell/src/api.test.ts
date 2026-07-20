@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "./api";
 import type {
   AwaitingRun,
+  Budget,
+  BudgetConfigInput,
   ClassTally,
   FeedEntry,
   ProjectSummary,
@@ -315,5 +317,52 @@ describe("daemon API client", () => {
       project_id: "alpha",
       mode: "off",
     });
+  });
+
+  it("gets the budget and returns null for a non-ok response", async () => {
+    const budget = {
+      limit_usd: 50,
+      period: "monthly",
+      hourly_limit_usd: null,
+      per_run_reserve_usd: 0.5,
+      time_cost_per_hour_usd: 3,
+      window_spend_usd: 12.5,
+      hourly_spend_usd: 1,
+      paused: false,
+      reason: null,
+    } satisfies Budget;
+    fetchMock
+      .mockResolvedValueOnce(okJson(budget))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(api.getBudget(TOKEN)).resolves.toEqual(budget);
+    expectGetCall(1, `${DAEMON_URL}/autopilot/budget`);
+    await expect(api.getBudget(TOKEN)).resolves.toBeNull();
+    expectGetCall(2, `${DAEMON_URL}/autopilot/budget`);
+  });
+
+  it("posts a budget config and returns the refreshed budget, null when non-ok", async () => {
+    const config = {
+      limit_usd: 50,
+      period: "monthly",
+      hourly_limit_usd: null,
+      per_run_reserve_usd: 0.5,
+      time_cost_per_hour_usd: 3,
+    } satisfies BudgetConfigInput;
+    const refreshed = {
+      ...config,
+      window_spend_usd: 0,
+      hourly_spend_usd: 0,
+      paused: false,
+      reason: null,
+    } satisfies Budget;
+    fetchMock
+      .mockResolvedValueOnce(okJson(refreshed))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(api.setBudget(TOKEN, config)).resolves.toEqual(refreshed);
+    expectPostCall(1, `${DAEMON_URL}/autopilot/budget`, config);
+    await expect(api.setBudget(TOKEN, config)).resolves.toBeNull();
+    expectPostCall(2, `${DAEMON_URL}/autopilot/budget`, config);
   });
 });

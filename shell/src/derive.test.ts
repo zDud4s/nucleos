@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import type { AutopilotMode, ClassTally, ProjectSummary } from "./api";
+import type { AutopilotMode, Budget, ClassTally, ProjectSummary } from "./api";
 import {
   agreementRate,
+  budgetStatusLabel,
+  formatUsd,
   groupScoreboardByMode,
   killSwitchLabel,
   modeBadge,
+  periodLabel,
   totalPending,
 } from "./derive";
 
@@ -132,5 +135,39 @@ describe("pure UI derivations", () => {
     for (const [engaged, expected] of cases) {
       expect(killSwitchLabel(engaged)).toBe(expected);
     }
+  });
+
+  it("formats USD amounts to two decimals", () => {
+    expect(formatUsd(1.5)).toBe("$1.50");
+    expect(formatUsd(0)).toBe("$0.00");
+    expect(formatUsd(12.345)).toBe("$12.35");
+  });
+
+  it("labels budget periods", () => {
+    expect(periodLabel("daily")).toBe("today");
+    expect(periodLabel("weekly")).toBe("this week");
+    expect(periodLabel("monthly")).toBe("this month");
+  });
+
+  it("derives budget status labels for unset, active, and paused budgets", () => {
+    const base = {
+      limit_usd: null,
+      period: "monthly",
+      hourly_limit_usd: null,
+      per_run_reserve_usd: 0.5,
+      time_cost_per_hour_usd: 3,
+      window_spend_usd: 0,
+      hourly_spend_usd: 0,
+      paused: false,
+      reason: null,
+    } satisfies Budget;
+
+    expect(budgetStatusLabel(base)).toBe("No spending limit set");
+    expect(
+      budgetStatusLabel({ ...base, limit_usd: 10, window_spend_usd: 1.5 }),
+    ).toBe("$1.50 of $10.00 this month");
+    expect(
+      budgetStatusLabel({ ...base, limit_usd: 10, window_spend_usd: 12, paused: true }),
+    ).toBe("Paused — $12.00 of $10.00 this month");
   });
 });

@@ -1,4 +1,4 @@
-import type { AutopilotMode, ClassTally, ProjectSummary } from "./api";
+import type { AutopilotMode, Budget, ClassTally, ProjectSummary } from "./api";
 
 export type Tone = "neutral" | "info" | "success";
 
@@ -39,4 +39,25 @@ export function groupScoreboardByMode(
 
 export function killSwitchLabel(engaged: boolean): string {
   return engaged ? "Kill switch engaged — autopilot paused" : "Kill switch off";
+}
+
+export function formatUsd(amount: number): string {
+  return `$${amount.toFixed(2)}`;
+}
+
+export function periodLabel(period: Budget["period"]): string {
+  switch (period) {
+    case "daily":
+      return "today";
+    case "weekly":
+      return "this week";
+    case "monthly":
+      return "this month";
+  }
+}
+
+export function budgetStatusLabel(budget: Budget): string {
+  if (budget.limit_usd === null) return "No spending limit set";
+  const base = `${formatUsd(budget.window_spend_usd)} of ${formatUsd(budget.limit_usd)} ${periodLabel(budget.period)}`;
+  return budget.paused ? `Paused — ${base}` : base;
 }
