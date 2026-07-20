@@ -25,6 +25,24 @@ pub struct CreateRunResponse {
     pub id: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct AwaitingRun {
+    pub id: i64,
+    pub project_id: Option<String>,
+    pub prompt: String,
+    pub cwd: Option<String>,
+    pub created_at: String,
+}
+
+pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<AwaitingRun>> {
+    sqlx::query_as::<_, AwaitingRun>(
+        "SELECT id, project_id, prompt, cwd, created_at
+         FROM runs WHERE status = 'awaiting_approval' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[derive(Debug)]
 pub enum CreateRunError {
     Invalid(&'static str),
@@ -635,6 +653,80 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_awaiting_approval_is_empty_when_there_are_no_runs() {
+        let pool = test_state().await.pool;
+
+        let runs: Vec<AwaitingRun> = list_awaiting_approval(&pool).await.unwrap();
+
+        assert!(runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_awaiting_approval_returns_only_awaiting_runs_ordered_by_id() {
+        let pool = test_state().await.pool;
+        for (project_id, prompt, status) in [
+            ("project-running", "running run", "running"),
+            ("project-first", "first awaiting run", "awaiting_approval"),
+            ("project-completed", "completed run", "completed"),
+            ("project-second", "second awaiting run", "awaiting_approval"),
+            ("project-cancelled", "cancelled run", "cancelled"),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(project_id)
+            .bind(format!("C:/projects/{project_id}"))
+            .bind(prompt)
+            .bind(status)
+            .bind("worktree")
+            .bind("2026-07-20T10:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let runs: Vec<AwaitingRun> = list_awaiting_approval(&pool).await.unwrap();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, 2);
+        assert_eq!(runs[0].prompt, "first awaiting run");
+        assert_eq!(runs[1].id, 4);
+        assert_eq!(runs[1].prompt, "second awaiting run");
+    }
+
+    #[tokio::test]
+    async fn list_awaiting_approval_returns_all_release_queue_fields() {
+        let pool = test_state().await.pool;
+        sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("project-alpha")
+        .bind("C:/worktrees/project-alpha/run-1")
+        .bind("release the pinned worktree")
+        .bind("awaiting_approval")
+        .bind("worktree")
+        .bind("2026-07-20T10:11:12Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let runs: Vec<AwaitingRun> = list_awaiting_approval(&pool).await.unwrap();
+
+        assert_eq!(
+            runs,
+            vec![AwaitingRun {
+                id: 1,
+                project_id: Some("project-alpha".into()),
+                prompt: "release the pinned worktree".into(),
+                cwd: Some("C:/worktrees/project-alpha/run-1".into()),
+                created_at: "2026-07-20T10:11:12Z".into(),
+            }]
+        );
     }
 
     #[tokio::test]

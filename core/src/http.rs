@@ -11,7 +11,7 @@ use crate::auth::require_token;
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary};
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
-use crate::runs::{CreateRunError, cancel_run, create_run, get_run};
+use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
 use crate::worktree::{self, ReleaseOutcome};
@@ -38,6 +38,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects", get(get_projects))
         .route("/feed", get(get_feed))
         .route("/runs", post(create_run))
+        // The literal path coexists with `/runs/{id}`; static segments win in matchit.
+        .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
@@ -191,6 +193,15 @@ async fn get_feed(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn list_awaiting_approval_runs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AwaitingRun>>, StatusCode> {
+    runs::list_awaiting_approval(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn post_worktree_release(
     State(state): State<AppState>,
     Path(run_id): Path<i64>,
@@ -313,6 +324,69 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn awaiting_approval_runs_returns_seeded_run_with_bearer_token() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("project-alpha")
+        .bind("C:/worktrees/project-alpha/run-1")
+        .bind("release the pinned worktree")
+        .bind("awaiting_approval")
+        .bind("worktree")
+        .bind("2026-07-20T10:11:12Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runs/awaiting-approval")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([{
+                "id": 1,
+                "project_id": "project-alpha",
+                "prompt": "release the pinned worktree",
+                "cwd": "C:/worktrees/project-alpha/run-1",
+                "created_at": "2026-07-20T10:11:12Z"
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn awaiting_approval_runs_rejects_requests_without_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runs/awaiting-approval")
                     .body(Body::empty())
                     .unwrap(),
             )
