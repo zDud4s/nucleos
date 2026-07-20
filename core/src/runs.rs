@@ -101,6 +101,120 @@ pub async fn create_run(
     Ok(Json(CreateRunResponse { id }))
 }
 
+fn spawn_run(
+    state: &AppState,
+    id: i64,
+    prompt: String,
+    project_id: Option<String>,
+    spawn_cwd: Option<std::path::PathBuf>,
+    plan_only: bool,
+    resume_session_id: Option<String>,
+    completion_feed: Option<(String, String)>,
+) {
+    // Persist session_id the instant the runner parses it (spec §3.3) — a separate task, so it lands
+    // even if the run is later terminated mid-flight.
+    let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            if let Some(session_id) = session_rx.recv().await {
+                let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                    .bind(&session_id)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+            }
+        });
+    }
+
+    let pool = state.pool.clone();
+    let runner = state.runner.clone();
+    let feed_project_id = project_id.clone();
+    let run_timeout = state.run_timeout;
+    let handles = state.run_handles.clone();
+    let env = vec![
+        (
+            "NUCLEOS_DAEMON_URL".to_string(),
+            "http://127.0.0.1:8791".to_string(),
+        ),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
+        // run_id == runs.id (spec §3.3) — the hook echoes it back in its decision request, so the
+        // core can validate it and, for a `pending_approval`, terminate the right run.
+        ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
+    ];
+
+    let join_handle = tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            run_timeout,
+            runner.run_prompt(
+                &prompt,
+                &env,
+                spawn_cwd.as_deref(),
+                plan_only,
+                resume_session_id.as_deref(),
+                session_tx,
+            ),
+        )
+        .await;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        match result {
+            Ok(Ok(o)) => {
+                let completed = sqlx::query(
+                    "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ?",
+                )
+                .bind(o.exit_code)
+                .bind(&o.stdout)
+                .bind(&o.stderr)
+                .bind(&o.session_id)
+                .bind(o.cost_usd)
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await;
+                if completed.is_ok() {
+                    if let Some((kind, summary)) = completion_feed {
+                        let _ = crate::feed::append(
+                            &pool,
+                            feed_project_id.as_deref(),
+                            &kind,
+                            &summary,
+                            Some(id),
+                        )
+                        .await;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ?",
+                )
+                .bind(e.to_string())
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await;
+            }
+            Err(_elapsed) => {
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ?",
+                )
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await;
+            }
+        }
+        // Only reached on natural completion/timeout — an aborted task (cancellation) never gets here.
+        handles.lock().unwrap().remove(&id);
+    });
+
+    state
+        .run_handles
+        .lock()
+        .unwrap()
+        .insert(id, join_handle.abort_handle());
+}
+
 pub async fn create_run_inner(
     state: &AppState,
     prompt: String,
@@ -195,108 +309,16 @@ pub async fn create_run_inner(
         spawn_cwd = Some(info.path);
     }
 
-    // Persist session_id the instant the runner parses it (spec §3.3) — a separate task, so it lands
-    // even if the run is later terminated mid-flight.
-    let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    {
-        let pool = state.pool.clone();
-        tokio::spawn(async move {
-            if let Some(session_id) = session_rx.recv().await {
-                let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
-                    .bind(&session_id)
-                    .bind(id)
-                    .execute(&pool)
-                    .await;
-            }
-        });
-    }
-
-    let pool = state.pool.clone();
-    let runner = state.runner.clone();
-    let feed_project_id = project_id.clone();
-    let run_timeout = state.run_timeout;
-    let handles = state.run_handles.clone();
-    let env = vec![
-        (
-            "NUCLEOS_DAEMON_URL".to_string(),
-            "http://127.0.0.1:8791".to_string(),
-        ),
-        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
-        // run_id == runs.id (spec §3.3) — the hook echoes it back in its decision request, so the
-        // core can validate it and, for a `pending_approval`, terminate the right run.
-        ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
-    ];
-
-    let join_handle = tokio::spawn(async move {
-        let result = tokio::time::timeout(
-            run_timeout,
-            runner.run_prompt(
-                &prompt,
-                &env,
-                spawn_cwd.as_deref(),
-                plan_only,
-                None,
-                session_tx,
-            ),
-        )
-        .await;
-        let completed_at = chrono::Utc::now().to_rfc3339();
-        match result {
-            Ok(Ok(o)) => {
-                let completed = sqlx::query(
-                    "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ?",
-                )
-                .bind(o.exit_code)
-                .bind(&o.stdout)
-                .bind(&o.stderr)
-                .bind(&o.session_id)
-                .bind(o.cost_usd)
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-                if completed.is_ok() {
-                    if let Some((kind, summary)) = completion_feed {
-                        let _ = crate::feed::append(
-                            &pool,
-                            feed_project_id.as_deref(),
-                            &kind,
-                            &summary,
-                            Some(id),
-                        )
-                        .await;
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ?",
-                )
-                .bind(e.to_string())
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-            }
-            Err(_elapsed) => {
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ?",
-                )
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-            }
-        }
-        // Only reached on natural completion/timeout — an aborted task (cancellation) never gets here.
-        handles.lock().unwrap().remove(&id);
-    });
-
-    state
-        .run_handles
-        .lock()
-        .unwrap()
-        .insert(id, join_handle.abort_handle());
+    spawn_run(
+        state,
+        id,
+        prompt,
+        project_id,
+        spawn_cwd,
+        plan_only,
+        None,
+        completion_feed,
+    );
 
     Ok(id)
 }
