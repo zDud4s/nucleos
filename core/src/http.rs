@@ -31,7 +31,10 @@ pub fn build_router(state: AppState) -> Router {
             "/autopilot/state",
             get(get_autopilot_state).post(post_autopilot_state),
         )
-        .route("/autopilot/kill", post(post_autopilot_kill))
+        .route(
+            "/autopilot/kill",
+            get(get_autopilot_kill).post(post_autopilot_kill),
+        )
         .route("/projects", get(get_projects))
         .route("/feed", get(get_feed))
         .route("/runs", post(create_run))
@@ -95,6 +98,11 @@ struct AutopilotKillRequest {
     engaged: bool,
 }
 
+#[derive(serde::Serialize)]
+struct AutopilotKillResponse {
+    engaged: bool,
+}
+
 async fn get_autopilot_state(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
@@ -125,6 +133,15 @@ async fn post_autopilot_state(
         project_id: body.project_id,
         mode,
     }))
+}
+
+async fn get_autopilot_kill(
+    State(state): State<AppState>,
+) -> Result<Json<AutopilotKillResponse>, StatusCode> {
+    let engaged = autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(AutopilotKillResponse { engaged }))
 }
 
 async fn post_autopilot_kill(
@@ -296,6 +313,83 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn autopilot_kill_get_returns_false_by_default() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/kill")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "engaged": false }));
+    }
+
+    #[tokio::test]
+    async fn autopilot_kill_get_returns_true_after_post_engages_switch() {
+        let app = build_router(test_state().await);
+        let post_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/kill")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "engaged": true })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_response.status(), StatusCode::NO_CONTENT);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/kill")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "engaged": true }));
+    }
+
+    #[tokio::test]
+    async fn autopilot_kill_get_rejects_requests_without_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/kill")
                     .body(Body::empty())
                     .unwrap(),
             )
