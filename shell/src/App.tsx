@@ -1,21 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { checkHealth, getStatus, type ConnectionState } from "./api";
+import Autopilot from "./Autopilot";
+import Home from "./Home";
 import "./App.css";
 
+type Tab = "home" | "autopilot";
+
 function App() {
-  const [state, setState] = useState<ConnectionState>("checking");
+  const [connection, setConnection] = useState<ConnectionState>("checking");
+  const [token, setToken] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>("home");
+  const tokenRequest = useRef<Promise<string> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const check = async () => {
       const health = await checkHealth();
       if (cancelled) return;
-      setState(health);
+      setConnection(health);
       if (health === "connected") {
-        const token = await invoke<string>("get_daemon_token");
-        const s = await getStatus(token);
+        if (tokenRequest.current === null) {
+          tokenRequest.current = invoke<string>("get_daemon_token");
+        }
+        const daemonToken = await tokenRequest.current;
+        if (cancelled) return;
+        setToken(daemonToken);
+        const s = await getStatus(daemonToken);
         if (!cancelled) setStatus(s);
       } else {
         setStatus(null);
@@ -32,8 +44,27 @@ function App() {
   return (
     <main className="container">
       <h1>NucleOS</h1>
-      <p data-testid="connection-state">Núcleo: {state}</p>
-      {status && <p data-testid="daemon-status">{status}</p>}
+      <nav className="tabs" aria-label="NucleOS views">
+        <button
+          className={`tab${tab === "home" ? " active" : ""}`}
+          type="button"
+          onClick={() => setTab("home")}
+        >
+          Home
+        </button>
+        <button
+          className={`tab${tab === "autopilot" ? " active" : ""}`}
+          type="button"
+          onClick={() => setTab("autopilot")}
+        >
+          Autopilot
+        </button>
+      </nav>
+      {tab === "home" ? (
+        <Home connection={connection} status={status} />
+      ) : (
+        <Autopilot token={token} connection={connection} />
+      )}
     </main>
   );
 }

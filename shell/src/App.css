@@ -30,6 +30,26 @@
   text-align: center;
 }
 
+.tabs {
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.tab {
+  box-shadow: none;
+}
+
+.tab.active {
+  border-color: #396cd8;
+  background-color: #e8e8e8;
+}
+
+.muted {
+  color: #666666;
+}
+
 .logo {
   height: 6em;
   padding: 1.5em;
@@ -112,5 +132,14 @@ button {
   }
   button:active {
     background-color: #0f0f0f69;
+  }
+
+  .tab.active {
+    border-color: #24c8db;
+    background-color: #0f0f0f69;
+  }
+
+  .muted {
+    color: #b8b8b8;
   }
 }
