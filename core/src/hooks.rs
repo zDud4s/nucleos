@@ -128,6 +128,51 @@ pub async fn pretooluse_decision(
         }
     }
 
+    // Single-use authorization (spec §8.4 step 6): a resume run's FIRST high-risk action whose
+    // tool_name matches the approved tool is allowed exactly once, overriding the pending_approval.
+    // Only a pending_approval is ever lifted — a `deny` (destructive) never reaches this check, so a
+    // grant can never launder a denied action.
+    if classification.decision.decision == "pending_approval" && is_in_flight {
+        match crate::proposals::consume_matching_grant(
+            &state.pool,
+            payload.run_id,
+            &payload.tool_name,
+        )
+        .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    run_id = payload.run_id,
+                    tool = %payload.tool_name,
+                    "pretooluse-decision: single-use grant consumed — authorizing the approved action"
+                );
+                let _ = crate::feed::append(
+                    &state.pool,
+                    None,
+                    "action_authorized",
+                    &format!(
+                        "authorized approved {} action for run {}",
+                        payload.tool_name, payload.run_id
+                    ),
+                    Some(payload.run_id),
+                )
+                .await;
+                return Json(Decision {
+                    decision: "allow".to_owned(),
+                    reason: "single-use authorization for an approved action".to_owned(),
+                });
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    %error,
+                    "pretooluse-decision: grant lookup failed; falling back to the classifier decision"
+                );
+            }
+        }
+    }
+
     if classification.decision.decision == "pending_approval" {
         // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
         // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
@@ -719,6 +764,168 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tool_name.as_deref(), Some("Edit"));
         assert_eq!(pending[0].run_id, Some(run_id));
+    }
+
+    #[tokio::test]
+    async fn granted_action_is_authorized_once_then_falls_back() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        proposals::grant_action(&state.pool, run_id, "Bash", 1)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let body = serde_json::json!({
+            "run_id": run_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push origin main"}
+        })
+        .to_string();
+
+        let first = decide(&app, &body).await;
+        assert_eq!(first.decision, "allow");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+
+        let consumed_at: Option<String> =
+            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(consumed_at.is_some());
+
+        let second = decide(&app, &body).await;
+        assert_eq!(second.decision, "pending_approval");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+    }
+
+    #[tokio::test]
+    async fn grant_for_a_different_tool_does_not_authorize() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        proposals::grant_action(&state.pool, run_id, "Bash", 1)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Edit",
+                "tool_input": {"file_path": ".ai/autopilot.yaml"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+
+        let consumed_at: Option<String> =
+            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(consumed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn deny_still_denies_even_with_a_matching_grant() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
+             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        proposals::grant_action(&state.pool, run_id, "Bash", 1)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf target"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+
+        let consumed_at: Option<String> =
+            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(consumed_at.is_none());
     }
 
     #[tokio::test]
