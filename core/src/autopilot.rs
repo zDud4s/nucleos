@@ -19,6 +19,13 @@ pub struct ProjectSummary {
     pub pending: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopedKill {
+    pub scope_type: String,
+    pub scope_id: String,
+    pub engaged: bool,
+}
+
 impl Mode {
     pub fn as_db_str(self) -> &'static str {
         match self {
@@ -222,6 +229,60 @@ pub async fn set_kill_switch(pool: &SqlitePool, engaged: bool) -> sqlx::Result<(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Whether the granular kill switch for a given scope (e.g. scope_type "project"/"trigger") is engaged.
+/// An absent row means not engaged.
+pub async fn scoped_kill_engaged(
+    pool: &SqlitePool,
+    scope_type: &str,
+    scope_id: &str,
+) -> sqlx::Result<bool> {
+    let value: Option<i64> = sqlx::query_scalar(
+        "SELECT engaged FROM scoped_kill_switches WHERE scope_type = ? AND scope_id = ?",
+    )
+    .bind(scope_type)
+    .bind(scope_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(value.unwrap_or(0) != 0)
+}
+
+/// Engage or disengage the granular kill switch for a scope (upsert).
+pub async fn set_scoped_kill(
+    pool: &SqlitePool,
+    scope_type: &str,
+    scope_id: &str,
+    engaged: bool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO scoped_kill_switches (scope_type, scope_id, engaged) VALUES (?, ?, ?)
+         ON CONFLICT(scope_type, scope_id) DO UPDATE SET engaged = excluded.engaged",
+    )
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(engaged)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// All granular kill-switch rows, ordered by (scope_type, scope_id).
+pub async fn list_scoped_kills(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedKill>> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT scope_type, scope_id, engaged FROM scoped_kill_switches
+         ORDER BY scope_type, scope_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(scope_type, scope_id, engaged)| ScopedKill {
+            scope_type,
+            scope_id,
+            engaged: engaged != 0,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -640,5 +701,56 @@ mod tests {
         assert!(kill_switch_engaged(&pool).await.unwrap());
         set_kill_switch(&pool, false).await.unwrap();
         assert!(!kill_switch_engaged(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scoped_kill_absent_scope_is_not_engaged() {
+        let pool = test_pool().await;
+        assert!(!scoped_kill_engaged(&pool, "project", "p1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scoped_kill_set_then_get_round_trips() {
+        let pool = test_pool().await;
+        set_scoped_kill(&pool, "project", "p1", true).await.unwrap();
+        assert!(scoped_kill_engaged(&pool, "project", "p1").await.unwrap());
+        set_scoped_kill(&pool, "project", "p1", false)
+            .await
+            .unwrap();
+        assert!(!scoped_kill_engaged(&pool, "project", "p1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scoped_kills_are_independent_and_listed_ordered() {
+        let pool = test_pool().await;
+        set_scoped_kill(&pool, "project", "p1", true).await.unwrap();
+        set_scoped_kill(&pool, "trigger", "scheduled", true)
+            .await
+            .unwrap();
+
+        // p2 was never set -> not engaged; the others are independent.
+        assert!(!scoped_kill_engaged(&pool, "project", "p2").await.unwrap());
+        assert!(scoped_kill_engaged(&pool, "project", "p1").await.unwrap());
+        assert!(
+            scoped_kill_engaged(&pool, "trigger", "scheduled")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            list_scoped_kills(&pool).await.unwrap(),
+            vec![
+                ScopedKill {
+                    scope_type: "project".into(),
+                    scope_id: "p1".into(),
+                    engaged: true
+                },
+                ScopedKill {
+                    scope_type: "trigger".into(),
+                    scope_id: "scheduled".into(),
+                    engaged: true
+                },
+            ]
+        );
     }
 }
