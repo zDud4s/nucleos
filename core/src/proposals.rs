@@ -253,9 +253,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(transition(&pool, id, "approved", "user approved")
-            .await
-            .unwrap());
+        assert!(
+            transition(&pool, id, "approved", "user approved")
+                .await
+                .unwrap()
+        );
 
         let proposal = get(&pool, id).await.unwrap().unwrap();
         assert_eq!(proposal.status, "approved");
@@ -280,9 +282,11 @@ mod tests {
     async fn transition_of_a_missing_or_non_pending_proposal_is_false() {
         let pool = test_pool().await;
 
-        assert!(!transition(&pool, 999_999, "approved", "missing")
-            .await
-            .unwrap());
+        assert!(
+            !transition(&pool, 999_999, "approved", "missing")
+                .await
+                .unwrap()
+        );
 
         let id = create_action_approval(
             &pool,
@@ -295,12 +299,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(transition(&pool, id, "approved", "user approved")
-            .await
-            .unwrap());
-        assert!(!transition(&pool, id, "rejected", "too late")
-            .await
-            .unwrap());
+        assert!(
+            transition(&pool, id, "approved", "user approved")
+                .await
+                .unwrap()
+        );
+        assert!(!transition(&pool, id, "rejected", "too late").await.unwrap());
     }
 
     #[tokio::test]
@@ -340,13 +344,18 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(transition(&pool, rejected, "rejected", "user rejected")
-            .await
-            .unwrap());
+        assert!(
+            transition(&pool, rejected, "rejected", "user rejected")
+                .await
+                .unwrap()
+        );
 
         let pending = list_pending(&pool).await.unwrap();
         assert_eq!(
-            pending.iter().map(|proposal| proposal.id).collect::<Vec<_>>(),
+            pending
+                .iter()
+                .map(|proposal| proposal.id)
+                .collect::<Vec<_>>(),
             vec![first, second]
         );
         assert!(
@@ -362,9 +371,7 @@ mod tests {
 
         grant_action(&pool, 100, "Bash", 5).await.unwrap();
 
-        assert!(consume_matching_grant(&pool, 100, "Bash")
-            .await
-            .unwrap());
+        assert!(consume_matching_grant(&pool, 100, "Bash").await.unwrap());
 
         let consumed_at = sqlx::query_scalar::<_, Option<String>>(
             "SELECT consumed_at FROM action_grants WHERE run_id = ?",
@@ -375,9 +382,7 @@ mod tests {
         .unwrap();
         assert!(consumed_at.is_some());
 
-        assert!(!consume_matching_grant(&pool, 100, "Bash")
-            .await
-            .unwrap());
+        assert!(!consume_matching_grant(&pool, 100, "Bash").await.unwrap());
     }
 
     #[tokio::test]
@@ -386,20 +391,18 @@ mod tests {
 
         grant_action(&pool, 101, "Bash", 6).await.unwrap();
 
-        assert!(!consume_matching_grant(&pool, 101, "Edit")
-            .await
-            .unwrap());
-        assert!(consume_matching_grant(&pool, 101, "Bash")
-            .await
-            .unwrap());
+        assert!(!consume_matching_grant(&pool, 101, "Edit").await.unwrap());
+        assert!(consume_matching_grant(&pool, 101, "Bash").await.unwrap());
     }
 
     #[tokio::test]
     async fn consume_for_unknown_run_returns_false() {
         let pool = test_pool().await;
 
-        assert!(!consume_matching_grant(&pool, 999_999, "Bash")
-            .await
-            .unwrap());
+        assert!(
+            !consume_matching_grant(&pool, 999_999, "Bash")
+                .await
+                .unwrap()
+        );
     }
 }
