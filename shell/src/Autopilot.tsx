@@ -1,14 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  getFeed,
   getKillSwitch,
   getProjects,
+  getScoreboard,
   setKillSwitch,
   setProjectMode,
   type AutopilotMode,
+  type ClassTally,
   type ConnectionState,
+  type FeedEntry,
   type ProjectSummary,
 } from "./api";
-import { killSwitchLabel, modeBadge, totalPending } from "./derive";
+import {
+  agreementRate,
+  groupScoreboardByMode,
+  killSwitchLabel,
+  modeBadge,
+  totalPending,
+} from "./derive";
 
 interface AutopilotProps {
   token: string | null;
@@ -19,9 +29,17 @@ interface ProjectCardProps {
   project: ProjectSummary;
   token: string;
   refresh: () => Promise<void>;
+  selected: boolean;
+  onSelect: () => void;
 }
 
-function ProjectCard({ project, token, refresh }: ProjectCardProps) {
+function ProjectCard({
+  project,
+  token,
+  refresh,
+  selected,
+  onSelect,
+}: ProjectCardProps) {
   const [root, setRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [changing, setChanging] = useState(false);
@@ -50,7 +68,7 @@ function ProjectCard({ project, token, refresh }: ProjectCardProps) {
   }
 
   return (
-    <article className="card">
+    <article className={`card${selected ? " selected" : ""}`}>
       <div className="card-header">
         <h3>{project.project_id}</h3>
         <div className="badges">
@@ -60,6 +78,10 @@ function ProjectCard({ project, token, refresh }: ProjectCardProps) {
           )}
         </div>
       </div>
+
+      <button type="button" onClick={onSelect}>
+        {selected ? "Hide details" : "View"}
+      </button>
 
       <label className="field">
         Mode
@@ -95,10 +117,108 @@ function ProjectCard({ project, token, refresh }: ProjectCardProps) {
   );
 }
 
+interface FeedPanelProps {
+  feed: FeedEntry[] | null;
+  loading: boolean;
+  selectedProject: string | null;
+}
+
+function FeedPanel({ feed, loading, selectedProject }: FeedPanelProps) {
+  return (
+    <section className="panel feed-panel">
+      <h3>
+        Feed — {selectedProject === null ? "all projects" : selectedProject}
+      </h3>
+      {feed === null ? (
+        !loading && (
+          <p className="muted error" role="alert">
+            Could not load activity from the daemon.
+          </p>
+        )
+      ) : feed.length === 0 ? (
+        <p className="muted">No activity yet.</p>
+      ) : (
+        <div className="feed">
+          {feed.map((entry) => (
+            <article className="feed-row" key={entry.id}>
+              <div className="feed-meta">
+                <time dateTime={entry.created_at}>{entry.created_at}</time>
+                <span>{entry.project_id ?? "global"}</span>
+              </div>
+              <strong>{entry.kind}</strong>
+              <p>{entry.summary}</p>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface ScoreboardPanelProps {
+  projectId: string;
+  scoreboard: ClassTally[] | null;
+}
+
+function ScoreboardPanel({ projectId, scoreboard }: ScoreboardPanelProps) {
+  const groupedTallies = groupScoreboardByMode(scoreboard ?? []);
+
+  return (
+    <section className="panel scoreboard">
+      <h3>Scoreboard — {projectId}</h3>
+      {Object.keys(groupedTallies).length === 0 ? (
+        <p className="muted">No scoreboard data.</p>
+      ) : (
+        Object.entries(groupedTallies).map(([mode, tallies]) => (
+          <div className="scoreboard-mode" key={mode}>
+            <h4>{mode}</h4>
+            <div className="scoreboard-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>action_class</th>
+                    <th>total</th>
+                    <th>allow</th>
+                    <th>pend</th>
+                    <th>deny</th>
+                    <th>reviewed</th>
+                    <th>agreement</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tallies.map((tally) => {
+                    const rate = agreementRate(tally);
+                    return (
+                      <tr key={tally.action_class}>
+                        <td>{tally.action_class}</td>
+                        <td>{tally.total}</td>
+                        <td>{tally.would_allow}</td>
+                        <td>{tally.would_pend}</td>
+                        <td>{tally.would_deny}</td>
+                        <td>{tally.reviewed}</td>
+                        <td>
+                          {rate === null ? "—" : `${Math.round(rate * 100)}%`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))
+      )}
+    </section>
+  );
+}
+
 function Autopilot({ token, connection }: AutopilotProps) {
   const unavailable = connection !== "connected" || token === null;
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [killEngaged, setKillEngaged] = useState<boolean | null>(null);
+  const [feed, setFeed] = useState<FeedEntry[] | null>(null);
+  const [scoreboard, setScoreboard] = useState<ClassTally[] | null>(null);
+  const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [togglingKillSwitch, setTogglingKillSwitch] = useState(false);
 
@@ -106,19 +226,30 @@ function Autopilot({ token, connection }: AutopilotProps) {
     if (token === null || connection !== "connected") return;
 
     setLoading(true);
-    const [nextProjects, nextKillEngaged] = await Promise.all([
+    const [nextProjects, nextKillEngaged, nextFeed] = await Promise.all([
       getProjects(token),
       getKillSwitch(token),
+      getFeed(
+        token,
+        selectedProject ? { projectId: selectedProject } : { scope: "all" },
+      ),
     ]);
+    const nextScoreboard = selectedProject
+      ? await getScoreboard(token, selectedProject)
+      : null;
     setProjects(nextProjects);
     setKillEngaged(nextKillEngaged);
+    setFeed(nextFeed);
+    setScoreboard(nextScoreboard);
     setLoading(false);
-  }, [connection, token]);
+  }, [connection, selectedProject, token]);
 
   useEffect(() => {
     if (unavailable) {
       setProjects(null);
       setKillEngaged(null);
+      setFeed(null);
+      setScoreboard(null);
       setLoading(true);
       return;
     }
@@ -181,10 +312,43 @@ function Autopilot({ token, connection }: AutopilotProps) {
                   project={project}
                   token={token}
                   refresh={refresh}
+                  selected={selectedProject === project.project_id}
+                  onSelect={() =>
+                    setSelectedProject((current) =>
+                      current === project.project_id ? null : project.project_id,
+                    )
+                  }
                 />
               ))}
             </div>
           )}
+
+          <div className="panel-scope">
+            {selectedProject === null ? (
+              <span className="muted">Viewing all projects</span>
+            ) : (
+              <>
+                <strong>Viewing {selectedProject}</strong>
+                <button type="button" onClick={() => setSelectedProject(null)}>
+                  Show all
+                </button>
+              </>
+            )}
+          </div>
+
+          <div className="autopilot-panels">
+            <FeedPanel
+              feed={feed}
+              loading={loading}
+              selectedProject={selectedProject}
+            />
+            {selectedProject !== null && (
+              <ScoreboardPanel
+                projectId={selectedProject}
+                scoreboard={scoreboard}
+              />
+            )}
+          </div>
         </>
       )}
     </section>

@@ -103,6 +103,11 @@
   box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
 }
 
+.card.selected {
+  border-color: #396cd8;
+  box-shadow: 0 0 0 2px rgba(57, 108, 216, 0.2);
+}
+
 .card-header {
   justify-content: space-between;
   gap: 0.75rem;
@@ -176,6 +181,101 @@
 .error {
   color: #a62b24;
   font-size: 0.85rem;
+}
+
+.panel-scope {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin: 1.5rem 0 0.75rem;
+}
+
+.autopilot-panels {
+  display: grid;
+  gap: 1rem;
+}
+
+.panel {
+  padding: 1rem;
+  border: 1px solid #d4d7dc;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.panel > h3,
+.scoreboard-mode:first-of-type h4 {
+  margin-top: 0;
+}
+
+.feed {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.feed-row {
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid #e1e3e7;
+}
+
+.feed-row:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.feed-row p {
+  margin: 0.25rem 0 0;
+}
+
+.feed-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  color: #666666;
+  font-size: 0.8rem;
+}
+
+.scoreboard-mode + .scoreboard-mode {
+  margin-top: 1.25rem;
+}
+
+.scoreboard-mode h4 {
+  margin-bottom: 0.5rem;
+  text-transform: capitalize;
+}
+
+.scoreboard-table-wrap {
+  overflow-x: auto;
+}
+
+.scoreboard table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.scoreboard th,
+.scoreboard td {
+  padding: 0.55rem 0.65rem;
+  border-bottom: 1px solid #e1e3e7;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.scoreboard th:first-child,
+.scoreboard td:first-child {
+  text-align: left;
+}
+
+.scoreboard th {
+  color: #555b65;
+  background: #f1f3f6;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.scoreboard tbody tr:nth-child(even) {
+  background: #f8f9fb;
 }
 
 .logo {
@@ -272,9 +372,34 @@ button {
   }
 
   .kill-switch,
-  .card {
+  .card,
+  .panel {
     border-color: #555b65;
     background: #252525;
+  }
+
+  .card.selected {
+    border-color: #24c8db;
+    box-shadow: 0 0 0 2px rgba(36, 200, 219, 0.22);
+  }
+
+  .feed-row,
+  .scoreboard th,
+  .scoreboard td {
+    border-color: #474b52;
+  }
+
+  .feed-meta {
+    color: #b8b8b8;
+  }
+
+  .scoreboard th {
+    color: #d5d7da;
+    background: #33363b;
+  }
+
+  .scoreboard tbody tr:nth-child(even) {
+    background: #2c2f33;
   }
 
   .kill-switch.engaged {
