@@ -115,6 +115,11 @@ pub async fn create_run(
     Ok(Json(CreateRunResponse { id }))
 }
 
+/// Autonomous runs (mode shadow/worktree) retry a launch failure up to this many TOTAL attempts.
+/// Only the pre-execution launch-failure path retries (the CLI never ran, so no work is double-applied);
+/// a run that executed and failed, and a timeout, are never retried.
+const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
+
 fn spawn_run(
     state: &AppState,
     id: i64,
@@ -124,23 +129,8 @@ fn spawn_run(
     plan_only: bool,
     resume_session_id: Option<String>,
     completion_feed: Option<(String, String)>,
+    max_attempts: u32,
 ) {
-    // Persist session_id the instant the runner parses it (spec §3.3) — a separate task, so it lands
-    // even if the run is later terminated mid-flight.
-    let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    {
-        let pool = state.pool.clone();
-        tokio::spawn(async move {
-            if let Some(session_id) = session_rx.recv().await {
-                let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
-                    .bind(&session_id)
-                    .bind(id)
-                    .execute(&pool)
-                    .await;
-            }
-        });
-    }
-
     let pool = state.pool.clone();
     let runner = state.runner.clone();
     let feed_project_id = project_id.clone();
@@ -158,67 +148,123 @@ fn spawn_run(
     ];
 
     let join_handle = tokio::spawn(async move {
-        let result = tokio::time::timeout(
-            run_timeout,
-            runner.run_prompt(
-                &prompt,
-                &env,
-                spawn_cwd.as_deref(),
-                plan_only,
-                resume_session_id.as_deref(),
-                session_tx,
-            ),
-        )
-        .await;
-        let completed_at = chrono::Utc::now().to_rfc3339();
-        match result {
-            Ok(Ok(o)) => {
-                let completed = sqlx::query(
-                    "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ?",
-                )
-                .bind(o.exit_code)
-                .bind(&o.stdout)
-                .bind(&o.stderr)
-                .bind(&o.session_id)
-                .bind(o.cost_usd)
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-                if completed.is_ok() {
-                    if let Some((kind, summary)) = completion_feed {
+        let mut attempt: u32 = 1;
+        loop {
+            // A fresh session channel per attempt: persist session_id the instant the runner parses it
+            // (spec §3.3), in a separate task so it lands even if the run is terminated mid-flight.
+            let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    if let Some(session_id) = session_rx.recv().await {
+                        let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                            .bind(&session_id)
+                            .bind(id)
+                            .execute(&pool)
+                            .await;
+                    }
+                });
+            }
+
+            let result = tokio::time::timeout(
+                run_timeout,
+                runner.run_prompt(
+                    &prompt,
+                    &env,
+                    spawn_cwd.as_deref(),
+                    plan_only,
+                    resume_session_id.as_deref(),
+                    session_tx,
+                ),
+            )
+            .await;
+            let completed_at = chrono::Utc::now().to_rfc3339();
+            match result {
+                Ok(Ok(o)) => {
+                    let completed = sqlx::query(
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ?",
+                    )
+                    .bind(o.exit_code)
+                    .bind(&o.stdout)
+                    .bind(&o.stderr)
+                    .bind(&o.session_id)
+                    .bind(o.cost_usd)
+                    .bind(&completed_at)
+                    .bind(attempt as i64)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    if completed.is_ok() {
+                        if let Some((kind, summary)) = completion_feed.as_ref() {
+                            let _ = crate::feed::append(
+                                &pool,
+                                feed_project_id.as_deref(),
+                                kind,
+                                summary,
+                                Some(id),
+                            )
+                            .await;
+                        }
+                    }
+                    break;
+                }
+                Ok(Err(e)) => {
+                    // A launch failure means the CLI never ran — no work happened — so retrying cannot
+                    // double-apply a mutation. Retry up to max_attempts; otherwise fail for good.
+                    if attempt < max_attempts {
                         let _ = crate::feed::append(
                             &pool,
                             feed_project_id.as_deref(),
-                            &kind,
-                            &summary,
+                            "run_retry",
+                            &format!("run {id} attempt {attempt} failed to launch, retrying: {e}"),
+                            Some(id),
+                        )
+                        .await;
+                        attempt += 1;
+                        let _ = sqlx::query("UPDATE runs SET attempt = ? WHERE id = ?")
+                            .bind(attempt as i64)
+                            .bind(id)
+                            .execute(&pool)
+                            .await;
+                        continue;
+                    }
+                    let _ = sqlx::query(
+                        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?, attempt = ? WHERE id = ?",
+                    )
+                    .bind(e.to_string())
+                    .bind(&completed_at)
+                    .bind(attempt as i64)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    if max_attempts > 1 {
+                        let _ = crate::feed::append(
+                            &pool,
+                            feed_project_id.as_deref(),
+                            "run_failed_final",
+                            &format!("run {id} failed after {attempt} attempts"),
                             Some(id),
                         )
                         .await;
                     }
+                    break;
+                }
+                Err(_elapsed) => {
+                    // A timeout is not a launch failure — retrying would likely time out again.
+                    let _ = sqlx::query(
+                        "UPDATE runs SET status = 'timed_out', completed_at = ?, attempt = ? WHERE id = ?",
+                    )
+                    .bind(&completed_at)
+                    .bind(attempt as i64)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    break;
                 }
             }
-            Ok(Err(e)) => {
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ?",
-                )
-                .bind(e.to_string())
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-            }
-            Err(_elapsed) => {
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ?",
-                )
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-            }
         }
-        // Only reached on natural completion/timeout — an aborted task (cancellation) never gets here.
+        // Only reached on natural completion / timeout / exhausted-failure — an aborted task
+        // (cancellation) never gets here.
         handles.lock().unwrap().remove(&id);
     });
 
@@ -323,6 +369,11 @@ pub async fn create_run_inner(
         spawn_cwd = Some(info.path);
     }
 
+    let max_attempts = if mode == "shadow" || mode == "worktree" {
+        MAX_AUTONOMOUS_ATTEMPTS
+    } else {
+        1
+    };
     spawn_run(
         state,
         id,
@@ -332,6 +383,7 @@ pub async fn create_run_inner(
         plan_only,
         None,
         completion_feed,
+        max_attempts,
     );
 
     Ok(id)
@@ -434,6 +486,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             "worktree_run_completed".to_owned(),
             format!("resumed run completed on nucleos/run-{original_run_id}"),
         )),
+        1,
     );
 
     Ok(resume_id)
@@ -1451,5 +1504,70 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, "run_interrupted");
         assert_eq!(entries[0].run_id, Some(1));
+    }
+
+    async fn poll_run(state: &AppState, id: i64, until: &str) -> (String, i64) {
+        for _ in 0..100 {
+            let row: (String, i64) =
+                sqlx::query_as("SELECT status, attempt FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            if row.0 == until {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sqlx::query_as("SELECT status, attempt FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn autonomous_run_retries_a_launch_failure_then_completes() {
+        let (state, runner) = test_state_with_runner(None, Duration::from_secs(5)).await;
+        *runner.fail_times.lock().unwrap() = 1; // 1st attempt fails to launch, 2nd succeeds
+
+        let id = create_run_inner(&state, "go".into(), None, None, "shadow")
+            .await
+            .unwrap();
+
+        let (status, attempt) = poll_run(&state, id, "completed").await;
+        assert_eq!(status, "completed");
+        assert_eq!(attempt, 2);
+        assert_eq!(*runner.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn autonomous_run_fails_after_exhausting_retries() {
+        let (state, runner) = test_state_with_runner(None, Duration::from_secs(5)).await;
+        *runner.fail_times.lock().unwrap() = 5; // always fails to launch
+
+        let id = create_run_inner(&state, "go".into(), None, None, "shadow")
+            .await
+            .unwrap();
+
+        let (status, attempt) = poll_run(&state, id, "failed").await;
+        assert_eq!(status, "failed");
+        assert_eq!(attempt, 2); // capped at the autonomous retry limit
+        assert_eq!(*runner.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_run_does_not_retry_a_launch_failure() {
+        let (state, runner) = test_state_with_runner(None, Duration::from_secs(5)).await;
+        *runner.fail_times.lock().unwrap() = 5;
+
+        let id = create_run_inner(&state, "go".into(), None, None, "real")
+            .await
+            .unwrap();
+
+        let (status, attempt) = poll_run(&state, id, "failed").await;
+        assert_eq!(status, "failed");
+        assert_eq!(attempt, 1); // manual runs never retry
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
     }
 }
