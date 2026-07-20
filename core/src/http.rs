@@ -9,6 +9,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary};
+use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
@@ -34,6 +35,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/autopilot/kill",
             get(get_autopilot_kill).post(post_autopilot_kill),
+        )
+        .route(
+            "/autopilot/budget",
+            get(get_autopilot_budget).post(post_autopilot_budget),
         )
         .route("/projects", get(get_projects))
         .route("/feed", get(get_feed))
@@ -109,6 +114,28 @@ struct AutopilotKillResponse {
     engaged: bool,
 }
 
+#[derive(serde::Serialize)]
+struct BudgetResponse {
+    limit_usd: Option<f64>,
+    period: String,
+    hourly_limit_usd: Option<f64>,
+    per_run_reserve_usd: f64,
+    time_cost_per_hour_usd: f64,
+    window_spend_usd: f64,
+    hourly_spend_usd: f64,
+    paused: bool,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BudgetRequest {
+    limit_usd: Option<f64>,
+    period: String,
+    hourly_limit_usd: Option<f64>,
+    per_run_reserve_usd: f64,
+    time_cost_per_hour_usd: f64,
+}
+
 async fn get_autopilot_state(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
@@ -158,6 +185,58 @@ async fn post_autopilot_kill(
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_autopilot_budget(
+    State(state): State<AppState>,
+) -> Result<Json<BudgetResponse>, StatusCode> {
+    budget_response(&state).await.map(Json)
+}
+
+async fn post_autopilot_budget(
+    State(state): State<AppState>,
+    Json(body): Json<BudgetRequest>,
+) -> Result<Json<BudgetResponse>, StatusCode> {
+    let period = budget::BudgetPeriod::from_db_str(&body.period).ok_or(StatusCode::BAD_REQUEST)?;
+    let config = budget::BudgetConfig {
+        limit_usd: body.limit_usd,
+        period,
+        hourly_limit_usd: body.hourly_limit_usd,
+        per_run_reserve_usd: body.per_run_reserve_usd,
+        time_cost_per_hour_usd: body.time_cost_per_hour_usd,
+    };
+    budget::set_budget_config(&state.pool, &config)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    budget_response(&state).await.map(Json)
+}
+
+async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode> {
+    let now = chrono::Utc::now();
+    let config = budget::load_budget_config(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let window_spend_usd = budget::window_spend(&state.pool, now)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let hourly_spend_usd = budget::hourly_spend(&state.pool, now)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (paused, reason) = match budget::budget_permits_new_run(&state.pool, now).await {
+        budget::BudgetDecision::Allow => (false, None),
+        budget::BudgetDecision::Pause { reason } => (true, Some(reason)),
+    };
+    Ok(BudgetResponse {
+        limit_usd: config.limit_usd,
+        period: config.period.as_db_str().to_string(),
+        hourly_limit_usd: config.hourly_limit_usd,
+        per_run_reserve_usd: config.per_run_reserve_usd,
+        time_cost_per_hour_usd: config.time_cost_per_hour_usd,
+        window_spend_usd,
+        hourly_spend_usd,
+        paused,
+        reason,
+    })
 }
 
 fn activation_status(error: ActivationError) -> StatusCode {
@@ -885,5 +964,178 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn autopilot_budget_get_returns_defaults() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/budget")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "limit_usd": null,
+                "period": "monthly",
+                "hourly_limit_usd": null,
+                "per_run_reserve_usd": 0.5,
+                "time_cost_per_hour_usd": 3.0,
+                "window_spend_usd": 0.0,
+                "hourly_spend_usd": 0.0,
+                "paused": false,
+                "reason": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn autopilot_budget_post_sets_config_and_get_reflects_it() {
+        let app = build_router(test_state().await);
+        let post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/budget")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "limit_usd": 50.0,
+                            "period": "weekly",
+                            "hourly_limit_usd": 5.0,
+                            "per_run_reserve_usd": 1.0,
+                            "time_cost_per_hour_usd": 2.0
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::OK);
+
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/budget")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["limit_usd"], serde_json::json!(50.0));
+        assert_eq!(parsed["period"], serde_json::json!("weekly"));
+        assert_eq!(parsed["hourly_limit_usd"], serde_json::json!(5.0));
+        assert_eq!(parsed["per_run_reserve_usd"], serde_json::json!(1.0));
+        assert_eq!(parsed["time_cost_per_hour_usd"], serde_json::json!(2.0));
+    }
+
+    #[tokio::test]
+    async fn autopilot_budget_post_rejects_invalid_period() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/budget")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "limit_usd": 10.0,
+                            "period": "yearly",
+                            "hourly_limit_usd": null,
+                            "per_run_reserve_usd": 0.5,
+                            "time_cost_per_hour_usd": 3.0
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn autopilot_budget_get_reports_paused_when_over_budget() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = build_router(state);
+
+        // $5 of autonomous spend recorded "now" (in the current window and hour).
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES ('proj', 'prior spend', 'completed', 'worktree', 5.0, ?, ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/budget")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "limit_usd": 1.0,
+                            "period": "monthly",
+                            "hourly_limit_usd": null,
+                            "per_run_reserve_usd": 0.5,
+                            "time_cost_per_hour_usd": 3.0
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::OK);
+
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/budget")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["paused"], serde_json::json!(true));
+        assert_eq!(parsed["window_spend_usd"], serde_json::json!(5.0));
+        assert!(parsed["reason"].is_string());
     }
 }
