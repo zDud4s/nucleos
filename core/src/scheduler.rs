@@ -99,6 +99,13 @@ pub(crate) async fn scheduler_tick(
         return;
     }
 
+    if let crate::budget::BudgetDecision::Pause { reason } =
+        crate::budget::budget_permits_new_run(&state.pool, now).await
+    {
+        tracing::info!(reason = %reason, "budget exhausted; scheduler paused this tick");
+        return;
+    }
+
     let projects = match crate::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {
@@ -691,5 +698,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_does_nothing_when_over_budget() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-20T10:10:00Z");
+        let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+
+        // A $1 monthly ceiling with $5 of prior autonomous spend this window -> over budget.
+        crate::budget::set_budget_config(
+            &state.pool,
+            &crate::budget::BudgetConfig {
+                limit_usd: Some(1.0),
+                period: crate::budget::BudgetPeriod::Monthly,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES ('proj', 'prior spend', 'completed', 'worktree', 5.0, ?, ?)",
+        )
+        .bind(timestamp("2026-07-05T09:00:00Z").to_rfc3339())
+        .bind(timestamp("2026-07-05T09:10:00Z").to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        // Only the pre-existing spend row remains; the over-budget scheduler fired no new run.
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 1);
     }
 }
