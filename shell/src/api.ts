@@ -88,6 +88,12 @@ export interface Proposal {
   decided_at: string | null;
 }
 
+export interface ScopedKill {
+  scope_type: string;
+  scope_id: string;
+  engaged: boolean;
+}
+
 export interface Budget {
   limit_usd: number | null;
   period: "daily" | "weekly" | "monthly";
@@ -336,6 +342,43 @@ export async function setProjectMode(
     return res.ok ? { ok: true } : { ok: false, status: res.status };
   } catch {
     return { ok: false, status: 0 };
+  }
+}
+
+export async function getScopedKills(token: string): Promise<ScopedKill[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/kill/scoped`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function setScopedKill(
+  token: string,
+  scopeType: string,
+  scopeId: string,
+  engaged: boolean,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/kill/scoped`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        scope_type: scopeType,
+        scope_id: scopeId,
+        engaged,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 

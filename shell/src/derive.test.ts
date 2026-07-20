@@ -9,6 +9,7 @@ import {
   killSwitchLabel,
   modeBadge,
   periodLabel,
+  promotionReadiness,
   totalPending,
 } from "./derive";
 
@@ -169,5 +170,30 @@ describe("pure UI derivations", () => {
     expect(
       budgetStatusLabel({ ...base, limit_usd: 10, window_spend_usd: 12, paused: true }),
     ).toBe("Paused — $12.00 of $10.00 this month");
+  });
+
+  it("derives promotion readiness per action class", () => {
+    const base = {
+      mode: "shadow",
+      action_class: "filesystem.write",
+      total: 0,
+      would_allow: 0,
+      would_pend: 0,
+      would_deny: 0,
+      reviewed: 0,
+      agree: 0,
+      disagree: 0,
+    } satisfies ClassTally;
+
+    expect(promotionReadiness(base)).toEqual({ ready: false, rate: null, samples: 0 });
+    expect(
+      promotionReadiness({ ...base, reviewed: 10, agree: 10 }),
+    ).toEqual({ ready: true, rate: 1, samples: 10 });
+    expect(
+      promotionReadiness({ ...base, reviewed: 10, agree: 9 }),
+    ).toEqual({ ready: false, rate: 0.9, samples: 10 });
+    expect(
+      promotionReadiness({ ...base, reviewed: 5, agree: 5 }),
+    ).toEqual({ ready: false, rate: 1, samples: 5 });
   });
 });

@@ -9,6 +9,7 @@ import type {
   FeedEntry,
   ProjectSummary,
   Proposal,
+  ScopedKill,
   ShadowDecision,
 } from "./api";
 
@@ -364,5 +365,42 @@ describe("daemon API client", () => {
     expectPostCall(1, `${DAEMON_URL}/autopilot/budget`, config);
     await expect(api.setBudget(TOKEN, config)).resolves.toBeNull();
     expectPostCall(2, `${DAEMON_URL}/autopilot/budget`, config);
+  });
+
+  it("gets scoped kill switches and returns null for a non-ok response", async () => {
+    const scoped = [
+      { scope_type: "project", scope_id: "alpha", engaged: true },
+    ] satisfies ScopedKill[];
+    fetchMock
+      .mockResolvedValueOnce(okJson(scoped))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(api.getScopedKills(TOKEN)).resolves.toEqual(scoped);
+    expectGetCall(1, `${DAEMON_URL}/autopilot/kill/scoped`);
+    await expect(api.getScopedKills(TOKEN)).resolves.toBeNull();
+    expectGetCall(2, `${DAEMON_URL}/autopilot/kill/scoped`);
+  });
+
+  it("posts a scoped kill and reflects response ok", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({}))
+      .mockResolvedValueOnce(nonOk());
+
+    await expect(
+      api.setScopedKill(TOKEN, "project", "alpha", true),
+    ).resolves.toBe(true);
+    expectPostCall(1, `${DAEMON_URL}/autopilot/kill/scoped`, {
+      scope_type: "project",
+      scope_id: "alpha",
+      engaged: true,
+    });
+    await expect(
+      api.setScopedKill(TOKEN, "trigger", "scheduled", false),
+    ).resolves.toBe(false);
+    expectPostCall(2, `${DAEMON_URL}/autopilot/kill/scoped`, {
+      scope_type: "trigger",
+      scope_id: "scheduled",
+      engaged: false,
+    });
   });
 });

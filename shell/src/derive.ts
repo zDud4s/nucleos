@@ -7,6 +7,25 @@ export interface Badge {
   tone: Tone;
 }
 
+export interface Readiness {
+  ready: boolean;
+  rate: number | null;
+  samples: number;
+}
+
+const READINESS_MIN_REVIEWED = 10;
+const READINESS_MIN_RATE = 0.95;
+
+export function promotionReadiness(tally: ClassTally): Readiness {
+  const samples = tally.reviewed;
+  const rate = samples === 0 ? null : tally.agree / samples;
+  const ready =
+    samples >= READINESS_MIN_REVIEWED &&
+    rate !== null &&
+    rate >= READINESS_MIN_RATE;
+  return { ready, rate, samples };
+}
+
 export function modeBadge(mode: AutopilotMode): Badge {
   switch (mode) {
     case "off":
