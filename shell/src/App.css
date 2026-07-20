@@ -1,3 +1,4 @@
+@import "./fonts.css";
 @import "./tokens.css";
 * { box-sizing: border-box; margin: 0; }
 body { background: radial-gradient(1100px 700px at 88% -12%, var(--glow-cool), transparent 62%), radial-gradient(900px 650px at -8% 108%, var(--glow-warm), transparent 60%), var(--bg); background-attachment: fixed; color: var(--text); font: 400 var(--fs-md)/1.6 var(--body); min-height: 100vh; padding-bottom: 96px; }
