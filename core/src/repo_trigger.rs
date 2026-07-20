@@ -1,5 +1,6 @@
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::config::RepoTrigger;
 
@@ -53,6 +54,39 @@ pub async fn record_sha(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Fetch the repo (best-effort when `fetch` is true) and return the current SHA of `git_ref`
+/// (a branch name or any ref). Returns `None` when git is unavailable or the ref does not resolve —
+/// the caller treats an unknown current SHA as "skip this trigger this poll".
+fn git_bin() -> String {
+    std::env::var("NUCLEOS_GIT_BIN").unwrap_or_else(|_| "git".into())
+}
+
+pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Option<String> {
+    if fetch {
+        // Best-effort: an offline / remoteless fetch failure must not block reading the local ref.
+        let _ = tokio::process::Command::new(git_bin())
+            .arg("-C")
+            .arg(repo)
+            .arg("fetch")
+            .arg("--quiet")
+            .output()
+            .await;
+    }
+    let output = tokio::process::Command::new(git_bin())
+        .arg("-C")
+        .arg(repo)
+        .arg("rev-parse")
+        .arg(git_ref)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
 }
 
 #[cfg(test)]
@@ -145,6 +179,78 @@ mod tests {
         assert_eq!(
             last_shas_for_project(&pool, "p2").await.unwrap(),
             HashMap::from([("t1".to_string(), "zzz".to_string())])
+        );
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start")
+            .success()
+    }
+
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git should start");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("create repo tempdir");
+        assert!(git_ok(repo.path(), &["init"]));
+        assert!(git_ok(repo.path(), &["config", "user.email", "test@x"]));
+        assert!(git_ok(repo.path(), &["config", "user.name", "test"]));
+        std::fs::write(repo.path().join("seed.txt"), "seed\n").unwrap();
+        assert!(git_ok(repo.path(), &["add", "-A"]));
+        assert!(git_ok(repo.path(), &["commit", "-m", "seed"]));
+        repo
+    }
+
+    #[tokio::test]
+    async fn current_sha_matches_rev_parse_and_tracks_a_new_commit() {
+        let repo = init_repo();
+        let head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            current_branch_sha(repo.path(), "HEAD", false).await,
+            Some(head.clone())
+        );
+
+        std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+        assert!(git_ok(repo.path(), &["add", "-A"]));
+        assert!(git_ok(repo.path(), &["commit", "-m", "second"]));
+        let head2 = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(head, head2);
+        assert_eq!(
+            current_branch_sha(repo.path(), "HEAD", false).await,
+            Some(head2)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_ref_returns_none() {
+        let repo = init_repo();
+        assert_eq!(
+            current_branch_sha(repo.path(), "no-such-branch", false).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_true_without_a_remote_is_best_effort() {
+        let repo = init_repo();
+        // fetch fails (no remote configured) but the local ref still resolves.
+        assert!(
+            current_branch_sha(repo.path(), "HEAD", true)
+                .await
+                .is_some()
         );
     }
 }
