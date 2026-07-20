@@ -1,6 +1,7 @@
 mod auth;
 mod autopilot;
 mod autostart;
+mod budget;
 mod classifier;
 mod config;
 mod feed;
