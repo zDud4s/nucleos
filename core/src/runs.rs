@@ -57,6 +57,20 @@ impl From<sqlx::Error> for CreateRunError {
     }
 }
 
+#[derive(Debug)]
+pub enum ResumeError {
+    ProposalNotFound,
+    ProposalNotPending,
+    NotResumable(&'static str),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ResumeError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
 impl std::fmt::Display for CreateRunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -323,6 +337,108 @@ pub async fn create_run_inner(
     Ok(id)
 }
 
+pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
+    let proposal = crate::proposals::get(&state.pool, proposal_id)
+        .await?
+        .ok_or(ResumeError::ProposalNotFound)?;
+    if proposal.kind != "action-approval" || proposal.status != "pending" {
+        return Err(ResumeError::ProposalNotPending);
+    }
+
+    let original_run_id = proposal
+        .run_id
+        .ok_or(ResumeError::NotResumable("proposal has no run_id"))?;
+    let session_id = proposal
+        .session_id
+        .clone()
+        .ok_or(ResumeError::NotResumable("run has no session_id to resume"))?;
+    let tool_name = proposal
+        .tool_name
+        .clone()
+        .ok_or(ResumeError::NotResumable("proposal has no tool_name"))?;
+
+    let (wt_project_id, wt_path) = sqlx::query_as::<_, (String, String)>(
+        "SELECT project_id, path FROM worktrees WHERE run_id = ? AND removed_at IS NULL",
+    )
+    .bind(original_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ResumeError::NotResumable(
+        "no live worktree for the paused run",
+    ))?;
+
+    let prompt = format!(
+        "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — that one high-risk action is now authorized for this run — then finish the task."
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = state.pool.begin().await?;
+
+    sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=?")
+        .bind(&now)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
+    let result = sqlx::query(
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+         VALUES (?, ?, ?, 'running', 'worktree', ?)",
+    )
+    .bind(&wt_project_id)
+    .bind(&wt_path)
+    .bind(&prompt)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    let resume_id = result.last_insert_rowid();
+    sqlx::query("UPDATE worktrees SET run_id=? WHERE run_id=?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO action_grants (run_id, tool_name, proposal_id, created_at, consumed_at)
+         VALUES (?, ?, ?, ?, NULL)",
+    )
+    .bind(resume_id)
+    .bind(&tool_name)
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE proposals SET status='approved', decided_at=? WHERE id=?")
+        .bind(&now)
+        .bind(proposal_id)
+        .execute(&mut *tx)
+        .await?;
+    let note = format!("approved; resume run {resume_id}");
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, 'pending', 'approved', ?, ?)",
+    )
+    .bind(proposal_id)
+    .bind(&note)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    spawn_run(
+        state,
+        resume_id,
+        prompt,
+        Some(wt_project_id),
+        Some(std::path::PathBuf::from(&wt_path)),
+        false,
+        Some(session_id),
+        Some((
+            "worktree_run_completed".to_owned(),
+            format!("resumed run completed on nucleos/run-{original_run_id}"),
+        )),
+    );
+
+    Ok(resume_id)
+}
+
 pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -410,6 +526,7 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
 mod tests {
     use super::*;
     use crate::auth::Token;
+    use crate::proposals;
     use crate::runner::{FakeCommandRunner, RunOutcome};
     use axum::Router;
     use axum::body::Body;
@@ -435,61 +552,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query(
-            "CREATE TABLE runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT,
-                cwd TEXT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL,
-                exit_code INTEGER,
-                stdout TEXT,
-                stderr TEXT,
-                session_id TEXT,
-                cost_usd REAL,
-                mode TEXT NOT NULL DEFAULT 'real',
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX one_open_worktree_run_per_project
-             ON runs (project_id)
-             WHERE mode = 'worktree' AND status IN ('running', 'awaiting_approval')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE feed (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT,
-                kind TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                run_id INTEGER,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE worktrees (
-                run_id INTEGER PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                project_root TEXT NOT NULL,
-                path TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                removed_at TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
 
         let runner = Arc::new(FakeCommandRunner {
             canned: std::sync::Mutex::new(Some(RunOutcome {
@@ -683,6 +746,165 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn seed_resumable_action_approval(
+        state: &AppState,
+        session_id: Option<&str>,
+    ) -> (i64, i64, PathBuf) {
+        let worktree_path = PathBuf::from("C:/worktrees/proj/run-paused");
+        let project_root = "C:/repos/proj";
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', ?, 'worktree', ?)",
+        )
+        .bind(worktree_path.to_string_lossy().as_ref())
+        .bind(session_id)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let original_run_id = result.last_insert_rowid();
+
+        sqlx::query(
+            "INSERT INTO worktrees
+             (run_id, project_id, project_root, path, branch, created_at)
+             VALUES (?, 'proj', ?, ?, ?, ?)",
+        )
+        .bind(original_run_id)
+        .bind(project_root)
+        .bind(worktree_path.to_string_lossy().as_ref())
+        .bind(format!("nucleos/run-{original_run_id}"))
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            original_run_id,
+            session_id,
+            Some("proj"),
+            "Bash",
+            "push needs approval",
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+
+        (original_run_id, proposal_id, worktree_path)
+    }
+
+    #[tokio::test]
+    async fn approve_resumes_session_in_same_worktree_and_grants_the_action() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (original_run_id, proposal_id, worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-a")).await;
+
+        let resume_run_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        for _ in 0..100 {
+            if runner.last_resume.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let original_status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = ?")
+                .bind(original_run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(original_status, "superseded");
+
+        let resume_run = sqlx::query_as::<_, (Option<String>, Option<String>, String, String)>(
+            "SELECT project_id, cwd, status, mode FROM runs WHERE id = ?",
+        )
+        .bind(resume_run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(resume_run.0.as_deref(), Some("proj"));
+        assert_eq!(resume_run.1.as_deref(), worktree_path.to_str());
+        assert_eq!(resume_run.2, "running");
+        assert_eq!(resume_run.3, "worktree");
+
+        let transferred_run_id =
+            sqlx::query_scalar::<_, i64>("SELECT run_id FROM worktrees WHERE path = ?")
+                .bind(worktree_path.to_string_lossy().as_ref())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(transferred_run_id, resume_run_id);
+
+        let grant = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT tool_name, consumed_at FROM action_grants WHERE run_id = ?",
+        )
+        .bind(resume_run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(grant, ("Bash".to_owned(), None));
+
+        let proposal = proposals::get(&state.pool, proposal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.status, "approved");
+        assert_eq!(
+            *runner.last_resume.lock().unwrap(),
+            Some("sess-a".to_owned())
+        );
+        assert_eq!(
+            *runner.last_cwd.lock().unwrap(),
+            Some(worktree_path.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_non_pending_proposal_is_rejected() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (_, proposal_id, _) = seed_resumable_action_approval(&state, Some("sess-a")).await;
+        assert!(
+            proposals::transition(&state.pool, proposal_id, "rejected", "x")
+                .await
+                .unwrap()
+        );
+        let count_before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        let result = resume_approved_run(&state, proposal_id).await;
+
+        assert!(matches!(result, Err(ResumeError::ProposalNotPending)));
+        let count_after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count_after, count_before);
+    }
+
+    #[tokio::test]
+    async fn approve_unknown_proposal_is_not_found() {
+        let state = test_state().await;
+
+        let result = resume_approved_run(&state, 999_999).await;
+
+        assert!(matches!(result, Err(ResumeError::ProposalNotFound)));
+    }
+
+    #[tokio::test]
+    async fn approve_requires_a_session_id() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (_, proposal_id, _) = seed_resumable_action_approval(&state, None).await;
+
+        let result = resume_approved_run(&state, proposal_id).await;
+
+        assert!(matches!(result, Err(ResumeError::NotResumable(_))));
     }
 
     #[tokio::test]
