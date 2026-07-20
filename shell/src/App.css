@@ -50,6 +50,134 @@
   color: #666666;
 }
 
+.autopilot {
+  width: min(960px, calc(100% - 2rem));
+  margin: 0 auto;
+  text-align: left;
+}
+
+.autopilot > h2 {
+  text-align: center;
+}
+
+.autopilot-summary,
+.kill-switch,
+.card-header,
+.badges {
+  display: flex;
+  align-items: center;
+}
+
+.autopilot-summary,
+.kill-switch {
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.kill-switch {
+  padding: 0.75rem 1rem;
+  border: 1px solid #c6cbd3;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.kill-switch.engaged {
+  color: #8c1d18;
+  border-color: #d94a42;
+  background: #fff0ef;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.card {
+  padding: 1rem;
+  border: 1px solid #d4d7dc;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
+}
+
+.card-header {
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.card-header h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.badges {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.badge.neutral {
+  color: #434851;
+  background: #e5e7eb;
+}
+
+.badge.info {
+  color: #17558b;
+  background: #dbeeff;
+}
+
+.badge.success {
+  color: #17633a;
+  background: #d9f5e4;
+}
+
+.badge.pending {
+  color: #81540a;
+  background: #fff0c2;
+}
+
+.field {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+  color: #555b65;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.field input,
+.field select {
+  box-sizing: border-box;
+  width: 100%;
+  border: 1px solid #c6cbd3;
+  border-radius: 8px;
+  padding: 0.6em 0.75em;
+  color: #0f0f0f;
+  background: #ffffff;
+  font: inherit;
+  font-weight: 400;
+}
+
+.error {
+  color: #a62b24;
+  font-size: 0.85rem;
+}
+
 .logo {
   height: 6em;
   padding: 1.5em;
@@ -141,5 +269,32 @@ button {
 
   .muted {
     color: #b8b8b8;
+  }
+
+  .kill-switch,
+  .card {
+    border-color: #555b65;
+    background: #252525;
+  }
+
+  .kill-switch.engaged {
+    color: #ffb4ae;
+    border-color: #e56b64;
+    background: #4a201e;
+  }
+
+  .field {
+    color: #c8cbd0;
+  }
+
+  .field input,
+  .field select {
+    color: #ffffff;
+    border-color: #666c75;
+    background: #181818;
+  }
+
+  .error {
+    color: #ffaaa4;
   }
 }
