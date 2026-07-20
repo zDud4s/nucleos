@@ -140,6 +140,10 @@ pub struct FakeCommandRunner {
     pub last_plan_only: std::sync::Mutex<Option<bool>>,
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
+    /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
+    pub fail_times: std::sync::Mutex<u32>,
+    /// Test-only: count of run_prompt invocations.
+    pub calls: std::sync::Mutex<u32>,
 }
 
 #[async_trait]
@@ -153,6 +157,19 @@ impl CommandRunner for FakeCommandRunner {
         resume_session_id: Option<&str>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
+        {
+            *self.calls.lock().unwrap() += 1;
+        }
+        {
+            let mut remaining = self.fail_times.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "fake launch failure",
+                ));
+            }
+        }
         *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());
         *self.last_plan_only.lock().unwrap() = Some(plan_only);
         *self.last_resume.lock().unwrap() = resume_session_id.map(|s| s.to_string());
@@ -230,5 +247,31 @@ mod tests {
             *runner.last_resume.lock().unwrap(),
             Some("sess-9".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn fake_runner_fails_configured_times_then_succeeds() {
+        let runner = FakeCommandRunner {
+            fail_times: std::sync::Mutex::new(2),
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            assert!(
+                runner
+                    .run_prompt("x", &[], None, false, None, tx)
+                    .await
+                    .is_err()
+            );
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            runner
+                .run_prompt("x", &[], None, false, None, tx)
+                .await
+                .is_ok()
+        );
+        assert_eq!(*runner.calls.lock().unwrap(), 3);
     }
 }

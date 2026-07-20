@@ -566,6 +566,7 @@ mod tests {
             last_plan_only: std::sync::Mutex::new(None),
             last_cwd: std::sync::Mutex::new(None),
             last_resume: std::sync::Mutex::new(None),
+            ..Default::default()
         });
         let state = AppState {
             token: Token("test-token".into()),
