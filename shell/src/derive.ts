@@ -1,0 +1,42 @@
+import type { AutopilotMode, ClassTally, ProjectSummary } from "./api";
+
+export type Tone = "neutral" | "info" | "success";
+
+export interface Badge {
+  label: string;
+  tone: Tone;
+}
+
+export function modeBadge(mode: AutopilotMode): Badge {
+  switch (mode) {
+    case "off":
+      return { label: "Off", tone: "neutral" };
+    case "shadow":
+      return { label: "Shadow", tone: "info" };
+    case "active":
+      return { label: "Active", tone: "success" };
+  }
+}
+
+export function totalPending(projects: ProjectSummary[]): number {
+  return projects.reduce((sum, project) => sum + project.pending, 0);
+}
+
+export function agreementRate(tally: ClassTally): number | null {
+  if (tally.reviewed === 0) return null;
+  return tally.agree / tally.reviewed;
+}
+
+export function groupScoreboardByMode(
+  tallies: ClassTally[],
+): Record<string, ClassTally[]> {
+  const grouped: Record<string, ClassTally[]> = {};
+  for (const tally of tallies) {
+    (grouped[tally.mode] ??= []).push(tally);
+  }
+  return grouped;
+}
+
+export function killSwitchLabel(engaged: boolean): string {
+  return engaged ? "Kill switch engaged — autopilot paused" : "Kill switch off";
+}
