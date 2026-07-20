@@ -22,3 +22,233 @@ export async function getStatus(token: string): Promise<string | null> {
     return null;
   }
 }
+
+export type AutopilotMode = "off" | "shadow" | "active";
+
+export interface ProjectSummary {
+  project_id: string;
+  mode: AutopilotMode;
+  pending: number;
+}
+
+export interface FeedEntry {
+  id: number;
+  project_id: string | null;
+  kind: string;
+  summary: string;
+  run_id: number | null;
+  created_at: string;
+}
+
+export interface ClassTally {
+  mode: string;
+  action_class: string;
+  total: number;
+  would_allow: number;
+  would_pend: number;
+  would_deny: number;
+  reviewed: number;
+  agree: number;
+  disagree: number;
+}
+
+export interface ShadowDecision {
+  id: number;
+  run_id: number;
+  tool_name: string;
+  tool_input: string | null;
+  decision: string;
+  reason: string | null;
+  action_class: string;
+  classifier_version: number;
+  human_verdict: string | null;
+  reviewed_at: string | null;
+  created_at: string;
+}
+
+export interface AwaitingRun {
+  id: number;
+  project_id: string | null;
+  prompt: string;
+  cwd: string | null;
+  created_at: string;
+}
+
+export type SetModeResult = { ok: true } | { ok: false; status: number };
+
+export async function getProjects(
+  token: string,
+): Promise<ProjectSummary[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/projects`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function getFeed(
+  token: string,
+  opts?: { scope?: "all"; projectId?: string },
+): Promise<FeedEntry[] | null> {
+  let path = "/feed";
+  if (opts?.scope === "all") {
+    path += "?scope=all";
+  } else if (opts?.projectId) {
+    path += `?project_id=${encodeURIComponent(opts.projectId)}`;
+  }
+
+  try {
+    const res = await fetch(`${DAEMON_URL}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function getScoreboard(
+  token: string,
+  projectId: string,
+): Promise<ClassTally[] | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/scoreboard?project_id=${encodeURIComponent(projectId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function getShadowDecisions(
+  token: string,
+  projectId: string,
+): Promise<ShadowDecision[] | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/shadow-decisions?project_id=${encodeURIComponent(projectId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function setVerdict(
+  token: string,
+  id: number,
+  verdict: "approve" | "reject",
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/shadow-decisions/${id}/verdict`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ verdict }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function getAwaitingApproval(
+  token: string,
+): Promise<AwaitingRun[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/awaiting-approval`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function releaseWorktree(
+  token: string,
+  runId: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/worktrees/${runId}/release`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function getKillSwitch(token: string): Promise<boolean | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/kill`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.engaged;
+  } catch {
+    return null;
+  }
+}
+
+export async function setKillSwitch(
+  token: string,
+  engaged: boolean,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/kill`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ engaged }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function setProjectMode(
+  token: string,
+  projectId: string,
+  mode: AutopilotMode,
+  projectRoot?: string,
+): Promise<SetModeResult> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/state`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        project_id: projectId,
+        mode,
+        project_root: projectRoot,
+      }),
+    });
+    return res.ok ? { ok: true } : { ok: false, status: res.status };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
