@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
-use crate::autopilot::{self, ActivationError, Mode, ProjectSummary};
+use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
@@ -35,6 +35,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/autopilot/kill",
             get(get_autopilot_kill).post(post_autopilot_kill),
+        )
+        .route(
+            "/autopilot/kill/scoped",
+            get(get_autopilot_kill_scoped).post(post_autopilot_kill_scoped),
         )
         .route(
             "/autopilot/budget",
@@ -106,6 +110,13 @@ struct AutopilotStateResponse {
 
 #[derive(Deserialize)]
 struct AutopilotKillRequest {
+    engaged: bool,
+}
+
+#[derive(Deserialize)]
+struct ScopedKillRequest {
+    scope_type: String,
+    scope_id: String,
     engaged: bool,
 }
 
@@ -182,6 +193,28 @@ async fn post_autopilot_kill(
     Json(body): Json<AutopilotKillRequest>,
 ) -> Result<StatusCode, StatusCode> {
     autopilot::set_kill_switch(&state.pool, body.engaged)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_autopilot_kill_scoped(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ScopedKill>>, StatusCode> {
+    autopilot::list_scoped_kills(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn post_autopilot_kill_scoped(
+    State(state): State<AppState>,
+    Json(body): Json<ScopedKillRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if body.scope_type != "project" && body.scope_type != "trigger" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    autopilot::set_scoped_kill(&state.pool, &body.scope_type, &body.scope_id, body.engaged)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1137,5 +1170,101 @@ mod tests {
         assert_eq!(parsed["paused"], serde_json::json!(true));
         assert_eq!(parsed["window_spend_usd"], serde_json::json!(5.0));
         assert!(parsed["reason"].is_string());
+    }
+
+    #[tokio::test]
+    async fn autopilot_kill_scoped_get_is_empty_by_default() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/kill/scoped")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn autopilot_kill_scoped_post_then_get_reflects_it() {
+        let app = build_router(test_state().await);
+        let post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/kill/scoped")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "scope_type": "project",
+                            "scope_id": "alpha",
+                            "engaged": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::NO_CONTENT);
+
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/kill/scoped")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                { "scope_type": "project", "scope_id": "alpha", "engaged": true }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn autopilot_kill_scoped_post_rejects_invalid_scope_type() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/kill/scoped")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "scope_type": "bogus",
+                            "scope_id": "x",
+                            "engaged": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
