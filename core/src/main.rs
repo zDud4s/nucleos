@@ -9,6 +9,7 @@ mod hooks;
 mod http;
 mod logging;
 mod proposals;
+mod repo_trigger;
 mod runner;
 mod runs;
 mod scheduler;

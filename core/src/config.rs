@@ -46,10 +46,19 @@ pub struct ScheduleRule {
     pub cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RepoTrigger {
+    pub name: String,
+    pub branch: String,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct AutopilotRules {
     #[serde(default)]
     pub schedules: Vec<ScheduleRule>,
+    #[serde(default)]
+    pub repo_triggers: Vec<RepoTrigger>,
 }
 
 pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRules> {
@@ -188,5 +197,26 @@ mod tests {
         .unwrap();
 
         assert!(load_schedule_rules(dir.path()).is_err());
+    }
+
+    #[test]
+    fn repo_triggers_parse_and_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::write(
+            dir.path().join(".ai").join("autopilot.yaml"),
+            "repo_triggers:\n\
+             \x20\x20- name: review-main\n\
+             \x20\x20\x20\x20branch: main\n\
+             \x20\x20\x20\x20prompt: \"review new commits on main\"\n",
+        )
+        .unwrap();
+
+        let rules = load_schedule_rules(dir.path()).unwrap();
+        assert!(rules.schedules.is_empty());
+        assert_eq!(rules.repo_triggers.len(), 1);
+        assert_eq!(rules.repo_triggers[0].name, "review-main");
+        assert_eq!(rules.repo_triggers[0].branch, "main");
+        assert_eq!(rules.repo_triggers[0].prompt, "review new commits on main");
     }
 }
