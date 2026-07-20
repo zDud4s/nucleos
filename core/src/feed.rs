@@ -62,9 +62,21 @@ pub async fn list_feed(
     }
 }
 
+/// Aggregated feed across EVERY scope (global NULL rows + all projects), newest-first, honoring `limit`.
+/// Distinct from `list_feed(None)`, which returns only global (`project_id IS NULL`) rows.
+pub async fn list_all(pool: &sqlx::SqlitePool, limit: i64) -> sqlx::Result<Vec<FeedEntry>> {
+    sqlx::query_as::<_, FeedEntry>(
+        "SELECT id, project_id, kind, summary, run_id, created_at
+         FROM feed ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{append, list_feed};
+    use super::{append, list_all, list_feed};
 
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -146,5 +158,92 @@ mod tests {
             vec![third, second]
         );
         assert!(first < second);
+    }
+
+    #[tokio::test]
+    async fn list_all_merges_every_scope_newest_first() {
+        let pool = test_pool().await;
+        let global = append(&pool, None, "global", "global summary", None)
+            .await
+            .unwrap();
+        let project_a = append(
+            &pool,
+            Some("project-a"),
+            "project",
+            "project a summary",
+            None,
+        )
+        .await
+        .unwrap();
+        let project_b = append(
+            &pool,
+            Some("project-b"),
+            "project",
+            "project b summary",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let entries = list_all(&pool, 50).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![project_b, project_a, global]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_honors_limit() {
+        let pool = test_pool().await;
+        let first = append(&pool, None, "event", "first", None).await.unwrap();
+        let second = append(&pool, Some("project-a"), "event", "second", None)
+            .await
+            .unwrap();
+        let third = append(&pool, Some("project-b"), "event", "third", None)
+            .await
+            .unwrap();
+
+        let entries = list_all(&pool, 2).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![third, second]
+        );
+        assert!(first < second);
+    }
+
+    #[tokio::test]
+    async fn list_feed_keeps_global_and_project_scopes_isolated() {
+        let pool = test_pool().await;
+        append(&pool, None, "global", "global summary", None)
+            .await
+            .unwrap();
+        append(
+            &pool,
+            Some("project-a"),
+            "project",
+            "project a summary",
+            None,
+        )
+        .await
+        .unwrap();
+        append(
+            &pool,
+            Some("project-b"),
+            "project",
+            "project b summary",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let global = list_feed(&pool, None, 50).await.unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].project_id, None);
+        assert_eq!(global[0].summary, "global summary");
+
+        let project_a = list_feed(&pool, Some("project-a"), 50).await.unwrap();
+        assert_eq!(project_a.len(), 1);
+        assert_eq!(project_a[0].project_id.as_deref(), Some("project-a"));
+        assert_eq!(project_a[0].summary, "project a summary");
     }
 }

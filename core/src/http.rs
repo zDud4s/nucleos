@@ -75,6 +75,7 @@ struct ProjectQuery {
 #[derive(Deserialize)]
 struct FeedQuery {
     project_id: Option<String>,
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -187,8 +188,12 @@ async fn get_feed(
     State(state): State<AppState>,
     Query(query): Query<FeedQuery>,
 ) -> Result<Json<Vec<FeedEntry>>, StatusCode> {
-    feed::list_feed(&state.pool, query.project_id.as_deref(), 50)
-        .await
+    let entries = if query.scope.as_deref() == Some("all") {
+        feed::list_all(&state.pool, 50).await
+    } else {
+        feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
+    };
+    entries
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -471,5 +476,134 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn feed_scope_all_returns_global_and_project_rows() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        crate::feed::append(&pool, None, "global", "global summary", None)
+            .await
+            .unwrap();
+        crate::feed::append(
+            &pool,
+            Some("project-a"),
+            "project",
+            "project a summary",
+            None,
+        )
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?scope=all")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["summary"], "project a summary");
+        assert_eq!(entries[1]["summary"], "global summary");
+    }
+
+    #[tokio::test]
+    async fn feed_project_query_returns_only_that_project() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        crate::feed::append(&pool, None, "global", "global summary", None)
+            .await
+            .unwrap();
+        crate::feed::append(
+            &pool,
+            Some("project-a"),
+            "project",
+            "project a summary",
+            None,
+        )
+        .await
+        .unwrap();
+        crate::feed::append(
+            &pool,
+            Some("project-b"),
+            "project",
+            "project b summary",
+            None,
+        )
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?project_id=project-a")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["project_id"], "project-a");
+        assert_eq!(entries[0]["summary"], "project a summary");
+    }
+
+    #[tokio::test]
+    async fn feed_without_query_returns_only_global_rows() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        crate::feed::append(&pool, None, "global", "global summary", None)
+            .await
+            .unwrap();
+        crate::feed::append(
+            &pool,
+            Some("project-a"),
+            "project",
+            "project a summary",
+            None,
+        )
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/feed")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
+        assert_eq!(entries[0]["summary"], "global summary");
     }
 }
