@@ -42,7 +42,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/proposals", get(get_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
+        .route("/proposals/{id}/reject", post(post_proposal_reject))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -208,6 +210,15 @@ async fn list_awaiting_approval_runs(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn get_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -218,6 +229,18 @@ async fn post_proposal_approve(
         Err(crate::runs::ResumeError::ProposalNotPending)
         | Err(crate::runs::ResumeError::NotResumable(_)) => Err(StatusCode::CONFLICT),
         Err(crate::runs::ResumeError::Db(_)) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn post_proposal_reject(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::proposals::reject_proposal(&state.pool, id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(crate::proposals::RejectError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(crate::proposals::RejectError::NotPending) => Err(StatusCode::CONFLICT),
+        Err(crate::proposals::RejectError::Db(_)) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -620,6 +643,168 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
         assert_eq!(entries[0]["summary"], "global summary");
+    }
+
+    #[tokio::test]
+    async fn list_proposals_returns_pending_action_approvals() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (10, 'first run', 'awaiting_approval', 'worktree', '2026-07-20T12:00:00Z'),
+                    (11, 'second run', 'awaiting_approval', 'worktree', '2026-07-20T12:01:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        proposals::create_action_approval(
+            &pool,
+            10,
+            Some("s10"),
+            Some("p"),
+            "Bash",
+            "first pending",
+            None,
+        )
+        .await
+        .unwrap();
+        proposals::create_action_approval(
+            &pool,
+            11,
+            Some("s11"),
+            Some("p"),
+            "Edit",
+            "second pending",
+            None,
+        )
+        .await
+        .unwrap();
+        let approved = proposals::create_action_approval(
+            &pool,
+            12,
+            Some("s12"),
+            Some("p"),
+            "Write",
+            "already approved",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            proposals::transition(&pool, approved, "approved", "x")
+                .await
+                .unwrap()
+        );
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/proposals")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["tool_name"], "Bash");
+        assert_eq!(entries[0]["reasoning"], "first pending");
+        assert_eq!(entries[0]["run_id"], 10);
+        assert_eq!(entries[1]["tool_name"], "Edit");
+        assert_eq!(entries[1]["reasoning"], "second pending");
+        assert_eq!(entries[1]["run_id"], 11);
+    }
+
+    #[tokio::test]
+    async fn list_proposals_rejects_without_token() {
+        let app = build_router(test_state().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/proposals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reject_endpoint_discards_and_returns_204() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let result = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('reject this run', 'awaiting_approval', 'worktree', '2026-07-20T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = result.last_insert_rowid();
+        let proposal_id = proposals::create_action_approval(
+            &pool,
+            run_id,
+            Some("s"),
+            Some("p"),
+            "Bash",
+            "push needs approval",
+            None,
+        )
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{proposal_id}/reject"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let proposal = proposals::get(&pool, proposal_id).await.unwrap().unwrap();
+        assert_eq!(proposal.status, "rejected");
+        let run_status = sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn reject_unknown_proposal_returns_404() {
+        let app = build_router(test_state().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/proposals/999999/reject")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

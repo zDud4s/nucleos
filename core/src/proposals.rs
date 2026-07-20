@@ -16,6 +16,19 @@ pub struct Proposal {
     pub decided_at: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum RejectError {
+    NotFound,
+    NotPending,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for RejectError {
+    fn from(error: sqlx::Error) -> Self {
+        RejectError::Db(error)
+    }
+}
+
 pub async fn create_action_approval(
     pool: &SqlitePool,
     run_id: i64,
@@ -113,6 +126,19 @@ pub async fn transition(
 
     transaction.commit().await?;
     Ok(true)
+}
+
+// Reject = discard: reject the pending proposal and discard its paused run.
+pub async fn reject_proposal(pool: &SqlitePool, id: i64) -> Result<(), RejectError> {
+    let proposal = get(pool, id).await?.ok_or(RejectError::NotFound)?;
+    if proposal.kind != "action-approval" || proposal.status != "pending" {
+        return Err(RejectError::NotPending);
+    }
+    transition(pool, id, "rejected", "rejected by user").await?;
+    if let Some(run_id) = proposal.run_id {
+        crate::worktree::release(pool, run_id).await?;
+    }
+    Ok(())
 }
 
 // Records a single-use authorization for a resume run.
@@ -363,6 +389,75 @@ mod tests {
                 .iter()
                 .all(|proposal| proposal.kind == "action-approval" && proposal.status == "pending")
         );
+    }
+
+    #[tokio::test]
+    async fn reject_marks_proposal_rejected_and_cancels_the_run() {
+        let pool = test_pool().await;
+        let result = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('reject this run', 'awaiting_approval', 'worktree', '2026-07-20T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = result.last_insert_rowid();
+        let proposal_id = create_action_approval(
+            &pool,
+            run_id,
+            Some("s"),
+            Some("p"),
+            "Bash",
+            "push needs approval",
+            None,
+        )
+        .await
+        .unwrap();
+
+        reject_proposal(&pool, proposal_id).await.unwrap();
+
+        let proposal = get(&pool, proposal_id).await.unwrap().unwrap();
+        assert_eq!(proposal.status, "rejected");
+        let run_status = sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn reject_non_pending_proposal_is_conflict() {
+        let pool = test_pool().await;
+        let proposal_id = create_action_approval(
+            &pool,
+            40,
+            Some("s"),
+            Some("p"),
+            "Bash",
+            "push needs approval",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            transition(&pool, proposal_id, "approved", "x")
+                .await
+                .unwrap()
+        );
+
+        let result = reject_proposal(&pool, proposal_id).await;
+
+        assert!(matches!(result, Err(RejectError::NotPending)));
+    }
+
+    #[tokio::test]
+    async fn reject_unknown_proposal_is_not_found() {
+        let pool = test_pool().await;
+
+        let result = reject_proposal(&pool, 999_999).await;
+
+        assert!(matches!(result, Err(RejectError::NotFound)));
     }
 
     #[tokio::test]
