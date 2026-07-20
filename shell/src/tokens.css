@@ -1,0 +1,10 @@
+:root {
+  --bg: oklch(0.155 0.02 265); --bg-raise: oklch(0.19 0.021 265 / 0.6); --glass: color-mix(in oklab, oklch(0.28 0.025 265) 52%, transparent); --glass-line: oklch(0.85 0.02 265 / 0.14); --line: oklch(0.32 0.02 265 / 0.7); --text: oklch(0.93 0.008 265); --muted: oklch(0.68 0.015 265); --faint: oklch(0.52 0.018 265);
+  --gold: oklch(0.82 0.115 85); --green: oklch(0.78 0.11 155); --red: oklch(0.67 0.165 20); --shadow-mode: oklch(0.76 0.05 255); --glow-cool: oklch(0.42 0.06 250 / 0.20); --glow-warm: oklch(0.46 0.06 85 / 0.13);
+  --display:"Cabinet Grotesk","Segoe UI",system-ui,sans-serif; --body:"General Sans","Segoe UI",system-ui,sans-serif; --mono:"Spline Sans Mono","Cascadia Code",ui-monospace,Consolas,monospace;
+  --fs-xs: 11px; --fs-sm: 13px; --fs-md: 14.5px; --fs-lg: 18px; --fs-xl: 23px; --fs-2xl: 29px;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
+  --r-sm: 10px; --r-md: 16px; --r-full: 999px;
+  --shadow-float: 0 18px 44px oklch(0.05 0.02 265 / 0.45), inset 0 1px 0 oklch(1 0 0 / 0.08); --shadow-card: 0 22px 50px oklch(0.05 0.02 265 / 0.4), inset 0 1px 0 oklch(1 0 0 / 0.07); --blur: blur(20px) saturate(1.2);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); --t-fast: 0.15s; --t-med: 0.3s; --t-slow: 0.55s;
+}

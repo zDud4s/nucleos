@@ -41,31 +41,35 @@ function App() {
     };
   }, []);
 
+  const connected = connection === "connected";
+
   return (
-    <main className="container">
-      <h1>NucleOS</h1>
-      <nav className="tabs" aria-label="NucleOS views">
-        <button
-          className={`tab${tab === "home" ? " active" : ""}`}
-          type="button"
-          onClick={() => setTab("home")}
-        >
-          Home
-        </button>
-        <button
-          className={`tab${tab === "autopilot" ? " active" : ""}`}
-          type="button"
-          onClick={() => setTab("autopilot")}
-        >
-          Autopilot
-        </button>
-      </nav>
-      {tab === "home" ? (
-        <Home connection={connection} status={status} />
+    <div className="shell-root">
+      <header className="command">
+        <span className="wordmark">NucleOS</span>
+        <nav className="tabs" aria-label="NucleOS views">
+          <button className="tab" type="button" aria-selected={tab === "home"} onClick={() => setTab("home")}>Home</button>
+          <button className="tab" type="button" aria-selected={tab === "autopilot"} onClick={() => setTab("autopilot")}>Autopilot</button>
+        </nav>
+        <div className="right">
+          <span className={`conn ${connected ? "online" : "offline"}`}>
+            {connected ? "daemon connected" : "daemon unreachable — retrying"}
+          </span>
+        </div>
+      </header>
+      {!connected ? (
+        <section className="offline-hero">
+          <span className="dot" />
+          <h1>The núcleo isn&apos;t running.</h1>
+          <p>The shell can&apos;t reach the local daemon. Start the NucleOS desktop app; it retries every 3 seconds.</p>
+          <p>Nothing was lost: paused runs stay parked, and the approval queue will be where you left it.</p>
+        </section>
       ) : (
-        <Autopilot token={token} connection={connection} />
+        <main className="page" data-state="normal" data-tab={tab}>
+          {tab === "home" ? <Home connection={connection} status={status} /> : <Autopilot token={token} connection={connection} />}
+        </main>
       )}
-    </main>
+    </div>
   );
 }
 
