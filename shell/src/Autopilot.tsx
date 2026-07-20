@@ -1,21 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  getAwaitingApproval,
+  approveProposal,
   getFeed,
   getKillSwitch,
   getProjects,
+  getProposals,
   getScoreboard,
   getShadowDecisions,
-  releaseWorktree,
+  rejectProposal,
   setKillSwitch,
   setProjectMode,
   setVerdict,
-  type AwaitingRun,
   type AutopilotMode,
   type ClassTally,
   type ConnectionState,
   type FeedEntry,
   type ProjectSummary,
+  type Proposal,
   type ShadowDecision,
 } from "./api";
 import {
@@ -325,89 +326,124 @@ function ShadowReviewPanel({
   );
 }
 
-interface ReleaseQueuePanelProps {
-  runs: AwaitingRun[] | null;
+interface ApprovalQueuePanelProps {
+  proposals: Proposal[] | null;
   loading: boolean;
   token: string;
   refresh: () => Promise<void>;
 }
 
-function ReleaseQueuePanel({
-  runs,
+function ApprovalQueuePanel({
+  proposals,
   loading,
   token,
   refresh,
-}: ReleaseQueuePanelProps) {
+}: ApprovalQueuePanelProps) {
   const [pendingIds, setPendingIds] = useState<Set<number>>(() => new Set());
   const [errors, setErrors] = useState<Record<number, string>>({});
 
-  async function release(runId: number) {
-    setPendingIds((current) => new Set(current).add(runId));
+  function startAction(proposalId: number) {
+    setPendingIds((current) => new Set(current).add(proposalId));
     setErrors((current) => {
       const next = { ...current };
-      delete next[runId];
+      delete next[proposalId];
       return next;
     });
+  }
 
-    const ok = await releaseWorktree(token, runId);
+  function finishAction(proposalId: number) {
+    setPendingIds((current) => {
+      const next = new Set(current);
+      next.delete(proposalId);
+      return next;
+    });
+  }
+
+  async function approve(proposalId: number) {
+    startAction(proposalId);
+
+    const resumedRunId = await approveProposal(token, proposalId);
+    if (resumedRunId !== null) {
+      await refresh();
+    } else {
+      setErrors((current) => ({
+        ...current,
+        [proposalId]: "Could not approve this proposal.",
+      }));
+    }
+
+    finishAction(proposalId);
+  }
+
+  async function reject(proposalId: number) {
+    startAction(proposalId);
+
+    const ok = await rejectProposal(token, proposalId);
     if (ok) {
       await refresh();
     } else {
       setErrors((current) => ({
         ...current,
-        [runId]: "Could not release this worktree.",
+        [proposalId]: "Could not reject this proposal.",
       }));
     }
 
-    setPendingIds((current) => {
-      const next = new Set(current);
-      next.delete(runId);
-      return next;
-    });
+    finishAction(proposalId);
   }
 
   return (
-    <section className="panel release-panel">
-      <h3>Release queue (awaiting approval)</h3>
-      <p className="muted release-help">
-        Release cancels the run, unpins and removes its worktree. It does NOT
-        approve or resume the pending work (approve-and-resume is a later
-        phase).
+    <section className="panel approval-panel">
+      <h3>Approval queue (pending proposals)</h3>
+      <p className="muted approval-help">
+        Approve resumes the paused run in its worktree with a single-use
+        authorization for the blocked action. Reject discards the worktree.
       </p>
-      {runs === null ? (
+      {proposals === null ? (
         !loading && (
           <p className="muted error" role="alert">
-            Could not load runs awaiting approval from the daemon.
+            Could not load pending proposals from the daemon.
           </p>
         )
-      ) : runs.length === 0 ? (
-        <p className="muted">No runs awaiting approval.</p>
+      ) : proposals.length === 0 ? (
+        <p className="muted">No proposals awaiting approval.</p>
       ) : (
         <div className="queue">
-          {runs.map((run) => {
-            const pending = pendingIds.has(run.id);
+          {proposals.map((proposal) => {
+            const pending = pendingIds.has(proposal.id);
             return (
-              <article className="queue-row" key={run.id}>
+              <article className="queue-row" key={proposal.id}>
                 <div className="queue-meta">
-                  <strong>Run {run.id}</strong>
-                  <span>{run.project_id ?? "global"}</span>
-                  <time dateTime={run.created_at}>{run.created_at}</time>
+                  <strong>Run {proposal.run_id ?? "—"}</strong>
+                  <span>{proposal.project_id ?? "global"}</span>
+                  <time dateTime={proposal.created_at}>
+                    {proposal.created_at}
+                  </time>
                 </div>
-                <p>{run.prompt}</p>
-                {run.cwd !== null && <p className="queue-path">{run.cwd}</p>}
+                <p>
+                  <strong>Blocked action:</strong> {proposal.tool_name ?? "—"}
+                </p>
+                <p>{proposal.reasoning}</p>
                 <div className="queue-actions">
+                  <button
+                    type="button"
+                    className="approve-action"
+                    disabled={pending}
+                    onClick={() => void approve(proposal.id)}
+                  >
+                    Approve &amp; resume
+                  </button>
                   <button
                     type="button"
                     className="discard-action"
                     disabled={pending}
-                    onClick={() => void release(run.id)}
+                    onClick={() => void reject(proposal.id)}
                   >
-                    Discard (release worktree)
+                    Reject (discard worktree)
                   </button>
                 </div>
-                {errors[run.id] !== undefined && (
+                {errors[proposal.id] !== undefined && (
                   <p className="error" role="alert">
-                    {errors[run.id]}
+                    {errors[proposal.id]}
                   </p>
                 )}
               </article>
@@ -428,7 +464,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
   const [shadowDecisions, setShadowDecisions] = useState<
     ShadowDecision[] | null
   >(null);
-  const [awaitingRuns, setAwaitingRuns] = useState<AwaitingRun[] | null>(null);
+  const [proposals, setProposals] = useState<Proposal[] | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [togglingKillSwitch, setTogglingKillSwitch] = useState(false);
@@ -439,7 +475,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     setLoading(true);
     setScoreboard(null);
     setShadowDecisions(null);
-    const [nextProjects, nextKillEngaged, nextFeed, nextAwaitingRuns] =
+    const [nextProjects, nextKillEngaged, nextFeed, nextProposals] =
       await Promise.all([
         getProjects(token),
         getKillSwitch(token),
@@ -447,7 +483,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
           token,
           selectedProject ? { projectId: selectedProject } : { scope: "all" },
         ),
-        getAwaitingApproval(token),
+        getProposals(token),
       ]);
     let nextScoreboard: ClassTally[] | null = null;
     let nextShadowDecisions: ShadowDecision[] | null = null;
@@ -462,7 +498,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     setFeed(nextFeed);
     setScoreboard(nextScoreboard);
     setShadowDecisions(nextShadowDecisions);
-    setAwaitingRuns(nextAwaitingRuns);
+    setProposals(nextProposals);
     setLoading(false);
   }, [connection, selectedProject, token]);
 
@@ -473,7 +509,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
       setFeed(null);
       setScoreboard(null);
       setShadowDecisions(null);
-      setAwaitingRuns(null);
+      setProposals(null);
       setLoading(true);
       return;
     }
@@ -581,8 +617,8 @@ function Autopilot({ token, connection }: AutopilotProps) {
                 />
               </>
             )}
-            <ReleaseQueuePanel
-              runs={awaitingRuns}
+            <ApprovalQueuePanel
+              proposals={proposals}
               loading={loading}
               token={token}
               refresh={refresh}

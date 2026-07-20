@@ -304,15 +304,21 @@
   overflow-wrap: anywhere;
 }
 
-.release-panel {
+.approval-panel {
   border-left: 4px solid #b97812;
   background: #fffcf5;
 }
 
-.release-help {
+.approval-help {
   max-width: 72ch;
   margin-top: -0.35rem;
   font-size: 0.85rem;
+}
+
+.approve-action {
+  color: #ffffff;
+  border-color: #216e48;
+  background: #216e48;
 }
 
 .discard-action {
@@ -498,9 +504,15 @@ button {
     background: #181818;
   }
 
-  .release-panel {
+  .approval-panel {
     border-left-color: #d99a36;
     background: #332d22;
+  }
+
+  .approve-action {
+    color: #0f2318;
+    border-color: #4fc287;
+    background: #4fc287;
   }
 
   .discard-action {
