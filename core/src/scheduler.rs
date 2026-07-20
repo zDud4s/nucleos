@@ -99,6 +99,13 @@ pub(crate) async fn scheduler_tick(
         return;
     }
 
+    if crate::autopilot::scoped_kill_engaged(&state.pool, "trigger", "scheduled")
+        .await
+        .unwrap_or(true)
+    {
+        return;
+    }
+
     if let crate::budget::BudgetDecision::Pause { reason } =
         crate::budget::budget_permits_new_run(&state.pool, now).await
     {
@@ -115,6 +122,13 @@ pub(crate) async fn scheduler_tick(
     };
 
     for (project_id, project_root, project_mode) in projects {
+        if crate::autopilot::scoped_kill_engaged(&state.pool, "project", &project_id)
+            .await
+            .unwrap_or(true)
+        {
+            continue;
+        }
+
         let rules = match config::load_schedule_rules(Path::new(&project_root)) {
             Ok(rules) => rules.schedules,
             Err(error) => {
@@ -739,5 +753,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_a_project_when_its_kill_is_engaged() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-20T10:10:00Z");
+        let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "proj", true)
+            .await
+            .unwrap();
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_still_fires_when_a_different_project_is_killed() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-20T10:10:00Z");
+        let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "some-other-project", true)
+            .await
+            .unwrap();
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_all_when_the_scheduled_trigger_kill_is_engaged() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-20T10:10:00Z");
+        let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+        crate::autopilot::set_scoped_kill(&state.pool, "trigger", "scheduled", true)
+            .await
+            .unwrap();
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 0);
     }
 }
