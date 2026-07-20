@@ -133,7 +133,46 @@ pub async fn pretooluse_decision(
         // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
-            finalize_termination(&state, payload.run_id, "awaiting_approval").await;
+            let terminated =
+                finalize_termination(&state, payload.run_id, "awaiting_approval").await;
+            if terminated {
+                let (session_id, project_id) =
+                    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                        "SELECT session_id, project_id FROM runs WHERE id = ?",
+                    )
+                    .bind(payload.run_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or((None, None));
+                let tool_input = payload.tool_input.to_string();
+                if let Err(error) = crate::proposals::create_action_approval(
+                    &state.pool,
+                    payload.run_id,
+                    session_id.as_deref(),
+                    project_id.as_deref(),
+                    &payload.tool_name,
+                    &classification.reason,
+                    Some(&tool_input),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        run_id = payload.run_id,
+                        %error,
+                        "pretooluse-decision: failed to record action-approval proposal"
+                    );
+                    let _ = crate::feed::append(
+                        &state.pool,
+                        project_id.as_deref(),
+                        "proposal_record_failed",
+                        &format!("failed to record action-approval proposal: {error}"),
+                        Some(payload.run_id),
+                    )
+                    .await;
+                }
+            }
         } else {
             tracing::warn!(
                 "pretooluse-decision: pending_approval for unknown/finished run_id {} — not terminating",
@@ -149,6 +188,7 @@ pub async fn pretooluse_decision(
 mod tests {
     use super::*;
     use crate::auth::Token;
+    use crate::proposals;
     use crate::runner::FakeCommandRunner;
     use axum::Router;
     use axum::body::Body;
@@ -167,40 +207,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // The active-termination path (`git push` -> awaiting_approval) writes the runs table, so the
-        // test pool needs it. A minimal shape is enough for these tests.
-        sqlx::query(
-            "CREATE TABLE runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL,
-                cwd TEXT,
-                mode TEXT NOT NULL DEFAULT 'real',
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE shadow_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL,
-                tool_name TEXT NOT NULL,
-                tool_input TEXT,
-                decision TEXT NOT NULL,
-                reason TEXT,
-                action_class TEXT NOT NULL,
-                classifier_version INTEGER NOT NULL,
-                human_verdict TEXT,
-                reviewed_at TEXT,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
         AppState {
             token: Token("test-token".into()),
             pool,
@@ -624,5 +631,109 @@ mod tests {
             .unwrap();
         assert_ne!(status, "awaiting_approval");
         assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn git_push_pause_creates_a_pending_action_approval_proposal() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', 'C:\\work\\repo', 'x', 'running', 'sess-x', 'worktree', '2026-07-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let proposal = &pending[0];
+        assert_eq!(proposal.run_id, Some(run_id));
+        assert_eq!(proposal.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(proposal.session_id.as_deref(), Some("sess-x"));
+        assert_eq!(proposal.project_id.as_deref(), Some("proj"));
+        assert_eq!(proposal.status, "pending");
+        assert!(!proposal.reasoning.is_empty());
+    }
+
+    #[tokio::test]
+    async fn self_governing_edit_pause_creates_a_proposal_with_edit_tool() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', 'C:\\work\\repo', 'x', 'running', 'sess-e', 'worktree', '2026-07-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Edit",
+                "tool_input": {"file_path": ".ai/autopilot.yaml"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_name.as_deref(), Some("Edit"));
+        assert_eq!(pending[0].run_id, Some(run_id));
+    }
+
+    #[tokio::test]
+    async fn no_proposal_created_when_run_is_not_in_flight() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#,
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert!(pending.is_empty());
     }
 }
