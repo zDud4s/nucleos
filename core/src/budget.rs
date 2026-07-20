@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +129,74 @@ pub async fn set_budget_config(pool: &SqlitePool, cfg: &BudgetConfig) -> sqlx::R
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Calendar-anchored start of the current budget window, in UTC.
+fn window_start(period: BudgetPeriod, now: DateTime<Utc>) -> DateTime<Utc> {
+    let day = match period {
+        BudgetPeriod::Daily => now.date_naive(),
+        BudgetPeriod::Weekly => {
+            let back = now.weekday().num_days_from_monday() as i64;
+            now.date_naive() - chrono::Duration::days(back)
+        }
+        BudgetPeriod::Monthly => now.date_naive().with_day(1).expect("day 1 is always valid"),
+    };
+    day.and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc()
+}
+
+async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
+    let raw: Vec<(Option<String>, Option<f64>, String, Option<String>)> = sqlx::query_as(
+        "SELECT session_id, cost_usd, created_at, completed_at
+         FROM runs
+         WHERE mode IN ('shadow', 'worktree')",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let parse = |value: &str| -> sqlx::Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(value)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|error| {
+                sqlx::Error::Protocol(format!("invalid run timestamp {value}: {error}"))
+            })
+    };
+
+    raw.into_iter()
+        .map(|(session_id, cost_usd, created_at, completed_at)| {
+            Ok(SpendRow {
+                session_id,
+                cost_usd,
+                created_at: parse(&created_at)?,
+                completed_at: completed_at.as_deref().map(parse).transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// Total autonomous spend in the current budget window (calendar-anchored in UTC by the configured period).
+pub async fn window_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<f64> {
+    let cfg = load_budget_config(pool).await?;
+    let since = window_start(cfg.period, now);
+    let rows: Vec<SpendRow> = autonomous_rows(pool)
+        .await?
+        .into_iter()
+        .filter(|row| row.created_at >= since)
+        .collect();
+    Ok(compute_spend(&rows, now, &cfg))
+}
+
+/// Total autonomous spend in the trailing 60 minutes (independent of the window boundary).
+pub async fn hourly_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<f64> {
+    let cfg = load_budget_config(pool).await?;
+    let since = now - chrono::Duration::hours(1);
+    let rows: Vec<SpendRow> = autonomous_rows(pool)
+        .await?
+        .into_iter()
+        .filter(|row| row.created_at >= since)
+        .collect();
+    Ok(compute_spend(&rows, now, &cfg))
 }
 
 #[cfg(test)]
@@ -337,5 +405,155 @@ mod tests {
             compute_spend(&rows, ts("2026-07-20T10:30:00Z"), &cfg(3.0)),
             1.5,
         );
+    }
+
+    async fn insert_run(
+        pool: &SqlitePool,
+        mode: &str,
+        session_id: Option<&str>,
+        cost_usd: Option<f64>,
+        created_at: &str,
+        completed_at: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, cost_usd, created_at, completed_at)
+             VALUES ('p', 'completed', ?, ?, ?, ?, ?)",
+        )
+        .bind(mode)
+        .bind(session_id)
+        .bind(cost_usd)
+        .bind(created_at)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn window_spend_counts_only_autonomous_runs_in_window() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z"); // default period = monthly -> window from 2026-07-01
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(1.0),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "shadow",
+            Some("b"),
+            Some(0.5),
+            "2026-07-15T09:00:00Z",
+            Some("2026-07-15T09:10:00Z"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "real",
+            Some("c"),
+            Some(5.0),
+            "2026-07-12T09:00:00Z",
+            Some("2026-07-12T09:10:00Z"),
+        )
+        .await; // excluded: manual
+        insert_run(
+            &pool,
+            "worktree",
+            Some("d"),
+            Some(9.0),
+            "2026-06-20T09:00:00Z",
+            Some("2026-06-20T09:10:00Z"),
+        )
+        .await; // excluded: before window
+
+        approx(window_spend(&pool, now).await.unwrap(), 1.5);
+    }
+
+    #[tokio::test]
+    async fn window_spend_dedups_resumed_session() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z");
+        // paused original (no result cost) then a resume run reporting the cumulative session total.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("s1"),
+            None,
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:30:00Z"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "worktree",
+            Some("s1"),
+            Some(0.9),
+            "2026-07-11T09:00:00Z",
+            Some("2026-07-11T09:10:00Z"),
+        )
+        .await;
+
+        approx(window_spend(&pool, now).await.unwrap(), 0.9);
+    }
+
+    #[tokio::test]
+    async fn hourly_spend_counts_only_the_last_hour() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z");
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(0.4),
+            "2026-07-20T11:30:00Z",
+            Some("2026-07-20T11:40:00Z"),
+        )
+        .await; // within last hour
+        insert_run(
+            &pool,
+            "worktree",
+            Some("b"),
+            Some(2.0),
+            "2026-07-20T09:00:00Z",
+            Some("2026-07-20T09:10:00Z"),
+        )
+        .await; // older today
+
+        approx(hourly_spend(&pool, now).await.unwrap(), 0.4);
+    }
+
+    #[tokio::test]
+    async fn hourly_spend_is_independent_of_window_across_midnight() {
+        let pool = test_pool().await;
+        // Daily window; at 00:30 UTC the previous hour is in YESTERDAY, before today's window start.
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: None,
+                period: BudgetPeriod::Daily,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T00:30:00Z");
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(0.7),
+            "2026-07-19T23:45:00Z",
+            Some("2026-07-19T23:55:00Z"),
+        )
+        .await;
+
+        approx(window_spend(&pool, now).await.unwrap(), 0.0); // before today's UTC midnight -> excluded
+        approx(hourly_spend(&pool, now).await.unwrap(), 0.7); // within the trailing hour -> included
     }
 }
