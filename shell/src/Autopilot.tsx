@@ -1,23 +1,39 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   approveProposal, getBudget, getFeed, getKillSwitch, getProjects, getProposals,
-  getScoreboard, getShadowDecisions, rejectProposal, setKillSwitch, setProjectMode,
+  getScopedKills, getScoreboard, getShadowDecisions, rejectProposal, setKillSwitch,
+  setProjectMode, setScopedKill,
   setVerdict, type AutopilotMode, type Budget, type ClassTally, type ConnectionState,
-  type FeedEntry, type ProjectSummary, type Proposal, type ShadowDecision,
+  type FeedEntry, type ProjectSummary, type Proposal, type ScopedKill,
+  type ShadowDecision,
 } from "./api";
 import {
   agreementRate, budgetStatusLabel, formatUsd, groupScoreboardByMode,
-  killSwitchLabel, modeBadge, periodLabel, totalPending,
+  killSwitchLabel, modeBadge, periodLabel, promotionReadiness, totalPending,
 } from "./derive";
 
 interface AutopilotProps { token: string | null; connection: ConnectionState; }
-interface ProjectCardProps { project: ProjectSummary; token: string; refresh: () => Promise<void>; selected: boolean; onSelect: () => void; }
+interface ProjectCardProps { project: ProjectSummary; scopedKills: ScopedKill[] | null; token: string; refresh: () => Promise<void>; selected: boolean; onSelect: () => void; }
 
-function ProjectCard({ project, token, refresh, selected, onSelect }: ProjectCardProps) {
+function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect }: ProjectCardProps) {
   const [root, setRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [changing, setChanging] = useState(false);
   const badge = modeBadge(project.mode);
+  const projectKilled =
+    scopedKills?.some(
+      (k) =>
+        k.scope_type === "project" &&
+        k.scope_id === project.project_id &&
+        k.engaged,
+    ) ?? false;
+
+  async function toggleProjectKill() {
+    setChanging(true);
+    await setScopedKill(token, "project", project.project_id, !projectKilled);
+    await refresh();
+    setChanging(false);
+  }
 
   async function changeMode(next: AutopilotMode) {
     setChanging(true);
@@ -53,6 +69,9 @@ function ProjectCard({ project, token, refresh, selected, onSelect }: ProjectCar
             <option value="off">Off</option><option value="shadow">Shadow</option><option value="active">Active</option>
           </select>
         </label>
+        <button type="button" disabled={changing} onClick={() => void toggleProjectKill()}>
+          {projectKilled ? "Resume this project" : "Pause this project"}
+        </button>
         <label className="field">Project root (needed for shadow/active)
           <input type="text" value={root} onChange={(event) => setRoot(event.target.value)} placeholder="C:\\path\\to\\project" />
         </label>
@@ -87,8 +106,8 @@ function ScoreboardPanel({ projectId, scoreboard }: ScoreboardPanelProps) {
       {Object.keys(groupedTallies).length === 0 ? <div className="teach"><span className="t-title">Trust has a shape.</span>Reviewed shadow decisions will show how each action class earns confidence.</div>
         : Object.entries(groupedTallies).map(([mode, tallies]) => <details className="scoreboard" key={mode} open>
             <summary>{mode} — shadow agreement</summary>
-            <table><thead><tr><th>class</th><th>total</th><th>allow</th><th>pend</th><th>deny</th><th>reviewed</th><th>agree</th></tr></thead>
-              <tbody>{tallies.map((tally) => { const rate = agreementRate(tally); return <tr key={tally.action_class}><td>{tally.action_class}</td><td>{tally.total}</td><td>{tally.would_allow}</td><td>{tally.would_pend}</td><td>{tally.would_deny}</td><td>{tally.reviewed}</td><td>{rate === null ? "—" : `${Math.round(rate * 100)}%`}</td></tr>; })}</tbody>
+            <table><thead><tr><th>class</th><th>total</th><th>allow</th><th>pend</th><th>deny</th><th>reviewed</th><th>agree</th><th>ready?</th></tr></thead>
+              <tbody>{tallies.map((tally) => { const rate = agreementRate(tally); const readiness = promotionReadiness(tally); return <tr key={tally.action_class}><td>{tally.action_class}</td><td>{tally.total}</td><td>{tally.would_allow}</td><td>{tally.would_pend}</td><td>{tally.would_deny}</td><td>{tally.reviewed}</td><td>{rate === null ? "—" : `${Math.round(rate * 100)}%`}</td><td>{readiness.ready ? "✓ ready" : "—"}</td></tr>; })}</tbody>
             </table>
           </details>)}
     </section>
@@ -164,10 +183,66 @@ function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill, isSwam
   );
 }
 
+interface ScopedKillPanelProps {
+  scopedKills: ScopedKill[] | null;
+  token: string;
+  refresh: () => Promise<void>;
+}
+
+const TRIGGER_TYPES = ["scheduled", "repo"] as const;
+
+function ScopedKillPanel({ scopedKills, token, refresh }: ScopedKillPanelProps) {
+  const [busy, setBusy] = useState(false);
+
+  function isEngaged(scopeType: string, scopeId: string): boolean {
+    return (
+      scopedKills?.some(
+        (k) =>
+          k.scope_type === scopeType && k.scope_id === scopeId && k.engaged,
+      ) ?? false
+    );
+  }
+
+  async function toggle(scopeType: string, scopeId: string) {
+    setBusy(true);
+    await setScopedKill(token, scopeType, scopeId, !isEngaged(scopeType, scopeId));
+    await refresh();
+    setBusy(false);
+  }
+
+  return (
+    <section className="panel scoped-kill-panel">
+      <h3>Trigger kill switches</h3>
+      <p className="muted">
+        Pause one trigger type without the global panic switch. In-flight runs
+        finish; only new firing stops.
+      </p>
+      {TRIGGER_TYPES.map((type) => {
+        const engaged = isEngaged("trigger", type);
+        return (
+          <div key={type} className="scoped-kill-row">
+            <span>
+              {type} triggers{engaged ? " — paused" : ""}
+            </span>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void toggle("trigger", type)}
+            >
+              {engaged ? "Resume" : "Pause"}
+            </button>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
 function Autopilot({ token, connection }: AutopilotProps) {
   const unavailable = connection !== "connected" || token === null;
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [killEngaged, setKillEngaged] = useState<boolean | null>(null);
+  const [scopedKills, setScopedKills] = useState<ScopedKill[] | null>(null);
   const [feed, setFeed] = useState<FeedEntry[] | null>(null);
   const [scoreboard, setScoreboard] = useState<ClassTally[] | null>(null);
   const [shadowDecisions, setShadowDecisions] = useState<ShadowDecision[] | null>(null);
@@ -183,7 +258,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     setLoading(true);
     setScoreboard(null);
     setShadowDecisions(null);
-    const [nextProjects, nextKillEngaged, nextFeed, nextProposals, nextBudget] =
+    const [nextProjects, nextKillEngaged, nextFeed, nextProposals, nextBudget, nextScopedKills] =
       await Promise.all([
         getProjects(token),
         getKillSwitch(token),
@@ -193,6 +268,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
         ),
         getProposals(token),
         getBudget(token),
+        getScopedKills(token),
       ]);
     let nextScoreboard: ClassTally[] | null = null;
     let nextShadowDecisions: ShadowDecision[] | null = null;
@@ -204,6 +280,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     }
     setProjects(nextProjects);
     setKillEngaged(nextKillEngaged);
+    setScopedKills(nextScopedKills);
     setFeed(nextFeed);
     setScoreboard(nextScoreboard);
     setShadowDecisions(nextShadowDecisions);
@@ -216,6 +293,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
     if (unavailable) {
       setProjects(null);
       setKillEngaged(null);
+      setScopedKills(null);
       setFeed(null);
       setScoreboard(null);
       setShadowDecisions(null);
@@ -250,6 +328,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
       {unavailable ? <div className="teach"><span className="t-title">Autopilot is waiting for the daemon.</span>Connect to the daemon to load projects, decisions and budget state.</div> : <>
         {isKill && <div className="banner kill-banner"><div><span className="b-title">Kill switch engaged.</span><p>Every run is stopped, schedulers are parked, and approvals are read-only until you disengage.</p></div><button type="button" disabled={togglingKillSwitch} onClick={() => void toggleKillSwitch()}>Disengage</button></div>}
         {isBudget && <div className="banner budget-banner"><div><span className="b-title">Autopilot is paused by budget.</span><p>{budget?.reason ?? "No new runs will start until the budget window reopens. Approvals remain available."}</p></div></div>}
+        <ScopedKillPanel scopedKills={scopedKills} token={token} refresh={refresh} />
         <h1 className="headline">{isKill ? <span className="bad">Everything is stopped.</span> : isBudget ? <><em>Paused by budget</em> — approvals still work.</> : isFirst ? <>No projects under autopilot yet.</> : isSwamped ? <><em>{proposals?.length ?? 0} decisions</em>, oldest last. Clear the queue.</> : pending > 0 ? <>All quiet — <em>{pending} decisions</em> waiting on you.</> : <>All quiet. <span className="ok">Nothing needs your signature.</span></>}</h1>
         <div className="statusline" title={budget ? budgetStatusLabel(budget) : undefined}>
           <span>{killSwitchLabel(killEngaged ?? false)}</span>
@@ -263,7 +342,7 @@ function Autopilot({ token, connection }: AutopilotProps) {
         <div className="grid">
           <ApprovalQueuePanel proposals={proposals} loading={loading} token={token} refresh={refresh} isKill={isKill} isSwamped={isSwamped} />
           <div className="stack">
-            <section className={isKill ? "flat dim" : "flat"}><h2>Projects</h2>{projects !== null && projects.length === 0 ? <div className="teach"><span className="t-title">Bring your first project aboard.</span>Start in shadow mode, see what it would do, then promote it when the scoreboard earns your trust.</div> : projects?.map((project) => <ProjectCard key={project.project_id} project={project} token={token} refresh={refresh} selected={selectedProject === project.project_id} onSelect={() => setSelectedProject((current) => current === project.project_id ? null : project.project_id)} />)}</section>
+            <section className={isKill ? "flat dim" : "flat"}><h2>Projects</h2>{projects !== null && projects.length === 0 ? <div className="teach"><span className="t-title">Bring your first project aboard.</span>Start in shadow mode, see what it would do, then promote it when the scoreboard earns your trust.</div> : projects?.map((project) => <ProjectCard key={project.project_id} project={project} scopedKills={scopedKills} token={token} refresh={refresh} selected={selectedProject === project.project_id} onSelect={() => setSelectedProject((current) => current === project.project_id ? null : project.project_id)} />)}</section>
             {selectedProject !== null && <div className="panel-scope"><strong>Viewing {selectedProject}</strong><button type="button" onClick={() => setSelectedProject(null)}>Show all</button></div>}
             {selectedProject !== null && <><ShadowReviewPanel projectId={selectedProject} decisions={shadowDecisions} loading={loading} token={token} refresh={refresh} /><ScoreboardPanel projectId={selectedProject} scoreboard={scoreboard} /></>}
             <FeedPanel feed={feed} loading={loading} selectedProject={selectedProject} />
