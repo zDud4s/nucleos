@@ -28,6 +28,7 @@ pub trait CommandRunner: Send + Sync {
         env: &[(String, String)],
         cwd: Option<&Path>,
         plan_only: bool,
+        resume_session_id: Option<&str>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome>;
 }
@@ -44,6 +45,7 @@ impl CommandRunner for ClaudeCliRunner {
         env: &[(String, String)],
         cwd: Option<&Path>,
         plan_only: bool,
+        resume_session_id: Option<&str>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
@@ -54,6 +56,9 @@ impl CommandRunner for ClaudeCliRunner {
         let mut cmd = Command::new(&claude_bin);
         cmd.arg("-p").arg(prompt);
         cmd.arg("--model").arg(&self.model);
+        if let Some(sid) = resume_session_id {
+            cmd.arg("--resume").arg(sid);
+        }
         cmd.arg("--output-format")
             .arg("stream-json")
             .arg("--verbose");
@@ -134,6 +139,7 @@ pub struct FakeCommandRunner {
     pub delay: std::sync::Mutex<Option<std::time::Duration>>,
     pub last_plan_only: std::sync::Mutex<Option<bool>>,
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub last_resume: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -144,10 +150,12 @@ impl CommandRunner for FakeCommandRunner {
         _env: &[(String, String)],
         cwd: Option<&Path>,
         plan_only: bool,
+        resume_session_id: Option<&str>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());
         *self.last_plan_only.lock().unwrap() = Some(plan_only);
+        *self.last_resume.lock().unwrap() = resume_session_id.map(|s| s.to_string());
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
         let outcome = {
             let guard = self.canned.lock().unwrap();
@@ -190,7 +198,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = runner
-            .run_prompt("what is 6*7", &[], None, false, tx)
+            .run_prompt("what is 6*7", &[], None, false, None, tx)
             .await
             .unwrap();
         assert_eq!(outcome.stdout, "42");
@@ -203,10 +211,24 @@ mod tests {
         let runner = FakeCommandRunner::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle =
-            tokio::spawn(async move { runner.run_prompt("hi", &[], None, false, tx).await });
+            tokio::spawn(async move { runner.run_prompt("hi", &[], None, false, None, tx).await });
         let sid = rx.recv().await;
         assert_eq!(sid.as_deref(), Some("fake-session-id"));
         let outcome = handle.await.unwrap().unwrap();
         assert_eq!(outcome.session_id.as_deref(), Some("fake-session-id"));
+    }
+
+    #[tokio::test]
+    async fn fake_runner_records_the_resume_session_id() {
+        let runner = FakeCommandRunner::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runner
+            .run_prompt("resume please", &[], None, false, Some("sess-9"), tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            *runner.last_resume.lock().unwrap(),
+            Some("sess-9".to_string())
+        );
     }
 }

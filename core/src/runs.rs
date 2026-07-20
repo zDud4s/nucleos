@@ -230,7 +230,14 @@ pub async fn create_run_inner(
     let join_handle = tokio::spawn(async move {
         let result = tokio::time::timeout(
             run_timeout,
-            runner.run_prompt(&prompt, &env, spawn_cwd.as_deref(), plan_only, session_tx),
+            runner.run_prompt(
+                &prompt,
+                &env,
+                spawn_cwd.as_deref(),
+                plan_only,
+                None,
+                session_tx,
+            ),
         )
         .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
@@ -473,6 +480,7 @@ mod tests {
             delay: std::sync::Mutex::new(delay),
             last_plan_only: std::sync::Mutex::new(None),
             last_cwd: std::sync::Mutex::new(None),
+            last_resume: std::sync::Mutex::new(None),
         });
         let state = AppState {
             token: Token("test-token".into()),
