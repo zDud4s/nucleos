@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  getAwaitingApproval,
   getFeed,
   getKillSwitch,
   getProjects,
   getScoreboard,
+  getShadowDecisions,
+  releaseWorktree,
   setKillSwitch,
   setProjectMode,
+  setVerdict,
+  type AwaitingRun,
   type AutopilotMode,
   type ClassTally,
   type ConnectionState,
   type FeedEntry,
   type ProjectSummary,
+  type ShadowDecision,
 } from "./api";
 import {
   agreementRate,
@@ -212,12 +218,217 @@ function ScoreboardPanel({ projectId, scoreboard }: ScoreboardPanelProps) {
   );
 }
 
+interface ShadowReviewPanelProps {
+  projectId: string;
+  decisions: ShadowDecision[] | null;
+  loading: boolean;
+  token: string;
+  refresh: () => Promise<void>;
+}
+
+function ShadowReviewPanel({
+  projectId,
+  decisions,
+  loading,
+  token,
+  refresh,
+}: ShadowReviewPanelProps) {
+  const [pendingIds, setPendingIds] = useState<Set<number>>(() => new Set());
+  const [errors, setErrors] = useState<Record<number, string>>({});
+
+  async function reviewDecision(
+    decisionId: number,
+    verdict: "approve" | "reject",
+  ) {
+    setPendingIds((current) => new Set(current).add(decisionId));
+    setErrors((current) => {
+      const next = { ...current };
+      delete next[decisionId];
+      return next;
+    });
+
+    const ok = await setVerdict(token, decisionId, verdict);
+    if (ok) {
+      await refresh();
+    } else {
+      setErrors((current) => ({
+        ...current,
+        [decisionId]: "Could not save this verdict.",
+      }));
+    }
+
+    setPendingIds((current) => {
+      const next = new Set(current);
+      next.delete(decisionId);
+      return next;
+    });
+  }
+
+  return (
+    <section className="panel">
+      <h3>Shadow review — {projectId}</h3>
+      {decisions === null ? (
+        !loading && (
+          <p className="muted error" role="alert">
+            Could not load shadow decisions from the daemon.
+          </p>
+        )
+      ) : decisions.length === 0 ? (
+        <p className="muted">No decisions awaiting review.</p>
+      ) : (
+        <div className="queue">
+          {decisions.map((decision) => {
+            const pending = pendingIds.has(decision.id);
+            return (
+              <article className="queue-row" key={decision.id}>
+                <div className="queue-meta">
+                  <strong>{decision.tool_name}</strong>
+                  <span>{decision.action_class}</span>
+                  <span>{decision.decision}</span>
+                </div>
+                {decision.reason !== null && <p>{decision.reason}</p>}
+                {decision.tool_input !== null && (
+                  <details>
+                    <summary>input</summary>
+                    <pre>{decision.tool_input}</pre>
+                  </details>
+                )}
+                <div className="queue-actions">
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() =>
+                      void reviewDecision(decision.id, "approve")
+                    }
+                  >
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() => void reviewDecision(decision.id, "reject")}
+                  >
+                    Reject
+                  </button>
+                </div>
+                {errors[decision.id] !== undefined && (
+                  <p className="error" role="alert">
+                    {errors[decision.id]}
+                  </p>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface ReleaseQueuePanelProps {
+  runs: AwaitingRun[] | null;
+  loading: boolean;
+  token: string;
+  refresh: () => Promise<void>;
+}
+
+function ReleaseQueuePanel({
+  runs,
+  loading,
+  token,
+  refresh,
+}: ReleaseQueuePanelProps) {
+  const [pendingIds, setPendingIds] = useState<Set<number>>(() => new Set());
+  const [errors, setErrors] = useState<Record<number, string>>({});
+
+  async function release(runId: number) {
+    setPendingIds((current) => new Set(current).add(runId));
+    setErrors((current) => {
+      const next = { ...current };
+      delete next[runId];
+      return next;
+    });
+
+    const ok = await releaseWorktree(token, runId);
+    if (ok) {
+      await refresh();
+    } else {
+      setErrors((current) => ({
+        ...current,
+        [runId]: "Could not release this worktree.",
+      }));
+    }
+
+    setPendingIds((current) => {
+      const next = new Set(current);
+      next.delete(runId);
+      return next;
+    });
+  }
+
+  return (
+    <section className="panel release-panel">
+      <h3>Release queue (awaiting approval)</h3>
+      <p className="muted release-help">
+        Release cancels the run, unpins and removes its worktree. It does NOT
+        approve or resume the pending work (approve-and-resume is a later
+        phase).
+      </p>
+      {runs === null ? (
+        !loading && (
+          <p className="muted error" role="alert">
+            Could not load runs awaiting approval from the daemon.
+          </p>
+        )
+      ) : runs.length === 0 ? (
+        <p className="muted">No runs awaiting approval.</p>
+      ) : (
+        <div className="queue">
+          {runs.map((run) => {
+            const pending = pendingIds.has(run.id);
+            return (
+              <article className="queue-row" key={run.id}>
+                <div className="queue-meta">
+                  <strong>Run {run.id}</strong>
+                  <span>{run.project_id ?? "global"}</span>
+                  <time dateTime={run.created_at}>{run.created_at}</time>
+                </div>
+                <p>{run.prompt}</p>
+                {run.cwd !== null && <p className="queue-path">{run.cwd}</p>}
+                <div className="queue-actions">
+                  <button
+                    type="button"
+                    className="discard-action"
+                    disabled={pending}
+                    onClick={() => void release(run.id)}
+                  >
+                    Discard (release worktree)
+                  </button>
+                </div>
+                {errors[run.id] !== undefined && (
+                  <p className="error" role="alert">
+                    {errors[run.id]}
+                  </p>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Autopilot({ token, connection }: AutopilotProps) {
   const unavailable = connection !== "connected" || token === null;
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [killEngaged, setKillEngaged] = useState<boolean | null>(null);
   const [feed, setFeed] = useState<FeedEntry[] | null>(null);
   const [scoreboard, setScoreboard] = useState<ClassTally[] | null>(null);
+  const [shadowDecisions, setShadowDecisions] = useState<
+    ShadowDecision[] | null
+  >(null);
+  const [awaitingRuns, setAwaitingRuns] = useState<AwaitingRun[] | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [togglingKillSwitch, setTogglingKillSwitch] = useState(false);
@@ -226,21 +437,32 @@ function Autopilot({ token, connection }: AutopilotProps) {
     if (token === null || connection !== "connected") return;
 
     setLoading(true);
-    const [nextProjects, nextKillEngaged, nextFeed] = await Promise.all([
-      getProjects(token),
-      getKillSwitch(token),
-      getFeed(
-        token,
-        selectedProject ? { projectId: selectedProject } : { scope: "all" },
-      ),
-    ]);
-    const nextScoreboard = selectedProject
-      ? await getScoreboard(token, selectedProject)
-      : null;
+    setScoreboard(null);
+    setShadowDecisions(null);
+    const [nextProjects, nextKillEngaged, nextFeed, nextAwaitingRuns] =
+      await Promise.all([
+        getProjects(token),
+        getKillSwitch(token),
+        getFeed(
+          token,
+          selectedProject ? { projectId: selectedProject } : { scope: "all" },
+        ),
+        getAwaitingApproval(token),
+      ]);
+    let nextScoreboard: ClassTally[] | null = null;
+    let nextShadowDecisions: ShadowDecision[] | null = null;
+    if (selectedProject !== null) {
+      [nextScoreboard, nextShadowDecisions] = await Promise.all([
+        getScoreboard(token, selectedProject),
+        getShadowDecisions(token, selectedProject),
+      ]);
+    }
     setProjects(nextProjects);
     setKillEngaged(nextKillEngaged);
     setFeed(nextFeed);
     setScoreboard(nextScoreboard);
+    setShadowDecisions(nextShadowDecisions);
+    setAwaitingRuns(nextAwaitingRuns);
     setLoading(false);
   }, [connection, selectedProject, token]);
 
@@ -250,6 +472,8 @@ function Autopilot({ token, connection }: AutopilotProps) {
       setKillEngaged(null);
       setFeed(null);
       setScoreboard(null);
+      setShadowDecisions(null);
+      setAwaitingRuns(null);
       setLoading(true);
       return;
     }
@@ -343,11 +567,26 @@ function Autopilot({ token, connection }: AutopilotProps) {
               selectedProject={selectedProject}
             />
             {selectedProject !== null && (
-              <ScoreboardPanel
-                projectId={selectedProject}
-                scoreboard={scoreboard}
-              />
+              <>
+                <ScoreboardPanel
+                  projectId={selectedProject}
+                  scoreboard={scoreboard}
+                />
+                <ShadowReviewPanel
+                  projectId={selectedProject}
+                  decisions={shadowDecisions}
+                  loading={loading}
+                  token={token}
+                  refresh={refresh}
+                />
+              </>
             )}
+            <ReleaseQueuePanel
+              runs={awaitingRuns}
+              loading={loading}
+              token={token}
+              refresh={refresh}
+            />
           </div>
         </>
       )}
