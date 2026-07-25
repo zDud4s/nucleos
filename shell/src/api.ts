@@ -28,6 +28,7 @@ export type AutopilotMode = "off" | "shadow" | "active";
 export interface ProjectSummary {
   project_id: string;
   mode: AutopilotMode;
+  project_root: string | null;
   pending: number;
 }
 
