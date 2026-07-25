@@ -65,6 +65,25 @@ pub async fn pretooluse_decision(
         (None, "real".to_owned())
     };
 
+    // Orchestrator (assistant) turns are already constrained to the NucleOS MCP tools by
+    // `--allowedTools` and delegate all real work to governed runs, so they must NOT go through the
+    // autopilot classifier — doing so would terminate the turn and mint action-approval proposals it
+    // can never satisfy (a resume expects a worktree run). Allow the sanctioned MCP tools, block
+    // everything else, and never create a proposal or terminate the turn.
+    if mode == "assistant" {
+        return if payload.tool_name.starts_with("mcp__nucleos__") {
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "orchestrator NucleOS tool".to_owned(),
+            })
+        } else {
+            Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "the orchestrator is restricted to NucleOS tools".to_owned(),
+            })
+        };
+    }
+
     let classification = classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
@@ -726,6 +745,99 @@ mod tests {
         assert_eq!(proposal.project_id.as_deref(), Some("proj"));
         assert_eq!(proposal.status, "pending");
         assert!(!proposal.reasoning.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assistant_turn_allows_nucleos_mcp_tool() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'assistant', '2026-07-22T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "mcp__nucleos__list_projects",
+                "tool_input": {}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_turn_denies_non_mcp_tool_and_creates_no_proposal() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'assistant', '2026-07-22T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "ToolSearch",
+                "tool_input": {}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

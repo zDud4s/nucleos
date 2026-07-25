@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde::Deserialize;
+use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
@@ -12,6 +13,7 @@ use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
+use crate::inspect;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
@@ -45,12 +47,18 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_budget).post(post_autopilot_budget),
         )
         .route("/projects", get(get_projects))
+        .route("/projects/{id}/ls", get(get_project_ls))
+        .route("/projects/{id}/cat", get(get_project_cat))
+        .route("/projects/{id}/grep", get(get_project_grep))
+        .route("/projects/{id}/diff", get(get_project_diff))
         .route("/feed", get(get_feed))
         .route("/runs", post(create_run))
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/assistant/message", post(post_assistant_message))
+        .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
@@ -88,6 +96,23 @@ struct ProjectQuery {
 struct FeedQuery {
     project_id: Option<String>,
     scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PathQuery {
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GrepQuery {
+    q: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AssistantMessageRequest {
+    chat_id: String,
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +170,17 @@ struct BudgetRequest {
     hourly_limit_usd: Option<f64>,
     per_run_reserve_usd: f64,
     time_cost_per_hour_usd: f64,
+}
+
+async fn post_assistant_message(
+    State(state): State<AppState>,
+    Json(body): Json<AssistantMessageRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match crate::assistant::send_message(&state, &body.chat_id, &body.text).await {
+        Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
+        Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn get_autopilot_state(
@@ -282,6 +318,22 @@ fn activation_status(error: ActivationError) -> StatusCode {
     }
 }
 
+fn inspect_status(error: inspect::InspectError) -> StatusCode {
+    match error {
+        inspect::InspectError::NoRoot | inspect::InspectError::NotFound => StatusCode::NOT_FOUND,
+        inspect::InspectError::UnsafePath => StatusCode::BAD_REQUEST,
+        inspect::InspectError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn resolve_project_root(state: &AppState, id: &str) -> Result<PathBuf, StatusCode> {
+    match inspect::project_root(&state.pool, id).await {
+        Ok(Some(root)) => Ok(PathBuf::from(root)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 async fn get_projects(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ProjectSummary>>, StatusCode> {
@@ -289,6 +341,59 @@ async fn get_projects(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_project_ls(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<Vec<inspect::Entry>>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    let rel = query.path.unwrap_or_default();
+    tokio::task::spawn_blocking(move || inspect::ls(&root, &rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+async fn get_project_cat(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<PathQuery>,
+) -> Result<String, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    let rel = query.path.unwrap_or_default();
+    tokio::task::spawn_blocking(move || inspect::cat(&root, &rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(inspect_status)
+}
+
+async fn get_project_grep(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<GrepQuery>,
+) -> Result<Json<Vec<inspect::Match>>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    let q = query.q.unwrap_or_default();
+    let rel = query.path.unwrap_or_default();
+    tokio::task::spawn_blocking(move || inspect::grep(&root, &q, &rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+async fn get_project_diff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<String, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    tokio::task::spawn_blocking(move || inspect::diff(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(inspect_status)
 }
 
 pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
@@ -486,6 +591,152 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn project_ls_returns_404_when_project_has_no_root() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/ghost/ls")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn project_cat_rejects_unsafe_path() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/cat?path=..%2f..%2fsecret")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn assistant_message_returns_turn_id_with_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "chat_id": "chat-1",
+                            "text": "hello"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["turn_id"].is_number());
+    }
+
+    #[tokio::test]
+    async fn assistant_message_rejects_without_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "chat_id": "chat-1",
+                            "text": "hello"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn assistant_turn_status_returns_run_after_message() {
+        let app = build_router(test_state().await);
+        let post_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "chat_id": "chat-2",
+                            "text": "hello"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(post_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let turn_id = parsed["turn_id"].as_i64().unwrap();
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/{turn_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["id"], serde_json::json!(turn_id));
     }
 
     #[tokio::test]

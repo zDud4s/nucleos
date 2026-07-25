@@ -174,6 +174,7 @@ fn spawn_run(
                     spawn_cwd.as_deref(),
                     plan_only,
                     resume_session_id.as_deref(),
+                    None,
                     session_tx,
                 ),
             )

@@ -29,6 +29,7 @@ pub trait CommandRunner: Send + Sync {
         cwd: Option<&Path>,
         plan_only: bool,
         resume_session_id: Option<&str>,
+        mcp_config: Option<&Path>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome>;
 }
@@ -46,6 +47,7 @@ impl CommandRunner for ClaudeCliRunner {
         cwd: Option<&Path>,
         plan_only: bool,
         resume_session_id: Option<&str>,
+        mcp_config: Option<&Path>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
@@ -64,6 +66,10 @@ impl CommandRunner for ClaudeCliRunner {
             .arg("--verbose");
         if plan_only {
             cmd.arg("--permission-mode").arg("plan");
+        }
+        if let Some(path) = mcp_config {
+            cmd.arg("--mcp-config").arg(path);
+            cmd.arg("--allowedTools").arg("mcp__nucleos__*");
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -140,6 +146,7 @@ pub struct FakeCommandRunner {
     pub last_plan_only: std::sync::Mutex<Option<bool>>,
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
+    pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -155,6 +162,7 @@ impl CommandRunner for FakeCommandRunner {
         cwd: Option<&Path>,
         plan_only: bool,
         resume_session_id: Option<&str>,
+        mcp_config: Option<&Path>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         {
@@ -173,6 +181,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());
         *self.last_plan_only.lock().unwrap() = Some(plan_only);
         *self.last_resume.lock().unwrap() = resume_session_id.map(|s| s.to_string());
+        *self.last_mcp_config.lock().unwrap() = mcp_config.map(|p| p.to_path_buf());
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
         let outcome = {
             let guard = self.canned.lock().unwrap();
@@ -215,7 +224,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = runner
-            .run_prompt("what is 6*7", &[], None, false, None, tx)
+            .run_prompt("what is 6*7", &[], None, false, None, None, tx)
             .await
             .unwrap();
         assert_eq!(outcome.stdout, "42");
@@ -227,8 +236,11 @@ mod tests {
     async fn fake_runner_emits_session_id_before_returning() {
         let runner = FakeCommandRunner::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle =
-            tokio::spawn(async move { runner.run_prompt("hi", &[], None, false, None, tx).await });
+        let handle = tokio::spawn(async move {
+            runner
+                .run_prompt("hi", &[], None, false, None, None, tx)
+                .await
+        });
         let sid = rx.recv().await;
         assert_eq!(sid.as_deref(), Some("fake-session-id"));
         let outcome = handle.await.unwrap().unwrap();
@@ -240,12 +252,34 @@ mod tests {
         let runner = FakeCommandRunner::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         runner
-            .run_prompt("resume please", &[], None, false, Some("sess-9"), tx)
+            .run_prompt("resume please", &[], None, false, Some("sess-9"), None, tx)
             .await
             .unwrap();
         assert_eq!(
             *runner.last_resume.lock().unwrap(),
             Some("sess-9".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_runner_records_the_mcp_config() {
+        let runner = FakeCommandRunner::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runner
+            .run_prompt(
+                "use mcp",
+                &[],
+                None,
+                false,
+                None,
+                Some(std::path::Path::new("C:/tmp/mcp.json")),
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *runner.last_mcp_config.lock().unwrap(),
+            Some(std::path::PathBuf::from("C:/tmp/mcp.json"))
         );
     }
 
@@ -260,7 +294,7 @@ mod tests {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             assert!(
                 runner
-                    .run_prompt("x", &[], None, false, None, tx)
+                    .run_prompt("x", &[], None, false, None, None, tx)
                     .await
                     .is_err()
             );
@@ -268,7 +302,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(
             runner
-                .run_prompt("x", &[], None, false, None, tx)
+                .run_prompt("x", &[], None, false, None, None, tx)
                 .await
                 .is_ok()
         );

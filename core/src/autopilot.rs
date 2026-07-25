@@ -12,10 +12,11 @@ pub enum Mode {
     Active,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSummary {
     pub project_id: String,
     pub mode: Mode,
+    pub project_root: Option<String>,
     pub pending: i64,
 }
 
@@ -161,8 +162,8 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
 }
 
 pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummary>> {
-    let projects: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT state.project_id, state.mode,
+    let projects: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT state.project_id, state.mode, state.project_root,
                 (SELECT COUNT(*)
                  FROM shadow_decisions
                  JOIN runs ON shadow_decisions.run_id = runs.id
@@ -181,13 +182,14 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 
     projects
         .into_iter()
-        .map(|(project_id, mode, pending)| {
+        .map(|(project_id, mode, project_root, pending)| {
             let mode = Mode::from_db_str(&mode).ok_or_else(|| {
                 sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
             })?;
             Ok(ProjectSummary {
                 project_id,
                 mode,
+                project_root,
                 pending,
             })
         })
@@ -350,16 +352,54 @@ mod tests {
                 ProjectSummary {
                     project_id: "project-active".to_owned(),
                     mode: Mode::Active,
+                    project_root: None,
                     pending: 0,
                 },
                 ProjectSummary {
                     project_id: "project-off".to_owned(),
                     mode: Mode::Off,
+                    project_root: None,
                     pending: 0,
                 },
                 ProjectSummary {
                     project_id: "project-shadow".to_owned(),
                     mode: Mode::Shadow,
+                    project_root: None,
+                    pending: 0,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roster_returns_project_root_when_present() {
+        let pool = test_pool().await;
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) \
+             VALUES ('project-rooted', 'shadow', '/some/root')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('project-off', 'off')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            project_roster(&pool).await.unwrap(),
+            vec![
+                ProjectSummary {
+                    project_id: "project-off".to_owned(),
+                    mode: Mode::Off,
+                    project_root: None,
+                    pending: 0,
+                },
+                ProjectSummary {
+                    project_id: "project-rooted".to_owned(),
+                    mode: Mode::Shadow,
+                    project_root: Some("/some/root".to_owned()),
                     pending: 0,
                 },
             ]
@@ -429,6 +469,7 @@ mod tests {
             vec![ProjectSummary {
                 project_id: "project-pending".to_owned(),
                 mode: Mode::Active,
+                project_root: None,
                 pending: 3,
             }]
         );
@@ -449,6 +490,7 @@ mod tests {
             vec![ProjectSummary {
                 project_id: "project-idle".to_owned(),
                 mode: Mode::Off,
+                project_root: None,
                 pending: 0,
             }]
         );
