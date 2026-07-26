@@ -120,6 +120,40 @@ pub async fn create_run(
 /// a run that executed and failed, and a timeout, are never retried.
 const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 
+/// The environment every autopilot/assistant CLI run needs: the daemon URL + token so the
+/// PreToolUse hook can call back, and NUCLEOS_RUN_ID (== runs.id, spec §3.3) so the hook echoes it
+/// back and the core can validate — and, for a `pending_approval`, terminate — the right run.
+pub(crate) fn run_env(state: &AppState, id: i64) -> Vec<(String, String)> {
+    vec![
+        (
+            "NUCLEOS_DAEMON_URL".to_string(),
+            "http://127.0.0.1:8791".to_string(),
+        ),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
+        ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
+    ]
+}
+
+/// Spawn a run's driver task and register its abort handle so an in-flight run can be terminated
+/// (cancel / `pending_approval`). The handle is removed when the task finishes naturally; an
+/// aborted task never reaches the removal because the terminator (`finalize_termination`) already
+/// removed it.
+pub(crate) fn spawn_registered<F>(state: &AppState, id: i64, body: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handles = state.run_handles.clone();
+    let join = tokio::spawn(async move {
+        body.await;
+        handles.lock().unwrap().remove(&id);
+    });
+    state
+        .run_handles
+        .lock()
+        .unwrap()
+        .insert(id, join.abort_handle());
+}
+
 fn spawn_run(
     state: &AppState,
     id: i64,
@@ -135,19 +169,9 @@ fn spawn_run(
     let runner = state.runner.clone();
     let feed_project_id = project_id.clone();
     let run_timeout = state.run_timeout;
-    let handles = state.run_handles.clone();
-    let env = vec![
-        (
-            "NUCLEOS_DAEMON_URL".to_string(),
-            "http://127.0.0.1:8791".to_string(),
-        ),
-        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
-        // run_id == runs.id (spec §3.3) — the hook echoes it back in its decision request, so the
-        // core can validate it and, for a `pending_approval`, terminate the right run.
-        ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
-    ];
+    let env = run_env(state, id);
 
-    let join_handle = tokio::spawn(async move {
+    spawn_registered(state, id, async move {
         let mut attempt: u32 = 1;
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it
@@ -264,16 +288,7 @@ fn spawn_run(
                 }
             }
         }
-        // Only reached on natural completion / timeout / exhausted-failure — an aborted task
-        // (cancellation) never gets here.
-        handles.lock().unwrap().remove(&id);
     });
-
-    state
-        .run_handles
-        .lock()
-        .unwrap()
-        .insert(id, join_handle.abort_handle());
 }
 
 pub async fn create_run_inner(

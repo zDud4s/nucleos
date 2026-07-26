@@ -138,17 +138,9 @@ fn spawn_assistant_turn(
     let pool = state.pool.clone();
     let runner = state.runner.clone();
     let run_timeout = state.run_timeout;
-    let handles = state.run_handles.clone();
-    let env = vec![
-        (
-            "NUCLEOS_DAEMON_URL".to_string(),
-            "http://127.0.0.1:8791".to_string(),
-        ),
-        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
-        ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
-    ];
+    let env = crate::runs::run_env(state, id);
 
-    let join = tokio::spawn(async move {
+    crate::runs::spawn_registered(state, id, async move {
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
             let pool = pool.clone();
@@ -228,14 +220,7 @@ fn spawn_assistant_turn(
 
         end_turn(&chat_id);
         let _ = std::fs::remove_file(&mcp_path);
-        handles.lock().unwrap().remove(&id);
     });
-
-    state
-        .run_handles
-        .lock()
-        .unwrap()
-        .insert(id, join.abort_handle());
 }
 
 #[cfg(test)]
