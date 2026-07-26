@@ -1,0 +1,8 @@
+# SQL migrations are checksummed byte-for-byte by `sqlx::migrate!` at compile
+# time. CRLF changes that checksum and makes the daemon panic with
+# Migrate(VersionMismatch) against a DB that recorded the LF checksum. Force LF
+# regardless of the machine's core.autocrlf.
+*.sql text eol=lf
+
+# Shell scripts run under Git Bash; a CR in the shebang/commands breaks them.
+*.sh text eol=lf
