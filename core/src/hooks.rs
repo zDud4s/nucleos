@@ -129,8 +129,8 @@ pub async fn pretooluse_decision(
         };
     }
 
-    if mode == "worktree" {
-        if let Err(error) = shadow::record_decision(
+    if mode == "worktree"
+        && let Err(error) = shadow::record_decision(
             &state.pool,
             payload.run_id,
             &payload.tool_name,
@@ -138,13 +138,12 @@ pub async fn pretooluse_decision(
             &classification,
         )
         .await
-        {
-            tracing::warn!(
-                run_id = payload.run_id,
-                %error,
-                "pretooluse-decision: failed to record shadow decision"
-            );
-        }
+    {
+        tracing::warn!(
+            run_id = payload.run_id,
+            %error,
+            "pretooluse-decision: failed to record shadow decision"
+        );
     }
 
     // Single-use authorization (spec §8.4 step 6): a resume run's FIRST high-risk action whose

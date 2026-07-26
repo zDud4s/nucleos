@@ -173,10 +173,10 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
 
         // Arm any trigger seen for the first time (known current SHA, no recorded last SHA) — no run.
         for trigger in &triggers {
-            if let Some(current) = current_shas.get(&trigger.name) {
-                if !last_shas.contains_key(&trigger.name) {
-                    let _ = record_sha(&state.pool, &project_id, &trigger.name, current).await;
-                }
+            if let Some(current) = current_shas.get(&trigger.name)
+                && !last_shas.contains_key(&trigger.name)
+            {
+                let _ = record_sha(&state.pool, &project_id, &trigger.name, current).await;
             }
         }
 

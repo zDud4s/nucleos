@@ -225,9 +225,8 @@ pub(crate) async fn scheduler_tick(
 
         let project_fires: HashMap<String, u32> = fires_today
             .iter()
-            .filter_map(|((stored_project_id, rule_name), count)| {
-                (stored_project_id == &project_id).then(|| (rule_name.clone(), *count))
-            })
+            .filter(|((stored_project_id, _), _)| stored_project_id == &project_id)
+            .map(|((_, rule_name), count)| (rule_name.clone(), *count))
             .collect();
         let due = due_rules(
             &rules,

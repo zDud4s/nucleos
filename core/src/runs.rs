@@ -219,17 +219,17 @@ fn spawn_run(
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    if completed.is_ok() {
-                        if let Some((kind, summary)) = completion_feed.as_ref() {
-                            let _ = crate::feed::append(
-                                &pool,
-                                feed_project_id.as_deref(),
-                                kind,
-                                summary,
-                                Some(id),
-                            )
-                            .await;
-                        }
+                    if completed.is_ok()
+                        && let Some((kind, summary)) = completion_feed.as_ref()
+                    {
+                        let _ = crate::feed::append(
+                            &pool,
+                            feed_project_id.as_deref(),
+                            kind,
+                            summary,
+                            Some(id),
+                        )
+                        .await;
                     }
                     break;
                 }

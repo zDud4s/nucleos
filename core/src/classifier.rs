@@ -169,7 +169,7 @@ fn has_destructive_flags(command: &str) -> bool {
                 .strip_prefix('-')
                 .is_some_and(|flags| flags.contains('r') && flags.contains('f'))
         }),
-        Some("rd" | "rmdir") => tokens.iter().any(|token| *token == "/s"),
+        Some("rd" | "rmdir") => tokens.contains(&"/s"),
         Some("del") => tokens.iter().any(|token| matches!(*token, "/s" | "/q")),
         Some("remove-item") => tokens
             .iter()

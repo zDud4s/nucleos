@@ -154,7 +154,9 @@ fn window_start(period: BudgetPeriod, now: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
-    let raw: Vec<(Option<String>, Option<f64>, String, Option<String>)> = sqlx::query_as(
+    // (session_id, cost_usd, created_at, completed_at)
+    type RawRow = (Option<String>, Option<f64>, String, Option<String>);
+    let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, created_at, completed_at
          FROM runs
          WHERE mode IN ('shadow', 'worktree')",

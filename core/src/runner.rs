@@ -106,21 +106,20 @@ impl CommandRunner for ClaudeCliRunner {
             stdout_acc.push_str(&line);
             stdout_acc.push('\n');
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if session_id.is_none() {
-                    if let Some(sid) = v.get("session_id").and_then(|x| x.as_str()) {
-                        session_id = Some(sid.to_string());
-                        // Best-effort: the receiver may already be gone if the run was cancelled.
-                        let _ = session_tx.send(sid.to_string());
-                    }
+                if session_id.is_none()
+                    && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
+                {
+                    session_id = Some(sid.to_string());
+                    // Best-effort: the receiver may already be gone if the run was cancelled.
+                    let _ = session_tx.send(sid.to_string());
                 }
-                if v.get("type").and_then(|x| x.as_str()) == Some("result") {
-                    if let Some(c) = v
+                if v.get("type").and_then(|x| x.as_str()) == Some("result")
+                    && let Some(c) = v
                         .get("total_cost_usd")
                         .or_else(|| v.get("cost_usd"))
                         .and_then(|x| x.as_f64())
-                    {
-                        cost_usd = Some(c);
-                    }
+                {
+                    cost_usd = Some(c);
                 }
             }
         }
@@ -172,10 +171,7 @@ impl CommandRunner for FakeCommandRunner {
             let mut remaining = self.fail_times.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "fake launch failure",
-                ));
+                return Err(std::io::Error::other("fake launch failure"));
             }
         }
         *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());

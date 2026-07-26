@@ -56,10 +56,9 @@ pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo
         .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("git worktree add failed: {stderr}"),
-        ));
+        return Err(io::Error::other(format!(
+            "git worktree add failed: {stderr}"
+        )));
     }
 
     Ok(WorktreeInfo { path, branch })
@@ -77,10 +76,9 @@ pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Res
         .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("git worktree remove failed: {stderr}"),
-        ));
+        return Err(io::Error::other(format!(
+            "git worktree remove failed: {stderr}"
+        )));
     }
 
     Ok(())

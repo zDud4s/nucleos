@@ -13,14 +13,12 @@ fn extract_reply(stdout: &str) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if v.get("type").and_then(|t| t.as_str()) == Some("result") {
-                if let Some(text) = v.get("result").and_then(|r| r.as_str()) {
-                    if !text.trim().is_empty() {
-                        reply = Some(text.to_string());
-                    }
-                }
-            }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v.get("type").and_then(|t| t.as_str()) == Some("result")
+            && let Some(text) = v.get("result").and_then(|r| r.as_str())
+            && !text.trim().is_empty()
+        {
+            reply = Some(text.to_string());
         }
     }
     reply
