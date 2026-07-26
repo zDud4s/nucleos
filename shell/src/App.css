@@ -307,6 +307,52 @@ details.scoreboard th {
   letter-spacing: 0.08em;
 }
 
+/* readiness surfaced above the numbers — the trust ledger at a glance */
+.sb-criterion {
+  color: var(--faint);
+  font-size: var(--fs-xs);
+  margin-bottom: var(--sp-3);
+}
+.sb-group + .sb-group { margin-top: var(--sp-4); }
+.sb-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-1);
+}
+.sb-mode {
+  font: 500 var(--fs-2xs) var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--faint);
+}
+.sb-count {
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--muted);
+}
+.readiness {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+.rc {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: 2px 0;
+  font: 400 var(--fs-sm) var(--mono);
+}
+.rc-class { color: var(--muted); }
+.rc-state {
+  color: var(--faint);
+  font-size: var(--fs-xs);
+}
+.rc.is-ready .rc-class { color: var(--text); }
+.rc.is-ready .rc-state { color: var(--green); }
+
 .panel-scope {
   display: flex;
   gap: var(--sp-2);

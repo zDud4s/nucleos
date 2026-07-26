@@ -9,6 +9,9 @@ import {
   killSwitchLabel,
   periodLabel,
   promotionReadiness,
+  readinessCriterionLabel,
+  readinessGap,
+  scoreboardReadiness,
   totalPending,
 } from "./derive";
 
@@ -183,5 +186,52 @@ describe("pure UI derivations", () => {
     expect(
       promotionReadiness({ ...base, reviewed: 5, agree: 5 }),
     ).toEqual({ ready: false, rate: 1, samples: 5 });
+  });
+
+  it("explains the gap to readiness, or null when ready", () => {
+    const base = {
+      mode: "shadow",
+      action_class: "filesystem.write",
+      total: 0,
+      would_allow: 0,
+      would_pend: 0,
+      would_deny: 0,
+      reviewed: 0,
+      agree: 0,
+      disagree: 0,
+    } satisfies ClassTally;
+
+    expect(readinessGap({ ...base, reviewed: 10, agree: 10 })).toBeNull();
+    expect(readinessGap(base)).toBe("10 more reviews");
+    expect(readinessGap({ ...base, reviewed: 4, agree: 4 })).toBe("6 more reviews");
+    expect(readinessGap({ ...base, reviewed: 9, agree: 9 })).toBe("1 more review");
+    expect(readinessGap({ ...base, reviewed: 10, agree: 9 })).toBe("90% agreement");
+    expect(readinessGap({ ...base, reviewed: 20, agree: 18 })).toBe("90% agreement");
+  });
+
+  it("counts ready classes across a scoreboard group", () => {
+    const base = {
+      mode: "shadow",
+      action_class: "a",
+      total: 0,
+      would_allow: 0,
+      would_pend: 0,
+      would_deny: 0,
+      reviewed: 0,
+      agree: 0,
+      disagree: 0,
+    } satisfies ClassTally;
+
+    expect(scoreboardReadiness([])).toEqual({ ready: 0, total: 0 });
+    expect(
+      scoreboardReadiness([
+        { ...base, action_class: "a", reviewed: 10, agree: 10 },
+        { ...base, action_class: "b", reviewed: 3, agree: 3 },
+      ]),
+    ).toEqual({ ready: 1, total: 2 });
+  });
+
+  it("states the promotion criterion", () => {
+    expect(readinessCriterionLabel()).toBe("Ready at 10+ reviews, ≥95% agreement");
   });
 });

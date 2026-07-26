@@ -6,8 +6,8 @@ export interface Readiness {
   samples: number;
 }
 
-const READINESS_MIN_REVIEWED = 10;
-const READINESS_MIN_RATE = 0.95;
+export const READINESS_MIN_REVIEWED = 10;
+export const READINESS_MIN_RATE = 0.95;
 
 export function promotionReadiness(tally: ClassTally): Readiness {
   const samples = tally.reviewed;
@@ -17,6 +17,29 @@ export function promotionReadiness(tally: ClassTally): Readiness {
     rate !== null &&
     rate >= READINESS_MIN_RATE;
   return { ready, rate, samples };
+}
+
+/** A short reason a class is not yet promotable, or null when it is ready. */
+export function readinessGap(tally: ClassTally): string | null {
+  const { ready, rate, samples } = promotionReadiness(tally);
+  if (ready) return null;
+  if (samples < READINESS_MIN_REVIEWED) {
+    const missing = READINESS_MIN_REVIEWED - samples;
+    return `${missing} more review${missing === 1 ? "" : "s"}`;
+  }
+  return `${Math.round((rate ?? 0) * 100)}% agreement`;
+}
+
+/** How many action classes in a group clear the promotion bar. */
+export function scoreboardReadiness(
+  tallies: ClassTally[],
+): { ready: number; total: number } {
+  const ready = tallies.filter((tally) => promotionReadiness(tally).ready).length;
+  return { ready, total: tallies.length };
+}
+
+export function readinessCriterionLabel(): string {
+  return `Ready at ${READINESS_MIN_REVIEWED}+ reviews, ≥${Math.round(READINESS_MIN_RATE * 100)}% agreement`;
 }
 
 export function totalPending(projects: ProjectSummary[]): number {

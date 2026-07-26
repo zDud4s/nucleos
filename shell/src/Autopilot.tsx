@@ -9,7 +9,8 @@ import {
 } from "./api";
 import {
   agreementRate, budgetStatusLabel, formatUsd, groupScoreboardByMode,
-  killSwitchLabel, periodLabel, promotionReadiness, totalPending,
+  killSwitchLabel, periodLabel, promotionReadiness, readinessCriterionLabel,
+  readinessGap, scoreboardReadiness, totalPending,
 } from "./derive";
 import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
@@ -139,13 +140,18 @@ function ScoreboardPanel({ projectId, scoreboard }: ScoreboardPanelProps) {
   const groupedTallies = groupScoreboardByMode(scoreboard ?? []);
   return (
     <Panel dim title="Scoreboard" aside={projectId}>
-      {Object.keys(groupedTallies).length === 0 ? <Teach title="Trust has a shape.">Reviewed shadow decisions will show how each action class earns confidence.</Teach>
-        : Object.entries(groupedTallies).map(([mode, tallies]) => <details className="scoreboard" key={mode}>
-            <summary>{mode} — shadow agreement</summary>
-            <table><thead><tr><th>class</th><th>total</th><th>allow</th><th>pend</th><th>deny</th><th>reviewed</th><th>agree</th><th>ready?</th></tr></thead>
-              <tbody>{tallies.map((tally) => { const rate = agreementRate(tally); const readiness = promotionReadiness(tally); return <tr key={tally.action_class}><td>{tally.action_class}</td><td>{tally.total}</td><td>{tally.would_allow}</td><td>{tally.would_pend}</td><td>{tally.would_deny}</td><td>{tally.reviewed}</td><td>{rate === null ? "—" : `${Math.round(rate * 100)}%`}</td><td>{readiness.ready ? "✓ ready" : "—"}</td></tr>; })}</tbody>
-            </table>
-          </details>)}
+      {Object.keys(groupedTallies).length === 0
+        ? <Teach title="Trust has a shape.">Reviewed shadow decisions show how each action class earns confidence. {readinessCriterionLabel()}, and promotion stays your call.</Teach>
+        : <><p className="sb-criterion">{readinessCriterionLabel()} — promotion stays your call.</p>
+          {Object.entries(groupedTallies).map(([mode, tallies]) => { const summary = scoreboardReadiness(tallies); return <div className="sb-group" key={mode}>
+            <div className="sb-head"><span className="sb-mode">{mode}</span><span className="sb-count">{summary.ready} of {summary.total} ready</span></div>
+            <ul className="readiness">{tallies.map((tally) => { const readiness = promotionReadiness(tally); const gap = readinessGap(tally); return <li className={readiness.ready ? "rc is-ready" : "rc"} key={tally.action_class}><span className="rc-class">{tally.action_class}</span><span className="rc-state">{readiness.ready ? "✓ ready" : gap ?? "—"}</span></li>; })}</ul>
+            <details className="scoreboard"><summary>numbers</summary>
+              <table><thead><tr><th>class</th><th>total</th><th>allow</th><th>pend</th><th>deny</th><th>reviewed</th><th>agree</th></tr></thead>
+                <tbody>{tallies.map((tally) => { const rate = agreementRate(tally); return <tr key={tally.action_class}><td>{tally.action_class}</td><td>{tally.total}</td><td>{tally.would_allow}</td><td>{tally.would_pend}</td><td>{tally.would_deny}</td><td>{tally.reviewed}</td><td>{rate === null ? "—" : `${Math.round(rate * 100)}%`}</td></tr>; })}</tbody>
+              </table>
+            </details>
+          </div>; })}</>}
     </Panel>
   );
 }
