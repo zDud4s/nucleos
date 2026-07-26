@@ -1,11 +1,4 @@
-import type { AutopilotMode, Budget, ClassTally, ProjectSummary } from "./api";
-
-export type Tone = "neutral" | "info" | "success";
-
-export interface Badge {
-  label: string;
-  tone: Tone;
-}
+import type { Budget, ClassTally, ProjectSummary } from "./api";
 
 export interface Readiness {
   ready: boolean;
@@ -24,17 +17,6 @@ export function promotionReadiness(tally: ClassTally): Readiness {
     rate !== null &&
     rate >= READINESS_MIN_RATE;
   return { ready, rate, samples };
-}
-
-export function modeBadge(mode: AutopilotMode): Badge {
-  switch (mode) {
-    case "off":
-      return { label: "Off", tone: "neutral" };
-    case "shadow":
-      return { label: "Shadow", tone: "info" };
-    case "active":
-      return { label: "Active", tone: "success" };
-  }
 }
 
 export function totalPending(projects: ProjectSummary[]): number {

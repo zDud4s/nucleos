@@ -1,38 +1,26 @@
 import { describe, expect, it } from "vitest";
 
-import type { AutopilotMode, Budget, ClassTally, ProjectSummary } from "./api";
+import type { Budget, ClassTally, ProjectSummary } from "./api";
 import {
   agreementRate,
   budgetStatusLabel,
   formatUsd,
   groupScoreboardByMode,
   killSwitchLabel,
-  modeBadge,
   periodLabel,
   promotionReadiness,
   totalPending,
 } from "./derive";
 
 describe("pure UI derivations", () => {
-  it.each([
-    ["off", { label: "Off", tone: "neutral" }],
-    ["shadow", { label: "Shadow", tone: "info" }],
-    ["active", { label: "Active", tone: "success" }],
-  ] satisfies [AutopilotMode, { label: string; tone: string }][]) (
-    "derives the %s mode badge",
-    (mode, expected) => {
-      expect(modeBadge(mode)).toEqual(expected);
-    },
-  );
-
   it("sums pending work across projects, including an empty list", () => {
     const cases = [
       { projects: [] satisfies ProjectSummary[], expected: 0 },
       {
         projects: [
-          { project_id: "alpha", mode: "off", pending: 2 },
-          { project_id: "beta", mode: "shadow", pending: 0 },
-          { project_id: "gamma", mode: "active", pending: 5 },
+          { project_id: "alpha", mode: "off", project_root: null, pending: 2 },
+          { project_id: "beta", mode: "shadow", project_root: null, pending: 0 },
+          { project_id: "gamma", mode: "active", project_root: null, pending: 5 },
         ] satisfies ProjectSummary[],
         expected: 7,
       },

@@ -1,25 +1,35 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  approveProposal, getBudget, getFeed, getKillSwitch, getProjects, getProposals,
-  getScopedKills, getScoreboard, getShadowDecisions, rejectProposal, setKillSwitch,
-  setProjectMode, setScopedKill,
-  setVerdict, type AutopilotMode, type Budget, type ClassTally, type ConnectionState,
+  approveProposal, getBudget, getFeed, getProjects, getProposals,
+  getScopedKills, getScoreboard, getShadowDecisions, rejectProposal,
+  setProjectMode, setScopedKill, setVerdict,
+  type AutopilotMode, type Budget, type ClassTally, type ConnectionState,
   type FeedEntry, type ProjectSummary, type Proposal, type ScopedKill,
   type ShadowDecision,
 } from "./api";
 import {
   agreementRate, budgetStatusLabel, formatUsd, groupScoreboardByMode,
-  killSwitchLabel, modeBadge, periodLabel, promotionReadiness, totalPending,
+  killSwitchLabel, periodLabel, promotionReadiness, totalPending,
 } from "./derive";
+import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
-interface AutopilotProps { token: string | null; connection: ConnectionState; }
+interface AutopilotProps {
+  token: string | null;
+  connection: ConnectionState;
+  killEngaged: boolean | null;
+  killBusy: boolean;
+  toggleKill: (engaged: boolean) => Promise<void>;
+}
+
 interface ProjectCardProps { project: ProjectSummary; scopedKills: ScopedKill[] | null; token: string; refresh: () => Promise<void>; selected: boolean; onSelect: () => void; }
 
+const MODES = ["off", "shadow", "active"] as const;
+
 function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect }: ProjectCardProps) {
+  const [rootAsk, setRootAsk] = useState<AutopilotMode | null>(null);
   const [root, setRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [changing, setChanging] = useState(false);
-  const badge = modeBadge(project.mode);
   const projectKilled =
     scopedKills?.some(
       (k) =>
@@ -37,22 +47,27 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
 
   async function changeMode(next: AutopilotMode) {
     setChanging(true);
+    const typedRoot = root.trim();
     const result = await setProjectMode(
       token,
       project.project_id,
       next,
-      root.trim() || undefined,
+      typedRoot !== "" ? typedRoot : project.project_root ?? undefined,
     );
 
     if (result.ok) {
       setError(null);
+      setRootAsk(null);
+      setRoot("");
       await refresh();
-    } else {
+    } else if (result.status === 422) {
+      setRootAsk(next);
+      setRoot((current) => (current !== "" ? current : project.project_root ?? ""));
       setError(
-        result.status === 422
-          ? "Cannot enable: prerequisites not met — the project must be onboarded to .ai/workflow, have a registered PreToolUse hook, be a git repo (for active), and a valid project root must be supplied."
-          : `Request failed (status ${result.status}).`,
+        "Prerequisites not met — the project needs .ai/workflow onboarding, a registered PreToolUse hook, git (for active), and a project root.",
       );
+    } else {
+      setError(`Request failed (status ${result.status}).`);
     }
     setChanging(false);
   }
@@ -60,24 +75,47 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
   return (
     <article className="project">
       <span className="name">{project.project_id}</span>
-      {project.pending > 0 && <span className="badge pending">{project.pending} pending</span>}
-      <span className={`badge ${badge.tone}`}>{badge.label}</span>
-      <span className="seg"><span className={project.mode === "off" ? "on off" : ""}>off</span><span className={project.mode === "shadow" ? "on shadow" : ""}>shadow</span><span className={project.mode === "active" ? "on active" : ""}>active</span></span>
-      <div className="project-controls">
-        <label className="field">Mode
-          <select value={project.mode} disabled={changing} onChange={(event) => void changeMode(event.target.value as AutopilotMode)}>
-            <option value="off">Off</option><option value="shadow">Shadow</option><option value="active">Active</option>
-          </select>
-        </label>
-        <button type="button" disabled={changing} onClick={() => void toggleProjectKill()}>
-          {projectKilled ? "Resume this project" : "Pause this project"}
-        </button>
-        <label className="field">Project root (needed for shadow/active)
-          <input type="text" value={root} onChange={(event) => setRoot(event.target.value)} placeholder="C:\\path\\to\\project" />
-        </label>
-        <button className="view" type="button" onClick={onSelect}>{selected ? "Hide details" : "View"}</button>
+      {project.pending > 0 && <Badge tone="pending">{project.pending} pending</Badge>}
+      {projectKilled && <Badge tone="paused">paused</Badge>}
+      <div className="seg" role="group" aria-label={`${project.project_id} autopilot mode`}>
+        {MODES.map((mode) => (
+          <button
+            key={mode}
+            type="button"
+            disabled={changing}
+            aria-pressed={project.mode === mode}
+            className={project.mode === mode ? `on ${mode}` : undefined}
+            onClick={() => { if (project.mode !== mode) void changeMode(mode); }}
+          >
+            {mode}
+          </button>
+        ))}
       </div>
-      {error !== null && <p className="error" role="alert">{error}</p>}
+      <Button size="sm" intent="stop" disabled={changing} onClick={() => void toggleProjectKill()}>
+        {projectKilled ? "Resume" : "Pause"}
+      </Button>
+      <Button size="sm" onClick={onSelect}>{selected ? "Hide details" : "View"}</Button>
+      {rootAsk !== null && (
+        <div className="root-ask">
+          <label className="field">Project root — needed for shadow/active
+            <input
+              type="text"
+              value={root}
+              onChange={(event) => setRoot(event.target.value)}
+              placeholder="C:\\path\\to\\project"
+            />
+          </label>
+          <Button
+            size="sm"
+            intent="go"
+            disabled={changing || root.trim() === ""}
+            onClick={() => void changeMode(rootAsk)}
+          >
+            Retry {rootAsk}
+          </Button>
+        </div>
+      )}
+      {error !== null && <ErrorNote>{error}</ErrorNote>}
     </article>
   );
 }
@@ -85,15 +123,14 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
 interface FeedPanelProps { feed: FeedEntry[] | null; loading: boolean; selectedProject: string | null; }
 function FeedPanel({ feed, loading, selectedProject }: FeedPanelProps) {
   return (
-    <section className="flat dim">
-      <h2>Feed <small>{selectedProject === null ? "latest across all projects" : selectedProject}</small></h2>
-      {feed === null ? !loading && <p className="error" role="alert">Could not load activity from the daemon.</p>
-        : feed.length === 0 ? <div className="teach"><span className="t-title">The record starts here.</span>Runs, proposals, verdicts and budget events will leave their paper trail here.</div>
+    <Panel dim title="Feed" aside={selectedProject === null ? "latest across all projects" : selectedProject}>
+      {feed === null ? !loading && <ErrorNote>Could not load activity from the daemon.</ErrorNote>
+        : feed.length === 0 ? <Teach title="The record starts here.">Runs, proposals, verdicts and budget events will leave their paper trail here.</Teach>
         : feed.map((entry) => <article className="feed-item" key={entry.id}>
             <div className="f-meta"><time dateTime={entry.created_at}>{entry.created_at}</time><span>{entry.kind}</span></div>
             <p className="f-body"><b>{entry.project_id ?? "global"}</b> — {entry.summary}</p>
           </article>)}
-    </section>
+    </Panel>
   );
 }
 
@@ -101,16 +138,15 @@ interface ScoreboardPanelProps { projectId: string; scoreboard: ClassTally[] | n
 function ScoreboardPanel({ projectId, scoreboard }: ScoreboardPanelProps) {
   const groupedTallies = groupScoreboardByMode(scoreboard ?? []);
   return (
-    <section className="flat dim">
-      <h2>Scoreboard <small>{projectId}</small></h2>
-      {Object.keys(groupedTallies).length === 0 ? <div className="teach"><span className="t-title">Trust has a shape.</span>Reviewed shadow decisions will show how each action class earns confidence.</div>
-        : Object.entries(groupedTallies).map(([mode, tallies]) => <details className="scoreboard" key={mode} open>
+    <Panel dim title="Scoreboard" aside={projectId}>
+      {Object.keys(groupedTallies).length === 0 ? <Teach title="Trust has a shape.">Reviewed shadow decisions will show how each action class earns confidence.</Teach>
+        : Object.entries(groupedTallies).map(([mode, tallies]) => <details className="scoreboard" key={mode}>
             <summary>{mode} — shadow agreement</summary>
             <table><thead><tr><th>class</th><th>total</th><th>allow</th><th>pend</th><th>deny</th><th>reviewed</th><th>agree</th><th>ready?</th></tr></thead>
               <tbody>{tallies.map((tally) => { const rate = agreementRate(tally); const readiness = promotionReadiness(tally); return <tr key={tally.action_class}><td>{tally.action_class}</td><td>{tally.total}</td><td>{tally.would_allow}</td><td>{tally.would_pend}</td><td>{tally.would_deny}</td><td>{tally.reviewed}</td><td>{rate === null ? "—" : `${Math.round(rate * 100)}%`}</td><td>{readiness.ready ? "✓ ready" : "—"}</td></tr>; })}</tbody>
             </table>
           </details>)}
-    </section>
+    </Panel>
   );
 }
 
@@ -128,18 +164,20 @@ function ShadowReviewPanel({ projectId, decisions, loading, token, refresh }: Sh
   }
 
   return (
-    <section className="flat dim">
-      <h2>Shadow review <small>{projectId}</small></h2>
-      {decisions === null ? !loading && <p className="error" role="alert">Could not load shadow decisions from the daemon.</p>
-        : decisions.length === 0 ? <div className="teach"><span className="t-title">Nothing needs a second pair of eyes.</span>Shadow verdicts appear here when the agent has an action for you to judge.</div>
+    <Panel dim title="Shadow review" aside={projectId}>
+      {decisions === null ? !loading && <ErrorNote>Could not load shadow decisions from the daemon.</ErrorNote>
+        : decisions.length === 0 ? <Teach title="Nothing needs a second pair of eyes.">Shadow verdicts appear here when the agent has an action for you to judge.</Teach>
         : decisions.map((decision) => { const pending = pendingIds.has(decision.id); return <article className="decision" key={decision.id}>
             <div className="dc-meta"><span className="tool">{decision.tool_name}</span><span className="class">{decision.action_class}</span><span className={decision.decision === "deny" ? "deny" : "allow"}>would {decision.decision}</span></div>
             {decision.reason !== null && <p className="dc-why">{decision.reason}</p>}
             {decision.tool_input !== null && <details className="dc-input"><summary>input</summary><pre>{decision.tool_input}</pre></details>}
-            <div className="dc-act"><button className="mini" type="button" disabled={pending} onClick={() => void reviewDecision(decision.id, "approve")}>Agree</button><button className="mini no" type="button" disabled={pending} onClick={() => void reviewDecision(decision.id, "reject")}>Disagree</button></div>
-            {errors[decision.id] !== undefined && <p className="error" role="alert">{errors[decision.id]}</p>}
+            <div className="dc-act">
+              <Button size="sm" intent="go" disabled={pending} onClick={() => void reviewDecision(decision.id, "approve")}>Agree</Button>
+              <Button size="sm" intent="stop" disabled={pending} onClick={() => void reviewDecision(decision.id, "reject")}>Disagree</Button>
+            </div>
+            {errors[decision.id] !== undefined && <ErrorNote>{errors[decision.id]}</ErrorNote>}
           </article>; })}
-    </section>
+    </Panel>
   );
 }
 
@@ -168,18 +206,17 @@ function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill, isSwam
     finishAction(proposalId);
   }
   const actionButtons = (proposal: Proposal, pending: boolean, compact = false) => <div className={compact ? "d-act" : "a-actions"}>
-    <button type="button" className="btn-approve" disabled={pending || isKill} onClick={() => void approve(proposal.id)}>{compact ? "Approve" : "Approve & resume"}</button>
-    <button type="button" className="btn-reject" disabled={pending || isKill} onClick={() => void reject(proposal.id)}>{compact ? "Reject" : "Reject and discard worktree"}</button>
+    <Button variant="approve" size={compact ? "sm" : "md"} disabled={pending || isKill} onClick={() => void approve(proposal.id)}>{compact ? "Approve" : "Approve & resume"}</Button>
+    <ConfirmButton variant="link" size="sm" confirmLabel="Discard worktree?" disabled={pending || isKill} onConfirm={() => void reject(proposal.id)}>{compact ? "Reject" : "Reject and discard worktree"}</ConfirmButton>
   </div>;
   return (
-    <section className={isKill ? "dim" : ""}>
-      <h2>Approval queue <small>approve resumes the run in its worktree · reject discards it</small></h2>
+    <Panel flat={false} dim={isKill} title="Approval queue" aside="approve resumes the run in its worktree · reject discards it">
       {isKill && <p className="a-note">Read-only while the kill switch is engaged — disengage to act.</p>}
-      {proposals === null ? !loading && <p className="error" role="alert">Could not load pending proposals from the daemon.</p>
-        : proposals.length === 0 ? <div className="teach"><span className="t-title">Nothing waits for you.</span>Proposals appear when an active run reaches outside its allowlist. For now, every run has finished clean.</div>
-        : isSwamped ? <div className="dense-queue">{proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="dense-row" key={proposal.id}><div className="d-id"><b>#{proposal.id} · run {proposal.run_id ?? "—"}</b>{proposal.created_at}</div><div className="d-main"><div className="d-cmd">{proposal.tool_name ?? "—"}</div><div className="d-why">{proposal.reasoning}</div>{errors[proposal.id] !== undefined && <p className="error" role="alert">{errors[proposal.id]}</p>}</div>{actionButtons(proposal, pending, true)}</article>; })}</div>
-        : proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="approval-card" key={proposal.id}><div className="a-meta"><span>#{proposal.id} · run {proposal.run_id ?? "—"}</span><span className="proj">{proposal.project_id ?? "global"}</span><time dateTime={proposal.created_at}>{proposal.created_at}</time></div><div className="a-cmd"><span className="verb">wants to run </span>{proposal.tool_name ?? "—"}</div><p className="a-reason">{proposal.reasoning}</p>{actionButtons(proposal, pending)}{errors[proposal.id] !== undefined && <p className="error" role="alert">{errors[proposal.id]}</p>}</article>; })}
-    </section>
+      {proposals === null ? !loading && <ErrorNote>Could not load pending proposals from the daemon.</ErrorNote>
+        : proposals.length === 0 ? <Teach title="Nothing waits for you.">Proposals appear when an active run reaches outside its allowlist. For now, every run has finished clean.</Teach>
+        : isSwamped ? <div className="dense-queue">{proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="dense-row" key={proposal.id}><div className="d-id"><b>#{proposal.id} · run {proposal.run_id ?? "—"}</b>{proposal.created_at}</div><div className="d-main"><div className="d-cmd">{proposal.tool_name ?? "—"}</div><div className="d-why">{proposal.reasoning}</div>{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</div>{actionButtons(proposal, pending, true)}</article>; })}</div>
+        : proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="approval-card" key={proposal.id}><div className="a-meta"><span>#{proposal.id} · run {proposal.run_id ?? "—"}</span><span className="proj">{proposal.project_id ?? "global"}</span><time dateTime={proposal.created_at}>{proposal.created_at}</time></div><div className="a-cmd"><span className="verb">wants to run </span>{proposal.tool_name ?? "—"}</div><p className="a-reason">{proposal.reasoning}</p>{actionButtons(proposal, pending)}{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</article>; })}
+    </Panel>
   );
 }
 
@@ -211,9 +248,8 @@ function ScopedKillPanel({ scopedKills, token, refresh }: ScopedKillPanelProps) 
   }
 
   return (
-    <section className="panel scoped-kill-panel">
-      <h3>Trigger kill switches</h3>
-      <p className="muted">
+    <Panel title="Trigger kill switches">
+      <p className="scoped-kill-note">
         Pause one trigger type without the global panic switch. In-flight runs
         finish; only new firing stops.
       </p>
@@ -223,25 +259,26 @@ function ScopedKillPanel({ scopedKills, token, refresh }: ScopedKillPanelProps) 
           <div key={type} className="scoped-kill-row">
             <span>
               {type} triggers{engaged ? " — paused" : ""}
+              {engaged && <> <Badge tone="paused">paused</Badge></>}
             </span>
-            <button
-              type="button"
+            <Button
+              size="sm"
+              intent={engaged ? "go" : "stop"}
               disabled={busy}
               onClick={() => void toggle("trigger", type)}
             >
               {engaged ? "Resume" : "Pause"}
-            </button>
+            </Button>
           </div>
         );
       })}
-    </section>
+    </Panel>
   );
 }
 
-function Autopilot({ token, connection }: AutopilotProps) {
+function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: AutopilotProps) {
   const unavailable = connection !== "connected" || token === null;
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
-  const [killEngaged, setKillEngaged] = useState<boolean | null>(null);
   const [scopedKills, setScopedKills] = useState<ScopedKill[] | null>(null);
   const [feed, setFeed] = useState<FeedEntry[] | null>(null);
   const [scoreboard, setScoreboard] = useState<ClassTally[] | null>(null);
@@ -250,7 +287,6 @@ function Autopilot({ token, connection }: AutopilotProps) {
   const [budget, setBudget] = useState<Budget | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [togglingKillSwitch, setTogglingKillSwitch] = useState(false);
 
   const refresh = useCallback(async () => {
     if (token === null || connection !== "connected") return;
@@ -258,10 +294,9 @@ function Autopilot({ token, connection }: AutopilotProps) {
     setLoading(true);
     setScoreboard(null);
     setShadowDecisions(null);
-    const [nextProjects, nextKillEngaged, nextFeed, nextProposals, nextBudget, nextScopedKills] =
+    const [nextProjects, nextFeed, nextProposals, nextBudget, nextScopedKills] =
       await Promise.all([
         getProjects(token),
-        getKillSwitch(token),
         getFeed(
           token,
           selectedProject ? { projectId: selectedProject } : { scope: "all" },
@@ -279,7 +314,6 @@ function Autopilot({ token, connection }: AutopilotProps) {
       ]);
     }
     setProjects(nextProjects);
-    setKillEngaged(nextKillEngaged);
     setScopedKills(nextScopedKills);
     setFeed(nextFeed);
     setScoreboard(nextScoreboard);
@@ -292,7 +326,6 @@ function Autopilot({ token, connection }: AutopilotProps) {
   useEffect(() => {
     if (unavailable) {
       setProjects(null);
-      setKillEngaged(null);
       setScopedKills(null);
       setFeed(null);
       setScoreboard(null);
@@ -305,15 +338,6 @@ function Autopilot({ token, connection }: AutopilotProps) {
     void refresh();
   }, [refresh, unavailable]);
 
-  async function toggleKillSwitch() {
-    if (token === null) return;
-
-    setTogglingKillSwitch(true);
-    await setKillSwitch(token, !killEngaged);
-    await refresh();
-    setTogglingKillSwitch(false);
-  }
-
   const isFirst = projects?.length === 0;
   const isKill = killEngaged === true;
   const isBudget = budget?.paused === true;
@@ -325,10 +349,30 @@ function Autopilot({ token, connection }: AutopilotProps) {
 
   return (
     <section className="autopilot" data-state={state}>
-      {unavailable ? <div className="teach"><span className="t-title">Autopilot is waiting for the daemon.</span>Connect to the daemon to load projects, decisions and budget state.</div> : <>
-        {isKill && <div className="banner kill-banner"><div><span className="b-title">Kill switch engaged.</span><p>Every run is stopped, schedulers are parked, and approvals are read-only until you disengage.</p></div><button type="button" disabled={togglingKillSwitch} onClick={() => void toggleKillSwitch()}>Disengage</button></div>}
-        {isBudget && <div className="banner budget-banner"><div><span className="b-title">Autopilot is paused by budget.</span><p>{budget?.reason ?? "No new runs will start until the budget window reopens. Approvals remain available."}</p></div></div>}
-        <ScopedKillPanel scopedKills={scopedKills} token={token} refresh={refresh} />
+      {unavailable ? <Teach title="Autopilot is waiting for the daemon.">Connect to the daemon to load projects, decisions and budget state.</Teach> : <>
+        {isKill && (
+          <Banner
+            tone="kill"
+            title="Kill switch engaged."
+            action={
+              <ConfirmButton
+                variant="danger-solid"
+                confirmLabel="Confirm disengage?"
+                disabled={killBusy}
+                onConfirm={() => void toggleKill(false)}
+              >
+                Disengage
+              </ConfirmButton>
+            }
+          >
+            Every run is stopped, schedulers are parked, and approvals are read-only until you disengage.
+          </Banner>
+        )}
+        {isBudget && (
+          <Banner tone="budget" title="Autopilot is paused by budget.">
+            {budget?.reason ?? "No new runs will start until the budget window reopens. Approvals remain available."}
+          </Banner>
+        )}
         <h1 className="headline">{isKill ? <span className="bad">Everything is stopped.</span> : isBudget ? <><em>Paused by budget</em> — approvals still work.</> : isFirst ? <>No projects under autopilot yet.</> : isSwamped ? <><em>{proposals?.length ?? 0} decisions</em>, oldest last. Clear the queue.</> : pending > 0 ? <>All quiet — <em>{pending} decisions</em> waiting on you.</> : <>All quiet. <span className="ok">Nothing needs your signature.</span></>}</h1>
         <div className="statusline" title={budget ? budgetStatusLabel(budget) : undefined}>
           <span>{killSwitchLabel(killEngaged ?? false)}</span>
@@ -338,13 +382,18 @@ function Autopilot({ token, connection }: AutopilotProps) {
           <span>{projects?.length ?? 0} projects · {activeCount} active · {shadowCount} shadow</span>
         </div>
         {loading && projects === null && <p className="a-note">Loading…</p>}
-        {!loading && projects === null && <p className="error" role="alert">Could not load projects from the daemon.</p>}
+        {!loading && projects === null && <ErrorNote>Could not load projects from the daemon.</ErrorNote>}
         <div className="grid">
           <ApprovalQueuePanel proposals={proposals} loading={loading} token={token} refresh={refresh} isKill={isKill} isSwamped={isSwamped} />
           <div className="stack">
-            <section className={isKill ? "flat dim" : "flat"}><h2>Projects</h2>{projects !== null && projects.length === 0 ? <div className="teach"><span className="t-title">Bring your first project aboard.</span>Start in shadow mode, see what it would do, then promote it when the scoreboard earns your trust.</div> : projects?.map((project) => <ProjectCard key={project.project_id} project={project} scopedKills={scopedKills} token={token} refresh={refresh} selected={selectedProject === project.project_id} onSelect={() => setSelectedProject((current) => current === project.project_id ? null : project.project_id)} />)}</section>
-            {selectedProject !== null && <div className="panel-scope"><strong>Viewing {selectedProject}</strong><button type="button" onClick={() => setSelectedProject(null)}>Show all</button></div>}
+            <Panel dim={isKill} title="Projects">
+              {projects !== null && projects.length === 0
+                ? <Teach title="Bring your first project aboard.">Start in shadow mode, see what it would do, then promote it when the scoreboard earns your trust.</Teach>
+                : projects?.map((project) => <ProjectCard key={project.project_id} project={project} scopedKills={scopedKills} token={token} refresh={refresh} selected={selectedProject === project.project_id} onSelect={() => setSelectedProject((current) => current === project.project_id ? null : project.project_id)} />)}
+            </Panel>
+            {selectedProject !== null && <div className="panel-scope"><strong>Viewing {selectedProject}</strong><Button size="sm" onClick={() => setSelectedProject(null)}>Show all</Button></div>}
             {selectedProject !== null && <><ShadowReviewPanel projectId={selectedProject} decisions={shadowDecisions} loading={loading} token={token} refresh={refresh} /><ScoreboardPanel projectId={selectedProject} scoreboard={scoreboard} /></>}
+            <ScopedKillPanel scopedKills={scopedKills} token={token} refresh={refresh} />
             <FeedPanel feed={feed} loading={loading} selectedProject={selectedProject} />
           </div>
         </div>
