@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { Budget, ClassTally, ProjectSummary } from "./api";
 import {
   agreementRate,
+  autopilotState,
   budgetStatusLabel,
   formatUsd,
   groupScoreboardByMode,
@@ -234,6 +235,48 @@ describe("pure UI derivations", () => {
 
   it("states the promotion criterion", () => {
     expect(readinessCriterionLabel()).toBe("Ready at 10+ reviews, ≥95% agreement");
+  });
+
+  it("derives the headline autopilot state in priority order", () => {
+    const calm = {
+      killEngaged: false,
+      budgetPaused: false,
+      isFirstProject: false,
+      proposalCount: 0,
+      pending: 0,
+    };
+
+    expect(autopilotState(calm)).toBe("quiet");
+    expect(autopilotState({ ...calm, pending: 2 })).toBe("pending");
+    expect(autopilotState({ ...calm, proposalCount: 4 })).toBe("swamped");
+    // The queue is only "swamped" strictly beyond the threshold.
+    expect(autopilotState({ ...calm, proposalCount: 3 })).toBe("quiet");
+    expect(autopilotState({ ...calm, isFirstProject: true })).toBe("first");
+    expect(autopilotState({ ...calm, budgetPaused: true })).toBe("budget");
+    expect(autopilotState({ ...calm, killEngaged: true })).toBe("kill");
+    // A null kill switch (not yet loaded) counts as not engaged.
+    expect(autopilotState({ ...calm, killEngaged: null, pending: 1 })).toBe("pending");
+
+    // Priority: each higher state wins over every lower one at once.
+    expect(
+      autopilotState({
+        killEngaged: true,
+        budgetPaused: true,
+        isFirstProject: true,
+        proposalCount: 9,
+        pending: 9,
+      }),
+    ).toBe("kill");
+    expect(
+      autopilotState({
+        ...calm,
+        budgetPaused: true,
+        isFirstProject: true,
+        proposalCount: 9,
+        pending: 9,
+      }),
+    ).toBe("budget");
+    expect(autopilotState({ ...calm, proposalCount: 4, pending: 9 })).toBe("swamped");
   });
 
   it("formats human relative times, with fallbacks", () => {

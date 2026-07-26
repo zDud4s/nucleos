@@ -8,9 +8,9 @@ import {
   type ShadowDecision,
 } from "./api";
 import {
-  agreementRate, budgetStatusLabel, formatUsd, groupScoreboardByMode,
+  agreementRate, autopilotState, budgetStatusLabel, formatUsd, groupScoreboardByMode,
   killSwitchLabel, periodLabel, promotionReadiness, readinessCriterionLabel,
-  readinessGap, relativeTime, scoreboardReadiness, totalPending,
+  readinessGap, relativeTime, scoreboardReadiness, SWAMPED_THRESHOLD, totalPending,
 } from "./derive";
 import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
@@ -362,9 +362,15 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
   const isFirst = projects?.length === 0;
   const isKill = killEngaged === true;
   const isBudget = budget?.paused === true;
-  const isSwamped = (proposals?.length ?? 0) > 3;
+  const isSwamped = (proposals?.length ?? 0) > SWAMPED_THRESHOLD;
   const pending = totalPending(projects ?? []);
-  const state = isKill ? "kill" : isBudget ? "budget" : isFirst ? "first" : isSwamped ? "swamped" : pending > 0 ? "pending" : "quiet";
+  const state = autopilotState({
+    killEngaged,
+    budgetPaused: isBudget,
+    isFirstProject: isFirst,
+    proposalCount: proposals?.length ?? 0,
+    pending,
+  });
   const activeCount = (projects ?? []).filter((project) => project.mode === "active").length;
   const shadowCount = (projects ?? []).filter((project) => project.mode === "shadow").length;
 

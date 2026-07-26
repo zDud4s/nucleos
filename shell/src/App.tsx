@@ -118,7 +118,13 @@ function App() {
       ) : (
         <main className="page" data-tab={tab}>
           {tab === "home"
-            ? <Home connection={connection} status={status} />
+            ? <Home
+                token={token}
+                connection={connection}
+                status={status}
+                killEngaged={killEngaged}
+                onOpenAutopilot={() => setTab("autopilot")}
+              />
             : <Autopilot
                 token={token}
                 connection={connection}

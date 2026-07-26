@@ -46,6 +46,41 @@ export function totalPending(projects: ProjectSummary[]): number {
   return projects.reduce((sum, project) => sum + project.pending, 0);
 }
 
+export type AutopilotState =
+  | "kill"
+  | "budget"
+  | "first"
+  | "swamped"
+  | "pending"
+  | "quiet";
+
+/** Proposals beyond this count tip the approval queue into its dense layout. */
+export const SWAMPED_THRESHOLD = 3;
+
+export interface AutopilotSignals {
+  killEngaged: boolean | null;
+  budgetPaused: boolean;
+  /** True only once the project list has loaded and turned out empty. */
+  isFirstProject: boolean;
+  proposalCount: number;
+  pending: number;
+}
+
+/**
+ * The single most important thing about autopilot right now, in priority order:
+ * a global stop outranks a budget pause, which outranks onboarding, a swamped
+ * queue, pending review, and finally calm. Shared by the Autopilot cockpit and
+ * the Home digest so the two never tell a different story.
+ */
+export function autopilotState(signals: AutopilotSignals): AutopilotState {
+  if (signals.killEngaged === true) return "kill";
+  if (signals.budgetPaused) return "budget";
+  if (signals.isFirstProject) return "first";
+  if (signals.proposalCount > SWAMPED_THRESHOLD) return "swamped";
+  if (signals.pending > 0) return "pending";
+  return "quiet";
+}
+
 export function agreementRate(tally: ClassTally): number | null {
   if (tally.reviewed === 0) return null;
   return tally.agree / tally.reviewed;

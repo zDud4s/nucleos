@@ -376,11 +376,44 @@ details.scoreboard th {
 
 /* ── Home e offline ─────────────────────────────────────── */
 
+.home-digest { display: grid; gap: var(--sp-5); }
 .home-digest p {
   color: var(--muted);
   font-size: var(--fs-sm);
   max-width: 62ch;
 }
+
+.digest-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-3);
+}
+.stat {
+  display: grid;
+  gap: 4px;
+  padding: var(--sp-4);
+  background: var(--wash);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+.stat .n { font: 600 var(--fs-xl) var(--display); color: var(--text); }
+.stat .k {
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.stat .sub { font-size: var(--fs-xs); color: var(--muted); }
+.stat.attn { border-color: var(--gold); }
+.stat.attn .n { color: var(--gold); }
+
+.digest-cta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+.cta-note { font-size: var(--fs-sm); color: var(--muted); }
 
 .offline-hero {
   max-width: 520px;
