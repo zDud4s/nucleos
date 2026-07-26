@@ -1,0 +1,191 @@
+/* Camada de primitivos — consumida pelos componentes em src/ui/.
+   Um só sistema de botões, badges, painéis, banners e campos.
+   Vistas específicas (cockpit, filas) vivem em App.css. */
+
+/* ── Botões ─────────────────────────────────────────────── */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-full);
+  font-weight: 500;
+  transition: color var(--t-fast) var(--ease-out),
+    background-color var(--t-fast) var(--ease-out),
+    border-color var(--t-fast) var(--ease-out);
+}
+
+.btn--md { font-size: var(--fs-sm); padding: 7px 18px; }
+.btn--sm { font-size: var(--fs-xs); padding: 3px 12px; }
+
+.btn--approve {
+  background: var(--green-tint);
+  border-color: var(--green-line);
+  color: var(--green);
+  font-weight: 600;
+}
+.btn--approve:hover:not(:disabled) { background: var(--green-tint-strong); }
+
+.btn--ghost {
+  border-color: var(--line);
+  color: var(--muted);
+}
+.btn--ghost:hover:not(:disabled) { color: var(--text); border-color: var(--glass-line); }
+.btn--ghost.intent-go:hover:not(:disabled) { color: var(--green); border-color: var(--green-line); }
+.btn--ghost.intent-stop:hover:not(:disabled) { color: var(--red); border-color: var(--red-line); }
+
+.btn--danger {
+  border-color: var(--red-line);
+  color: var(--red);
+}
+.btn--danger:hover:not(:disabled) { background: var(--red-tint); }
+
+.btn--danger-solid {
+  background: var(--red);
+  color: var(--on-red);
+  font-weight: 600;
+}
+
+.btn--link {
+  border: none;
+  padding: 3px 4px;
+  color: var(--faint);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.btn--link:hover:not(:disabled) { color: var(--red); }
+
+/* estado armado do ConfirmButton: a segunda pergunta é visível, não um modal */
+.btn.is-armed {
+  background: var(--red-tint);
+  border-color: var(--red-line);
+  color: var(--red);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+/* ── Badges ─────────────────────────────────────────────── */
+
+.badge {
+  font: 500 var(--fs-2xs) / 1.6 var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-radius: var(--r-full);
+  padding: 2px 10px;
+  flex-shrink: 0;
+}
+.badge--active { color: var(--green); background: var(--green-tint); }
+.badge--shadow { color: var(--shadow-mode); background: var(--shadow-mode-tint); }
+.badge--off { color: var(--faint); background: var(--hairline); }
+.badge--pending { color: var(--gold); background: var(--gold-tint); }
+.badge--paused { color: var(--gold); background: none; border: 1px solid var(--gold-line); }
+
+/* ── Seletor segmentado (controlo de modo) ──────────────── */
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.seg button {
+  background: none;
+  border: none;
+  font: 500 var(--fs-2xs) var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  color: var(--faint);
+  transition: color var(--t-fast) var(--ease-out),
+    background-color var(--t-fast) var(--ease-out);
+}
+.seg button:hover:not(:disabled):not(.on) { color: var(--text); background: var(--hairline); }
+.seg button.on.off { color: var(--text); background: var(--wash-strong); }
+.seg button.on.shadow { color: var(--on-shadow); background: var(--shadow-mode); }
+.seg button.on.active { color: var(--on-green); background: var(--green); }
+
+/* ── Painéis (camada base, sólida) ──────────────────────── */
+
+.flat {
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+}
+
+section > h2 {
+  font: 700 var(--fs-lg) var(--display);
+  letter-spacing: 0.01em;
+  margin: 0 0 var(--sp-3);
+}
+section > h2 small {
+  font: 400 var(--fs-xs) var(--body);
+  color: var(--faint);
+  margin-left: var(--sp-2);
+}
+
+/* ── Teach (empty state que ensina) ─────────────────────── */
+
+.teach {
+  padding: var(--sp-5);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  max-width: 58ch;
+}
+.teach b { color: var(--text); }
+.teach .t-title {
+  font: 700 var(--fs-md) var(--display);
+  color: var(--text);
+  display: block;
+  margin-bottom: var(--sp-2);
+}
+
+/* ── Banners de exceção (camada elevada: vidro) ─────────── */
+
+.banner {
+  max-width: 1120px;
+  width: calc(100% - var(--sp-6));
+  margin: var(--sp-4) auto 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-5);
+  border-radius: var(--r-md);
+  backdrop-filter: var(--blur);
+  border: 1px solid;
+  box-shadow: var(--shadow-card);
+  animation: drop var(--t-med) var(--ease-out);
+}
+.banner p { font-size: var(--fs-sm); max-width: 70ch; }
+.banner .b-title { font: 700 var(--fs-md) var(--display); }
+.banner > .btn { margin-left: auto; flex-shrink: 0; }
+.banner--kill { background: var(--red-surface); border-color: var(--red-line); }
+.banner--kill .b-title { color: var(--red); }
+.banner--budget { background: var(--gold-surface); border-color: var(--gold-line); }
+.banner--budget .b-title { color: var(--gold); }
+
+/* ── Erro e campos ──────────────────────────────────────── */
+
+.error { color: var(--red); font-size: var(--fs-sm); }
+
+.field {
+  display: grid;
+  gap: var(--sp-1);
+  color: var(--faint);
+  font-size: var(--fs-xs);
+}
+.field input,
+.field select {
+  width: 100%;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: 400 var(--fs-sm) var(--body);
+  padding: 6px 8px;
+}

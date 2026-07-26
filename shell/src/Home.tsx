@@ -1,4 +1,5 @@
 import type { ConnectionState } from "./api";
+import { Teach } from "./ui";
 
 interface HomeProps {
   connection: ConnectionState;
@@ -16,10 +17,9 @@ function Home({ connection, status }: HomeProps) {
         <span data-testid="connection-state">connection <b>{connection}</b></span>
         <span data-testid="daemon-status">daemon <b>{status ?? "waiting for status"}</b></span>
       </div>
-      <div className="teach">
-        <span className="t-title">Your operating picture will appear here.</span>
+      <Teach title="Your operating picture will appear here.">
         Once Autopilot has projects and activity to report, this is where the quiet summary lands.
-      </div>
+      </Teach>
     </section>
   );
 }

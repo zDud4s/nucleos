@@ -1,10 +1,94 @@
+/* ─────────────────────────────────────────────────────────────
+   NucleOS — design tokens (fonte canónica)
+   Direção: B · "vidro com propósito" — ver design/design-system.md
+   design/prototypes/b-tokens.css é o snapshot histórico do protótipo;
+   este ficheiro é o que a shell consome e o que evolui.
+   Regra de ouro: vidro (blur + translucidez + sombra) SÓ nas camadas
+   elevadas — barra de comando, cartões de aprovação, banners de
+   exceção. A camada base é sólida e quieta.
+   ───────────────────────────────────────────────────────────── */
 :root {
-  --bg: oklch(0.155 0.02 265); --bg-raise: oklch(0.19 0.021 265 / 0.6); --glass: color-mix(in oklab, oklch(0.28 0.025 265) 52%, transparent); --glass-line: oklch(0.85 0.02 265 / 0.14); --line: oklch(0.32 0.02 265 / 0.7); --text: oklch(0.93 0.008 265); --muted: oklch(0.68 0.015 265); --faint: oklch(0.52 0.018 265);
-  --gold: oklch(0.82 0.115 85); --green: oklch(0.78 0.11 155); --red: oklch(0.67 0.165 20); --shadow-mode: oklch(0.76 0.05 255); --glow-cool: oklch(0.42 0.06 250 / 0.20); --glow-warm: oklch(0.46 0.06 85 / 0.13);
-  --display:"Cabinet Grotesk","Segoe UI",system-ui,sans-serif; --body:"General Sans","Segoe UI",system-ui,sans-serif; --mono:"Spline Sans Mono","Cascadia Code",ui-monospace,Consolas,monospace;
-  --fs-xs: 11px; --fs-sm: 13px; --fs-md: 14.5px; --fs-lg: 18px; --fs-xl: 23px; --fs-2xl: 29px;
-  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
-  --r-sm: 10px; --r-md: 16px; --r-full: 999px;
-  --shadow-float: 0 18px 44px oklch(0.05 0.02 265 / 0.45), inset 0 1px 0 oklch(1 0 0 / 0.08); --shadow-card: 0 22px 50px oklch(0.05 0.02 265 / 0.4), inset 0 1px 0 oklch(1 0 0 / 0.07); --blur: blur(20px) saturate(1.2);
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); --t-fast: 0.15s; --t-med: 0.3s; --t-slow: 0.55s;
+  /* ── superfícies & tinta (hue 265 = tinta de marca, OKLCH) ── */
+  --bg: oklch(0.155 0.02 265);
+  --bg-raise: oklch(0.19 0.021 265 / 0.6);      /* painéis flat, camada base */
+  --glass: color-mix(in oklab, oklch(0.28 0.025 265) 52%, transparent);
+  --glass-line: oklch(0.85 0.02 265 / 0.14);
+  --line: oklch(0.32 0.02 265 / 0.7);
+  --hairline: oklch(1 0 0 / 0.05);              /* separadores dentro de vidro */
+  --wash: oklch(1 0 0 / 0.09);                  /* preenchimento selecionado/hover */
+  --wash-strong: oklch(1 0 0 / 0.12);
+  --code-bg: oklch(0.1 0.02 265 / 0.55);        /* chips de comando, <pre> */
+  --text: oklch(0.93 0.008 265);
+  --muted: oklch(0.68 0.015 265);
+  --faint: oklch(0.58 0.018 265);               /* ≥4.5:1 sobre --bg (AA) */
+
+  /* ── estado = cor; croma quase só aqui ── */
+  --gold: oklch(0.82 0.115 85);                  /* pendente / atenção */
+  --green: oklch(0.78 0.11 155);                 /* ok / ativo */
+  --red: oklch(0.67 0.165 20);                   /* perigo / kill */
+  --shadow-mode: oklch(0.76 0.05 255);           /* modo sombra */
+
+  /* tints derivados: -tint (fundo), -line (contorno), -strong (hover) */
+  --green-tint: oklch(0.78 0.11 155 / 0.14);
+  --green-tint-strong: oklch(0.78 0.11 155 / 0.28);
+  --green-line: oklch(0.78 0.11 155 / 0.45);
+  --gold-tint: oklch(0.82 0.115 85 / 0.13);
+  --gold-line: oklch(0.82 0.115 85 / 0.35);
+  --red-tint: oklch(0.67 0.165 20 / 0.14);
+  --red-line: oklch(0.67 0.165 20 / 0.5);
+  --shadow-mode-tint: oklch(0.76 0.05 255 / 0.13);
+
+  /* tinta sobre preenchimentos sólidos de estado */
+  --on-green: oklch(0.15 0.03 155);
+  --on-red: oklch(0.15 0.03 20);
+  --on-shadow: oklch(0.15 0.02 255);
+
+  /* superfícies de banner (exceções) */
+  --red-surface: color-mix(in oklab, oklch(0.35 0.09 20) 45%, transparent);
+  --gold-surface: color-mix(in oklab, oklch(0.4 0.07 85) 38%, transparent);
+
+  /* foco */
+  --focus-ring: oklch(0.75 0.04 265 / 0.9);
+
+  /* brilhos de fundo (fixos, alpha baixo) */
+  --glow-cool: oklch(0.42 0.06 250 / 0.20);
+  --glow-warm: oklch(0.46 0.06 85 / 0.13);
+
+  /* ── tipografia ── */
+  --display: "Cabinet Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body: "General Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "Spline Sans Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+
+  /* escala fixa (app UI, sem fluid) */
+  --fs-2xs: 10px;   /* micro-labels uppercase: badges, seg, th */
+  --fs-xs: 11.5px;  /* meta mono, labels, botões sm */
+  --fs-sm: 13px;    /* secundário, botões md */
+  --fs-md: 14.5px;  /* corpo */
+  --fs-lg: 18px;    /* título de secção */
+  --fs-xl: 23px;    /* subheadline */
+  --fs-2xl: 29px;   /* headline de estado */
+
+  /* espaçamento 4pt */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
+
+  /* raio */
+  --r-sm: 10px;
+  --r-md: 16px;
+  --r-full: 999px;
+
+  /* elevação — sombra só nas camadas de vidro */
+  --shadow-float: 0 18px 44px oklch(0.05 0.02 265 / 0.45),
+                  inset 0 1px 0 oklch(1 0 0 / 0.08);
+  --shadow-card: 0 22px 50px oklch(0.05 0.02 265 / 0.4),
+                 inset 0 1px 0 oklch(1 0 0 / 0.07);
+
+  /* vidro — usar em conjunto com background: var(--glass) */
+  --blur: blur(20px) saturate(1.2);
+
+  /* movimento */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --t-fast: 0.15s;
+  --t-med: 0.3s;
+  --t-slow: 0.55s;
 }

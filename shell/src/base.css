@@ -1,0 +1,78 @@
+/* Camada base: reset, fundo, foco, movimento global.
+   Nada aqui conhece componentes — só o palco. */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(1100px 700px at 88% -12%, var(--glow-cool), transparent 62%),
+    radial-gradient(900px 650px at -8% 108%, var(--glow-warm), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--text);
+  font: 400 var(--fs-md) / 1.6 var(--body);
+  min-height: 100vh;
+  padding-bottom: 96px;
+}
+
+/* grão subtil por cima dos brilhos — evita banding no vidro */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+  mix-blend-mode: overlay;
+}
+
+.shell-root {
+  min-height: 100vh;
+  position: relative;
+  z-index: 2;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+code {
+  font: 500 0.9em var(--mono);
+}
+
+:is(button, summary, input, select):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+}
+
+@keyframes drop {
+  from { opacity: 0; transform: translateY(-8px); }
+}
+
+@keyframes pulse {
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
