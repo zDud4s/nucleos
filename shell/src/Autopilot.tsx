@@ -294,12 +294,10 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (background = false) => {
     if (token === null || connection !== "connected") return;
 
-    setLoading(true);
-    setScoreboard(null);
-    setShadowDecisions(null);
+    if (!background) setLoading(true);
     const [nextProjects, nextFeed, nextProposals, nextBudget, nextScopedKills] =
       await Promise.all([
         getProjects(token),
@@ -326,8 +324,16 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
     setShadowDecisions(nextShadowDecisions);
     setProposals(nextProposals);
     setBudget(nextBudget);
-    setLoading(false);
+    if (!background) setLoading(false);
   }, [connection, selectedProject, token]);
+
+  // Switching projects clears the previous project's scoped data so a switch
+  // never shows the wrong project's numbers; an ambient refresh of the SAME
+  // project keeps them so nothing flickers.
+  useEffect(() => {
+    setScoreboard(null);
+    setShadowDecisions(null);
+  }, [selectedProject]);
 
   useEffect(() => {
     if (unavailable) {
@@ -342,6 +348,15 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
       return;
     }
     void refresh();
+  }, [refresh, unavailable]);
+
+  // Keep the tab live on the same 3s cadence as the health poll, silently:
+  // a background refresh sets no loading flag and keeps prior data until fresh
+  // data lands, so nothing flickers.
+  useEffect(() => {
+    if (unavailable) return;
+    const id = setInterval(() => void refresh(true), 3000);
+    return () => clearInterval(id);
   }, [refresh, unavailable]);
 
   const isFirst = projects?.length === 0;
