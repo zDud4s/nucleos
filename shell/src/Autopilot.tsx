@@ -10,7 +10,7 @@ import {
 import {
   agreementRate, budgetStatusLabel, formatUsd, groupScoreboardByMode,
   killSwitchLabel, periodLabel, promotionReadiness, readinessCriterionLabel,
-  readinessGap, scoreboardReadiness, totalPending,
+  readinessGap, relativeTime, scoreboardReadiness, totalPending,
 } from "./derive";
 import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
@@ -128,7 +128,7 @@ function FeedPanel({ feed, loading, selectedProject }: FeedPanelProps) {
       {feed === null ? !loading && <ErrorNote>Could not load activity from the daemon.</ErrorNote>
         : feed.length === 0 ? <Teach title="The record starts here.">Runs, proposals, verdicts and budget events will leave their paper trail here.</Teach>
         : feed.map((entry) => <article className="feed-item" key={entry.id}>
-            <div className="f-meta"><time dateTime={entry.created_at}>{entry.created_at}</time><span>{entry.kind}</span></div>
+            <div className="f-meta"><time dateTime={entry.created_at} title={entry.created_at}>{relativeTime(entry.created_at)}</time><span>{entry.kind}</span></div>
             <p className="f-body"><b>{entry.project_id ?? "global"}</b> — {entry.summary}</p>
           </article>)}
     </Panel>
@@ -220,8 +220,8 @@ function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill, isSwam
       {isKill && <p className="a-note">Read-only while the kill switch is engaged — disengage to act.</p>}
       {proposals === null ? !loading && <ErrorNote>Could not load pending proposals from the daemon.</ErrorNote>
         : proposals.length === 0 ? <Teach title="Nothing waits for you.">Proposals appear when an active run reaches outside its allowlist. For now, every run has finished clean.</Teach>
-        : isSwamped ? <div className="dense-queue">{proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="dense-row" key={proposal.id}><div className="d-id"><b>#{proposal.id} · run {proposal.run_id ?? "—"}</b>{proposal.created_at}</div><div className="d-main"><div className="d-cmd">{proposal.tool_name ?? "—"}</div><div className="d-why">{proposal.reasoning}</div>{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</div>{actionButtons(proposal, pending, true)}</article>; })}</div>
-        : proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="approval-card" key={proposal.id}><div className="a-meta"><span>#{proposal.id} · run {proposal.run_id ?? "—"}</span><span className="proj">{proposal.project_id ?? "global"}</span><time dateTime={proposal.created_at}>{proposal.created_at}</time></div><div className="a-cmd"><span className="verb">wants to run </span>{proposal.tool_name ?? "—"}</div><p className="a-reason">{proposal.reasoning}</p>{actionButtons(proposal, pending)}{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</article>; })}
+        : isSwamped ? <div className="dense-queue">{proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="dense-row" key={proposal.id}><div className="d-id"><b>#{proposal.id} · run {proposal.run_id ?? "—"}</b><time dateTime={proposal.created_at} title={proposal.created_at}>{relativeTime(proposal.created_at)}</time></div><div className="d-main"><div className="d-cmd">{proposal.tool_name ?? "—"}</div><div className="d-why">{proposal.reasoning}</div>{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</div>{actionButtons(proposal, pending, true)}</article>; })}</div>
+        : proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="approval-card" key={proposal.id}><div className="a-meta"><span>#{proposal.id} · run {proposal.run_id ?? "—"}</span><span className="proj">{proposal.project_id ?? "global"}</span><time dateTime={proposal.created_at} title={proposal.created_at}>{relativeTime(proposal.created_at)}</time></div><div className="a-cmd"><span className="verb">wants to run </span>{proposal.tool_name ?? "—"}</div><p className="a-reason">{proposal.reasoning}</p>{actionButtons(proposal, pending)}{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</article>; })}
     </Panel>
   );
 }

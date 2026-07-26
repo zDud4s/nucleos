@@ -11,6 +11,7 @@ import {
   promotionReadiness,
   readinessCriterionLabel,
   readinessGap,
+  relativeTime,
   scoreboardReadiness,
   totalPending,
 } from "./derive";
@@ -233,5 +234,18 @@ describe("pure UI derivations", () => {
 
   it("states the promotion criterion", () => {
     expect(readinessCriterionLabel()).toBe("Ready at 10+ reviews, ≥95% agreement");
+  });
+
+  it("formats human relative times, with fallbacks", () => {
+    const now = Date.parse("2026-07-26T12:00:00Z");
+    expect(relativeTime("2026-07-26T12:00:00Z", now)).toBe("just now");
+    expect(relativeTime("2026-07-26T11:59:30Z", now)).toBe("just now");
+    expect(relativeTime("2026-07-26T12:00:30Z", now)).toBe("just now");
+    expect(relativeTime("2026-07-26T11:48:00Z", now)).toBe("12 min ago");
+    expect(relativeTime("2026-07-26T09:00:00Z", now)).toBe("3 h ago");
+    expect(relativeTime("2026-07-24T12:00:00Z", now)).toBe("2 d ago");
+    expect(relativeTime("2026-07-12T12:00:00Z", now)).toBe("2 w ago");
+    expect(relativeTime("2026-05-01T00:00:00Z", now)).toBe("2026-05-01");
+    expect(relativeTime("not-a-date", now)).toBe("not-a-date");
   });
 });

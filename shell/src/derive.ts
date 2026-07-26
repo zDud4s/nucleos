@@ -85,3 +85,26 @@ export function budgetStatusLabel(budget: Budget): string {
   const base = `${formatUsd(budget.window_spend_usd)} of ${formatUsd(budget.limit_usd)} ${periodLabel(budget.period)}`;
   return budget.paused ? `Paused — ${base}` : base;
 }
+
+/**
+ * A compact, human relative time like "12 min ago" for feed/proposal metadata;
+ * the exact ISO instant belongs in a `title`. `nowMs` defaults to the current
+ * time so callers pass just the ISO string, while tests pin it. Unparseable
+ * input falls back to the raw string; timestamps older than ~a month fall back
+ * to the calendar date.
+ */
+export function relativeTime(iso: string, nowMs: number = Date.now()): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return iso;
+  const sec = Math.floor((nowMs - then) / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day} d ago`;
+  const wk = Math.floor(day / 7);
+  if (wk < 5) return `${wk} w ago`;
+  return iso.slice(0, 10);
+}
