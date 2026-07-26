@@ -593,6 +593,13 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
 
 #[cfg(test)]
 mod tests {
+    // These `current_thread` async tests hold `worktree::test_env_lock()` — a
+    // process-wide MutexGuard — across their awaits to serialise mutation of the
+    // shared `WORKTREE_ROOT` env override. Holding it across `.await` is the whole
+    // point (and there is no multi-thread runtime to starve), so
+    // `await_holding_lock` is a false positive here.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use crate::auth::Token;
     use crate::proposals;

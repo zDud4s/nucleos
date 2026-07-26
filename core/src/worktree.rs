@@ -371,6 +371,14 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
+    // `env_lock()` returns a process-wide MutexGuard deliberately held across the
+    // awaits of these `current_thread` async tests, serialising mutation of the
+    // shared `WORKTREE_ROOT` env override. It is a `std::sync::Mutex` (shared with
+    // sync `#[test]`s, so it cannot become a `tokio::Mutex`) and there is no
+    // multi-thread runtime to starve here — `await_holding_lock` is a false
+    // positive for this intentional test-serialisation guard.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::ffi::{OsStr, OsString};
