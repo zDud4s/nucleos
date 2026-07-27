@@ -34,6 +34,26 @@ fn end_turn(chat_id: &str) {
     BUSY_CHATS.lock().unwrap().remove(chat_id);
 }
 
+/// Owns a turn's chat slot and its temp MCP config, releasing both when the turn ends — by
+/// completing, by failing, or by being aborted.
+///
+/// This must be a guard rather than cleanup statements at the end of the task. Cancelling a run
+/// calls `abort()` (`runs::finalize_termination`), which drops the task's future mid-await, so
+/// anything written after the `.await` never runs. A chat left behind in `BUSY_CHATS` then rejects
+/// every later message with 409 until the daemon restarts — and "the bot stopped answering" points
+/// nowhere near a cancel that reported success.
+struct TurnGuard {
+    chat_id: String,
+    mcp_path: std::path::PathBuf,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        end_turn(&self.chat_id);
+        let _ = std::fs::remove_file(&self.mcp_path);
+    }
+}
+
 pub async fn get_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
     let session_id: Option<Option<String>> =
         sqlx::query_scalar("SELECT session_id FROM assistant_sessions WHERE chat_id = ?")
@@ -137,12 +157,16 @@ fn spawn_assistant_turn(
     let runner = state.runner.clone();
     let run_timeout = state.run_timeout;
     let env = crate::runs::run_env(state, id);
+    // Built HERE, outside the task, and captured by the async block. A task aborted before its first
+    // poll drops its captured state without ever running a line of the body, so a guard constructed
+    // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
+    let turn = TurnGuard { chat_id, mcp_path };
 
     crate::runs::spawn_registered(state, id, async move {
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
             let pool = pool.clone();
-            let chat_id = chat_id.clone();
+            let chat_id = turn.chat_id.clone();
             tokio::spawn(async move {
                 if let Some(session_id) = session_rx.recv().await {
                     let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
@@ -169,7 +193,7 @@ fn spawn_assistant_turn(
                 None,
                 false,
                 resume.as_deref(),
-                Some(mcp_path.as_path()),
+                Some(turn.mcp_path.as_path()),
                 session_tx,
             ),
         )
@@ -192,7 +216,7 @@ fn spawn_assistant_turn(
                 .execute(&pool)
                 .await;
                 if let Some(session_id) = o.session_id.as_deref() {
-                    let _ = upsert_session(&pool, &chat_id, session_id, &completed_at).await;
+                    let _ = upsert_session(&pool, &turn.chat_id, session_id, &completed_at).await;
                 }
             }
             Ok(Err(e)) => {
@@ -216,8 +240,7 @@ fn spawn_assistant_turn(
             }
         }
 
-        end_turn(&chat_id);
-        let _ = std::fs::remove_file(&mcp_path);
+        // No cleanup here on purpose: `turn` drops it, on every path including an abort.
     });
 }
 
@@ -372,5 +395,60 @@ mod tests {
 
         assert_eq!(status, "completed");
         assert_eq!(session, Some("fake-session-id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_turn_frees_the_chat_and_removes_its_mcp_config() {
+        let mut state = test_state().await;
+        // A slow runner keeps the turn parked on an await, which is where a real `/cancel` lands.
+        let runner = Arc::new(FakeCommandRunner {
+            delay: Mutex::new(Some(Duration::from_secs(30))),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let chat_id = "assistant-cancel-test-chat";
+        let mcp_path = std::env::temp_dir().join(format!("nucleos-mcp-{chat_id}.json"));
+
+        let id = send_message(&state, chat_id, "take your time")
+            .await
+            .unwrap();
+        // Wait until the CLI is actually under way; cancelling a turn still queued would exercise a
+        // different (and easier) path than the one a user hits.
+        for _ in 0..50 {
+            if *runner.calls.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            1,
+            "the turn should have started"
+        );
+
+        assert!(
+            crate::runs::finalize_termination(&state, id, "cancelled").await,
+            "the turn should still have been in flight"
+        );
+
+        // `finalize_termination` aborts the task, which drops its future mid-await. Cleanup that
+        // lives in trailing statements never runs — and a chat left in BUSY_CHATS rejects every
+        // later message with 409 until the daemon restarts, which is indistinguishable from the bot
+        // having died.
+        for _ in 0..50 {
+            if !mcp_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !mcp_path.exists(),
+            "the temp mcp config should not outlive a cancelled turn"
+        );
+        assert!(
+            try_begin_turn(chat_id),
+            "a cancelled turn must free the chat for the next message"
+        );
+        end_turn(chat_id);
     }
 }
