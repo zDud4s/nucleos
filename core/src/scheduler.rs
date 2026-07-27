@@ -16,7 +16,50 @@ const TICK: Duration = Duration::from_secs(30);
 const MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(1);
 /// Phase 1 limits each project rule to 24 runs per daemon day.
 const DAILY_CAP: u32 = 24;
+/// How late a due window must be before its run counts as a catch-up. Normal scheduling lands within
+/// one `TICK`; this far behind means the daemon or the machine was genuinely unavailable, not merely
+/// busy — which is the difference between "a bit late" and "running on days-old assumptions".
+const CATCH_UP_GRACE_MINUTES: i64 = 15;
 
+/// Whether a due window came up so long ago that the daemon plainly was not running to serve it.
+pub fn is_catch_up(due_at: DateTime<Utc>, now: DateTime<Utc>, grace: chrono::Duration) -> bool {
+    now.signed_duration_since(due_at) > grace
+}
+
+fn humanize_lateness(late: chrono::Duration) -> String {
+    let minutes = late.num_minutes().max(0);
+    match minutes {
+        0..=59 => format!("{minutes} minutes"),
+        60..=1439 => format!("{} hours", minutes / 60),
+        _ => format!("{} days", minutes / (60 * 24)),
+    }
+}
+
+/// The preamble a catch-up run carries ahead of its rule's own prompt.
+///
+/// Two separate warnings, because they answer different risks: being late says the surrounding work
+/// may have moved on, while a moved HEAD says the plan itself may no longer apply. The run is always
+/// plan-only, so the worst case is a proposal worth rejecting rather than a bad commit — but the
+/// model still needs to be told, or it will confidently execute a stale plan as if it were fresh.
+pub fn catch_up_preamble(late: chrono::Duration, head_moved: bool) -> String {
+    let mut preamble = format!(
+        "This is a CATCH-UP run: its scheduled window was missed and it is starting {} late, \
+         so the assumptions behind this task may be out of date.",
+        humanize_lateness(late)
+    );
+    if head_moved {
+        preamble.push_str(
+            " The repository HEAD has also moved since this window was scheduled. Re-triage before \
+             planning: check the task against the current state of the repository, and if it no \
+             longer makes sense, say so instead of carrying out the original plan.",
+        );
+    }
+    preamble.push_str(" You are in plan-only mode — propose, do not act.");
+    preamble
+}
+
+/// Returns each due rule paired with the occurrence that made it due, so the caller can tell a run
+/// served on time from one recovering a window missed hours or days ago.
 pub fn due_rules<'a>(
     rules: &'a [ScheduleRule],
     last_fired: &HashMap<String, DateTime<Utc>>,
@@ -24,10 +67,10 @@ pub fn due_rules<'a>(
     now: DateTime<Utc>,
     min_interval: chrono::Duration,
     daily_cap: u32,
-) -> Vec<&'a ScheduleRule> {
+) -> Vec<(&'a ScheduleRule, DateTime<Utc>)> {
     rules
         .iter()
-        .filter(|rule| {
+        .filter_map(|rule| {
             let cron = match rule.cron.parse::<Cron>() {
                 Ok(cron) => cron,
                 Err(error) => {
@@ -37,24 +80,23 @@ pub fn due_rules<'a>(
                         error = %error,
                         "skipping invalid schedule rule"
                     );
-                    return false;
+                    return None;
                 }
             };
 
-            let Some(last_fired_at) = last_fired.get(&rule.name) else {
-                return false;
-            };
+            let last_fired_at = last_fired.get(&rule.name)?;
 
             if now.signed_duration_since(*last_fired_at) < min_interval {
-                return false;
+                return None;
             }
 
             if fires_today.get(&rule.name).copied().unwrap_or(0) >= daily_cap {
-                return false;
+                return None;
             }
 
             match cron.find_next_occurrence(last_fired_at, false) {
-                Ok(next) => next <= now,
+                Ok(next) if next <= now => Some((rule, next.with_timezone(&Utc))),
+                Ok(_) => None,
                 Err(error) => {
                     tracing::warn!(
                         rule_name = %rule.name,
@@ -62,7 +104,7 @@ pub fn due_rules<'a>(
                         error = %error,
                         "could not calculate the next schedule occurrence"
                     );
-                    false
+                    None
                 }
             }
         })
@@ -154,8 +196,8 @@ pub(crate) async fn scheduler_tick(
             }
         };
 
-        let rows: Vec<(String, String)> = match sqlx::query_as(
-            "SELECT rule_name, last_fired_at
+        let rows: Vec<(String, String, Option<String>)> = match sqlx::query_as(
+            "SELECT rule_name, last_fired_at, last_head_sha
              FROM scheduler_state
              WHERE project_id = ?",
         )
@@ -174,9 +216,16 @@ pub(crate) async fn scheduler_tick(
             }
         };
 
-        let persisted_names: HashSet<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+        let persisted_names: HashSet<&str> = rows.iter().map(|(name, ..)| name.as_str()).collect();
+        // The HEAD each rule was last armed/fired at, so a catch-up can tell whether the repo moved
+        // under it. Absent for rules armed before migration 0018 — treated as "cannot tell", which
+        // is not the same as "did not move", so those simply skip the re-triage warning.
+        let last_head_shas: HashMap<&str, &str> = rows
+            .iter()
+            .filter_map(|(name, _, sha)| Some((name.as_str(), sha.as_deref()?)))
+            .collect();
         let mut last_fired = HashMap::new();
-        for (rule_name, value) in &rows {
+        for (rule_name, value, _) in &rows {
             match DateTime::parse_from_rfc3339(value) {
                 Ok(timestamp) => {
                     last_fired.insert(rule_name.clone(), timestamp.with_timezone(&Utc));
@@ -211,30 +260,6 @@ pub(crate) async fn scheduler_tick(
             }
         }
 
-        for rule in &rules {
-            if persisted_names.contains(rule.name.as_str()) {
-                continue;
-            }
-
-            if let Err(error) = sqlx::query(
-                "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(&project_id)
-            .bind(&rule.name)
-            .bind(now.to_rfc3339())
-            .execute(&state.pool)
-            .await
-            {
-                tracing::warn!(
-                    project_id = %project_id,
-                    rule_name = %rule.name,
-                    %error,
-                    "failed to arm new schedule rule"
-                );
-            }
-        }
-
         let project_fires: HashMap<String, u32> = fires_today
             .iter()
             .filter(|((stored_project_id, _), _)| stored_project_id == &project_id)
@@ -249,8 +274,44 @@ pub(crate) async fn scheduler_tick(
             DAILY_CAP,
         );
 
+        // Read HEAD once per project, and only when something is actually about to be armed or
+        // fired — this loop runs every 30s and spawning git for an idle project would be pure waste.
+        let unarmed = rules
+            .iter()
+            .any(|rule| !persisted_names.contains(rule.name.as_str()));
+        let head_sha = if unarmed || !due.is_empty() {
+            crate::repo_trigger::current_branch_sha(Path::new(&project_root), "HEAD", false).await
+        } else {
+            None
+        };
+
+        for rule in &rules {
+            if persisted_names.contains(rule.name.as_str()) {
+                continue;
+            }
+
+            if let Err(error) = sqlx::query(
+                "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at, last_head_sha)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&project_id)
+            .bind(&rule.name)
+            .bind(now.to_rfc3339())
+            .bind(head_sha.as_deref())
+            .execute(&state.pool)
+            .await
+            {
+                tracing::warn!(
+                    project_id = %project_id,
+                    rule_name = %rule.name,
+                    %error,
+                    "failed to arm new schedule rule"
+                );
+            }
+        }
+
         let mut fired_this_tick = HashSet::new();
-        for rule in due {
+        for (rule, due_at) in due {
             let fire_key = (project_id.clone(), rule.name.clone());
             if fires_today.get(&fire_key).copied().unwrap_or(0) >= DAILY_CAP {
                 tracing::warn!(
@@ -270,30 +331,62 @@ pub(crate) async fn scheduler_tick(
                 continue;
             }
 
+            // A catch-up is demoted to plan-only whatever the project's mode: it carries assumptions
+            // as old as the window it missed, so the most it may produce is a proposal.
+            let catch_up = is_catch_up(
+                due_at,
+                now,
+                chrono::Duration::minutes(CATCH_UP_GRACE_MINUTES),
+            );
             let (cwd, run_mode) = match project_mode {
-                Mode::Shadow => (
+                Mode::Off => continue,
+                Mode::Active if !catch_up => (project_root.clone(), "worktree"),
+                // Shadow always, and Active demoted by a catch-up: plan-only, in place, no worktree.
+                Mode::Shadow | Mode::Active => (
                     rule.cwd.clone().unwrap_or_else(|| project_root.clone()),
                     "shadow",
                 ),
-                Mode::Active => (project_root.clone(), "worktree"),
-                Mode::Off => continue,
             };
-            match create_run_inner(
-                state,
-                rule.prompt.clone(),
-                Some(project_id.clone()),
-                Some(cwd),
-                run_mode,
-            )
-            .await
+
+            let prompt = if catch_up {
+                let head_moved = match (last_head_shas.get(rule.name.as_str()), head_sha.as_deref())
+                {
+                    (Some(recorded), Some(current)) => *recorded != current,
+                    // No recorded sha (armed before migration 0018) or no readable HEAD: we cannot
+                    // tell, which is not the same as knowing it stayed put — so warn about lateness
+                    // only, rather than asserting the repo is unchanged.
+                    _ => false,
+                };
+                tracing::info!(
+                    project_id = %project_id,
+                    rule_name = %rule.name,
+                    late_minutes = now.signed_duration_since(due_at).num_minutes(),
+                    head_moved,
+                    "serving a missed window as a plan-only catch-up run"
+                );
+                format!(
+                    "{}\n\n{}",
+                    catch_up_preamble(now.signed_duration_since(due_at), head_moved),
+                    rule.prompt
+                )
+            } else {
+                rule.prompt.clone()
+            };
+
+            match create_run_inner(state, prompt, Some(project_id.clone()), Some(cwd), run_mode)
+                .await
             {
                 Ok(run_id) => {
+                    // The sha rides along with the timestamp: both describe the state this rule's
+                    // NEXT window is being scheduled from, so they have to move together or a later
+                    // catch-up would compare against a HEAD from the wrong moment.
                     if let Err(error) = sqlx::query(
                         "UPDATE scheduler_state
-                         SET last_fired_at = ?
+                         SET last_fired_at = ?, last_head_sha = ?
                          WHERE project_id = ? AND rule_name = ?",
                     )
                     .bind(now.to_rfc3339())
+                    .bind(head_sha.as_deref())
                     .bind(&project_id)
                     .bind(&rule.name)
                     .execute(&state.pool)
@@ -509,7 +602,9 @@ mod tests {
         );
 
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].name, "every-minute");
+        assert_eq!(due[0].0.name, "every-minute");
+        // The occurrence that came due, not `now` — this is what tells a catch-up from a fresh fire.
+        assert_eq!(due[0].1, timestamp("2026-07-18T10:01:00Z"));
     }
 
     #[test]
@@ -629,6 +724,117 @@ mod tests {
         assert_eq!(timestamp(&stored), now);
 
         let _ = crate::worktree::remove(&repo, &PathBuf::from(worktree_path), &[]).await;
+    }
+
+    #[test]
+    fn a_window_is_a_catch_up_only_once_it_is_properly_late() {
+        let due = timestamp("2026-07-18T10:00:00Z");
+        let grace = chrono::Duration::minutes(15);
+
+        // Served within a tick or two: ordinary, not a catch-up.
+        assert!(!is_catch_up(due, timestamp("2026-07-18T10:00:30Z"), grace));
+        // Exactly at the grace boundary is still not late enough — the daemon may just be busy.
+        assert!(!is_catch_up(due, timestamp("2026-07-18T10:15:00Z"), grace));
+        assert!(is_catch_up(due, timestamp("2026-07-18T10:15:01Z"), grace));
+        // The case this exists for: the machine was off overnight.
+        assert!(is_catch_up(due, timestamp("2026-07-19T09:00:00Z"), grace));
+    }
+
+    #[test]
+    fn the_catch_up_preamble_warns_about_lateness_and_only_re_triages_when_head_moved() {
+        let steady = catch_up_preamble(chrono::Duration::hours(4), false);
+        assert!(steady.contains("CATCH-UP"), "got: {steady}");
+        assert!(steady.contains("4 hours"), "got: {steady}");
+        assert!(steady.contains("plan-only"), "got: {steady}");
+        // Nothing is claimed about the repository when we have no evidence it moved.
+        assert!(!steady.contains("Re-triage"), "got: {steady}");
+
+        let moved = catch_up_preamble(chrono::Duration::minutes(90), true);
+        assert!(moved.contains("Re-triage"), "got: {moved}");
+        assert!(moved.contains("1 hours"), "got: {moved}");
+
+        // Lateness reads in the largest whole unit that fits.
+        assert!(catch_up_preamble(chrono::Duration::minutes(20), false).contains("20 minutes"));
+        assert!(catch_up_preamble(chrono::Duration::days(3), false).contains("3 days"));
+    }
+
+    #[tokio::test]
+    async fn a_missed_window_is_demoted_to_a_plan_only_catch_up_on_an_active_project() {
+        let project = tempfile::tempdir().expect("create active project");
+        let state = test_state(None).await;
+        // The window came due at 10:01; the daemon only ran again four hours later.
+        let now = timestamp("2026-07-18T14:00:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "active", &old).await;
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        let (mode, prompt): (String, String) = sqlx::query_as("SELECT mode, prompt FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        // An active project would normally get a worktree run; a catch-up may only propose.
+        assert_eq!(mode, "shadow");
+        assert!(prompt.contains("CATCH-UP"), "got: {prompt}");
+        assert!(prompt.contains("plan-only"), "got: {prompt}");
+        // The rule's own prompt still rides at the end, unaltered.
+        assert!(prompt.ends_with("go"), "got: {prompt}");
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_over_a_moved_head_is_told_to_re_triage() {
+        let container = space_free_tempdir("nucleos-scheduler-catchup-");
+        let repo = container.path().join("repo");
+        initialize_repo(&repo);
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T14:00:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, &repo, "shadow", &old).await;
+        // The rule was armed at a HEAD the repository has since left behind.
+        sqlx::query(
+            "UPDATE scheduler_state SET last_head_sha = 'deadbeef' WHERE project_id = 'proj'",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(prompt.contains("Re-triage"), "got: {prompt}");
+
+        // Firing re-anchors the sha, so the next window is compared against the right moment.
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT last_head_sha FROM scheduler_state WHERE project_id = 'proj'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            recorded.is_some_and(|sha| sha != "deadbeef"),
+            "the fired rule should record the HEAD it was scheduled from"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_punctual_window_carries_no_catch_up_preamble() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        // Due at 10:01, served at 10:10 — late, but well inside the grace.
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+
+        scheduler_tick(&state, now, &mut HashMap::new()).await;
+
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(prompt, "go");
     }
 
     #[tokio::test]
