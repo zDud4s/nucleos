@@ -22,6 +22,7 @@ mod shadow;
 mod sidecar;
 mod state;
 mod storage;
+mod wip;
 mod worktree;
 
 use auth::Token;

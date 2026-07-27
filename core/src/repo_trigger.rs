@@ -142,6 +142,19 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
             continue;
         }
 
+        // Same brake as the scheduler: a full approval queue defers repo-event work too, otherwise
+        // a busy branch would route around the ceiling the cron path respects.
+        if let crate::wip::WipDecision::Defer { reason } =
+            crate::wip::wip_permits_new_run(&state.pool, &project_id).await
+        {
+            tracing::info!(
+                project_id = %project_id,
+                reason = %reason,
+                "approval queue full; deferring this project's repo triggers"
+            );
+            continue;
+        }
+
         let triggers = match crate::config::load_schedule_rules(Path::new(&project_root)) {
             Ok(rules) => rules.repo_triggers,
             Err(error) => {

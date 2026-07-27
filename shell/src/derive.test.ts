@@ -11,6 +11,7 @@ import {
   periodLabel,
   promotionBlock,
   promotionReadiness,
+  queueBlock,
   readinessCriterionLabel,
   readinessGap,
   relativeTime,
@@ -24,9 +25,9 @@ describe("pure UI derivations", () => {
       { projects: [] satisfies ProjectSummary[], expected: 0 },
       {
         projects: [
-          { project_id: "alpha", mode: "off", project_root: null, pending: 2, classes_ready: 0, classes_total: 0, promotable: false },
-          { project_id: "beta", mode: "shadow", project_root: null, pending: 0, classes_ready: 0, classes_total: 0, promotable: false },
-          { project_id: "gamma", mode: "active", project_root: null, pending: 5, classes_ready: 0, classes_total: 0, promotable: false },
+          { project_id: "alpha", mode: "off", project_root: null, pending: 2, classes_ready: 0, classes_total: 0, promotable: false, open_proposals: 0, wip_limit: 3, queue_full: false },
+          { project_id: "beta", mode: "shadow", project_root: null, pending: 0, classes_ready: 0, classes_total: 0, promotable: false, open_proposals: 0, wip_limit: 3, queue_full: false },
+          { project_id: "gamma", mode: "active", project_root: null, pending: 5, classes_ready: 0, classes_total: 0, promotable: false, open_proposals: 0, wip_limit: 3, queue_full: false },
         ] satisfies ProjectSummary[],
         expected: 7,
       },
@@ -48,6 +49,9 @@ describe("pure UI derivations", () => {
       classes_ready: 0,
       classes_total: 0,
       promotable: false,
+      open_proposals: 0,
+      wip_limit: 3,
+      queue_full: false,
       ...over,
     });
 
@@ -64,6 +68,29 @@ describe("pure UI derivations", () => {
     ).toBeNull();
     // The gate guards the way IN to autonomy; an already-active project is never re-gated.
     expect(promotionBlock(project({ mode: "active" }))).toBeNull();
+  });
+
+  it("explains a project gone quiet on a full approval queue", () => {
+    const project = (over: Partial<ProjectSummary>): ProjectSummary => ({
+      project_id: "alpha",
+      mode: "active",
+      project_root: null,
+      pending: 0,
+      classes_ready: 0,
+      classes_total: 0,
+      promotable: false,
+      open_proposals: 0,
+      wip_limit: 3,
+      queue_full: false,
+      ...over,
+    });
+
+    // Room to spare says nothing — the note only appears when it explains something.
+    expect(queueBlock(project({ open_proposals: 2 }))).toBeNull();
+    // The daemon decides fullness; the copy points at reviewing, since that is what releases it.
+    expect(queueBlock(project({ open_proposals: 3, queue_full: true }))).toBe(
+      "3/3 proposals waiting — new work is deferred until you review one",
+    );
   });
 
   it("derives agreement rates, including the zero-reviewed edge case", () => {

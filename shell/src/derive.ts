@@ -62,6 +62,18 @@ export function promotionBlock(project: ProjectSummary): string | null {
   return `${project.classes_ready}/${project.classes_total} action classes ready`;
 }
 
+/**
+ * Why a project has stopped starting new work, or null when nothing is holding it.
+ *
+ * A project whose approval queue is full goes quiet on purpose — but silent throttling reads as a
+ * bug, so the reason has to be as visible as the budget pause is. Self-clearing: reviewing one
+ * proposal releases it, which is why the copy points at reviewing rather than at raising the limit.
+ */
+export function queueBlock(project: ProjectSummary): string | null {
+  if (!project.queue_full) return null;
+  return `${project.open_proposals}/${project.wip_limit ?? 0} proposals waiting — new work is deferred until you review one`;
+}
+
 export function totalPending(projects: ProjectSummary[]): number {
   return projects.reduce((sum, project) => sum + project.pending, 0);
 }

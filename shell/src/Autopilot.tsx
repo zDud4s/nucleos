@@ -9,7 +9,8 @@ import {
 } from "./api";
 import {
   agreementRate, autopilotState, budgetStatusLabel, formatUsd, groupScoreboardByMode,
-  killSwitchLabel, periodLabel, promotionBlock, promotionReadiness, readinessCriterionLabel,
+  killSwitchLabel, periodLabel, promotionBlock, promotionReadiness, queueBlock,
+  readinessCriterionLabel,
   readinessGap, relativeTime, scoreboardReadiness, SWAMPED_THRESHOLD, totalPending,
 } from "./derive";
 import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
@@ -34,6 +35,8 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
   // The §8.2 shadow-exit gate: `active` stays locked until the scoreboard says the project earned it.
   const blocked = promotionBlock(project);
   const gateId = `gate-${project.project_id}`;
+  // The WIP brake: a full approval queue is why an otherwise healthy project has gone quiet.
+  const queueFull = queueBlock(project);
   const projectKilled =
     scopedKills?.some(
       (k) =>
@@ -81,6 +84,7 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
       <span className="name">{project.project_id}</span>
       {project.pending > 0 && <Badge tone="pending">{project.pending} pending</Badge>}
       {projectKilled && <Badge tone="paused">paused</Badge>}
+      {queueFull !== null && <Badge tone="paused">queue full</Badge>}
       <div className="seg" role="group" aria-label={`${project.project_id} autopilot mode`}>
         {MODES.map((mode) => {
           const locked = mode === "active" && blocked !== null;
@@ -105,6 +109,7 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
           Locked until the scoreboard earns it — {blocked}. {readinessCriterionLabel()}.
         </p>
       )}
+      {queueFull !== null && <p className="gate-note">{queueFull}</p>}
       <Button size="sm" intent="stop" disabled={changing} onClick={() => void toggleProjectKill()}>
         {projectKilled ? "Resume" : "Pause"}
       </Button>

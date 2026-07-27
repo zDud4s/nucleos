@@ -35,6 +35,10 @@ export interface ProjectSummary {
   classes_total: number;
   /** Whether the promote-to-active control should unlock. Decided by the daemon (`shadow.rs`). */
   promotable: boolean;
+  /** WIP brake: proposals waiting on you, the ceiling (null = off), and whether it is reached. */
+  open_proposals: number;
+  wip_limit: number | null;
+  queue_full: boolean;
 }
 
 export interface FeedEntry {

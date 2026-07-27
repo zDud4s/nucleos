@@ -203,6 +203,9 @@ mod tests {
             classes_ready: 0,
             classes_total: 0,
             promotable: false,
+            open_proposals: 0,
+            wip_limit: Some(3),
+            queue_full: false,
         }];
 
         let body = resolve_run_request(&projects, "active-project", "do the work").unwrap();
@@ -221,6 +224,9 @@ mod tests {
             classes_ready: 0,
             classes_total: 0,
             promotable: false,
+            open_proposals: 0,
+            wip_limit: Some(3),
+            queue_full: false,
         }];
 
         let body = resolve_run_request(&projects, "shadow-project", "inspect the work").unwrap();
@@ -239,6 +245,9 @@ mod tests {
             classes_ready: 0,
             classes_total: 0,
             promotable: false,
+            open_proposals: 0,
+            wip_limit: Some(3),
+            queue_full: false,
         }];
 
         assert!(resolve_run_request(&projects, "off-project", "do the work").is_err());
@@ -254,6 +263,9 @@ mod tests {
             classes_ready: 0,
             classes_total: 0,
             promotable: false,
+            open_proposals: 0,
+            wip_limit: Some(3),
+            queue_full: false,
         }];
 
         assert!(resolve_run_request(&projects, "unknown-project", "do the work").is_err());
@@ -269,6 +281,9 @@ mod tests {
             classes_ready: 0,
             classes_total: 0,
             promotable: false,
+            open_proposals: 0,
+            wip_limit: Some(3),
+            queue_full: false,
         }];
 
         assert!(resolve_run_request(&projects, "rootless-project", "do the work").is_err());

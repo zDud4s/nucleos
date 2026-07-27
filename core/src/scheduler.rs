@@ -129,6 +129,18 @@ pub(crate) async fn scheduler_tick(
             continue;
         }
 
+        // Per-project, so a full queue on one project never stalls the others.
+        if let crate::wip::WipDecision::Defer { reason } =
+            crate::wip::wip_permits_new_run(&state.pool, &project_id).await
+        {
+            tracing::info!(
+                project_id = %project_id,
+                reason = %reason,
+                "approval queue full; deferring this project's scheduled work"
+            );
+            continue;
+        }
+
         let rules = match config::load_schedule_rules(Path::new(&project_root)) {
             Ok(rules) => rules.schedules,
             Err(error) => {

@@ -24,6 +24,12 @@ pub struct ProjectSummary {
     /// Whether the shell should unlock the promote-to-active control. Computed here rather than in
     /// the shell so the displayed gate and the enforced rule are the same arithmetic (`shadow.rs`).
     pub promotable: bool,
+    /// WIP brake (§8.4): proposals waiting on the human, the effective ceiling (`None` = brake off),
+    /// and whether the project is currently deferring new work because of it. A project can be idle
+    /// purely because its queue is full, so the UI has to be able to say so.
+    pub open_proposals: i64,
+    pub wip_limit: Option<i64>,
+    pub queue_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -167,8 +173,12 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
         .collect()
 }
 
+/// One raw roster row: `(project_id, mode, project_root, pending, open_proposals, wip_override)`.
+/// Named because the tuple carries six positional fields and is only readable at the destructure.
+type RosterRow = (String, String, Option<String>, i64, i64, Option<i64>);
+
 pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummary>> {
-    let projects: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+    let projects: Vec<RosterRow> = sqlx::query_as(
         "SELECT state.project_id, state.mode, state.project_root,
                 (SELECT COUNT(*)
                  FROM shadow_decisions
@@ -179,7 +189,12 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                 (SELECT COUNT(*)
                  FROM runs
                  WHERE runs.project_id = state.project_id
-                   AND runs.status = 'awaiting_approval') AS pending
+                   AND runs.status = 'awaiting_approval') AS pending,
+                (SELECT COUNT(*)
+                 FROM proposals
+                 WHERE proposals.project_id = state.project_id
+                   AND proposals.status = 'pending') AS open_proposals,
+                state.wip_limit AS wip_limit
          FROM autopilot_state AS state
          ORDER BY state.project_id",
     )
@@ -187,27 +202,35 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     .await?;
 
     // One grouped query for every project's readiness, rather than a scoreboard call per row — the
-    // shell polls this endpoint every 3s.
+    // shell polls this endpoint every 3s. Same reason the WIP ceiling is resolved from one global
+    // read plus the per-row override already selected above.
     let readiness = crate::shadow::shadow_readiness(pool).await?;
+    let global_wip_limit = crate::wip::global_wip_limit(pool).await?;
 
     projects
         .into_iter()
-        .map(|(project_id, mode, project_root, pending)| {
-            let mode = Mode::from_db_str(&mode).ok_or_else(|| {
-                sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
-            })?;
-            let (classes_ready, classes_total) =
-                readiness.get(&project_id).copied().unwrap_or((0, 0));
-            Ok(ProjectSummary {
-                project_id,
-                mode,
-                project_root,
-                pending,
-                classes_ready,
-                classes_total,
-                promotable: crate::shadow::promotable(classes_ready, classes_total),
-            })
-        })
+        .map(
+            |(project_id, mode, project_root, pending, open_proposals, wip_override)| {
+                let mode = Mode::from_db_str(&mode).ok_or_else(|| {
+                    sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
+                })?;
+                let (classes_ready, classes_total) =
+                    readiness.get(&project_id).copied().unwrap_or((0, 0));
+                let wip_limit = wip_override.or(global_wip_limit);
+                Ok(ProjectSummary {
+                    project_id,
+                    mode,
+                    project_root,
+                    pending,
+                    classes_ready,
+                    classes_total,
+                    promotable: crate::shadow::promotable(classes_ready, classes_total),
+                    open_proposals,
+                    wip_limit,
+                    queue_full: crate::wip::queue_full(open_proposals, wip_limit),
+                })
+            },
+        )
         .collect()
 }
 
@@ -372,6 +395,9 @@ mod tests {
                     classes_ready: 0,
                     classes_total: 0,
                     promotable: false,
+                    open_proposals: 0,
+                    wip_limit: Some(3),
+                    queue_full: false,
                 },
                 ProjectSummary {
                     project_id: "project-off".to_owned(),
@@ -381,6 +407,9 @@ mod tests {
                     classes_ready: 0,
                     classes_total: 0,
                     promotable: false,
+                    open_proposals: 0,
+                    wip_limit: Some(3),
+                    queue_full: false,
                 },
                 ProjectSummary {
                     project_id: "project-shadow".to_owned(),
@@ -390,6 +419,9 @@ mod tests {
                     classes_ready: 0,
                     classes_total: 0,
                     promotable: false,
+                    open_proposals: 0,
+                    wip_limit: Some(3),
+                    queue_full: false,
                 },
             ]
         );
@@ -422,6 +454,9 @@ mod tests {
                     classes_ready: 0,
                     classes_total: 0,
                     promotable: false,
+                    open_proposals: 0,
+                    wip_limit: Some(3),
+                    queue_full: false,
                 },
                 ProjectSummary {
                     project_id: "project-rooted".to_owned(),
@@ -431,6 +466,9 @@ mod tests {
                     classes_ready: 0,
                     classes_total: 0,
                     promotable: false,
+                    open_proposals: 0,
+                    wip_limit: Some(3),
+                    queue_full: false,
                 },
             ]
         );
@@ -504,6 +542,9 @@ mod tests {
                 classes_ready: 0,
                 classes_total: 1,
                 promotable: false,
+                open_proposals: 0,
+                wip_limit: Some(3),
+                queue_full: false,
             }]
         );
     }
@@ -528,7 +569,68 @@ mod tests {
                 classes_ready: 0,
                 classes_total: 0,
                 promotable: false,
+                open_proposals: 0,
+                wip_limit: Some(3),
+                queue_full: false,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roster_reports_a_full_approval_queue() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, wip_limit)
+             VALUES ('project-a', 'active', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-b', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (run_id, project_id, status) in [
+            (1_i64, "project-a", "pending"),
+            (2, "project-a", "pending"),
+            // Already decided, so it must not count against the ceiling.
+            (3, "project-a", "approved"),
+            (4, "project-b", "pending"),
+        ] {
+            sqlx::query(
+                "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+                 VALUES ('action-approval', ?, ?, ?, 'test', '2026-07-27T00:00:00Z')",
+            )
+            .bind(status)
+            .bind(run_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let roster = project_roster(&pool).await.unwrap();
+
+        // project-a overrides the ceiling to 2 and has exactly 2 waiting.
+        assert_eq!(
+            (
+                roster[0].open_proposals,
+                roster[0].wip_limit,
+                roster[0].queue_full
+            ),
+            (2, Some(2), true)
+        );
+        // project-b inherits the global default of 3 and is nowhere near it.
+        assert_eq!(
+            (
+                roster[1].open_proposals,
+                roster[1].wip_limit,
+                roster[1].queue_full
+            ),
+            (1, Some(3), false)
         );
     }
 
