@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const GC_BACKOFF: &[Duration] = &[
+pub const GC_BACKOFF: &[Duration] = &[
     Duration::from_secs(1),
     Duration::from_secs(5),
     Duration::from_secs(25),
@@ -214,7 +214,19 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
         .await?;
 
     if let Some(worktree) = worktree {
-        let summary = format!("released worktree {}", worktree.path);
+        // A discarded run's branch was left behind until now, so every rejected proposal leaked one.
+        // `-d` keeps anything with unmerged commits, so this only collects the branches that carry
+        // no work — which is exactly the case for a run blocked at its first high-risk action.
+        let branch_deleted =
+            delete_branch_if_merged(&worktree.project_root, &worktree.branch).await;
+        let summary = if branch_deleted {
+            format!(
+                "released worktree {} + branch {}",
+                worktree.path, worktree.branch
+            )
+        } else {
+            format!("released worktree {}", worktree.path)
+        };
         let _ = feed::append(
             pool,
             Some(&worktree.project_id),
@@ -223,9 +235,45 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
             Some(run_id),
         )
         .await;
+        feed_branch_outcome(pool, &worktree, branch_deleted).await;
     }
 
     Ok(ReleaseOutcome::Released)
+}
+
+/// Best-effort `git branch -d`, reporting whether the branch went away.
+///
+/// Always `-d`, never `-D`: git refuses to delete a branch holding unmerged commits, and that
+/// refusal is the safety property — autonomous cleanup must never be able to destroy work the human
+/// has not seen. The common case for a discarded run is a branch with no commits at all, which `-d`
+/// removes happily, so this collects the branches that actually accumulate.
+async fn delete_branch_if_merged(project_root: &str, branch: &str) -> bool {
+    tokio::process::Command::new(git_bin())
+        .arg("-C")
+        .arg(project_root)
+        .arg("branch")
+        .arg("-d")
+        .arg(branch)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Records what became of a branch after its worktree was collected. Kept branches are announced
+/// too — an unmerged branch left behind is a thing the human may want to look at, not a silent leak.
+async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted: bool) {
+    if deleted {
+        return;
+    }
+    let summary = format!("kept unmerged branch {}", worktree.branch);
+    let _ = feed::append(
+        pool,
+        Some(&worktree.project_id),
+        "worktree_branch_kept",
+        &summary,
+        Some(worktree.run_id),
+    )
+    .await;
 }
 
 pub async fn gc_candidates(
@@ -297,46 +345,22 @@ pub(crate) async fn gc_pass(
                     );
                 }
 
-                let branch_deleted = tokio::process::Command::new(git_bin())
-                    .arg("-C")
-                    .arg(&worktree.project_root)
-                    .arg("branch")
-                    .arg("-d")
-                    .arg(&worktree.branch)
-                    .output()
-                    .await
-                    .is_ok_and(|output| output.status.success());
-
-                if branch_deleted {
-                    let summary = format!("removed worktree + merged branch {}", worktree.branch);
-                    let _ = feed::append(
-                        pool,
-                        Some(&worktree.project_id),
-                        "worktree_removed",
-                        &summary,
-                        Some(worktree.run_id),
-                    )
-                    .await;
+                let branch_deleted =
+                    delete_branch_if_merged(&worktree.project_root, &worktree.branch).await;
+                let summary = if branch_deleted {
+                    format!("removed worktree + merged branch {}", worktree.branch)
                 } else {
-                    let summary = format!("removed worktree {}", worktree.path);
-                    let _ = feed::append(
-                        pool,
-                        Some(&worktree.project_id),
-                        "worktree_removed",
-                        &summary,
-                        Some(worktree.run_id),
-                    )
-                    .await;
-                    let summary = format!("kept unmerged branch {}", worktree.branch);
-                    let _ = feed::append(
-                        pool,
-                        Some(&worktree.project_id),
-                        "worktree_branch_kept",
-                        &summary,
-                        Some(worktree.run_id),
-                    )
-                    .await;
-                }
+                    format!("removed worktree {}", worktree.path)
+                };
+                let _ = feed::append(
+                    pool,
+                    Some(&worktree.project_id),
+                    "worktree_removed",
+                    &summary,
+                    Some(worktree.run_id),
+                )
+                .await;
+                feed_branch_outcome(pool, &worktree, branch_deleted).await;
             }
             Err(error) => {
                 let summary = format!("failed to remove worktree {}: {}", worktree.path, error);
@@ -351,6 +375,109 @@ pub(crate) async fn gc_pass(
             }
         }
     }
+}
+
+/// How old an unaccounted-for directory must be before startup will collect it. Generous on purpose:
+/// the cost of waiting is a stale directory for an hour, the cost of being wrong is deleting a
+/// worktree a live run is mid-way through creating.
+pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// Worktree directories on disk that no LIVE `worktrees` row accounts for.
+///
+/// Two ways one appears, and the normal GC pass can reach neither, because it only ever walks rows
+/// that exist: a crash between `git worktree add` and the row INSERT leaves a directory nothing in
+/// the database knows about, and a removal that set `removed_at` but whose files never actually went
+/// away leaves a directory the GC now believes is gone. Both leak forever without this.
+///
+/// Fail-safe: a directory whose age cannot be determined is left alone, and anything not named
+/// `run-<id>` is not ours to touch.
+pub async fn orphaned_worktrees(
+    pool: &SqlitePool,
+    project_root: &Path,
+    min_age: Duration,
+) -> sqlx::Result<Vec<PathBuf>> {
+    let live: std::collections::HashSet<i64> =
+        sqlx::query_scalar("SELECT run_id FROM worktrees WHERE removed_at IS NULL")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+
+    let root = worktree_root(project_root);
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return Ok(Vec::new());
+    };
+
+    let mut orphans = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = entry.file_name();
+        let Some(run_id) = file_name
+            .to_string_lossy()
+            .strip_prefix("run-")
+            .and_then(|id| id.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if live.contains(&run_id) {
+            continue;
+        }
+
+        let old_enough = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if !old_enough {
+            continue;
+        }
+
+        orphans.push(entry.path());
+    }
+    Ok(orphans)
+}
+
+/// Sweeps orphaned worktree directories for every project the daemon knows a root for, returning how
+/// many it collected. Runs once at startup, where `reconcile_orphaned_runs` has already established
+/// that nothing from a previous life is still running.
+pub async fn reconcile_orphaned_worktrees(
+    pool: &SqlitePool,
+    min_age: Duration,
+    backoff: &[Duration],
+) -> sqlx::Result<usize> {
+    // Both sources matter: a project switched off still owns whatever its runs left behind.
+    let roots: Vec<String> = sqlx::query_scalar(
+        "SELECT project_root FROM autopilot_state WHERE project_root IS NOT NULL
+         UNION
+         SELECT project_root FROM worktrees",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut collected = 0;
+    for root in roots {
+        let project_root = Path::new(&root);
+        for orphan in orphaned_worktrees(pool, project_root, min_age).await? {
+            // `git worktree remove` first, so git's own bookkeeping is updated when it still knows
+            // about the worktree; a bare directory it never registered falls through to the fs.
+            let removed = remove(project_root, &orphan, backoff).await.is_ok()
+                || tokio::fs::remove_dir_all(&orphan).await.is_ok();
+            if removed {
+                collected += 1;
+                tracing::warn!(
+                    path = %orphan.display(),
+                    "collected an orphaned worktree directory left by a previous daemon"
+                );
+            } else {
+                tracing::warn!(
+                    path = %orphan.display(),
+                    "could not collect an orphaned worktree directory; will retry next startup"
+                );
+            }
+        }
+    }
+    Ok(collected)
 }
 
 pub async fn run_gc(pool: SqlitePool) {
@@ -1232,5 +1359,123 @@ mod tests {
             // the worktree immediately; keep the meaningful eventual-success assertion.
         }
         assert!(!info.path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_sweep_ignores_a_directory_a_live_row_accounts_for() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(&pool, "running", None, "2026-07-27T00:00:00+00:00").await;
+        create_and_record(&pool, repo.path(), run_id).await;
+
+        // Old enough to collect, but a live row explains it — this is the pinned-worktree case, and
+        // collecting it would delete work an approval is still waiting on.
+        assert!(
+            orphaned_worktrees(&pool, repo.path(), Duration::ZERO)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_sweep_finds_a_directory_no_live_row_explains() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        // A crash between `git worktree add` and the row INSERT: on disk, unknown to the database.
+        let unrecorded = create(repo.path(), 41).await.expect("create worktree");
+        // A removal that set `removed_at` but whose files never went away.
+        let leaked_run = insert_run(&pool, "completed", None, "2026-07-27T00:00:00+00:00").await;
+        let leaked = create_and_record(&pool, repo.path(), leaked_run).await;
+        mark_removed(&pool, leaked_run).await.unwrap();
+        // Not ours, whatever its age.
+        let stranger = root.path().join("not-a-run");
+        std::fs::create_dir_all(&stranger).expect("create unrelated directory");
+
+        let mut orphans = orphaned_worktrees(&pool, repo.path(), Duration::ZERO)
+            .await
+            .unwrap();
+        orphans.sort();
+        let mut expected = vec![unrecorded.path.clone(), leaked.path.clone()];
+        expected.sort();
+        assert_eq!(orphans, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_sweep_leaves_a_young_directory_alone() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        create(repo.path(), 42).await.expect("create worktree");
+
+        // Freshly made and unrecorded looks exactly like a run mid-way through starting up, so the
+        // age gate is what stops the sweep from deleting a worktree out from under a live run.
+        assert!(
+            orphaned_worktrees(&pool, repo.path(), ORPHAN_MIN_AGE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_collects_orphans_for_every_known_root() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('project-a', 'active', ?)")
+            .bind(repo.path().to_string_lossy().as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let orphan = create(repo.path(), 43).await.expect("create worktree");
+
+        let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(collected, 1);
+        assert!(!orphan.path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_deletes_a_branch_that_carries_no_work() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-27T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::Released
+        );
+
+        // A run blocked at its first high-risk action leaves a commitless branch; discarding the
+        // worktree without it is how every rejected proposal used to leak one.
+        let branches = git_stdout(repo.path(), &[OsStr::new("branch"), OsStr::new("--list")]);
+        assert!(
+            !branches.contains(&info.branch),
+            "branch should be gone, got: {branches}"
+        );
     }
 }

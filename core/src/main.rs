@@ -106,6 +106,22 @@ async fn main() {
         );
     }
 
+    // After the run reconciliation above, so nothing from a previous life still counts as live.
+    match worktree::reconcile_orphaned_worktrees(
+        &pool,
+        worktree::ORPHAN_MIN_AGE,
+        worktree::GC_BACKOFF,
+    )
+    .await
+    {
+        Ok(collected) if collected > 0 => {
+            tracing::warn!("collected {collected} orphaned worktree director(ies) on startup");
+        }
+        Ok(_) => {}
+        // Hygiene, not a prerequisite: a daemon that cannot tidy up must still start.
+        Err(error) => tracing::warn!(%error, "orphaned-worktree reconciliation failed"),
+    }
+
     let token_value =
         match secrets::load_secret(TOKEN_KEY).expect("failed to read Credential Manager") {
             Some(existing) => existing,
