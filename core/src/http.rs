@@ -492,11 +492,55 @@ async fn post_shadow_verdict(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Readiness only ever moves when a human reviews a decision, so this is the one place a project
+    // can cross the promotion bar — sample it either side of the verdict to catch the crossing.
+    let project = shadow::project_of_decision(&state.pool, id)
+        .await
+        .unwrap_or(None);
+    let was_promotable = match &project {
+        Some(project_id) => shadow::project_readiness(&state.pool, project_id)
+            .await
+            .map(|(ready, total)| shadow::promotable(ready, total))
+            .unwrap_or(false),
+        None => false,
+    };
+
     match shadow::set_verdict(&state.pool, id, &body.verdict).await {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(true) => {
+            if let Some(project_id) = project {
+                announce_promotable(&state.pool, &project_id, was_promotable).await;
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// The §8.2 promotion nudge: a feed entry the moment a project's last outstanding action class
+/// clears the bar. Without it the gate solves promotion-by-impatience but leaves the opposite
+/// failure — a project that quietly became promotable and nobody noticed.
+///
+/// Best-effort and idempotent by construction: it fires only on the false→true crossing, so a
+/// project already promotable before the verdict stays silent. Feed failures never fail the verdict.
+async fn announce_promotable(pool: &sqlx::SqlitePool, project_id: &str, was_promotable: bool) {
+    if was_promotable {
+        return;
+    }
+    let Ok((ready, total)) = shadow::project_readiness(pool, project_id).await else {
+        return;
+    };
+    if !shadow::promotable(ready, total) {
+        return;
+    }
+
+    let summary = format!(
+        "{project_id} is ready for promotion — all {total} reviewed action classes clear the bar \
+         ({}+ reviews, {}%+ agreement). Promotion is still yours to make.",
+        shadow::READINESS_MIN_REVIEWED,
+        shadow::READINESS_MIN_AGREE_PERCENT,
+    );
+    let _ = feed::append(pool, Some(project_id), "promotion_ready", &summary, None).await;
 }
 
 async fn get_scoreboard(
@@ -1517,5 +1561,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Seeds one shadow-mode run whose `read-local` class has `reviewed` approved decisions plus one
+    /// still-unreviewed decision, and returns that unreviewed decision's id.
+    async fn seed_shadow_class(pool: &sqlx::SqlitePool, project_id: &str, reviewed: usize) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES (?, 'seed', 'completed', 'shadow', '2026-07-27T00:00:00Z')",
+        )
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let run_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let mut last = 0;
+        for index in 0..=reviewed {
+            let verdict = if index < reviewed {
+                Some("approve")
+            } else {
+                None
+            };
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, tool_input, decision, reason, action_class,
+                  classifier_version, human_verdict, reviewed_at, created_at)
+                 VALUES (?, 'Read', '{}', 'allow', 'seed', 'read-local', 1, ?, NULL,
+                         '2026-07-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(verdict)
+            .execute(pool)
+            .await
+            .unwrap();
+            last = sqlx::query_scalar("SELECT last_insert_rowid()")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        }
+        last
+    }
+
+    async fn post_verdict(state: AppState, id: i64) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/shadow-decisions/{id}/verdict"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "verdict": "approve" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn promotion_feed_rows(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'promotion_ready'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verdict_that_clears_the_bar_announces_the_project_as_promotable() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        // Nine reviewed leaves the class one short of the ten-review floor.
+        let last = seed_shadow_class(&pool, "project-a", 9).await;
+
+        assert_eq!(promotion_feed_rows(&pool).await, 0);
+        assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
+
+        assert_eq!(promotion_feed_rows(&pool).await, 1);
+        let summary: String =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'promotion_ready'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(summary.contains("project-a"), "got: {summary}");
+    }
+
+    #[tokio::test]
+    async fn verdict_below_the_bar_announces_nothing() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let last = seed_shadow_class(&pool, "project-a", 3).await;
+
+        assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
+
+        assert_eq!(promotion_feed_rows(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_already_promotable_project_is_not_announced_again() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        // Ten reviewed already clears the bar, so the eleventh verdict is not a crossing.
+        let last = seed_shadow_class(&pool, "project-a", 10).await;
+
+        assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
+
+        assert_eq!(promotion_feed_rows(&pool).await, 0);
     }
 }

@@ -18,6 +18,12 @@ pub struct ProjectSummary {
     pub mode: Mode,
     pub project_root: Option<String>,
     pub pending: i64,
+    /// Shadow-exit progress (§8.2): action classes clearing the bar, out of those exercised so far.
+    pub classes_ready: i64,
+    pub classes_total: i64,
+    /// Whether the shell should unlock the promote-to-active control. Computed here rather than in
+    /// the shell so the displayed gate and the enforced rule are the same arithmetic (`shadow.rs`).
+    pub promotable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -180,17 +186,26 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     .fetch_all(pool)
     .await?;
 
+    // One grouped query for every project's readiness, rather than a scoreboard call per row — the
+    // shell polls this endpoint every 3s.
+    let readiness = crate::shadow::shadow_readiness(pool).await?;
+
     projects
         .into_iter()
         .map(|(project_id, mode, project_root, pending)| {
             let mode = Mode::from_db_str(&mode).ok_or_else(|| {
                 sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
             })?;
+            let (classes_ready, classes_total) =
+                readiness.get(&project_id).copied().unwrap_or((0, 0));
             Ok(ProjectSummary {
                 project_id,
                 mode,
                 project_root,
                 pending,
+                classes_ready,
+                classes_total,
+                promotable: crate::shadow::promotable(classes_ready, classes_total),
             })
         })
         .collect()
@@ -354,18 +369,27 @@ mod tests {
                     mode: Mode::Active,
                     project_root: None,
                     pending: 0,
+                    classes_ready: 0,
+                    classes_total: 0,
+                    promotable: false,
                 },
                 ProjectSummary {
                     project_id: "project-off".to_owned(),
                     mode: Mode::Off,
                     project_root: None,
                     pending: 0,
+                    classes_ready: 0,
+                    classes_total: 0,
+                    promotable: false,
                 },
                 ProjectSummary {
                     project_id: "project-shadow".to_owned(),
                     mode: Mode::Shadow,
                     project_root: None,
                     pending: 0,
+                    classes_ready: 0,
+                    classes_total: 0,
+                    promotable: false,
                 },
             ]
         );
@@ -395,12 +419,18 @@ mod tests {
                     mode: Mode::Off,
                     project_root: None,
                     pending: 0,
+                    classes_ready: 0,
+                    classes_total: 0,
+                    promotable: false,
                 },
                 ProjectSummary {
                     project_id: "project-rooted".to_owned(),
                     mode: Mode::Shadow,
                     project_root: Some("/some/root".to_owned()),
                     pending: 0,
+                    classes_ready: 0,
+                    classes_total: 0,
+                    promotable: false,
                 },
             ]
         );
@@ -471,6 +501,9 @@ mod tests {
                 mode: Mode::Active,
                 project_root: None,
                 pending: 3,
+                classes_ready: 0,
+                classes_total: 1,
+                promotable: false,
             }]
         );
     }
@@ -492,6 +525,9 @@ mod tests {
                 mode: Mode::Off,
                 project_root: None,
                 pending: 0,
+                classes_ready: 0,
+                classes_total: 0,
+                promotable: false,
             }]
         );
     }

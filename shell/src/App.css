@@ -233,6 +233,13 @@
 }
 .project .error { flex-basis: 100%; }
 
+/* porquê o modo "active" está trancado — a nota acompanha sempre o botão desativado */
+.gate-note {
+  flex-basis: 100%;
+  color: var(--faint);
+  font-size: var(--fs-xs);
+}
+
 /* ── Kill switches por gatilho ──────────────────────────── */
 
 .scoped-kill-row {

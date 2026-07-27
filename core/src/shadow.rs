@@ -89,8 +89,23 @@ pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Res
     Ok(result.rows_affected() == 1)
 }
 
+/// The asymmetric agreement rule, as a SQL expression yielding 1 when the human's verdict matched
+/// the classifier. `approve` agrees only with `allow`; `reject` agrees with both `deny` and
+/// `pending_approval` (rejecting an action the classifier already withheld IS agreement).
+///
+/// Shared by `scoreboard` and `shadow_readiness` on purpose: the scoreboard is what the human reads
+/// to decide whether to trust a project, and the readiness bar is what gates the promotion — the two
+/// must never be computed from different arithmetic.
+const AGREE_CASE: &str = "CASE
+    WHEN shadow_decisions.human_verdict = 'approve'
+         AND shadow_decisions.decision = 'allow' THEN 1
+    WHEN shadow_decisions.human_verdict = 'reject'
+         AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
+    ELSE 0
+END";
+
 pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<ClassTally>> {
-    sqlx::query_as(
+    let sql = format!(
         "SELECT
              runs.mode AS mode,
              shadow_decisions.action_class,
@@ -99,32 +114,107 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
              SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END) AS would_pend,
              SUM(CASE WHEN shadow_decisions.decision = 'deny' THEN 1 ELSE 0 END) AS would_deny,
              SUM(CASE WHEN shadow_decisions.human_verdict IS NOT NULL THEN 1 ELSE 0 END) AS reviewed,
+             SUM({AGREE_CASE}) AS agree,
              SUM(CASE
-                 WHEN shadow_decisions.human_verdict = 'approve'
-                      AND shadow_decisions.decision = 'allow' THEN 1
-                 WHEN shadow_decisions.human_verdict = 'reject'
-                      AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
-                 ELSE 0
-             END) AS agree,
-             SUM(CASE
-                 WHEN shadow_decisions.human_verdict IS NOT NULL
-                      AND NOT (
-                          (shadow_decisions.human_verdict = 'approve'
-                           AND shadow_decisions.decision = 'allow')
-                          OR
-                          (shadow_decisions.human_verdict = 'reject'
-                           AND shadow_decisions.decision IN ('deny', 'pending_approval'))
-                      ) THEN 1
+                 WHEN shadow_decisions.human_verdict IS NOT NULL AND ({AGREE_CASE}) = 0 THEN 1
                  ELSE 0
              END) AS disagree
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.project_id = ?
          GROUP BY runs.mode, shadow_decisions.action_class
-         ORDER BY runs.mode, shadow_decisions.action_class",
+         ORDER BY runs.mode, shadow_decisions.action_class"
+    );
+
+    // `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str` by default. Safe here by
+    // construction: the only interpolated fragment is the private `AGREE_CASE` const, and the
+    // project id stays a bound parameter — no caller input reaches the SQL text.
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// The shadow-exit bar (spec §8.2/§8.8, `.ai/decisions.md` 2026-07-27): an action class earns
+/// promotion once enough of its shadow decisions have been reviewed AND the classifier agreed with
+/// the human on nearly all of them.
+///
+/// **This is the single source of truth for the rule.** The shell reads the computed
+/// `classes_ready`/`promotable` off the daemon rather than recomputing them, so the button the user
+/// sees and the bar the product enforces can never gate on different numbers.
+pub const READINESS_MIN_REVIEWED: i64 = 10;
+pub const READINESS_MIN_AGREE_PERCENT: i64 = 95;
+
+/// `agree / reviewed >= 0.95` in integer arithmetic — a float ratio rounds at the boundary, and this
+/// is exactly the boundary the gate is decided on.
+pub fn class_ready(reviewed: i64, agree: i64) -> bool {
+    reviewed >= READINESS_MIN_REVIEWED && agree * 100 >= READINESS_MIN_AGREE_PERCENT * reviewed
+}
+
+/// A project may leave shadow once it has exercised at least one action class and EVERY exercised
+/// class clears the bar. Classes never exercised don't block (a project would otherwise wait forever
+/// on a `deploy` it never attempts), but zero exercised classes is NOT promotable — "no evidence"
+/// must not read as "all the evidence is good".
+pub fn promotable(classes_ready: i64, classes_total: i64) -> bool {
+    classes_total > 0 && classes_ready == classes_total
+}
+
+/// `(classes_ready, classes_total)` per project, over SHADOW-mode decisions only.
+///
+/// Shadow-mode only because promotion OUT of shadow is earned by evidence gathered IN shadow: a
+/// `worktree`-mode decision was actually enforced, not a hypothetical the human could still overrule.
+/// Projects with no shadow decisions are absent from the map (the caller reads that as `(0, 0)`).
+pub async fn shadow_readiness(
+    pool: &SqlitePool,
+) -> sqlx::Result<std::collections::HashMap<String, (i64, i64)>> {
+    let sql = format!(
+        "SELECT
+             runs.project_id AS project_id,
+             shadow_decisions.action_class AS action_class,
+             SUM(CASE WHEN shadow_decisions.human_verdict IS NOT NULL THEN 1 ELSE 0 END) AS reviewed,
+             SUM({AGREE_CASE}) AS agree
+         FROM shadow_decisions
+         JOIN runs ON runs.id = shadow_decisions.run_id
+         WHERE runs.mode = 'shadow'
+         GROUP BY runs.project_id, shadow_decisions.action_class"
+    );
+
+    // Same `AssertSqlSafe` reasoning as `scoreboard`: the only interpolation is `AGREE_CASE`.
+    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?;
+
+    let mut readiness: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for (project_id, _action_class, reviewed, agree) in rows {
+        let entry = readiness.entry(project_id).or_insert((0, 0));
+        entry.1 += 1;
+        if class_ready(reviewed, agree) {
+            entry.0 += 1;
+        }
+    }
+    Ok(readiness)
+}
+
+/// `(classes_ready, classes_total)` for one project — same rule as `shadow_readiness`, used by the
+/// promotion nudge to spot the moment a project crosses the bar.
+pub async fn project_readiness(pool: &SqlitePool, project_id: &str) -> sqlx::Result<(i64, i64)> {
+    Ok(shadow_readiness(pool)
+        .await?
+        .remove(project_id)
+        .unwrap_or((0, 0)))
+}
+
+/// The project a shadow decision belongs to, or `None` when the decision id is unknown.
+pub async fn project_of_decision(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT runs.project_id
+         FROM shadow_decisions
+         JOIN runs ON runs.id = shadow_decisions.run_id
+         WHERE shadow_decisions.id = ?",
     )
-    .bind(project_id)
-    .fetch_all(pool)
+    .bind(id)
+    .fetch_optional(pool)
     .await
 }
 
@@ -431,5 +521,99 @@ mod tests {
         let tally = &scoreboard(&pool, "project-a").await.unwrap()[0];
         assert_eq!(tally.mode, "real");
         assert_eq!((tally.reviewed, tally.agree, tally.disagree), (1, 1, 0));
+    }
+
+    #[test]
+    fn class_ready_needs_both_enough_reviews_and_enough_agreement() {
+        // Under the review floor, however perfect the agreement.
+        assert!(!class_ready(9, 9));
+        // Exactly at the floor, unanimous.
+        assert!(class_ready(10, 10));
+        // Exactly at the rate — 19/20 is 95%, the boundary the gate is decided on.
+        assert!(class_ready(20, 19));
+        // Just under: 18/20 is 90%.
+        assert!(!class_ready(20, 18));
+        // No reviews at all is not "vacuously perfect".
+        assert!(!class_ready(0, 0));
+    }
+
+    #[test]
+    fn promotable_requires_evidence_not_just_the_absence_of_failure() {
+        // A project that has never exercised a class has not earned anything.
+        assert!(!promotable(0, 0));
+        assert!(promotable(1, 1));
+        assert!(promotable(4, 4));
+        // One class still short holds the whole project.
+        assert!(!promotable(3, 4));
+    }
+
+    #[tokio::test]
+    async fn shadow_readiness_counts_ready_classes_per_project() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // `read-local` clears the bar: 10 reviewed, all agreeing.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        // `push-merge-deploy` is exercised but nowhere near reviewed enough.
+        insert_shadow(
+            &pool,
+            run,
+            "push-merge-deploy",
+            "pending_approval",
+            Some("reject"),
+        )
+        .await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 2)));
+        assert!(!promotable(1, 2));
+    }
+
+    #[tokio::test]
+    async fn shadow_readiness_ignores_non_shadow_runs() {
+        let pool = test_pool().await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, worktree_run, "read-local", "allow", Some("approve")).await;
+        }
+
+        // Promotion out of shadow is earned by shadow evidence; an enforced worktree decision was
+        // never a hypothetical the human could have overruled, so it must not count toward the bar.
+        assert_eq!(
+            shadow_readiness(&pool).await.unwrap().get("project-a"),
+            None
+        );
+        assert_eq!(project_readiness(&pool, "project-a").await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn project_readiness_scopes_to_one_project() {
+        let pool = test_pool().await;
+        let run_a = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let run_b = insert_run_with_mode(&pool, "project-b", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run_a, "read-local", "allow", Some("approve")).await;
+        }
+        insert_shadow(&pool, run_b, "read-local", "allow", None).await;
+
+        assert_eq!(project_readiness(&pool, "project-a").await.unwrap(), (1, 1));
+        assert_eq!(project_readiness(&pool, "project-b").await.unwrap(), (0, 1));
+        assert_eq!(project_readiness(&pool, "project-c").await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn project_of_decision_resolves_through_the_run() {
+        let pool = test_pool().await;
+        let run = insert_run(&pool, "project-a").await;
+        let id = insert_shadow(&pool, run, "read-local", "allow", None).await;
+
+        assert_eq!(
+            project_of_decision(&pool, id).await.unwrap().as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(project_of_decision(&pool, id + 999).await.unwrap(), None);
     }
 }

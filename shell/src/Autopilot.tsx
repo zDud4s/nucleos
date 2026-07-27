@@ -9,7 +9,7 @@ import {
 } from "./api";
 import {
   agreementRate, autopilotState, budgetStatusLabel, formatUsd, groupScoreboardByMode,
-  killSwitchLabel, periodLabel, promotionReadiness, readinessCriterionLabel,
+  killSwitchLabel, periodLabel, promotionBlock, promotionReadiness, readinessCriterionLabel,
   readinessGap, relativeTime, scoreboardReadiness, SWAMPED_THRESHOLD, totalPending,
 } from "./derive";
 import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
@@ -31,6 +31,9 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
   const [root, setRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [changing, setChanging] = useState(false);
+  // The §8.2 shadow-exit gate: `active` stays locked until the scoreboard says the project earned it.
+  const blocked = promotionBlock(project);
+  const gateId = `gate-${project.project_id}`;
   const projectKilled =
     scopedKills?.some(
       (k) =>
@@ -79,19 +82,29 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
       {project.pending > 0 && <Badge tone="pending">{project.pending} pending</Badge>}
       {projectKilled && <Badge tone="paused">paused</Badge>}
       <div className="seg" role="group" aria-label={`${project.project_id} autopilot mode`}>
-        {MODES.map((mode) => (
-          <button
-            key={mode}
-            type="button"
-            disabled={changing}
-            aria-pressed={project.mode === mode}
-            className={project.mode === mode ? `on ${mode}` : undefined}
-            onClick={() => { if (project.mode !== mode) void changeMode(mode); }}
-          >
-            {mode}
-          </button>
-        ))}
+        {MODES.map((mode) => {
+          const locked = mode === "active" && blocked !== null;
+          return (
+            <button
+              key={mode}
+              type="button"
+              disabled={changing || locked}
+              aria-pressed={project.mode === mode}
+              aria-describedby={locked ? gateId : undefined}
+              title={locked ? `Not promotable yet — ${blocked}` : undefined}
+              className={project.mode === mode ? `on ${mode}` : undefined}
+              onClick={() => { if (project.mode !== mode) void changeMode(mode); }}
+            >
+              {mode}
+            </button>
+          );
+        })}
       </div>
+      {blocked !== null && (
+        <p className="gate-note" id={gateId}>
+          Locked until the scoreboard earns it — {blocked}. {readinessCriterionLabel()}.
+        </p>
+      )}
       <Button size="sm" intent="stop" disabled={changing} onClick={() => void toggleProjectKill()}>
         {projectKilled ? "Resume" : "Pause"}
       </Button>

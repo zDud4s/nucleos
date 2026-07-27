@@ -63,7 +63,7 @@ function expectPostCall(
 describe("daemon API client", () => {
   it("gets project summaries and returns null for a non-ok response", async () => {
     const projects = [
-      { project_id: "alpha", mode: "shadow", project_root: null, pending: 2 },
+      { project_id: "alpha", mode: "shadow", project_root: null, pending: 2, classes_ready: 0, classes_total: 0, promotable: false },
     ] satisfies ProjectSummary[];
     fetchMock
       .mockResolvedValueOnce(okJson(projects))

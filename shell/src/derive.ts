@@ -6,6 +6,12 @@ export interface Readiness {
   samples: number;
 }
 
+/**
+ * Mirrors `READINESS_MIN_REVIEWED` / `READINESS_MIN_AGREE_PERCENT` in `core/src/shadow.rs`, which is
+ * the SINGLE SOURCE OF TRUTH for the promotion bar. These copies drive per-class scoreboard COPY
+ * only — the gate on the promote control reads `project.promotable` off the daemon, so a drift here
+ * can mislabel a row but can never let a project be promoted on different arithmetic.
+ */
 export const READINESS_MIN_REVIEWED = 10;
 export const READINESS_MIN_RATE = 0.95;
 
@@ -40,6 +46,20 @@ export function scoreboardReadiness(
 
 export function readinessCriterionLabel(): string {
   return `Ready at ${READINESS_MIN_REVIEWED}+ reviews, ≥${Math.round(READINESS_MIN_RATE * 100)}% agreement`;
+}
+
+/**
+ * Why the promote-to-active control is locked for a project, or null when it may be promoted.
+ *
+ * The gate exists so shadow mode has a real exit criterion: promotion stays the human's call, but it
+ * can't be made on a hunch after three runs. A project already active is never gated (this only
+ * guards the way IN to autonomy), and a project with nothing reviewed yet is blocked for lack of
+ * evidence rather than for failing the bar — a different message, because it's a different problem.
+ */
+export function promotionBlock(project: ProjectSummary): string | null {
+  if (project.mode === "active" || project.promotable) return null;
+  if (project.classes_total === 0) return "No reviewed shadow decisions yet";
+  return `${project.classes_ready}/${project.classes_total} action classes ready`;
 }
 
 export function totalPending(projects: ProjectSummary[]): number {

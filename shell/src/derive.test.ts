@@ -9,6 +9,7 @@ import {
   groupScoreboardByMode,
   killSwitchLabel,
   periodLabel,
+  promotionBlock,
   promotionReadiness,
   readinessCriterionLabel,
   readinessGap,
@@ -23,9 +24,9 @@ describe("pure UI derivations", () => {
       { projects: [] satisfies ProjectSummary[], expected: 0 },
       {
         projects: [
-          { project_id: "alpha", mode: "off", project_root: null, pending: 2 },
-          { project_id: "beta", mode: "shadow", project_root: null, pending: 0 },
-          { project_id: "gamma", mode: "active", project_root: null, pending: 5 },
+          { project_id: "alpha", mode: "off", project_root: null, pending: 2, classes_ready: 0, classes_total: 0, promotable: false },
+          { project_id: "beta", mode: "shadow", project_root: null, pending: 0, classes_ready: 0, classes_total: 0, promotable: false },
+          { project_id: "gamma", mode: "active", project_root: null, pending: 5, classes_ready: 0, classes_total: 0, promotable: false },
         ] satisfies ProjectSummary[],
         expected: 7,
       },
@@ -34,6 +35,35 @@ describe("pure UI derivations", () => {
     for (const { projects, expected } of cases) {
       expect(totalPending(projects)).toBe(expected);
     }
+  });
+
+  it("locks promotion until the scoreboard earns it, and never gates an active project", () => {
+    const project = (
+      over: Partial<ProjectSummary>,
+    ): ProjectSummary => ({
+      project_id: "alpha",
+      mode: "shadow",
+      project_root: null,
+      pending: 0,
+      classes_ready: 0,
+      classes_total: 0,
+      promotable: false,
+      ...over,
+    });
+
+    // No evidence yet reads differently from "tried and fell short".
+    expect(promotionBlock(project({}))).toBe("No reviewed shadow decisions yet");
+    expect(promotionBlock(project({ classes_ready: 1, classes_total: 3 }))).toBe(
+      "1/3 action classes ready",
+    );
+    // The daemon owns the verdict — when it says promotable, nothing is blocked.
+    expect(
+      promotionBlock(
+        project({ classes_ready: 3, classes_total: 3, promotable: true }),
+      ),
+    ).toBeNull();
+    // The gate guards the way IN to autonomy; an already-active project is never re-gated.
+    expect(promotionBlock(project({ mode: "active" }))).toBeNull();
   });
 
   it("derives agreement rates, including the zero-reviewed edge case", () => {

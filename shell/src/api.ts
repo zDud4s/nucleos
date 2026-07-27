@@ -30,6 +30,11 @@ export interface ProjectSummary {
   mode: AutopilotMode;
   project_root: string | null;
   pending: number;
+  /** Action classes clearing the shadow-exit bar, out of those the project has exercised. */
+  classes_ready: number;
+  classes_total: number;
+  /** Whether the promote-to-active control should unlock. Decided by the daemon (`shadow.rs`). */
+  promotable: boolean;
 }
 
 export interface FeedEntry {

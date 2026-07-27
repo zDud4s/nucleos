@@ -200,6 +200,9 @@ mod tests {
             mode: Mode::Active,
             project_root: Some("C:/projects/active".into()),
             pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            promotable: false,
         }];
 
         let body = resolve_run_request(&projects, "active-project", "do the work").unwrap();
@@ -215,6 +218,9 @@ mod tests {
             mode: Mode::Shadow,
             project_root: Some("C:/projects/shadow".into()),
             pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            promotable: false,
         }];
 
         let body = resolve_run_request(&projects, "shadow-project", "inspect the work").unwrap();
@@ -230,6 +236,9 @@ mod tests {
             mode: Mode::Off,
             project_root: Some("C:/projects/off".into()),
             pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            promotable: false,
         }];
 
         assert!(resolve_run_request(&projects, "off-project", "do the work").is_err());
@@ -242,6 +251,9 @@ mod tests {
             mode: Mode::Active,
             project_root: Some("C:/projects/known".into()),
             pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            promotable: false,
         }];
 
         assert!(resolve_run_request(&projects, "unknown-project", "do the work").is_err());
@@ -254,6 +266,9 @@ mod tests {
             mode: Mode::Active,
             project_root: None,
             pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            promotable: false,
         }];
 
         assert!(resolve_run_request(&projects, "rootless-project", "do the work").is_err());
