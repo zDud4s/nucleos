@@ -66,6 +66,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
         .route("/scoreboard", get(get_scoreboard))
+        .route("/email/cursor", get(get_email_cursor))
+        .route("/email/incoming", post(post_email_incoming))
+        .route("/email/{id}/requeue", post(post_email_requeue))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -170,6 +173,87 @@ struct BudgetRequest {
     hourly_limit_usd: Option<f64>,
     per_run_reserve_usd: f64,
     time_cost_per_hour_usd: f64,
+}
+
+#[derive(Deserialize)]
+struct MailboxQuery {
+    mailbox: String,
+}
+
+/// The sidecar's delivery envelope (spec §4.3).
+#[derive(Deserialize)]
+struct EmailIncomingRequest {
+    mailbox: String,
+    uidvalidity: i64,
+    /// The highest uid the sidecar LOOKED AT, which is what lets the cursor move past a message it
+    /// could not read. Not the same as the highest uid delivered.
+    max_uid_examined: i64,
+    #[serde(default)]
+    skipped: Vec<crate::email::SkippedMessage>,
+    #[serde(default)]
+    messages: Vec<crate::email::IncomingMessage>,
+}
+
+/// Paging belongs to the sidecar; a batch this large means it stopped doing its job, and the
+/// núcleo should say so rather than quietly ingest whatever arrives.
+const MAX_MESSAGES_PER_BATCH: usize = 200;
+
+async fn get_email_cursor(
+    State(state): State<AppState>,
+    Query(query): Query<MailboxQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let cursor = crate::email::get_cursor(&state.pool, &query.mailbox)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(match cursor {
+        Some(cursor) => serde_json::json!({
+            "uidvalidity": cursor.uidvalidity,
+            "last_uid": cursor.last_uid,
+        }),
+        None => serde_json::Value::Null,
+    }))
+}
+
+async fn post_email_incoming(
+    State(state): State<AppState>,
+    Json(body): Json<EmailIncomingRequest>,
+) -> Result<Json<crate::email::IngestOutcome>, StatusCode> {
+    if body.messages.len() > MAX_MESSAGES_PER_BATCH {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Ingestion is one transaction over untrusted content and it moves the cursor. A client that
+    // disconnects mid-request must not be able to leave that half-done.
+    let pool = state.pool.clone();
+    uncancellable(async move {
+        crate::email::ingest_batch(
+            &pool,
+            &body.mailbox,
+            body.uidvalidity,
+            body.max_uid_examined,
+            &body.skipped,
+            &body.messages,
+            chrono::Utc::now(),
+        )
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    })
+    .await?
+}
+
+async fn post_email_requeue(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    use crate::email::RequeueError;
+    let pool = state.pool.clone();
+    uncancellable(async move { crate::email::requeue(&pool, id).await })
+        .await?
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| match error {
+            RequeueError::UnknownEmail => StatusCode::NOT_FOUND,
+            RequeueError::BodyPurged | RequeueError::ClaimedByRun(_) => StatusCode::CONFLICT,
+        })
 }
 
 async fn post_assistant_message(
@@ -640,6 +724,217 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    fn email_batch(messages: serde_json::Value) -> Body {
+        Body::from(
+            serde_json::json!({
+                "mailbox": "INBOX",
+                "uidvalidity": 1,
+                "max_uid_examined": 10,
+                "messages": messages,
+            })
+            .to_string(),
+        )
+    }
+
+    fn one_message() -> serde_json::Value {
+        serde_json::json!([{
+            "message_id": "<a@b>",
+            "uid": 10,
+            "from_addr": "ana@company.com",
+            "received_at": "2026-07-28T11:00:00+00:00",
+            "body_text": "hello",
+        }])
+    }
+
+    async fn post_email(state: AppState, token: Option<&str>, body: Body) -> StatusCode {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/email/incoming")
+            .header("Content-Type", "application/json");
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        build_router(state)
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn email_ingestion_requires_the_bearer_token() {
+        let state = test_state().await;
+        assert_eq!(
+            post_email(state, None, email_batch(one_message())).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_email_batch_is_rejected() {
+        let state = test_state().await;
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                Body::from(r#"{"mailbox":"INBOX"}"#)
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// Paging is the sidecar's job (C7T3). A batch past the ceiling means it stopped doing it, and
+    /// the núcleo says so instead of ingesting whatever arrives.
+    #[tokio::test]
+    async fn an_oversized_email_batch_is_rejected() {
+        let state = test_state().await;
+        let messages: Vec<serde_json::Value> = (0..=MAX_MESSAGES_PER_BATCH)
+            .map(|i| {
+                serde_json::json!({
+                    "message_id": format!("<m{i}@x>"),
+                    "uid": i,
+                    "from_addr": "ana@company.com",
+                    "received_at": "2026-07-28T11:00:00+00:00",
+                })
+            })
+            .collect();
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                email_batch(serde_json::Value::Array(messages))
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_email_batch_reports_what_it_did() {
+        let state = test_state().await;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/email/incoming")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(email_batch(one_message()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ingested"], 1);
+        assert_eq!(body["duplicates"], 0);
+        assert_eq!(body["cursor"], 10);
+    }
+
+    async fn get_cursor_body(state: AppState, mailbox: &str) -> serde_json::Value {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/email/cursor?mailbox={mailbox}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unsynchronised_mailbox_reports_a_null_cursor() {
+        let state = test_state().await;
+        assert_eq!(
+            get_cursor_body(state, "INBOX").await,
+            serde_json::Value::Null
+        );
+    }
+
+    /// Two mailboxes have two positions; answering with the wrong one would resynchronise a
+    /// mailbox from the other's uid.
+    #[tokio::test]
+    async fn the_cursor_route_answers_per_mailbox() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO email_cursor (mailbox, uidvalidity, last_uid, updated_at) VALUES
+                 ('INBOX', 1, 10, '2026-07-28T10:00:00+00:00'),
+                 ('Archive', 2, 20, '2026-07-28T10:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let inbox = get_cursor_body(state.clone(), "INBOX").await;
+        assert_eq!(inbox["uidvalidity"], 1);
+        assert_eq!(inbox["last_uid"], 10);
+        let archive = get_cursor_body(state, "Archive").await;
+        assert_eq!(archive["uidvalidity"], 2);
+        assert_eq!(archive["last_uid"], 20);
+    }
+
+    async fn requeue_status(state: AppState, id: i64) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/email/{id}/requeue"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn requeueing_an_unknown_email_is_a_404() {
+        let state = test_state().await;
+        assert_eq!(requeue_status(state, 999).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn requeueing_a_classified_email_puts_it_back_in_the_queue() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, body_text,
+                                 received_at, ingested_at, triage_class, triage_summary,
+                                 triaged_at, triage_attempts)
+             VALUES ('<r@x>', 'INBOX', 1, 1, 'a@b', 'still here',
+                     '2026-07-28T10:00:00+00:00', '2026-07-28T10:00:00+00:00',
+                     'info', 'wrong call', '2026-07-28T10:05:00+00:00', 2)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        assert_eq!(
+            requeue_status(state.clone(), id).await,
+            StatusCode::NO_CONTENT
+        );
+        let (class, attempts): (Option<String>, i64) =
+            sqlx::query_as("SELECT triage_class, triage_attempts FROM emails WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(class, None);
+        assert_eq!(attempts, 0);
     }
 
     /// Rejecting a proposal is two commits with a gap between them: the proposal flips to

@@ -17,6 +17,25 @@ pub async fn append(
     summary: &str,
     run_id: Option<i64>,
 ) -> sqlx::Result<i64> {
+    append_on(
+        pool.acquire().await?.as_mut(),
+        project_id,
+        kind,
+        summary,
+        run_id,
+    )
+    .await
+}
+
+/// The same append against a caller-supplied connection, so a writer that must be atomic with its
+/// feed entry can run both inside one transaction. Feed SQL stays in this module either way.
+pub async fn append_on(
+    conn: &mut sqlx::SqliteConnection,
+    project_id: Option<&str>,
+    kind: &str,
+    summary: &str,
+    run_id: Option<i64>,
+) -> sqlx::Result<i64> {
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO feed (project_id, kind, summary, run_id, created_at)
@@ -27,7 +46,7 @@ pub async fn append(
     .bind(summary)
     .bind(run_id)
     .bind(created_at)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(result.last_insert_rowid())
 }

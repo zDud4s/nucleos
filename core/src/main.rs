@@ -6,6 +6,7 @@ mod budget;
 mod classifier;
 mod config;
 mod daemon_client;
+mod email;
 mod feed;
 mod hooks;
 mod http;

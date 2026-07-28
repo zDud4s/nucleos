@@ -1,0 +1,1229 @@
+//! The email pillar's domain core (spec §4): ingestion, the noise gate, and the cursor.
+//!
+//! This module owns every statement that touches `emails` and `email_cursor` — `storage.rs` stays
+//! table-agnostic. Everything here is reachable without a mailbox, a CLI or the sidecar, which is
+//! why the rules that decide what happens to a message are pure functions with the I/O around them.
+//!
+//! The one invariant worth stating up front: a message body is untrusted third-party content, and
+//! the system holds it for exactly as long as triage needs it (§7.2).
+
+/// One message as the sidecar delivers it (spec §4.3). Headers arrive lowercased by the sidecar.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct IncomingMessage {
+    /// Absent for the rare message with no `Message-ID`; ingestion synthesises one.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    pub uid: i64,
+    pub from_addr: String,
+    #[serde(default)]
+    pub from_name: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// IMAP INTERNALDATE, RFC 3339.
+    pub received_at: String,
+    #[serde(default)]
+    pub body_text: Option<String>,
+    #[serde(default)]
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// A message the sidecar looked at but could not deliver (spec §3.3/§4.3). It carries the uid so
+/// the cursor can move past it, and the reason so the user learns mail was skipped instead of
+/// silently losing it.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SkippedMessage {
+    pub uid: i64,
+    pub reason: String,
+}
+
+/// The stored position in one mailbox.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Cursor {
+    pub uidvalidity: i64,
+    pub last_uid: i64,
+    pub updated_at: String,
+}
+
+/// Why a message was classified as noise without spending a run on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoiseReason {
+    /// The universal mailing-list / marketing signature.
+    ListUnsubscribe,
+    /// `Precedence: bulk | list | junk`.
+    Precedence,
+    /// `Auto-Submitted` anything other than `no`.
+    AutoSubmitted,
+    /// A sender that announces itself as unattended.
+    NoReplySender,
+}
+
+impl NoiseReason {
+    /// The user-facing summary stored on the row.
+    pub fn summary(self) -> &'static str {
+        match self {
+            NoiseReason::ListUnsubscribe => "noise: mailing list (List-Unsubscribe)",
+            NoiseReason::Precedence => "noise: bulk precedence",
+            NoiseReason::AutoSubmitted => "noise: auto-submitted",
+            NoiseReason::NoReplySender => "noise: no-reply sender",
+        }
+    }
+}
+
+/// Local parts that identify an unattended sender. Matched WHOLE, never as a prefix: `noreply` is
+/// unambiguous, `noreply-team-2026` is somebody's real alias somewhere, and the cost asymmetry of
+/// this gate is not symmetric — letting noise through costs tokens, filing a real message as noise
+/// costs trust in the pillar (§4.2).
+const NO_REPLY_LOCAL_PARTS: &[&str] = &["noreply", "no-reply", "donotreply", "mailer-daemon"];
+
+/// PURE (spec §4.2): does this message announce itself as automated?
+///
+/// Deliberately conservative — it only catches what declares its own nature in a header a human
+/// never sends. It lives in the núcleo rather than the sidecar so the rules are testable in Rust
+/// next to the domain, and changing them never means recompiling Go.
+///
+/// Header lookup is case-insensitive even though the sidecar lowercases keys: a casing bug on the
+/// Go side should not be able to switch this gate off silently.
+pub fn classify_noise(
+    headers: &std::collections::HashMap<String, String>,
+    from_addr: &str,
+) -> Option<NoiseReason> {
+    let header = |name: &str| -> Option<&str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    };
+
+    if header("list-unsubscribe").is_some() {
+        return Some(NoiseReason::ListUnsubscribe);
+    }
+    if let Some(precedence) = header("precedence")
+        && ["bulk", "list", "junk"]
+            .iter()
+            .any(|kind| precedence.eq_ignore_ascii_case(kind))
+    {
+        return Some(NoiseReason::Precedence);
+    }
+    // `Auto-Submitted: no` is the RFC 3834 way of saying "a human sent this", so it is the one
+    // value that must NOT count.
+    if let Some(auto) = header("auto-submitted")
+        && !auto.eq_ignore_ascii_case("no")
+    {
+        return Some(NoiseReason::AutoSubmitted);
+    }
+
+    let local_part = from_addr.split('@').next().unwrap_or_default();
+    if NO_REPLY_LOCAL_PARTS
+        .iter()
+        .any(|candidate| local_part.eq_ignore_ascii_case(candidate))
+    {
+        return Some(NoiseReason::NoReplySender);
+    }
+    None
+}
+
+/// Bodies are capped before storage: a triage prompt does not get better with a megabyte of
+/// quoted thread, and the cap bounds how much untrusted content sits at rest.
+pub const MAX_BODY_BYTES: usize = 32 * 1024;
+
+/// A cursor older than this means a pile of already-read mail is about to arrive, which is the
+/// only situation the backfill cutoff exists for. Seven days is what separates it from the laptop
+/// that was off for the weekend (§4.4).
+pub const CURSOR_STALE_DAYS: i64 = 7;
+
+/// Mail older than this, in a batch where the cutoff is armed, is filed rather than triaged.
+pub const BACKFILL_AGE_HOURS: i64 = 24;
+
+/// The summary a backfilled row carries, so the reason is visible on the row itself.
+pub const BACKFILL_SUMMARY: &str = "não triado (backfill)";
+
+/// What one ingestion did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IngestOutcome {
+    pub ingested: i64,
+    pub duplicates: i64,
+    pub cursor: i64,
+}
+
+/// PURE (spec §4.4): is the backfill cutoff armed for this batch?
+///
+/// Armed only when there is a pile of read mail to recover — no cursor at all, a cursor invalidated
+/// by a `UIDVALIDITY` change, or a cursor that has not moved in `CURSOR_STALE_DAYS`.
+///
+/// This rule cost three wrong versions, each of which destroyed mail, so the shape matters more
+/// than the brevity. Evaluating it on batch SELECTION turned any pause longer than a day (kill
+/// switch, budget, daily cap) into "backfill". Evaluating it on EVERY ingestion looked like the fix
+/// until you remember the daemon starts on `LogonTrigger`: a laptop closed for the weekend
+/// resyncs on Monday with its cursor intact, and every Saturday message arrives older than 24h —
+/// silently discarded, unrecoverably, because retention drops the body in the same transaction.
+/// Tying it to the cursor catches exactly the case that justifies it and no other.
+pub fn backfill_armed(
+    cursor: Option<&Cursor>,
+    incoming_uidvalidity: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    if cursor.uidvalidity != incoming_uidvalidity {
+        return true;
+    }
+    match chrono::DateTime::parse_from_rfc3339(&cursor.updated_at) {
+        // A cursor whose timestamp cannot be read is a cursor whose age is unknown. Treating that
+        // as "recent" would be a guess in the direction that floods the queue.
+        Err(_) => true,
+        Ok(updated_at) => {
+            now.signed_duration_since(updated_at.with_timezone(&chrono::Utc))
+                > chrono::Duration::days(CURSOR_STALE_DAYS)
+        }
+    }
+}
+
+/// PURE: within an armed batch, is this particular message old enough to file instead of triage?
+/// A `received_at` that will not parse is treated as recent — the direction that keeps the message
+/// in the queue, since the alternative silently files mail on a formatting error.
+pub fn is_backfill_message(received_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(received_at) {
+        Err(_) => false,
+        Ok(received) => {
+            now.signed_duration_since(received.with_timezone(&chrono::Utc))
+                > chrono::Duration::hours(BACKFILL_AGE_HOURS)
+        }
+    }
+}
+
+/// PURE: the identifier a message is stored under. A message with no `Message-ID` is legal, so it
+/// gets one built from the only pair that identifies it on this server (§4.1).
+pub fn message_key(message_id: Option<&str>, uidvalidity: i64, uid: i64) -> String {
+    match message_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => format!("<nucleos-{uidvalidity}-{uid}>"),
+    }
+}
+
+/// PURE: cap a body at `MAX_BODY_BYTES` without splitting a UTF-8 character.
+pub fn truncate_body(body: &str) -> &str {
+    if body.len() <= MAX_BODY_BYTES {
+        return body;
+    }
+    let mut end = MAX_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
+/// How a freshly ingested row enters: either pending, or already resolved without spending a run.
+struct EntryClass {
+    triage_class: Option<&'static str>,
+    summary: Option<String>,
+}
+
+impl EntryClass {
+    fn pending() -> Self {
+        Self {
+            triage_class: None,
+            summary: None,
+        }
+    }
+}
+
+/// Ingests one delivered batch (spec §4.3), atomically.
+///
+/// Either every message lands and the cursor advances, or nothing happens and the sidecar
+/// redelivers. There is deliberately no intermediate state: a cursor that moved past mail that was
+/// not stored is mail lost with no way to notice.
+///
+/// `now` is a parameter rather than read inside, so the cutoff rules can be tested at any point in
+/// time without waiting for one.
+pub async fn ingest_batch(
+    pool: &sqlx::SqlitePool,
+    mailbox: &str,
+    uidvalidity: i64,
+    max_uid_examined: i64,
+    skipped: &[SkippedMessage],
+    messages: &[IncomingMessage],
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<IngestOutcome> {
+    let now_str = now.to_rfc3339();
+    let mut tx = pool.begin().await?;
+
+    let stored: Option<(i64, i64, String)> = sqlx::query_as(
+        "SELECT uidvalidity, last_uid, updated_at FROM email_cursor WHERE mailbox = ?",
+    )
+    .bind(mailbox)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let cursor = stored.map(|(uidvalidity, last_uid, updated_at)| Cursor {
+        uidvalidity,
+        last_uid,
+        updated_at,
+    });
+    let armed = backfill_armed(cursor.as_ref(), uidvalidity, now);
+
+    let mut ingested = 0i64;
+    let mut duplicates = 0i64;
+    let mut highest_delivered = 0i64;
+
+    for message in messages {
+        highest_delivered = highest_delivered.max(message.uid);
+        let key = message_key(message.message_id.as_deref(), uidvalidity, message.uid);
+
+        // The class is decided BEFORE the insert rather than patched in afterwards. A second
+        // UPDATE keyed on message_id would also reach a redelivered row that an in-flight batch had
+        // already claimed, and race that run's verdict (§4.2).
+        let entry = if let Some(reason) = classify_noise(&message.headers, &message.from_addr) {
+            EntryClass {
+                triage_class: Some("noise"),
+                summary: Some(reason.summary().to_string()),
+            }
+        } else if armed && is_backfill_message(&message.received_at, now) {
+            EntryClass {
+                triage_class: Some("info"),
+                summary: Some(BACKFILL_SUMMARY.to_string()),
+            }
+        } else {
+            EntryClass::pending()
+        };
+
+        // A row that never enters the queue never needs its body: it will not be triaged (§7.2).
+        let body = match entry.triage_class {
+            Some(_) => None,
+            None => message.body_text.as_deref().map(truncate_body),
+        };
+        let triaged_at = entry.triage_class.map(|_| now_str.as_str());
+
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO emails
+                 (message_id, mailbox, uidvalidity, uid, from_addr, from_name, subject, body_text,
+                  has_attachments, received_at, ingested_at, triage_class, triage_summary,
+                  triaged_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&key)
+        .bind(mailbox)
+        .bind(uidvalidity)
+        .bind(message.uid)
+        .bind(&message.from_addr)
+        .bind(message.from_name.as_deref())
+        .bind(message.subject.as_deref())
+        .bind(body)
+        .bind(i64::from(message.has_attachments))
+        .bind(&message.received_at)
+        .bind(&now_str)
+        .bind(entry.triage_class)
+        .bind(entry.summary.as_deref())
+        .bind(triaged_at)
+        .execute(tx.as_mut())
+        .await?;
+
+        if result.rows_affected() == 1 {
+            ingested += 1;
+        } else {
+            duplicates += 1;
+        }
+    }
+
+    // Mail the sidecar could not read still has to be visible, or it disappears leaving nothing but
+    // a line in the sidecar's log. Inside the transaction, because the cursor is about to move past
+    // it (§4.3).
+    for skip in skipped {
+        crate::feed::append_on(
+            tx.as_mut(),
+            None,
+            "email_fetch_skipped",
+            &format!(
+                "skipped uid {} in {}: {}",
+                skip.uid,
+                mailbox,
+                skip.reason.trim()
+            ),
+            None,
+        )
+        .await?;
+    }
+
+    // The cursor advances over what was EXAMINED, not only over what was delivered — that is what
+    // unblocks a message the sidecar cannot parse (§4.3). A batch with no messages and a higher
+    // `max_uid_examined` is therefore a legitimate, meaningful call.
+    let advanced = max_uid_examined.max(highest_delivered);
+    let next_uid = match &cursor {
+        // A UIDVALIDITY change means the server's uid space was rebuilt: the old position is not a
+        // position any more, so it is replaced rather than advanced.
+        Some(cursor) if cursor.uidvalidity == uidvalidity => cursor.last_uid.max(advanced),
+        _ => advanced,
+    };
+
+    sqlx::query(
+        "INSERT INTO email_cursor (mailbox, uidvalidity, last_uid, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(mailbox) DO UPDATE SET
+             uidvalidity = excluded.uidvalidity,
+             last_uid = excluded.last_uid,
+             updated_at = excluded.updated_at",
+    )
+    .bind(mailbox)
+    .bind(uidvalidity)
+    .bind(next_uid)
+    .bind(&now_str)
+    .execute(tx.as_mut())
+    .await?;
+
+    tx.commit().await?;
+    Ok(IngestOutcome {
+        ingested,
+        duplicates,
+        cursor: next_uid,
+    })
+}
+
+/// A run is terminal when it can no longer write anything: everything except `running` and
+/// `awaiting_approval`. Written as a SQL fragment because both the requeue guard and the triage
+/// loop's single-flight check ask the same question, and two spellings of it would drift.
+/// (A triage run never reaches `awaiting_approval` — it has no tools to trigger an approval.)
+pub const RUN_IS_TERMINAL: &str =
+    "status IN ('completed','failed','timed_out','cancelled','interrupted','superseded')";
+
+/// Why a requeue was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequeueError {
+    UnknownEmail,
+    /// The body was already dropped, so there is nothing left to re-triage (§7.2).
+    BodyPurged,
+    /// A batch currently holds this row (§5.1).
+    ClaimedByRun(i64),
+}
+
+/// Returns a classified message to the pending queue (spec §4.3).
+///
+/// Eligibility is `body_text IS NOT NULL` rather than `class = 'failed'`, because that predicate is
+/// literally the condition for a re-triage to be possible — and it covers the row the classifier
+/// merely got wrong just as well as the one that failed.
+///
+/// `ingested_at` is deliberately untouched: the message did not re-arrive, and that column governs
+/// queue order and pruning.
+pub async fn requeue(pool: &sqlx::SqlitePool, id: i64) -> Result<(), RequeueError> {
+    let row: Option<(Option<String>, Option<i64>)> =
+        sqlx::query_as("SELECT body_text, triage_run_id FROM emails WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| RequeueError::UnknownEmail)?;
+    let (body, claim) = row.ok_or(RequeueError::UnknownEmail)?;
+    if body.is_none() {
+        return Err(RequeueError::BodyPurged);
+    }
+
+    // Without this guard a requeue mid-batch clears the claim, the next tick launches a second run
+    // over the same message, and both write a verdict — §5.1's mutual exclusion reopened from
+    // behind.
+    if let Some(run_id) = claim {
+        // `AssertSqlSafe` because sqlx only accepts `&'static str` otherwise. The interpolated
+        // fragment is a private const in this file and the run id stays a bound parameter, so
+        // nothing caller-supplied reaches the SQL text (same justification as `shadow.rs`).
+        let terminal: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT 1 FROM runs WHERE id = ? AND {RUN_IS_TERMINAL}"
+        )))
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| RequeueError::ClaimedByRun(run_id))?;
+        if terminal.is_none() {
+            return Err(RequeueError::ClaimedByRun(run_id));
+        }
+    }
+
+    sqlx::query(
+        "UPDATE emails
+            SET triage_class = NULL, triage_run_id = NULL, triage_summary = NULL,
+                triaged_at = NULL, triage_attempts = 0, infra_failures = 0
+          WHERE id = ?",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|_| RequeueError::UnknownEmail)?;
+    Ok(())
+}
+
+/// Reads the cursor for one mailbox. `None` means this mailbox was never synchronised, which is
+/// also one of the three conditions that arm the backfill cutoff (§4.4).
+pub async fn get_cursor(pool: &sqlx::SqlitePool, mailbox: &str) -> sqlx::Result<Option<Cursor>> {
+    let row: Option<(i64, i64, String)> = sqlx::query_as(
+        "SELECT uidvalidity, last_uid, updated_at FROM email_cursor WHERE mailbox = ?",
+    )
+    .bind(mailbox)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(uidvalidity, last_uid, updated_at)| Cursor {
+        uidvalidity,
+        last_uid,
+        updated_at,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+
+    pub(crate) async fn test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn migration_creates_the_email_tables() {
+        let pool = test_pool().await;
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'email%' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, vec!["email_cursor", "emails"]);
+    }
+
+    /// The partial index is what makes the pending queue cheap to read every tick; without the
+    /// WHERE clause it would be an ordinary index over the whole table.
+    #[tokio::test]
+    async fn the_pending_index_is_partial() {
+        let pool = test_pool().await;
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'emails_pending'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            sql.contains("WHERE triage_class IS NULL"),
+            "the pending index must stay partial: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_email_row_round_trips_every_column() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, from_name,
+                                 subject, body_text, has_attachments, received_at, ingested_at,
+                                 triage_class, triage_summary, triage_run_id, triage_attempts,
+                                 infra_failures, triaged_at)
+             VALUES ('<a@b>', 'INBOX', 12, 34, 'x@y', 'X', 'subj', 'body', 1,
+                     '2026-07-28T10:00:00+00:00', '2026-07-28T10:00:01+00:00',
+                     'urgent', 'summary', 7, 2, 1, '2026-07-28T10:05:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query("SELECT * FROM emails WHERE message_id = '<a@b>'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("mailbox"), "INBOX");
+        assert_eq!(row.get::<i64, _>("uidvalidity"), 12);
+        assert_eq!(row.get::<i64, _>("uid"), 34);
+        assert_eq!(row.get::<String, _>("from_addr"), "x@y");
+        assert_eq!(
+            row.get::<Option<String>, _>("from_name").as_deref(),
+            Some("X")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("subject").as_deref(),
+            Some("subj")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("body_text").as_deref(),
+            Some("body")
+        );
+        assert_eq!(row.get::<i64, _>("has_attachments"), 1);
+        assert_eq!(
+            row.get::<String, _>("received_at"),
+            "2026-07-28T10:00:00+00:00"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("triage_class").as_deref(),
+            Some("urgent")
+        );
+        assert_eq!(row.get::<Option<i64>, _>("triage_run_id"), Some(7));
+        assert_eq!(row.get::<i64, _>("triage_attempts"), 2);
+        assert_eq!(row.get::<i64, _>("infra_failures"), 1);
+    }
+
+    /// Defaults matter here: a freshly ingested row must be *pending*, not accidentally counted as
+    /// having already failed or been attempted.
+    #[tokio::test]
+    async fn a_minimal_row_defaults_to_pending() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, received_at,
+                                 ingested_at)
+             VALUES ('<c@d>', 'INBOX', 1, 2, 'a@b', '2026-07-28T10:00:00+00:00',
+                     '2026-07-28T10:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query("SELECT * FROM emails WHERE message_id = '<c@d>'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.get::<Option<String>, _>("triage_class").is_none());
+        assert!(row.get::<Option<i64>, _>("triage_run_id").is_none());
+        assert_eq!(row.get::<i64, _>("triage_attempts"), 0);
+        assert_eq!(row.get::<i64, _>("infra_failures"), 0);
+        assert_eq!(row.get::<i64, _>("has_attachments"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_message_id_can_only_be_stored_once() {
+        let pool = test_pool().await;
+        let insert = "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr,
+                                          received_at, ingested_at)
+                      VALUES ('<dup@x>', 'INBOX', 1, 2, 'a@b', '2026-07-28T10:00:00+00:00',
+                              '2026-07-28T10:00:00+00:00')";
+        sqlx::query(insert).execute(&pool).await.unwrap();
+        assert!(sqlx::query(insert).execute(&pool).await.is_err());
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn each_automation_header_is_noise() {
+        /// headers, sender, expected verdict.
+        type NoiseCase<'a> = (&'a [(&'a str, &'a str)], &'a str, NoiseReason);
+
+        let cases: &[NoiseCase] = &[
+            (
+                &[("list-unsubscribe", "<mailto:x@y>")],
+                "team@company.com",
+                NoiseReason::ListUnsubscribe,
+            ),
+            (
+                &[("precedence", "bulk")],
+                "team@company.com",
+                NoiseReason::Precedence,
+            ),
+            (
+                &[("precedence", "List")],
+                "team@company.com",
+                NoiseReason::Precedence,
+            ),
+            (
+                &[("precedence", "junk")],
+                "team@company.com",
+                NoiseReason::Precedence,
+            ),
+            (
+                &[("auto-submitted", "auto-generated")],
+                "team@company.com",
+                NoiseReason::AutoSubmitted,
+            ),
+            (&[], "noreply@company.com", NoiseReason::NoReplySender),
+            (&[], "no-reply@company.com", NoiseReason::NoReplySender),
+            (&[], "donotreply@company.com", NoiseReason::NoReplySender),
+            (&[], "mailer-daemon@company.com", NoiseReason::NoReplySender),
+        ];
+        for (hdrs, from, expected) in cases {
+            assert_eq!(
+                classify_noise(&headers(hdrs), from),
+                Some(*expected),
+                "{from} with {hdrs:?} should be {expected:?}"
+            );
+        }
+    }
+
+    /// The whole point of the gate is that it never touches mail a person actually sent.
+    #[test]
+    fn a_personal_email_is_not_noise() {
+        let hdrs = headers(&[
+            ("from", "Ana <ana@company.com>"),
+            ("subject", "lunch?"),
+            ("message-id", "<abc@company.com>"),
+        ]);
+        assert_eq!(classify_noise(&hdrs, "ana@company.com"), None);
+    }
+
+    /// RFC 3834's way of saying a human sent it — the one value that must not trip the gate.
+    #[test]
+    fn auto_submitted_no_is_not_noise() {
+        assert_eq!(
+            classify_noise(&headers(&[("auto-submitted", "no")]), "ana@company.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_sender_local_part_matches_case_insensitively() {
+        assert_eq!(
+            classify_noise(&headers(&[]), "NoReply@Company.COM"),
+            Some(NoiseReason::NoReplySender)
+        );
+    }
+
+    /// Whole-local-part matching, not prefix: a real alias that merely starts the same way is a
+    /// person's mail, and filing it as noise is the expensive direction of this gate's error.
+    #[test]
+    fn a_sender_that_merely_starts_like_no_reply_is_not_noise() {
+        assert_eq!(
+            classify_noise(&headers(&[]), "noreply-team@company.com"),
+            None
+        );
+        assert_eq!(
+            classify_noise(&headers(&[]), "noreplying@company.com"),
+            None
+        );
+    }
+
+    /// The sidecar promises lowercase keys; a casing bug there must not silently disable the gate.
+    #[test]
+    fn header_lookup_survives_unexpected_casing() {
+        assert_eq!(
+            classify_noise(&headers(&[("List-Unsubscribe", "<mailto:x@y>")]), "a@b"),
+            Some(NoiseReason::ListUnsubscribe)
+        );
+    }
+
+    /// An unusual precedence value is not one of the three the spec names, and inventing a fourth
+    /// would widen the gate past what a message actually declared.
+    #[test]
+    fn an_unknown_precedence_value_is_not_noise() {
+        assert_eq!(
+            classify_noise(&headers(&[("precedence", "first-class")]), "a@b"),
+            None
+        );
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-28T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn ago(hours: i64) -> String {
+        (now() - chrono::Duration::hours(hours)).to_rfc3339()
+    }
+
+    fn message(uid: i64) -> IncomingMessage {
+        IncomingMessage {
+            message_id: Some(format!("<m{uid}@x>")),
+            uid,
+            from_addr: "ana@company.com".into(),
+            from_name: Some("Ana".into()),
+            subject: Some("hello".into()),
+            received_at: ago(1),
+            body_text: Some("body".into()),
+            has_attachments: false,
+            headers: Default::default(),
+        }
+    }
+
+    async fn seed_cursor(pool: &sqlx::SqlitePool, uidvalidity: i64, last_uid: i64, age_days: i64) {
+        sqlx::query(
+            "INSERT INTO email_cursor (mailbox, uidvalidity, last_uid, updated_at)
+             VALUES ('INBOX', ?, ?, ?)",
+        )
+        .bind(uidvalidity)
+        .bind(last_uid)
+        .bind((now() - chrono::Duration::days(age_days)).to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn ingest(
+        pool: &sqlx::SqlitePool,
+        messages: &[IncomingMessage],
+        max_uid_examined: i64,
+    ) -> IngestOutcome {
+        ingest_batch(pool, "INBOX", 1, max_uid_examined, &[], messages, now())
+            .await
+            .unwrap()
+    }
+
+    async fn class_of(pool: &sqlx::SqlitePool, message_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT triage_class FROM emails WHERE message_id = ?")
+            .bind(message_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ingest_stores_a_message_and_advances_the_cursor() {
+        let pool = test_pool().await;
+        let outcome = ingest(&pool, &[message(10)], 10).await;
+        assert_eq!(
+            outcome,
+            IngestOutcome {
+                ingested: 1,
+                duplicates: 0,
+                cursor: 10
+            }
+        );
+        assert_eq!(
+            class_of(&pool, "<m10@x>").await,
+            None,
+            "must arrive pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_message_is_a_duplicate_not_an_error() {
+        let pool = test_pool().await;
+        ingest(&pool, &[message(10)], 10).await;
+        let outcome = ingest(&pool, &[message(10)], 10).await;
+        assert_eq!(outcome.ingested, 0);
+        assert_eq!(outcome.duplicates, 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_message_without_an_id_gets_a_synthetic_one() {
+        let pool = test_pool().await;
+        let mut m = message(77);
+        m.message_id = None;
+        ingest(&pool, &[m], 77).await;
+        let stored: String = sqlx::query_scalar("SELECT message_id FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "<nucleos-1-77>");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_truncated() {
+        let pool = test_pool().await;
+        let mut m = message(11);
+        m.body_text = Some("x".repeat(MAX_BODY_BYTES + 500));
+        ingest(&pool, &[m], 11).await;
+        let body: String = sqlx::query_scalar("SELECT body_text FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), MAX_BODY_BYTES);
+    }
+
+    /// A gated row never enters the queue, so it never needs the body — and dropping it here is
+    /// what makes the gate the pillar's main reducer of untrusted content at rest.
+    #[tokio::test]
+    async fn a_noise_row_is_stored_classified_without_body_or_run() {
+        let pool = test_pool().await;
+        let mut m = message(12);
+        m.headers
+            .insert("list-unsubscribe".into(), "<mailto:x@y>".into());
+        ingest(&pool, &[m], 12).await;
+
+        let row = sqlx::query("SELECT * FROM emails WHERE message_id = '<m12@x>'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("triage_class").as_deref(),
+            Some("noise")
+        );
+        assert!(row.get::<Option<String>, _>("body_text").is_none());
+        assert!(row.get::<Option<i64>, _>("triage_run_id").is_none());
+        assert!(row.get::<Option<String>, _>("triaged_at").is_some());
+    }
+
+    /// Spec §4.2's race: a redelivery must not re-run the gate over a row an in-flight batch has
+    /// already claimed, because that write competes with the run's verdict.
+    #[tokio::test]
+    async fn a_redelivery_never_touches_an_already_claimed_row() {
+        let pool = test_pool().await;
+        ingest(&pool, &[message(13)], 13).await;
+        sqlx::query(
+            "UPDATE emails SET triage_run_id = 99, triage_class = 'urgent',
+                               triage_summary = 'the verdict' WHERE message_id = '<m13@x>'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut redelivered = message(13);
+        redelivered
+            .headers
+            .insert("precedence".into(), "bulk".into());
+        ingest(&pool, &[redelivered], 13).await;
+
+        let row = sqlx::query("SELECT * FROM emails WHERE message_id = '<m13@x>'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("triage_class").as_deref(),
+            Some("urgent")
+        );
+        assert_eq!(row.get::<Option<i64>, _>("triage_run_id"), Some(99));
+        assert_eq!(
+            row.get::<Option<String>, _>("triage_summary").as_deref(),
+            Some("the verdict")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_mid_batch_leaves_no_rows_and_no_cursor() {
+        let pool = test_pool().await;
+        // `received_at` is NOT NULL, so a message carrying a NULL for it fails the insert. The
+        // batch has a good message before it, which must not survive the rollback.
+        let mut poisoned = message(21);
+        poisoned.received_at = String::new();
+        sqlx::query(
+            "CREATE TRIGGER reject_empty BEFORE INSERT ON emails
+                     WHEN NEW.received_at = '' BEGIN SELECT RAISE(ABORT, 'bad date'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result =
+            ingest_batch(&pool, "INBOX", 1, 21, &[], &[message(20), poisoned], now()).await;
+        assert!(result.is_err(), "the batch must fail as a whole");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "no message may survive a failed batch");
+        assert_eq!(get_cursor(&pool, "INBOX").await.unwrap(), None);
+    }
+
+    /// "I looked at a message, could not read it, move on" — the case that unblocks a corrupted
+    /// message instead of retrying it forever.
+    #[tokio::test]
+    async fn an_empty_batch_still_advances_the_cursor() {
+        let pool = test_pool().await;
+        let outcome = ingest(&pool, &[], 55).await;
+        assert_eq!(outcome.cursor, 55);
+        assert_eq!(
+            get_cursor(&pool, "INBOX").await.unwrap().unwrap().last_uid,
+            55
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_message_is_announced_in_the_feed() {
+        let pool = test_pool().await;
+        ingest_batch(
+            &pool,
+            "INBOX",
+            1,
+            60,
+            &[SkippedMessage {
+                uid: 59,
+                reason: "malformed MIME".into(),
+            }],
+            &[],
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let (kind, summary): (String, String) =
+            sqlx::query_as("SELECT kind, summary FROM feed ORDER BY id DESC LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "email_fetch_skipped");
+        assert!(summary.contains("59"), "{summary}");
+        assert!(summary.contains("malformed MIME"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_uidvalidity_change_replaces_the_cursor() {
+        let pool = test_pool().await;
+        seed_cursor(&pool, 1, 900, 0).await;
+        let outcome = ingest_batch(&pool, "INBOX", 2, 5, &[], &[], now())
+            .await
+            .unwrap();
+        assert_eq!(outcome.cursor, 5, "a rebuilt uid space is not a rewind");
+        let cursor = get_cursor(&pool, "INBOX").await.unwrap().unwrap();
+        assert_eq!(cursor.uidvalidity, 2);
+        assert_eq!(cursor.last_uid, 5);
+    }
+
+    // ---- §4.4, the four cases that separate the wrong versions of the cutoff from the right one.
+
+    #[tokio::test]
+    async fn without_a_cursor_old_mail_is_filed_as_backfill() {
+        let pool = test_pool().await;
+        let mut m = message(30);
+        m.received_at = ago(72);
+        ingest(&pool, &[m], 30).await;
+
+        let row = sqlx::query("SELECT * FROM emails WHERE message_id = '<m30@x>'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("triage_class").as_deref(),
+            Some("info")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("triage_summary").as_deref(),
+            Some(BACKFILL_SUMMARY)
+        );
+    }
+
+    /// The weekend-offline case an earlier version destroyed: the daemon starts on LogonTrigger, so
+    /// Monday's first sync carries Saturday's mail with an intact cursor. It must stay triageable.
+    #[tokio::test]
+    async fn a_recent_cursor_keeps_old_mail_in_the_queue() {
+        let pool = test_pool().await;
+        seed_cursor(&pool, 1, 5, 2).await;
+        let mut m = message(31);
+        m.received_at = ago(72);
+        ingest(&pool, &[m], 31).await;
+        assert_eq!(class_of(&pool, "<m31@x>").await, None);
+    }
+
+    /// The month-long absence: the cursor is intact but thousands of messages are about to arrive,
+    /// and triaging them would drain the budget and notify three-week-old urgencies.
+    #[tokio::test]
+    async fn a_stale_cursor_arms_the_cutoff_again() {
+        let pool = test_pool().await;
+        seed_cursor(&pool, 1, 5, 30).await;
+        let mut m = message(32);
+        m.received_at = ago(72);
+        ingest(&pool, &[m], 32).await;
+        assert_eq!(class_of(&pool, "<m32@x>").await.as_deref(), Some("info"));
+    }
+
+    /// The cutoff is decided at ingestion and never re-evaluated, so a message that waits in the
+    /// queue does not become backfill just by ageing there.
+    #[tokio::test]
+    async fn a_message_ingested_recently_never_becomes_backfill_later() {
+        let pool = test_pool().await;
+        let m = message(33);
+        ingest(&pool, &[m], 33).await;
+        assert_eq!(class_of(&pool, "<m33@x>").await, None);
+
+        // Two days later the row is still exactly what it was: pending, with its body.
+        let body: Option<String> =
+            sqlx::query_scalar("SELECT body_text FROM emails WHERE uid = 33")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(body.as_deref(), Some("body"));
+        assert_eq!(class_of(&pool, "<m33@x>").await, None);
+    }
+
+    #[tokio::test]
+    async fn an_armed_batch_still_triages_fresh_mail() {
+        let pool = test_pool().await;
+        let mut fresh = message(34);
+        fresh.received_at = ago(2);
+        ingest(&pool, &[fresh], 34).await;
+        assert_eq!(class_of(&pool, "<m34@x>").await, None);
+    }
+
+    #[test]
+    fn an_unreadable_cursor_timestamp_arms_the_cutoff() {
+        let cursor = Cursor {
+            uidvalidity: 1,
+            last_uid: 5,
+            updated_at: "not a date".into(),
+        };
+        assert!(backfill_armed(Some(&cursor), 1, now()));
+    }
+
+    /// The opposite direction on the message side: an unreadable `received_at` keeps the message in
+    /// the queue rather than filing it on a formatting error.
+    #[test]
+    fn an_unreadable_received_at_is_not_backfill() {
+        assert!(!is_backfill_message("not a date", now()));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let body = "é".repeat(MAX_BODY_BYTES);
+        let cut = truncate_body(&body);
+        assert!(cut.len() <= MAX_BODY_BYTES);
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    async fn seed_classified(
+        pool: &sqlx::SqlitePool,
+        body: Option<&str>,
+        claim: Option<i64>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, body_text,
+                                 received_at, ingested_at, triage_class, triage_summary,
+                                 triaged_at, triage_attempts, infra_failures, triage_run_id)
+             VALUES ('<q@x>', 'INBOX', 1, 1, 'a@b', ?, '2026-07-28T10:00:00+00:00',
+                     '2026-07-28T10:00:00+00:00', 'failed', 'gave up', '2026-07-28T10:05:00+00:00',
+                     2, 3, ?)",
+        )
+        .bind(body)
+        .bind(claim)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn seed_run(pool: &sqlx::SqlitePool, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('proj', 'triage', ?, 'email_triage', '2026-07-28T10:00:00+00:00')",
+        )
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn requeue_clears_the_verdict_without_moving_ingested_at() {
+        let pool = test_pool().await;
+        let id = seed_classified(&pool, Some("body"), None).await;
+        requeue(&pool, id).await.unwrap();
+
+        let row = sqlx::query("SELECT * FROM emails WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.get::<Option<String>, _>("triage_class").is_none());
+        assert!(row.get::<Option<String>, _>("triage_summary").is_none());
+        assert!(row.get::<Option<String>, _>("triaged_at").is_none());
+        assert!(row.get::<Option<i64>, _>("triage_run_id").is_none());
+        assert_eq!(row.get::<i64, _>("triage_attempts"), 0);
+        assert_eq!(row.get::<i64, _>("infra_failures"), 0);
+        assert_eq!(
+            row.get::<String, _>("ingested_at"),
+            "2026-07-28T10:00:00+00:00",
+            "the message did not re-arrive, so queue order must not move"
+        );
+    }
+
+    /// Eligibility is the body, not the class: the misclassified `info` row is exactly as worth
+    /// re-triaging as the one that failed.
+    #[tokio::test]
+    async fn a_misclassified_row_is_as_requeueable_as_a_failed_one() {
+        let pool = test_pool().await;
+        let id = seed_classified(&pool, Some("body"), None).await;
+        sqlx::query("UPDATE emails SET triage_class = 'info' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(requeue(&pool, id).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_purged_body_cannot_be_requeued() {
+        let pool = test_pool().await;
+        let id = seed_classified(&pool, None, None).await;
+        assert_eq!(requeue(&pool, id).await, Err(RequeueError::BodyPurged));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_email_cannot_be_requeued() {
+        let pool = test_pool().await;
+        assert_eq!(requeue(&pool, 4242).await, Err(RequeueError::UnknownEmail));
+    }
+
+    /// The guard that carries this route: clearing a live claim would let the next tick launch a
+    /// second run over the same message, and both would write a verdict.
+    #[tokio::test]
+    async fn a_row_claimed_by_a_live_run_is_refused() {
+        let pool = test_pool().await;
+        let run_id = seed_run(&pool, "running").await;
+        let id = seed_classified(&pool, Some("body"), Some(run_id)).await;
+        assert_eq!(
+            requeue(&pool, id).await,
+            Err(RequeueError::ClaimedByRun(run_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_claimed_by_a_finished_run_is_released() {
+        let pool = test_pool().await;
+        for status in [
+            "completed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "interrupted",
+            "superseded",
+        ] {
+            let run_id = seed_run(&pool, status).await;
+            let id = seed_classified(&pool, Some("body"), Some(run_id)).await;
+            assert_eq!(requeue(&pool, id).await, Ok(()), "status {status}");
+            sqlx::query("DELETE FROM emails WHERE id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// An `awaiting_approval` run is not terminal. A triage run never gets there, but the predicate
+    /// is shared with the triage loop's single-flight check, so it has to be right for both.
+    #[tokio::test]
+    async fn a_row_claimed_by_a_paused_run_is_refused() {
+        let pool = test_pool().await;
+        let run_id = seed_run(&pool, "awaiting_approval").await;
+        let id = seed_classified(&pool, Some("body"), Some(run_id)).await;
+        assert_eq!(
+            requeue(&pool, id).await,
+            Err(RequeueError::ClaimedByRun(run_id))
+        );
+    }
+
+    /// Spec §4.3: a feed entry is a notification, and notifying someone of their own click is noise.
+    #[tokio::test]
+    async fn requeue_writes_no_feed_row() {
+        let pool = test_pool().await;
+        let id = seed_classified(&pool, Some("body"), None).await;
+        requeue(&pool, id).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unsynchronised_mailbox_has_no_cursor() {
+        let pool = test_pool().await;
+        assert_eq!(get_cursor(&pool, "INBOX").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_stored_cursor_round_trips() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO email_cursor (mailbox, uidvalidity, last_uid, updated_at)
+             VALUES ('INBOX', 9, 41, '2026-07-28T10:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            get_cursor(&pool, "INBOX").await.unwrap(),
+            Some(Cursor {
+                uidvalidity: 9,
+                last_uid: 41,
+                updated_at: "2026-07-28T10:00:00+00:00".to_string(),
+            })
+        );
+    }
+}
