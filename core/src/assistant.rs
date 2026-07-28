@@ -211,7 +211,7 @@ fn spawn_assistant_turn(
         match result {
             Ok(Ok(o)) => {
                 let reply = extract_reply(&o.stdout).unwrap_or_else(|| o.stdout.clone());
-                let _ = sqlx::query(
+                let completed = sqlx::query(
                     "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(o.exit_code)
@@ -223,13 +223,14 @@ fn spawn_assistant_turn(
                 .bind(id)
                 .execute(&pool)
                 .await;
+                crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
                 if let Some(session_id) = o.session_id.as_deref() {
                     let _ =
                         upsert_session(&pool, &turn.slot.chat_id, session_id, &completed_at).await;
                 }
             }
             Ok(Err(e)) => {
-                let _ = sqlx::query(
+                let failed = sqlx::query(
                     "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(e.to_string())
@@ -237,15 +238,17 @@ fn spawn_assistant_turn(
                 .bind(id)
                 .execute(&pool)
                 .await;
+                crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
             }
             Err(_) => {
-                let _ = sqlx::query(
+                let timed_out = sqlx::query(
                     "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(&completed_at)
                 .bind(id)
                 .execute(&pool)
                 .await;
+                crate::runs::warn_on_terminal_write_err(&timed_out, id, "timed_out");
             }
         }
 

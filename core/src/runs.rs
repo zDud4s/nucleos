@@ -184,6 +184,21 @@ where
     handles.insert(id, join.abort_handle());
 }
 
+/// A terminal-status UPDATE failing is not the same severity as a feed write failing: a feed
+/// insert is genuinely best-effort, but a lost terminal write leaves the run `running` behind a
+/// dead task — the exact jam class this crate guards against elsewhere, reached here through a DB
+/// error instead of a dropped future. `rows_affected() == 0` is a lost first-writer race (see the
+/// comments at each call site), a legal outcome rather than a failure, so only `Err` warns.
+pub(crate) fn warn_on_terminal_write_err(
+    result: &Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>,
+    run_id: i64,
+    target_status: &str,
+) {
+    if let Err(error) = result {
+        tracing::warn!(run_id, target_status, %error, "terminal-status update failed");
+    }
+}
+
 /// Deliberately wide rather than taking an options struct: these are the axes on which a run's
 /// lifecycle actually differs (plan-only, resumed, retried, worktree-bound), and naming each one at
 /// every call site is what makes those differences readable where the runs are created.
@@ -259,6 +274,7 @@ fn spawn_run(
                     .bind(id)
                     .execute(&pool)
                     .await;
+                    warn_on_terminal_write_err(&completed, id, "completed");
                     if completed.is_ok()
                         && let Some((kind, summary)) = completion_feed.as_ref()
                     {
@@ -293,7 +309,7 @@ fn spawn_run(
                             .await;
                         continue;
                     }
-                    let _ = sqlx::query(
+                    let failed = sqlx::query(
                         "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(e.to_string())
@@ -302,6 +318,7 @@ fn spawn_run(
                     .bind(id)
                     .execute(&pool)
                     .await;
+                    warn_on_terminal_write_err(&failed, id, "failed");
                     if max_attempts > 1 {
                         let _ = crate::feed::append(
                             &pool,
@@ -316,7 +333,7 @@ fn spawn_run(
                 }
                 Err(_elapsed) => {
                     // A timeout is not a launch failure — retrying would likely time out again.
-                    let _ = sqlx::query(
+                    let timed_out = sqlx::query(
                         "UPDATE runs SET status = 'timed_out', completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&completed_at)
@@ -324,6 +341,7 @@ fn spawn_run(
                     .bind(id)
                     .execute(&pool)
                     .await;
+                    warn_on_terminal_write_err(&timed_out, id, "timed_out");
                     break;
                 }
             }
@@ -386,13 +404,14 @@ pub async fn create_run_inner(
             Ok(info) => info,
             Err(error) => {
                 let completed_at = chrono::Utc::now().to_rfc3339();
-                let _ = sqlx::query(
+                let failed = sqlx::query(
                     "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(&completed_at)
                 .bind(id)
                 .execute(&state.pool)
                 .await;
+                warn_on_terminal_write_err(&failed, id, "failed");
                 let _ = crate::feed::append(
                     &state.pool,
                     project_id.as_deref(),
@@ -603,7 +622,7 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             let now = chrono::Utc::now().to_rfc3339();
             // First writer wins: no rows means the run finalised itself while this call was on its
             // way, which is an outcome, not a failure — nothing to retry and nothing to report.
-            let _ = sqlx::query(
+            let result = sqlx::query(
                 "UPDATE runs SET status = ?, completed_at = ? WHERE id = ? AND status = 'running'",
             )
             .bind(status)
@@ -611,6 +630,7 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             .bind(id)
             .execute(&state.pool)
             .await;
+            warn_on_terminal_write_err(&result, id, status);
             true
         }
         None => false,
