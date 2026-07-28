@@ -147,6 +147,32 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// One message in full, body included.
+    pub async fn get_email(&self, id: i64) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, &format!("/email/{id}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// What is in the mail organization folder. Reading only — there is deliberately no client
+    /// method here for creating or writing, so an agent cannot reach those even by mistake.
+    pub async fn list_mail_files(&self, path: &str) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::GET,
+            &format!("/mail-files?path={}", urlencoding_encode(path)),
+        )
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+    }
+
     pub async fn get_kill(&self) -> Result<Value, String> {
         self.request(reqwest::Method::GET, "/autopilot/kill")
             .send()
@@ -166,6 +192,23 @@ impl DaemonClient {
             .map_err(|e| e.to_string())?;
         json_or_null(response).await
     }
+}
+
+/// Percent-encodes a query value.
+///
+/// Written out rather than pulled in: a folder name carrying `&`, `#` or `..` would otherwise
+/// arrive as a different request than the one intended — and `..` reaching the daemon's path guard
+/// as a *separate parameter* rather than part of the path is exactly how a check gets skipped.
+fn urlencoding_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -215,6 +258,23 @@ async fn json_or_null(response: reqwest::Response) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder name reaches the daemon as a query value. Left raw, `&` would start a second
+    /// parameter and `..` would arrive somewhere the path guard never inspects — which is how a
+    /// check gets skipped rather than defeated.
+    #[test]
+    fn a_folder_name_cannot_rewrite_the_request_it_travels_in() {
+        assert_eq!(urlencoding_encode("BACMAT/2026"), "BACMAT%2F2026");
+        assert_eq!(urlencoding_encode(".."), "..");
+        assert_eq!(urlencoding_encode("../../etc"), "..%2F..%2Fetc");
+        assert_eq!(urlencoding_encode("a&path=b"), "a%26path%3Db");
+        assert_eq!(urlencoding_encode("com espaço"), "com%20espa%C3%A7o");
+        // Unreserved characters are left alone, or every path would be unreadable in a log.
+        assert_eq!(
+            urlencoding_encode("relatorio-2026_v1.docx"),
+            "relatorio-2026_v1.docx"
+        );
+    }
 
     #[test]
     fn active_project_resolves_to_worktree_mode() {
