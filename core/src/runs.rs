@@ -548,12 +548,15 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // `tool_input` rides along so the grant names the action the human actually read and approved,
+    // not merely the tool that would perform it (migration 0020).
     sqlx::query(
-        "INSERT INTO action_grants (run_id, tool_name, proposal_id, created_at, consumed_at)
-         VALUES (?, ?, ?, ?, NULL)",
+        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at)
+         VALUES (?, ?, ?, ?, ?, NULL)",
     )
     .bind(resume_id)
     .bind(&tool_name)
+    .bind(proposal.tool_input.as_deref())
     .bind(proposal_id)
     .bind(&now)
     .execute(&mut *tx)
