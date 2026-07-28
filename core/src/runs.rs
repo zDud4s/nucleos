@@ -275,7 +275,11 @@ fn spawn_run(
                     .execute(&pool)
                     .await;
                     warn_on_terminal_write_err(&completed, id, "completed");
-                    if completed.is_ok()
+                    // The feed row announces this run *finished* — only true if this write won the
+                    // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
+                    // there first, so this attempt never actually completed as far as the runs table
+                    // is concerned; appending anyway would announce a completion it denies.
+                    if matches!(&completed, Ok(result) if result.rows_affected() == 1)
                         && let Some((kind, summary)) = completion_feed.as_ref()
                     {
                         let _ = crate::feed::append(
@@ -319,7 +323,11 @@ fn spawn_run(
                     .execute(&pool)
                     .await;
                     warn_on_terminal_write_err(&failed, id, "failed");
-                    if max_attempts > 1 {
+                    // Same principle as the completion feed row above: this announces the run's
+                    // terminal outcome, so it must only fire when this write actually won the race.
+                    if max_attempts > 1
+                        && matches!(&failed, Ok(result) if result.rows_affected() == 1)
+                    {
                         let _ = crate::feed::append(
                             &pool,
                             feed_project_id.as_deref(),
@@ -1548,6 +1556,68 @@ mod tests {
             "a killed run must not report itself completed"
         );
         assert_eq!(exit_code, None);
+    }
+
+    /// Same race, on the feed side: a completion write that loses the CAS race must not still
+    /// announce a completion the runs table denies. Shadow mode is used because its completion
+    /// feed row is unconditional (`plan_only.then(...)`), unlike worktree mode's provisioning.
+    #[tokio::test]
+    async fn a_lost_completion_race_never_appends_its_completion_feed_row() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(1)), Duration::from_secs(600)).await;
+        let id = create_run_inner(&state, "a slow shadow one".into(), None, None, "shadow")
+            .await
+            .unwrap();
+
+        // Park the body inside the CLI call, same as the sibling test above.
+        for _ in 0..500 {
+            if *runner.calls.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            1,
+            "the run body should be inside the CLI call"
+        );
+
+        // A concurrent cancel wins the status write first.
+        sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // Wait for the body to wake up, lose the CAS race, and finish.
+        for _ in 0..500 {
+            if !state.run_handles.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&id),
+            "the run body never finished"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+
+        let feed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE run_id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            feed_count, 0,
+            "a lost completion race must not append the completion feed row"
+        );
     }
 
     #[tokio::test]
