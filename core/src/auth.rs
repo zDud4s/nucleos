@@ -5,6 +5,7 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
+use subtle::ConstantTimeEq;
 
 use crate::state::AppState;
 
@@ -29,8 +30,13 @@ pub async fn require_token(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    match header_value {
-        Some(v) if v == format!("Bearer {}", state.token.0) => Ok(next.run(req).await),
+    // Constant-time compare: `==` on the token short-circuits at the first differing
+    // byte, timing which leaks the secret's content one byte at a time. `ct_eq` only
+    // short-circuits on a length mismatch, and the length is not the secret.
+    match header_value.and_then(|v| v.strip_prefix("Bearer ")) {
+        Some(t) if bool::from(t.as_bytes().ct_eq(state.token.0.as_bytes())) => {
+            Ok(next.run(req).await)
+        }
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -104,6 +110,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_token_prefix() {
+        let app = protected_router(test_state("expected-token").await);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/secret")
+                    .header("Authorization", "Bearer expected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_scheme() {
+        for header in ["expected-token", "bearer expected-token", "Bearer"] {
+            let app = protected_router(test_state("expected-token").await);
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/secret")
+                        .header("Authorization", header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "header {header:?} should not authenticate"
+            );
+        }
     }
 
     #[tokio::test]
