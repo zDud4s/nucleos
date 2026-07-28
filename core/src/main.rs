@@ -33,6 +33,9 @@ use std::sync::Arc;
 
 const TOKEN_KEY: &str = "daemon-token";
 const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
+/// The mailbox password (spec §3.4). An app password, in Credential Manager rather than in
+/// `.ai/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
+const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 
 #[tokio::main]
 async fn main() {
@@ -62,6 +65,23 @@ async fn main() {
             },
             None => {
                 eprintln!("usage: nucleos-core --set-telegram-token <BOT_TOKEN>");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(pos) = std::env::args().position(|a| a == "--set-email-password") {
+        match std::env::args().nth(pos + 1) {
+            Some(value) => match secrets::store_secret(EMAIL_PASSWORD_KEY, &value) {
+                Ok(()) => println!("email password stored in Credential Manager"),
+                Err(e) => {
+                    eprintln!("failed to store email password: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("usage: nucleos-core --set-email-password <APP_PASSWORD>");
                 std::process::exit(1);
             }
         }
@@ -215,6 +235,10 @@ async fn main() {
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
 
+    // Spawned whether or not the pillar is enabled: the loop also owns retention, and bodies
+    // already stored do not stop needing to expire because polling was switched off.
+    tokio::spawn(triage::run_triage_loop(state.clone()));
+
     // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
     // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a
     // daemon that is not up yet produces `ask_daemon.py`'s fail-closed `block`, which looks like
@@ -232,6 +256,10 @@ async fn main() {
             .await
             {
                 Ok(()) => {
+                    state
+                        .email
+                        .armed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!("email triage barrier verified — the pillar is armed");
                 }
                 // Off rather than unprotected. The pillar's whole premise is that untrusted content
@@ -244,9 +272,32 @@ async fn main() {
                     return;
                 }
             }
-            // Only reached when the barrier is proven. The loop is its own task beside the
-            // scheduler, which is the precedent that takes `AppState`.
-            triage::run_triage_loop(state).await;
+            // Supervision needs all three: enabled, a password, and a PROVEN barrier. Any one
+            // missing leaves the sidecar unstarted and the mailbox untouched — the pillar is off
+            // rather than half-on.
+            match secrets::load_secret(EMAIL_PASSWORD_KEY) {
+                Ok(Some(password)) => {
+                    let path = std::env::current_exe()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("email-sidecar.exe");
+                    let env = sidecar::email_env(
+                        "http://127.0.0.1:8791",
+                        &state.token.0,
+                        &email_config,
+                        &password,
+                    );
+                    tokio::spawn(sidecar::supervise("email".to_string(), path, env));
+                    tracing::info!("email sidecar supervised");
+                }
+                Ok(None) => tracing::warn!(
+                    "no email-imap-password stored — the email sidecar will not start (set with --set-email-password)"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the email password from Credential Manager")
+                }
+            }
         });
     } else {
         tracing::info!("email pillar disabled (.ai/email.yaml: enabled: false)");

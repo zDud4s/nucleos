@@ -373,6 +373,8 @@ pub struct LoopState {
     paused_until: Option<chrono::DateTime<chrono::Utc>>,
     /// One `email_triage_stalled` per episode, not per tick.
     stall_announced: bool,
+    /// When retention last ran, so the prune keeps its own cadence inside the 60s tick.
+    last_prune: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Messages waiting with no batch holding them.
@@ -626,6 +628,7 @@ async fn apply_verdicts(
     batch: &[i64],
     verdicts: &[Verdict],
     retain_bodies_days: u8,
+    notify_classes: &[String],
     now: chrono::DateTime<chrono::Utc>,
 ) -> sqlx::Result<()> {
     let now_str = now.to_rfc3339();
@@ -667,6 +670,23 @@ async fn apply_verdicts(
             .bind(id)
             .execute(pool)
             .await?;
+    }
+
+    // The notification filter lives HERE, on the writing side, because the Telegram notifier
+    // forwards every new feed entry without looking at its kind: a feed row for a triaged email
+    // simply IS a notification. Writing one per message would deliver exactly the notification
+    // fatigue the rollout is designed to avoid.
+    for verdict in verdicts {
+        if notify_classes.iter().any(|class| class == &verdict.class) {
+            let _ = crate::feed::append(
+                pool,
+                None,
+                &format!("email_{}", verdict.class),
+                &verdict.summary,
+                None,
+            )
+            .await;
+        }
     }
 
     let answered: Vec<i64> = verdicts.iter().map(|v| v.id).collect();
@@ -926,6 +946,7 @@ async fn collect_run(
         batch,
         &verdicts,
         state.email.retain_bodies_days,
+        &state.email.notify_classes,
         now,
     )
     .await
@@ -942,13 +963,186 @@ async fn collect_run(
     );
 }
 
+/// How long the digest window stays open after its hour. The upper bound matters: without it a
+/// daemon starting at 22:00 with `digest_hour_utc = 7` would fire immediately, out of hours.
+pub const DIGEST_WINDOW_HOURS: u32 = 2;
+/// Subjects listed for `action` messages, so the digest stays a digest.
+pub const DIGEST_MAX_SUBJECTS: usize = 10;
+
+/// PURE: is `now` inside today's digest window?
+///
+/// `digest_hour_utc` is validated to `0..=21` precisely so this window cannot cross midnight: at
+/// 23, `[23, 25)` would land in the next UTC day with the "already sent today" guard freshly
+/// reset, and two digests would go out back to back.
+pub fn digest_window_open(now: chrono::DateTime<chrono::Utc>, digest_hour_utc: u8) -> bool {
+    use chrono::Timelike;
+    let hour = now.hour();
+    hour >= u32::from(digest_hour_utc) && hour < u32::from(digest_hour_utc) + DIGEST_WINDOW_HOURS
+}
+
+/// Writes the daily digest if it is due (spec §6.3).
+///
+/// No LLM: it aggregates summaries that were already computed, so it costs nothing and opens no new
+/// path from untrusted content into a prompt. The feed is its own record of having been sent, which
+/// is what makes "once a day" hold across a restart without a state table.
+///
+/// A day when the daemon was down through the window simply has no digest. That is the accepted
+/// trade: a summary of the day before yesterday is worth less than the code to produce it.
+async fn maybe_write_digest(
+    pool: &sqlx::SqlitePool,
+    digest_hour_utc: u8,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<bool> {
+    if !digest_window_open(now, digest_hour_utc) {
+        return Ok(false);
+    }
+    if announced_today(pool, "email_digest", now).await? {
+        return Ok(false);
+    }
+
+    let since = now - chrono::Duration::hours(24);
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT triage_class, subject, triaged_at FROM emails WHERE triage_class IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut action_subjects: Vec<String> = Vec::new();
+    for (class, subject, triaged_at) in rows {
+        // Parsed, never string-compared: `+00:00` and `Z` are the same instant.
+        let Some(triaged_at) = triaged_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        else {
+            continue;
+        };
+        if triaged_at.with_timezone(&chrono::Utc) < since {
+            continue;
+        }
+        *counts.entry(class.clone()).or_default() += 1;
+        if class == "action" && action_subjects.len() < DIGEST_MAX_SUBJECTS {
+            action_subjects.push(subject.unwrap_or_else(|| "(no subject)".to_string()));
+        }
+    }
+
+    if counts.is_empty() {
+        return Ok(false);
+    }
+
+    let tally = counts
+        .iter()
+        .map(|(class, count)| format!("{count} {class}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut summary = format!("email digest (last 24h): {tally}");
+    if !action_subjects.is_empty() {
+        summary.push_str("\nneeds action: ");
+        summary.push_str(&action_subjects.join("; "));
+    }
+    crate::feed::append(pool, None, "email_digest", &summary, None).await?;
+    Ok(true)
+}
+
+/// Content classes — the ones a body is no longer needed for. `failed` is deliberately absent: it
+/// is the one class the user may want to inspect or put back, and without its body it is
+/// unrecoverable.
+const CONTENT_CLASSES: &str = "('urgent','action','info','noise')";
+
+/// How often the prune runs while the daemon is up.
+pub const PRUNE_INTERVAL_HOURS: i64 = 6;
+/// Rows are removed entirely after this long, and `failed` rows are kept far longer because they
+/// are the ones a person may still act on.
+pub const ROW_RETENTION_DAYS: i64 = 30;
+pub const FAILED_ROW_RETENTION_DAYS: i64 = 90;
+
+/// Drops bodies that fell out of the retention window, then removes rows that fell out of theirs
+/// (spec §7.2). Returns (bodies dropped, rows removed).
+///
+/// `COALESCE(triaged_at, ingested_at)` is the whole point rather than a nicety: rows classified by
+/// the noise gate or the backfill cutoff never went through triage and have `triaged_at` NULL, so
+/// keying on `triaged_at` alone would keep their bodies forever — the exact opposite of what this
+/// exists for. Untriaged rows are never touched: they still have work to do.
+pub async fn prune(
+    pool: &sqlx::SqlitePool,
+    retain_bodies_days: u8,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<(u64, u64)> {
+    let body_cutoff = (now - chrono::Duration::days(i64::from(retain_bodies_days))).to_rfc3339();
+    let bodies = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE emails SET body_text = NULL
+          WHERE body_text IS NOT NULL
+            AND triage_class IN {CONTENT_CLASSES}
+            AND COALESCE(triaged_at, ingested_at) < ?"
+    )))
+    .bind(&body_cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let row_cutoff = (now - chrono::Duration::days(ROW_RETENTION_DAYS)).to_rfc3339();
+    let failed_cutoff = (now - chrono::Duration::days(FAILED_ROW_RETENTION_DAYS)).to_rfc3339();
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM emails
+          WHERE triage_class IS NOT NULL
+            AND ((triage_class IN {CONTENT_CLASSES} AND COALESCE(triaged_at, ingested_at) < ?)
+              OR (triage_class = 'failed' AND COALESCE(triaged_at, ingested_at) < ?))"
+    )))
+    .bind(&row_cutoff)
+    .bind(&failed_cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok((bodies, rows))
+}
+
 /// The loop itself. Its own task, beside the scheduler — `scheduler.rs` stays about project cron
 /// rules, and triage belongs to no project.
 pub async fn run_triage_loop(state: crate::state::AppState) {
     let mut loop_state = LoopState::default();
+
+    // Once at startup, and thereafter on its own clock: retention is about bounding how long
+    // untrusted content sits at rest, and a daemon that only ever runs for an hour at a time would
+    // otherwise never prune at all.
+    housekeeping(&state, &mut loop_state, chrono::Utc::now()).await;
+
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(TICK_SECONDS)).await;
-        triage_tick(&state, &mut loop_state, chrono::Utc::now()).await;
+        let now = chrono::Utc::now();
+        housekeeping(&state, &mut loop_state, now).await;
+        // The pillar can be off and still owe the housekeeping above: bodies already stored do not
+        // stop needing to expire because polling was switched off.
+        if state.email.enabled && state.email.armed.load(std::sync::atomic::Ordering::Relaxed) {
+            triage_tick(&state, &mut loop_state, now).await;
+        }
+    }
+}
+
+/// The digest and the prune: everything the loop owes whether or not triage itself is running.
+async fn housekeeping(
+    state: &crate::state::AppState,
+    loop_state: &mut LoopState,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    match maybe_write_digest(&state.pool, state.email.digest_hour_utc, now).await {
+        Ok(true) => tracing::info!("email digest written"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "email digest could not be written"),
+    }
+
+    let due = loop_state
+        .last_prune
+        .is_none_or(|last| now - last >= chrono::Duration::hours(PRUNE_INTERVAL_HOURS));
+    if due {
+        loop_state.last_prune = Some(now);
+        match prune(&state.pool, state.email.retain_bodies_days, now).await {
+            Ok((0, 0)) => {}
+            Ok((bodies, rows)) => {
+                tracing::info!(bodies, rows, "email retention: pruned")
+            }
+            Err(error) => tracing::warn!(%error, "email retention: prune failed"),
+        }
     }
 }
 
@@ -1476,6 +1670,265 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stalled, 1, "once per episode, not once per tick");
+    }
+
+    async fn state_notifying(classes: &[&str]) -> crate::state::AppState {
+        let mut state = triage_state().await;
+        state.email = std::sync::Arc::new(crate::state::EmailRuntime {
+            enabled: true,
+            notify_classes: classes.iter().map(|c| c.to_string()).collect(),
+            ..Default::default()
+        });
+        state
+    }
+
+    async fn feed_kinds(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT kind FROM feed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The Telegram notifier forwards every feed entry without looking at its kind, so a feed row
+    /// IS a notification and the filter has to live on the writing side.
+    #[tokio::test]
+    async fn only_the_notified_classes_reach_the_feed() {
+        let state = state_notifying(&["urgent"]).await;
+        let ids = seed_pending(&state.pool, 3, 1).await;
+        let stdout = transcript(serde_json::json!([
+            {"id": ids[0], "class": "urgent", "summary": "server down"},
+            {"id": ids[1], "class": "info", "summary": "newsletter"},
+            {"id": ids[2], "class": "noise", "summary": "spam"},
+        ]));
+        seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
+
+        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+
+        assert_eq!(feed_kinds(&state.pool).await, vec!["email_urgent"]);
+    }
+
+    /// The rollout's first week: nothing notifies, but the operational entries still must, or a
+    /// stalled pillar would be silent as well as idle.
+    #[tokio::test]
+    async fn an_empty_notify_list_silences_classes_but_not_operations() {
+        let state = state_notifying(&[]).await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let stdout = transcript(serde_json::json!([
+            {"id": ids[0], "class": "urgent", "summary": "server down"},
+        ]));
+        seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
+        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        assert!(feed_kinds(&state.pool).await.is_empty());
+
+        // An operational entry still gets through.
+        let more = seed_pending(&state.pool, 1, 1).await;
+        seed_finished_run(&state.pool, "failed", "", &more).await;
+        for _ in 0..QUARANTINE_THRESHOLD {
+            seed_finished_run(&state.pool, "failed", "", &more).await;
+            triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        }
+        assert!(
+            feed_kinds(&state.pool)
+                .await
+                .iter()
+                .any(|kind| kind == "email_triage_failed")
+        );
+    }
+
+    fn at_hour(hour: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(hour, 30, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    async fn seed_triaged(pool: &sqlx::SqlitePool, class: &str, subject: &str, hours_ago: i64) {
+        let seq = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let when = (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, triage_class, triage_summary, triaged_at)
+             VALUES (?, 'INBOX', 1, ?, 'ana@company.com', ?, ?, ?, ?, 'summary', ?)",
+        )
+        .bind(format!("<digest-{seq}@x>"))
+        .bind(seq)
+        .bind(subject)
+        .bind(&when)
+        .bind(&when)
+        .bind(class)
+        .bind(&when)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_digest_counts_the_last_day_and_lists_what_needs_action() {
+        let state = triage_state().await;
+        seed_triaged(&state.pool, "urgent", "incident", 2).await;
+        seed_triaged(&state.pool, "action", "sign this", 3).await;
+        seed_triaged(&state.pool, "info", "fyi", 4).await;
+        seed_triaged(&state.pool, "urgent", "yesterday's news", 30).await;
+
+        assert!(
+            maybe_write_digest(&state.pool, 7, at_hour(7))
+                .await
+                .unwrap(),
+            "the window is open and nothing has been sent today"
+        );
+
+        let summary: String =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'email_digest'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(summary.contains("1 urgent"), "{summary}");
+        assert!(summary.contains("1 action"), "{summary}");
+        assert!(summary.contains("1 info"), "{summary}");
+        assert!(summary.contains("sign this"), "{summary}");
+        assert!(!summary.contains("yesterday's news"), "{summary}");
+    }
+
+    /// With a 60s tick, "it is hour X" would emit about sixty digests. The feed is its own record
+    /// of having spoken, which also makes it correct after a restart.
+    #[tokio::test]
+    async fn a_second_digest_the_same_day_is_not_written() {
+        let state = triage_state().await;
+        seed_triaged(&state.pool, "urgent", "incident", 1).await;
+        assert!(
+            maybe_write_digest(&state.pool, 7, at_hour(7))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !maybe_write_digest(&state.pool, 7, at_hour(8))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The window's upper bound: a daemon starting at 22:00 must not fire the 07:00 digest.
+    #[tokio::test]
+    async fn no_digest_outside_the_window() {
+        let state = triage_state().await;
+        seed_triaged(&state.pool, "urgent", "incident", 1).await;
+        assert!(
+            !maybe_write_digest(&state.pool, 7, at_hour(22))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !maybe_write_digest(&state.pool, 7, at_hour(6))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !maybe_write_digest(&state.pool, 7, at_hour(9))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn the_digest_window_never_crosses_midnight() {
+        // 21 is the highest hour the config allows, precisely so `[21, 23)` stays inside the day.
+        assert!(digest_window_open(at_hour(21), 21));
+        assert!(digest_window_open(at_hour(22), 21));
+        assert!(!digest_window_open(at_hour(23), 21));
+    }
+
+    async fn body_of(pool: &sqlx::SqlitePool, message_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT body_text FROM emails WHERE message_id = ?")
+            .bind(message_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn seed_for_prune(
+        pool: &sqlx::SqlitePool,
+        message_id: &str,
+        class: &str,
+        triaged_at: Option<i64>,
+        ingested_days_ago: i64,
+    ) {
+        let ingested =
+            (chrono::Utc::now() - chrono::Duration::days(ingested_days_ago)).to_rfc3339();
+        let triaged =
+            triaged_at.map(|days| (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339());
+        let seq = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, body_text,
+                                 received_at, ingested_at, triage_class, triaged_at)
+             VALUES (?, 'INBOX', 1, ?, 'a@b', 'body', ?, ?, ?, ?)",
+        )
+        .bind(message_id)
+        .bind(seq)
+        .bind(&ingested)
+        .bind(&ingested)
+        .bind(class)
+        .bind(triaged)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The `COALESCE` is the whole point: a noise-gated row never went through triage and has
+    /// `triaged_at` NULL, so keying on that column alone would keep its body forever — the exact
+    /// opposite of what retention is for.
+    #[tokio::test]
+    async fn the_prune_reaches_rows_that_never_went_through_triage() {
+        let state = triage_state().await;
+        seed_for_prune(&state.pool, "<triaged@x>", "info", Some(20), 21).await;
+        seed_for_prune(&state.pool, "<gated@x>", "noise", None, 20).await;
+        seed_for_prune(&state.pool, "<recent@x>", "info", Some(1), 2).await;
+
+        let (bodies, _) = prune(&state.pool, 14, chrono::Utc::now()).await.unwrap();
+        assert_eq!(bodies, 2);
+        assert!(body_of(&state.pool, "<triaged@x>").await.is_none());
+        assert!(body_of(&state.pool, "<gated@x>").await.is_none());
+        assert!(body_of(&state.pool, "<recent@x>").await.is_some());
+    }
+
+    /// `failed` is the one class whose body must survive: it is what the user inspects or requeues,
+    /// and without it the row is unrecoverable.
+    #[tokio::test]
+    async fn a_failed_row_keeps_its_body_through_the_prune() {
+        let state = triage_state().await;
+        seed_for_prune(&state.pool, "<failed@x>", "failed", Some(40), 41).await;
+        prune(&state.pool, 14, chrono::Utc::now()).await.unwrap();
+        assert!(body_of(&state.pool, "<failed@x>").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn untriaged_rows_are_never_pruned() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 60 * 24 * 90).await;
+        let (bodies, rows) = prune(&state.pool, 0, chrono::Utc::now()).await.unwrap();
+        assert_eq!((bodies, rows), (0, 0), "a message still has work to do");
+        let survives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails WHERE id = ?")
+            .bind(ids[0])
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(survives, 1);
+    }
+
+    #[tokio::test]
+    async fn rows_are_removed_at_thirty_days_and_failed_ones_at_ninety() {
+        let state = triage_state().await;
+        seed_for_prune(&state.pool, "<old@x>", "info", Some(31), 31).await;
+        seed_for_prune(&state.pool, "<oldfailed@x>", "failed", Some(31), 31).await;
+        seed_for_prune(&state.pool, "<ancientfailed@x>", "failed", Some(91), 91).await;
+
+        let (_, rows) = prune(&state.pool, 14, chrono::Utc::now()).await.unwrap();
+        assert_eq!(rows, 2);
+        let left: Vec<String> = sqlx::query_scalar("SELECT message_id FROM emails")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["<oldfailed@x>"]);
     }
 
     /// The prompt is the one place a mail body reaches a model, so its framing is asserted rather

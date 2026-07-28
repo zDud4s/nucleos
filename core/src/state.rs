@@ -18,7 +18,7 @@ pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 /// Grouped into one struct rather than spread across `AppState` because they are read together and
 /// change together: spec §3.4 makes this config startup-time on purpose, so editing `.ai/email.yaml`
 /// means restarting the daemon, never recompiling it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EmailRuntime {
     /// False keeps every part of the pillar dormant — no polling, no triage, no digest.
     pub enabled: bool,
@@ -28,6 +28,14 @@ pub struct EmailRuntime {
     pub retain_bodies_days: u8,
     /// The directory a triage run works in, so it never inherits the daemon's (spec §5.5).
     pub sandbox: std::path::PathBuf,
+    /// Set once the hook barrier has been PROVEN at startup, and read by the triage loop before
+    /// every batch.
+    ///
+    /// `enabled` alone is not enough to authorise reading mail into a prompt: the pillar's premise
+    /// is that untrusted content never meets a tool, and an unverified barrier is not a barrier. The
+    /// loop itself runs regardless, because it also owns retention — bodies already stored do not
+    /// stop needing to expire because the barrier failed.
+    pub armed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for EmailRuntime {
@@ -40,6 +48,7 @@ impl Default for EmailRuntime {
             digest_hour_utc: 7,
             retain_bodies_days: 14,
             sandbox: std::path::PathBuf::new(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -52,6 +61,7 @@ impl EmailRuntime {
             digest_hour_utc: config.digest_hour_utc,
             retain_bodies_days: config.retain_bodies_days,
             sandbox,
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
