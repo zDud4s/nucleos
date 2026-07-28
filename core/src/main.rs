@@ -12,6 +12,7 @@ mod hooks;
 mod http;
 mod inspect;
 mod logging;
+mod mailfiles;
 mod mcp_tools;
 mod proposals;
 mod repo_trigger;
@@ -182,6 +183,18 @@ async fn main() {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
 
+    // The folder a person arranges their mail into. Created whether or not the pillar is enabled,
+    // for the same reason as the sandbox: a directory that always exists is one less thing to go
+    // wrong the day email is switched on. An empty path means every route under it refuses, which
+    // is the right answer when the directory could not be made.
+    let mail_files_root = match mailfiles::ensure_root(dirs.data_local_dir()) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(%error, "could not create the mail folder — organising mail will be unavailable");
+            std::path::PathBuf::new()
+        }
+    };
+
     let state = AppState {
         token: Token(token_value),
         pool,
@@ -191,6 +204,7 @@ async fn main() {
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
+            mail_files_root,
         )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_timeout: state::DEFAULT_RUN_TIMEOUT,

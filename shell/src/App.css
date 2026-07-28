@@ -140,10 +140,32 @@
   color: var(--muted);
   font-size: var(--fs-sm);
 }
-.mail-files { list-style: none; margin-top: var(--sp-3); display: grid; gap: 4px; }
+.mail-files { list-style: none; margin-top: var(--sp-3); display: grid; gap: 6px; }
 .mail-files li { display: flex; gap: var(--sp-3); align-items: baseline; font-size: var(--fs-sm); }
 .mf-name { color: var(--text); }
-.mf-meta { color: var(--faint); font-size: var(--fs-xs, 0.75rem); }
+/* Pushes the buttons to the right so the names stay in one readable column. */
+.mf-meta { color: var(--faint); font-size: var(--fs-xs, 0.75rem); margin-right: auto; }
+
+.mf-folder {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+.mf-root { color: var(--faint); font-family: var(--mono); }
+.mf-folder input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 0;
+  color: var(--text);
+  font: inherit;
+}
+.mf-folder input:focus { outline: none; border-bottom-color: var(--gold-line); }
 
 .flat + .flat,
 .stack > * + * { margin-top: var(--sp-4); }

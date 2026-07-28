@@ -453,6 +453,66 @@ export async function fetchAttachment(
   }
 }
 
+/** One entry in the mail folder. */
+export interface MailFile {
+  name: string;
+  is_dir: boolean;
+  /** Zero for a folder — its size is a different question, answered by walking it. */
+  size_bytes: number;
+  modified: string | null;
+}
+
+/** What is in a folder under the mail root. `path` empty means the root itself. */
+export async function listMailFiles(token: string, path = ""): Promise<MailFile[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/mail-files?path=${encodeURIComponent(path)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as MailFile[];
+  } catch {
+    return null;
+  }
+}
+
+export async function createMailFolder(token: string, path: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/mail-files/folder`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Files an attachment into the mail folder.
+ *
+ * Returns the name it was ACTUALLY stored under, which can differ from the sender's twice over:
+ * once because the name was made safe, once because it collided with something already there.
+ */
+export async function saveAttachment(
+  token: string,
+  emailId: number,
+  position: number,
+  folder: string,
+): Promise<string | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/${emailId}/attachments/${position}/save`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ folder }),
+    });
+    if (!res.ok) return null;
+    return ((await res.json()) as { filename: string }).filename;
+  } catch {
+    return null;
+  }
+}
+
 /** One message with its body — read when a message is opened, never to draw the list. */
 export async function getEmail(token: string, id: number): Promise<EmailDetail | null> {
   try {

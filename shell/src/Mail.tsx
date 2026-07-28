@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  fetchAttachment, getEmail, getEmailQueue, triageEmail,
+  fetchAttachment, getEmail, getEmailQueue, listMailFiles, saveAttachment, triageEmail,
   type ConnectionState, type EmailAttachment, type EmailDetail, type QueuedEmail,
 } from "./api";
 import { formatBytes, mailLabel, mailTone, relativeTime, safeDownloadName } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
 
-interface OpenMessageProps { token: string; detail: EmailDetail | null; loading: boolean; }
+interface OpenMessageProps {
+  token: string;
+  detail: EmailDetail | null;
+  loading: boolean;
+  /** Folders that already exist at the root, offered as suggestions rather than as the only choices. */
+  folders: string[];
+  onFiled: () => void;
+}
 /**
  * An opened message: its text, and what came with it.
  *
@@ -14,9 +21,12 @@ interface OpenMessageProps { token: string; detail: EmailDetail | null; loading:
  * someone outside this machine, and the sidecar already reduced any HTML to plain text — putting it
  * back into the DOM as HTML would undo that and hand a stranger a script tag and a tracking pixel.
  */
-function OpenMessage({ token, detail, loading }: OpenMessageProps) {
+function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessageProps) {
   const [saving, setSaving] = useState<number | null>(null);
+  const [filing, setFiling] = useState<number | null>(null);
+  const [folder, setFolder] = useState("");
   const [failed, setFailed] = useState<string | null>(null);
+  const [filed, setFiled] = useState<string | null>(null);
 
   if (loading) return <p className="a-note">A abrir…</p>;
   if (detail === null) return <ErrorNote>Could not open this message.</ErrorNote>;
@@ -42,6 +52,25 @@ function OpenMessage({ token, detail, loading }: OpenMessageProps) {
     URL.revokeObjectURL(url);
   }
 
+  // Filing writes into the mail folder, which is the one place a stranger's bytes land on this
+  // disk — and it happens because someone typed a folder and pressed a button.
+  async function file(attachment: EmailAttachment) {
+    if (detail === null) return;
+    setFiling(attachment.position);
+    setFailed(null);
+    setFiled(null);
+    const stored = await saveAttachment(token, detail.id, attachment.position, folder);
+    setFiling(null);
+    if (stored === null) {
+      setFailed("Could not file this one. Check the folder name.");
+      return;
+    }
+    // Reporting the stored name rather than the sender's, because they differ whenever the name
+    // had to be made safe or collided with something already there.
+    setFiled(`${stored} → ${folder === "" ? "mail/" : `mail/${folder}/`}`);
+    onFiled();
+  }
+
   return (
     <div className="mail-open">
       {detail.body_text === null
@@ -51,24 +80,48 @@ function OpenMessage({ token, detail, loading }: OpenMessageProps) {
           </Teach>
         : <pre className="mail-body">{detail.body_text}</pre>}
       {detail.attachments.length > 0 && (
-        <ul className="mail-files">
-          {detail.attachments.map((file) => (
-            <li key={file.position}>
-              <span className="mf-name">{file.filename ?? "(sem nome)"}</span>
-              <span className="mf-meta">
-                {file.mime_type ?? "tipo desconhecido"} · {formatBytes(file.size_bytes)}
-              </span>
-              <Button
-                size="sm"
-                disabled={saving !== null}
-                onClick={() => void save(file)}
-              >
-                {saving === file.position ? "A obter…" : "Guardar"}
-              </Button>
-            </li>
-          ))}
-        </ul>
+        <>
+          <label className="mf-folder">
+            Arquivar em <span className="mf-root">mail/</span>
+            <input
+              type="text"
+              list="mail-folders"
+              value={folder}
+              placeholder="(raiz)"
+              onChange={(event) => setFolder(event.target.value)}
+            />
+            <datalist id="mail-folders">
+              {folders.map((name) => <option key={name} value={name} />)}
+            </datalist>
+          </label>
+          <ul className="mail-files">
+            {detail.attachments.map((attachment) => (
+              <li key={attachment.position}>
+                <span className="mf-name">{attachment.filename ?? "(sem nome)"}</span>
+                <span className="mf-meta">
+                  {attachment.mime_type ?? "tipo desconhecido"} ·{" "}
+                  {formatBytes(attachment.size_bytes)}
+                </span>
+                <Button
+                  size="sm"
+                  disabled={saving !== null || filing !== null}
+                  onClick={() => void save(attachment)}
+                >
+                  {saving === attachment.position ? "A obter…" : "Descarregar"}
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={saving !== null || filing !== null}
+                  onClick={() => void file(attachment)}
+                >
+                  {filing === attachment.position ? "A arquivar…" : "Arquivar"}
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
+      {filed !== null && <p className="gate-note">Arquivado como {filed}</p>}
       {failed !== null && <ErrorNote>{failed}</ErrorNote>}
     </div>
   );
@@ -100,6 +153,15 @@ function Mail({ token, connection }: MailProps) {
   const [detail, setDetail] = useState<EmailDetail | null>(null);
   const [opening, setOpening] = useState(false);
   const openRequest = useRef<number | null>(null);
+  const [folders, setFolders] = useState<string[]>([]);
+
+  // Only the top level, and only as suggestions in the folder box. A full browser is a different
+  // screen; what this needs is to stop someone retyping "BACMAT" every time.
+  const loadFolders = useCallback(async () => {
+    if (token === null) return;
+    const entries = await listMailFiles(token);
+    setFolders((entries ?? []).filter((entry) => entry.is_dir).map((entry) => entry.name));
+  }, [token]);
 
   const refresh = useCallback(
     async (background = false) => {
@@ -119,7 +181,8 @@ function Mail({ token, connection }: MailProps) {
       return;
     }
     void refresh();
-  }, [refresh, unavailable]);
+    void loadFolders();
+  }, [loadFolders, refresh, unavailable]);
 
   // The same silent 3s cadence as the rest of the shell: a background refresh keeps the previous
   // rows on screen until fresh ones land, so a list you are reading never blinks.
@@ -244,7 +307,13 @@ function Mail({ token, connection }: MailProps) {
                     )}
                   </button>
                   {openId === mail.id && token !== null && (
-                    <OpenMessage token={token} detail={detail} loading={opening} />
+                    <OpenMessage
+                      token={token}
+                      detail={detail}
+                      loading={opening}
+                      folders={folders}
+                      onFiled={() => void loadFolders()}
+                    />
                   )}
                 </article>
               ))}

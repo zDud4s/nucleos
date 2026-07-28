@@ -28,6 +28,9 @@ pub struct EmailRuntime {
     pub retain_bodies_days: u8,
     /// The directory a triage run works in, so it never inherits the daemon's (spec §5.5).
     pub sandbox: std::path::PathBuf,
+    /// The mail organization folder, canonicalised once so every containment check compares
+    /// against a path the filesystem has already resolved.
+    pub files_root: std::path::PathBuf,
     /// Set once the hook barrier has been PROVEN at startup, and read by the triage loop before
     /// every batch.
     ///
@@ -48,19 +51,25 @@ impl Default for EmailRuntime {
             digest_hour_utc: 7,
             retain_bodies_days: 14,
             sandbox: std::path::PathBuf::new(),
+            files_root: std::path::PathBuf::new(),
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
 
 impl EmailRuntime {
-    pub fn from_config(config: &crate::config::EmailConfig, sandbox: std::path::PathBuf) -> Self {
+    pub fn from_config(
+        config: &crate::config::EmailConfig,
+        sandbox: std::path::PathBuf,
+        files_root: std::path::PathBuf,
+    ) -> Self {
         Self {
             enabled: config.enabled,
             notify_classes: config.notify_classes.clone(),
             digest_hour_utc: config.digest_hour_utc,
             retain_bodies_days: config.retain_bodies_days,
             sandbox,
+            files_root,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }

@@ -76,7 +76,13 @@ pub fn build_router(state: AppState) -> Router {
             "/email/{id}/attachments/{position}",
             get(get_email_attachment),
         )
+        .route(
+            "/email/{id}/attachments/{position}/save",
+            post(post_email_attachment_save),
+        )
         .route("/email/{id}/requeue", post(post_email_requeue))
+        .route("/mail-files", get(get_mail_files))
+        .route("/mail-files/folder", post(post_mail_folder))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -429,6 +435,33 @@ async fn get_email_attachment(
     State(state): State<AppState>,
     Path((id, position)): Path<(i64, i64)>,
 ) -> Result<axum::response::Response, StatusCode> {
+    let (bytes, filename) = fetch_attachment(&state, id, position).await?;
+
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                content_disposition(&filename),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Asks the sidecar for one attachment's bytes, and reports the name it was described under.
+///
+/// Shared by the route that hands a file to a person and the one that files it into a folder,
+/// because those must never diverge on WHICH file they mean.
+async fn fetch_attachment(
+    state: &AppState,
+    id: i64,
+    position: i64,
+) -> Result<(Vec<u8>, String), StatusCode> {
     let row: Option<(i64, Option<String>)> = sqlx::query_as(
         "SELECT emails.uid, email_attachments.filename
            FROM email_attachments
@@ -473,20 +506,104 @@ async fn get_email_attachment(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    Ok((
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/octet-stream".to_string(),
-            ),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                content_disposition(filename.as_deref().unwrap_or("")),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    Ok((bytes.to_vec(), filename.unwrap_or_default()))
+}
+
+/// Turns a folder refusal into a status. `Escapes` and `Unsafe` are both 400: the request named
+/// something it may not name, and which of the two rules caught it is not the caller's business —
+/// a distinction here would be a probe for how the guard is built.
+fn folder_status(error: crate::mailfiles::PathError) -> StatusCode {
+    use crate::mailfiles::PathError;
+    match error {
+        PathError::Escapes | PathError::Unsafe => StatusCode::BAD_REQUEST,
+        PathError::NotFound => StatusCode::NOT_FOUND,
+        PathError::NotADirectory => StatusCode::CONFLICT,
+        PathError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The folder root, or a refusal when startup could not create it.
+fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
+    if state.email.files_root.as_os_str().is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(&state.email.files_root)
+}
+
+#[derive(Deserialize)]
+struct FolderQuery {
+    /// Relative to the root. Absent means the root itself.
+    #[serde(default)]
+    path: String,
+}
+
+async fn get_mail_files(
+    State(state): State<AppState>,
+    Query(query): Query<FolderQuery>,
+) -> Result<Json<Vec<crate::mailfiles::Entry>>, StatusCode> {
+    let root = files_root(&state)?;
+    crate::mailfiles::list(root, &query.path)
+        .map(Json)
+        .map_err(folder_status)
+}
+
+#[derive(Deserialize)]
+struct CreateFolderRequest {
+    path: String,
+}
+
+async fn post_mail_folder(
+    State(state): State<AppState>,
+    Json(body): Json<CreateFolderRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let root = files_root(&state)?;
+    crate::mailfiles::create_folder(root, &body.path)
+        .map(|()| StatusCode::CREATED)
+        .map_err(folder_status)
+}
+
+#[derive(Deserialize)]
+struct SaveAttachmentRequest {
+    /// Which folder under the root. Empty means the root itself.
+    #[serde(default)]
+    folder: String,
+}
+
+#[derive(serde::Serialize)]
+struct SavedAttachment {
+    /// The name it was ACTUALLY stored under, which can differ from the sender's twice over: once
+    /// because the name was made safe, once because it collided.
+    filename: String,
+    folder: String,
+}
+
+/// Fetches an attachment and files it into the folder — the one path where a stranger's bytes are
+/// written to this disk, and it happens because a person asked for it by name.
+async fn post_email_attachment_save(
+    State(state): State<AppState>,
+    Path((id, position)): Path<(i64, i64)>,
+    Json(body): Json<SaveAttachmentRequest>,
+) -> Result<Json<SavedAttachment>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let (bytes, filename) = fetch_attachment(&state, id, position).await?;
+
+    // Blocking file I/O off the async runtime, and uncancellable: a client that disconnects
+    // mid-write must not leave half a file behind under a name that says it is whole.
+    let saved = uncancellable(async move {
+        tokio::task::spawn_blocking(move || {
+            crate::mailfiles::write_file(&root, &body.folder, &filename, &bytes).map(|stored| {
+                SavedAttachment {
+                    filename: stored,
+                    folder: body.folder,
+                }
+            })
+        })
+        .await
+    })
+    .await?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    saved.map(Json).map_err(folder_status)
 }
 
 /// The mail the pillar knows about: what is waiting, and what it most recently said.
@@ -1228,6 +1345,122 @@ mod tests {
             queue[1]["triage_class"].is_null(),
             "the hour-old message should still be waiting, and still second"
         );
+    }
+
+    fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
+        let mut email = (*state.email).clone();
+        email.files_root = root;
+        AppState {
+            email: std::sync::Arc::new(email),
+            ..state
+        }
+    }
+
+    async fn call(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token");
+        let body = match body {
+            Some(value) => {
+                request = request.header("Content-Type", "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = build_router(state)
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// A root that startup could not create means the routes refuse, rather than quietly writing
+    /// somewhere else on disk.
+    #[tokio::test]
+    async fn the_folder_routes_refuse_when_there_is_no_root() {
+        let state = test_state().await;
+        assert_eq!(
+            call(state, "GET", "/mail-files", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_can_be_created_and_listed_over_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::mailfiles::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root);
+
+        assert_eq!(
+            call(
+                state.clone(),
+                "POST",
+                "/mail-files/folder",
+                Some(serde_json::json!({"path": "BACMAT/2026"}))
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+
+        let (status, entries) = call(state, "GET", "/mail-files", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(entries[0]["name"], "BACMAT");
+        assert_eq!(entries[0]["is_dir"], true);
+    }
+
+    /// The one guard this whole surface rests on, checked through the routes rather than only in
+    /// the module — a handler that forgets to call it is exactly the mistake worth catching.
+    #[tokio::test]
+    async fn a_path_that_leaves_the_root_is_refused_by_every_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::mailfiles::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root);
+
+        for escape in ["..", "../outside", "/etc", "C:\\Windows"] {
+            let listed = call(
+                state.clone(),
+                "GET",
+                &format!("/mail-files?path={}", urlencode(escape)),
+                None,
+            )
+            .await;
+            assert_eq!(listed.0, StatusCode::BAD_REQUEST, "listed {escape:?}");
+
+            let created = call(
+                state.clone(),
+                "POST",
+                "/mail-files/folder",
+                Some(serde_json::json!({ "path": escape })),
+            )
+            .await;
+            assert_eq!(created.0, StatusCode::BAD_REQUEST, "created {escape:?}");
+        }
+    }
+
+    fn urlencode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                other => format!("%{other:02X}"),
+            })
+            .collect()
     }
 
     async fn get_email_detail(state: AppState, id: i64) -> (StatusCode, serde_json::Value) {
