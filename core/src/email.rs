@@ -269,8 +269,12 @@ pub fn is_backfill_message(received_at: &str, now: chrono::DateTime<chrono::Utc>
     }
 }
 
-/// PURE: the identifier a message is stored under. A message with no `Message-ID` is legal, so it
-/// gets one built from the only pair that identifies it on this server (§4.1).
+/// PURE: what gets recorded as a message's `Message-ID`. A message with no `Message-ID` is legal,
+/// so it gets a synthetic one rather than a NULL.
+///
+/// Not the dedupe key, despite the name — that is `(mailbox, uidvalidity, uid)` since migration
+/// 0024, because a header the sender writes is a claim and not an identity. This value is kept for
+/// the record and for threading; nothing decides whether a message already exists by reading it.
 pub fn message_key(message_id: Option<&str>, uidvalidity: i64, uid: i64) -> String {
     match message_id.map(str::trim).filter(|id| !id.is_empty()) {
         Some(id) => id.to_string(),
@@ -361,8 +365,8 @@ pub async fn ingest_batch(
         let key = message_key(message.message_id.as_deref(), uidvalidity, message.uid);
 
         // The class is decided BEFORE the insert rather than patched in afterwards. A second
-        // UPDATE keyed on message_id would also reach a redelivered row that an in-flight batch had
-        // already claimed, and race that run's verdict (§4.2).
+        // UPDATE keyed on the same row would also reach a redelivered message that an in-flight
+        // batch had already claimed, and race that run's verdict (§4.2).
         let entry = if let Some(reason) = classify_noise(&message.headers, &message.from_addr) {
             EntryClass {
                 triage_class: Some("noise"),
@@ -692,15 +696,161 @@ mod tests {
         assert_eq!(row.get::<i64, _>("has_attachments"), 0);
     }
 
+    async fn insert_email(
+        pool: &sqlx::SqlitePool,
+        message_id: &str,
+        mailbox: &str,
+        uidvalidity: i64,
+        uid: i64,
+    ) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr,
+                                 received_at, ingested_at)
+             VALUES (?, ?, ?, ?, 'a@b', '2026-07-28T10:00:00+00:00', '2026-07-28T10:00:00+00:00')",
+        )
+        .bind(message_id)
+        .bind(mailbox)
+        .bind(uidvalidity)
+        .bind(uid)
+        .execute(pool)
+        .await
+    }
+
+    /// `Message-ID` is a header the sender composes, so it was an identity anyone could claim. Two
+    /// messages carrying the same one used to collapse into one row, and the one that lost was
+    /// whichever the mailbox delivered second — a way to suppress someone else's mail that costs a
+    /// forged header. Mailing-list resends and forwards do it without meaning to.
     #[tokio::test]
-    async fn a_message_id_can_only_be_stored_once() {
+    async fn two_messages_claiming_the_same_message_id_are_both_stored() {
         let pool = test_pool().await;
-        let insert = "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr,
-                                          received_at, ingested_at)
-                      VALUES ('<dup@x>', 'INBOX', 1, 2, 'a@b', '2026-07-28T10:00:00+00:00',
-                              '2026-07-28T10:00:00+00:00')";
-        sqlx::query(insert).execute(&pool).await.unwrap();
-        assert!(sqlx::query(insert).execute(&pool).await.is_err());
+        insert_email(&pool, "<dup@x>", "INBOX", 1, 2).await.unwrap();
+        insert_email(&pool, "<dup@x>", "INBOX", 1, 3).await.unwrap();
+
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 2);
+    }
+
+    /// What the dedupe is actually for: the same message arriving twice, which is what a redelivery
+    /// after a dropped connection looks like. The server's own UID is the thing that says so.
+    #[tokio::test]
+    async fn the_same_message_on_the_server_can_only_be_stored_once() {
+        let pool = test_pool().await;
+        insert_email(&pool, "<a@x>", "INBOX", 1, 2).await.unwrap();
+        // A different Message-ID does not make it a different message.
+        assert!(insert_email(&pool, "<b@x>", "INBOX", 1, 2).await.is_err());
+    }
+
+    /// The other two thirds of the key. A UID means nothing on its own: mailboxes number
+    /// independently, and `uidvalidity` changing is the server saying the numbering restarted.
+    #[tokio::test]
+    async fn a_uid_only_identifies_a_message_within_its_mailbox_and_uidvalidity() {
+        let pool = test_pool().await;
+        insert_email(&pool, "<a@x>", "INBOX", 1, 2).await.unwrap();
+        insert_email(&pool, "<b@x>", "Archive", 1, 2)
+            .await
+            .expect("the same uid in another mailbox is another message");
+        insert_email(&pool, "<c@x>", "INBOX", 2, 2)
+            .await
+            .expect("a uidvalidity reset renumbers from scratch");
+    }
+
+    /// Migration 0024 rebuilds two tables to drop a UNIQUE, which SQLite cannot do in place. A fresh
+    /// database never exercises that — `migrate!()` runs it against empty tables — so the data path
+    /// is tested here, against the schema as it stood at 0023 and with foreign keys ON, which is
+    /// what makes `DROP TABLE emails` dangerous: the implicit DELETE fires the attachments' cascade.
+    #[tokio::test]
+    async fn the_rebuild_keeps_the_mail_and_its_attachments() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0019_email.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0021_email_attachments.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Two rows the OLD key allowed and the new one does not: one message stored twice under two
+        // Message-IDs. The earlier row wins, and its attachment has to come through with it.
+        insert_email(&pool, "<first@x>", "INBOX", 1, 7)
+            .await
+            .unwrap();
+        insert_email(&pool, "<second@x>", "INBOX", 1, 7)
+            .await
+            .unwrap();
+        insert_email(&pool, "<other@x>", "INBOX", 1, 8)
+            .await
+            .unwrap();
+        for email_id in [1, 2, 3] {
+            sqlx::query(
+                "INSERT INTO email_attachments (email_id, position, filename, mime_type, size_bytes)
+                 VALUES (?, 0, 'r.pdf', 'application/pdf', 10)",
+            )
+            .bind(email_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::raw_sql(include_str!("../migrations/0024_email_server_key.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let surviving: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, message_id FROM emails ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            surviving,
+            vec![(1, "<first@x>".to_owned()), (3, "<other@x>".to_owned())],
+            "the earlier of the two rows sharing a server identity is the one kept"
+        );
+
+        // The cascade must not have taken these with it, and the orphan of the dropped row must not
+        // have survived either.
+        let attachments: Vec<i64> =
+            sqlx::query_scalar("SELECT email_id FROM email_attachments ORDER BY email_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attachments, vec![1, 3]);
+
+        // And the constraint that was the point of the rebuild.
+        assert!(
+            insert_email(&pool, "<third@x>", "INBOX", 1, 8)
+                .await
+                .is_err()
+        );
+        insert_email(&pool, "<first@x>", "INBOX", 1, 9)
+            .await
+            .expect("a repeated Message-ID is no longer a collision");
+
+        // The foreign key survived the rename, rather than being left pointing at `emails_new`.
+        assert!(
+            sqlx::query(
+                "INSERT INTO email_attachments (email_id, position, size_bytes)
+                 VALUES (9999, 0, 1)"
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "email_attachments must still reference emails"
+        );
     }
 
     fn headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
