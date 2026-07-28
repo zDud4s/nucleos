@@ -112,6 +112,15 @@ func (c *Client) GetCursor(mailbox string) (*Cursor, error) {
 
 // Deliver hands one batch to the núcleo, which stores it and moves the cursor in one transaction.
 func (c *Client) Deliver(batch Batch) (IngestResult, error) {
+	// A nil slice marshals to `null`, and a field this side declares as a list must arrive as one.
+	// The núcleo tolerates `null` too, but sending it was the bug: an inbox with nothing skipped —
+	// the ordinary case — produced a batch the daemon rejected, and it replayed every poll.
+	if batch.Skipped == nil {
+		batch.Skipped = []Skipped{}
+	}
+	if batch.Messages == nil {
+		batch.Messages = []Message{}
+	}
 	payload, err := json.Marshal(batch)
 	if err != nil {
 		return IngestResult{}, err

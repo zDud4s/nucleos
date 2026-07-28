@@ -182,6 +182,21 @@ struct MailboxQuery {
     mailbox: String,
 }
 
+/// Reads an absent list, a `null` list and an empty list as the same thing: nothing.
+///
+/// `#[serde(default)]` alone covers only the ABSENT case, and Go's `encoding/json` writes a nil
+/// slice as `null` rather than omitting it. That gap ate a real inbox: the sidecar read the mail,
+/// the núcleo answered 422, and the batch replayed into the same wall every five minutes. It
+/// survived the tests because the fixtures omitted the field, which is a shape the sidecar never
+/// sends. There is no message these three encodings could carry that differs.
+fn absent_or_null_is_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// The sidecar's delivery envelope (spec §4.3).
 #[derive(Deserialize)]
 struct EmailIncomingRequest {
@@ -190,9 +205,9 @@ struct EmailIncomingRequest {
     /// The highest uid the sidecar LOOKED AT, which is what lets the cursor move past a message it
     /// could not read. Not the same as the highest uid delivered.
     max_uid_examined: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "absent_or_null_is_empty")]
     skipped: Vec<crate::email::SkippedMessage>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "absent_or_null_is_empty")]
     messages: Vec<crate::email::IncomingMessage>,
 }
 
@@ -852,6 +867,50 @@ mod tests {
             )
             .await,
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// The shape the sidecar actually sends, not the one the fixtures invented. Go writes an empty
+    /// `[]Skipped` as `null`, and the first real inbox met a 422 that every earlier test had
+    /// missed because `email_batch` omits the field entirely — a nil slice and an absent key look
+    /// alike in Rust and are different bytes on the wire.
+    #[tokio::test]
+    async fn a_batch_with_null_lists_is_accepted() {
+        let state = test_state().await;
+        let body = Body::from(
+            serde_json::json!({
+                "mailbox": "INBOX",
+                "uidvalidity": 1,
+                "max_uid_examined": 10,
+                "skipped": serde_json::Value::Null,
+                "messages": one_message(),
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            post_email(state, Some("test-token"), body).await,
+            StatusCode::OK
+        );
+    }
+
+    /// A poll that read nothing but examined uids still has to land, or the cursor never moves past
+    /// mail the sidecar decided about.
+    #[tokio::test]
+    async fn a_batch_with_no_messages_at_all_is_accepted() {
+        let state = test_state().await;
+        let body = Body::from(
+            serde_json::json!({
+                "mailbox": "INBOX",
+                "uidvalidity": 1,
+                "max_uid_examined": 10,
+                "skipped": serde_json::Value::Null,
+                "messages": serde_json::Value::Null,
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            post_email(state, Some("test-token"), body).await,
+            StatusCode::OK
         );
     }
 

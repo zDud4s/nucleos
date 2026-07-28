@@ -72,6 +72,14 @@ func Collect(fetcher Fetcher, uids []imapv2.UID, limit int) (
 	return messages, skipped, maxExamined
 }
 
+// lastSeen reports the stored position for logging, with 0 standing for "no cursor yet".
+func lastSeen(cursor *daemon.Cursor) uint32 {
+	if cursor == nil {
+		return 0
+	}
+	return cursor.LastUID
+}
+
 // Once performs a single poll: connect, read what is new, deliver it.
 func Once(cfg config.Config, client *daemon.Client) error {
 	cursor, err := client.GetCursor(cfg.Mailbox)
@@ -101,8 +109,13 @@ func Once(cfg config.Config, client *daemon.Client) error {
 		return err
 	}
 	if len(uids) == 0 {
+		// Said out loud, every time. A poll that finds nothing used to be silent, which made
+		// silence mean both "connected, nothing new" and "never connected at all" — and those are
+		// the two things a person setting this up most needs to tell apart.
+		log.Printf("email: %s has nothing new above uid %d", cfg.Mailbox, lastSeen(cursor))
 		return nil
 	}
+	log.Printf("email: %s has %d message(s) to read", cfg.Mailbox, len(uids))
 
 	messages, skipped, maxExamined := Collect(conn, uids, MaxPerBatch)
 	if maxExamined == 0 {
