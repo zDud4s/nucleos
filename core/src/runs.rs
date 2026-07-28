@@ -282,9 +282,20 @@ fn spawn_run(
             // outcome rather than a failure — the loop breaks either way.
             match result {
                 Ok(Ok(o)) => {
+                    // A CLI that exited non-zero did not do the work, and recording it `completed`
+                    // announced a success its own exit code denies — including in the feed row the
+                    // user reads. The runner now also reports -1 for a stream that broke after
+                    // launch, so that lands here as a failure rather than being mistaken for a
+                    // launch failure and retried over work that was already applied.
+                    let terminal_status = if o.exit_code == 0 {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
+                    .bind(terminal_status)
                     .bind(o.exit_code)
                     .bind(&o.stdout)
                     .bind(&o.stderr)

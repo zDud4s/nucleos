@@ -169,6 +169,48 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
     reply
 }
 
+/// Kills a spawned CLI's whole process TREE when a run is dropped mid-flight.
+///
+/// `kill_on_drop` reaches the direct child and stops there, but `claude` is a supervisor: it spawns
+/// bash, cargo, git and node to do the actual work. Terminating only the parent orphans those, and
+/// an orphaned `cargo build` keeps file locks inside the worktree that the run was supposed to
+/// release — which is what makes `git worktree remove` fail through its entire backoff and leaves
+/// the GC reporting the same failure every half hour.
+///
+/// Sound only while the `Child` is still alive, because the open process handle is what stops
+/// Windows reusing the pid. Hence `disarm()` the moment the child is reaped, and hence the killer
+/// is declared AFTER the child so it drops FIRST.
+struct TreeKiller {
+    pid: u32,
+    armed: bool,
+}
+
+impl TreeKiller {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TreeKiller {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best effort by definition: this runs while a future is being dropped, so it cannot await
+        // and cannot report. `/T` is the whole point (the tree), `/F` because a cancelled run is
+        // not being asked politely.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &self.pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Runs one `claude -p` invocation. `cwd`, when set, is the run's working directory (spec §3.3).
@@ -234,7 +276,23 @@ impl CommandRunner for ClaudeCliRunner {
         // process actually dying. DO NOT drop this line — Chunk 5 Task 1 adds `--model` and preserves it.
         cmd.kill_on_drop(true);
 
+        // The ONLY `?` from here on. Everything below turns a failure into a failed RunOutcome
+        // instead of an `Err`, because `runs::spawn_run` reads `Err` as "the CLI never ran, so a
+        // retry cannot double-apply a mutation". A non-UTF-8 byte on stdout or a broken pipe used
+        // to share that type with a spawn failure, so a run that had already worked for minutes
+        // inside a worktree — and committed — was re-run from the top.
         let mut child = cmd.spawn()?;
+
+        // Dropped BEFORE `child` (reverse declaration order), which is what keeps this sound: tokio
+        // holds the process handle for as long as `child` lives, and Windows will not reuse a pid
+        // while a handle to it is open. So an armed killer always names the process we spawned.
+        //
+        // `kill_on_drop` alone terminates the direct child only. `claude` spawns its own tools —
+        // bash, cargo, git, node — and TerminateProcess on the parent orphans every one of them:
+        // a cancelled run leaves a `cargo build` holding file locks in the worktree, which is
+        // exactly what makes `git worktree remove` fail through its whole backoff afterwards.
+        let mut tree_killer = child.id().map(TreeKiller::new);
+
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");
 
@@ -252,7 +310,17 @@ impl CommandRunner for ClaudeCliRunner {
         let mut session_id: Option<String> = None;
         let mut cost_usd: Option<f64> = None;
 
-        while let Some(line) = lines.next_line().await? {
+        let mut post_launch_error: Option<std::io::Error> = None;
+
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    post_launch_error = Some(error);
+                    break;
+                }
+            };
             stdout_acc.push_str(&line);
             stdout_acc.push('\n');
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -274,11 +342,31 @@ impl CommandRunner for ClaudeCliRunner {
             }
         }
 
-        let status = child.wait().await?;
-        let stderr_str = stderr_task.await.unwrap_or_default();
+        let status = match child.wait().await {
+            Ok(status) => Some(status),
+            Err(error) => {
+                post_launch_error.get_or_insert(error);
+                None
+            }
+        };
+        // Reaped, so the process is gone and there is nothing left to kill.
+        if let Some(killer) = tree_killer.as_mut() {
+            killer.disarm();
+        }
+
+        let mut stderr_str = stderr_task.await.unwrap_or_default();
+        let exit_code = match &post_launch_error {
+            // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
+            // incomplete, so "succeeded" is a claim this cannot make.
+            Some(error) => {
+                stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
+                -1
+            }
+            None => status.and_then(|status| status.code()).unwrap_or(-1),
+        };
 
         Ok(RunOutcome {
-            exit_code: status.code().unwrap_or(-1),
+            exit_code,
             stdout: stdout_acc,
             stderr: stderr_str,
             session_id,
