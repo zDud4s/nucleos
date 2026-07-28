@@ -106,7 +106,16 @@ async fn main() {
         );
     }
 
-    // After the run reconciliation above, so nothing from a previous life still counts as live.
+    let stranded = runs::reconcile_stranded_approvals(&pool)
+        .await
+        .expect("failed to reconcile stranded approval pauses on startup");
+    if stranded > 0 {
+        tracing::warn!(
+            "reconciled {stranded} run(s) left 'awaiting_approval' with no pending proposal -> 'interrupted'"
+        );
+    }
+
+    // After the run reconciliations above, so nothing from a previous life still counts as live.
     match worktree::reconcile_orphaned_worktrees(
         &pool,
         worktree::ORPHAN_MIN_AGE,

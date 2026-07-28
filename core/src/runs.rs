@@ -656,6 +656,49 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
     Ok(reconciled.len() as u64)
 }
 
+/// Marks every `"awaiting_approval"` run whose action-approval proposal is gone or already decided
+/// as `"interrupted"` — the pause's counterpart to `reconcile_orphaned_runs`, run once at startup.
+/// Returns how many rows it changed.
+///
+/// Such a run is unreachable, not merely idle: both `/approve` and `/reject` start from the pending
+/// proposal row, so with none there is no input left that can move it. It is also load-bearing:
+/// `one_open_worktree_run_per_project` (migration 0009) counts `awaiting_approval`, so one strand
+/// blocks every later worktree run of its project, and the worktree GC only collects terminal runs.
+/// A run holding a *pending* proposal is resumable by design — the NOT EXISTS leaves it alone.
+///
+/// The doors that created these strands are closed, so this only heals rows predating that fix; the
+/// pass stays because a strand is permanent and invisible otherwise. Worktrees are left to the GC,
+/// which collects `interrupted` on its own — no removal here.
+pub async fn reconcile_stranded_approvals(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // Single statement: the status guard and the proposal check must observe one snapshot, or an
+    // approval landing mid-pass would be overwritten by a decision taken before it existed.
+    let reconciled: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "UPDATE runs SET status = 'interrupted', completed_at = ?
+         WHERE status = 'awaiting_approval'
+           AND NOT EXISTS (
+               SELECT 1 FROM proposals
+               WHERE proposals.run_id = runs.id
+                 AND proposals.kind = 'action-approval'
+                 AND proposals.status = 'pending')
+         RETURNING id, project_id",
+    )
+    .bind(&now)
+    .fetch_all(pool)
+    .await?;
+    for (id, project_id) in &reconciled {
+        let _ = crate::feed::append(
+            pool,
+            project_id.as_deref(),
+            "run_interrupted",
+            "run interrupted during startup recovery: its approval request no longer exists",
+            Some(*id),
+        )
+        .await;
+    }
+    Ok(reconciled.len() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     // These `current_thread` async tests hold `worktree::test_env_lock()` — a
@@ -1799,6 +1842,128 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, "run_interrupted");
         assert_eq!(entries[0].run_id, Some(1));
+    }
+
+    async fn reconcile_test_pool(dir: &tempfile::TempDir) -> sqlx::SqlitePool {
+        crate::storage::open(&dir.path().join("nucleos.db"))
+            .await
+            .unwrap()
+    }
+
+    // One project per run: `one_open_worktree_run_per_project` (migration 0009) is exactly what a
+    // stranded pause jams, so two of them cannot coexist under the same project_id.
+    async fn insert_awaiting_run(pool: &sqlx::SqlitePool, project_id: &str, prompt: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES (?, ?, 'awaiting_approval', 'worktree', '2026-07-20T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(prompt)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn run_row(pool: &sqlx::SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, completed_at FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_an_awaiting_approval_run_with_no_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = reconcile_test_pool(&dir).await;
+        let id = insert_awaiting_run(&pool, "p", "stranded").await;
+
+        let n = reconcile_stranded_approvals(&pool).await.unwrap();
+        assert_eq!(n, 1, "the run has nothing left that could decide it");
+
+        let (status, completed_at) = run_row(&pool, id).await;
+        assert_eq!(status, "interrupted");
+        // The worktree GC keys off completed_at, so an unset one would strand the directory instead.
+        assert!(completed_at.is_some());
+
+        let entries = crate::feed::list_feed(&pool, Some("p"), 50).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "run_interrupted");
+        assert_eq!(entries[0].run_id, Some(id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_an_awaiting_approval_run_with_a_pending_proposal_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = reconcile_test_pool(&dir).await;
+        let id = insert_awaiting_run(&pool, "p", "resumable").await;
+        proposals::create_action_approval(&pool, id, Some("s"), Some("p"), "Bash", "why", None)
+            .await
+            .unwrap();
+
+        let n = reconcile_stranded_approvals(&pool).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "a pending proposal makes the pause resumable by design"
+        );
+
+        let (status, completed_at) = run_row(&pool, id).await;
+        assert_eq!(status, "awaiting_approval");
+        assert_eq!(completed_at, None);
+        assert!(crate::feed::list_all(&pool, 50).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_an_awaiting_approval_run_whose_proposal_was_decided() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = reconcile_test_pool(&dir).await;
+
+        let rejected_run = insert_awaiting_run(&pool, "p-rejected", "rejected proposal").await;
+        let rejected = proposals::create_action_approval(
+            &pool,
+            rejected_run,
+            Some("s"),
+            Some("p"),
+            "Bash",
+            "why",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            proposals::transition(&pool, rejected, "rejected", "x")
+                .await
+                .unwrap()
+        );
+
+        let approved_run = insert_awaiting_run(&pool, "p-approved", "approved proposal").await;
+        let approved = proposals::create_action_approval(
+            &pool,
+            approved_run,
+            Some("s"),
+            Some("p"),
+            "Bash",
+            "why",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            proposals::transition(&pool, approved, "approved", "x")
+                .await
+                .unwrap()
+        );
+
+        let n = reconcile_stranded_approvals(&pool).await.unwrap();
+        assert_eq!(n, 2, "a decided proposal can no longer release either run");
+
+        for id in [rejected_run, approved_run] {
+            let (status, completed_at) = run_row(&pool, id).await;
+            assert_eq!(status, "interrupted");
+            assert!(completed_at.is_some());
+        }
+        assert_eq!(crate::feed::list_all(&pool, 50).await.unwrap().len(), 2);
     }
 
     async fn poll_run(state: &AppState, id: i64, until: &str) -> (String, i64) {
