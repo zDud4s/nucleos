@@ -74,6 +74,19 @@ pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Opti
             .output()
             .await;
     }
+    // A branch name comes from `.ai/autopilot.yaml`, so it is configuration rather than a constant,
+    // and `rev-parse` reads a leading `-` as an option: a value like `--git-dir=...` changed what
+    // the command did. No shell is involved, so this was argument injection rather than command
+    // injection — still not the config file's decision to make. Rejecting the shape is simpler and
+    // more predictable than a separator flag, because `rev-parse` echoes `--end-of-options` back as
+    // an argument rather than honouring it.
+    if git_ref.starts_with('-') {
+        tracing::warn!(
+            git_ref,
+            "repo trigger: refusing a ref that looks like an option"
+        );
+        return None;
+    }
     let output = tokio::process::Command::new(git_bin())
         .arg("-C")
         .arg(repo)

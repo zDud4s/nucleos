@@ -8,7 +8,15 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        // Stated rather than inherited. Every fail-closed gate in this daemon turns a database
+        // error into a refusal, so how long a writer waits before becoming one is a decision worth
+        // making here instead of depending on whichever default sqlx happens to ship.
+        .busy_timeout(std::time::Duration::from_secs(10))
+        // SQLite disables foreign keys per connection unless asked. The schema declares them
+        // (`worktrees.run_id`, `action_grants.proposal_id`, ...), so without this they were
+        // documentation: an orphaned row was free to exist and nothing said so.
+        .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
