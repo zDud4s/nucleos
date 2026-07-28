@@ -226,9 +226,22 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
             .await
             {
                 Ok(run_id) => {
-                    // Record the new SHA only once the run actually started, so a deferred/failed fire
-                    // stays "due" and is retried on the next poll.
-                    let _ = record_sha(&state.pool, &project_id, &trigger.name, &current).await;
+                    // Recording AFTER the run starts is what keeps a deferred fire due — but the
+                    // error was being discarded outright, and a write that keeps failing while the
+                    // run keeps succeeding re-fires the same prompt every five minutes forever.
+                    // The SHA cannot be recorded and the trigger cannot be trusted, so say so
+                    // loudly rather than letting the loop quietly repeat itself.
+                    if let Err(error) =
+                        record_sha(&state.pool, &project_id, &trigger.name, &current).await
+                    {
+                        tracing::error!(
+                            project_id = %project_id,
+                            trigger = %trigger.name,
+                            run_id,
+                            %error,
+                            "repo-trigger run started but its SHA was not recorded — this trigger will fire again"
+                        );
+                    }
                     tracing::info!(
                         project_id = %project_id,
                         trigger = %trigger.name,

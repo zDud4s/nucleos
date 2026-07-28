@@ -224,6 +224,13 @@ pub(crate) async fn scheduler_tick(
             .iter()
             .filter_map(|(name, _, sha)| Some((name.as_str(), sha.as_deref()?)))
             .collect();
+        // The stored timestamp verbatim, not the parsed one: it is the value the claim below
+        // compare-and-sets against, and a round-trip through `DateTime` can change the spelling
+        // (offset form, sub-second digits) without changing the instant.
+        let last_fired_raw: HashMap<&str, &str> = rows
+            .iter()
+            .map(|(name, value, _)| (name.as_str(), value.as_str()))
+            .collect();
         let mut last_fired = HashMap::new();
         for (rule_name, value, _) in &rows {
             match DateTime::parse_from_rfc3339(value) {
@@ -373,34 +380,59 @@ pub(crate) async fn scheduler_tick(
                 rule.prompt.clone()
             };
 
+            // Claim the window BEFORE starting anything, compare-and-set against the timestamp this
+            // tick read. Firing first and persisting afterwards made every failure mode duplicate
+            // work: a crash in between left the rule still due, so the next start ran the same
+            // prompt again, and a persistent write failure re-fired it every tick while the run
+            // itself kept succeeding. For an autonomous run that is not a retry — it is the same
+            // mutation applied twice.
+            //
+            // The trade is deliberate and the safe direction: if the run then fails to start, this
+            // window is spent and the rule waits for its next one. A missed window is visible and
+            // recoverable; a duplicated commit is neither.
+            //
+            // The sha rides along with the timestamp because both describe the state the NEXT
+            // window is scheduled from, so a later catch-up would otherwise compare against a HEAD
+            // from the wrong moment.
+            let previous_fired_at = last_fired_raw.get(rule.name.as_str()).copied();
+            let claim = sqlx::query(
+                "UPDATE scheduler_state
+                 SET last_fired_at = ?, last_head_sha = ?
+                 WHERE project_id = ? AND rule_name = ? AND last_fired_at IS ?",
+            )
+            .bind(now.to_rfc3339())
+            .bind(head_sha.as_deref())
+            .bind(&project_id)
+            .bind(&rule.name)
+            .bind(previous_fired_at)
+            .execute(&state.pool)
+            .await;
+            match claim {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => {
+                    // Another tick already moved this rule on. Not an error: the window is served.
+                    tracing::info!(
+                        project_id = %project_id,
+                        rule_name = %rule.name,
+                        "scheduler window already claimed; not firing"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        rule_name = %rule.name,
+                        %error,
+                        "could not claim the scheduler window; not firing"
+                    );
+                    continue;
+                }
+            }
+
             match create_run_inner(state, prompt, Some(project_id.clone()), Some(cwd), run_mode)
                 .await
             {
                 Ok(run_id) => {
-                    // The sha rides along with the timestamp: both describe the state this rule's
-                    // NEXT window is being scheduled from, so they have to move together or a later
-                    // catch-up would compare against a HEAD from the wrong moment.
-                    if let Err(error) = sqlx::query(
-                        "UPDATE scheduler_state
-                         SET last_fired_at = ?, last_head_sha = ?
-                         WHERE project_id = ? AND rule_name = ?",
-                    )
-                    .bind(now.to_rfc3339())
-                    .bind(head_sha.as_deref())
-                    .bind(&project_id)
-                    .bind(&rule.name)
-                    .execute(&state.pool)
-                    .await
-                    {
-                        tracing::warn!(
-                            project_id = %project_id,
-                            rule_name = %rule.name,
-                            run_id,
-                            %error,
-                            "scheduled run started but scheduler state update failed"
-                        );
-                    }
-
                     let count = fires_today.entry(fire_key).or_insert(0);
                     *count += 1;
                     tracing::info!(
@@ -419,17 +451,52 @@ pub(crate) async fn scheduler_tick(
                         );
                     }
                 }
-                Err(CreateRunError::Busy) => tracing::info!(
-                    project_id = %project_id,
-                    rule_name = %rule.name,
-                    "scheduler deferred a worktree run; project busy"
-                ),
+                // `Busy` and `Invalid` are both decided before or by the runs INSERT itself — the
+                // unique violation that means another worktree run holds the project, and the
+                // argument check ahead of it — so no row exists and nothing ran. Those give the
+                // window back, which is what makes a busy project retry on the next tick rather
+                // than silently skip its schedule.
+                //
+                // Every other error is kept spent, because past the INSERT the row exists and this
+                // cannot tell how far provisioning got. Re-firing on a maybe is the duplicate this
+                // whole ordering exists to prevent.
+                //
+                // Released with a compare-and-set on the value just written, so a concurrent tick
+                // that has already claimed the next window is not clobbered.
+                Err(error @ (CreateRunError::Busy | CreateRunError::Invalid(_))) => {
+                    let released = sqlx::query(
+                        "UPDATE scheduler_state
+                         SET last_fired_at = ?, last_head_sha = ?
+                         WHERE project_id = ? AND rule_name = ? AND last_fired_at = ?",
+                    )
+                    .bind(previous_fired_at)
+                    .bind(last_head_shas.get(rule.name.as_str()).copied())
+                    .bind(&project_id)
+                    .bind(&rule.name)
+                    .bind(now.to_rfc3339())
+                    .execute(&state.pool)
+                    .await;
+                    if let Err(release_error) = released {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            rule_name = %rule.name,
+                            %release_error,
+                            "could not give the scheduler window back; it stays spent"
+                        );
+                    }
+                    tracing::info!(
+                        project_id = %project_id,
+                        rule_name = %rule.name,
+                        %error,
+                        "no run was created; window released for the next tick"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     project_id = %project_id,
                     rule_name = %rule.name,
                     run_mode,
                     %error,
-                    "failed to create scheduled run"
+                    "failed to create scheduled run — this window is spent"
                 ),
             }
         }
