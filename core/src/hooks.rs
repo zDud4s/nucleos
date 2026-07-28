@@ -83,11 +83,23 @@ pub async fn pretooluse_decision(
     //
     // It returns before the classifier, so it never terminates the run and never mints a proposal.
     if mode == crate::email::TRIAGE_MODE {
-        tracing::warn!(
-            run_id = payload.run_id,
-            tool = %payload.tool_name,
-            "pretooluse-decision: a triage run attempted a tool — barrier 1 is not in force"
-        );
+        // Only a run that is actually executing can have reached a tool through barrier 1, and that
+        // is the alarming case. The startup verification deliberately probes this branch with a
+        // throwaway row that is NOT in flight, so warning on both would fire a false alarm on every
+        // single boot — and an alarm that cries wolf at startup is one nobody reads when it matters.
+        if is_in_flight {
+            tracing::warn!(
+                run_id = payload.run_id,
+                tool = %payload.tool_name,
+                "pretooluse-decision: a triage run attempted a tool — barrier 1 is not in force"
+            );
+        } else {
+            tracing::debug!(
+                run_id = payload.run_id,
+                tool = %payload.tool_name,
+                "pretooluse-decision: denied a tool for a triage run that is not in flight"
+            );
+        }
         return Json(Decision {
             decision: "deny".to_owned(),
             reason: "email triage runs have no tools".to_owned(),
