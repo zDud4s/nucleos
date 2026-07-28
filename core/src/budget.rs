@@ -81,14 +81,22 @@ pub fn compute_spend(rows: &[SpendRow], now: DateTime<Utc>, cfg: &BudgetConfig) 
 
     for group in sessions.values() {
         // `--resume` reports the cumulative session total, so a session with any known cost counts
-        // that single most-recent value once; a session with no known cost yet falls back to time.
-        let latest_known_cost = group
+        // ONE of those values rather than their sum; a session with no known cost yet falls back
+        // to time.
+        //
+        // The largest, not the most recent. Cumulativeness is an assumption about the CLI's output,
+        // not something this can verify: a restart, a version change, or a crafted result line can
+        // report less than the session has already spent, and taking that value verbatim erases
+        // real money and reopens the gate. A spend limit has to round the wrong way on purpose,
+        // and `max` costs nothing when the assumption does hold.
+        let largest_known_cost = group
             .iter()
-            .filter(|row| row.cost_usd.is_some())
-            .max_by_key(|row| row.created_at)
-            .and_then(|row| row.cost_usd);
+            .filter_map(|row| row.cost_usd)
+            .fold(None::<f64>, |acc, cost| {
+                Some(acc.map_or(cost, |a| a.max(cost)))
+            });
 
-        match latest_known_cost {
+        match largest_known_cost {
             Some(cost) => total += cost,
             None => {
                 total += group
@@ -343,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_session_counts_latest_cost_once_not_summed() {
+    fn resumed_session_counts_one_reported_cost_not_their_sum() {
         // Original paused run (no result -> cost None) then a resume run whose cost is the
         // cumulative session total. Must count 0.9 once, NOT 0.9 + time-approx of the first row.
         let rows = vec![
@@ -363,6 +371,32 @@ mod tests {
         approx(
             compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0)),
             0.9,
+        );
+    }
+
+    #[test]
+    fn a_later_smaller_report_cannot_erase_spend_already_counted() {
+        // The cumulative-total assumption is an assumption, not a guarantee: a CLI restart, a
+        // version change, or simply a crafted result line can make a resume report LESS than the
+        // session already spent. Taking the most recent value verbatim then wipes out real money
+        // and reopens the budget gate. A spend limit must round the wrong way on purpose.
+        let rows = vec![
+            SpendRow {
+                session_id: Some("s1".into()),
+                cost_usd: Some(40.0),
+                created_at: ts("2026-07-20T10:00:00Z"),
+                completed_at: Some(ts("2026-07-20T10:30:00Z")),
+            },
+            SpendRow {
+                session_id: Some("s1".into()),
+                cost_usd: Some(0.02),
+                created_at: ts("2026-07-20T10:40:00Z"),
+                completed_at: Some(ts("2026-07-20T10:50:00Z")),
+            },
+        ];
+        approx(
+            compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0)),
+            40.0,
         );
     }
 
