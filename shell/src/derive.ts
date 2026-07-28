@@ -158,7 +158,14 @@ export function promotionBlock(project: ProjectSummary): string | null {
  */
 export function queueBlock(project: ProjectSummary): string | null {
   if (!project.queue_full) return null;
-  return `${project.open_proposals}/${project.wip_limit ?? 0} proposals waiting — new work is deferred until you review one`;
+  // A null limit means no ceiling was configured, so there is no denominator to
+  // show: "3/0 proposals waiting" would claim a limit of zero that the queue
+  // has somehow exceeded, which is not a thing that can happen.
+  const waiting =
+    project.wip_limit === null
+      ? `${project.open_proposals}`
+      : `${project.open_proposals}/${project.wip_limit}`;
+  return `${waiting} proposals waiting — new work is deferred until you review one`;
 }
 
 export function totalPending(projects: ProjectSummary[]): number {

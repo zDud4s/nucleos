@@ -313,11 +313,45 @@ describe("daemon API client", () => {
 
     await expect(
       api.setProjectMode(TOKEN, "alpha", "off"),
-    ).resolves.toEqual({ ok: false, status: 422 });
+    ).resolves.toEqual({ ok: false, fault: "failed", status: 422 });
     expectPostCall(3, `${DAEMON_URL}/autopilot/state`, {
       project_id: "alpha",
       mode: "off",
     });
+  });
+
+  it("tells a refused token apart from an unreachable daemon", async () => {
+    fetchMock
+      .mockResolvedValueOnce(nonOk(401))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    // A stale token and a stopped daemon are the two failures a user can act
+    // on, and they need opposite actions — so they must not read alike.
+    await expect(api.setProjectMode(TOKEN, "alpha", "shadow")).resolves.toEqual({
+      ok: false,
+      fault: "unauthorized",
+      status: 401,
+    });
+    await expect(api.setProjectMode(TOKEN, "alpha", "shadow")).resolves.toEqual({
+      ok: false,
+      fault: "unreachable",
+      status: 0,
+    });
+  });
+
+  it("reads the daemon status line, and says why when it cannot", async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => "idle · 0 runs" })
+      .mockResolvedValueOnce(nonOk(403))
+      .mockResolvedValueOnce(nonOk(500))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    await expect(api.getStatus(TOKEN)).resolves.toEqual({ ok: true, value: "idle · 0 runs" });
+    expectGetCall(1, `${DAEMON_URL}/status`);
+    // 403 is unauthorized too: from here, both mean the token buys nothing.
+    await expect(api.getStatus(TOKEN)).resolves.toEqual({ ok: false, fault: "unauthorized", status: 403 });
+    await expect(api.getStatus(TOKEN)).resolves.toEqual({ ok: false, fault: "failed", status: 500 });
+    await expect(api.getStatus(TOKEN)).resolves.toEqual({ ok: false, fault: "unreachable", status: 0 });
   });
 
   it("gets the budget and returns null for a non-ok response", async () => {

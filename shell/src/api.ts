@@ -2,6 +2,25 @@ const DAEMON_URL = "http://127.0.0.1:8791";
 
 export type ConnectionState = "checking" | "connected" | "disconnected";
 
+/**
+ * Why a token-carrying request failed.
+ *
+ * Two of these are different problems wearing the same face: "the daemon isn't
+ * there" is fixed by waiting, while "the daemon is there and refused this
+ * token" never is — a stale credential collapsed into `null` looks like an
+ * outage and buys the user a retry loop that cannot succeed.
+ */
+export type ApiFault = "unauthorized" | "unreachable" | "failed";
+
+export type ApiResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; fault: ApiFault; status: number };
+
+/** 403 counts as unauthorized: from the shell's side, both mean "this token buys nothing". */
+export function faultForStatus(status: number): ApiFault {
+  return status === 401 || status === 403 ? "unauthorized" : "failed";
+}
+
 export async function checkHealth(): Promise<ConnectionState> {
   try {
     const res = await fetch(`${DAEMON_URL}/health`);
@@ -11,15 +30,23 @@ export async function checkHealth(): Promise<ConnectionState> {
   }
 }
 
-export async function getStatus(token: string): Promise<string | null> {
+/**
+ * The daemon's own status line — and, because it is the first authenticated
+ * call of every poll, the shell's proof that the stored token still works.
+ * That is why this one reports HOW it failed and the read-only getters below
+ * still do not: the distinction is only actionable once per round.
+ */
+export async function getStatus(token: string): Promise<ApiResult<string>> {
   try {
     const res = await fetch(`${DAEMON_URL}/status`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!res.ok) return null;
-    return await res.text();
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: await res.text() };
   } catch {
-    return null;
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
 
@@ -170,7 +197,9 @@ export interface BudgetConfigInput {
   time_cost_per_hour_usd: number;
 }
 
-export type SetModeResult = { ok: true } | { ok: false; status: number };
+export type SetModeResult =
+  | { ok: true }
+  | { ok: false; fault: ApiFault; status: number };
 
 export async function getProjects(
   token: string,
@@ -395,9 +424,11 @@ export async function setProjectMode(
         project_root: projectRoot,
       }),
     });
-    return res.ok ? { ok: true } : { ok: false, status: res.status };
+    return res.ok
+      ? { ok: true }
+      : { ok: false, fault: faultForStatus(res.status), status: res.status };
   } catch {
-    return { ok: false, status: 0 };
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
 

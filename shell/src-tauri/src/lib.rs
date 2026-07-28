@@ -1,13 +1,12 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::WindowEvent;
+use tauri::{Manager, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+/// Marker for "autostart has been decided once". Its EXISTENCE is the whole
+/// state: after the first launch the answer belongs to the user, whatever it is.
+const AUTOSTART_MARKER: &str = "autostart-initialised";
 
 #[tauri::command]
 fn get_daemon_token() -> Result<String, String> {
@@ -27,13 +26,23 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Shell-GUI autostart convenience only — the daemon owns its OWN persistence via a
-            // Windows Scheduled Task (Part A), independent of this. Enable on first run.
-            let autostart_manager = app.autolaunch();
-            if !autostart_manager.is_enabled().unwrap_or(false) {
-                let _ = autostart_manager.enable();
+            // Windows Scheduled Task (Part A), independent of this.
+            //
+            // Enabled ONCE, on the first launch, and never asserted again: without the marker
+            // this ran on every start, so turning autostart off in Windows Settings lasted
+            // exactly until the next launch and looked like the setting was broken. A launch
+            // that cannot resolve the config dir simply skips the offer rather than re-enabling.
+            if let Ok(config_dir) = app.path().app_config_dir() {
+                let marker = config_dir.join(AUTOSTART_MARKER);
+                if !marker.exists() {
+                    let _ = app.autolaunch().enable();
+                    // Written whatever `enable()` returned: the first run has happened, and a
+                    // failed attempt is not a licence to keep asking.
+                    let _ = std::fs::create_dir_all(&config_dir);
+                    let _ = std::fs::write(&marker, b"");
+                }
             }
 
             // A tray icon is required once window-close hides instead of quits — otherwise there is no
@@ -62,7 +71,7 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![greet, get_daemon_token])
+        .invoke_handler(tauri::generate_handler![get_daemon_token])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

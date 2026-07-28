@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   approveProposal, getBudget, getFeed, getProjects, getProposals,
   getScopedKills, getScoreboard, getShadowDecisions, rejectProposal,
@@ -75,7 +75,16 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
         "Prerequisites not met — the project needs .ai/workflow onboarding, a registered PreToolUse hook, git (for active), and a project root.",
       );
     } else {
-      setError(`Request failed (status ${result.status}).`);
+      // "status 0" was the network path leaking an HTTP vocabulary it never
+      // had: there was no response to have a status. Each of these asks the
+      // user for a different move, so they cannot share one sentence.
+      setError(
+        result.fault === "unreachable"
+          ? "Could not reach the daemon — it looks like the núcleo stopped. The mode was not changed."
+          : result.fault === "unauthorized"
+            ? "The daemon rejected this token, so the mode was not changed. Restart the núcleo so the shell can pick up the current one."
+            : `The daemon refused the change (status ${result.status}).`,
+      );
     }
     setChanging(false);
   }
@@ -208,9 +217,20 @@ function ShadowReviewPanel({ projectId, decisions, loading, token, refresh }: Sh
 }
 
 interface ApprovalQueuePanelProps { proposals: Proposal[] | null; loading: boolean; token: string; refresh: () => Promise<void>; isKill: boolean; isSwamped: boolean; }
-function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill, isSwamped }: ApprovalQueuePanelProps) {
+export function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill, isSwamped }: ApprovalQueuePanelProps) {
   const [pendingIds, setPendingIds] = useState<Set<number>>(() => new Set());
+  // Keyed by proposal AND action: approve and reject are separate buttons and
+  // either one being armed is a decision the panel must not disturb.
+  const [armedKeys, setArmedKeys] = useState<Set<string>>(() => new Set());
   const [errors, setErrors] = useState<Record<number, string>>({});
+
+  function setArmed(key: string, armed: boolean) {
+    setArmedKeys((current) => {
+      const next = new Set(current);
+      if (armed) next.add(key); else next.delete(key);
+      return next;
+    });
+  }
 
   function startAction(proposalId: number) {
     setPendingIds((current) => new Set(current).add(proposalId));
@@ -231,17 +251,31 @@ function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill, isSwam
     if (ok) { await refresh(); } else { setErrors((current) => ({ ...current, [proposalId]: "Could not reject this proposal." })); }
     finishAction(proposalId);
   }
+  // Approve is the MORE consequential of the two — it resumes an agent run
+  // that was stopped precisely because it asked to leave its allowlist — so it
+  // asks the same second question reject always did.
   const actionButtons = (proposal: Proposal, pending: boolean, compact = false) => <div className={compact ? "d-act" : "a-actions"}>
-    <Button variant="approve" size={compact ? "sm" : "md"} disabled={pending || isKill} onClick={() => void approve(proposal.id)}>{compact ? "Approve" : "Approve & resume"}</Button>
-    <ConfirmButton variant="link" size="sm" confirmLabel="Discard worktree?" disabled={pending || isKill} onConfirm={() => void reject(proposal.id)}>{compact ? "Reject" : "Reject and discard worktree"}</ConfirmButton>
+    <ConfirmButton variant="approve" size={compact ? "sm" : "md"} confirmLabel={compact ? "Approve?" : "Approve & resume?"} disabled={pending || isKill} onArmedChange={(armed) => setArmed(`${proposal.id}:approve`, armed)} onConfirm={() => void approve(proposal.id)}>{compact ? "Approve" : "Approve & resume"}</ConfirmButton>
+    <ConfirmButton variant="link" size="sm" confirmLabel="Discard worktree?" disabled={pending || isKill} onArmedChange={(armed) => setArmed(`${proposal.id}:reject`, armed)} onConfirm={() => void reject(proposal.id)}>{compact ? "Reject" : "Reject and discard worktree"}</ConfirmButton>
   </div>;
+
+  // A background refresh every 3 seconds re-sorts this list; the daemon decides
+  // the order, so a row can move between the click that arms a button and the
+  // click that confirms it — and the confirm would land on a different run's
+  // proposal. While any decision is open, the panel shows the order the user is
+  // actually looking at and lets the fresh data wait.
+  const deciding = armedKeys.size > 0 || pendingIds.size > 0;
+  const held = useRef<Proposal[] | null>(null);
+  if (!deciding) held.current = proposals;
+  const shown = deciding ? held.current ?? proposals : proposals;
+
   return (
     <Panel flat={false} dim={isKill} title="Approval queue" aside="approve resumes the run in its worktree · reject discards it">
       {isKill && <p className="a-note">Read-only while the kill switch is engaged — disengage to act.</p>}
-      {proposals === null ? !loading && <ErrorNote>Could not load pending proposals from the daemon.</ErrorNote>
-        : proposals.length === 0 ? <Teach title="Nothing waits for you.">Proposals appear when an active run reaches outside its allowlist. For now, every run has finished clean.</Teach>
-        : isSwamped ? <div className="dense-queue">{proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="dense-row" key={proposal.id}><div className="d-id"><b>#{proposal.id} · run {proposal.run_id ?? "—"}</b><time dateTime={proposal.created_at} title={proposal.created_at}>{relativeTime(proposal.created_at)}</time></div><div className="d-main"><div className="d-cmd">{proposal.tool_name ?? "—"}</div><div className="d-why">{proposal.reasoning}</div>{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</div>{actionButtons(proposal, pending, true)}</article>; })}</div>
-        : proposals.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="approval-card" key={proposal.id}><div className="a-meta"><span>#{proposal.id} · run {proposal.run_id ?? "—"}</span><span className="proj">{proposal.project_id ?? "global"}</span><time dateTime={proposal.created_at} title={proposal.created_at}>{relativeTime(proposal.created_at)}</time></div><div className="a-cmd"><span className="verb">wants to run </span>{proposal.tool_name ?? "—"}</div><p className="a-reason">{proposal.reasoning}</p>{actionButtons(proposal, pending)}{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</article>; })}
+      {shown === null ? !loading && <ErrorNote>Could not load pending proposals from the daemon.</ErrorNote>
+        : shown.length === 0 ? <Teach title="Nothing waits for you.">Proposals appear when an active run reaches outside its allowlist. For now, every run has finished clean.</Teach>
+        : isSwamped ? <div className="dense-queue">{shown.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="dense-row" key={proposal.id}><div className="d-id"><b>#{proposal.id} · run {proposal.run_id ?? "—"}</b><time dateTime={proposal.created_at} title={proposal.created_at}>{relativeTime(proposal.created_at)}</time></div><div className="d-main"><div className="d-cmd">{proposal.tool_name ?? "—"}</div><div className="d-why">{proposal.reasoning}</div>{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</div>{actionButtons(proposal, pending, true)}</article>; })}</div>
+        : shown.map((proposal) => { const pending = pendingIds.has(proposal.id); return <article className="approval-card" key={proposal.id}><div className="a-meta"><span>#{proposal.id} · run {proposal.run_id ?? "—"}</span><span className="proj">{proposal.project_id ?? "global"}</span><time dateTime={proposal.created_at} title={proposal.created_at}>{relativeTime(proposal.created_at)}</time></div><div className="a-cmd"><span className="verb">wants to run </span>{proposal.tool_name ?? "—"}</div><p className="a-reason">{proposal.reasoning}</p>{actionButtons(proposal, pending)}{errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}</article>; })}
     </Panel>
   );
 }
@@ -313,44 +347,62 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
   const [budget, setBudget] = useState<Budget | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const batchSeq = useRef(0);
+  const inFlight = useRef(0);
 
   const refresh = useCallback(async (background = false) => {
     if (token === null || connection !== "connected") return;
+    // One batch at a time. Each round is ~7 requests; on a daemon slower than
+    // the 3s tick they would pile up, and their answers can then land in any
+    // order — the panel would flicker between two ages of the same truth.
+    if (background && inFlight.current > 0) return;
 
+    // A batch is only allowed to write the panel if it is still the newest one
+    // and still about the project on screen. Switching projects bumps this
+    // counter, so the previous project's in-flight answers are dropped instead
+    // of overwriting the new project's numbers.
+    const batch = (batchSeq.current += 1);
+    const project = selectedProject;
+
+    inFlight.current += 1;
     if (!background) setLoading(true);
-    const [nextProjects, nextFeed, nextProposals, nextBudget, nextScopedKills] =
-      await Promise.all([
-        getProjects(token),
-        getFeed(
-          token,
-          selectedProject ? { projectId: selectedProject } : { scope: "all" },
-        ),
-        getProposals(token),
-        getBudget(token),
-        getScopedKills(token),
-      ]);
-    let nextScoreboard: ClassTally[] | null = null;
-    let nextShadowDecisions: ShadowDecision[] | null = null;
-    if (selectedProject !== null) {
-      [nextScoreboard, nextShadowDecisions] = await Promise.all([
-        getScoreboard(token, selectedProject),
-        getShadowDecisions(token, selectedProject),
-      ]);
+    try {
+      const [nextProjects, nextFeed, nextProposals, nextBudget, nextScopedKills] =
+        await Promise.all([
+          getProjects(token),
+          getFeed(token, project ? { projectId: project } : { scope: "all" }),
+          getProposals(token),
+          getBudget(token),
+          getScopedKills(token),
+        ]);
+      let nextScoreboard: ClassTally[] | null = null;
+      let nextShadowDecisions: ShadowDecision[] | null = null;
+      if (project !== null) {
+        [nextScoreboard, nextShadowDecisions] = await Promise.all([
+          getScoreboard(token, project),
+          getShadowDecisions(token, project),
+        ]);
+      }
+      if (batch !== batchSeq.current) return;
+      setProjects(nextProjects);
+      setScopedKills(nextScopedKills);
+      setFeed(nextFeed);
+      setScoreboard(nextScoreboard);
+      setShadowDecisions(nextShadowDecisions);
+      setProposals(nextProposals);
+      setBudget(nextBudget);
+    } finally {
+      inFlight.current -= 1;
+      if (!background && batch === batchSeq.current) setLoading(false);
     }
-    setProjects(nextProjects);
-    setScopedKills(nextScopedKills);
-    setFeed(nextFeed);
-    setScoreboard(nextScoreboard);
-    setShadowDecisions(nextShadowDecisions);
-    setProposals(nextProposals);
-    setBudget(nextBudget);
-    if (!background) setLoading(false);
   }, [connection, selectedProject, token]);
 
   // Switching projects clears the previous project's scoped data so a switch
   // never shows the wrong project's numbers; an ambient refresh of the SAME
-  // project keeps them so nothing flickers.
+  // project keeps them so nothing flickers. Bumping the batch counter here is
+  // what stops an already in-flight refresh from putting them back.
   useEffect(() => {
+    batchSeq.current += 1;
     setScoreboard(null);
     setShadowDecisions(null);
   }, [selectedProject]);

@@ -99,6 +99,11 @@ describe("pure UI derivations", () => {
     expect(queueBlock(project({ open_proposals: 3, queue_full: true }))).toBe(
       "3/3 proposals waiting — new work is deferred until you review one",
     );
+    // A limit the daemon reports as null is a ceiling nobody set; printing it
+    // as "3/0" would state an impossibility where the count alone is honest.
+    expect(
+      queueBlock(project({ open_proposals: 3, queue_full: true, wip_limit: null })),
+    ).toBe("3 proposals waiting — new work is deferred until you review one");
   });
 
   it("derives agreement rates, including the zero-reviewed edge case", () => {

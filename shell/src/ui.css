@@ -66,6 +66,14 @@
   text-decoration: none;
 }
 
+/* Armar não torna a acção perigosa: aprovar continua verde, porque a pergunta
+   é "de certeza?" e não "isto destrói alguma coisa". */
+.btn--approve.is-armed {
+  background: var(--green-tint-strong);
+  border-color: var(--green-line);
+  color: var(--green);
+}
+
 /* ── Badges ─────────────────────────────────────────────── */
 
 .badge {

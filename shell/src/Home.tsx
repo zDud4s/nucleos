@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   getBudget, getProjects, getProposals,
@@ -29,6 +29,7 @@ function Home({ token, connection, status, killEngaged, onOpenAutopilot }: HomeP
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
   const [budget, setBudget] = useState<Budget | null>(null);
+  const inFlight = useRef(false);
 
   // Read-only digest on the same 3s cadence as the health poll. Home and
   // Autopilot are never mounted together (tabs render one or the other), so this
@@ -42,15 +43,24 @@ function Home({ token, connection, status, killEngaged, onOpenAutopilot }: HomeP
     }
     let cancelled = false;
     const load = async () => {
-      const [nextProjects, nextProposals, nextBudget] = await Promise.all([
-        getProjects(token),
-        getProposals(token),
-        getBudget(token),
-      ]);
-      if (cancelled) return;
-      setProjects(nextProjects);
-      setProposals(nextProposals);
-      setBudget(nextBudget);
+      // One round at a time: a daemon slower than the 3s tick would otherwise
+      // accumulate rounds whose answers land out of order, so the digest could
+      // settle on older numbers than it had already shown.
+      if (inFlight.current) return;
+      inFlight.current = true;
+      try {
+        const [nextProjects, nextProposals, nextBudget] = await Promise.all([
+          getProjects(token),
+          getProposals(token),
+          getBudget(token),
+        ]);
+        if (cancelled) return;
+        setProjects(nextProjects);
+        setProposals(nextProposals);
+        setBudget(nextBudget);
+      } finally {
+        inFlight.current = false;
+      }
     };
     void load();
     const id = setInterval(() => void load(), 3000);
