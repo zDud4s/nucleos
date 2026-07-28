@@ -433,6 +433,7 @@ mod tests {
             pool,
             runner: Arc::new(crate::runner::FakeCommandRunner::default()),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }

@@ -42,32 +42,52 @@ pub async fn pretooluse_decision(
         .unwrap()
         .contains_key(&payload.run_id);
 
-    let (cwd, mode) = if is_in_flight {
-        match sqlx::query_as::<_, (Option<String>, String)>(
-            "SELECT cwd, mode FROM runs WHERE id = ?",
-        )
-        .bind(payload.run_id)
-        .fetch_optional(&state.pool)
-        .await
-        {
-            Ok(Some((cwd, mode))) => (cwd, mode),
-            Ok(None) => (None, "real".to_owned()),
-            Err(error) => {
-                tracing::warn!(
-                    run_id = payload.run_id,
-                    %error,
-                    "pretooluse-decision: failed to resolve cwd for in-flight run"
-                );
-                (None, "real".to_owned())
-            }
+    // `mode` is resolved for EVERY request, in flight or not, because it decides WHICH set of rules
+    // applies — and a run that has left `run_handles` is exactly when defaulting to `real` is most
+    // dangerous: the classifier permits `Read` there, so an email triage run would be handed the one
+    // tool the pillar exists to keep away from a stranger's text. `cwd` stays behind the in-flight
+    // check: it only feeds the classifier's path sensitivity, which is meaningful for a run that is
+    // actually executing.
+    let (cwd, mode) = match sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT cwd, mode FROM runs WHERE id = ?",
+    )
+    .bind(payload.run_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some((cwd, mode))) => (is_in_flight.then_some(cwd).flatten(), mode),
+        Ok(None) => (None, "real".to_owned()),
+        Err(error) => {
+            tracing::warn!(
+                run_id = payload.run_id,
+                %error,
+                "pretooluse-decision: failed to resolve the run's mode"
+            );
+            (None, "real".to_owned())
         }
-    } else {
-        (None, "real".to_owned())
     };
 
-    // Orchestrator (assistant) turns are already constrained to the NucleOS MCP tools by
-    // `--allowedTools` and delegate all real work to governed runs, so they must NOT go through the
-    // autopilot classifier — doing so would terminate the turn and mint action-approval proposals it
+    // Barrier 2 of spec §5.5. A triage run is launched with no tools at all (barrier 1), so a tool
+    // call arriving here means barrier 1 is not in force — which is the entire reason this branch
+    // exists. There is no allowlist and no read-only exception: the run's whole job is to read text
+    // a stranger wrote and answer with a verdict, and every tool is a way for that text to act.
+    //
+    // It returns before the classifier, so it never terminates the run and never mints a proposal.
+    if mode == crate::email::TRIAGE_MODE {
+        tracing::warn!(
+            run_id = payload.run_id,
+            tool = %payload.tool_name,
+            "pretooluse-decision: a triage run attempted a tool — barrier 1 is not in force"
+        );
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: "email triage runs have no tools".to_owned(),
+        });
+    }
+
+    // Orchestrator (assistant) turns are constrained to the NucleOS MCP tools by their tool policy
+    // (`ToolPolicy::McpOnly`) and delegate all real work to governed runs, so they must NOT go
+    // through the autopilot classifier — doing so would terminate the turn and mint action-approval proposals it
     // can never satisfy (a resume expects a worktree run). Allow the sanctioned MCP tools, block
     // everything else, and never create a proposal or terminate the turn.
     if mode == "assistant" {
@@ -98,14 +118,18 @@ pub async fn pretooluse_decision(
     );
 
     if mode == "shadow" {
-        if let Err(error) = shadow::record_decision(
-            &state.pool,
-            payload.run_id,
-            &payload.tool_name,
-            &payload.tool_input,
-            &classification,
-        )
-        .await
+        // Gated on the run being in flight, which is what the mode lookup above used to guarantee
+        // implicitly. A scoreboard is a record of decisions taken over live runs; a stray call
+        // naming a finished run is not one of those.
+        if is_in_flight
+            && let Err(error) = shadow::record_decision(
+                &state.pool,
+                payload.run_id,
+                &payload.tool_name,
+                &payload.tool_input,
+                &classification,
+            )
+            .await
         {
             tracing::warn!(
                 run_id = payload.run_id,
@@ -130,6 +154,7 @@ pub async fn pretooluse_decision(
     }
 
     if mode == "worktree"
+        && is_in_flight
         && let Err(error) = shadow::record_decision(
             &state.pool,
             payload.run_id,
@@ -304,6 +329,7 @@ mod tests {
             pool,
             runner: Arc::new(FakeCommandRunner::default()),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }
@@ -367,6 +393,147 @@ mod tests {
             .insert(run_id, task.abort_handle());
 
         run_id
+    }
+
+    /// A `runs` row without an abort handle: the run exists and its mode is on record, but nothing
+    /// is executing under it. Every barrier that reads `mode` has to hold here too, because this is
+    /// the state a run passes through on its way out — and the state a forged request would claim.
+    async fn out_of_flight_run(state: &AppState, mode: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'completed', ?, '2026-07-28T00:00:00Z')",
+        )
+        .bind(mode)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// The single most important assertion in this pillar: a triage run gets NO tool, of any kind.
+    /// Barrier 1 means the CLI should never offer one — this is what happens if it does.
+    #[tokio::test]
+    async fn a_triage_run_is_denied_every_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::email::TRIAGE_MODE, None, None, None).await;
+        let app = test_router(state);
+
+        for (tool, input) in [
+            ("Bash", serde_json::json!({"command": "ls -la"})),
+            ("Read", serde_json::json!({"file_path": "/etc/passwd"})),
+            (
+                "Edit",
+                serde_json::json!({"file_path": "a", "new_string": "b"}),
+            ),
+            (
+                "Write",
+                serde_json::json!({"file_path": "a", "content": "b"}),
+            ),
+            ("Grep", serde_json::json!({"pattern": "secret"})),
+            ("Glob", serde_json::json!({"pattern": "**/*.env"})),
+            ("mcp__nucleos__create_run", serde_json::json!({})),
+            (
+                "mcp__claude_ai_Google_Drive__create_file",
+                serde_json::json!({}),
+            ),
+        ] {
+            let body = serde_json::json!({
+                "run_id": run_id,
+                "tool_name": tool,
+                "tool_input": input,
+            })
+            .to_string();
+            let decision = decide(&app, &body).await;
+            assert_eq!(decision.decision, "deny", "{tool} must be denied");
+            assert_eq!(decision.reason, "email triage runs have no tools");
+        }
+    }
+
+    /// `ls -la` is the case that proves the fallthrough was real: the classifier calls it
+    /// read-local and ALLOWS it, so before `mode` was resolved for out-of-flight runs, a triage run
+    /// that had left `run_handles` was handed a shell.
+    #[tokio::test]
+    async fn a_triage_run_stays_denied_once_it_leaves_the_handle_map() {
+        let state = test_state().await;
+        let run_id = out_of_flight_run(&state, crate::email::TRIAGE_MODE).await;
+        let app = test_router(state);
+
+        let body = serde_json::json!({
+            "run_id": run_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls -la"},
+        })
+        .to_string();
+        let decision = decide(&app, &body).await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "email triage runs have no tools");
+    }
+
+    #[tokio::test]
+    async fn an_out_of_flight_orchestrator_turn_is_denied_rather_than_classified() {
+        let state = test_state().await;
+        let run_id = out_of_flight_run(&state, "assistant").await;
+        let app = test_router(state);
+
+        let body = serde_json::json!({
+            "run_id": run_id,
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/etc/passwd"},
+        })
+        .to_string();
+        let decision = decide(&app, &body).await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(
+            decision.reason,
+            "the orchestrator is restricted to NucleOS tools"
+        );
+    }
+
+    /// The no-regression half of the lift: resolving `mode` outside the in-flight check must not
+    /// have narrowed what a shadow run may do.
+    #[tokio::test]
+    async fn an_out_of_flight_shadow_run_still_allows_read_only_tools() {
+        let state = test_state().await;
+        let run_id = out_of_flight_run(&state, "shadow").await;
+        let app = test_router(state);
+
+        for tool in ["Read", "Grep", "Glob"] {
+            let body = serde_json::json!({
+                "run_id": run_id,
+                "tool_name": tool,
+                "tool_input": {"file_path": "src/main.rs", "pattern": "fn"},
+            })
+            .to_string();
+            let decision = decide(&app, &body).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+    }
+
+    /// The scoreboard records decisions taken over live runs. A call naming a run that is no longer
+    /// executing is not one, and counting it would quietly inflate the promotion gate's evidence.
+    #[tokio::test]
+    async fn an_out_of_flight_run_records_no_shadow_decision() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let shadow_id = out_of_flight_run(&state, "shadow").await;
+        let worktree_id = out_of_flight_run(&state, "worktree").await;
+        let app = test_router(state);
+
+        for run_id in [shadow_id, worktree_id] {
+            let body = serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/main.rs"},
+            })
+            .to_string();
+            decide(&app, &body).await;
+        }
+
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(recorded, 0);
     }
 
     #[tokio::test]

@@ -28,6 +28,10 @@ pub enum ToolPolicy {
     Unrestricted,
     /// Only the NucleOS MCP server: every built-in denied, every ambient MCP server dropped.
     McpOnly,
+    /// No tools at all. The run reads its prompt and answers; it cannot reach the filesystem, the
+    /// shell, or the network. This is what lets a run process untrusted third-party content at all
+    /// (spec §5.5), and it is the CLI's own refusal rather than a hook's cooperation.
+    None,
 }
 
 /// Built-in tool names denied under `ToolPolicy::McpOnly`.
@@ -116,14 +120,53 @@ pub(crate) fn cli_args(
         args.push("--allowedTools".to_string());
         args.push("mcp__nucleos__*".to_string());
     }
-    if tool_policy == ToolPolicy::McpOnly {
-        // Drops every MCP server this user happens to have configured — the ambient surface a
-        // spawned run inherits otherwise includes file-writing connectors.
-        args.push("--strict-mcp-config".to_string());
-        args.push("--disallowedTools".to_string());
-        args.push(BUILTIN_TOOLS.join(","));
+    match tool_policy {
+        ToolPolicy::Unrestricted => {}
+        ToolPolicy::McpOnly => {
+            // Drops every MCP server this user happens to have configured — the ambient surface a
+            // spawned run inherits otherwise includes file-writing connectors.
+            args.push("--strict-mcp-config".to_string());
+            args.push("--disallowedTools".to_string());
+            args.push(BUILTIN_TOOLS.join(","));
+        }
+        // Measured against CLI 2.1.198: this yields an `init` event advertising NO tools at all —
+        // the capability is absent rather than refused, so there is nothing for a prompt injected
+        // into a mail body to talk the model into reaching for. `--strict-mcp-config` is redundant
+        // under the wildcard and passed anyway, so a future narrowing of one is not a silent
+        // widening of the other.
+        ToolPolicy::None => {
+            args.push("--strict-mcp-config".to_string());
+            args.push("--disallowedTools".to_string());
+            args.push("*".to_string());
+        }
     }
     args
+}
+
+/// The final text of a `claude -p --output-format stream-json` run.
+///
+/// This lives at the núcleo↔CLI boundary because knowing the CLI's output format is this module's
+/// job — every caller that needs the answer of a run needs the same parse, and a second copy of it
+/// would drift the day the format does.
+///
+/// Each line is a JSON object; the reply is the last non-empty `result` string. `None` means there
+/// was no such event, and callers fall back to the raw stream rather than lose the output.
+pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
+    let mut reply: Option<String> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v.get("type").and_then(|t| t.as_str()) == Some("result")
+            && let Some(text) = v.get("result").and_then(|r| r.as_str())
+            && !text.trim().is_empty()
+        {
+            reply = Some(text.to_string());
+        }
+    }
+    reply
 }
 
 #[async_trait]
@@ -421,6 +464,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_reply_pulls_the_result_text() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}
+{"type":"result","subtype":"success","result":"Here are your projects: alpha, beta.","total_cost_usd":0.08}"#;
+
+        assert_eq!(
+            extract_reply(stdout),
+            Some("Here are your projects: alpha, beta.".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_reply_returns_none_without_result_event() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#;
+
+        assert_eq!(extract_reply(stdout), None);
+    }
+
+    /// The transcript a triage run actually produces: the model's own text arrives in a `content`
+    /// array several events BEFORE the `result`, and any parse that takes the first JSON array it
+    /// sees would answer with the model's thinking instead of its verdict.
+    #[test]
+    fn extract_reply_ignores_content_arrays_before_the_result() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s","tools":[]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"[{\"uid\": 1, \"class\": \"noise\"}]"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"reconsidering"}]}}
+{"type":"result","subtype":"success","result":"[{\"uid\": 1, \"class\": \"urgent\", \"summary\": \"server down\"}]","total_cost_usd":0.02}"#;
+
+        let reply = extract_reply(stdout).expect("the result event carries the verdict");
+        assert!(reply.contains("urgent"), "{reply}");
+        assert!(!reply.contains("noise"), "the draft must not win: {reply}");
+    }
+
     fn args_for(policy: ToolPolicy, mcp: Option<&Path>) -> Vec<String> {
         cli_args("triage this", "sonnet", false, None, mcp, policy)
     }
@@ -465,6 +543,21 @@ mod tests {
     #[test]
     fn mcp_only_drops_the_ambient_mcp_servers() {
         let args = args_for(ToolPolicy::McpOnly, None);
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    /// Barrier 1 of spec §5.5. Measured against CLI 2.1.198, a wildcard deny yields an `init` event
+    /// advertising no tools at all — the capability is absent, not refused, so a prompt injected
+    /// into a mail body has nothing to talk the model into reaching for.
+    #[test]
+    fn the_no_tools_policy_denies_everything() {
+        let args = args_for(ToolPolicy::None, None);
+        let denied = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("the triage policy must deny tools");
+        assert_eq!(denied, "*");
         assert!(args.iter().any(|a| a == "--strict-mcp-config"));
     }
 

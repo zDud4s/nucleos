@@ -213,6 +213,7 @@ fn spawn_run(
     resume_session_id: Option<String>,
     completion_feed: Option<(String, String)>,
     max_attempts: u32,
+    tool_policy: crate::runner::ToolPolicy,
 ) {
     let pool = state.pool.clone();
     let runner = state.runner.clone();
@@ -248,8 +249,7 @@ fn spawn_run(
                     plan_only,
                     resume_session_id.as_deref(),
                     None,
-                    // Autopilot runs need real tools; the hook and the classifier govern them.
-                    crate::runner::ToolPolicy::Unrestricted,
+                    tool_policy,
                     session_tx,
                 ),
             )
@@ -397,6 +397,15 @@ pub async fn create_run_inner(
     };
 
     let plan_only = mode == "shadow";
+    // Barrier 1 of spec §5.5, derived here for the same reason `plan_only` is: the mode is what the
+    // caller asked for, and `spawn_run` must not learn to read modes. A triage run handles content
+    // written by strangers, so it launches with no tools rather than trusting the hook to refuse
+    // each one.
+    let tool_policy = if mode == crate::email::TRIAGE_MODE {
+        crate::runner::ToolPolicy::None
+    } else {
+        crate::runner::ToolPolicy::Unrestricted
+    };
     let mut spawn_cwd = cwd.clone().map(std::path::PathBuf::from);
     let mut completion_feed = plan_only.then(|| {
         (
@@ -470,6 +479,7 @@ pub async fn create_run_inner(
         None,
         completion_feed,
         max_attempts,
+        tool_policy,
     );
 
     Ok(id)
@@ -579,6 +589,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             format!("resumed run completed on nucleos/run-{original_run_id}"),
         )),
         1,
+        // A resume continues an approved worktree run, which is autopilot work: the hook and the
+        // classifier govern it, exactly as they governed the run being resumed.
+        crate::runner::ToolPolicy::Unrestricted,
     );
 
     Ok(resume_id)
@@ -787,6 +800,7 @@ mod tests {
             pool,
             runner: runner.clone(),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout,
         };
         (state, runner)
@@ -1214,6 +1228,36 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run did not reach completed status in time, last status: {status}");
+    }
+
+    /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by
+    /// strangers, so the CLI must launch unable to touch anything — and every other mode must keep
+    /// the tools its work depends on, or this hardening silently breaks the autopilot.
+    #[tokio::test]
+    async fn only_a_triage_run_launches_without_tools() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+
+        for (mode, expected) in [
+            (crate::email::TRIAGE_MODE, crate::runner::ToolPolicy::None),
+            ("real", crate::runner::ToolPolicy::Unrestricted),
+            ("shadow", crate::runner::ToolPolicy::Unrestricted),
+        ] {
+            *runner.last_tool_policy.lock().unwrap() = None;
+            create_run_inner(&state, "prompt".into(), None, None, mode)
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if runner.last_tool_policy.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                *runner.last_tool_policy.lock().unwrap(),
+                Some(expected),
+                "mode {mode}"
+            );
+        }
     }
 
     #[tokio::test]

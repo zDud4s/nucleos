@@ -472,6 +472,7 @@ mod tests {
                 ..Default::default()
             }),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: DEFAULT_RUN_TIMEOUT,
         }
     }

@@ -124,6 +124,11 @@ pub fn classify_noise(
     None
 }
 
+/// The `runs.mode` a triage run carries. It is what `create_run_inner` reads to launch the CLI
+/// with no tools (§5.5, barrier 1) and what `hooks.rs` reads to deny every tool call (barrier 2),
+/// so the two barriers are keyed on the same fact rather than on two independent conditions.
+pub const TRIAGE_MODE: &str = "email_triage";
+
 /// Bodies are capped before storage: a triage prompt does not get better with a megabyte of
 /// quoted thread, and the cap bounds how much untrusted content sits at rest.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;

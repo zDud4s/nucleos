@@ -25,6 +25,92 @@ pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// `.ai/email.yaml` (spec §3.4). Every field has a default, so a partial file is valid and an
+/// absent one switches the pillar off in silence rather than blocking startup.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EmailConfig {
+    /// Opt-in. The pillar reads a real mailbox, so nothing about it starts by accident.
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub mailbox: String,
+    pub poll_interval_secs: u64,
+    /// Which triage classes are worth interrupting a person for.
+    ///
+    /// An EMPTY list is a valid value meaning "notify about nothing" — only an ABSENT key gives
+    /// the `["urgent"]` default. The distinction carries the rollout's first week (spec §9), where
+    /// the whole point is to watch the classifier without being paged by it; treating `[]` as
+    /// absent would notify from day one and burn the calibration ramp.
+    pub notify_classes: Vec<String>,
+    /// Hour (UTC) the daily digest is emitted. Validated to `0..=21` so its two-hour window cannot
+    /// straddle midnight and emit twice (§6.3).
+    pub digest_hour_utc: u8,
+    /// How long a classified message keeps its body (§7.2). Defaults to 14 rather than 0 because
+    /// the pillar's first state after being switched on is always the calibration week, which is
+    /// exactly when the bodies are needed. Capped at 30, where row pruning removes the row anyway.
+    pub retain_bodies_days: u8,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: 993,
+            username: String::new(),
+            mailbox: "INBOX".to_string(),
+            poll_interval_secs: 300,
+            notify_classes: vec!["urgent".to_string()],
+            digest_hour_utc: 7,
+            retain_bodies_days: 14,
+        }
+    }
+}
+
+impl EmailConfig {
+    /// Clamps the two validated fields, warning about what it changed. Out-of-range values are
+    /// corrected rather than fatal, for the same reason the whole file is: nothing in this config
+    /// is worth refusing to start the daemon over.
+    fn validated(mut self) -> Self {
+        if self.digest_hour_utc > 21 {
+            tracing::warn!(
+                digest_hour_utc = self.digest_hour_utc,
+                "email config: digest_hour_utc must be 0..=21 so the window cannot cross midnight; using 7"
+            );
+            self.digest_hour_utc = 7;
+        }
+        if self.retain_bodies_days > 30 {
+            tracing::warn!(
+                retain_bodies_days = self.retain_bodies_days,
+                "email config: retain_bodies_days must be 0..=30; using 30"
+            );
+            self.retain_bodies_days = 30;
+        }
+        self
+    }
+}
+
+/// Reads `.ai/email.yaml`. Absent or unreadable → defaults, with a warning; never an error, so a
+/// typo in an optional pillar's config cannot stop the daemon from starting.
+pub fn load_email_config(path: &Path) -> EmailConfig {
+    if !path.exists() {
+        return EmailConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<EmailConfig>(&text)) {
+        Ok(Ok(config)) => config.validated(),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "email config: could not be parsed; the pillar stays off");
+            EmailConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "email config: could not be read; the pillar stays off");
+            EmailConfig::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ScheduleRule {
     pub name: String,
@@ -61,6 +147,83 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn email_config_from(yaml: &str) -> EmailConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("email.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        load_email_config(&path)
+    }
+
+    #[test]
+    fn an_absent_email_config_leaves_the_pillar_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_email_config(&dir.path().join("email.yaml"));
+        assert_eq!(config, EmailConfig::default());
+        assert!(!config.enabled);
+    }
+
+    /// A typo in an optional pillar's config must not stop the daemon from starting.
+    #[test]
+    fn an_unparseable_email_config_leaves_the_pillar_off() {
+        assert_eq!(
+            email_config_from("enabled: [this is not a bool"),
+            EmailConfig::default()
+        );
+    }
+
+    #[test]
+    fn a_partial_email_config_keeps_the_defaults_for_the_rest() {
+        let config = email_config_from("enabled: true\nhost: imap.gmail.com\nusername: me@x.com\n");
+        assert!(config.enabled);
+        assert_eq!(config.host, "imap.gmail.com");
+        assert_eq!(config.port, 993);
+        assert_eq!(config.mailbox, "INBOX");
+        assert_eq!(config.notify_classes, vec!["urgent".to_string()]);
+        assert_eq!(config.retain_bodies_days, 14);
+    }
+
+    /// The distinction the rollout's first week depends on: an EMPTY list means "notify about
+    /// nothing", and only an absent key means "urgent". Collapsing the two would page the user from
+    /// day one and burn the calibration ramp.
+    #[test]
+    fn an_empty_notify_list_is_a_real_setting() {
+        assert_eq!(
+            email_config_from("notify_classes: []\n").notify_classes,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            email_config_from("enabled: true\n").notify_classes,
+            vec!["urgent".to_string()]
+        );
+    }
+
+    /// A window starting after 21:00 UTC would cross midnight and emit two digests (§6.3).
+    #[test]
+    fn a_digest_hour_that_would_cross_midnight_is_corrected() {
+        assert_eq!(
+            email_config_from("digest_hour_utc: 23\n").digest_hour_utc,
+            7
+        );
+        assert_eq!(
+            email_config_from("digest_hour_utc: 21\n").digest_hour_utc,
+            21
+        );
+        assert_eq!(email_config_from("digest_hour_utc: 0\n").digest_hour_utc, 0);
+    }
+
+    /// Above 30 days the row itself is gone, so a larger value would keep nothing extra (§7.2).
+    #[test]
+    fn retention_is_capped_at_the_row_pruning_horizon() {
+        assert_eq!(
+            email_config_from("retain_bodies_days: 90\n").retain_bodies_days,
+            30
+        );
+        assert_eq!(
+            email_config_from("retain_bodies_days: 0\n").retain_bodies_days,
+            0
+        );
+    }
 
     #[test]
     fn missing_file_returns_default() {

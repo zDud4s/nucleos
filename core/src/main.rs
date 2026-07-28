@@ -23,6 +23,7 @@ mod shadow;
 mod sidecar;
 mod state;
 mod storage;
+mod triage;
 mod wip;
 mod worktree;
 
@@ -149,12 +150,24 @@ async fn main() {
         config::ModelsConfig::default()
     });
 
+    let email_config = config::load_email_config(std::path::Path::new(".ai/email.yaml"));
+    // Built whether or not the pillar is enabled: it is two small files, and having it always in a
+    // known state means enabling email later is a config edit rather than a fresh directory.
+    let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
+    if let Err(error) = triage::ensure_sandbox(&triage_sandbox) {
+        tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
+    }
+
     let state = AppState {
         token: Token(token_value),
         pool,
         runner: Arc::new(runner::ClaudeCliRunner {
             model: models_config.claude_model.clone(),
         }),
+        email: Arc::new(state::EmailRuntime::from_config(
+            &email_config,
+            triage_sandbox,
+        )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
@@ -201,5 +214,37 @@ async fn main() {
     tokio::spawn(scheduler::run_scheduler(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
+
+    // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
+    // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a
+    // daemon that is not up yet produces `ask_daemon.py`'s fail-closed `block`, which looks like
+    // success and proves nothing (spec §5.5). Hence a task that waits for `axum::serve` below
+    // rather than a check inline here.
+    if state.email.enabled {
+        let state = state.clone();
+        tokio::spawn(async move {
+            match triage::verify_hook_barrier(
+                &state.pool,
+                &state.email.sandbox,
+                "http://127.0.0.1:8791",
+                &state.token.0,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("email triage barrier verified — the pillar is armed");
+                }
+                // Off rather than unprotected. The pillar's whole premise is that untrusted content
+                // never meets a tool, and an unproven barrier is not a barrier.
+                Err(error) => tracing::error!(
+                    %error,
+                    "email triage barrier could not be verified — the pillar stays OFF"
+                ),
+            }
+        });
+    } else {
+        tracing::info!("email pillar disabled (.ai/email.yaml: enabled: false)");
+    }
+
     axum::serve(listener, app).await.unwrap();
 }

@@ -2,27 +2,7 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
-/// Extract the assistant's final text from `claude -p --output-format stream-json` output.
-/// Each line is a JSON object; the final `{"type":"result", "result":"<text>", ...}` event holds
-/// the reply. Returns the last non-empty `result` string, or None if there is no such event
-/// (caller falls back to the raw stream so nothing is silently lost).
-fn extract_reply(stdout: &str) -> Option<String> {
-    let mut reply: Option<String> = None;
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-            && v.get("type").and_then(|t| t.as_str()) == Some("result")
-            && let Some(text) = v.get("result").and_then(|r| r.as_str())
-            && !text.trim().is_empty()
-        {
-            reply = Some(text.to_string());
-        }
-    }
-    reply
-}
+use crate::runner::extract_reply;
 
 static BUSY_CHATS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -270,26 +250,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[test]
-    fn extract_reply_pulls_the_result_text() {
-        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}
-{"type":"result","subtype":"success","result":"Here are your projects: alpha, beta.","total_cost_usd":0.08}"#;
-
-        assert_eq!(
-            extract_reply(stdout),
-            Some("Here are your projects: alpha, beta.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reply_returns_none_without_result_event() {
-        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#;
-
-        assert_eq!(extract_reply(stdout), None);
-    }
-
     async fn test_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -310,6 +270,7 @@ mod tests {
             pool: test_pool().await,
             runner: Arc::new(FakeCommandRunner::default()),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }

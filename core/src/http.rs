@@ -722,6 +722,7 @@ mod tests {
             pool,
             runner: Arc::new(FakeCommandRunner::default()),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }
@@ -966,6 +967,7 @@ mod tests {
             pool: pool.clone(),
             runner: Arc::new(FakeCommandRunner::default()),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };
 
