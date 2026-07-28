@@ -57,13 +57,22 @@ pub async fn pretooluse_decision(
     {
         Ok(Some((cwd, mode))) => (is_in_flight.then_some(cwd).flatten(), mode),
         Ok(None) => (None, "real".to_owned()),
+        // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
+        // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
+        // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
+        // the run may well be a triage or shadow run whose barrier we would be stepping over, and
+        // the pool this reads through is shared with feed appends and run-status writes, so
+        // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
         Err(error) => {
             tracing::warn!(
                 run_id = payload.run_id,
                 %error,
-                "pretooluse-decision: failed to resolve the run's mode"
+                "pretooluse-decision: failed to resolve the run's mode — failing closed"
             );
-            (None, "real".to_owned())
+            return Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "could not resolve the run's mode — failing closed".to_owned(),
+            });
         }
     };
 
@@ -1119,6 +1128,34 @@ mod tests {
                 .await
                 .unwrap();
         assert!(consumed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_database_error_resolving_the_mode_denies() {
+        // `mode` decides WHICH rules apply, so failing to read it is not a reason to pick the most
+        // permissive one. This is the `Err` twin of the `Ok(None)` case: an email-triage run whose
+        // mode read fails must not be handed `Read`, the one tool the pillar exists to keep away
+        // from a stranger's text. A gate that cannot be read is not permission.
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::email::TRIAGE_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        // A closed pool makes every query error — the cheapest faithful stand-in for the SQLITE_BUSY
+        // this handler shares a pool with feed appends and run-status writes to earn.
+        state.pool.close().await;
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Read",
+                "tool_input": {"file_path": "README.md"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
     }
 
     #[tokio::test]
