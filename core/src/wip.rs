@@ -39,9 +39,25 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
         .map(Option::flatten)
 }
 
-/// How many proposals a project has waiting on the human right now.
+/// How much a project has waiting on the human right now.
+///
+/// Both kinds of waiting, not just proposals. A shadow run never mints a proposal — it records
+/// `shadow_decisions` for review instead — so counting proposals alone meant the brake was inert in
+/// the one mode whose entire purpose is to accumulate reviewable evidence. A busy watched branch
+/// could pile up an unbounded backlog while this kept answering Allow, which is precisely the
+/// failure §8.4 describes: the system generating faster than the human reviews.
+///
+/// Kept as one query so the roster's `queue_full` flag and this gate stay the same arithmetic.
+pub const OPEN_REVIEW_ITEMS_SQL: &str = "SELECT
+    (SELECT COUNT(*) FROM proposals
+     WHERE project_id = ?1 AND status = 'pending')
+    +
+    (SELECT COUNT(*) FROM shadow_decisions
+     JOIN runs ON shadow_decisions.run_id = runs.id
+     WHERE runs.project_id = ?1 AND shadow_decisions.human_verdict IS NULL)";
+
 pub async fn open_proposals(pool: &SqlitePool, project_id: &str) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE project_id = ? AND status = 'pending'")
+    sqlx::query_scalar(OPEN_REVIEW_ITEMS_SQL)
         .bind(project_id)
         .fetch_one(pool)
         .await
@@ -110,6 +126,34 @@ mod tests {
             .unwrap();
     }
 
+    /// Shadow work waiting for review: a run owned by the project, plus decisions recorded under it
+    /// with no human verdict yet. This is what a shadow run actually produces — no proposal is ever
+    /// minted — which is why the brake has to see it.
+    async fn add_unreviewed_shadow_decisions(pool: &SqlitePool, project_id: &str, count: usize) {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES (?, 'shadow work', 'completed', 'shadow', '2026-07-27T00:00:00Z')",
+        )
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        for index in 0..count {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, decision, action_class, classifier_version, created_at)
+                 VALUES (?, 'Bash', 'allow', 'read-local', 2, ?)",
+            )
+            .bind(run_id)
+            .bind(format!("2026-07-27T00:0{index}:00Z"))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     async fn add_pending_proposals(pool: &SqlitePool, project_id: &str, count: usize) {
         for index in 0..count {
             sqlx::query(
@@ -131,6 +175,53 @@ mod tests {
         assert!(queue_full(3, Some(3)));
         // Over the line (a limit lowered under an existing queue) still counts as full.
         assert!(queue_full(5, Some(3)));
+    }
+
+    /// The brake counted `proposals`, and a shadow run never mints one — it records
+    /// `shadow_decisions` for the human to review instead. So the one mode whose entire purpose is
+    /// to accumulate reviewable evidence was the one mode the review-backlog brake ignored, and a
+    /// busy watched branch could pile up an unbounded queue while `wip_permits_new_run` kept
+    /// answering Allow.
+    #[tokio::test]
+    async fn unreviewed_shadow_decisions_count_towards_the_queue() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_unreviewed_shadow_decisions(&pool, "project-a", 3).await;
+
+        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 3);
+        assert!(matches!(
+            wip_permits_new_run(&pool, "project-a").await,
+            WipDecision::Defer { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reviewed_shadow_decision_releases_the_brake() {
+        // Self-clearing is the property that makes this brake tolerable: it has to throttle on what
+        // is actually saturated, and release the moment the human clears it.
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_unreviewed_shadow_decisions(&pool, "project-a", 3).await;
+        sqlx::query("UPDATE shadow_decisions SET human_verdict = 'approve' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 2);
+        assert!(matches!(
+            wip_permits_new_run(&pool, "project-a").await,
+            WipDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn proposals_and_shadow_decisions_add_up() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_pending_proposals(&pool, "project-a", 2).await;
+        add_unreviewed_shadow_decisions(&pool, "project-a", 1).await;
+
+        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 3);
     }
 
     #[tokio::test]

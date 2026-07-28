@@ -190,10 +190,20 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                  FROM runs
                  WHERE runs.project_id = state.project_id
                    AND runs.status = 'awaiting_approval') AS pending,
+                -- Same arithmetic as `wip::open_proposals`, deliberately: the flag the shell renders
+                -- and the gate the daemon enforces must not be able to disagree. Shadow decisions
+                -- count because a shadow run mints no proposal, so counting proposals alone left
+                -- the brake invisible in the mode that generates the most review work.
                 (SELECT COUNT(*)
                  FROM proposals
                  WHERE proposals.project_id = state.project_id
-                   AND proposals.status = 'pending') AS open_proposals,
+                   AND proposals.status = 'pending')
+                +
+                (SELECT COUNT(*)
+                 FROM shadow_decisions
+                 JOIN runs ON shadow_decisions.run_id = runs.id
+                 WHERE runs.project_id = state.project_id
+                   AND shadow_decisions.human_verdict IS NULL) AS open_proposals,
                 state.wip_limit AS wip_limit
          FROM autopilot_state AS state
          ORDER BY state.project_id",
@@ -584,7 +594,12 @@ mod tests {
                 classes_ready: 0,
                 classes_total: 1,
                 promotable: false,
-                open_proposals: 0,
+                // The one unreviewed shadow decision seeded above. It counts here as well as in
+                // `pending`, because the WIP brake throttles on everything waiting for a human and
+                // a shadow run mints no proposal to stand for it. The overlap is deliberate:
+                // `pending` is what the person is shown, `open_proposals` is what the brake
+                // measures, and both have to see the same backlog.
+                open_proposals: 1,
                 wip_limit: Some(3),
                 queue_full: false,
             }]
