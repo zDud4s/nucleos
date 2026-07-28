@@ -112,9 +112,11 @@ pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Res
 /// the classifier. `approve` agrees only with `allow`; `reject` agrees with both `deny` and
 /// `pending_approval` (rejecting an action the classifier already withheld IS agreement).
 ///
-/// Shared by `scoreboard` and `shadow_readiness` on purpose: the scoreboard is what the human reads
-/// to decide whether to trust a project, and the readiness bar is what gates the promotion — the two
-/// must never be computed from different arithmetic.
+/// Used by `scoreboard`, which reports ACTIVITY: how many decisions were taken and how the human
+/// judged each one. `shadow_readiness` deliberately does not share it — the gate counts distinct
+/// ACTIONS (see `REVIEWED_DISTINCT`), because ten reviews of one command are ten data points about
+/// the same thing. Same rule for what counts as agreement, applied to different units, and the
+/// scoreboard's column headings are what tell the two apart on screen.
 const AGREE_CASE: &str = "CASE
     WHEN shadow_decisions.human_verdict = 'approve'
          AND shadow_decisions.decision = 'allow' THEN 1
@@ -122,6 +124,37 @@ const AGREE_CASE: &str = "CASE
          AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
     ELSE 0
 END";
+
+/// Distinct reviewed ACTIONS, not reviewed rows.
+///
+/// Ten reviews of the same `ls` are one piece of evidence about the classifier, not ten. Counting
+/// rows meant a single shadow run looping one harmless command, bulk-approved, cleared its class
+/// and unlocked active mode having proved nothing about anything risky. The tool name joins the
+/// key because a `Read` of a path and a `Bash` touching it are different actions, and `char(31)`
+/// is the unit separator, so the two fields cannot run together into a colliding string.
+const REVIEWED_DISTINCT: &str =
+    "COUNT(DISTINCT CASE WHEN shadow_decisions.human_verdict IS NOT NULL
+        THEN shadow_decisions.tool_name || char(31) || COALESCE(shadow_decisions.tool_input, '')
+    END)";
+
+/// Distinct actions the classifier got right: reviewed, minus every action a human EVER rejected.
+///
+/// Subtracting disagreements rather than counting agreements, because the same action can be
+/// reviewed more than once. Counting agreements directly would let one approval cancel out a
+/// rejection of that very action, and an action anyone disagreed about is not evidence that the
+/// classifier handles it correctly.
+const AGREE_DISTINCT: &str = "COUNT(DISTINCT CASE WHEN shadow_decisions.human_verdict IS NOT NULL
+        THEN shadow_decisions.tool_name || char(31) || COALESCE(shadow_decisions.tool_input, '')
+    END)
+    - COUNT(DISTINCT CASE
+        WHEN shadow_decisions.human_verdict IS NOT NULL
+             AND NOT (
+                 (shadow_decisions.human_verdict = 'approve' AND shadow_decisions.decision = 'allow')
+                 OR (shadow_decisions.human_verdict = 'reject'
+                     AND shadow_decisions.decision IN ('deny', 'pending_approval'))
+             )
+        THEN shadow_decisions.tool_name || char(31) || COALESCE(shadow_decisions.tool_input, '')
+    END)";
 
 pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<ClassTally>> {
     let sql = format!(
@@ -190,8 +223,8 @@ pub async fn shadow_readiness(
         "SELECT
              runs.project_id AS project_id,
              shadow_decisions.action_class AS action_class,
-             SUM(CASE WHEN shadow_decisions.human_verdict IS NOT NULL THEN 1 ELSE 0 END) AS reviewed,
-             SUM({AGREE_CASE}) AS agree
+             {REVIEWED_DISTINCT} AS reviewed,
+             {AGREE_DISTINCT} AS agree
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.mode = 'shadow'
@@ -284,6 +317,9 @@ mod tests {
         .last_insert_rowid()
     }
 
+    /// A DISTINCT action each time. Readiness counts distinct actions rather than rows, so a helper
+    /// that reused one `tool_input` would quietly turn every arithmetic test into one piece of
+    /// evidence repeated N times — the exact thing readiness now refuses to accept.
     async fn insert_shadow(
         pool: &sqlx::SqlitePool,
         run_id: i64,
@@ -291,15 +327,37 @@ mod tests {
         decision: &str,
         verdict: Option<&str>,
     ) -> i64 {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        insert_shadow_with_input(
+            pool,
+            run_id,
+            action_class,
+            decision,
+            verdict,
+            &format!(r#"{{"command":"cmd-{unique}"}}"#),
+        )
+        .await
+    }
+
+    async fn insert_shadow_with_input(
+        pool: &sqlx::SqlitePool,
+        run_id: i64,
+        action_class: &str,
+        decision: &str,
+        verdict: Option<&str>,
+        tool_input: &str,
+    ) -> i64 {
         sqlx::query(
             "INSERT INTO shadow_decisions
              (run_id, tool_name, tool_input, decision, reason, action_class,
               classifier_version, human_verdict, reviewed_at, created_at)
-             VALUES (?, 'Bash', '{}', ?, 'test reason', ?, ?, ?,
+             VALUES (?, 'Bash', ?, ?, 'test reason', ?, ?, ?,
                      CASE WHEN ? IS NULL THEN NULL ELSE '2026-07-18T01:00:00Z' END,
                      '2026-07-18T00:00:00Z')",
         )
         .bind(run_id)
+        .bind(tool_input)
         .bind(decision)
         .bind(action_class)
         .bind(CLASSIFIER_VERSION as i64)
@@ -622,6 +680,68 @@ mod tests {
 
         assert_eq!(readiness.get("project-a").copied(), Some((1, 2)));
         assert!(!promotable(1, 2));
+    }
+
+    /// The promotion bar exists to say the classifier has been checked against enough real
+    /// variety. One command looped ten times and bulk-approved is one thing checked ten times, and
+    /// counting rows let exactly that unlock active mode.
+    #[tokio::test]
+    async fn repeating_one_action_does_not_earn_promotion() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..10 {
+            insert_shadow_with_input(
+                &pool,
+                run,
+                "read-local",
+                "allow",
+                Some("approve"),
+                r#"{"command":"ls"}"#,
+            )
+            .await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(
+            readiness.get("project-a").copied(),
+            Some((0, 1)),
+            "one action reviewed ten times is one piece of evidence"
+        );
+        assert!(!promotable(0, 1));
+    }
+
+    /// A person disagreeing about an action means the classifier does not handle it, however many
+    /// times it was also approved. Counting agreements per row let a later approval cancel out an
+    /// earlier rejection of the very same command.
+    #[tokio::test]
+    async fn an_action_ever_rejected_never_counts_as_agreement() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // Nine distinct actions the human agreed with.
+        for _ in 0..9 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        // A tenth action, rejected once and approved once — the classifier called it `allow`.
+        let contested = r#"{"command":"curl http://evil.test"}"#;
+        insert_shadow_with_input(&pool, run, "read-local", "allow", Some("reject"), contested)
+            .await;
+        insert_shadow_with_input(
+            &pool,
+            run,
+            "read-local",
+            "allow",
+            Some("approve"),
+            contested,
+        )
+        .await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        // 10 distinct actions reviewed, 9 agreed = 90%, under the 95% bar.
+        assert_eq!(readiness.get("project-a").copied(), Some((0, 1)));
     }
 
     #[tokio::test]

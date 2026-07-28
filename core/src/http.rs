@@ -3013,14 +3013,19 @@ mod tests {
             } else {
                 None
             };
+            // A DISTINCT action per row. Readiness counts distinct actions rather than rows, so
+            // seeding one repeated `tool_input` would seed one piece of evidence N times and the
+            // class would never clear the bar — which is the point of that rule, not a fixture
+            // detail to work around.
             sqlx::query(
                 "INSERT INTO shadow_decisions
                  (run_id, tool_name, tool_input, decision, reason, action_class,
                   classifier_version, human_verdict, reviewed_at, created_at)
-                 VALUES (?, 'Read', '{}', 'allow', 'seed', 'read-local', 1, ?, NULL,
+                 VALUES (?, 'Read', ?, 'allow', 'seed', 'read-local', 1, ?, NULL,
                          '2026-07-27T00:00:00Z')",
             )
             .bind(run_id)
+            .bind(format!(r#"{{"file_path":"seed-{index}.rs"}}"#))
             .bind(verdict)
             .execute(pool)
             .await
