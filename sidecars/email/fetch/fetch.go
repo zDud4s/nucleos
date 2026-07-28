@@ -11,6 +11,8 @@ package fetch
 
 import (
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,6 +24,7 @@ import (
 	imapv2 "github.com/emersion/go-imap/v2"
 
 	"nucleosemail/config"
+	"nucleosemail/daemon"
 	"nucleosemail/extract"
 	"nucleosemail/imap"
 )
@@ -34,6 +37,7 @@ const HeaderTimeout = 10 * time.Second
 func Serve(cfg config.Config) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/attachment", handler(cfg))
+	mux.HandleFunc("/attachments", allHandler(cfg))
 	server := &http.Server{
 		Addr:              cfg.FetchAddr,
 		Handler:           mux,
@@ -83,6 +87,76 @@ func handler(cfg config.Config) http.HandlerFunc {
 	}
 }
 
+// bulkAttachment is one entry of the all-at-once answer. The content is base64 because the payload
+// is JSON; it costs a third more over loopback and saves N-1 fetches of the whole message.
+type bulkAttachment struct {
+	Position  int    `json:"position"`
+	Filename  string `json:"filename,omitempty"`
+	MimeType  string `json:"mime_type,omitempty"`
+	SizeBytes int64  `json:"size_bytes"`
+	Content   string `json:"content_base64"`
+}
+
+// allHandler answers with every attachment of one message, read in a single pass.
+//
+// Worth its own route rather than a loop over the single one: that loop would fetch the entire
+// message once per attachment, so a message carrying eight files was downloaded eight times over
+// eight TLS connections to deliver the same bytes.
+func allHandler(cfg config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, cfg.DaemonToken) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		uid, err := requestUID(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		described, contents, err := readAll(cfg, uid)
+		if err != nil {
+			log.Printf("attachments of uid %d: %v", uid, err)
+			http.Error(w, "could not read the attachments", http.StatusBadGateway)
+			return
+		}
+
+		payload := make([]bulkAttachment, 0, len(described))
+		for _, attachment := range described {
+			content := contents[attachment.Position]
+			payload = append(payload, bulkAttachment{
+				Position:  attachment.Position,
+				Filename:  attachment.Filename,
+				MimeType:  attachment.MimeType,
+				SizeBytes: attachment.SizeBytes,
+				Content:   base64.StdEncoding.EncodeToString(content),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			log.Printf("writing attachments of uid %d: %v", uid, err)
+		}
+	}
+}
+
+func readAll(cfg config.Config, uid imapv2.UID) ([]daemon.Attachment, map[int][]byte, error) {
+	conn, err := imap.Dial(cfg.Addr(), cfg.Username, cfg.Password)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.Select(cfg.Mailbox); err != nil {
+		return nil, nil, err
+	}
+	raw, err := conn.Fetch(uid)
+	if err != nil {
+		return nil, nil, err
+	}
+	return extract.AllAttachments(raw.Body)
+}
+
 // authorized compares in constant time: a token checked with `==` leaks its prefix to anything that
 // can time the loopback interface.
 func authorized(r *http.Request, token string) bool {
@@ -95,16 +169,23 @@ func authorized(r *http.Request, token string) bool {
 }
 
 func request(r *http.Request) (imapv2.UID, int, error) {
-	query := r.URL.Query()
-	uid, err := strconv.ParseUint(query.Get("uid"), 10, 32)
-	if err != nil || uid == 0 {
-		return 0, 0, fmt.Errorf("uid must be a positive number")
+	uid, err := requestUID(r)
+	if err != nil {
+		return 0, 0, err
 	}
-	position, err := strconv.Atoi(query.Get("position"))
+	position, err := strconv.Atoi(r.URL.Query().Get("position"))
 	if err != nil || position < 0 {
 		return 0, 0, fmt.Errorf("position must be zero or more")
 	}
-	return imapv2.UID(uid), position, nil
+	return uid, position, nil
+}
+
+func requestUID(r *http.Request) (imapv2.UID, error) {
+	uid, err := strconv.ParseUint(r.URL.Query().Get("uid"), 10, 32)
+	if err != nil || uid == 0 {
+		return 0, fmt.Errorf("uid must be a positive number")
+	}
+	return imapv2.UID(uid), nil
 }
 
 // read opens its own connection rather than borrowing the poll loop's.

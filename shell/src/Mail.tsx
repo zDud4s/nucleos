@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  fetchAttachment, getEmail, getEmailQueue, listMailFiles, saveAttachment, triageEmail,
+  fetchAllAttachments, fetchAttachment, getEmail, getEmailQueue, listMailFiles,
+  saveAllAttachments, saveAttachment, triageEmail,
   type ConnectionState, type EmailAttachment, type EmailDetail, type QueuedEmail,
 } from "./api";
-import { formatBytes, mailLabel, mailTone, relativeTime, safeDownloadName } from "./derive";
+import {
+  base64ToBytes, formatBytes, mailLabel, mailTone, relativeTime, safeDownloadName,
+} from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
 
 interface OpenMessageProps {
@@ -24,9 +27,14 @@ interface OpenMessageProps {
 function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessageProps) {
   const [saving, setSaving] = useState<number | null>(null);
   const [filing, setFiling] = useState<number | null>(null);
+  const [bulk, setBulk] = useState<"saving" | "filing" | null>(null);
   const [folder, setFolder] = useState("");
   const [failed, setFailed] = useState<string | null>(null);
   const [filed, setFiled] = useState<string | null>(null);
+
+  // One flag for every action on this message: two downloads at once would race the same folder
+  // input, and a per-file button pressed mid-bulk would fetch the message a second time.
+  const busy = saving !== null || filing !== null || bulk !== null;
 
   if (loading) return <p className="a-note">A abrir…</p>;
   if (detail === null) return <ErrorNote>Could not open this message.</ErrorNote>;
@@ -41,15 +49,55 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
       setFailed("Could not fetch this file. It may have been deleted from the mailbox since.");
       return;
     }
-    // The bytes never touched a disk on the way here, so the browser's own download is what puts
-    // them somewhere — under a name made safe on this side, because going through a blob skips the
-    // `Content-Disposition` the daemon took care to build.
+    // The bytes never touched a disk on the way here; the browser's own download is what puts them
+    // somewhere.
+    offer(blob, file.filename);
+  }
+
+  // Puts one blob on disk under a name made safe here, because downloading through a blob is the
+  // only way to send the bearer token and it skips the `Content-Disposition` the daemon built.
+  function offer(blob: Blob, filename: string | null) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = safeDownloadName(file.filename);
+    link.download = safeDownloadName(filename);
     link.click();
     URL.revokeObjectURL(url);
+  }
+
+  // All of them, from ONE trip to the mailbox. A loop over the single fetch would pull the whole
+  // message once per attachment — eight files meant downloading all eight, eight times.
+  async function saveAll() {
+    if (detail === null) return;
+    setBulk("saving");
+    setFailed(null);
+    setFiled(null);
+    const all = await fetchAllAttachments(token, detail.id);
+    setBulk(null);
+    if (all === null) {
+      setFailed("Could not fetch these files. The message may have been deleted from the mailbox.");
+      return;
+    }
+    for (const attachment of all) {
+      offer(new Blob([base64ToBytes(attachment.content_base64)]), attachment.filename);
+    }
+  }
+
+  async function fileAll() {
+    if (detail === null) return;
+    setBulk("filing");
+    setFailed(null);
+    setFiled(null);
+    const stored = await saveAllAttachments(token, detail.id, folder);
+    setBulk(null);
+    if (stored === null) {
+      setFailed("Could not file these. Check the folder name.");
+      return;
+    }
+    setFiled(
+      `${stored.length} ficheiro${stored.length === 1 ? "" : "s"} → ${folder === "" ? "mail/" : `mail/${folder}/`}`,
+    );
+    onFiled();
   }
 
   // Filing writes into the mail folder, which is the one place a stranger's bytes land on this
@@ -94,6 +142,18 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
               {folders.map((name) => <option key={name} value={name} />)}
             </datalist>
           </label>
+          {/* All-at-once above the list, per-file beside each row: the same two actions at two
+              scales, so choosing one file is never harder than choosing every file. */}
+          <div className="mf-bulk">
+            <Button size="sm" disabled={busy} onClick={() => void saveAll()}>
+              {bulk === "saving"
+                ? "A obter…"
+                : `Descarregar ${detail.attachments.length} ficheiro${detail.attachments.length === 1 ? "" : "s"}`}
+            </Button>
+            <Button size="sm" disabled={busy} onClick={() => void fileAll()}>
+              {bulk === "filing" ? "A arquivar…" : "Arquivar todos"}
+            </Button>
+          </div>
           <ul className="mail-files">
             {detail.attachments.map((attachment) => (
               <li key={attachment.position}>
@@ -104,14 +164,14 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
                 </span>
                 <Button
                   size="sm"
-                  disabled={saving !== null || filing !== null}
+                  disabled={busy}
                   onClick={() => void save(attachment)}
                 >
                   {saving === attachment.position ? "A obter…" : "Descarregar"}
                 </Button>
                 <Button
                   size="sm"
-                  disabled={saving !== null || filing !== null}
+                  disabled={busy}
                   onClick={() => void file(attachment)}
                 >
                   {filing === attachment.position ? "A arquivar…" : "Arquivar"}

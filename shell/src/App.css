@@ -167,6 +167,9 @@
 }
 .mf-folder input:focus { outline: none; border-bottom-color: var(--gold-line); }
 
+/* The two all-at-once actions, above the per-file rows they summarise. */
+.mf-bulk { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); }
+
 .flat + .flat,
 .stack > * + * { margin-top: var(--sp-4); }
 

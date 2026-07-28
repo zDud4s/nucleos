@@ -296,3 +296,65 @@ func TestDeeplyNestedMessageTerminates(t *testing.T) {
 		t.Fatalf("a deeply nested message should parse to something, got %v", err)
 	}
 }
+
+// Two attachments, so the pairing between a description and its bytes is actually exercised: with
+// one of each, a function that returned the wrong content would still look right.
+func TestAllAttachmentsPairsEachDescriptionWithItsOwnBytes(t *testing.T) {
+	raw := "From: Ana <ana@company.com>\r\n" +
+		"Content-Type: multipart/mixed; boundary=\"B\"\r\n" +
+		"\r\n" +
+		"--B\r\n" +
+		"Content-Type: multipart/alternative; boundary=\"A\"\r\n" +
+		"\r\n" +
+		"--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"texto\r\n" +
+		"--A--\r\n" +
+		"--B\r\n" +
+		"Content-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename=\"primeiro.pdf\"\r\n" +
+		"\r\n" +
+		"conteudo do primeiro\r\n" +
+		"--B\r\n" +
+		"Content-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename=\"segundo.pdf\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"c2VndW5kbw==\r\n" +
+		"--B--\r\n"
+
+	described, contents, err := AllAttachments([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(described) != 2 || len(contents) != 2 {
+		t.Fatalf("got %d described and %d contents, want 2 of each", len(described), len(contents))
+	}
+	if described[0].Filename != "primeiro.pdf" || described[1].Filename != "segundo.pdf" {
+		t.Fatalf("described %q and %q, want primeiro/segundo",
+			described[0].Filename, described[1].Filename)
+	}
+	if string(contents[0]) != "conteudo do primeiro" {
+		t.Errorf("position 0 carried %q", contents[0])
+	}
+	// Decoded, not the base64 that arrived.
+	if string(contents[1]) != "segundo" {
+		t.Errorf("position 1 carried %q, want the decoded bytes", contents[1])
+	}
+	// And the size reported matches the bytes handed over, or a caller sizing a list would lie.
+	if described[1].SizeBytes != int64(len(contents[1])) {
+		t.Errorf("size %d does not match the %d bytes returned",
+			described[1].SizeBytes, len(contents[1]))
+	}
+}
+
+// A message with no multipart structure carries no attachments, and "none" is the truthful answer
+// rather than an error the caller has to special-case.
+func TestAllAttachmentsOnAPlainMessageIsEmpty(t *testing.T) {
+	raw := "From: Ana <ana@company.com>\r\nContent-Type: text/plain\r\n\r\nso texto\r\n"
+	described, contents, err := AllAttachments([]byte(raw))
+	if err != nil || len(described) != 0 || len(contents) != 0 {
+		t.Fatalf("got %d/%d err=%v, want nothing and no error", len(described), len(contents), err)
+	}
+}

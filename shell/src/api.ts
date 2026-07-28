@@ -513,6 +513,55 @@ export async function saveAttachment(
   }
 }
 
+/** One attachment with its bytes, as the bulk read hands them over. */
+export interface BulkAttachment {
+  position: number;
+  filename: string | null;
+  mime_type: string | null;
+  size_bytes: number;
+  content_base64: string;
+}
+
+/**
+ * Every attachment of one message, in ONE trip to the mailbox.
+ *
+ * Not a loop over `fetchAttachment`: each of those downloads the whole message, so eight
+ * attachments meant pulling the same eight files eight times over eight connections.
+ */
+export async function fetchAllAttachments(
+  token: string,
+  emailId: number,
+): Promise<BulkAttachment[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/${emailId}/attachments`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as BulkAttachment[];
+  } catch {
+    return null;
+  }
+}
+
+/** Files every attachment into one folder. Returns the names actually stored, in order. */
+export async function saveAllAttachments(
+  token: string,
+  emailId: number,
+  folder: string,
+): Promise<string[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/${emailId}/attachments/save-all`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ folder }),
+    });
+    if (!res.ok) return null;
+    return ((await res.json()) as { filenames: string[] }).filenames;
+  } catch {
+    return null;
+  }
+}
+
 /** One message with its body — read when a message is opened, never to draw the list. */
 export async function getEmail(token: string, id: number): Promise<EmailDetail | null> {
   try {

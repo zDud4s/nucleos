@@ -52,6 +52,22 @@ export function safeDownloadName(filename: string | null): string {
 }
 
 /**
+ * Turns the base64 a bulk attachment read arrives in back into bytes.
+ *
+ * `atob` yields a string of char codes, not text — writing it into a Blob directly would re-encode
+ * every byte above 127 as UTF-8 and quietly corrupt any file that is not plain ASCII, which is
+ * every real document.
+ */
+export function base64ToBytes(encoded: string): Uint8Array {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
  * A file size in the units a person recognises from their own file manager.
  *
  * Decimal units (kB = 1000), because that is what the OS shows next to the same file — matching the

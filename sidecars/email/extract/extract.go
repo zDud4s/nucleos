@@ -118,6 +118,12 @@ const MaxAttachmentBytes = 25 * 1024 * 1024
 // an empty file.
 var ErrNoSuchAttachment = errors.New("no attachment at that position")
 
+// What a walk should keep the bytes of, beside the descriptions it always builds.
+const (
+	wantNone  = -1
+	wantEvery = -2
+)
+
 // collector accumulates one message's text and attachment descriptions across the MIME tree.
 type collector struct {
 	// Not named `html`: that is an imported package here, and shadowing it would make
@@ -125,12 +131,12 @@ type collector struct {
 	plain       string
 	htmlPart    string
 	attachments []daemon.Attachment
-	// want is the position whose BYTES to keep, or -1 for the ordinary describe-only walk. One walk
-	// serves both readings so the position that addresses an attachment is derived the same way in
-	// both — a second traversal with its own idea of ordering is how the description and the
-	// content start pointing at different files.
-	want   int
-	wanted []byte
+	// want is `wantNone` for the ordinary describe-only walk, `wantEvery` to keep everything, or a
+	// single position. All three readings share ONE walk so the position that addresses an
+	// attachment is derived the same way in each — a second traversal with its own idea of ordering
+	// is how a description and its content start pointing at different files.
+	want     int
+	contents map[int][]byte
 }
 
 // bodyAndAttachments prefers `text/plain`, falls back to stripped HTML, and describes every
@@ -158,7 +164,7 @@ func bodyAndAttachments(msg *mail.Message) (string, []daemon.Attachment) {
 		return string(body), nil
 	}
 
-	found := collector{want: -1}
+	found := collector{want: wantNone}
 	found.walk(msg.Body, params["boundary"], 0)
 
 	if found.plain != "" {
@@ -188,7 +194,33 @@ func Attachment(raw []byte, position int) (daemon.Attachment, []byte, error) {
 	if position < 0 || position >= len(found.attachments) {
 		return daemon.Attachment{}, nil, ErrNoSuchAttachment
 	}
-	return found.attachments[position], found.wanted, nil
+	return found.attachments[position], found.contents[position], nil
+}
+
+// AllAttachments returns every attachment in one pass, described and with its bytes.
+//
+// The reason this exists rather than a loop over `Attachment` is arithmetic: each call fetches the
+// WHOLE message from IMAP, so eight attachments meant eight downloads of the same eight files, and
+// eight TLS handshakes. Reading them together is one fetch, and the total is bounded anyway — every
+// attachment in a message weighs less than the message.
+func AllAttachments(raw []byte) ([]daemon.Attachment, map[int][]byte, error) {
+	parsed, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		return nil, nil, err
+	}
+	mediaType, params, err := mime.ParseMediaType(parsed.Header.Get("Content-Type"))
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		// Not an error: a message with no multipart structure carries no attachments, and saying
+		// "none" is the truthful answer to "give me all of them".
+		return nil, map[int][]byte{}, nil
+	}
+
+	found := collector{want: wantEvery}
+	found.walk(parsed.Body, params["boundary"], 0)
+	if found.contents == nil {
+		found.contents = map[int][]byte{}
+	}
+	return found.attachments, found.contents, nil
 }
 
 // readDecoded reads a part's real content, undoing base64 where multipart does not, and stops at
@@ -224,9 +256,13 @@ func (c *collector) walk(body io.Reader, boundary string, depth int) {
 		if disposition == "attachment" {
 			position := len(c.attachments)
 			size := int64(0)
-			if position == c.want {
-				c.wanted = readDecoded(part)
-				size = int64(len(c.wanted))
+			if c.want == wantEvery || position == c.want {
+				content := readDecoded(part)
+				if c.contents == nil {
+					c.contents = map[int][]byte{}
+				}
+				c.contents[position] = content
+				size = int64(len(content))
 			} else {
 				size = partSize(part)
 			}

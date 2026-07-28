@@ -76,6 +76,13 @@ pub fn build_router(state: AppState) -> Router {
             "/email/{id}/attachments/{position}",
             get(get_email_attachment),
         )
+        // Static `/attachments` and the parameterised `/attachments/{position}` coexist; matchit
+        // prefers the literal, so the bulk routes never shadow a single one.
+        .route("/email/{id}/attachments", get(get_email_attachments))
+        .route(
+            "/email/{id}/attachments/save-all",
+            post(post_email_attachments_save_all),
+        )
         .route(
             "/email/{id}/attachments/{position}/save",
             post(post_email_attachment_save),
@@ -451,6 +458,118 @@ async fn get_email_attachment(
         bytes,
     )
         .into_response())
+}
+
+/// One attachment as the sidecar hands it over in bulk.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct BulkAttachment {
+    position: i64,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    size_bytes: i64,
+    content_base64: String,
+}
+
+/// Every attachment of one message, read in a single pass over the mailbox.
+///
+/// One route rather than the caller looping, because each single fetch downloads the WHOLE message:
+/// a loop over eight attachments pulled the same eight files eight times, over eight connections.
+async fn get_email_attachments(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<BulkAttachment>>, StatusCode> {
+    fetch_all_attachments(&state, id).await.map(Json)
+}
+
+async fn fetch_all_attachments(
+    state: &AppState,
+    id: i64,
+) -> Result<Vec<BulkAttachment>, StatusCode> {
+    let uid: Option<i64> = sqlx::query_scalar("SELECT uid FROM emails WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let uid = uid.ok_or(StatusCode::NOT_FOUND)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(ATTACHMENT_TIMEOUT)
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response = client
+        .get(format!(
+            "http://{}/attachments?uid={uid}",
+            crate::sidecar::EMAIL_FETCH_ADDR
+        ))
+        .bearer_auth(&state.token.0)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !response.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    response
+        .json::<Vec<BulkAttachment>>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+#[derive(serde::Serialize)]
+struct SaveAllOutcome {
+    folder: String,
+    /// The names actually stored, in the order the message carries them.
+    filenames: Vec<String>,
+}
+
+/// Files every attachment of one message into a folder.
+///
+/// Partial success is not a state this reports: the write happens after all the bytes are in hand,
+/// so the failure that matters — the mailbox being unreachable — happens before anything lands.
+/// What can still fail per file is the disk, and a folder holding three of eight files with no word
+/// about the other five is worse than a refusal.
+async fn post_email_attachments_save_all(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<SaveAttachmentRequest>,
+) -> Result<Json<SaveAllOutcome>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let attachments = fetch_all_attachments(&state, id).await?;
+
+    let decoded: Vec<(String, Vec<u8>)> = attachments
+        .into_iter()
+        .map(|attachment| {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&attachment.content_base64)
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            Ok((attachment.filename.unwrap_or_default(), bytes))
+        })
+        .collect::<Result<_, StatusCode>>()?;
+
+    let saved = uncancellable(async move {
+        tokio::task::spawn_blocking(move || {
+            let mut filenames = Vec::with_capacity(decoded.len());
+            for (filename, bytes) in &decoded {
+                filenames.push(crate::mailfiles::write_file(
+                    &root,
+                    &body.folder,
+                    filename,
+                    bytes,
+                )?);
+            }
+            Ok::<_, crate::mailfiles::PathError>(SaveAllOutcome {
+                folder: body.folder,
+                filenames,
+            })
+        })
+        .await
+    })
+    .await?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    saved.map(Json).map_err(folder_status)
 }
 
 /// Asks the sidecar for one attachment's bytes, and reports the name it was described under.
@@ -1395,6 +1514,54 @@ mod tests {
         assert_eq!(
             call(state, "GET", "/mail-files", None).await.0,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// Filing checks where it would write BEFORE it fetches anything. The order is the test: no
+    /// sidecar is running here, so reaching the mailbox first would answer 502 and, worse, would
+    /// mean the mailbox is read for a write that was never going to happen.
+    #[tokio::test]
+    async fn filing_checks_the_root_before_it_touches_the_mailbox() {
+        let state = test_state().await;
+        for uri in [
+            "/email/1/attachments/0/save",
+            "/email/1/attachments/save-all",
+        ] {
+            assert_eq!(
+                call(
+                    state.clone(),
+                    "POST",
+                    uri,
+                    Some(serde_json::json!({"folder": ""}))
+                )
+                .await
+                .0,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}"
+            );
+        }
+    }
+
+    /// The literal `save-all` must keep winning over `{position}`, or filing everything starts
+    /// trying to file an attachment numbered "save-all".
+    #[tokio::test]
+    async fn the_bulk_route_is_not_shadowed_by_the_position_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::mailfiles::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root);
+
+        // No such message, so this stops at the database — which is proof enough that it reached
+        // the bulk handler rather than being parsed as a position.
+        assert_eq!(
+            call(
+                state,
+                "POST",
+                "/email/999/attachments/save-all",
+                Some(serde_json::json!({"folder": ""}))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
         );
     }
 

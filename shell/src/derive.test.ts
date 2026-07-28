@@ -4,6 +4,7 @@ import type { Budget, ClassTally, ProjectSummary } from "./api";
 import {
   agreementRate,
   autopilotState,
+  base64ToBytes,
   budgetStatusLabel,
   formatBytes,
   formatUsd,
@@ -383,6 +384,17 @@ describe("pure UI derivations", () => {
     // Larger than the last unit keeps counting in GB rather than inventing one.
     expect(formatBytes(9_000_000_000_000)).toBe("9000 GB");
     expect(formatBytes(-1)).toBe("—");
+  });
+
+  it("decodes base64 attachment content to real bytes", () => {
+    // "ola" is ASCII and would survive almost any mistake; the accented and high bytes are the
+    // point — writing atob's char codes straight into a Blob re-encodes them as UTF-8 and quietly
+    // corrupts every file that is not plain ASCII.
+    expect(Array.from(base64ToBytes("b2xh"))).toEqual([111, 108, 97]);
+    expect(Array.from(base64ToBytes("w6k="))).toEqual([0xc3, 0xa9]);
+    // The first bytes of a .docx (a zip): 0x50 0x4b 0x03 0x04.
+    expect(Array.from(base64ToBytes("UEsDBA=="))).toEqual([0x50, 0x4b, 0x03, 0x04]);
+    expect(base64ToBytes("").length).toBe(0);
   });
 
   it("makes a sender's filename safe to save under", () => {
