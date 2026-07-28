@@ -109,9 +109,10 @@ pub async fn create_run(
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, StatusCode> {
     // Checked here and not only in the tick loops, because the loops are not the only way a run
-    // starts. Every spawned CLI gets `NUCLEOS_DAEMON_TOKEN` in its environment (`run_env`) and
-    // passes it to every subprocess, so a "stop" that only stopped the scheduler left the thing
-    // being stopped free to start its own successors through this endpoint.
+    // starts. An autonomous run's own key no longer opens this route (`auth::Scope::Run`), so the
+    // original escape — a stopped run spawning its own successors through this endpoint — is closed
+    // twice over. It stays checked here regardless: the shell and the sidecars still reach it with
+    // the control token, and the emergency stop has to hold against them too.
     //
     // Only the GLOBAL switch, deliberately. The scoped kills, the budget and the WIP limit pace
     // proactive autonomy, and a person asking for a run through the shell is not that. The global
@@ -149,15 +150,45 @@ const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 /// The environment every autopilot/assistant CLI run needs: the daemon URL + token so the
 /// PreToolUse hook can call back, and NUCLEOS_RUN_ID (== runs.id, spec §3.3) so the hook echoes it
 /// back and the core can validate — and, for a `pending_approval`, terminate — the right run.
-pub(crate) fn run_env(state: &AppState, id: i64) -> Vec<(String, String)> {
+///
+/// `token` is the caller's decision and not read from `state` on purpose. It used to be
+/// `state.token` for every run, which handed a `shadow` run — a mode that has Bash and whose
+/// classifier calls `echo $NUCLEOS_DAEMON_TOKEN` a `read-local` action — the key that approves
+/// proposals and disengages the kill switch. Autonomous runs now get their own scoped key
+/// (`auth::mint_run_token`); only orchestrator turns still carry the control token, and only
+/// because `ToolPolicy::McpOnly` leaves them nothing to read it with.
+pub(crate) fn run_env(token: &str, id: i64) -> Vec<(String, String)> {
     vec![
         (
             "NUCLEOS_DAEMON_URL".to_string(),
             "http://127.0.0.1:8791".to_string(),
         ),
-        ("NUCLEOS_DAEMON_TOKEN".to_string(), state.token.0.clone()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), token.to_string()),
         ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
     ]
+}
+
+/// Mints a run's own daemon key and stores its secret, returning what goes in the environment.
+///
+/// Called before the CLI is spawned, never after: the hook fires on the run's first tool call, and
+/// a secret that lands in the row a moment later would 401 that call for reasons no log explains.
+/// A failure to store is not fatal — the run proceeds with a key that authenticates nothing, so its
+/// tool calls are refused rather than ungoverned, which is the right direction to fail in.
+async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
+    let (token, secret) = crate::auth::mint_run_token(id);
+    if let Err(error) = sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+        .bind(&secret)
+        .bind(id)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            run_id = id,
+            %error,
+            "could not store the run's token — its tool calls will be refused"
+        );
+    }
+    token
 }
 
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
@@ -259,12 +290,13 @@ fn spawn_run(
     completion_feed: Option<(String, String)>,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
+    daemon_token: String,
 ) {
     let pool = state.pool.clone();
     let runner = state.runner.clone();
     let feed_project_id = project_id.clone();
     let run_timeout = state.run_timeout;
-    let env = run_env(state, id);
+    let env = run_env(&daemon_token, id);
 
     spawn_registered(state, id, async move {
         let mut attempt: u32 = 1;
@@ -565,6 +597,7 @@ pub async fn create_run_inner(
     } else {
         1
     };
+    let daemon_token = mint_run_token(&state.pool, id).await;
     spawn_run(
         state,
         id,
@@ -576,6 +609,7 @@ pub async fn create_run_inner(
         completion_feed,
         max_attempts,
         tool_policy,
+        daemon_token,
     );
 
     Ok(id)
@@ -693,6 +727,8 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 
     tx.commit().await?;
 
+    // After the commit, because the resume row does not exist to be UPDATEd before it.
+    let daemon_token = mint_run_token(&state.pool, resume_id).await;
     spawn_run(
         state,
         resume_id,
@@ -709,6 +745,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // A resume continues an approved worktree run, which is autopilot work: the hook and the
         // classifier govern it, exactly as they governed the run being resumed.
         crate::runner::ToolPolicy::Unrestricted,
+        daemon_token,
     );
 
     Ok(resume_id)
@@ -1372,6 +1409,61 @@ mod tests {
             assert_eq!(
                 *runner.last_tool_policy.lock().unwrap(),
                 Some(expected),
+                "mode {mode}"
+            );
+        }
+    }
+
+    /// An autonomous run launches with `ToolPolicy::Unrestricted`, so it has a Bash tool, and the
+    /// classifier calls `echo $NUCLEOS_DAEMON_TOKEN` a `read-local` action — allowed even in shadow
+    /// mode. Whatever is in that environment must be assumed published, so it cannot be the key that
+    /// approves proposals and disengages the kill switch.
+    #[tokio::test]
+    async fn an_autonomous_run_is_never_handed_the_control_token() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let control = state.token.0.clone();
+
+        for mode in [crate::email::TRIAGE_MODE, "real", "shadow"] {
+            *runner.last_env.lock().unwrap() = None;
+            let id = create_run_inner(&state, "prompt".into(), None, None, mode)
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if runner.last_env.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let env: std::collections::HashMap<String, String> = runner
+                .last_env
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| panic!("mode {mode} never launched"))
+                .into_iter()
+                .collect();
+            let handed = &env["NUCLEOS_DAEMON_TOKEN"];
+
+            assert_ne!(handed, &control, "mode {mode} was handed the control token");
+            // Its own key, and recognisably so: the run id travels in it, which is what lets the
+            // daemon check the run_id in a hook payload against something the caller cannot pick.
+            assert_eq!(
+                handed.split_once('.').map(|(prefix, _)| prefix),
+                Some(id.to_string().as_str()),
+                "mode {mode}"
+            );
+
+            // Stored before the CLI could possibly have called back — a secret that lands a moment
+            // later would 401 the run's first tool call for reasons no log explains.
+            let stored: Option<String> = sqlx::query_scalar("SELECT token FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                handed.split_once('.').map(|(_, secret)| secret),
                 "mode {mode}"
             );
         }

@@ -1,9 +1,10 @@
-use axum::Json;
 use axum::extract::State;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
+use crate::auth::Scope;
 use crate::classifier;
 use crate::runs::finalize_termination;
 use crate::shadow;
@@ -31,8 +32,28 @@ pub struct Decision {
 
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
     Json(payload): Json<PreToolUsePayload>,
 ) -> Json<Decision> {
+    // `run_id` arrives in the body, which makes it a claim the caller makes about itself. With a
+    // scoped key the daemon can check that claim against something the caller cannot choose: a run
+    // token names its own run. Without this, a run could ask for a decision under another run's id
+    // — a `shadow` run borrowing a `worktree` run's rules, or an in-flight run's id being used to
+    // terminate it — and every branch below reads `mode` from exactly that id.
+    if let Scope::Run(id) = scope
+        && id != payload.run_id
+    {
+        tracing::warn!(
+            token_run_id = id,
+            claimed_run_id = payload.run_id,
+            "pretooluse-decision: a run asked for a decision under another run's id"
+        );
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: "a run may only ask about itself".to_owned(),
+        });
+    }
+
     // Validate run_id against runs actually in flight before trusting anything derived from it (spec
     // §3.4 — the hook's environment sits inside the same cooperative trust model as the token, so the
     // core never blindly trusts what the hook sends).
@@ -397,13 +418,26 @@ mod tests {
         }
     }
 
+    /// The real middleware, not a stand-in that inserts the extension directly: the handler now
+    /// reads a `Scope` that only `require_token` puts there, so a test router without it would pass
+    /// while every hook call in production returned 500.
     fn test_router(state: AppState) -> Router {
         Router::new()
             .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::require_token,
+            ))
             .with_state(state)
     }
 
+    /// As the control token, which is what these tests were written against — they are about what
+    /// the classifier decides, not about who is allowed to ask. `decide_as` is for the latter.
     async fn decide(app: &Router, body: &str) -> Decision {
+        decide_as(app, "test-token", body).await
+    }
+
+    async fn decide_as(app: &Router, bearer: &str, body: &str) -> Decision {
         let response = app
             .clone()
             .oneshot(
@@ -411,6 +445,7 @@ mod tests {
                     .method("POST")
                     .uri("/hooks/pretooluse-decision")
                     .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {bearer}"))
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -471,6 +506,50 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid()
+    }
+
+    /// Mints and stores a run's own key, returning what its CLI would find in the environment.
+    async fn key_for(state: &AppState, run_id: i64) -> String {
+        let (token, secret) = crate::auth::mint_run_token(run_id);
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(&secret)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        token
+    }
+
+    /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
+    /// branch in this handler reads `mode` from that id, so a run able to name another run's id
+    /// picks which rules it is judged by — a `shadow` run could ask under a `worktree` run's id and
+    /// be handed the worktree ruleset, and an in-flight run's id could be used to terminate it.
+    #[tokio::test]
+    async fn a_run_may_only_ask_the_gate_about_itself() {
+        let state = test_state().await;
+        let mine = in_flight_run(&state, "shadow", None, None, None).await;
+        let other = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let my_key = key_for(&state, mine).await;
+        let app = test_router(state.clone());
+
+        let decision = decide_as(
+            &app,
+            &my_key,
+            &format!(r#"{{"run_id":{other},"tool_name":"Read","tool_input":{{}}}}"#),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "a run may only ask about itself");
+
+        // And the same key asking about its own run is answered normally — the check is about the
+        // id, not about run tokens being second-class.
+        let own = decide_as(
+            &app,
+            &my_key,
+            &format!(r#"{{"run_id":{mine},"tool_name":"Read","tool_input":{{}}}}"#),
+        )
+        .await;
+        assert_eq!(own.decision, "allow");
     }
 
     /// The single most important assertion in this pillar: a triage run gets NO tool, of any kind.
@@ -710,6 +789,8 @@ mod tests {
 
         let mut handler = Box::pin(pretooluse_decision(
             State(state.clone()),
+            // What the middleware would have inserted for this run's own key.
+            Extension(Scope::Run(run_id)),
             Json(PreToolUsePayload {
                 run_id,
                 tool_name: "Bash".to_owned(),

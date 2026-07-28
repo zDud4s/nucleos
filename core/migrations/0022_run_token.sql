@@ -1,0 +1,12 @@
+-- A run carries its own key instead of the daemon's.
+--
+-- `runs::run_env` handed `state.token` — the key the shell holds, the one that approves proposals
+-- and disengages the kill switch — to every spawned CLI. `worktree` and `shadow` runs launch with
+-- `ToolPolicy::Unrestricted`, so they own a Bash tool, and the classifier calls
+-- `echo $NUCLEOS_DAEMON_TOKEN` a `read-local` action. The mode whose premise is watching a run
+-- work without letting it act could print the key that lets it do anything.
+--
+-- NULL for every row written before this migration and for every run that legitimately carries the
+-- control token (orchestrator turns, which have no Bash to read it with). A NULL authenticates
+-- nothing: `auth::resolve` requires a stored secret to compare against.
+ALTER TABLE runs ADD COLUMN token TEXT;

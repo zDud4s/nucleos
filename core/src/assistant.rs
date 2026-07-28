@@ -162,7 +162,11 @@ fn spawn_assistant_turn(
     let pool = state.pool.clone();
     let runner = state.runner.clone();
     let run_timeout = state.run_timeout;
-    let env = crate::runs::run_env(state, id);
+    // The one agent that carries the control token, and the only one that can: an orchestrator turn
+    // runs under `ToolPolicy::McpOnly`, so it has no Bash, no Read and no Write — no way to look at
+    // its own environment. It needs the full surface because approving a proposal or disengaging the
+    // kill switch on the user's word is its job, and a scoped key would make it useless for that.
+    let env = crate::runs::run_env(&state.token.0, id);
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.

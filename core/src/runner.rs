@@ -388,6 +388,9 @@ pub struct FakeCommandRunner {
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
+    /// What the CLI was handed in its environment. Recorded because a run with a Bash tool can read
+    /// its own environment, so which key lands here is a safety property and not a detail.
+    pub last_env: std::sync::Mutex<Option<Vec<(String, String)>>>,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -400,7 +403,7 @@ impl CommandRunner for FakeCommandRunner {
     async fn run_prompt(
         &self,
         _prompt: &str,
-        _env: &[(String, String)],
+        env: &[(String, String)],
         cwd: Option<&Path>,
         plan_only: bool,
         resume_session_id: Option<&str>,
@@ -411,6 +414,9 @@ impl CommandRunner for FakeCommandRunner {
         {
             *self.calls.lock().unwrap() += 1;
         }
+        // Before the failure injection below: what a run was handed is worth knowing even when the
+        // launch is made to fail.
+        *self.last_env.lock().unwrap() = Some(env.to_vec());
         {
             let mut remaining = self.fail_times.lock().unwrap();
             if *remaining > 0 {
