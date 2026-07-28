@@ -590,10 +590,17 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
 }
 
 pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> StatusCode {
-    if finalize_termination(&state, id, "cancelled").await {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
+    // Uncancellable: `finalize_termination` removes the handle and kills the process before it
+    // writes the status, so a request dropped on that write leaves a `running` row nothing can
+    // reach — the handle is gone, so a second `/cancel` answers 404 and the GC never collects it.
+    match crate::http::uncancellable(
+        async move { finalize_termination(&state, id, "cancelled").await },
+    )
+    .await
+    {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(status) => status,
     }
 }
 

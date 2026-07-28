@@ -535,16 +535,24 @@ async fn post_shadow_verdict(
         None => false,
     };
 
-    match shadow::set_verdict(&state.pool, id, &body.verdict).await {
-        Ok(true) => {
-            if let Some(project_id) = project {
-                announce_promotable(&state.pool, &project_id, was_promotable).await;
+    // Uncancellable: the verdict lands first and the crossing is announced second, and a verdict is
+    // recorded once — replaying it answers 404, so an announcement dropped in between is lost for
+    // good, and the promotion bar is the one thing this endpoint exists to surface.
+    let pool = state.pool.clone();
+    let verdict = body.verdict.clone();
+    uncancellable(async move {
+        match shadow::set_verdict(&pool, id, &verdict).await {
+            Ok(true) => {
+                if let Some(project_id) = project {
+                    announce_promotable(&pool, &project_id, was_promotable).await;
+                }
+                Ok(StatusCode::NO_CONTENT)
             }
-            Ok(StatusCode::NO_CONTENT)
+            Ok(false) => Err(StatusCode::NOT_FOUND),
+            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    })
+    .await?
 }
 
 /// The §8.2 promotion nudge: a feed entry the moment a project's last outstanding action class
