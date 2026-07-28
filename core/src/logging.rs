@@ -4,12 +4,25 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// How many daily log files survive. See `init` for why a ceiling exists at all.
+const LOG_RETENTION_DAYS: usize = 14;
+
 /// Initializes a `tracing` subscriber that writes to both stdout and a daily-rotating log file inside
 /// `log_dir`, filtered by `RUST_LOG` or `info,sqlx=warn` by default. Returns a `WorkerGuard` that MUST
 /// be kept alive for the lifetime of `main()` — the non-blocking file writer flushes on drop.
 pub fn init(log_dir: &Path) -> WorkerGuard {
     std::fs::create_dir_all(log_dir).expect("failed to create log directory");
-    let file_appender = tracing_appender::rolling::daily(log_dir, "nucleos-core.log");
+    // Rotation is not retention. A daily-rolling appender keeps every day it has ever written, so
+    // anything that logs steadily — a sidecar that cannot spawn, a poller warning on every tick —
+    // grows this directory until the volume fills. Two weeks is long enough to investigate
+    // something that happened over a weekend and short enough to bound.
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("nucleos-core")
+        .filename_suffix("log")
+        .max_log_files(LOG_RETENTION_DAYS)
+        .build(log_dir)
+        .expect("failed to build the rolling log appender");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));

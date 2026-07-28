@@ -38,6 +38,31 @@ const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
 /// `.ai/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
 const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 
+/// Reads a secret from stdin rather than from `argv`.
+///
+/// A Windows command line is readable by any process running as the same user
+/// (`Get-CimInstance Win32_Process | select CommandLine`) and is recorded verbatim in PSReadLine's
+/// plaintext history file. Passing an IMAP app password or a bot token as an argument therefore put
+/// it on disk in cleartext at the exact moment the operator was securely storing it, which is the
+/// one thing this path exists to avoid.
+fn read_secret_from_stdin(prompt: &str) -> Option<String> {
+    use std::io::BufRead;
+
+    eprintln!("{prompt}");
+    let mut value = String::new();
+    if std::io::stdin().lock().read_line(&mut value).is_err() {
+        return None;
+    }
+    // The line terminator only. A secret may legitimately end in a space, and silently eating one
+    // would store a credential that differs from what was pasted — a failure that surfaces much
+    // later as an authentication error nobody connects back to this prompt.
+    let value = value
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_owned();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--print-token") {
@@ -55,8 +80,8 @@ async fn main() {
         return;
     }
 
-    if let Some(pos) = std::env::args().position(|a| a == "--set-telegram-token") {
-        match std::env::args().nth(pos + 1) {
+    if std::env::args().any(|a| a == "--set-telegram-token") {
+        match read_secret_from_stdin("paste the bot token, then press Enter:") {
             Some(value) => match secrets::store_secret(TELEGRAM_TOKEN_KEY, &value) {
                 Ok(()) => println!("telegram bot token stored in Credential Manager"),
                 Err(e) => {
@@ -65,15 +90,15 @@ async fn main() {
                 }
             },
             None => {
-                eprintln!("usage: nucleos-core --set-telegram-token <BOT_TOKEN>");
+                eprintln!("no bot token was read from stdin");
                 std::process::exit(1);
             }
         }
         return;
     }
 
-    if let Some(pos) = std::env::args().position(|a| a == "--set-email-password") {
-        match std::env::args().nth(pos + 1) {
+    if std::env::args().any(|a| a == "--set-email-password") {
+        match read_secret_from_stdin("paste the app password, then press Enter:") {
             Some(value) => match secrets::store_secret(EMAIL_PASSWORD_KEY, &value) {
                 Ok(()) => println!("email password stored in Credential Manager"),
                 Err(e) => {
@@ -82,7 +107,7 @@ async fn main() {
                 }
             },
             None => {
-                eprintln!("usage: nucleos-core --set-email-password <APP_PASSWORD>");
+                eprintln!("no app password was read from stdin");
                 std::process::exit(1);
             }
         }

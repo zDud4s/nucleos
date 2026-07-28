@@ -20,11 +20,17 @@ use crate::state::AppState;
 use crate::worktree::{self, ReleaseOutcome};
 
 pub fn build_router(state: AppState) -> Router {
+    // The production WebView2 origin is the only one a shipped build ever uses.
+    let mut origins = vec!["https://tauri.localhost".parse().unwrap()];
+    // The Vite dev server was compiled into release builds too. Binding localhost:1420 needs no
+    // privilege on Windows, so any local process could serve a page whose cross-origin reads of
+    // this API the browser would then approve — leaving only the bearer token in the way, and the
+    // shell hands that to its own webview. A dev convenience does not belong in a shipped binary.
+    #[cfg(debug_assertions)]
+    origins.push("http://localhost:1420".parse().unwrap());
+
     let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:1420".parse().unwrap(), // Vite dev server (npm run tauri dev)
-            "https://tauri.localhost".parse().unwrap(), // production WebView2 origin on Windows
-        ])
+        .allow_origin(origins)
         .allow_methods(Any)
         .allow_headers(Any);
 

@@ -2,30 +2,45 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
 
+/// First delay after a sidecar dies. A single crash should cost about as much as a restart.
+const RESTART_BASE: Duration = Duration::from_secs(2);
+/// Ceiling for the backoff: long enough that a binary which was never built is nearly free, short
+/// enough that a sidecar which starts working again is back within a minute.
+const RESTART_MAX: Duration = Duration::from_secs(60);
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
+    let mut delay = RESTART_BASE;
     loop {
         let mut cmd = Command::new(&binary_path);
         for (k, v) in &env {
             cmd.env(k, v);
         }
+        // A sidecar's environment holds the daemon token, and for email the IMAP password too.
+        // Without this, shutting the daemon down left the process running with both.
+        cmd.kill_on_drop(true);
         match cmd.spawn() {
             Ok(mut child) => {
                 let status = child.wait().await;
-                tracing::warn!(
-                    "sidecar '{}' exited ({:?}) — restarting in 2s",
-                    name,
-                    status
-                );
+                tracing::warn!(sidecar = %name, ?status, "sidecar exited — restarting");
+                // Ran and then died is a different event from cannot start: a rare crash should
+                // restart promptly rather than inherit a backoff earned by something else.
+                delay = RESTART_BASE;
             }
-            Err(e) => {
+            Err(error) => {
+                // Exponential, because the usual cause is a binary that was never built — `main.rs`
+                // supervises the echo sidecar unconditionally, built or not. At a flat two seconds
+                // that wrote a warning every two seconds forever, roughly 43k lines a day, into a
+                // log directory that had no retention either.
                 tracing::warn!(
-                    "sidecar '{}' failed to spawn ({}) — retrying in 2s",
-                    name,
-                    e
+                    sidecar = %name,
+                    %error,
+                    ?delay,
+                    "sidecar failed to spawn — backing off"
                 );
+                delay = (delay * 2).min(RESTART_MAX);
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(delay).await;
     }
 }
 
