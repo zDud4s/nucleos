@@ -1345,10 +1345,8 @@ mod tests {
         let _lock = env_lock();
         // A file-backed pool with room for a second connection: the test writes to the same rows
         // while the release future is mid-flight, which a single-connection pool would deadlock on.
-        let db_dir = tempfile::tempdir().expect("create database tempdir");
-        let pool = crate::storage::open(&db_dir.path().join("nucleos.db"))
-            .await
-            .expect("open database");
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
         let repo = init_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
@@ -1406,6 +1404,7 @@ mod tests {
             status, "superseded",
             "release must not stamp `cancelled` over a status it did not read"
         );
+        db.close().await;
     }
 
     #[tokio::test]

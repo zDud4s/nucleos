@@ -1935,6 +1935,10 @@ mod tests {
             status, "cancelled",
             "a rejected proposal must not leave its run pinning the project"
         );
+        // This test builds its own pool rather than using `storage::TempDb`, because the race it
+        // drives depends on the exact pool it was written against. It still has to close it, or the
+        // directory outlives the run for the same reason every other one did.
+        pool.close().await;
     }
 
     #[tokio::test]

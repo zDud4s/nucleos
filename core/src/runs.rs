@@ -1951,10 +1951,8 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_marks_only_running_runs_as_interrupted() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = crate::storage::open(&dir.path().join("nucleos.db"))
-            .await
-            .unwrap();
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
 
         // One run in flight when the daemon "died", one already completed.
         sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', '2026-07-17T00:00:00Z')")
@@ -1981,12 +1979,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, "run_interrupted");
         assert_eq!(entries[0].run_id, Some(1));
-    }
-
-    async fn reconcile_test_pool(dir: &tempfile::TempDir) -> sqlx::SqlitePool {
-        crate::storage::open(&dir.path().join("nucleos.db"))
-            .await
-            .unwrap()
+        db.close().await;
     }
 
     // One project per run: `one_open_worktree_run_per_project` (migration 0009) is exactly what a
@@ -2014,8 +2007,8 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_recovers_an_awaiting_approval_run_with_no_proposal() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = reconcile_test_pool(&dir).await;
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
         let id = insert_awaiting_run(&pool, "p", "stranded").await;
 
         let n = reconcile_stranded_approvals(&pool).await.unwrap();
@@ -2030,12 +2023,13 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, "run_interrupted");
         assert_eq!(entries[0].run_id, Some(id));
+        db.close().await;
     }
 
     #[tokio::test]
     async fn reconcile_leaves_an_awaiting_approval_run_with_a_pending_proposal_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = reconcile_test_pool(&dir).await;
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
         let id = insert_awaiting_run(&pool, "p", "resumable").await;
         proposals::create_action_approval(&pool, id, Some("s"), Some("p"), "Bash", "why", None)
             .await
@@ -2051,12 +2045,13 @@ mod tests {
         assert_eq!(status, "awaiting_approval");
         assert_eq!(completed_at, None);
         assert!(crate::feed::list_all(&pool, 50).await.unwrap().is_empty());
+        db.close().await;
     }
 
     #[tokio::test]
     async fn reconcile_recovers_an_awaiting_approval_run_whose_proposal_was_decided() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = reconcile_test_pool(&dir).await;
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
 
         let rejected_run = insert_awaiting_run(&pool, "p-rejected", "rejected proposal").await;
         let rejected = proposals::create_action_approval(
@@ -2103,6 +2098,7 @@ mod tests {
             assert!(completed_at.is_some());
         }
         assert_eq!(crate::feed::list_all(&pool, 50).await.unwrap().len(), 2);
+        db.close().await;
     }
 
     async fn poll_run(state: &AppState, id: i64, until: &str) -> (String, i64) {
