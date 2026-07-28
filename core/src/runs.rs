@@ -201,6 +201,32 @@ where
         body.await;
     });
     handles.insert(id, join.abort_handle());
+
+    // A panic unwinds past every terminal-status write in the body, and nothing awaits this handle,
+    // so the panic went unobserved and the run stayed `running` behind a dead task — `/cancel`
+    // answering 404, the GC skipping it, and migration 0009 blocking the project until a restart.
+    // The guard above releases the abort handle on a panic, which the existing test checks; the
+    // database row was the half nobody was watching.
+    //
+    // A supervisor rather than a guard because writing that status needs to await, and `Drop`
+    // cannot. Cancellation is deliberately ignored here: `finalize_termination` owns that path and
+    // has already written the status it chose.
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let Err(error) = join.await else { return };
+        if error.is_cancelled() {
+            return;
+        }
+        tracing::error!(run_id = id, %error, "run task panicked; recording it as failed");
+        let failed = sqlx::query(
+            "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&pool)
+        .await;
+        warn_on_terminal_write_err(&failed, id, "failed");
+    });
 }
 
 /// A terminal-status UPDATE failing is not the same severity as a feed write failing: a feed
@@ -389,6 +415,31 @@ fn spawn_run(
     });
 }
 
+/// Retires a run that failed somewhere in worktree provisioning, and says so in the feed.
+///
+/// Provisioning happens after the run row exists, so a failure that just returns leaves it
+/// `running` with no task — a state only a daemon restart reconciles, while migration 0009 blocks
+/// the project's next worktree run for as long as it lasts. Compare-and-set on `running` so a
+/// concurrent cancel keeps the last word.
+async fn fail_provisioning(state: &AppState, id: i64, project_id: Option<&str>, summary: &str) {
+    let failed = sqlx::query(
+        "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+    warn_on_terminal_write_err(&failed, id, "failed");
+    let _ = crate::feed::append(
+        &state.pool,
+        project_id,
+        "worktree_provision_failed",
+        summary,
+        Some(id),
+    )
+    .await;
+}
+
 pub async fn create_run_inner(
     state: &AppState,
     prompt: String,
@@ -452,28 +503,23 @@ pub async fn create_run_inner(
         let info = match crate::worktree::create(std::path::Path::new(project_root), id).await {
             Ok(info) => info,
             Err(error) => {
-                let completed_at = chrono::Utc::now().to_rfc3339();
-                let failed = sqlx::query(
-                    "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
-                )
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&state.pool)
-                .await;
-                warn_on_terminal_write_err(&failed, id, "failed");
-                let _ = crate::feed::append(
-                    &state.pool,
+                fail_provisioning(
+                    state,
+                    id,
                     project_id.as_deref(),
-                    "worktree_provision_failed",
                     &format!("worktree provisioning failed: {error}"),
-                    Some(id),
                 )
                 .await;
                 return Err(CreateRunError::Worktree(error));
             }
         };
+        // Every exit from here on has to leave a terminal status behind. Past the INSERT the row is
+        // `running` with no task and no abort handle: `/cancel` answers 404, the GC skips it, and
+        // `one_open_worktree_run_per_project` (migration 0009) blocks every later worktree run for
+        // the project — until a restart, the only thing that reconciles `running`. The `create`
+        // branch above compensated; these two propagated with `?` and stranded the run.
         let worktree_path = info.path.to_string_lossy().into_owned();
-        crate::worktree::record(
+        if let Err(error) = crate::worktree::record(
             &state.pool,
             id,
             worktree_project_id,
@@ -481,12 +527,32 @@ pub async fn create_run_inner(
             &worktree_path,
             &info.branch,
         )
-        .await?;
-        sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?")
+        .await
+        {
+            fail_provisioning(
+                state,
+                id,
+                project_id.as_deref(),
+                &format!("worktree was created but could not be recorded: {error}"),
+            )
+            .await;
+            return Err(CreateRunError::Db(error));
+        }
+        if let Err(error) = sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?")
             .bind(&worktree_path)
             .bind(id)
             .execute(&state.pool)
-            .await?;
+            .await
+        {
+            fail_provisioning(
+                state,
+                id,
+                project_id.as_deref(),
+                &format!("worktree was recorded but the run's cwd could not be set: {error}"),
+            )
+            .await;
+            return Err(CreateRunError::Db(error));
+        }
         completion_feed = Some((
             "worktree_run_completed".to_owned(),
             format!("worktree run completed on {}", info.branch),
@@ -1586,6 +1652,75 @@ mod tests {
             !state.run_handles.lock().unwrap().contains_key(&id),
             "a dead run must not stay registered as in-flight"
         );
+    }
+
+    /// The half the test above does not cover. Releasing the handle keeps the in-flight map honest,
+    /// but the `runs` row was left `running` behind a dead task — `/cancel` answering 404, the GC
+    /// skipping it, and `one_open_worktree_run_per_project` blocking the project until a restart.
+    #[tokio::test]
+    async fn a_panicking_run_task_records_the_run_as_failed() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
+             VALUES ('proj', 'C:/work/repo', 'x', 'running', 'worktree', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        spawn_registered(&state, id, async { panic!("run body blew up") });
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            status, "failed",
+            "a panicked run must not be left occupying the project's worktree slot"
+        );
+    }
+
+    /// A cancelled task must NOT be rewritten by the panic supervisor: `finalize_termination` has
+    /// already chosen and written the status, and stamping `failed` over it would report a failure
+    /// for a run the user deliberately stopped.
+    #[tokio::test]
+    async fn an_aborted_run_keeps_the_status_its_terminator_wrote() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        spawn_registered(&state, id, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        // Long enough for a supervisor that ignored cancellation to have overwritten this.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
     }
 
     /// `abort()` does not reach into a task that is already past its last `.await`: the body can

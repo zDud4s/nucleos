@@ -330,6 +330,36 @@ async fn pause_for_approval(
             Some(run_id),
         )
         .await;
+
+        // Warning alone left the run parked in `awaiting_approval` with nothing to approve or
+        // reject, and `one_open_worktree_run_per_project` (migration 0009) turns that into a block
+        // on every later worktree run for the project. `reconcile_stranded_approvals` clears it —
+        // but only at startup, so the project stayed jammed until someone restarted the daemon.
+        //
+        // Undo the pause instead. `interrupted` is the status startup recovery already uses for
+        // exactly this shape, so a run that ends here reads the same either way, and the slot is
+        // free immediately. Guarded on the status this function set, so a cancel that arrived in
+        // the meantime keeps the last word.
+        let rolled_back = sqlx::query(
+            "UPDATE runs SET status = 'interrupted', completed_at = ?
+             WHERE id = ? AND status = 'awaiting_approval'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(&state.pool)
+        .await;
+        match rolled_back {
+            Ok(result) if result.rows_affected() == 1 => tracing::warn!(
+                run_id,
+                "pretooluse-decision: rolled the unapprovable pause back to interrupted"
+            ),
+            Ok(_) => {}
+            Err(rollback_error) => tracing::error!(
+                run_id,
+                %rollback_error,
+                "pretooluse-decision: could not roll back an unapprovable pause — this project is blocked until restart"
+            ),
+        }
     }
 }
 
