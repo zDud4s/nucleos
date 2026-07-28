@@ -216,6 +216,23 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
             let Some(current) = current_shas.get(&trigger.name).cloned() else {
                 continue;
             };
+
+            // Re-read the emergency stop immediately before committing. This poller's preamble
+            // checked it once and then ran a `git fetch` per trigger across every project, which is
+            // network time — a switch thrown during that did not stop the triggers still queued
+            // behind it. Fails closed, like the preamble.
+            if crate::autopilot::kill_switch_engaged(&state.pool)
+                .await
+                .unwrap_or(true)
+            {
+                tracing::info!(
+                    project_id = %project_id,
+                    trigger = %trigger.name,
+                    "kill switch engaged mid-poll; not firing"
+                );
+                return;
+            }
+
             match crate::runs::create_run_inner(
                 state,
                 trigger.prompt.clone(),

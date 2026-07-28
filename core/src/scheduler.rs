@@ -380,6 +380,25 @@ pub(crate) async fn scheduler_tick(
                 rule.prompt.clone()
             };
 
+            // Re-read the emergency stop immediately before committing to this run. The tick's
+            // preamble checked it once and then iterates every project and every due rule, and one
+            // tick can spend minutes in `git worktree add` — so a switch thrown during that fan-out
+            // did not stop the rules that had not been reached yet. "Stop" that keeps starting work
+            // for another minute is not a stop.
+            //
+            // Fails closed, like the preamble: an unreadable switch stops the tick.
+            if crate::autopilot::kill_switch_engaged(&state.pool)
+                .await
+                .unwrap_or(true)
+            {
+                tracing::info!(
+                    project_id = %project_id,
+                    rule_name = %rule.name,
+                    "kill switch engaged mid-tick; not firing"
+                );
+                return;
+            }
+
             // Claim the window BEFORE starting anything, compare-and-set against the timestamp this
             // tick read. Firing first and persisting afterwards made every failure mode duplicate
             // work: a crash in between left the rule still due, so the next start ran the same
