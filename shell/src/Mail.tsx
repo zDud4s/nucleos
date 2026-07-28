@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  getEmail, getEmailQueue, triageEmail,
-  type ConnectionState, type EmailDetail, type QueuedEmail,
+  fetchAttachment, getEmail, getEmailQueue, triageEmail,
+  type ConnectionState, type EmailAttachment, type EmailDetail, type QueuedEmail,
 } from "./api";
-import { formatBytes, mailLabel, mailTone, relativeTime } from "./derive";
+import { formatBytes, mailLabel, mailTone, relativeTime, safeDownloadName } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
 
-interface OpenMessageProps { detail: EmailDetail | null; loading: boolean; }
+interface OpenMessageProps { token: string; detail: EmailDetail | null; loading: boolean; }
 /**
  * An opened message: its text, and what came with it.
  *
@@ -14,9 +14,33 @@ interface OpenMessageProps { detail: EmailDetail | null; loading: boolean; }
  * someone outside this machine, and the sidecar already reduced any HTML to plain text — putting it
  * back into the DOM as HTML would undo that and hand a stranger a script tag and a tracking pixel.
  */
-function OpenMessage({ detail, loading }: OpenMessageProps) {
+function OpenMessage({ token, detail, loading }: OpenMessageProps) {
+  const [saving, setSaving] = useState<number | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+
   if (loading) return <p className="a-note">A abrir…</p>;
   if (detail === null) return <ErrorNote>Could not open this message.</ErrorNote>;
+
+  async function save(file: EmailAttachment) {
+    if (detail === null) return;
+    setSaving(file.position);
+    setFailed(null);
+    const blob = await fetchAttachment(token, detail.id, file.position);
+    setSaving(null);
+    if (blob === null) {
+      setFailed("Could not fetch this file. It may have been deleted from the mailbox since.");
+      return;
+    }
+    // The bytes never touched a disk on the way here, so the browser's own download is what puts
+    // them somewhere — under a name made safe on this side, because going through a blob skips the
+    // `Content-Disposition` the daemon took care to build.
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = safeDownloadName(file.filename);
+    link.click();
+    URL.revokeObjectURL(url);
+  }
 
   return (
     <div className="mail-open">
@@ -34,10 +58,18 @@ function OpenMessage({ detail, loading }: OpenMessageProps) {
               <span className="mf-meta">
                 {file.mime_type ?? "tipo desconhecido"} · {formatBytes(file.size_bytes)}
               </span>
+              <Button
+                size="sm"
+                disabled={saving !== null}
+                onClick={() => void save(file)}
+              >
+                {saving === file.position ? "A obter…" : "Guardar"}
+              </Button>
             </li>
           ))}
         </ul>
       )}
+      {failed !== null && <ErrorNote>{failed}</ErrorNote>}
     </div>
   );
 }
@@ -211,7 +243,9 @@ function Mail({ token, connection }: MailProps) {
                       <p className="f-body">{mail.triage_summary}</p>
                     )}
                   </button>
-                  {openId === mail.id && <OpenMessage detail={detail} loading={opening} />}
+                  {openId === mail.id && token !== null && (
+                    <OpenMessage token={token} detail={detail} loading={opening} />
+                  )}
                 </article>
               ))}
       </Panel>

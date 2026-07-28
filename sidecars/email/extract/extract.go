@@ -6,6 +6,7 @@ package extract
 
 import (
 	"encoding/base64"
+	"errors"
 	"html"
 	"io"
 	"mime"
@@ -108,6 +109,15 @@ func sender(header mail.Header) (addr string, name string) {
 // deeper is a message built to make a parser recurse, not to be read.
 const MaxMIMEDepth = 10
 
+// MaxAttachmentBytes caps what a single attachment may weigh when its content is actually read.
+// Gmail refuses to send more than this, so a part claiming more is not a file someone attached.
+const MaxAttachmentBytes = 25 * 1024 * 1024
+
+// ErrNoSuchAttachment means the message does not carry an attachment at that position — the stored
+// description and the live message have diverged, which is the case a caller must not confuse with
+// an empty file.
+var ErrNoSuchAttachment = errors.New("no attachment at that position")
+
 // collector accumulates one message's text and attachment descriptions across the MIME tree.
 type collector struct {
 	// Not named `html`: that is an imported package here, and shadowing it would make
@@ -115,6 +125,12 @@ type collector struct {
 	plain       string
 	htmlPart    string
 	attachments []daemon.Attachment
+	// want is the position whose BYTES to keep, or -1 for the ordinary describe-only walk. One walk
+	// serves both readings so the position that addresses an attachment is derived the same way in
+	// both — a second traversal with its own idea of ordering is how the description and the
+	// content start pointing at different files.
+	want   int
+	wanted []byte
 }
 
 // bodyAndAttachments prefers `text/plain`, falls back to stripped HTML, and describes every
@@ -142,13 +158,48 @@ func bodyAndAttachments(msg *mail.Message) (string, []daemon.Attachment) {
 		return string(body), nil
 	}
 
-	var found collector
+	found := collector{want: -1}
 	found.walk(msg.Body, params["boundary"], 0)
 
 	if found.plain != "" {
 		return found.plain, found.attachments
 	}
 	return StripHTML(found.htmlPart), found.attachments
+}
+
+// Attachment returns one attachment's description and its bytes, addressed by the same position
+// the stored description carries.
+//
+// The message is re-read from the mailbox rather than kept: an attachment is a stranger's file, and
+// the one place it is guaranteed to already exist is the mailbox it arrived in. Nothing is written
+// to disk on the way through.
+func Attachment(raw []byte, position int) (daemon.Attachment, []byte, error) {
+	parsed, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		return daemon.Attachment{}, nil, err
+	}
+	mediaType, params, err := mime.ParseMediaType(parsed.Header.Get("Content-Type"))
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		return daemon.Attachment{}, nil, ErrNoSuchAttachment
+	}
+
+	found := collector{want: position}
+	found.walk(parsed.Body, params["boundary"], 0)
+	if position < 0 || position >= len(found.attachments) {
+		return daemon.Attachment{}, nil, ErrNoSuchAttachment
+	}
+	return found.attachments[position], found.wanted, nil
+}
+
+// readDecoded reads a part's real content, undoing base64 where multipart does not, and stops at
+// MaxAttachmentBytes so one hostile part cannot be answered with unbounded memory.
+func readDecoded(part *multipart.Part) []byte {
+	var reader io.Reader = part
+	if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "base64") {
+		reader = base64.NewDecoder(base64.StdEncoding, part)
+	}
+	content, _ := io.ReadAll(io.LimitReader(reader, MaxAttachmentBytes))
+	return content
 }
 
 // walk reads one multipart level, descending into nested multiparts and stopping at MaxMIMEDepth.
@@ -171,11 +222,19 @@ func (c *collector) walk(body io.Reader, boundary string, depth int) {
 
 		disposition, dispParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 		if disposition == "attachment" {
+			position := len(c.attachments)
+			size := int64(0)
+			if position == c.want {
+				c.wanted = readDecoded(part)
+				size = int64(len(c.wanted))
+			} else {
+				size = partSize(part)
+			}
 			c.attachments = append(c.attachments, daemon.Attachment{
-				Position:  len(c.attachments),
+				Position:  position,
 				Filename:  attachmentName(dispParams, partParams),
 				MimeType:  partType,
-				SizeBytes: partSize(part),
+				SizeBytes: size,
 			})
 			part.Close()
 			continue

@@ -5,9 +5,9 @@ import {
   agreementRate,
   autopilotState,
   budgetStatusLabel,
+  formatBytes,
   formatUsd,
   groupScoreboardByMode,
-  formatBytes,
   killSwitchLabel,
   mailLabel,
   mailTone,
@@ -18,6 +18,7 @@ import {
   readinessCriterionLabel,
   readinessGap,
   relativeTime,
+  safeDownloadName,
   scoreboardReadiness,
   totalPending,
 } from "./derive";
@@ -382,5 +383,17 @@ describe("pure UI derivations", () => {
     // Larger than the last unit keeps counting in GB rather than inventing one.
     expect(formatBytes(9_000_000_000_000)).toBe("9000 GB");
     expect(formatBytes(-1)).toBe("—");
+  });
+
+  it("makes a sender's filename safe to save under", () => {
+    // Downloading through a blob is the only way to send the bearer token, and it skips the
+    // Content-Disposition the daemon sanitised — so the name is made safe again here.
+    expect(safeDownloadName("../../.ssh/authorized_keys")).toBe("authorized_keys");
+    expect(safeDownloadName("..\\..\\System32\\evil.dll")).toBe("evil.dll");
+    expect(safeDownloadName("rela\u0000torio.docx")).toBe("relatorio.docx");
+    expect(safeDownloadName(null)).toBe("attachment.bin");
+    expect(safeDownloadName("")).toBe("attachment.bin");
+    expect(safeDownloadName("..")).toBe("attachment.bin");
+    expect(safeDownloadName("MÉDIAS_ESPERADAS.docx")).toBe("MÉDIAS_ESPERADAS.docx");
   });
 });

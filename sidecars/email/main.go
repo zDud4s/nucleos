@@ -11,6 +11,7 @@ import (
 
 	"nucleosemail/config"
 	"nucleosemail/daemon"
+	"nucleosemail/fetch"
 	"nucleosemail/poll"
 )
 
@@ -25,5 +26,15 @@ func main() {
 
 	log.Printf("watching %s on %s as %s every %s",
 		cfg.Mailbox, cfg.Addr(), cfg.Username, cfg.PollInterval)
+
+	// Attachments are served alongside the poll rather than instead of it. A failure here is logged
+	// and left: not being able to hand over a file is a worse day than not reading mail at all, and
+	// killing the process would trade one for the other.
+	go func() {
+		if err := fetch.Serve(cfg); err != nil {
+			log.Printf("attachment listener stopped: %v — polling continues", err)
+		}
+	}()
+
 	poll.Run(cfg, daemon.New(cfg.DaemonURL, cfg.DaemonToken))
 }

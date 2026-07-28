@@ -430,6 +430,29 @@ export async function getEmailQueue(token: string): Promise<QueuedEmail[] | null
   }
 }
 
+/**
+ * One attachment's bytes.
+ *
+ * Nothing is stored anywhere: the daemon asks the sidecar, the sidecar opens the mailbox, and the
+ * file travels straight through. Which is also why this can fail for a message that was deleted in
+ * Gmail after it was read here.
+ */
+export async function fetchAttachment(
+  token: string,
+  emailId: number,
+  position: number,
+): Promise<Blob | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/${emailId}/attachments/${position}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.blob();
+  } catch {
+    return null;
+  }
+}
+
 /** One message with its body — read when a message is opened, never to draw the list. */
 export async function getEmail(token: string, id: number): Promise<EmailDetail | null> {
   try {

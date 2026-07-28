@@ -150,6 +150,59 @@ pub const TRIAGE_MODE: &str = "email_triage";
 /// quoted thread, and the cap bounds how much untrusted content sits at rest.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 
+/// What an attachment is called when the sender gave it no usable name.
+pub const FALLBACK_FILENAME: &str = "attachment.bin";
+
+/// Filesystems stop around here, and a name this long is not a name anyone chose.
+const MAX_FILENAME_BYTES: usize = 120;
+
+/// Windows refuses these as filenames whatever the extension, and a program that tries anyway gets
+/// an error at a moment it is not expecting one.
+const RESERVED_WINDOWS_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// PURE: reduces a sender-chosen filename to something safe to put in a header or on a filesystem.
+///
+/// This string is the least trustworthy value in the whole pillar. It is written by whoever sent
+/// the mail, and it ends up in an HTTP header and, later, in a path — two places where the wrong
+/// characters stop being text and start being syntax. A carriage return ends a header and starts
+/// one of the sender's choosing; `../` walks out of the directory it was meant to stay in.
+///
+/// So it is rebuilt rather than checked: take the last path segment, drop what a filesystem or a
+/// header cannot carry, and if nothing survives, name it ourselves. A name that cannot be made safe
+/// is not worth preserving — the file it labels is unchanged either way.
+pub fn safe_filename(raw: &str) -> String {
+    // Both separators, always: a name arriving from a Unix sender is still going onto this disk.
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        // `<>:"|?*` are illegal on Windows; the rest are the characters that turn a filename into
+        // an argument, a redirect or a second command when something later forgets to quote it.
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0' => '_',
+            other => other,
+        })
+        .collect();
+
+    // Trailing dots and spaces are silently dropped by Windows, so a name ending in one resolves to
+    // a DIFFERENT file than the one written — the classic way a guard is stepped around.
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']).trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return FALLBACK_FILENAME.to_string();
+    }
+
+    let stem = trimmed.split('.').next().unwrap_or("").to_ascii_lowercase();
+    if RESERVED_WINDOWS_NAMES.contains(&stem.as_str()) {
+        return format!("_{trimmed}");
+    }
+
+    truncate_utf8(trimmed, MAX_FILENAME_BYTES).to_string()
+}
+
 /// A cursor older than this means a pile of already-read mail is about to arrive, which is the
 /// only situation the backfill cutoff exists for. Seven days is what separates it from the laptop
 /// that was off for the weekend (§4.4).
@@ -227,14 +280,22 @@ pub fn message_key(message_id: Option<&str>, uidvalidity: i64, uid: i64) -> Stri
 
 /// PURE: cap a body at `MAX_BODY_BYTES` without splitting a UTF-8 character.
 pub fn truncate_body(body: &str) -> &str {
-    if body.len() <= MAX_BODY_BYTES {
-        return body;
+    truncate_utf8(body, MAX_BODY_BYTES)
+}
+
+/// PURE: cut a string to a byte budget without splitting a character in half.
+///
+/// Shared by the body cap and the filename cap. Two copies of a rule this easy to get subtly wrong
+/// is how one of them ends up panicking on the first message with an accent in the wrong place.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
     }
-    let mut end = MAX_BODY_BYTES;
-    while end > 0 && !body.is_char_boundary(end) {
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    &body[..end]
+    &value[..end]
 }
 
 /// How a freshly ingested row enters: either pending, or already resolved without spending a run.
@@ -791,6 +852,52 @@ mod tests {
             }],
             ..message(uid)
         }
+    }
+
+    /// The sender writes this string. It ends up in an HTTP header and, later, in a path — two
+    /// places where the wrong character stops being text and becomes syntax.
+    #[test]
+    fn a_filename_is_rebuilt_rather_than_trusted() {
+        // A carriage return ends a header and starts one the sender chose.
+        assert_eq!(
+            safe_filename("relatorio\r\nSet-Cookie: x=1.docx"),
+            "relatorioSet-Cookie_ x=1.docx"
+        );
+        // Path traversal, both separators, because a Unix sender still writes to this disk.
+        assert_eq!(
+            safe_filename("../../.ssh/authorized_keys"),
+            "authorized_keys"
+        );
+        assert_eq!(
+            safe_filename(r"..\..\Windows\System32\evil.dll"),
+            "evil.dll"
+        );
+        // Nothing usable left is named by us rather than guessed at.
+        assert_eq!(safe_filename(""), FALLBACK_FILENAME);
+        assert_eq!(safe_filename("   "), FALLBACK_FILENAME);
+        assert_eq!(safe_filename(".."), FALLBACK_FILENAME);
+        assert_eq!(safe_filename("../"), FALLBACK_FILENAME);
+        // Windows drops trailing dots and spaces silently, so `x.docx.` resolves to a DIFFERENT
+        // file than the one written — the classic way past a check on the extension.
+        assert_eq!(safe_filename("relatorio.docx. "), "relatorio.docx");
+        // Reserved device names fail at open() rather than at write().
+        assert_eq!(safe_filename("CON.txt"), "_CON.txt");
+        assert_eq!(safe_filename("nul"), "_nul");
+        // Ordinary names, including accents, survive untouched.
+        assert_eq!(
+            safe_filename("MÉDIAS_ESPERADAS_e_percentis.docx"),
+            "MÉDIAS_ESPERADAS_e_percentis.docx"
+        );
+    }
+
+    /// Cutting at a byte budget must not split a character, or the name is invalid UTF-8 and the
+    /// first accented attachment takes the process down.
+    #[test]
+    fn a_long_filename_is_cut_on_a_character_boundary() {
+        let long = format!("{}.docx", "é".repeat(200));
+        let cut = safe_filename(&long);
+        assert!(cut.len() <= 120, "still {} bytes", cut.len());
+        assert!(cut.chars().all(|c| c == 'é'));
     }
 
     #[tokio::test]

@@ -72,6 +72,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/email/incoming", post(post_email_incoming))
         // Static segments win over `{id}` in matchit, so the three routes above stay reachable.
         .route("/email/{id}", get(get_email))
+        .route(
+            "/email/{id}/attachments/{position}",
+            get(get_email_attachment),
+        )
         .route("/email/{id}/requeue", post(post_email_requeue))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .layer(axum::middleware::from_fn_with_state(
@@ -378,6 +382,111 @@ async fn get_email(
         message,
         attachments,
     }))
+}
+
+/// How long the núcleo waits for the sidecar to go and get a file. Generous because the sidecar
+/// opens a fresh TLS connection and may be fetching 25 MB over someone's home connection.
+const ATTACHMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// PURE: builds a `Content-Disposition` for a filename chosen by a stranger.
+///
+/// Always `attachment`, never `inline`: the bytes came from outside and nothing renders them in
+/// place. The name goes out twice — a conservative ASCII form for old clients and the RFC 6266
+/// `filename*` form for everything else — and both are built from `safe_filename`'s output, so a
+/// name carrying a carriage return cannot end this header and begin one of the sender's choosing.
+fn content_disposition(filename: &str) -> String {
+    let safe = crate::email::safe_filename(filename);
+    // The quoted form cannot carry a quote or a backslash without escaping them, and a filename is
+    // not worth the escaping rules — anything outside a plain set becomes an underscore, and the
+    // faithful version travels in `filename*` alongside it.
+    let ascii: String = safe
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut encoded = String::with_capacity(safe.len());
+    for byte in safe.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+}
+
+/// One attachment's bytes, fetched from the mailbox at the moment they are asked for.
+///
+/// Nothing is cached on the way through. The file exists in exactly one place — the mailbox it
+/// arrived in — and keeping a copy would mean a stranger's executable sitting on disk because
+/// someone once clicked a filename.
+async fn get_email_attachment(
+    State(state): State<AppState>,
+    Path((id, position)): Path<(i64, i64)>,
+) -> Result<axum::response::Response, StatusCode> {
+    let row: Option<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT emails.uid, email_attachments.filename
+           FROM email_attachments
+           JOIN emails ON emails.id = email_attachments.email_id
+          WHERE email_attachments.email_id = ? AND email_attachments.position = ?",
+    )
+    .bind(id)
+    .bind(position)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (uid, filename) = row.ok_or(StatusCode::NOT_FOUND)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(ATTACHMENT_TIMEOUT)
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response = client
+        .get(format!(
+            "http://{}/attachment?uid={uid}&position={position}",
+            crate::sidecar::EMAIL_FETCH_ADDR
+        ))
+        .bearer_auth(&state.token.0)
+        .send()
+        .await
+        // The sidecar not answering is not the same as the file not existing, and telling a person
+        // "not found" when the truth is "nothing went to look" sends them hunting in the mailbox.
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    if !response.status().is_success() {
+        return Err(if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // The stored description and the live message disagree: the mail was deleted or
+            // replaced since it was read.
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        });
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                content_disposition(filename.as_deref().unwrap_or("")),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// The mail the pillar knows about: what is waiting, and what it most recently said.
@@ -1183,6 +1292,49 @@ mod tests {
     async fn the_static_email_routes_still_win_over_the_id_route() {
         let state = test_state().await;
         assert!(get_queue(state).await.is_empty());
+    }
+
+    /// The header a stranger's filename ends up in.
+    #[test]
+    fn a_content_disposition_cannot_be_ended_by_a_filename() {
+        let header = content_disposition("relatorio\r\nSet-Cookie: session=stolen.docx");
+        assert!(
+            !header.contains('\r') && !header.contains('\n'),
+            "the header carries a line break: {header}"
+        );
+        // Always a download, never something rendered where it landed.
+        assert!(header.starts_with("attachment; "));
+    }
+
+    #[test]
+    fn a_content_disposition_carries_the_name_in_both_forms() {
+        // The ASCII form stays plain for old clients; `filename*` carries the accents faithfully.
+        assert_eq!(
+            content_disposition("MÉDIAS.docx"),
+            "attachment; filename=\"M_DIAS.docx\"; filename*=UTF-8''M%C3%89DIAS.docx"
+        );
+        // A name with nothing usable in it still produces a valid header.
+        assert_eq!(
+            content_disposition(""),
+            "attachment; filename=\"attachment.bin\"; filename*=UTF-8''attachment.bin"
+        );
+    }
+
+    #[tokio::test]
+    async fn asking_for_an_attachment_that_was_never_described_is_a_404() {
+        let state = test_state().await;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/email/1/attachments/0")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Answered from the database, so no sidecar is contacted and none needs to be running.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

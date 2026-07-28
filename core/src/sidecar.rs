@@ -41,6 +41,13 @@ pub fn telegram_env(
     ]
 }
 
+/// Where the email sidecar serves attachments, and where the núcleo asks for them.
+///
+/// A constant rather than configuration because it is one fact shared by two processes, and a fact
+/// with two homes eventually has two values. 8793 follows the daemon (8791) and the echo sidecar
+/// (8792). Loopback is not a default here — the sidecar refuses to bind anything else.
+pub const EMAIL_FETCH_ADDR: &str = "127.0.0.1:8793";
+
 /// The email sidecar's environment (spec §3.4). This list is the contract between the núcleo and
 /// the Go sidecar: it reads nothing from disk and holds no config of its own, so anything it needs
 /// is here or it does not exist. The password comes from Credential Manager and never touches a
@@ -54,6 +61,7 @@ pub fn email_env(
     vec![
         ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
         ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
+        ("EMAIL_FETCH_ADDR".to_string(), EMAIL_FETCH_ADDR.to_string()),
         ("EMAIL_IMAP_HOST".to_string(), config.host.clone()),
         ("EMAIL_IMAP_PORT".to_string(), config.port.to_string()),
         ("EMAIL_IMAP_USERNAME".to_string(), config.username.clone()),
@@ -87,9 +95,12 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        assert_eq!(env.len(), 8);
+        assert_eq!(env.len(), 9);
         assert_eq!(env["NUCLEOS_DAEMON_URL"], "http://127.0.0.1:8791");
         assert_eq!(env["NUCLEOS_DAEMON_TOKEN"], "tok");
+        // The one address both processes have to agree on. The sidecar defaults to the same value,
+        // so a mismatch would only ever come from this line drifting.
+        assert_eq!(env["EMAIL_FETCH_ADDR"], EMAIL_FETCH_ADDR);
         assert_eq!(env["EMAIL_IMAP_HOST"], "imap.gmail.com");
         assert_eq!(env["EMAIL_IMAP_PORT"], "993");
         assert_eq!(env["EMAIL_IMAP_USERNAME"], "me@x.com");

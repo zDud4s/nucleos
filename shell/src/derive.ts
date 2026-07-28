@@ -36,6 +36,22 @@ export function mailLabel(triageClass: string | null): string {
 }
 
 /**
+ * The name a downloaded attachment is saved under.
+ *
+ * The daemon already sends a sanitised `Content-Disposition`, but downloading through a blob — the
+ * only way to send the bearer token — bypasses that header entirely, so the name has to be made
+ * safe again on this side. Mirrors the essential half of the daemon's `safe_filename`: last path
+ * segment, no control characters, and a name of our own when nothing usable survives.
+ */
+export function safeDownloadName(filename: string | null): string {
+  const base = (filename ?? "").split(/[/\\]/).pop() ?? "";
+  // eslint-disable-next-line no-control-regex
+  const cleaned = base.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (cleaned === "" || cleaned === "." || cleaned === "..") return "attachment.bin";
+  return cleaned;
+}
+
+/**
  * A file size in the units a person recognises from their own file manager.
  *
  * Decimal units (kB = 1000), because that is what the OS shows next to the same file — matching the
