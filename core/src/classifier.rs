@@ -32,13 +32,36 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "git diff",
     "git log",
     "git show",
-    "git remote -v",
     "cargo test",
     "cargo check",
     "cargo fmt --check",
     "cargo clippy",
     "dir",
     "type",
+];
+/// Read-only commands whose safety lives in the EXACT form, so they get no argument tolerance: for
+/// `git branch` and `git remote` the listing spelling and the mutating spelling share a first token
+/// (`git branch feature` CREATES, `git branch --unset-upstream` rewrites config, and `git remote -v
+/// add origin <url>` still adds a remote). A prefix entry would hand all three over; an "every
+/// argument starts with `-`" rule would still hand over the flag-only mutations. Verbatim listing
+/// forms are the widest shape that is provably non-mutating — anything else falls through to
+/// pending_approval.
+const SAFE_EXACT_COMMANDS: &[&str] = &[
+    "git branch",
+    "git branch -v",
+    "git branch -vv",
+    "git branch -a",
+    "git branch -av",
+    "git branch -a -v",
+    "git branch -r",
+    "git branch --all",
+    "git branch --list",
+    "git branch --remotes",
+    "git branch --verbose",
+    "git branch --show-current",
+    "git remote",
+    "git remote -v",
+    "git remote --verbose",
 ];
 
 pub struct Classification {
@@ -186,7 +209,19 @@ fn has_shell_control(command: &str) -> bool {
 fn is_safe_command(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")
-        && matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
+        && !writes_an_output_file(command)
+        && (SAFE_EXACT_COMMANDS.contains(&command)
+            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
+}
+
+/// `--output=<file>` is a *diff* option, so every history command in the safe set (`git log`,
+/// `git show`, `git diff`) turns into a file write with one flag — read-local must never mean "wrote
+/// a file". Rejecting the whole `--output` family also costs the display-only spellings
+/// (`--output-indicator-new`); that over-reach is the cheap side of the trade.
+fn writes_an_output_file(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|token| token.starts_with("--output"))
 }
 
 fn matches_command_prefix(command: &str, prefixes: &[&str]) -> bool {
@@ -402,6 +437,128 @@ mod tests {
                 classify("Bash", &json!({"command": command}), None),
                 "allow",
                 "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn allows_git_log_history_reads() {
+        for command in [
+            "git log",
+            "git log --oneline -5",
+            "git log -p",
+            "git log --stat --since=yesterday",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn allows_git_show_object_reads() {
+        for command in [
+            "git show",
+            "git show HEAD",
+            "git show HEAD:core/src/classifier.rs",
+            "git show --stat HEAD~3",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn allows_git_branch_listing_forms() {
+        for command in [
+            "git branch",
+            "git branch -v",
+            "git branch -vv",
+            "git branch -a",
+            "git branch -av",
+            "git branch -a -v",
+            "git branch -r",
+            "git branch --list",
+            "git branch --all",
+            "git branch --remotes",
+            "git branch --verbose",
+            "git branch --show-current",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn allows_git_remote_listing_forms() {
+        for command in ["git remote", "git remote -v", "git remote --verbose"] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn branch_and_remote_forms_that_mutate_stay_pending() {
+        for command in [
+            "git branch feature",
+            "git branch -d feature",
+            "git branch -D feature",
+            "git branch -m old new",
+            "git branch -v feature",
+            "git branch --edit-description",
+            "git branch --unset-upstream",
+            "git branch --set-upstream-to=origin/main",
+            "git remote add origin https://x",
+            "git remote -v add origin https://x",
+            "git remote remove origin",
+            "git remote set-url origin https://x",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    #[test]
+    fn history_reads_that_write_a_file_stay_pending() {
+        for command in [
+            "git log --output=patch.txt",
+            "git log --output patch.txt",
+            "git show --output=leak.txt HEAD",
+            "git diff --output=leak.txt",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    #[test]
+    fn git_push_still_requires_approval() {
+        for command in [
+            "git push",
+            "git push origin main",
+            "git push --force-with-lease origin main",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "push-merge-deploy",
             );
         }
     }
