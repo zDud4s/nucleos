@@ -561,11 +561,29 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     .bind(&now)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE proposals SET status='approved', decided_at=? WHERE id=?")
-        .bind(&now)
-        .bind(proposal_id)
-        .execute(&mut *tx)
-        .await?;
+    // Compare-and-set on the state this resume was authorised from, like every other writer of a
+    // proposal decision (`proposals::transition`, `worktree::release`). The `status != "pending"`
+    // check at the top of this function reads OUTSIDE the transaction, so a reject arriving in
+    // between would otherwise be overwritten here: the user's rejection would be stamped
+    // `approved`, its audit trail would read pending→approved, and the resume run would go on to
+    // perform the action they had just refused.
+    //
+    // Deliberately untested. Landing a rejection inside the window means writing to `proposals`
+    // after this transaction opens but before it takes SQLite's write lock, and once that lock is
+    // held a second writer blocks rather than races — a hand-driven poll test for it only ever
+    // reproduced the busy timeout. The guard costs one clause; a flaky test would cost more.
+    let approved = sqlx::query(
+        "UPDATE proposals SET status='approved', decided_at=? WHERE id=? AND status='pending'",
+    )
+    .bind(&now)
+    .bind(proposal_id)
+    .execute(&mut *tx)
+    .await?;
+    if approved.rows_affected() != 1 {
+        // Rolls back by dropping `tx`: the supersede, the resume row, the worktree hand-over and
+        // the grant all disappear with it, so a lost race leaves nothing half-applied.
+        return Err(ResumeError::ProposalNotPending);
+    }
     let note = format!("approved; resume run {resume_id}");
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
