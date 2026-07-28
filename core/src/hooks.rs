@@ -192,50 +192,22 @@ pub async fn pretooluse_decision(
     }
 
     if classification.decision.decision == "pending_approval" {
-        // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
-        // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
-            let terminated =
-                finalize_termination(&state, payload.run_id, "awaiting_approval").await;
-            if terminated {
-                let (session_id, project_id) =
-                    sqlx::query_as::<_, (Option<String>, Option<String>)>(
-                        "SELECT session_id, project_id FROM runs WHERE id = ?",
-                    )
-                    .bind(payload.run_id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or((None, None));
-                let tool_input = payload.tool_input.to_string();
-                if let Err(error) = crate::proposals::create_action_approval(
-                    &state.pool,
-                    payload.run_id,
-                    session_id.as_deref(),
-                    project_id.as_deref(),
-                    &payload.tool_name,
-                    &classification.reason,
-                    Some(&tool_input),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        run_id = payload.run_id,
-                        %error,
-                        "pretooluse-decision: failed to record action-approval proposal"
-                    );
-                    let _ = crate::feed::append(
-                        &state.pool,
-                        project_id.as_deref(),
-                        "proposal_record_failed",
-                        &format!("failed to record action-approval proposal: {error}"),
-                        Some(payload.run_id),
-                    )
-                    .await;
-                }
-            }
+            // In its own task, on purpose. Terminating the run kills the CLI whose hook script owns
+            // the connection this handler is answering, and that script gives up after 5s anyway
+            // (`ask_daemon.py`'s `timeout=5`) — so the request can disappear mid-handler, and a
+            // dropped request drops the handler future exactly the way `abort()` does. Awaiting the
+            // JoinHandle keeps the response as synchronous as before; dropping a JoinHandle only
+            // detaches its task, so the pause still gets recorded when the request goes away.
+            let _ = tokio::spawn(pause_for_approval(
+                state.clone(),
+                payload.run_id,
+                payload.tool_name.clone(),
+                payload.tool_input.to_string(),
+                classification.reason.clone(),
+            ))
+            .await;
         } else {
             tracing::warn!(
                 "pretooluse-decision: pending_approval for unknown/finished run_id {} — not terminating",
@@ -245,6 +217,62 @@ pub async fn pretooluse_decision(
     }
 
     Json(classification.decision)
+}
+
+/// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
+/// pause actionable. These two belong together — a run parked in `awaiting_approval` with no
+/// proposal can be neither approved nor rejected, and `one_open_worktree_run_per_project`
+/// (migration 0009) makes it block every later worktree run for that project, permanently: startup
+/// recovery only reconciles rows left `running`. Hence the caller runs this as a detachable task
+/// rather than inline in a request that may not survive its own side effects.
+async fn pause_for_approval(
+    state: AppState,
+    run_id: i64,
+    tool_name: String,
+    tool_input: String,
+    reason: String,
+) {
+    // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
+    // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
+    if !finalize_termination(&state, run_id, "awaiting_approval").await {
+        return;
+    }
+
+    let (session_id, project_id) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT session_id, project_id FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((None, None));
+
+    if let Err(error) = crate::proposals::create_action_approval(
+        &state.pool,
+        run_id,
+        session_id.as_deref(),
+        project_id.as_deref(),
+        &tool_name,
+        &reason,
+        Some(&tool_input),
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id,
+            %error,
+            "pretooluse-decision: failed to record action-approval proposal"
+        );
+        let _ = crate::feed::append(
+            &state.pool,
+            project_id.as_deref(),
+            "proposal_record_failed",
+            &format!("failed to record action-approval proposal: {error}"),
+            Some(run_id),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +451,89 @@ mod tests {
             .unwrap();
         assert_eq!(status, "awaiting_approval");
         assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    /// Terminating the run kills the CLI whose hook script owns the very connection this handler is
+    /// serving, and that script gives up after 5s anyway (`ask_daemon.py`'s `timeout=5`). Either way
+    /// the request can vanish mid-handler, and a dropped request drops the handler future exactly the
+    /// way `abort()` does — so everything sequenced after the termination is lost.
+    ///
+    /// The loss is unrecoverable, not merely untidy: a run parked in `awaiting_approval` with no
+    /// proposal can be neither approved nor rejected, and `one_open_worktree_run_per_project`
+    /// (migration 0009) then makes it block every later worktree run for that project. Startup
+    /// recovery does not help — it only reconciles rows left `running`.
+    #[tokio::test]
+    async fn a_dropped_hook_request_still_records_the_approval_proposal() {
+        use std::future::Future;
+
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, project_id, created_at)
+             VALUES ('x', 'running', 'worktree', 'proj-1', '2026-07-28T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+
+        let mut handler = Box::pin(pretooluse_decision(
+            State(state.clone()),
+            Json(PreToolUsePayload {
+                run_id,
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({"command": "git push origin main"}),
+            }),
+        ));
+
+        // Drive the handler by hand so the request can be dropped at a chosen point: the instant the
+        // irreversible half is done. Removing the abort handle is that point of no return — it is the
+        // arbiter that decides this call owns the termination, and it runs before any recording work.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut terminated = false;
+        for _ in 0..10_000 {
+            assert!(
+                handler.as_mut().poll(&mut context).is_pending(),
+                "the handler ran to completion before the request could be dropped"
+            );
+            if !state.run_handles.lock().unwrap().contains_key(&run_id) {
+                terminated = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(terminated, "the handler never terminated the run");
+        drop(handler);
+
+        for _ in 0..100 {
+            if !proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a paused run with no proposal is stuck forever and blocks its project"
+        );
+        assert_eq!(pending[0].run_id, Some(run_id));
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
     }
 
     #[tokio::test]
