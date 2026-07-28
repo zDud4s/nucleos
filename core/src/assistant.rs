@@ -26,30 +26,47 @@ fn extract_reply(stdout: &str) -> Option<String> {
 
 static BUSY_CHATS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-fn try_begin_turn(chat_id: &str) -> bool {
-    BUSY_CHATS.lock().unwrap().insert(chat_id.to_string())
-}
-
-fn end_turn(chat_id: &str) {
-    BUSY_CHATS.lock().unwrap().remove(chat_id);
-}
-
-/// Owns a turn's chat slot and its temp MCP config, releasing both when the turn ends — by
-/// completing, by failing, or by being aborted.
+/// Owns a chat's one turn slot for as long as it is held, releasing it on every way out.
 ///
-/// This must be a guard rather than cleanup statements at the end of the task. Cancelling a run
-/// calls `abort()` (`runs::finalize_termination`), which drops the task's future mid-await, so
-/// anything written after the `.await` never runs. A chat left behind in `BUSY_CHATS` then rejects
-/// every later message with 409 until the daemon restarts — and "the bot stopped answering" points
-/// nowhere near a cancel that reported success.
-struct TurnGuard {
+/// A guard rather than a matching pair of calls, because there is no point in the turn's life where
+/// a trailing statement is reliable. Cancelling a run calls `abort()`
+/// (`runs::finalize_termination`), which drops the task's future mid-await; abandoning the HTTP
+/// request that started the turn drops that future the same way. Anything written after an `.await`
+/// then never runs, and a chat left behind in `BUSY_CHATS` rejects every later message with 409
+/// until the daemon restarts — "the bot stopped answering" points nowhere near either cause.
+struct ChatSlot {
     chat_id: String,
+}
+
+impl ChatSlot {
+    /// Claims the chat, or returns None if a turn is already in flight for it.
+    fn acquire(chat_id: &str) -> Option<Self> {
+        BUSY_CHATS
+            .lock()
+            .unwrap()
+            .insert(chat_id.to_string())
+            .then(|| Self {
+                chat_id: chat_id.to_string(),
+            })
+    }
+}
+
+impl Drop for ChatSlot {
+    fn drop(&mut self) {
+        BUSY_CHATS.lock().unwrap().remove(&self.chat_id);
+    }
+}
+
+/// Owns a turn's chat slot and its temp MCP config for the length of the turn, releasing both when
+/// it ends — by completing, by failing, or by being aborted.
+struct TurnGuard {
+    slot: ChatSlot,
     mcp_path: std::path::PathBuf,
 }
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        end_turn(&self.chat_id);
+        // `slot` releases the chat by being dropped with the rest of this struct.
         let _ = std::fs::remove_file(&self.mcp_path);
     }
 }
@@ -102,53 +119,39 @@ pub async fn send_message(
     chat_id: &str,
     text: &str,
 ) -> Result<i64, String> {
-    if !try_begin_turn(chat_id) {
-        return Err("a turn is already in progress for this chat".into());
-    }
+    // Held from here on: every early return, error, and dropped future below releases the chat by
+    // dropping this, which is why none of them needs a cleanup statement of its own.
+    let slot = ChatSlot::acquire(chat_id)
+        .ok_or("a turn is already in progress for this chat".to_string())?;
 
-    let result = async {
-        let resume = get_session(&state.pool, chat_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let exe = exe.to_string_lossy().to_string();
-        let config = build_mcp_config(&exe);
-        let mcp_path = std::env::temp_dir().join(format!("nucleos-mcp-{chat_id}.json"));
-        let config_bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
-        std::fs::write(&mcp_path, config_bytes).map_err(|e| e.to_string())?;
-
-        let id = sqlx::query(
-            "INSERT INTO runs (prompt, status, mode, created_at) VALUES (?, 'running', 'assistant', ?)",
-        )
-        .bind(text)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&state.pool)
+    let resume = get_session(&state.pool, chat_id)
         .await
-        .map_err(|e| e.to_string())?
-        .last_insert_rowid();
+        .map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe.to_string_lossy().to_string();
+    let config = build_mcp_config(&exe);
+    let mcp_path = std::env::temp_dir().join(format!("nucleos-mcp-{chat_id}.json"));
+    let config_bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&mcp_path, config_bytes).map_err(|e| e.to_string())?;
 
-        spawn_assistant_turn(
-            state,
-            id,
-            chat_id.to_string(),
-            text.to_string(),
-            resume,
-            mcp_path,
-        );
-        Ok(id)
-    }
-    .await;
+    let id = sqlx::query(
+        "INSERT INTO runs (prompt, status, mode, created_at) VALUES (?, 'running', 'assistant', ?)",
+    )
+    .bind(text)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .last_insert_rowid();
 
-    if result.is_err() {
-        end_turn(chat_id);
-    }
-    result
+    spawn_assistant_turn(state, id, slot, text.to_string(), resume, mcp_path);
+    Ok(id)
 }
 
 fn spawn_assistant_turn(
     state: &crate::state::AppState,
     id: i64,
-    chat_id: String,
+    slot: ChatSlot,
     text: String,
     resume: Option<String>,
     mcp_path: std::path::PathBuf,
@@ -160,13 +163,13 @@ fn spawn_assistant_turn(
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
-    let turn = TurnGuard { chat_id, mcp_path };
+    let turn = TurnGuard { slot, mcp_path };
 
     crate::runs::spawn_registered(state, id, async move {
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
             let pool = pool.clone();
-            let chat_id = turn.chat_id.clone();
+            let chat_id = turn.slot.chat_id.clone();
             tokio::spawn(async move {
                 if let Some(session_id) = session_rx.recv().await {
                     let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
@@ -216,7 +219,8 @@ fn spawn_assistant_turn(
                 .execute(&pool)
                 .await;
                 if let Some(session_id) = o.session_id.as_deref() {
-                    let _ = upsert_session(&pool, &turn.chat_id, session_id, &completed_at).await;
+                    let _ =
+                        upsert_session(&pool, &turn.slot.chat_id, session_id, &completed_at).await;
                 }
             }
             Ok(Err(e)) => {
@@ -355,11 +359,43 @@ mod tests {
     fn only_one_turn_can_be_in_flight_per_chat() {
         let chat_id = "busy-test-chat";
 
-        assert!(try_begin_turn(chat_id));
-        assert!(!try_begin_turn(chat_id));
-        end_turn(chat_id);
-        assert!(try_begin_turn(chat_id));
-        end_turn(chat_id);
+        let slot = ChatSlot::acquire(chat_id).expect("the chat starts free");
+        assert!(ChatSlot::acquire(chat_id).is_none());
+        drop(slot);
+        assert!(ChatSlot::acquire(chat_id).is_some());
+    }
+
+    /// The chat is marked busy synchronously, but the work that follows — reading the session,
+    /// writing the MCP config, inserting the run row — spans awaits, and the Telegram sidecar's HTTP
+    /// client can give up inside that span. A cancelled request drops this future exactly the way
+    /// `abort()` drops a turn's, so a chat slot released only by a trailing statement is never
+    /// released at all. That is the same 409-forever symptom as a cancelled turn, reached through a
+    /// different door: the bot simply stops answering until the daemon restarts.
+    #[tokio::test]
+    async fn a_dropped_message_request_frees_the_chat() {
+        use std::future::Future;
+
+        let state = test_state().await;
+        let chat_id = "assistant-dropped-request-chat";
+
+        let mut request = Box::pin(send_message(&state, chat_id, "hello"));
+
+        // One poll is all it takes to claim the chat; the future then parks on the session lookup.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            request.as_mut().poll(&mut context).is_pending(),
+            "the request ran to completion before it could be dropped"
+        );
+        assert!(
+            BUSY_CHATS.lock().unwrap().contains(chat_id),
+            "the turn should have claimed the chat"
+        );
+        drop(request);
+
+        assert!(
+            !BUSY_CHATS.lock().unwrap().contains(chat_id),
+            "an abandoned request must not leave the chat busy forever"
+        );
     }
 
     #[tokio::test]
@@ -446,9 +482,8 @@ mod tests {
             "the temp mcp config should not outlive a cancelled turn"
         );
         assert!(
-            try_begin_turn(chat_id),
+            ChatSlot::acquire(chat_id).is_some(),
             "a cancelled turn must free the chat for the next message"
         );
-        end_turn(chat_id);
     }
 }
