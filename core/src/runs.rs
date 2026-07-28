@@ -144,24 +144,47 @@ pub(crate) fn run_env(state: &AppState, id: i64) -> Vec<(String, String)> {
     ]
 }
 
+/// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
+/// aborted, including aborted before its first poll, when the task drops its captured state without
+/// running a line of the body.
+struct Registration {
+    handles: crate::state::RunHandles,
+    id: i64,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.handles.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// Spawn a run's driver task and register its abort handle so an in-flight run can be terminated
-/// (cancel / `pending_approval`). The handle is removed when the task finishes naturally; an
-/// aborted task never reaches the removal because the terminator (`finalize_termination`) already
-/// removed it.
+/// (cancel / `pending_approval`).
+///
+/// The handle is released by a guard the task captures rather than by a statement after
+/// `body.await`, because a stale entry here is not merely untidy bookkeeping:
+/// `hooks::pretooluse_decision` reads this map as its "is this run_id really in flight" check, so an
+/// entry that outlives its run lets a finished run be terminated and pended all over again, and
+/// `cancel_run` will overwrite a completed run's final status. An abort is already covered — the
+/// terminator (`finalize_termination`) removes the entry itself — but a panicking body is not.
+///
+/// Registration holds the map lock across the spawn on purpose: the guard runs on whichever thread
+/// picks the task up, so a body that finishes before the insert would otherwise release a handle
+/// that is only inserted afterwards, pinning it for the life of the daemon.
 pub(crate) fn spawn_registered<F>(state: &AppState, id: i64, body: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let handles = state.run_handles.clone();
+    let registration = Registration {
+        handles: state.run_handles.clone(),
+        id,
+    };
+    let mut handles = state.run_handles.lock().unwrap();
     let join = tokio::spawn(async move {
+        let _registration = registration;
         body.await;
-        handles.lock().unwrap().remove(&id);
     });
-    state
-        .run_handles
-        .lock()
-        .unwrap()
-        .insert(id, join.abort_handle());
+    handles.insert(id, join.abort_handle());
 }
 
 fn spawn_run(
@@ -1293,6 +1316,30 @@ mod tests {
         );
 
         let _ = crate::worktree::remove(&repo, &worktree_path, &[]).await;
+    }
+
+    /// A leaked abort handle is not just untidy bookkeeping: `hooks::pretooluse_decision` reads this
+    /// map as its "is this run_id really in flight" check, so an entry that outlives its run lets a
+    /// finished run be terminated and pended all over again — and `cancel_run` will happily overwrite
+    /// a completed run's final status. Releasing the handle in a statement after `body.await` misses
+    /// every way out of the task that is not a clean return.
+    #[tokio::test]
+    async fn a_panicking_run_task_still_releases_its_abort_handle() {
+        let state = test_state().await;
+        let id = 91_001;
+
+        spawn_registered(&state, id, async { panic!("run body blew up") });
+
+        for _ in 0..100 {
+            if !state.run_handles.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&id),
+            "a dead run must not stay registered as in-flight"
+        );
     }
 
     #[tokio::test]
