@@ -243,6 +243,11 @@ impl EntryClass {
 ///
 /// `now` is a parameter rather than read inside, so the cutoff rules can be tested at any point in
 /// time without waiting for one.
+///
+/// Wide rather than taking a struct, deliberately: every parameter is a distinct field of the
+/// sidecar's wire envelope, and bundling them would let a caller inherit a default for one of them
+/// — including `retain_bodies_days`, which decides whether a body survives.
+#[allow(clippy::too_many_arguments)]
 pub async fn ingest_batch(
     pool: &sqlx::SqlitePool,
     mailbox: &str,
@@ -250,6 +255,7 @@ pub async fn ingest_batch(
     max_uid_examined: i64,
     skipped: &[SkippedMessage],
     messages: &[IncomingMessage],
+    retain_bodies_days: u8,
     now: chrono::DateTime<chrono::Utc>,
 ) -> sqlx::Result<IngestOutcome> {
     let now_str = now.to_rfc3339();
@@ -293,10 +299,14 @@ pub async fn ingest_batch(
             EntryClass::pending()
         };
 
-        // A row that never enters the queue never needs its body: it will not be triaged (§7.2).
+        // A row classified here never enters the queue, so in the steady state it never needs its
+        // body. But that is only true at `retain_bodies_days == 0`: the default keeps bodies so the
+        // calibration week (§9) has a real corpus to judge the classifier against, and dropping
+        // them at classification would make that week one-way — a wrong call could never be
+        // reviewed. With retention on, periodic pruning is what clears them (§7.2).
         let body = match entry.triage_class {
-            Some(_) => None,
-            None => message.body_text.as_deref().map(truncate_body),
+            Some(_) if retain_bodies_days == 0 => None,
+            _ => message.body_text.as_deref().map(truncate_body),
         };
         let triaged_at = entry.triage_class.map(|_| now_str.as_str());
 
@@ -750,7 +760,7 @@ mod tests {
         messages: &[IncomingMessage],
         max_uid_examined: i64,
     ) -> IngestOutcome {
-        ingest_batch(pool, "INBOX", 1, max_uid_examined, &[], messages, now())
+        ingest_batch(pool, "INBOX", 1, max_uid_examined, &[], messages, 14, now())
             .await
             .unwrap()
     }
@@ -825,7 +835,7 @@ mod tests {
     /// A gated row never enters the queue, so it never needs the body — and dropping it here is
     /// what makes the gate the pillar's main reducer of untrusted content at rest.
     #[tokio::test]
-    async fn a_noise_row_is_stored_classified_without_body_or_run() {
+    async fn a_noise_row_is_stored_classified_without_a_run() {
         let pool = test_pool().await;
         let mut m = message(12);
         m.headers
@@ -840,9 +850,40 @@ mod tests {
             row.get::<Option<String>, _>("triage_class").as_deref(),
             Some("noise")
         );
-        assert!(row.get::<Option<String>, _>("body_text").is_none());
+        assert!(
+            row.get::<Option<String>, _>("body_text").is_some(),
+            "with retention on, classification keeps the body for the calibration week (§7.2)"
+        );
         assert!(row.get::<Option<i64>, _>("triage_run_id").is_none());
         assert!(row.get::<Option<String>, _>("triaged_at").is_some());
+    }
+
+    /// The steady state (`retain_bodies_days: 0`): a row that never enters the queue never needs
+    /// its body, and dropping it here is what makes the gate the pillar's main reducer of untrusted
+    /// content at rest.
+    #[tokio::test]
+    async fn with_retention_off_a_classified_row_keeps_no_body() {
+        let pool = test_pool().await;
+        let mut noisy = message(14);
+        noisy
+            .headers
+            .insert("list-unsubscribe".into(), "<mailto:x@y>".into());
+        let mut old = message(15);
+        old.received_at = ago(72);
+
+        ingest_batch(&pool, "INBOX", 1, 15, &[], &[noisy, old], 0, now())
+            .await
+            .unwrap();
+
+        for message_id in ["<m14@x>", "<m15@x>"] {
+            let body: Option<String> =
+                sqlx::query_scalar("SELECT body_text FROM emails WHERE message_id = ?")
+                    .bind(message_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(body.is_none(), "{message_id} should have dropped its body");
+        }
     }
 
     /// Spec §4.2's race: a redelivery must not re-run the gate over a row an in-flight batch has
@@ -895,8 +936,17 @@ mod tests {
         .await
         .unwrap();
 
-        let result =
-            ingest_batch(&pool, "INBOX", 1, 21, &[], &[message(20), poisoned], now()).await;
+        let result = ingest_batch(
+            &pool,
+            "INBOX",
+            1,
+            21,
+            &[],
+            &[message(20), poisoned],
+            14,
+            now(),
+        )
+        .await;
         assert!(result.is_err(), "the batch must fail as a whole");
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
@@ -933,6 +983,7 @@ mod tests {
                 reason: "malformed MIME".into(),
             }],
             &[],
+            14,
             now(),
         )
         .await
@@ -952,7 +1003,7 @@ mod tests {
     async fn a_uidvalidity_change_replaces_the_cursor() {
         let pool = test_pool().await;
         seed_cursor(&pool, 1, 900, 0).await;
-        let outcome = ingest_batch(&pool, "INBOX", 2, 5, &[], &[], now())
+        let outcome = ingest_batch(&pool, "INBOX", 2, 5, &[], &[], 14, now())
             .await
             .unwrap();
         assert_eq!(outcome.cursor, 5, "a rebuilt uid space is not a rewind");

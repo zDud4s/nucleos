@@ -159,7 +159,7 @@ async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, created_at, completed_at
          FROM runs
-         WHERE mode IN ('shadow', 'worktree')",
+         WHERE mode IN ('shadow', 'worktree', 'email_triage')",
     )
     .fetch_all(pool)
     .await?;

@@ -236,11 +236,17 @@ async fn main() {
                 }
                 // Off rather than unprotected. The pillar's whole premise is that untrusted content
                 // never meets a tool, and an unproven barrier is not a barrier.
-                Err(error) => tracing::error!(
-                    %error,
-                    "email triage barrier could not be verified — the pillar stays OFF"
-                ),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "email triage barrier could not be verified — the pillar stays OFF"
+                    );
+                    return;
+                }
             }
+            // Only reached when the barrier is proven. The loop is its own task beside the
+            // scheduler, which is the precedent that takes `AppState`.
+            triage::run_triage_loop(state).await;
         });
     } else {
         tracing::info!("email pillar disabled (.ai/email.yaml: enabled: false)");

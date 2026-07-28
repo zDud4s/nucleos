@@ -224,6 +224,7 @@ async fn post_email_incoming(
     // Ingestion is one transaction over untrusted content and it moves the cursor. A client that
     // disconnects mid-request must not be able to leave that half-done.
     let pool = state.pool.clone();
+    let retain_bodies_days = state.email.retain_bodies_days;
     uncancellable(async move {
         crate::email::ingest_batch(
             &pool,
@@ -232,6 +233,7 @@ async fn post_email_incoming(
             body.max_uid_examined,
             &body.skipped,
             &body.messages,
+            retain_bodies_days,
             chrono::Utc::now(),
         )
         .await
