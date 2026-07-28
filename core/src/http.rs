@@ -798,7 +798,18 @@ async fn post_assistant_message(
     State(state): State<AppState>,
     Json(body): Json<AssistantMessageRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match crate::assistant::send_message(&state, &body.chat_id, &body.text).await {
+    // Uncancellable for the same reason `create_run` is: `send_message` writes the turn's `running`
+    // row and only then spawns the task that will finish it. A client that disconnects mid-request
+    // drops this future exactly the way `abort()` drops a run's, and a drop landing between those
+    // two leaves a `running` assistant row with no task and no abort handle — `/assistant/{id}`
+    // reports it running forever and `/cancel` answers 404. The Telegram sidecar is the caller, and
+    // it gives up on a turn after a timeout, so the disconnect is routine rather than theoretical.
+    let outcome = uncancellable(async move {
+        crate::assistant::send_message(&state, &body.chat_id, &body.text).await
+    })
+    .await?;
+
+    match outcome {
         Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
         Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
