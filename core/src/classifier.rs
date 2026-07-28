@@ -210,6 +210,7 @@ fn is_safe_command(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")
         && !writes_an_output_file(command)
+        && !forces_external_diff_or_textconv(command)
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
 }
@@ -222,6 +223,18 @@ fn writes_an_output_file(command: &str) -> bool {
     command
         .split_whitespace()
         .any(|token| token.starts_with("--output"))
+}
+
+/// `--ext-diff` forces a repo-configured external diff driver to run — arbitrary command
+/// execution, not a read — on `git log`/`git show`, where it is off by default; rejecting the
+/// token closes that door. On `git diff` a configured driver can already run with no flag at
+/// all, a config-driven residual a lexical classifier cannot see and this does NOT close.
+/// `--textconv` likewise forces a configured textconv filter where it would not otherwise run.
+/// `--no-ext-diff` / `--no-textconv` disable the drivers (the safe direction) and must not match.
+fn forces_external_diff_or_textconv(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|token| token.starts_with("--ext-diff") || token.starts_with("--textconv"))
 }
 
 fn matches_command_prefix(command: &str, prefixes: &[&str]) -> bool {
@@ -544,6 +557,50 @@ mod tests {
                 classify("Bash", &json!({"command": command}), None),
                 "pending_approval",
                 "unrecognized",
+            );
+        }
+    }
+
+    #[test]
+    fn history_reads_that_force_external_commands_stay_pending() {
+        for command in [
+            "git log -p --ext-diff",
+            "git show --ext-diff HEAD",
+            "git diff --ext-diff",
+            "git log --textconv",
+            "git show --textconv",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    #[test]
+    fn default_history_reads_without_ext_diff_or_textconv_still_allowed() {
+        for command in ["git log -p", "git show HEAD", "git diff"] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn no_ext_diff_and_no_textconv_remain_allowed() {
+        for command in [
+            "git diff --no-ext-diff",
+            "git diff --no-textconv",
+            "git log --no-ext-diff",
+            "git show --no-textconv",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
             );
         }
     }
