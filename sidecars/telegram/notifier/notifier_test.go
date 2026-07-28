@@ -36,6 +36,57 @@ func TestStateNewFeedItems(t *testing.T) {
 	}
 }
 
+// The seen sets used to grow for the life of the process: every id ever observed stayed, including
+// the proposals the daemon decided months ago. Rebuilding them from what the daemon still reports
+// keeps them the size of the answer — and a decided proposal never returns to be announced twice.
+func TestSeenIdsShrinkBackAsItemsLeaveTheDaemonsLists(t *testing.T) {
+	state := NewState()
+
+	for id := 1; id <= 100; id++ {
+		state.NewProposals([]map[string]any{{"id": float64(id)}})
+		state.NewFeedItems([]map[string]any{{"id": float64(id)}})
+	}
+
+	if len(state.seenProposals) != 1 {
+		t.Errorf("remembered proposals = %d, want only the one still pending", len(state.seenProposals))
+	}
+	if len(state.seenFeed) != 1 {
+		t.Errorf("remembered feed items = %d, want only the one still in the feed", len(state.seenFeed))
+	}
+}
+
+// An announcement that failed to send has still been marked as announced, so it would never be
+// tried again — the proposal simply never reaches the person who has to decide on it.
+func TestAnUndeliveredAnnouncementCanBeRetried(t *testing.T) {
+	state := NewState()
+	pending := []map[string]any{{"id": float64(4)}}
+
+	if len(state.NewProposals(pending)) != 1 {
+		t.Fatal("the first look must report the proposal as new")
+	}
+	if len(state.NewProposals(pending)) != 0 {
+		t.Fatal("the second look must not report it again")
+	}
+
+	state.Forget(4)
+	if len(state.NewProposals(pending)) != 1 {
+		t.Error("a forgotten proposal must be reported again so the send can be retried")
+	}
+}
+
+func TestAnUndeliveredKillAlertCanBeRetried(t *testing.T) {
+	state := NewState()
+	state.KillChanged(false)
+
+	if !state.KillChanged(true) {
+		t.Fatal("KillChanged(true) after false = false, want the change reported")
+	}
+	state.ForgetKill(true)
+	if !state.KillChanged(true) {
+		t.Error("KillChanged(true) after ForgetKill(true) = false, want the alert offered again")
+	}
+}
+
 func TestStateKillChanged(t *testing.T) {
 	state := NewState()
 

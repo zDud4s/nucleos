@@ -1,9 +1,12 @@
 package pipe
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +22,18 @@ import (
 
 const pollInterval = 3 * time.Second
 const maxPollAttempts = 200
+
+// A turn outlives a daemon restart — the run keeps going server-side — so a failed GetRun is not a
+// reason to stop watching. A daemon that is gone for good still has to produce an answer, which is
+// what bounds the tolerance.
+const maxConsecutivePollErrors = 5
+
+const tempFilePattern = "nucleos-tg-*"
+
+// An attachment has to survive the turn that reads it, and a queued turn can take minutes — but
+// these are files from a private control channel sitting unencrypted in the system temp directory,
+// and "until someone notices" is not a retention policy.
+const tempFileTTL = 24 * time.Hour
 
 const helpText = `Talk normally to reach the orchestrator.
 
@@ -82,10 +97,30 @@ func (t *Tracker) Get(chatID int64) (int64, bool) {
 	return v, ok
 }
 
+// ChatOf is the chat an update belongs to, which is the key updates are serialised by.
+func ChatOf(u telegram.Update) int64 {
+	switch {
+	case u.CallbackQuery != nil && u.CallbackQuery.Message != nil:
+		return u.CallbackQuery.Message.Chat.ID
+	case u.Message != nil:
+		return u.Message.Chat.ID
+	default:
+		return 0
+	}
+}
+
 func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Tracker, u telegram.Update) {
 	if u.CallbackQuery != nil {
 		cb := u.CallbackQuery
 		if cb.Message == nil || !cfg.IsAllowed(cb.Message.Chat.ID) {
+			return
+		}
+		// The button is checked against the finger that pressed it, not only against the chat it
+		// lives in: in a group those are different questions, and this button approves an action an
+		// autonomous agent asked to take.
+		if !cfg.IsAllowedSender(cb.Message.Chat.ID, cb.From.ID) {
+			logSend("unauthorised press", bot.AnswerCallbackQuery(cb.ID, "not authorised"))
+			log.Printf("callback from unauthorised user %d in chat %d ignored", cb.From.ID, cb.Message.Chat.ID)
 			return
 		}
 		HandleCallback(bot, dc, *cb)
@@ -97,24 +132,53 @@ func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Trac
 	if !cfg.IsAllowed(u.Message.Chat.ID) {
 		return
 	}
+	if !cfg.IsAllowedSender(u.Message.Chat.ID, u.Message.SenderID()) {
+		log.Printf("message from unauthorised user %d in chat %d ignored", u.Message.SenderID(), u.Message.Chat.ID)
+		return
+	}
+
+	chatID := u.Message.Chat.ID
 	text := resolveIncoming(dl, cfg.TranscribeCmd, u.Message)
-	HandleMessage(bot, dc, tr, u.Message.Chat.ID, text)
+	if strings.TrimSpace(text) == "" {
+		// A sticker, a location, a poll: none of them carries a prompt, and a turn started on an
+		// empty one spends a run to answer nothing.
+		logSend("unreadable message", bot.SendMessage(chatID,
+			"I can only read text, voice notes, photos and documents."))
+		return
+	}
+	if u.Message.Voice != nil {
+		handleTranscript(bot, dc, tr, chatID, text)
+		return
+	}
+	HandleMessage(bot, dc, tr, chatID, text)
 }
 
 // buildAttachmentPrompt returns the orchestrator prompt for a saved attachment. A document takes
-// priority over a photo. Returns ("", false) when neither path is set.
-func buildAttachmentPrompt(documentPath, photoPath string) (string, bool) {
+// priority over a photo. Returns ("", false) when neither path is set. The caption is carried
+// through because it is where the instruction lives — without it the orchestrator is handed a file
+// and no idea what it is meant to do with it.
+func buildAttachmentPrompt(documentPath, photoPath, caption string) (string, bool) {
+	var prompt string
 	switch {
 	case documentPath != "":
-		return "The user sent a document. File saved at: " + documentPath, true
+		prompt = "The user sent a document. File saved at: " + documentPath
 	case photoPath != "":
-		return "The user sent a photo. File saved at: " + photoPath, true
+		prompt = "The user sent a photo. File saved at: " + photoPath
 	default:
 		return "", false
 	}
+
+	if caption = strings.TrimSpace(caption); caption != "" {
+		prompt += "\nThe user wrote: " + caption
+	}
+	return prompt, true
 }
 
 func downloadToTemp(dl Downloader, fileID, suffix string) (string, error) {
+	// Swept here rather than on a timer: this is the only place that creates these files, so it is
+	// the one place guaranteed to run whenever there are new ones to eventually clean up.
+	sweepTempFiles(os.TempDir(), tempFileTTL)
+
 	remotePath, err := dl.GetFile(fileID)
 	if err != nil {
 		return "", err
@@ -123,7 +187,7 @@ func downloadToTemp(dl Downloader, fileID, suffix string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f, err := os.CreateTemp("", "nucleos-tg-*"+suffix)
+	f, err := os.CreateTemp("", tempFilePattern+suffix)
 	if err != nil {
 		return "", err
 	}
@@ -132,6 +196,25 @@ func downloadToTemp(dl Downloader, fileID, suffix string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// sweepTempFiles removes attachments this sidecar wrote and nobody came back for. It only ever
+// touches names it creates itself, so a shared temp directory keeps everything else.
+func sweepTempFiles(dir string, maxAge time.Duration) {
+	matches, err := filepath.Glob(filepath.Join(dir, tempFilePattern))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			log.Printf("could not remove stale attachment %q: %v", path, err)
+		}
+	}
 }
 
 // resolveIncoming turns a message (possibly a voice note or attachment) into the text to route to
@@ -145,6 +228,13 @@ func resolveIncoming(dl Downloader, transcribeCmd string, msg *telegram.Message)
 		if err != nil {
 			return "[voice message received but could not be downloaded]"
 		}
+		// The recording is a person's voice, in the clear, in the system temp directory; it is
+		// needed for exactly as long as the transcription takes and not one turn longer.
+		defer func() {
+			if err := os.Remove(path); err != nil {
+				log.Printf("could not remove voice recording %q: %v", path, err)
+			}
+		}()
 		text, err := transcribe.Transcribe(transcribeCmd, path)
 		if err != nil || strings.TrimSpace(text) == "" {
 			return "[voice message received but transcription is unavailable]"
@@ -155,7 +245,7 @@ func resolveIncoming(dl Downloader, transcribeCmd string, msg *telegram.Message)
 		if err != nil {
 			return "[document received but could not be downloaded]"
 		}
-		prompt, _ := buildAttachmentPrompt(path, "")
+		prompt, _ := buildAttachmentPrompt(path, "", msg.Caption)
 		return prompt
 	case len(msg.Photo) > 0:
 		// largest photo is the last element in Telegram's ascending-size array
@@ -164,11 +254,21 @@ func resolveIncoming(dl Downloader, transcribeCmd string, msg *telegram.Message)
 		if err != nil {
 			return "[photo received but could not be downloaded]"
 		}
-		prompt, _ := buildAttachmentPrompt("", path)
+		prompt, _ := buildAttachmentPrompt("", path, msg.Caption)
 		return prompt
 	default:
 		return msg.Text
 	}
+}
+
+// logSend records a send that failed instead of dropping it. This channel is a remote control: an
+// approval prompt or a kill-switch alert that never arrives leaves a person looking at a bot that
+// seems alive, unaware a decision was taken without them. The failure has to land somewhere.
+func logSend(what string, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("telegram send failed (%s): %v", what, err)
 }
 
 func docSuffix(name string) string {
@@ -179,39 +279,53 @@ func docSuffix(name string) string {
 }
 
 func HandleMessage(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
-	intent := shortcuts.Route(text)
+	handleIntent(bot, dc, tr, chatID, shortcuts.Route(text))
+}
 
+// handleTranscript routes what a speech model heard rather than what someone typed. The difference
+// is that a transcript cannot fire a command — see shortcuts.RouteTranscript.
+func handleTranscript(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
+	handleIntent(bot, dc, tr, chatID, shortcuts.RouteTranscript(text))
+}
+
+func handleIntent(bot Bot, dc Daemon, tr *Tracker, chatID int64, intent shortcuts.Intent) {
 	switch intent.Kind {
 	case shortcuts.Help:
-		_ = bot.SendMessage(chatID, helpText)
+		logSend("help", bot.SendMessage(chatID, helpText))
+	case shortcuts.Refused:
+		// Said out loud, never silently: a person who spoke `/kill off` and heard nothing back
+		// would reasonably believe the kill switch is now off.
+		logSend("refused spoken command", bot.SendMessage(chatID,
+			"I heard a command in that voice note and did not run it — type it instead: "+
+				strings.TrimSpace(intent.Text)))
 	case shortcuts.Kill:
 		if err := dc.SetKill(intent.On); err != nil {
-			_ = bot.SendMessage(chatID, "kill switch error: "+err.Error())
+			logSend("kill switch error", bot.SendMessage(chatID, "kill switch error: "+err.Error()))
 			return
 		}
 		if intent.On {
-			_ = bot.SendMessage(chatID, "kill switch ENGAGED")
+			logSend("kill switch engaged", bot.SendMessage(chatID, "kill switch ENGAGED"))
 		} else {
-			_ = bot.SendMessage(chatID, "kill switch disengaged")
+			logSend("kill switch disengaged", bot.SendMessage(chatID, "kill switch disengaged"))
 		}
 	case shortcuts.Cancel:
 		id, ok := tr.Get(chatID)
 		if !ok {
-			_ = bot.SendMessage(chatID, "nothing to cancel")
+			logSend("nothing to cancel", bot.SendMessage(chatID, "nothing to cancel"))
 			return
 		}
 		if err := dc.CancelRun(id); err != nil {
-			_ = bot.SendMessage(chatID, err.Error())
+			logSend("cancel error", bot.SendMessage(chatID, err.Error()))
 			return
 		}
-		_ = bot.SendMessage(chatID, fmt.Sprintf("cancelled turn %d", id))
+		logSend("cancel confirmation", bot.SendMessage(chatID, fmt.Sprintf("cancelled turn %d", id)))
 	case shortcuts.Budget:
 		budget, err := dc.GetBudget()
 		if err != nil {
-			_ = bot.SendMessage(chatID, err.Error())
+			logSend("budget error", bot.SendMessage(chatID, err.Error()))
 			return
 		}
-		_ = bot.SendMessage(chatID, formatBudget(budget))
+		logSend("budget", bot.SendMessage(chatID, formatBudget(budget)))
 	case shortcuts.Proposals:
 		sendProposals(bot, dc, chatID)
 	case shortcuts.Proj:
@@ -228,15 +342,15 @@ func HandleMessage(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
 func startTurn(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
 	turnID, err := dc.SendAssistantMessage(strconv.FormatInt(chatID, 10), text)
 	if err != nil {
-		_ = bot.SendMessage(chatID, "couldn't start turn: "+err.Error())
+		logSend("turn start failure", bot.SendMessage(chatID, "couldn't start turn: "+err.Error()))
 		return
 	}
 	tr.Set(chatID, turnID)
-	_ = bot.SendMessage(chatID, fmt.Sprintf("working… (turn %d)", turnID))
-	go func() {
+	logSend("turn acknowledgement", bot.SendMessage(chatID, fmt.Sprintf("working… (turn %d)", turnID)))
+	GoGuarded("turn watcher", func() {
 		reply := pollTurnAndReply(dc, turnID, pollInterval, maxPollAttempts)
 		sendReply(bot, chatID, reply)
-	}()
+	})
 }
 
 // sendReply renders the orchestrator's Markdown reply to Telegram HTML, splits it under the 4096
@@ -244,18 +358,38 @@ func startTurn(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
 // falls back to plain text so the user always receives the content.
 func sendReply(bot Bot, chatID int64, reply string) {
 	for _, chunk := range format.Chunk(format.ToHTML(reply), 4096) {
-		if err := bot.SendHTML(chatID, chunk); err != nil {
-			_ = bot.SendMessage(chatID, format.StripTags(chunk))
+		err := bot.SendHTML(chatID, chunk)
+		if err == nil {
+			continue
 		}
+		// The fallback exists for one failure: Telegram rejecting the markup. When the send failed
+		// because we are throttled or because it never arrived, the content was never the problem —
+		// re-sending it immediately doubles this sidecar's traffic at the exact moment Telegram
+		// asked it to send less.
+		if telegram.IsRateLimited(err) || telegram.IsTransport(err) {
+			logSend("reply chunk", err)
+			continue
+		}
+		logSend("reply chunk (retrying as plain text)", err)
+		logSend("reply chunk fallback", bot.SendMessage(chatID, format.StripTags(chunk)))
 	}
 }
 
 func pollTurnAndReply(dc Daemon, turnID int64, interval time.Duration, maxAttempts int) string {
+	consecutiveErrors := 0
 	for i := 0; i < maxAttempts; i++ {
 		run, err := dc.GetRun(turnID)
 		if err != nil {
-			return "error checking turn: " + err.Error()
+			// The run is the daemon's, not ours: it keeps going while the daemon restarts, and
+			// giving up on the first error threw away output that was still coming.
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutivePollErrors {
+				return "error checking turn: " + err.Error()
+			}
+			time.Sleep(interval)
+			continue
 		}
+		consecutiveErrors = 0
 		status, _ := run["status"].(string)
 		if isTerminal(status) {
 			return runReply(run)
@@ -372,15 +506,15 @@ func approveRejectRow(id int64) [][]telegram.Button {
 func sendProposals(bot Bot, dc Daemon, chatID int64) {
 	props, err := dc.GetProposals()
 	if err != nil {
-		_ = bot.SendMessage(chatID, "couldn't fetch proposals: "+err.Error())
+		logSend("proposals error", bot.SendMessage(chatID, "couldn't fetch proposals: "+err.Error()))
 		return
 	}
 	if len(props) == 0 {
-		_ = bot.SendMessage(chatID, "no pending proposals")
+		logSend("no proposals", bot.SendMessage(chatID, "no pending proposals"))
 		return
 	}
 	for _, p := range props {
-		_ = bot.SendMessageWithButtons(chatID, formatProposal(p), approveRejectRow(idOf(p)))
+		logSend("proposal", bot.SendMessageWithButtons(chatID, formatProposal(p), approveRejectRow(idOf(p))))
 	}
 }
 
@@ -390,7 +524,7 @@ func sendProposals(bot Bot, dc Daemon, chatID int64) {
 func sendTriage(bot Bot, dc Daemon, chatID int64) {
 	outcome, err := dc.TriageEmail()
 	if err != nil {
-		_ = bot.SendMessage(chatID, "couldn't triage the mailbox: "+err.Error())
+		logSend("triage error", bot.SendMessage(chatID, "couldn't triage the mailbox: "+err.Error()))
 		return
 	}
 	queued := 0
@@ -402,11 +536,11 @@ func sendTriage(bot Bot, dc Daemon, chatID int64) {
 		if r, ok := outcome["reason"].(string); ok && r != "" {
 			reason = r
 		}
-		_ = bot.SendMessage(chatID, "no triage started: "+reason)
+		logSend("triage not started", bot.SendMessage(chatID, "no triage started: "+reason))
 		return
 	}
-	_ = bot.SendMessage(chatID, fmt.Sprintf(
-		"reading %d message(s) — the verdicts arrive here in a few minutes", queued))
+	logSend("triage started", bot.SendMessage(chatID, fmt.Sprintf(
+		"reading %d message(s) — the verdicts arrive here in a few minutes", queued)))
 }
 
 // sendInbox costs nothing: it reports what is already known, which is what makes it safe to ask
@@ -414,11 +548,11 @@ func sendTriage(bot Bot, dc Daemon, chatID int64) {
 func sendInbox(bot Bot, dc Daemon, chatID int64) {
 	queue, err := dc.GetEmailQueue()
 	if err != nil {
-		_ = bot.SendMessage(chatID, "couldn't read the mailbox: "+err.Error())
+		logSend("mailbox error", bot.SendMessage(chatID, "couldn't read the mailbox: "+err.Error()))
 		return
 	}
 	if len(queue) == 0 {
-		_ = bot.SendMessage(chatID, "nothing in the mailbox yet")
+		logSend("empty mailbox", bot.SendMessage(chatID, "nothing in the mailbox yet"))
 		return
 	}
 
@@ -449,13 +583,13 @@ func sendInbox(bot Bot, dc Daemon, chatID int64) {
 		out = append(out, "", "already read:")
 		out = append(out, judged...)
 	}
-	_ = bot.SendMessage(chatID, strings.Join(out, "\n"))
+	logSend("inbox", bot.SendMessage(chatID, strings.Join(out, "\n")))
 }
 
 func sendProjects(bot Bot, dc Daemon, chatID int64, filter string) {
 	projects, err := dc.GetProjects()
 	if err != nil {
-		_ = bot.SendMessage(chatID, "couldn't fetch projects: "+err.Error())
+		logSend("projects error", bot.SendMessage(chatID, "couldn't fetch projects: "+err.Error()))
 		return
 	}
 	var records []string
@@ -477,9 +611,9 @@ func sendProjects(bot Bot, dc Daemon, chatID int64, filter string) {
 	}
 	if len(records) == 0 {
 		if filter != "" {
-			_ = bot.SendMessage(chatID, fmt.Sprintf("Nenhum projeto corresponde a %q.", filter))
+			logSend("no matching projects", bot.SendMessage(chatID, fmt.Sprintf("Nenhum projeto corresponde a %q.", filter)))
 		} else {
-			_ = bot.SendMessage(chatID, "Sem projetos registados no NucleOS.")
+			logSend("no projects", bot.SendMessage(chatID, "Sem projetos registados no NucleOS."))
 		}
 		return
 	}
@@ -493,49 +627,64 @@ func HandleCallback(bot Bot, dc Daemon, cb telegram.CallbackQuery) {
 		chatID = cb.Message.Chat.ID
 	}
 	if !ok {
-		_ = bot.AnswerCallbackQuery(cb.ID, "unknown action")
+		logSend("unknown callback action", bot.AnswerCallbackQuery(cb.ID, "unknown action"))
 		return
 	}
 
 	switch action {
 	case "approve":
 		if _, err := dc.ApproveProposal(id); err != nil {
-			_ = bot.AnswerCallbackQuery(cb.ID, "approve failed")
-			_ = bot.SendMessage(chatID, fmt.Sprintf("approve of proposal %d failed: %s", id, err))
+			logSend("approve failure answer", bot.AnswerCallbackQuery(cb.ID, "approve failed"))
+			logSend("approve failure", bot.SendMessage(chatID, fmt.Sprintf("approve of proposal %d failed: %s", id, err)))
 			return
 		}
-		_ = bot.AnswerCallbackQuery(cb.ID, "approved")
-		_ = bot.SendMessage(chatID, fmt.Sprintf("proposal %d approved", id))
+		logSend("approve answer", bot.AnswerCallbackQuery(cb.ID, "approved"))
+		logSend("approve confirmation", bot.SendMessage(chatID, fmt.Sprintf("proposal %d approved", id)))
 	case "reject":
 		if err := dc.RejectProposal(id); err != nil {
-			_ = bot.AnswerCallbackQuery(cb.ID, "reject failed")
-			_ = bot.SendMessage(chatID, fmt.Sprintf("reject of proposal %d failed: %s", id, err))
+			logSend("reject failure answer", bot.AnswerCallbackQuery(cb.ID, "reject failed"))
+			logSend("reject failure", bot.SendMessage(chatID, fmt.Sprintf("reject of proposal %d failed: %s", id, err)))
 			return
 		}
-		_ = bot.AnswerCallbackQuery(cb.ID, "rejected")
-		_ = bot.SendMessage(chatID, fmt.Sprintf("proposal %d rejected", id))
+		logSend("reject answer", bot.AnswerCallbackQuery(cb.ID, "rejected"))
+		logSend("reject confirmation", bot.SendMessage(chatID, fmt.Sprintf("proposal %d rejected", id)))
 	}
 }
 
-func RunNotifier(bot Bot, dc Daemon, chatID int64, interval time.Duration) {
+func RunNotifier(ctx context.Context, bot Bot, dc Daemon, chatID int64, interval time.Duration) {
 	state := notifier.NewState()
-	if props, err := dc.GetProposals(); err == nil {
-		state.NewProposals(props)
-	}
-	if feed, err := dc.GetFeed(); err == nil {
-		state.NewFeedItems(feed)
+
+	// Seeding has to succeed before anything is announced, and at boot the daemon is usually not up
+	// yet. Skipping a failed seed meant the first poll that worked treated the whole backlog as
+	// new: every pending proposal and the entire feed arriving at once, each proposal under a live
+	// Approve button — an invitation to a mis-tap on a decision nobody was making.
+	for !seedNotifier(state, dc) {
+		if !sleepUntil(ctx, interval) {
+			return
+		}
 	}
 
-	for {
-		time.Sleep(interval)
+	for sleepUntil(ctx, interval) {
 		if props, err := dc.GetProposals(); err == nil {
 			for _, p := range state.NewProposals(props) {
-				_ = bot.SendMessageWithButtons(chatID, "🆕 "+formatProposal(p), approveRejectRow(idOf(p)))
+				err := bot.SendMessageWithButtons(chatID, "🆕 "+formatProposal(p), approveRejectRow(idOf(p)))
+				logSend("new proposal", err)
+				if err != nil {
+					// Marked as announced before anyone was announced to: without this the prompt
+					// to approve an agent's action is lost, and the person deciding never learns
+					// there was anything to decide. A duplicate on the next poll is the cheaper
+					// mistake — both buttons carry the same proposal id.
+					state.Forget(idOf(p))
+				}
 			}
 		}
 		if feed, err := dc.GetFeed(); err == nil {
 			for _, f := range state.NewFeedItems(feed) {
-				_ = bot.SendMessage(chatID, "📣 "+formatFeed(f))
+				err := bot.SendMessage(chatID, "📣 "+formatFeed(f))
+				logSend("feed item", err)
+				if err != nil {
+					state.Forget(idOf(f))
+				}
 			}
 		}
 		if kill, err := dc.GetKill(); err == nil && state.KillChanged(kill) {
@@ -543,11 +692,43 @@ func RunNotifier(bot Bot, dc Daemon, chatID int64, interval time.Duration) {
 			if kill {
 				word = "ENGAGED"
 			}
-			_ = bot.SendMessage(chatID, "kill switch "+word)
+			err := bot.SendMessage(chatID, "kill switch "+word)
+			logSend("kill switch alert", err)
+			if err != nil {
+				state.ForgetKill(kill)
+			}
 		}
 		if budget, err := dc.GetBudget(); err == nil && state.BudgetChanged(budget) {
-			_ = bot.SendMessage(chatID, formatBudget(budget))
+			logSend("budget alert", bot.SendMessage(chatID, formatBudget(budget)))
 		}
+	}
+}
+
+// seedNotifier records what already exists so it is never announced. It is all-or-nothing: a
+// half-seeded state announces the half it missed.
+func seedNotifier(state *notifier.State, dc Daemon) bool {
+	props, err := dc.GetProposals()
+	if err != nil {
+		return false
+	}
+	feed, err := dc.GetFeed()
+	if err != nil {
+		return false
+	}
+	state.NewProposals(props)
+	state.NewFeedItems(feed)
+	return true
+}
+
+// sleepUntil waits out the interval and reports whether the caller should keep going.
+func sleepUntil(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

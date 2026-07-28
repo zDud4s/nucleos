@@ -20,7 +20,13 @@ var (
 	italicUnderPattern = regexp.MustCompile(`_(.+?)_`)
 	linkPattern        = regexp.MustCompile(`\[(.+?)\]\((https?://[^)\s]+)\)`)
 	tagPattern         = regexp.MustCompile(`(?s)<[^>]*>`)
+	// A tag left open at the very end of the text — what a cut mid-tag leaves behind.
+	truncatedTagPattern = regexp.MustCompile(`(?s)<[^>]*$`)
 )
+
+// maxEntityLength bounds how far back a cut looks for the `&` that opens an entity. `&thetasym;` is
+// among the longest named entities; escapeHTML itself never emits more than `&quot;`.
+const maxEntityLength = 12
 
 // ToHTML converts the subset of Markdown that claude emits into Telegram-supported HTML
 // (for parse_mode=HTML). Telegram supports <b> <i> <u> <s> <code> <pre> <a>; it supports NO
@@ -150,6 +156,9 @@ func Chunk(s string, limit int) []string {
 // parse_mode=HTML send is rejected by Telegram.
 func StripTags(html string) string {
 	plain := tagPattern.ReplaceAllString(html, "")
+	// A tag whose `>` never arrived is still markup to a reader. tagPattern cannot match it (it
+	// needs the closing bracket), so the fallback used to show `<a hre` as text.
+	plain = truncatedTagPattern.ReplaceAllString(plain, "")
 	// Mirrors escapeHTML entry for entry, `&quot;` included: this is the fallback a user actually
 	// reads when Telegram rejects the HTML send, so an entity escapeHTML can emit and this cannot
 	// decode surfaces as raw `&quot;` in their chat.
@@ -165,24 +174,44 @@ func StripTags(html string) string {
 }
 
 func inline(text string) string {
-	code := make([]string, 0)
+	// Placeholders below are delimited by NUL, a byte no message legitimately carries. Dropping any
+	// the input already had is what stops a line from forging one: a forged placeholder used to be
+	// restored as if it were a span this function had held itself, rendering someone else's content
+	// twice and letting the input pick what it turned into.
+	text = strings.ReplaceAll(text, "\x00", "")
+
+	held := make([]string, 0)
+	hold := func(html string) string {
+		held = append(held, html)
+		return "\x00" + strconv.Itoa(len(held)-1) + "\x00"
+	}
+
+	// Code spans and links are both held aside BEFORE emphasis runs. Emphasis inside them is not
+	// emphasis: an underscore in `.../a_b_c` is part of a URL, and the italic pattern used to
+	// rewrite it into markup that the link pattern then no longer matched.
 	protected := codePattern.ReplaceAllStringFunc(text, func(span string) string {
-		code = append(code, span[1:len(span)-1])
-		return "\x00" + strconv.Itoa(len(code)-1) + "\x00"
+		return hold("<code>" + escapeHTML(span[1:len(span)-1]) + "</code>")
+	})
+	protected = linkPattern.ReplaceAllStringFunc(protected, func(link string) string {
+		parts := linkPattern.FindStringSubmatch(link)
+		return hold(`<a href="` + escapeHTML(parts[2]) + `">` + emphasize(escapeHTML(parts[1])) + `</a>`)
 	})
 
-	converted := escapeHTML(protected)
-	converted = boldStarPattern.ReplaceAllString(converted, "<b>$1</b>")
-	converted = boldUnderPattern.ReplaceAllString(converted, "<b>$1</b>")
-	converted = italicStarPattern.ReplaceAllString(converted, "$1<i>$2</i>")
-	converted = italicUnderPattern.ReplaceAllString(converted, "<i>$1</i>")
-	converted = linkPattern.ReplaceAllString(converted, `<a href="$2">$1</a>`)
+	converted := emphasize(escapeHTML(protected))
 
-	for i, contents := range code {
-		placeholder := "\x00" + strconv.Itoa(i) + "\x00"
-		converted = strings.ReplaceAll(converted, placeholder, "<code>"+escapeHTML(contents)+"</code>")
+	// Restored last-to-first: a held fragment can only contain placeholders created before it (a
+	// code span inside a link label), so descending order is what leaves none behind.
+	for i := len(held) - 1; i >= 0; i-- {
+		converted = strings.ReplaceAll(converted, "\x00"+strconv.Itoa(i)+"\x00", held[i])
 	}
 	return converted
+}
+
+func emphasize(escaped string) string {
+	converted := boldStarPattern.ReplaceAllString(escaped, "<b>$1</b>")
+	converted = boldUnderPattern.ReplaceAllString(converted, "<b>$1</b>")
+	converted = italicStarPattern.ReplaceAllString(converted, "$1<i>$2</i>")
+	return italicUnderPattern.ReplaceAllString(converted, "<i>$1</i>")
 }
 
 // escapeHTML escapes for BOTH contexts this package emits: element text and the one attribute value
@@ -339,6 +368,25 @@ func splitTextAt(s string, limit int) (string, string) {
 	}
 	if lastNewline > 0 {
 		cut = lastNewline
+	} else {
+		cut = safeCut(s, cut)
 	}
 	return s[:cut], s[cut:]
+}
+
+// safeCut moves a hard cut off the middle of a tag or an entity. Telegram parses each chunk on its
+// own, so `<a hre` in one message and the rest in the next is not a link, it is a rejected message
+// — and the plain-text fallback for that rejection cannot strip half a tag either. A newline cut
+// never needs this: neither a tag nor an entity contains one.
+func safeCut(s string, cut int) int {
+	if open := strings.LastIndexByte(s[:cut], '<'); open > 0 && !strings.Contains(s[open:cut], ">") {
+		return open
+	}
+	if amp := strings.LastIndexByte(s[:cut], '&'); amp > 0 && cut-amp <= maxEntityLength &&
+		!strings.ContainsAny(s[amp:cut], ";<> ") {
+		return amp
+	}
+	// Falling through leaves the raw cut, which is what keeps a chunk whose first byte opens a tag
+	// from producing an empty prefix and a loop that never advances.
+	return cut
 }

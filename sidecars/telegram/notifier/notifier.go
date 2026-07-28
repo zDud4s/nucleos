@@ -20,11 +20,31 @@ func NewState() *State {
 }
 
 func (s *State) NewProposals(current []map[string]any) []map[string]any {
-	return newItems(current, s.seenProposals)
+	var items []map[string]any
+	items, s.seenProposals = newItems(current, s.seenProposals)
+	return items
 }
 
 func (s *State) NewFeedItems(current []map[string]any) []map[string]any {
-	return newItems(current, s.seenFeed)
+	var items []map[string]any
+	items, s.seenFeed = newItems(current, s.seenFeed)
+	return items
+}
+
+// Forget drops an id from what has been announced, so the next look offers it again. It is how an
+// announcement whose send failed gets a second chance instead of being lost: the item was marked as
+// told before anyone was actually told.
+func (s *State) Forget(id int64) {
+	delete(s.seenProposals, id)
+	delete(s.seenFeed, id)
+}
+
+// ForgetKill re-arms a kill-switch alert that could not be delivered. The next observation is
+// compared against the opposite of what went undelivered, so the alert comes back around whichever
+// way the switch was moved.
+func (s *State) ForgetKill(undelivered bool) {
+	opposite := !undelivered
+	s.lastKill = &opposite
 }
 
 func (s *State) KillChanged(engaged bool) bool {
@@ -60,8 +80,13 @@ func (s *State) BudgetChanged(budget map[string]any) bool {
 	return changed
 }
 
-func newItems(current []map[string]any, seen map[int64]bool) []map[string]any {
+// newItems returns what is new since the last look, and the set to remember for the next one. The
+// set is rebuilt rather than added to: an id the daemon no longer reports is a proposal it has
+// decided or a feed entry that scrolled past, and remembering those forever is how this map grew
+// without bound in a process meant to run for months.
+func newItems(current []map[string]any, seen map[int64]bool) ([]map[string]any, map[int64]bool) {
 	items := make([]map[string]any, 0)
+	stillPresent := make(map[int64]bool, len(current))
 	for _, item := range current {
 		id, ok := idOf(item)
 		if !ok {
@@ -70,9 +95,9 @@ func newItems(current []map[string]any, seen map[int64]bool) []map[string]any {
 		if !seen[id] {
 			items = append(items, item)
 		}
-		seen[id] = true
+		stillPresent[id] = true
 	}
-	return items
+	return items, stillPresent
 }
 
 func idOf(m map[string]any) (int64, bool) {
