@@ -26,6 +26,34 @@ func TestToHTMLEscapesProse(t *testing.T) {
 	}
 }
 
+// escapeHTML runs before linkPattern substitutes the URL into href="$2", so a quote inside the URL
+// closes the attribute early and the rest of the URL becomes stray markup. The link regex forbids
+// whitespace, which is the only reason a second attribute cannot follow -- the escaping, not the
+// regex, is what should be holding that line.
+func TestALinkURLCannotCloseItsOwnHrefAttribute(t *testing.T) {
+	got := ToHTML(`[click](https://a.test/"x)`)
+	if strings.Contains(got, `href="https://a.test/"x"`) {
+		t.Errorf("ToHTML() = %q, the URL closed its own href attribute", got)
+	}
+	if !strings.Contains(got, "&quot;") {
+		t.Errorf("ToHTML() = %q, want the quote escaped inside the attribute", got)
+	}
+}
+
+// StripTags is the fallback a user reads when Telegram rejects the HTML send, so it must decode
+// every entity escapeHTML can emit -- and decode each one exactly once.
+func TestStripTagsDecodesEveryEscapedEntityOnce(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{escapeHTML(`say "hi" & <bye>`), `say "hi" & <bye>`},
+		{"&amp;lt;", "&lt;"},
+		{"<b>x</b>", "x"},
+	} {
+		if got := StripTags(c.in); got != c.want {
+			t.Errorf("StripTags(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestToHTMLTable(t *testing.T) {
 	md := "| ID | Modo | Raiz |\n|---|---|---|\n| nucleos | off | — |\n| nucleos-e2e | shadow | C:\\path\\to\\project |"
 	got := ToHTML(md)

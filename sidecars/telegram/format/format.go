@@ -150,9 +150,16 @@ func Chunk(s string, limit int) []string {
 // parse_mode=HTML send is rejected by Telegram.
 func StripTags(html string) string {
 	plain := tagPattern.ReplaceAllString(html, "")
+	// Mirrors escapeHTML entry for entry, `&quot;` included: this is the fallback a user actually
+	// reads when Telegram rejects the HTML send, so an entity escapeHTML can emit and this cannot
+	// decode surfaces as raw `&quot;` in their chat.
+	//
+	// One `strings.Replacer` pass, not sequential ReplaceAll calls: sequential ones would decode
+	// `&amp;lt;` twice and hand back `<`, re-materialising markup the escape had neutralised.
 	return strings.NewReplacer(
 		"&lt;", "<",
 		"&gt;", ">",
+		"&quot;", `"`,
 		"&amp;", "&",
 	).Replace(plain)
 }
@@ -178,11 +185,20 @@ func inline(text string) string {
 	return converted
 }
 
+// escapeHTML escapes for BOTH contexts this package emits: element text and the one attribute value
+// it builds, `href="..."` in inline(). The quote is what makes it safe in the second: without it a
+// URL carrying `"` closes the attribute early and the remainder becomes stray markup. Today the
+// link regex forbids whitespace, so nothing can follow with a new attribute name, but that is the
+// regex holding a line that escaping should hold.
+//
+// `strings.Replacer` scans once and does not re-examine what it wrote, so `<` -> `&lt;` cannot be
+// re-escaped into `&amp;lt;` by the `&` rule that precedes it.
 func escapeHTML(text string) string {
 	return strings.NewReplacer(
 		"&", "&amp;",
 		"<", "&lt;",
 		">", "&gt;",
+		`"`, "&quot;",
 	).Replace(text)
 }
 
