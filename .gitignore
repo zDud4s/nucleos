@@ -28,3 +28,8 @@ sidecars/**/*.exe
 # ─────────────────────────────────────────────────────────────
 AGENTS.md
 CLAUDE.md
+
+# Local git hooks (core.hooksPath) — local only, never committed.
+# A rule rather than a habit: without this the directory is merely untracked, one `git add -A`
+# away from entering history. Recreate it with scripts/install-hooks.sh.
+.githooks/

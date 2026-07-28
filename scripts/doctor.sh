@@ -36,6 +36,18 @@ if command -v rustc >/dev/null 2>&1; then
   [ -f rust-toolchain.toml ] && printf 'info rust-toolchain.toml present (repo pins the active toolchain)\n'
 fi
 
+# The commit guards are untracked by design (.gitignore) and core.hooksPath is local config, so a
+# fresh clone has neither and says nothing about it — a repo whose guards are inert looks exactly
+# like one whose guards work, right up to the commit that should have been blocked. Reported as a
+# warning, not a MISS: nothing here stops a build, so it must not fail the environment check.
+root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+if [ "$(git config core.hooksPath 2>/dev/null || true)" = ".githooks" ] &&
+   [ -f "$root/.githooks/pre-commit" ]; then
+  printf 'ok   hooks  core.hooksPath=.githooks, commit guards present\n'
+else
+  printf 'warn hooks  commit guards inert — run scripts/install-hooks.sh\n'
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "doctor: environment is INCOMPLETE — resolve the MISS lines above before building." >&2
   exit 1
