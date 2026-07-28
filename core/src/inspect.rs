@@ -8,7 +8,6 @@ const SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "__pycache__"];
 
 #[derive(Debug)]
 pub enum InspectError {
-    NoRoot,
     UnsafePath,
     NotFound,
     Io(std::io::Error),

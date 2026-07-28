@@ -320,9 +320,14 @@ fn activation_status(error: ActivationError) -> StatusCode {
 
 fn inspect_status(error: inspect::InspectError) -> StatusCode {
     match error {
-        inspect::InspectError::NoRoot | inspect::InspectError::NotFound => StatusCode::NOT_FOUND,
+        inspect::InspectError::NotFound => StatusCode::NOT_FOUND,
         inspect::InspectError::UnsafePath => StatusCode::BAD_REQUEST,
-        inspect::InspectError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // The only one the caller cannot diagnose from the status code alone, so it is the only one
+        // worth a line in the log.
+        inspect::InspectError::Io(error) => {
+            tracing::warn!(%error, "project inspection failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
@@ -467,9 +472,21 @@ async fn post_proposal_approve(
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await }).await? {
         Ok(resume_id) => Ok(Json(serde_json::json!({ "resume_run_id": resume_id }))),
         Err(crate::runs::ResumeError::ProposalNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(crate::runs::ResumeError::ProposalNotPending)
-        | Err(crate::runs::ResumeError::NotResumable(_)) => Err(StatusCode::CONFLICT),
-        Err(crate::runs::ResumeError::Db(_)) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(crate::runs::ResumeError::ProposalNotPending) => Err(StatusCode::CONFLICT),
+        // A 409 alone cannot say which precondition failed, and these are the ones a human has to
+        // act on — an approval that will not resume looks identical to one nobody clicked.
+        Err(crate::runs::ResumeError::NotResumable(reason)) => {
+            tracing::warn!(
+                proposal_id = id,
+                reason,
+                "approved proposal is not resumable"
+            );
+            Err(StatusCode::CONFLICT)
+        }
+        Err(crate::runs::ResumeError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "approving a proposal failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -485,7 +502,10 @@ async fn post_proposal_reject(
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(crate::proposals::RejectError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(crate::proposals::RejectError::NotPending) => Err(StatusCode::CONFLICT),
-        Err(crate::proposals::RejectError::Db(_)) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(crate::proposals::RejectError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "rejecting a proposal failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 

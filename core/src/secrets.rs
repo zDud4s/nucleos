@@ -14,6 +14,10 @@ pub fn load_secret(key: &str) -> keyring::Result<Option<String>> {
     }
 }
 
+/// The third of the store/load/delete trio. Nothing in the daemon removes a credential yet — token
+/// rotation overwrites — but the roundtrip test needs it to clean up after itself honestly, and a
+/// credential wrapper that cannot delete is an abstraction with a hole in it rather than a small one.
+#[allow(dead_code)]
 pub fn delete_secret(key: &str) -> keyring::Result<()> {
     match Entry::new(SERVICE_NAME, key)?.delete_credential() {
         Ok(()) => Ok(()),

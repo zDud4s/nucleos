@@ -184,6 +184,10 @@ where
     handles.insert(id, join.abort_handle());
 }
 
+/// Deliberately wide rather than taking an options struct: these are the axes on which a run's
+/// lifecycle actually differs (plan-only, resumed, retried, worktree-bound), and naming each one at
+/// every call site is what makes those differences readable where the runs are created.
+#[allow(clippy::too_many_arguments)]
 fn spawn_run(
     state: &AppState,
     id: i64,

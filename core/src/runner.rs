@@ -22,6 +22,10 @@ pub struct RunOutcome {
 pub trait CommandRunner: Send + Sync {
     /// Runs one `claude -p` invocation. `cwd`, when set, is the run's working directory (spec §3.3).
     /// `session_tx` receives the `session_id` the instant the CLI's `init` message is parsed.
+    ///
+    /// Deliberately wide rather than taking an options struct: every parameter is one CLI flag, and
+    /// keeping them positional means adding a flag cannot silently inherit a default nobody chose.
+    #[allow(clippy::too_many_arguments)]
     async fn run_prompt(
         &self,
         prompt: &str,
@@ -137,6 +141,9 @@ impl CommandRunner for ClaudeCliRunner {
     }
 }
 
+/// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
+/// it into the daemon would ship a runner that can fake a run's outcome.
+#[cfg(test)]
 #[derive(Default)]
 pub struct FakeCommandRunner {
     pub canned: std::sync::Mutex<Option<RunOutcome>>,
@@ -152,6 +159,7 @@ pub struct FakeCommandRunner {
     pub calls: std::sync::Mutex<u32>,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
     async fn run_prompt(

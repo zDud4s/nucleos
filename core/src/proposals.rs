@@ -141,7 +141,14 @@ pub async fn reject_proposal(pool: &SqlitePool, id: i64) -> Result<(), RejectErr
     Ok(())
 }
 
-// Records a single-use authorization for a resume run.
+/// Records a single-use authorization for a resume run — test fixture only.
+///
+/// Production does not call this and must not start: `resume_approved_run` inlines the same INSERT
+/// inside its transaction, because the grant has to land atomically with the supersede, the resume
+/// row, and the proposal's approval. A standalone helper is a second, non-atomic way to do the same
+/// thing, so `#[cfg(test)]` keeps it available to the tests that need to mint a grant while making
+/// it unavailable to anything else.
+#[cfg(test)]
 pub async fn grant_action(
     pool: &SqlitePool,
     resume_run_id: i64,
