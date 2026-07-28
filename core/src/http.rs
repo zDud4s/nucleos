@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -69,7 +69,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/email/cursor", get(get_email_cursor))
         .route("/email/triage", post(post_email_triage))
         .route("/email/queue", get(get_email_queue))
-        .route("/email/incoming", post(post_email_incoming))
+        // The one route whose legitimate payload outgrows axum's 2 MB default. A full batch is
+        // 200 messages of up to 32 KiB of body each (the sidecar's own `MaxPerBatch` and
+        // `MaxBodyBytes`), so ~6.4 MB of text before subjects, headers and JSON escaping — the
+        // ordinary shape of a first sync, not an attack. Rejecting it at the transport was
+        // self-inflicted deadlock rather than a limit: the 413 stopped the cursor advancing, so
+        // the sidecar re-sent the identical batch every five minutes for as long as the mailbox
+        // stayed that busy, and `MAX_MESSAGES_PER_BATCH` never ran because the body never reached
+        // the handler. Sized with headroom over the sidecar's ceiling and applied only here, so
+        // every other route keeps the tighter default.
+        .route(
+            "/email/incoming",
+            post(post_email_incoming).layer(DefaultBodyLimit::max(EMAIL_BATCH_BODY_LIMIT)),
+        )
         // Static segments win over `{id}` in matchit, so the three routes above stay reachable.
         .route("/email/{id}", get(get_email))
         .route(
@@ -233,6 +245,13 @@ struct EmailIncomingRequest {
 /// Paging belongs to the sidecar; a batch this large means it stopped doing its job, and the
 /// núcleo should say so rather than quietly ingest whatever arrives.
 const MAX_MESSAGES_PER_BATCH: usize = 200;
+
+/// Body ceiling for `/email/incoming`, in bytes.
+///
+/// `MAX_MESSAGES_PER_BATCH` x the sidecar's 32 KiB per-body cap is ~6.4 MB of text; doubling it
+/// covers subjects, addresses, headers and JSON escaping without turning the route into an
+/// unbounded sink. It is a backstop, not the real limit — the count check in the handler is.
+const EMAIL_BATCH_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// How much of the mailbox the queue hands back. Generous because a first sync pulls a week at
 /// once, and a list that silently stops at its limit is indistinguishable from mail that never
@@ -1367,6 +1386,40 @@ mod tests {
             )
             .await,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// A FULL batch is legitimate — a first sync of a busy mailbox is exactly this shape — and it
+    /// has to survive the transport, not just the handler. At the sidecar's own ceilings (200
+    /// messages of up to 32 KiB) the JSON runs to megabytes, well past axum's 2 MB default; the
+    /// 413 that produced stopped the cursor from advancing, so the identical oversized batch came
+    /// back every five minutes, forever. `MAX_MESSAGES_PER_BATCH` never even ran: the body was
+    /// rejected before the handler saw it.
+    #[tokio::test]
+    async fn a_full_batch_of_large_messages_is_accepted() {
+        let state = test_state().await;
+        // 200 x ~32 KiB of body, i.e. the largest batch the sidecar is allowed to send.
+        let body_text = "x".repeat(32 * 1024);
+        let messages: Vec<serde_json::Value> = (0..MAX_MESSAGES_PER_BATCH)
+            .map(|i| {
+                serde_json::json!({
+                    "message_id": format!("<big{i}@x>"),
+                    "uid": i,
+                    "from_addr": "ana@company.com",
+                    "received_at": "2026-07-28T11:00:00+00:00",
+                    "body_text": body_text,
+                })
+            })
+            .collect();
+
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                email_batch(serde_json::Value::Array(messages))
+            )
+            .await,
+            StatusCode::OK
         );
     }
 
