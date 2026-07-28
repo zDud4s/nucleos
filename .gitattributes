@@ -6,3 +6,9 @@
 
 # Shell scripts run under Git Bash; a CR in the shebang/commands breaks them.
 *.sh text eol=lf
+
+# `gofmt -l` reports every CRLF file as unformatted, so with core.autocrlf=true —
+# the Windows default, and set globally on this machine — a plain checkout fails
+# the fmt gate on files nobody touched. The blobs are already LF; this stops the
+# checkout from undoing that, and is why CI does not need to normalise them first.
+*.go text eol=lf
