@@ -82,6 +82,29 @@ pub async fn upsert_session(
     Ok(())
 }
 
+/// Where a chat's throwaway MCP config lives, with `chat_id` encoded rather than interpolated.
+///
+/// `chat_id` arrives from a sidecar and is an opaque string to us, so it cannot be trusted to be a
+/// filename. Interpolated raw it reached `Path::join`, which **discards the base** when the joined
+/// component is absolute: a `chat_id` of `C:/Windows/System32/x` wrote the config there instead of
+/// in the temp directory, and `TurnGuard::drop` then removed whatever it had landed on — an
+/// arbitrary write and delete for anything holding the daemon token.
+///
+/// Encoding, not validating: the id stays opaque (chats are not required to look like numbers, and
+/// the tests rely on that), and the mapping stays injective, so two chats differing only in an
+/// escaped character cannot collide onto one file and clobber each other's config mid-turn.
+fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
+    let mut safe = String::with_capacity(chat_id.len());
+    for byte in chat_id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => safe.push(byte as char),
+            // `%` itself lands here, which is what keeps the encoding reversible.
+            other => safe.push_str(&format!("%{other:02x}")),
+        }
+    }
+    std::env::temp_dir().join(format!("nucleos-mcp-{safe}.json"))
+}
+
 pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
@@ -110,7 +133,7 @@ pub async fn send_message(
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe);
-    let mcp_path = std::env::temp_dir().join(format!("nucleos-mcp-{chat_id}.json"));
+    let mcp_path = mcp_config_path(chat_id);
     let config_bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
     std::fs::write(&mcp_path, config_bytes).map_err(|e| e.to_string())?;
 
@@ -497,6 +520,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_hostile_chat_id_cannot_escape_the_temp_directory() {
+        // `chat_id` arrives from a sidecar and is opaque to us. Interpolated raw it reached
+        // `Path::join`, which DISCARDS the base when the joined component is absolute — so the
+        // config landed on an arbitrary path, and `TurnGuard::drop` then deleted whatever was there.
+        let temp = std::env::temp_dir();
+        for chat_id in [
+            "C:/Windows/System32/nucleos",
+            r"C:\Windows\System32\nucleos",
+            "../../../evil",
+            r"..\..\..\evil",
+            "/etc/passwd",
+            r"\\server\share\evil",
+        ] {
+            let path = mcp_config_path(chat_id);
+            assert_eq!(
+                path.parent(),
+                Some(temp.as_path()),
+                "{chat_id:?} escaped the temp directory"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_chats_never_share_a_config_path() {
+        // Encoding rather than stripping, so the mapping stays injective: two chats that differ
+        // only in an escaped character must not collide onto one file and clobber each other.
+        assert_ne!(mcp_config_path("a/b"), mcp_config_path("a-b"));
+        assert_ne!(mcp_config_path("a/b"), mcp_config_path(r"a\b"));
+        assert_ne!(mcp_config_path("a%2fb"), mcp_config_path("a/b"));
+
+        // The ordinary case stays readable rather than being hex soup: a real Telegram group id.
+        assert!(
+            mcp_config_path("-1001234567890")
+                .to_string_lossy()
+                .ends_with("nucleos-mcp--1001234567890.json")
+        );
+    }
+
     #[tokio::test]
     async fn cancelling_a_turn_frees_the_chat_and_removes_its_mcp_config() {
         let mut state = test_state().await;
@@ -507,7 +569,7 @@ mod tests {
         });
         state.runner = runner.clone();
         let chat_id = "assistant-cancel-test-chat";
-        let mcp_path = std::env::temp_dir().join(format!("nucleos-mcp-{chat_id}.json"));
+        let mcp_path = mcp_config_path(chat_id);
 
         let id = send_message(&state, chat_id, "take your time")
             .await
