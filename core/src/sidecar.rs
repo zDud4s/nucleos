@@ -44,6 +44,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
     }
 }
 
+/// `daemon_token` is the control token here, deliberately, where the email sidecar gets a scoped
+/// one. This sidecar is the user's remote control: it approves proposals, works the kill switch and
+/// cancels runs — the shell's surface, reached from a phone. An allowlist for it would be all of
+/// Control minus a few routes, which reads like a boundary without being one. Narrowing it means
+/// first deciding what a chat message is allowed to do, which is a product decision.
 pub fn telegram_env(
     daemon_url: &str,
     daemon_token: &str,
@@ -67,6 +72,11 @@ pub const EMAIL_FETCH_ADDR: &str = "127.0.0.1:8793";
 /// the Go sidecar: it reads nothing from disk and holds no config of its own, so anything it needs
 /// is here or it does not exist. The password comes from Credential Manager and never touches a
 /// file — it is passed to the child process and nowhere else.
+///
+/// `daemon_token` is this sidecar's own key (`auth::Service::Email`), not the control token. It
+/// opens `/email/cursor` and `/email/incoming` and nothing else, which is the complete set
+/// `daemon/client.go` builds a URL for. The process on the other end parses MIME written by
+/// strangers; a bug in that parser should cost the mailbox, not the daemon.
 pub fn email_env(
     daemon_url: &str,
     daemon_token: &str,

@@ -320,19 +320,31 @@ async fn main() {
             // rather than half-on.
             match secrets::load_secret(EMAIL_PASSWORD_KEY) {
                 Ok(Some(password)) => {
-                    let path = std::env::current_exe()
-                        .unwrap()
-                        .parent()
-                        .unwrap()
-                        .join("email-sidecar.exe");
-                    let env = sidecar::email_env(
-                        "http://127.0.0.1:8791",
-                        &state.token.0,
-                        &email_config,
-                        &password,
-                    );
-                    tokio::spawn(sidecar::supervise("email".to_string(), path, env));
-                    tracing::info!("email sidecar supervised");
+                    // Its own key, minted before the spawn. A failure here leaves the sidecar
+                    // unstarted rather than started with the control token: this process parses
+                    // MIME written by strangers, and the fallback that hands it everything is the
+                    // arrangement being removed.
+                    match auth::mint_service_token(&state.pool, auth::Service::Email).await {
+                        Ok(token) => {
+                            let path = std::env::current_exe()
+                                .unwrap()
+                                .parent()
+                                .unwrap()
+                                .join("email-sidecar.exe");
+                            let env = sidecar::email_env(
+                                "http://127.0.0.1:8791",
+                                &token,
+                                &email_config,
+                                &password,
+                            );
+                            tokio::spawn(sidecar::supervise("email".to_string(), path, env));
+                            tracing::info!("email sidecar supervised");
+                        }
+                        Err(error) => tracing::error!(
+                            %error,
+                            "could not mint the email sidecar's token — the sidecar will not start"
+                        ),
+                    }
                 }
                 Ok(None) => tracing::warn!(
                     "no email-imap-password stored — the email sidecar will not start (set with --set-email-password)"
