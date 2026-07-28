@@ -35,6 +35,26 @@ export function mailLabel(triageClass: string | null): string {
   return triageClass ?? "waiting";
 }
 
+/**
+ * A file size in the units a person recognises from their own file manager.
+ *
+ * Decimal units (kB = 1000), because that is what the OS shows next to the same file — matching the
+ * binary convention would make every attachment look slightly smaller here than where it lands.
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1000) return `${bytes} B`;
+  const units = ["kB", "MB", "GB"];
+  let value = bytes / 1000;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  // One decimal below 10 and none above: "1.4 MB" is informative, "847.3 kB" is false precision.
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
 export interface Readiness {
   ready: boolean;
   rate: number | null;

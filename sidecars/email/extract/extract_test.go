@@ -158,3 +158,141 @@ func TestASubjectIsMimeDecoded(t *testing.T) {
 		t.Fatalf("subject = %q", message.Subject)
 	}
 }
+
+// gmailWithAttachment is the shape Gmail actually sends when a message carries a file: the text is
+// one level down, inside a `multipart/alternative` that is itself the first part of a
+// `multipart/mixed`. Reading only the top level finds no `text/*` and returns nothing.
+const gmailWithAttachment = "From: Ana <ana@company.com>\r\n" +
+	"Subject: cotacao\r\n" +
+	"Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n" +
+	"\r\n" +
+	"--OUTER\r\n" +
+	"Content-Type: multipart/alternative; boundary=\"INNER\"\r\n" +
+	"\r\n" +
+	"--INNER\r\n" +
+	"Content-Type: text/plain; charset=UTF-8\r\n" +
+	"\r\n" +
+	"o texto que interessa\r\n" +
+	"--INNER\r\n" +
+	"Content-Type: text/html; charset=UTF-8\r\n" +
+	"\r\n" +
+	"<p>o texto que interessa</p>\r\n" +
+	"--INNER--\r\n" +
+	"--OUTER\r\n" +
+	"Content-Type: application/pdf; name=\"cotacao.pdf\"\r\n" +
+	"Content-Disposition: attachment; filename=\"cotacao.pdf\"\r\n" +
+	"Content-Transfer-Encoding: base64\r\n" +
+	"\r\n" +
+	"SGVsbG8sIHdvcmxkIQ==\r\n" +
+	"--OUTER--\r\n"
+
+// The regression that mattered: every message with an attachment in the first real mailbox came
+// through with an empty body and was triaged on subject and sender alone.
+func TestBodyIsFoundInsideNestedMultipart(t *testing.T) {
+	message, err := Message([]byte(gmailWithAttachment), 1, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.BodyText != "o texto que interessa" {
+		t.Fatalf("body = %q, want the text from the nested text/plain part", message.BodyText)
+	}
+}
+
+func TestAttachmentIsDescribedNotDelivered(t *testing.T) {
+	message, err := Message([]byte(gmailWithAttachment), 1, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !message.HasAttachments || len(message.Attachments) != 1 {
+		t.Fatalf("got %d attachments (flag %v), want exactly 1",
+			len(message.Attachments), message.HasAttachments)
+	}
+	got := message.Attachments[0]
+	if got.Filename != "cotacao.pdf" || got.MimeType != "application/pdf" {
+		t.Errorf("described as %q/%q, want cotacao.pdf/application/pdf", got.Filename, got.MimeType)
+	}
+	if got.Position != 0 {
+		t.Errorf("position = %d, want 0", got.Position)
+	}
+	// "Hello, world!" — the DECODED length. Reporting base64's 20 bytes would overstate every
+	// attachment Gmail sends by a third.
+	if got.SizeBytes != 13 {
+		t.Errorf("size = %d, want the decoded 13", got.SizeBytes)
+	}
+}
+
+// `multipart/related` wrapping the text is how mail with inline images arrives, and it emptied
+// bodies the same way — with `has_attachments` false, so nothing hinted at why.
+func TestBodyIsFoundInsideMultipartRelated(t *testing.T) {
+	raw := "From: Ana <ana@company.com>\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL\"\r\n" +
+		"\r\n" +
+		"--REL\r\n" +
+		"Content-Type: multipart/alternative; boundary=\"ALT\"\r\n" +
+		"\r\n" +
+		"--ALT\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"corpo real\r\n" +
+		"--ALT--\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-Disposition: inline; filename=\"logo.png\"\r\n" +
+		"\r\n" +
+		"binary\r\n" +
+		"--REL--\r\n"
+
+	message, err := Message([]byte(raw), 2, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.BodyText != "corpo real" {
+		t.Fatalf("body = %q, want the nested text", message.BodyText)
+	}
+	// An inline image is part of the message being shown, not a file someone sent. Listing it
+	// would make almost every newsletter claim attachments.
+	if message.HasAttachments {
+		t.Error("an inline image was counted as an attachment")
+	}
+}
+
+// Older senders put the name only on Content-Type.
+func TestAttachmentNameFallsBackToContentType(t *testing.T) {
+	raw := "From: Ana <ana@company.com>\r\n" +
+		"Content-Type: multipart/mixed; boundary=\"B\"\r\n" +
+		"\r\n" +
+		"--B\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"texto\r\n" +
+		"--B\r\n" +
+		"Content-Type: application/octet-stream; name=\"antigo.doc\"\r\n" +
+		"Content-Disposition: attachment\r\n" +
+		"\r\n" +
+		"conteudo\r\n" +
+		"--B--\r\n"
+
+	message, err := Message([]byte(raw), 3, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(message.Attachments) != 1 || message.Attachments[0].Filename != "antigo.doc" {
+		t.Fatalf("attachments = %+v, want one named antigo.doc", message.Attachments)
+	}
+}
+
+// A message nested past MaxMIMEDepth stops the walk instead of recursing on someone else's terms.
+func TestDeeplyNestedMessageTerminates(t *testing.T) {
+	var raw strings.Builder
+	raw.WriteString("From: Ana <ana@company.com>\r\n")
+	raw.WriteString("Content-Type: multipart/mixed; boundary=\"B0\"\r\n\r\n")
+	depth := MaxMIMEDepth + 5
+	for level := 0; level < depth; level++ {
+		raw.WriteString("--B" + string(rune('0'+level%10)) + "\r\n")
+		raw.WriteString("Content-Type: multipart/mixed; boundary=\"B" +
+			string(rune('0'+(level+1)%10)) + "\"\r\n\r\n")
+	}
+	if _, err := Message([]byte(raw.String()), 4, at("2026-07-28T10:00:00Z")); err != nil {
+		t.Fatalf("a deeply nested message should parse to something, got %v", err)
+	}
+}

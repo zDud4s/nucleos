@@ -36,6 +36,21 @@ type Cursor struct {
 	LastUID     uint32 `json:"last_uid"`
 }
 
+// Attachment is what a message carries besides its text — described, not delivered.
+//
+// The BYTES are deliberately absent. The núcleo keeps what a person needs in order to decide
+// whether something is worth opening (a name, a type, a size) and asks for the content only when
+// someone actually asks, so a stranger's executable never lands on disk unrequested.
+type Attachment struct {
+	// Which attachment, counting from zero in the order the message carries them — NOT a MIME part
+	// number. It is how the content is requested later, and it is stable because it is re-derived
+	// by walking the same message the same way.
+	Position  int    `json:"position"`
+	Filename  string `json:"filename,omitempty"`
+	MimeType  string `json:"mime_type,omitempty"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
 // Message is one delivered message, in the envelope the núcleo's `POST /email/incoming` expects.
 type Message struct {
 	MessageID      string            `json:"message_id,omitempty"`
@@ -46,6 +61,7 @@ type Message struct {
 	ReceivedAt     string            `json:"received_at"`
 	BodyText       string            `json:"body_text,omitempty"`
 	HasAttachments bool              `json:"has_attachments"`
+	Attachments    []Attachment      `json:"attachments,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 }
 

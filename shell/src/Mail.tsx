@@ -1,10 +1,46 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  getEmailQueue, triageEmail,
-  type ConnectionState, type QueuedEmail,
+  getEmail, getEmailQueue, triageEmail,
+  type ConnectionState, type EmailDetail, type QueuedEmail,
 } from "./api";
-import { mailLabel, mailTone, relativeTime } from "./derive";
+import { formatBytes, mailLabel, mailTone, relativeTime } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
+
+interface OpenMessageProps { detail: EmailDetail | null; loading: boolean; }
+/**
+ * An opened message: its text, and what came with it.
+ *
+ * The body is rendered as TEXT and never as markup. It is the one thing on screen written by
+ * someone outside this machine, and the sidecar already reduced any HTML to plain text — putting it
+ * back into the DOM as HTML would undo that and hand a stranger a script tag and a tracking pixel.
+ */
+function OpenMessage({ detail, loading }: OpenMessageProps) {
+  if (loading) return <p className="a-note">A abrir…</p>;
+  if (detail === null) return <ErrorNote>Could not open this message.</ErrorNote>;
+
+  return (
+    <div className="mail-open">
+      {detail.body_text === null
+        ? <Teach title="This message no longer has a body.">
+            Bodies are kept for a set number of days and then pruned, so the verdict outlives the
+            text it was based on. Nothing was lost from the mailbox itself.
+          </Teach>
+        : <pre className="mail-body">{detail.body_text}</pre>}
+      {detail.attachments.length > 0 && (
+        <ul className="mail-files">
+          {detail.attachments.map((file) => (
+            <li key={file.position}>
+              <span className="mf-name">{file.filename ?? "(sem nome)"}</span>
+              <span className="mf-meta">
+                {file.mime_type ?? "tipo desconhecido"} · {formatBytes(file.size_bytes)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 interface MailProps {
   token: string | null;
@@ -28,6 +64,10 @@ function Mail({ token, connection }: MailProps) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [detail, setDetail] = useState<EmailDetail | null>(null);
+  const [opening, setOpening] = useState(false);
+  const openRequest = useRef<number | null>(null);
 
   const refresh = useCallback(
     async (background = false) => {
@@ -78,6 +118,28 @@ function Mail({ token, connection }: MailProps) {
     void refresh(true);
   }
 
+  // Bodies are fetched one at a time, when opened. The list's 3s refresh never touches this, so a
+  // message you are reading does not reload underneath you.
+  async function toggle(id: number) {
+    if (openId === id) {
+      openRequest.current = null;
+      setOpenId(null);
+      setDetail(null);
+      return;
+    }
+    openRequest.current = id;
+    setOpenId(id);
+    setDetail(null);
+    if (token === null) return;
+    setOpening(true);
+    const next = await getEmail(token, id);
+    // A slow fetch that lands after something else was opened must not paint the wrong message
+    // into the open one. Checked against a ref because the state read in this closure is stale.
+    if (openRequest.current !== id) return;
+    setOpening(false);
+    setDetail(next);
+  }
+
   const waiting = (queue ?? []).filter((mail) => mail.triage_class === null);
 
   if (unavailable) {
@@ -125,18 +187,31 @@ function Mail({ token, connection }: MailProps) {
                 // Server order, not re-sorted here: the daemon sorts by arrival and truncates at
                 // its own limit, so re-sorting a truncated page would only invent a second opinion.
                 <article className="feed-item" key={mail.id}>
-                  <div className="f-meta">
-                    <time dateTime={mail.received_at} title={mail.received_at}>
-                      {relativeTime(mail.received_at)}
-                    </time>
-                    <Badge tone={mailTone(mail.triage_class)}>{mailLabel(mail.triage_class)}</Badge>
-                  </div>
-                  <p className="f-body">
-                    <b>{mail.from_name ?? mail.from_addr}</b> — {mail.subject ?? "(no subject)"}
-                  </p>
-                  {mail.triage_summary !== null && (
-                    <p className="f-body">{mail.triage_summary}</p>
-                  )}
+                  {/* A button rather than a clickable div, so the mailbox is reachable from the
+                      keyboard and announces itself as expandable. */}
+                  <button
+                    type="button"
+                    className="mail-row"
+                    aria-expanded={openId === mail.id}
+                    onClick={() => void toggle(mail.id)}
+                  >
+                    <div className="f-meta">
+                      <time dateTime={mail.received_at} title={mail.received_at}>
+                        {relativeTime(mail.received_at)}
+                      </time>
+                      <Badge tone={mailTone(mail.triage_class)}>
+                        {mailLabel(mail.triage_class)}
+                      </Badge>
+                      {mail.has_attachments > 0 && <span className="mf-clip" title="tem anexos">📎</span>}
+                    </div>
+                    <p className="f-body">
+                      <b>{mail.from_name ?? mail.from_addr}</b> — {mail.subject ?? "(no subject)"}
+                    </p>
+                    {mail.triage_summary !== null && (
+                      <p className="f-body">{mail.triage_summary}</p>
+                    )}
+                  </button>
+                  {openId === mail.id && <OpenMessage detail={detail} loading={opening} />}
                 </article>
               ))}
       </Panel>

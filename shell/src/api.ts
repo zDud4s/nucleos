@@ -118,6 +118,31 @@ export interface QueuedEmail {
   has_attachments: number;
 }
 
+/** One attachment, described. The bytes are not stored; opening one asks the mailbox. */
+export interface EmailAttachment {
+  position: number;
+  filename: string | null;
+  mime_type: string | null;
+  /** Decoded size, so it matches what the file would weigh on disk. */
+  size_bytes: number;
+}
+
+/** One message in full. The queue deliberately does not carry bodies; this is what opening reads. */
+export interface EmailDetail {
+  id: number;
+  from_addr: string;
+  from_name: string | null;
+  subject: string | null;
+  received_at: string;
+  triage_class: string | null;
+  triage_summary: string | null;
+  triaged_at: string | null;
+  /** null once retention pruned it — a state to show, not an empty message. */
+  body_text: string | null;
+  has_attachments: number;
+  attachments: EmailAttachment[];
+}
+
 /** What a requested triage pass started. The verdicts arrive later, in the feed. */
 export interface TriageOutcome {
   queued: number;
@@ -400,6 +425,19 @@ export async function getEmailQueue(token: string): Promise<QueuedEmail[] | null
     });
     if (!res.ok) return null;
     return (await res.json()) as QueuedEmail[];
+  } catch {
+    return null;
+  }
+}
+
+/** One message with its body — read when a message is opened, never to draw the list. */
+export async function getEmail(token: string, id: number): Promise<EmailDetail | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as EmailDetail;
   } catch {
     return null;
   }

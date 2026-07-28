@@ -7,6 +7,7 @@ import {
   budgetStatusLabel,
   formatUsd,
   groupScoreboardByMode,
+  formatBytes,
   killSwitchLabel,
   mailLabel,
   mailTone,
@@ -368,5 +369,18 @@ describe("pure UI derivations", () => {
   it("labels an unjudged message as waiting rather than blank", () => {
     expect(mailLabel(null)).toBe("waiting");
     expect(mailLabel("urgent")).toBe("urgent");
+  });
+
+  it("formats attachment sizes the way a file manager does", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(999)).toBe("999 B");
+    // Decimal units, matching the OS the file lands on rather than the binary convention.
+    expect(formatBytes(1000)).toBe("1.0 kB");
+    expect(formatBytes(847300)).toBe("847 kB");
+    expect(formatBytes(1_400_000)).toBe("1.4 MB");
+    expect(formatBytes(2_500_000_000)).toBe("2.5 GB");
+    // Larger than the last unit keeps counting in GB rather than inventing one.
+    expect(formatBytes(9_000_000_000_000)).toBe("9000 GB");
+    expect(formatBytes(-1)).toBe("—");
   });
 });

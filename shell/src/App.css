@@ -110,6 +110,41 @@
    otherwise sit flush against the window. */
 .mail { padding-bottom: var(--sp-6); }
 
+/* The whole row opens the message, so it is a button — stripped back to looking like the text it
+   contains, since a mailbox of 34 buttons that look like buttons is a wall. */
+.mail-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.mail-row:hover .f-body b { color: var(--gold); }
+.mail-row:focus-visible { outline: 2px solid var(--gold-line); outline-offset: 2px; }
+.mf-clip { font-size: var(--fs-sm); }
+
+.mail-open { margin: var(--sp-3) 0 var(--sp-2); }
+/* `pre` because the text arrives with the sender's own line breaks and nothing should re-flow them,
+   and because it can never be anything but text. */
+.mail-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 26rem;
+  overflow-y: auto;
+  padding: var(--sp-3);
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+.mail-files { list-style: none; margin-top: var(--sp-3); display: grid; gap: 4px; }
+.mail-files li { display: flex; gap: var(--sp-3); align-items: baseline; font-size: var(--fs-sm); }
+.mf-name { color: var(--text); }
+.mf-meta { color: var(--faint); font-size: var(--fs-xs, 0.75rem); }
+
 .flat + .flat,
 .stack > * + * { margin-top: var(--sp-4); }
 

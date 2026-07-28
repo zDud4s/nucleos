@@ -70,6 +70,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/email/triage", post(post_email_triage))
         .route("/email/queue", get(get_email_queue))
         .route("/email/incoming", post(post_email_incoming))
+        // Static segments win over `{id}` in matchit, so the three routes above stay reachable.
+        .route("/email/{id}", get(get_email))
         .route("/email/{id}/requeue", post(post_email_requeue))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .layer(axum::middleware::from_fn_with_state(
@@ -308,6 +310,74 @@ struct QueuedEmail {
     triage_summary: Option<String>,
     triaged_at: Option<String>,
     has_attachments: i64,
+}
+
+/// One attachment, described. The bytes are not here and are not stored (migration 0021).
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct EmailAttachment {
+    position: i64,
+    filename: Option<String>,
+    mime_type: Option<String>,
+    size_bytes: i64,
+}
+
+/// One message in full.
+///
+/// Separate from the queue's row because the body is the expensive and sensitive half: a mailbox
+/// list has no business carrying a mailbox's worth of third-party text, and this way opening a
+/// message is the moment that text is read out of the database, not a side effect of drawing a list.
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct EmailDetail {
+    id: i64,
+    from_addr: String,
+    from_name: Option<String>,
+    subject: Option<String>,
+    received_at: String,
+    triage_class: Option<String>,
+    triage_summary: Option<String>,
+    triaged_at: Option<String>,
+    /// NULL once retention has pruned it (§7.2), which is a state the reader must show rather than
+    /// mistake for an empty message.
+    body_text: Option<String>,
+    has_attachments: i64,
+}
+
+#[derive(serde::Serialize)]
+struct EmailDetailResponse {
+    #[serde(flatten)]
+    message: EmailDetail,
+    attachments: Vec<EmailAttachment>,
+}
+
+/// One message, body included — what "open the mail" reads.
+async fn get_email(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<EmailDetailResponse>, StatusCode> {
+    let message: EmailDetail = sqlx::query_as(
+        "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
+                triaged_at, body_text, has_attachments
+           FROM emails WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let attachments: Vec<EmailAttachment> = sqlx::query_as(
+        "SELECT position, filename, mime_type, size_bytes
+           FROM email_attachments WHERE email_id = ? ORDER BY position",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(EmailDetailResponse {
+        message,
+        attachments,
+    }))
 }
 
 /// The mail the pillar knows about: what is waiting, and what it most recently said.
@@ -1049,6 +1119,76 @@ mod tests {
             queue[1]["triage_class"].is_null(),
             "the hour-old message should still be waiting, and still second"
         );
+    }
+
+    async fn get_email_detail(state: AppState, id: i64) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/email/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Opening a message reads the body, which the list deliberately does not carry.
+    #[tokio::test]
+    async fn opening_a_message_returns_its_body_and_attachments() {
+        let state = test_state().await;
+        let body = Body::from(
+            serde_json::json!({
+                "mailbox": "INBOX",
+                "uidvalidity": 1,
+                "max_uid_examined": 10,
+                "messages": [{
+                    "message_id": "<a@b>", "uid": 10, "from_addr": "ana@company.com",
+                    "received_at": chrono::Utc::now().to_rfc3339(),
+                    "body_text": "o texto que interessa",
+                    "has_attachments": true,
+                    "attachments": [
+                        {"position": 0, "filename": "cotacao.pdf",
+                         "mime_type": "application/pdf", "size_bytes": 4096},
+                    ],
+                }],
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            post_email(state.clone(), Some("test-token"), body).await,
+            StatusCode::OK
+        );
+
+        let id = get_queue(state.clone()).await[0]["id"].as_i64().unwrap();
+        let (status, detail) = get_email_detail(state, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["body_text"], "o texto que interessa");
+        assert_eq!(detail["attachments"][0]["filename"], "cotacao.pdf");
+        assert_eq!(detail["attachments"][0]["size_bytes"], 4096);
+    }
+
+    /// `/email/queue` must keep winning over `/email/{id}`, or listing the mailbox starts trying to
+    /// open a message called "queue".
+    #[tokio::test]
+    async fn the_static_email_routes_still_win_over_the_id_route() {
+        let state = test_state().await;
+        assert!(get_queue(state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opening_a_message_that_does_not_exist_is_a_404() {
+        let state = test_state().await;
+        assert_eq!(get_email_detail(state, 9999).await.0, StatusCode::NOT_FOUND);
     }
 
     async fn get_cursor_body(state: AppState, mailbox: &str) -> serde_json::Value {

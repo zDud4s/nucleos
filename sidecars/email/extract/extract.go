@@ -5,6 +5,7 @@
 package extract
 
 import (
+	"encoding/base64"
 	"html"
 	"io"
 	"mime"
@@ -40,7 +41,7 @@ func Message(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, er
 	}
 
 	fromAddr, fromName := sender(parsed.Header)
-	body, hasAttachments := bodyAndAttachments(parsed)
+	body, attachments := bodyAndAttachments(parsed)
 
 	headers := map[string]string{}
 	for _, name := range HeadersOfInterest {
@@ -59,7 +60,8 @@ func Message(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, er
 		Subject:        decodeHeader(parsed.Header.Get("Subject")),
 		ReceivedAt:     internalDate.UTC().Format(time.RFC3339),
 		BodyText:       Truncate(body),
-		HasAttachments: hasAttachments,
+		HasAttachments: len(attachments) > 0,
+		Attachments:    attachments,
 		Headers:        headers,
 	}, nil
 }
@@ -102,55 +104,118 @@ func sender(header mail.Header) (addr string, name string) {
 	return parsed.Address, decodeHeader(parsed.Name)
 }
 
-// bodyAndAttachments prefers `text/plain`, falls back to stripped HTML, and reports whether any
-// part is an attachment. The HTML fallback is deliberately naive: this text is triage input, not a
-// rendering, and a real HTML parser would be a dependency earning nothing.
-func bodyAndAttachments(msg *mail.Message) (string, bool) {
+// MaxMIMEDepth bounds how far the walk descends. Real mail nests three or four levels; anything
+// deeper is a message built to make a parser recurse, not to be read.
+const MaxMIMEDepth = 10
+
+// collector accumulates one message's text and attachment descriptions across the MIME tree.
+type collector struct {
+	// Not named `html`: that is an imported package here, and shadowing it would make
+	// `html.UnescapeString` fail to compile for a non-obvious reason.
+	plain       string
+	htmlPart    string
+	attachments []daemon.Attachment
+}
+
+// bodyAndAttachments prefers `text/plain`, falls back to stripped HTML, and describes every
+// attachment. The HTML fallback is deliberately naive: this text is triage input, not a rendering,
+// and a real HTML parser would be a dependency earning nothing.
+//
+// It DESCENDS the MIME tree, and that is not a refinement — it is the difference between reading a
+// message and not. Gmail wraps any message carrying an attachment in a `multipart/mixed` whose
+// first part is the `multipart/alternative` that holds the actual text, and does the same with
+// `multipart/related` for inline images. A walk that reads only the top level finds no `text/*`
+// there at all and returns nothing: in the first real mailbox this pillar ever read, a third of
+// the messages arrived with an empty body and were triaged on subject and sender alone.
+func bodyAndAttachments(msg *mail.Message) (string, []daemon.Attachment) {
 	mediaType, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
 	if err != nil {
 		body, _ := io.ReadAll(io.LimitReader(msg.Body, MaxBodyBytes*4))
-		return string(body), false
+		return string(body), nil
 	}
 
 	if !strings.HasPrefix(mediaType, "multipart/") {
 		body, _ := io.ReadAll(io.LimitReader(msg.Body, MaxBodyBytes*4))
 		if mediaType == "text/html" {
-			return StripHTML(string(body)), false
+			return StripHTML(string(body)), nil
 		}
-		return string(body), false
+		return string(body), nil
 	}
 
-	reader := multipart.NewReader(msg.Body, params["boundary"])
-	// Not named `html`: that is now an imported package, and shadowing it here would make a later
-	// `html.UnescapeString` in this function fail to compile for a non-obvious reason.
-	var plain, htmlPart string
-	hasAttachments := false
+	var found collector
+	found.walk(msg.Body, params["boundary"], 0)
+
+	if found.plain != "" {
+		return found.plain, found.attachments
+	}
+	return StripHTML(found.htmlPart), found.attachments
+}
+
+// walk reads one multipart level, descending into nested multiparts and stopping at MaxMIMEDepth.
+func (c *collector) walk(body io.Reader, boundary string, depth int) {
+	if depth >= MaxMIMEDepth || boundary == "" {
+		return
+	}
+	reader := multipart.NewReader(body, boundary)
 	for {
 		part, err := reader.NextPart()
 		if err != nil {
 			break
 		}
-		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-		partType, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
-		if disposition == "attachment" {
-			hasAttachments = true
+		partType, partParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if strings.HasPrefix(partType, "multipart/") {
+			c.walk(part, partParams["boundary"], depth+1)
 			part.Close()
 			continue
 		}
+
+		disposition, dispParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		if disposition == "attachment" {
+			c.attachments = append(c.attachments, daemon.Attachment{
+				Position:  len(c.attachments),
+				Filename:  attachmentName(dispParams, partParams),
+				MimeType:  partType,
+				SizeBytes: partSize(part),
+			})
+			part.Close()
+			continue
+		}
+
 		content, _ := io.ReadAll(io.LimitReader(part, MaxBodyBytes*4))
 		switch {
-		case strings.HasPrefix(partType, "text/plain") && plain == "":
-			plain = string(content)
-		case strings.HasPrefix(partType, "text/html") && htmlPart == "":
-			htmlPart = string(content)
+		case strings.HasPrefix(partType, "text/plain") && c.plain == "":
+			c.plain = string(content)
+		case strings.HasPrefix(partType, "text/html") && c.htmlPart == "":
+			c.htmlPart = string(content)
 		}
 		part.Close()
 	}
+}
 
-	if plain != "" {
-		return plain, hasAttachments
+// attachmentName reads the filename from `Content-Disposition`, falling back to `Content-Type`'s
+// `name` for the older senders that only set that one. Empty is a legal answer: an attachment with
+// no name is still an attachment, and inventing one would be inventing information.
+func attachmentName(dispParams, typeParams map[string]string) string {
+	if name := dispParams["filename"]; name != "" {
+		return decodeHeader(name)
 	}
-	return StripHTML(htmlPart), hasAttachments
+	if name := typeParams["name"]; name != "" {
+		return decodeHeader(name)
+	}
+	return ""
+}
+
+// partSize reports the DECODED size, which is the number a person recognises from their own file
+// system. `multipart` decodes quoted-printable transparently and hides the header when it does,
+// but leaves base64 alone — and base64 is 4/3 of the real thing, so reporting it raw would
+// overstate the size of essentially every attachment Gmail sends.
+func partSize(part *multipart.Part) int64 {
+	var reader io.Reader = part
+	if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "base64") {
+		reader = base64.NewDecoder(base64.StdEncoding, part)
+	}
+	size, _ := io.Copy(io.Discard, reader)
+	return size
 }
 
 // StripHTML reduces markup to the text a triage prompt needs.

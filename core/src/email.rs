@@ -26,7 +26,24 @@ pub struct IncomingMessage {
     #[serde(default)]
     pub has_attachments: bool,
     #[serde(default)]
+    pub attachments: Vec<IncomingAttachment>,
+    #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+}
+
+/// What a message carries besides its text, described rather than delivered.
+///
+/// No bytes: the sidecar reports a name, a type and a size — enough for a person to decide whether
+/// something is worth opening — and the content is fetched from the mailbox only when asked.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct IncomingAttachment {
+    /// Which attachment, from zero, in the order the message carries them.
+    pub position: i64,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    pub size_bytes: i64,
 }
 
 /// A message the sidecar looked at but could not deliver (spec §3.3/§4.3). It carries the uid so
@@ -336,6 +353,26 @@ pub async fn ingest_batch(
 
         if result.rows_affected() == 1 {
             ingested += 1;
+            // Only for a row this batch actually created. A duplicate already has its attachments,
+            // and re-inserting them would either collide on the UNIQUE or silently double a list
+            // the user reads as "what came with this message".
+            let email_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
+                .fetch_one(tx.as_mut())
+                .await?;
+            for attachment in &message.attachments {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO email_attachments
+                         (email_id, position, filename, mime_type, size_bytes)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(email_id)
+                .bind(attachment.position)
+                .bind(attachment.filename.as_deref())
+                .bind(attachment.mime_type.as_deref())
+                .bind(attachment.size_bytes)
+                .execute(tx.as_mut())
+                .await?;
+            }
         } else {
             duplicates += 1;
         }
@@ -499,7 +536,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables, vec!["email_cursor", "emails"]);
+        assert_eq!(tables, vec!["email_attachments", "email_cursor", "emails"]);
     }
 
     /// The partial index is what makes the pending queue cheap to read every tick; without the
@@ -738,8 +775,52 @@ mod tests {
             received_at: ago(1),
             body_text: Some("body".into()),
             has_attachments: false,
+            attachments: Vec::new(),
             headers: Default::default(),
         }
+    }
+
+    fn message_with_attachment(uid: i64) -> IncomingMessage {
+        IncomingMessage {
+            has_attachments: true,
+            attachments: vec![IncomingAttachment {
+                position: 0,
+                filename: Some("cotacao.pdf".into()),
+                mime_type: Some("application/pdf".into()),
+                size_bytes: 4096,
+            }],
+            ..message(uid)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_described_alongside_its_message() {
+        let pool = test_pool().await;
+        ingest(&pool, &[message_with_attachment(1)], 1).await;
+
+        let row: (i64, String, i64) = sqlx::query_as(
+            "SELECT position, filename, size_bytes FROM email_attachments
+              JOIN emails ON emails.id = email_attachments.email_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (0, "cotacao.pdf".to_string(), 4096));
+    }
+
+    /// A redelivered message must not grow a second copy of its own attachment list — the list is
+    /// read as "what came with this message", and a duplicate would read as two files.
+    #[tokio::test]
+    async fn a_redelivered_message_does_not_duplicate_its_attachments() {
+        let pool = test_pool().await;
+        ingest(&pool, &[message_with_attachment(1)], 1).await;
+        ingest(&pool, &[message_with_attachment(1)], 1).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM email_attachments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     async fn seed_cursor(pool: &sqlx::SqlitePool, uidvalidity: i64, last_uid: i64, age_days: i64) {
