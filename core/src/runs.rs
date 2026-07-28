@@ -108,9 +108,19 @@ pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, StatusCode> {
-    let id = create_run_inner(&state, req.prompt, req.project_id, req.cwd, &req.mode)
-        .await
-        .map_err(|error| crate::http::create_run_status(&error))?;
+    // In its own task, on purpose. A client that disconnects cancels the request it was making,
+    // dropping this future exactly the way `abort()` drops a run's — and the run row is INSERTed
+    // `running` before the worktree is provisioned, so `git worktree add` holds that window open for
+    // as long as git takes. A drop inside it strands a `running` worktree row with no task and no
+    // abort handle, which `one_open_worktree_run_per_project` (migration 0009) turns into a
+    // project-wide block until the daemon restarts. Awaiting the JoinHandle leaves the response
+    // unchanged; dropping a JoinHandle only detaches its task, so the run still gets finished.
+    let id = tokio::spawn(async move {
+        create_run_inner(&state, req.prompt, req.project_id, req.cwd, &req.mode).await
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|error| crate::http::create_run_status(&error))?;
 
     Ok(Json(CreateRunResponse { id }))
 }
@@ -1213,6 +1223,76 @@ mod tests {
         assert!(summary.contains(&branch));
 
         let _ = crate::worktree::remove(&repo, &spawn_cwd, &[]).await;
+    }
+
+    /// A worktree run's row is INSERTed `running` before its worktree is provisioned, and
+    /// `git worktree add` takes real time — so the window between the two is wide enough to matter.
+    /// A client that disconnects cancels the request it was making, which drops the handler's future
+    /// exactly the way `abort()` drops a run's, and everything past that point is simply never done:
+    /// no task, no abort handle (so `/cancel` answers 404), and a `running` worktree row that
+    /// `one_open_worktree_run_per_project` (migration 0009) turns into a project-wide block on every
+    /// later worktree run — until the daemon restarts, the only thing that reconciles `running` rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_create_request_still_finishes_the_run_it_started() {
+        use std::future::Future;
+
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-dropped-");
+        let state = test_state().await;
+        advance_run_ids_past(&state.pool, 47_000).await;
+        let run_id = 47_001;
+
+        let mut handler = Box::pin(create_run(
+            State(state.clone()),
+            Json(CreateRunRequest {
+                prompt: "do it".to_owned(),
+                project_id: Some("proj".to_owned()),
+                cwd: Some(repo.to_string_lossy().into_owned()),
+                mode: "worktree".to_owned(),
+            }),
+        ));
+
+        // Drive the handler by hand so the request can be dropped at a chosen point: once the
+        // worktree exists on disk, which is past the row INSERT and before the run is spawned.
+        // Watching the directory rather than the database keeps the pool's single connection free
+        // while the handler is parked on it.
+        let worktree_path = wt_root.path().join(format!("run-{run_id}"));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut provisioned = false;
+        for _ in 0..10_000 {
+            assert!(
+                handler.as_mut().poll(&mut context).is_pending(),
+                "the handler ran to completion before the request could be dropped"
+            );
+            if worktree_path.exists() {
+                provisioned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(provisioned, "the worktree was never provisioned");
+        drop(handler);
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            status, "completed",
+            "a dropped request must not leave the project pinned by a half-created run"
+        );
+
+        let _ = crate::worktree::remove(&repo, &worktree_path, &[]).await;
     }
 
     #[tokio::test]
