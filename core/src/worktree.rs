@@ -170,15 +170,33 @@ pub async fn mark_removed(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
 }
 
 pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutcome> {
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await?;
-    let Some(status) = status else {
-        return Ok(ReleaseOutcome::NotFound);
-    };
-    if status != "awaiting_approval" {
-        return Ok(ReleaseOutcome::NotAwaitingApproval);
+    // Claim the run first, with the check inside the write. Read-then-write left a gap that this
+    // call then spent tens of seconds inside — `git worktree remove` retries on a backoff — and
+    // anything finalising the run in that gap (a cancel, or an approval that supersedes it and hands
+    // its worktree to a resume) would find `cancelled` stamped over its status and its worktree
+    // deleted. Claiming before touching anything means only the winner does the destructive part.
+    //
+    // The order also fails in the better direction: a crash between the claim and the removal leaves
+    // a `cancelled` run with a live worktree row, which the GC collects; the old order could leave a
+    // removed worktree pinned by an `awaiting_approval` run, which the GC never touches.
+    let claimed = sqlx::query(
+        "UPDATE runs SET status = 'cancelled', completed_at = ?
+         WHERE id = ? AND status = 'awaiting_approval'",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        // Losing the claim is not an error; it only decides which of the two honest answers this is.
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+        return Ok(match exists {
+            Some(_) => ReleaseOutcome::NotAwaitingApproval,
+            None => ReleaseOutcome::NotFound,
+        });
     }
 
     let worktree: Option<WorktreeRow> = sqlx::query_as(
@@ -206,12 +224,6 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
         }
         mark_removed(pool, run_id).await?;
     }
-
-    sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(run_id)
-        .execute(pool)
-        .await?;
 
     if let Some(worktree) = worktree {
         // A discarded run's branch was left behind until now, so every rejected proposal leaked one.
@@ -1319,6 +1331,81 @@ mod tests {
         remove(repo.path(), &info.path, &[])
             .await
             .expect("remove worktree");
+    }
+
+    /// Release is not a quick write: `git worktree remove` retries on a backoff that can run for
+    /// half a minute, and everything the run's status meant when the call started can change inside
+    /// that window — a cancel, or an approval that supersedes the run and hands its worktree to a
+    /// resume. Checking the status and then writing it are therefore two decisions about two
+    /// different moments unless the check lives inside the write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_never_overwrites_a_status_written_under_it() {
+        use std::future::Future;
+
+        let _lock = env_lock();
+        // A file-backed pool with room for a second connection: the test writes to the same rows
+        // while the release future is mid-flight, which a single-connection pool would deadlock on.
+        let db_dir = tempfile::tempdir().expect("create database tempdir");
+        let pool = crate::storage::open(&db_dir.path().join("nucleos.db"))
+            .await
+            .expect("open database");
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-28T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+
+        // Driven by hand so the status can be moved at a chosen point rather than a hoped-for one:
+        // once the worktree is gone from disk, which is past the status check and, unguarded, still
+        // short of the `cancelled` write.
+        let mut releasing = Box::pin(release(&pool, run_id));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut removed = false;
+        for _ in 0..10_000 {
+            assert!(
+                releasing.as_mut().poll(&mut context).is_pending(),
+                "release finished before the status could move under it"
+            );
+            if !info.path.exists() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(removed, "the worktree was never removed");
+
+        // Whatever finalises the run next — here, an approval superseding it.
+        sqlx::query("UPDATE runs SET status = 'superseded' WHERE id = ?")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = loop {
+            if let std::task::Poll::Ready(outcome) = releasing.as_mut().poll(&mut context) {
+                break outcome.expect("release should not fail");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+
+        // Honest either way: the claim that authorised this release happened before the status
+        // moved, so the worktree really was this call's to discard.
+        assert_eq!(outcome, ReleaseOutcome::Released);
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "superseded",
+            "release must not stamp `cancelled` over a status it did not read"
+        );
     }
 
     #[tokio::test]

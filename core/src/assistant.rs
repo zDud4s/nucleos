@@ -203,11 +203,16 @@ fn spawn_assistant_turn(
         .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
 
+        // Each terminal write below is guarded on the turn still being `running`. A `/cancel` aborts
+        // this task, but the abort lands only where this future is next dropped — so a cancel that
+        // already wrote its status can still be followed by one last wake-up here, and an unguarded
+        // write would report a completed turn for a CLI that was killed. First writer wins; no rows
+        // means the turn was finalised elsewhere, which is an outcome, not an error.
         match result {
             Ok(Ok(o)) => {
                 let reply = extract_reply(&o.stdout).unwrap_or_else(|| o.stdout.clone());
                 let _ = sqlx::query(
-                    "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ?",
+                    "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(o.exit_code)
                 .bind(&reply)
@@ -225,7 +230,7 @@ fn spawn_assistant_turn(
             }
             Ok(Err(e)) => {
                 let _ = sqlx::query(
-                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ?",
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(e.to_string())
                 .bind(&completed_at)
@@ -235,7 +240,7 @@ fn spawn_assistant_turn(
             }
             Err(_) => {
                 let _ = sqlx::query(
-                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ?",
+                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(&completed_at)
                 .bind(id)
@@ -431,6 +436,70 @@ mod tests {
 
         assert_eq!(status, "completed");
         assert_eq!(session, Some("fake-session-id".to_string()));
+    }
+
+    /// A cancelled turn's future is dropped where it is parked, but `abort()` reaches it only at
+    /// that drop — so a cancel that has already written `cancelled` can be followed by the turn
+    /// waking up once more and writing its own `completed`, reply text and all, over a turn whose
+    /// CLI was killed. The status a chat reports must be the first one written, not the last.
+    #[tokio::test]
+    async fn a_turn_completion_never_overwrites_a_finalised_status() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner {
+            delay: Mutex::new(Some(Duration::from_secs(1))),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let chat_id = "assistant-finalised-status-chat";
+
+        let id = send_message(&state, chat_id, "take your time")
+            .await
+            .unwrap();
+        // The fake runner counts the call before it sleeps, so this parks the turn inside the CLI
+        // call: past the point of no return for its terminal write, and short of running it.
+        for _ in 0..500 {
+            if *runner.calls.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            1,
+            "the turn should have started"
+        );
+
+        // What `finalize_termination` writes when it gets there first — written directly, because
+        // aborting the task would drop the very future whose last write is the thing under test.
+        sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // The handle is released by the guard the task captured, so an empty map is proof the turn
+        // reached the end — its terminal write included — rather than proof that time passed.
+        for _ in 0..500 {
+            if !state.run_handles.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&id),
+            "the turn never finished"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "cancelled",
+            "a killed turn must not report itself completed"
+        );
     }
 
     #[tokio::test]

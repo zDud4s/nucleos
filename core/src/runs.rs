@@ -238,10 +238,16 @@ fn spawn_run(
             )
             .await;
             let completed_at = chrono::Utc::now().to_rfc3339();
+            // Every terminal write below is guarded on the run still being `running`. This body is
+            // not the only writer racing for the last word: `finalize_termination` aborts the task,
+            // but the abort only lands where the future is next dropped, so a cancel or an
+            // approval-pause can already have written its own status while this attempt was on its
+            // way here. First writer wins; no rows means someone else finalised the run, which is an
+            // outcome rather than a failure — the loop breaks either way.
             match result {
                 Ok(Ok(o)) => {
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ?",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&o.stdout)
@@ -288,7 +294,7 @@ fn spawn_run(
                         continue;
                     }
                     let _ = sqlx::query(
-                        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?, attempt = ? WHERE id = ?",
+                        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(e.to_string())
                     .bind(&completed_at)
@@ -311,7 +317,7 @@ fn spawn_run(
                 Err(_elapsed) => {
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let _ = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', completed_at = ?, attempt = ? WHERE id = ?",
+                        "UPDATE runs SET status = 'timed_out', completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&completed_at)
                     .bind(attempt as i64)
@@ -380,12 +386,13 @@ pub async fn create_run_inner(
             Ok(info) => info,
             Err(error) => {
                 let completed_at = chrono::Utc::now().to_rfc3339();
-                let _ =
-                    sqlx::query("UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ?")
-                        .bind(&completed_at)
-                        .bind(id)
-                        .execute(&state.pool)
-                        .await;
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&state.pool)
+                .await;
                 let _ = crate::feed::append(
                     &state.pool,
                     project_id.as_deref(),
@@ -475,7 +482,13 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
 
-    sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=?")
+    // Guarded on the state this resume was authorised from: the paused run was `awaiting_approval`
+    // when the proposal was read, and a release or a cancel can have finalised it since. No rows
+    // means one of those got there first, so the supersede is a no-op rather than a status this
+    // resume is entitled to overwrite — the live-worktree lookup above is what actually stops a
+    // resume onto a discarded worktree, and `one_open_worktree_run_per_project` (migration 0009)
+    // rejects the INSERT below if the slot is still held.
+    sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'")
         .bind(&now)
         .bind(original_run_id)
         .execute(&mut *tx)
@@ -575,18 +588,29 @@ pub async fn get_run(
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
 /// it first sets the final status; a later reason finds it gone and no-ops. Returns true iff this call
 /// terminated the run. Factored out so Chunk 3's `pending_approval` path reuses the same arbiter.
+///
+/// The handle arbitrates between terminators, but it does not arbitrate against the run's own body:
+/// `abort()` takes effect where the future is next dropped, so a body already past its last `.await`
+/// keeps running, and a body that has just written its own terminal status is still registered until
+/// its `Registration` drops. The status write below is therefore compare-and-set, and `true` keeps
+/// meaning "this call terminated the task" — not "the run ended up in `status`". A caller that needs
+/// the latter reads the row back; today none does.
 pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bool {
     let handle = state.run_handles.lock().unwrap().remove(&id);
     match handle {
         Some(h) => {
             h.abort();
             let now = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?")
-                .bind(status)
-                .bind(&now)
-                .bind(id)
-                .execute(&state.pool)
-                .await;
+            // First writer wins: no rows means the run finalised itself while this call was on its
+            // way, which is an outcome, not a failure — nothing to retry and nothing to report.
+            let _ = sqlx::query(
+                "UPDATE runs SET status = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(status)
+            .bind(&now)
+            .bind(id)
+            .execute(&state.pool)
+            .await;
             true
         }
         None => false,
@@ -1348,6 +1372,119 @@ mod tests {
             !state.run_handles.lock().unwrap().contains_key(&id),
             "a dead run must not stay registered as in-flight"
         );
+    }
+
+    /// `abort()` does not reach into a task that is already past its last `.await`: the body can
+    /// have written its own `completed` and still be on its way out, with the `Registration` that
+    /// releases its handle not yet dropped. `finalize_termination` therefore still finds a handle
+    /// and, writing blind, would stamp `cancelled` over a run whose work genuinely finished —
+    /// reporting a cancellation for output the user already has.
+    #[tokio::test]
+    async fn finalize_termination_leaves_an_already_finished_run_alone() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        // The body's own terminal write, which lands before its handle is released.
+        sqlx::query("UPDATE runs SET status = 'completed', exit_code = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // A handle still registered over that write is exactly the window: the task is finishing,
+        // not gone. A parked body keeps it registered for as long as the test needs it.
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(
+            finalize_termination(&state, id, "cancelled").await,
+            "this call is still the one that terminated the task"
+        );
+
+        let (status, exit_code): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, exit_code FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(exit_code, Some(0));
+    }
+
+    /// The same race from the other side. `abort()` only takes effect where the future is dropped,
+    /// so a cancel that wins the status write can be followed by the run body waking up one last
+    /// time and running its completion write — turning a run whose CLI was killed mid-flight into a
+    /// `completed` one, exit code, output and all.
+    #[tokio::test]
+    async fn a_completion_write_never_overwrites_a_finalised_status() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(1)), Duration::from_secs(600)).await;
+        let id = create_run_inner(&state, "a slow one".into(), None, None, "real")
+            .await
+            .unwrap();
+
+        // The fake runner counts the call before it sleeps, so this parks the body inside the CLI
+        // call — past the point of no return for the completion write, and short of running it.
+        for _ in 0..500 {
+            if *runner.calls.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            1,
+            "the run body should be inside the CLI call"
+        );
+
+        // What `finalize_termination` writes when it gets there first. Written directly rather than
+        // through it, because aborting the task would drop the very future whose last write is the
+        // thing under test.
+        sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let exit_code: Option<i64> = sqlx::query_scalar("SELECT exit_code FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            exit_code, None,
+            "the completion write must not have run yet"
+        );
+
+        // The handle is released by the guard the task captured, so an empty map is proof the body
+        // reached the end — its terminal write included — rather than proof that time passed.
+        for _ in 0..500 {
+            if !state.run_handles.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&id),
+            "the run body never finished"
+        );
+
+        let (status, exit_code): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, exit_code FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "cancelled",
+            "a killed run must not report itself completed"
+        );
+        assert_eq!(exit_code, None);
     }
 
     #[tokio::test]
