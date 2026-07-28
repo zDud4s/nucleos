@@ -108,6 +108,25 @@ pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, StatusCode> {
+    // Checked here and not only in the tick loops, because the loops are not the only way a run
+    // starts. Every spawned CLI gets `NUCLEOS_DAEMON_TOKEN` in its environment (`run_env`) and
+    // passes it to every subprocess, so a "stop" that only stopped the scheduler left the thing
+    // being stopped free to start its own successors through this endpoint.
+    //
+    // Only the GLOBAL switch, deliberately. The scoped kills, the budget and the WIP limit pace
+    // proactive autonomy, and a person asking for a run through the shell is not that. The global
+    // switch is the emergency stop, and an emergency stop with exemptions is not one.
+    //
+    // Fails closed: a switch that cannot be read stops runs rather than starting them.
+    match crate::autopilot::kill_switch_engaged(&state.pool).await {
+        Ok(false) => {}
+        Ok(true) => return Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(%error, "create_run: could not read the kill switch — refusing");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
     // Uncancellable: the run row is INSERTed `running` before the worktree is provisioned, so
     // `git worktree add` holds that window open for as long as git takes. A request dropped inside
     // it strands a `running` worktree row with no task and no abort handle — `/cancel` answers 404,
@@ -1416,6 +1435,52 @@ mod tests {
         assert!(summary.contains(&branch));
 
         let _ = crate::worktree::remove(&repo, &spawn_cwd, &[]).await;
+    }
+
+    /// The kill switch has to stop the endpoint, not just the schedulers. Every spawned CLI holds
+    /// the daemon token, so autonomy that is "stopped" can otherwise start its own successors.
+    #[tokio::test]
+    async fn the_kill_switch_refuses_a_run_created_through_the_api() {
+        let state = test_state().await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let result = create_run(
+            State(state.clone()),
+            Json(CreateRunRequest {
+                prompt: "start something".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "real".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::CONFLICT)));
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "no row may be written for a refused run");
+    }
+
+    #[tokio::test]
+    async fn a_run_is_created_normally_while_the_kill_switch_is_off() {
+        let state = test_state().await;
+
+        let result = create_run(
+            State(state.clone()),
+            Json(CreateRunRequest {
+                prompt: "start something".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "real".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok(), "the switch is off; this must go through");
     }
 
     /// A worktree run's row is INSERTed `running` before its worktree is provisioned, and
