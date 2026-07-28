@@ -5,10 +5,11 @@ import {
 } from "./api";
 import Autopilot from "./Autopilot";
 import Home from "./Home";
+import Mail from "./Mail";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 
-type Tab = "home" | "autopilot";
+type Tab = "home" | "autopilot" | "mail";
 
 function App() {
   const [connection, setConnection] = useState<ConnectionState>("checking");
@@ -73,6 +74,7 @@ function App() {
         <nav className="tabs" aria-label="NucleOS views">
           <button className="tab" type="button" aria-current={tab === "home" ? "page" : undefined} onClick={() => setTab("home")}>Home</button>
           <button className="tab" type="button" aria-current={tab === "autopilot" ? "page" : undefined} onClick={() => setTab("autopilot")}>Autopilot</button>
+          <button className="tab" type="button" aria-current={tab === "mail" ? "page" : undefined} onClick={() => setTab("mail")}>Mail</button>
         </nav>
         <div className="right">
           {connected && (
@@ -117,21 +119,25 @@ function App() {
         </section>
       ) : (
         <main className="page" data-tab={tab}>
-          {tab === "home"
-            ? <Home
-                token={token}
-                connection={connection}
-                status={status}
-                killEngaged={killEngaged}
-                onOpenAutopilot={() => setTab("autopilot")}
-              />
-            : <Autopilot
-                token={token}
-                connection={connection}
-                killEngaged={killEngaged}
-                killBusy={killBusy}
-                toggleKill={toggleKill}
-              />}
+          {tab === "home" && (
+            <Home
+              token={token}
+              connection={connection}
+              status={status}
+              killEngaged={killEngaged}
+              onOpenAutopilot={() => setTab("autopilot")}
+            />
+          )}
+          {tab === "autopilot" && (
+            <Autopilot
+              token={token}
+              connection={connection}
+              killEngaged={killEngaged}
+              killBusy={killBusy}
+              toggleKill={toggleKill}
+            />
+          )}
+          {tab === "mail" && <Mail token={token} connection={connection} />}
         </main>
       )}
     </div>

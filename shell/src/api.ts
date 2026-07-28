@@ -388,7 +388,11 @@ export async function getScopedKills(token: string): Promise<ScopedKill[] | null
   }
 }
 
-/** What the pillar knows about, waiting mail first. */
+/**
+ * The mailbox, newest arrival first — the daemon's order, which callers should not second-guess:
+ * it sorts the whole table and then truncates, so re-sorting the page you received would only
+ * reorder a slice of the answer.
+ */
 export async function getEmailQueue(token: string): Promise<QueuedEmail[] | null> {
   try {
     const res = await fetch(`${DAEMON_URL}/email/queue`, {

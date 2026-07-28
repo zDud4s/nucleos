@@ -121,3 +121,28 @@ func TestAnImmediateFailureExaminesNothing(t *testing.T) {
 			len(messages), len(skipped), maxExamined)
 	}
 }
+
+// A mailbox with nothing new answers `SearchAbove` with its own last message, because IMAP's `n:*`
+// range always matches the highest uid present. Left in, it makes every idle poll claim there is
+// one message to read.
+func TestStrictlyAboveDropsTheCursorsOwnMessage(t *testing.T) {
+	kept := StrictlyAbove([]imapv2.UID{8239}, 8239)
+	if len(kept) != 0 {
+		t.Fatalf("kept %v, want nothing above the cursor", kept)
+	}
+}
+
+func TestStrictlyAboveKeepsGenuinelyNewMail(t *testing.T) {
+	kept := StrictlyAbove([]imapv2.UID{8239, 8240, 8241}, 8239)
+	if len(kept) != 2 || kept[0] != 8240 || kept[1] != 8241 {
+		t.Fatalf("kept %v, want [8240 8241]", kept)
+	}
+}
+
+// No cursor means no floor, and uid 0 is not a real uid — every message is new.
+func TestStrictlyAboveKeepsEverythingWithoutACursor(t *testing.T) {
+	kept := StrictlyAbove([]imapv2.UID{1, 2, 3}, 0)
+	if len(kept) != 3 {
+		t.Fatalf("kept %v, want all three", kept)
+	}
+}

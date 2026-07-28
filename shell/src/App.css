@@ -106,6 +106,10 @@
 }
 .grid > section > h2 { margin-inline: var(--sp-5); }
 
+/* Mail is a single column, so nothing else gives it a bottom edge and the last message would
+   otherwise sit flush against the window. */
+.mail { padding-bottom: var(--sp-6); }
+
 .flat + .flat,
 .stack > * + * { margin-top: var(--sp-4); }
 

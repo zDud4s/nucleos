@@ -80,6 +80,23 @@ func lastSeen(cursor *daemon.Cursor) uint32 {
 	return cursor.LastUID
 }
 
+// StrictlyAbove drops uids the cursor has already passed.
+//
+// IMAP's `n:*` range always matches the highest message in the mailbox, even when nothing sits
+// above `n` — so a caught-up mailbox answers a search for "anything after 8239" with message 8239
+// itself. The núcleo's dedup already absorbed that, but silently: every poll reported one message
+// to read and zero delivered, which made "nothing new" unreachable in the log and turned the line
+// that distinguishes a healthy poll from a broken one into noise.
+func StrictlyAbove(uids []imapv2.UID, lastUID uint32) []imapv2.UID {
+	kept := make([]imapv2.UID, 0, len(uids))
+	for _, uid := range uids {
+		if uint32(uid) > lastUID {
+			kept = append(kept, uid)
+		}
+	}
+	return kept
+}
+
 // Once performs a single poll: connect, read what is new, deliver it.
 func Once(cfg config.Config, client *daemon.Client) error {
 	cursor, err := client.GetCursor(cfg.Mailbox)
@@ -104,6 +121,9 @@ func Once(cfg config.Config, client *daemon.Client) error {
 		uids, err = conn.SearchSince(time.Now().Add(-ResyncWindow))
 	} else {
 		uids, err = conn.SearchAbove(cursor.LastUID)
+		if err == nil {
+			uids = StrictlyAbove(uids, cursor.LastUID)
+		}
 	}
 	if err != nil {
 		return err

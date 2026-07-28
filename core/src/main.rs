@@ -170,7 +170,11 @@ async fn main() {
         config::ModelsConfig::default()
     });
 
-    let email_config = config::load_email_config(std::path::Path::new(".ai/email.yaml"));
+    // Relative to the working directory, so it matters where the daemon was launched from — which
+    // is exactly why the "off" message below has to name the path it looked at.
+    let email_config_path = std::path::Path::new(".ai/email.yaml");
+    let email_config_found = email_config_path.exists();
+    let email_config = config::load_email_config(email_config_path);
     // Built whether or not the pillar is enabled: it is two small files, and having it always in a
     // known state means enabling email later is a config edit rather than a fresh directory.
     let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
@@ -299,8 +303,18 @@ async fn main() {
                 }
             }
         });
+    } else if email_config_found {
+        tracing::info!("email pillar disabled (.ai/email.yaml says enabled: false)");
     } else {
-        tracing::info!("email pillar disabled (.ai/email.yaml: enabled: false)");
+        // Not the same thing, and saying so cost a diagnosis: a daemon started from the wrong
+        // directory reported the user's config as switched off while that file sat there reading
+        // `enabled: true`. Absolute, because the whole point is which directory was searched.
+        tracing::info!(
+            path = %std::path::absolute(email_config_path)
+                .unwrap_or_else(|_| email_config_path.to_path_buf())
+                .display(),
+            "email pillar off — no config file here (the path is relative to the working directory)"
+        );
     }
 
     axum::serve(listener, app).await.unwrap();

@@ -8,6 +8,8 @@ import {
   formatUsd,
   groupScoreboardByMode,
   killSwitchLabel,
+  mailLabel,
+  mailTone,
   periodLabel,
   promotionBlock,
   promotionReadiness,
@@ -347,5 +349,24 @@ describe("pure UI derivations", () => {
     expect(relativeTime("2026-07-12T12:00:00Z", now)).toBe("2 w ago");
     expect(relativeTime("2026-05-01T00:00:00Z", now)).toBe("2026-05-01");
     expect(relativeTime("not-a-date", now)).toBe("not-a-date");
+  });
+
+  it("maps triage classes onto the app's state vocabulary", () => {
+    expect(mailTone("urgent")).toBe("pending");
+    expect(mailTone("action")).toBe("paused");
+    // `failed` is not a verdict about the content — it is mail that still wants a requeue, so it
+    // keeps `action`'s tone rather than receding with `noise`.
+    expect(mailTone("failed")).toBe("paused");
+    expect(mailTone("info")).toBe("active");
+    expect(mailTone("noise")).toBe("off");
+    // No verdict yet is a state of its own, not a missing one.
+    expect(mailTone(null)).toBe("shadow");
+    // A class the núcleo invents later must recede, never shout.
+    expect(mailTone("whatever-comes-next")).toBe("off");
+  });
+
+  it("labels an unjudged message as waiting rather than blank", () => {
+    expect(mailLabel(null)).toBe("waiting");
+    expect(mailLabel("urgent")).toBe("urgent");
   });
 });

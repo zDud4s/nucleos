@@ -215,6 +215,11 @@ struct EmailIncomingRequest {
 /// núcleo should say so rather than quietly ingest whatever arrives.
 const MAX_MESSAGES_PER_BATCH: usize = 200;
 
+/// How much of the mailbox the queue hands back. Generous because a first sync pulls a week at
+/// once, and a list that silently stops at its limit is indistinguishable from mail that never
+/// arrived — which is the exact confusion this pillar has already cost once.
+const EMAIL_QUEUE_LIMIT: i64 = 200;
+
 async fn get_email_cursor(
     State(state): State<AppState>,
     Query(query): Query<MailboxQuery>,
@@ -309,15 +314,25 @@ struct QueuedEmail {
 async fn get_email_queue(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<QueuedEmail>>, StatusCode> {
-    // Pending first (that is what a person acts on), then the newest verdicts. `failed` sorts with
-    // the rest rather than being hidden: it is the class the user may want to requeue.
+    // Newest arrival first — the order a mailbox is read in. Deliberately NOT by triage time: a
+    // verdict landing now would otherwise drag a week-old message to the top, and a list that
+    // reorders itself while you read it is one you lose your place in. Waiting mail is marked
+    // rather than floated for the same reason; the count and the button live above the list.
+    //
+    // Sorting `received_at` as text is a chronological sort because the sidecar normalises the
+    // server's INTERNALDATE to UTC (`...Z`), so every value shares one offset. `id` breaks ties
+    // within a second, which a bulk delivery produces routinely.
+    //
+    // `failed` sorts with the rest rather than being hidden: it is the class most likely to be
+    // requeued, so it is the one that must stay findable.
     sqlx::query_as::<_, QueuedEmail>(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
                 triaged_at, has_attachments
            FROM emails
-          ORDER BY triage_class IS NOT NULL, COALESCE(triaged_at, ingested_at) DESC
-          LIMIT 50",
+          ORDER BY received_at DESC, id DESC
+          LIMIT ?",
     )
+    .bind(EMAIL_QUEUE_LIMIT)
     .fetch_all(&state.pool)
     .await
     .map(Json)
@@ -964,6 +979,76 @@ mod tests {
         assert_eq!(body["ingested"], 1);
         assert_eq!(body["duplicates"], 0);
         assert_eq!(body["cursor"], 10);
+    }
+
+    async fn get_queue(state: AppState) -> Vec<serde_json::Value> {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/email/queue")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A mailbox reads newest-arrival-first, and a verdict does not move a message.
+    ///
+    /// The previous ordering floated waiting mail to the top, which meant a message classified for
+    /// free a second ago sank below one that arrived an hour earlier — the list rearranged itself
+    /// while you were reading it. Ordering by arrival is the only order that holds still.
+    #[tokio::test]
+    async fn the_queue_is_ordered_by_arrival_newest_first() {
+        let state = test_state().await;
+        let now = chrono::Utc::now();
+        let stamp = |minutes: i64| (now - chrono::Duration::minutes(minutes)).to_rfc3339();
+
+        // Delivered oldest-first, the way a mailbox hands them over, so a correct result cannot
+        // come from insertion order by accident.
+        let body = Body::from(
+            serde_json::json!({
+                "mailbox": "INBOX",
+                "uidvalidity": 1,
+                "max_uid_examined": 3,
+                "messages": [
+                    {"message_id": "<old@x>", "uid": 1, "from_addr": "ana@company.com",
+                     "received_at": stamp(120), "body_text": "oldest"},
+                    {"message_id": "<mid@x>", "uid": 2, "from_addr": "bea@company.com",
+                     "received_at": stamp(60), "body_text": "still waiting"},
+                    // Newest AND classified on arrival — the case the old ordering got backwards.
+                    {"message_id": "<new@x>", "uid": 3, "from_addr": "news@list.com",
+                     "received_at": stamp(1), "body_text": "newest",
+                     "headers": {"list-unsubscribe": "<https://list.com/u>"}},
+                ],
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            post_email(state.clone(), Some("test-token"), body).await,
+            StatusCode::OK
+        );
+
+        let queue = get_queue(state).await;
+        let senders: Vec<&str> = queue
+            .iter()
+            .map(|mail| mail["from_addr"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            senders,
+            vec!["news@list.com", "bea@company.com", "ana@company.com"]
+        );
+        assert_eq!(queue[0]["triage_class"], "noise");
+        assert!(
+            queue[1]["triage_class"].is_null(),
+            "the hour-old message should still be waiting, and still second"
+        );
     }
 
     async fn get_cursor_body(state: AppState, mailbox: &str) -> serde_json::Value {

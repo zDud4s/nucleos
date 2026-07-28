@@ -1,4 +1,39 @@
 import type { Budget, ClassTally, ProjectSummary } from "./api";
+import type { BadgeTone } from "./ui/Badge";
+
+/**
+ * The badge tone for a message's triage class.
+ *
+ * Those five tones are the app's entire state vocabulary, so this mapping makes claims about
+ * attention rather than decoration: gold means the message wants something from you, green means it
+ * wants nothing, grey means it should recede, and `shadow` — already the app's tone for "observed,
+ * not acted on" — means no verdict exists yet.
+ *
+ * `failed` borrows `action`'s tone on purpose. It is not a statement about the content; it is a
+ * message that still needs something from you, namely a requeue.
+ */
+export function mailTone(triageClass: string | null): BadgeTone {
+  switch (triageClass) {
+    case null:
+      return "shadow";
+    case "urgent":
+      return "pending";
+    case "action":
+    case "failed":
+      return "paused";
+    case "info":
+      return "active";
+    default:
+      // `noise` and anything a future núcleo invents. An unknown class recedes rather than
+      // shouting: the alternative is a model typo painting the inbox gold.
+      return "off";
+  }
+}
+
+/** What a message's badge says. `null` is a state, not a missing value. */
+export function mailLabel(triageClass: string | null): string {
+  return triageClass ?? "waiting";
+}
 
 export interface Readiness {
   ready: boolean;
