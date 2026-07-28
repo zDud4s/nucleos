@@ -334,6 +334,41 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// Insert a `runs` row and spawn a long-sleeping task whose abort handle is registered under
+    /// the row's id, making that run look in-flight to `pretooluse_decision` the same way a real
+    /// governed run does. `project_id`, `cwd`, and `session_id` are `None` for tests that don't
+    /// care about them; `created_at` is a fixed placeholder since no test ever asserts on it.
+    async fn in_flight_run(
+        state: &AppState,
+        mode: &str,
+        project_id: Option<&str>,
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+    ) -> i64 {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, project_id, cwd, session_id, created_at)
+             VALUES ('x', 'running', ?, ?, ?, ?, '2026-07-17T00:00:00Z')",
+        )
+        .bind(mode)
+        .bind(project_id)
+        .bind(cwd)
+        .bind(session_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+
+        run_id
+    }
+
     #[tokio::test]
     async fn denies_rm_rf() {
         let app = test_router(test_state().await);
@@ -379,20 +414,7 @@ mod tests {
 
         // Stand up a fake in-flight run: a runs row plus a live task whose abort handle is registered
         // under the same id (that's the `run_id` the hook will send).
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', '2026-07-17T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "real", None, None, None).await;
 
         let app = test_router(state.clone());
         let body = format!(
@@ -418,20 +440,7 @@ mod tests {
     #[tokio::test]
     async fn edit_to_autopilot_config_pends_approval_and_terminates_the_run() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, created_at) VALUES ('x', 'running', 'C:\\work\\repo', '2026-07-17T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "real", None, Some("C:\\work\\repo"), None).await;
 
         let app = test_router(state.clone());
         let body = format!(
@@ -467,21 +476,7 @@ mod tests {
         use std::future::Future;
 
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, mode, project_id, created_at)
-             VALUES ('x', 'running', 'worktree', 'proj-1', '2026-07-28T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
 
         let mut handler = Box::pin(pretooluse_decision(
             State(state.clone()),
@@ -539,20 +534,7 @@ mod tests {
     #[tokio::test]
     async fn cwd_dependent_delete_outside_workspace_denies_through_the_handler() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, created_at) VALUES ('x', 'running', 'C:\\work\\repo', '2026-07-18T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "real", None, Some("C:\\work\\repo"), None).await;
 
         let app = test_router(state.clone());
         let body = format!(
@@ -574,21 +556,7 @@ mod tests {
     #[tokio::test]
     async fn worktree_allows_and_records_an_ordinary_edit() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-18T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
         let app = test_router(state.clone());
 
         let tool_input = serde_json::json!({"file_path": "src/ordinary.rs"});
@@ -628,21 +596,7 @@ mod tests {
     #[tokio::test]
     async fn worktree_denies_and_records_a_destructive_delete_without_terminating() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-18T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -680,21 +634,7 @@ mod tests {
     #[tokio::test]
     async fn worktree_pends_and_terminates_on_git_push_and_records_it() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-18T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -732,21 +672,7 @@ mod tests {
     #[tokio::test]
     async fn shadow_read_only_brake_records_would_decisions_without_terminating() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'shadow', '2026-07-18T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "shadow", None, Some("C:\\work\\repo"), None).await;
         let app = test_router(state.clone());
 
         let edit_input = serde_json::json!({"file_path": "src/ordinary.rs"});
@@ -810,21 +736,14 @@ mod tests {
     #[tokio::test]
     async fn git_push_pause_creates_a_pending_action_approval_proposal() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
-             VALUES ('proj', 'C:\\work\\repo', 'x', 'running', 'sess-x', 'worktree', '2026-07-20T00:00:00Z')",
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-x"),
         )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        .await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -860,21 +779,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_turn_allows_nucleos_mcp_tool() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, mode, created_at)
-             VALUES ('x', 'running', 'assistant', '2026-07-22T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -906,21 +811,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_turn_denies_non_mcp_tool_and_creates_no_proposal() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, mode, created_at)
-             VALUES ('x', 'running', 'assistant', '2026-07-22T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -953,21 +844,14 @@ mod tests {
     #[tokio::test]
     async fn self_governing_edit_pause_creates_a_proposal_with_edit_tool() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
-             VALUES ('proj', 'C:\\work\\repo', 'x', 'running', 'sess-e', 'worktree', '2026-07-20T00:00:00Z')",
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-e"),
         )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        .await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -991,21 +875,7 @@ mod tests {
     #[tokio::test]
     async fn granted_action_is_authorized_once_then_falls_back() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-20T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
         proposals::grant_action(&state.pool, run_id, "Bash", 1)
             .await
             .unwrap();
@@ -1050,21 +920,7 @@ mod tests {
     #[tokio::test]
     async fn grant_for_a_different_tool_does_not_authorize() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-20T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
         proposals::grant_action(&state.pool, run_id, "Bash", 1)
             .await
             .unwrap();
@@ -1101,21 +957,7 @@ mod tests {
     #[tokio::test]
     async fn deny_still_denies_even_with_a_matching_grant() {
         let state = test_state().await;
-        let run_id = sqlx::query(
-            "INSERT INTO runs (prompt, status, cwd, mode, created_at)
-             VALUES ('x', 'running', 'C:\\work\\repo', 'worktree', '2026-07-20T00:00:00Z')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        let task =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        state
-            .run_handles
-            .lock()
-            .unwrap()
-            .insert(run_id, task.abort_handle());
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
         proposals::grant_action(&state.pool, run_id, "Bash", 1)
             .await
             .unwrap();
