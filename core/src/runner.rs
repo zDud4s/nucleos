@@ -18,6 +18,114 @@ pub struct RunOutcome {
     pub cost_usd: Option<f64>,
 }
 
+/// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
+/// where the `PreToolUse` hook cannot. The hook is COOPERATIVE — it only runs if the
+/// `.claude/settings.json` resolved from the run's working directory registers it — so it is not a
+/// tool boundary on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPolicy {
+    /// Every tool the CLI offers, governed at runtime by the hook + classifier (spec §8.2).
+    Unrestricted,
+    /// Only the NucleOS MCP server: every built-in denied, every ambient MCP server dropped.
+    McpOnly,
+}
+
+/// Built-in tool names denied under `ToolPolicy::McpOnly`.
+///
+/// A blocklist, and deliberately so: measured against CLI 2.1.198, `--allowedTools` does not
+/// restrict anything — it only GRANTS permission on top of what is already allowed — and a
+/// deny-all `--disallowedTools "*"` takes the MCP server down with the built-ins, which would
+/// leave the orchestrator with nothing to call. Denying a name this CLI does not have is harmless,
+/// so the list is wider than any one version's tool set; a CLI upgrade that ADDS a tool still
+/// needs this reviewed. A name the CLI does not know costs one stderr line per run
+/// (`Permission deny rule "X" matches no known tool`) — that warning is the price of the margin,
+/// not a typo to clean up.
+const BUILTIN_TOOLS: &[&str] = &[
+    "Agent",
+    "Artifact",
+    "Bash",
+    "BashOutput",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "Edit",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "KillShell",
+    "ListMcpResourcesTool",
+    "LSP",
+    "Monitor",
+    "NotebookEdit",
+    "PowerShell",
+    "PushNotification",
+    "Read",
+    "ReadMcpResourceDirTool",
+    "ReadMcpResourceTool",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "SlashCommand",
+    "Task",
+    "TaskOutput",
+    "TaskStop",
+    "TodoWrite",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Workflow",
+    "Write",
+];
+
+/// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
+/// reach are asserted in tests instead of inspected on a live process.
+pub(crate) fn cli_args(
+    prompt: &str,
+    model: &str,
+    plan_only: bool,
+    resume_session_id: Option<&str>,
+    mcp_config: Option<&Path>,
+    tool_policy: ToolPolicy,
+) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        prompt.to_string(),
+        "--model".to_string(),
+        model.to_string(),
+    ];
+    if let Some(sid) = resume_session_id {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+    args.push("--output-format".to_string());
+    args.push("stream-json".to_string());
+    args.push("--verbose".to_string());
+    if plan_only {
+        args.push("--permission-mode".to_string());
+        args.push("plan".to_string());
+    }
+    if let Some(path) = mcp_config {
+        args.push("--mcp-config".to_string());
+        args.push(path.to_string_lossy().into_owned());
+        args.push("--allowedTools".to_string());
+        args.push("mcp__nucleos__*".to_string());
+    }
+    if tool_policy == ToolPolicy::McpOnly {
+        // Drops every MCP server this user happens to have configured — the ambient surface a
+        // spawned run inherits otherwise includes file-writing connectors.
+        args.push("--strict-mcp-config".to_string());
+        args.push("--disallowedTools".to_string());
+        args.push(BUILTIN_TOOLS.join(","));
+    }
+    args
+}
+
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Runs one `claude -p` invocation. `cwd`, when set, is the run's working directory (spec §3.3).
@@ -34,6 +142,7 @@ pub trait CommandRunner: Send + Sync {
         plan_only: bool,
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
+        tool_policy: ToolPolicy,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome>;
 }
@@ -52,6 +161,7 @@ impl CommandRunner for ClaudeCliRunner {
         plan_only: bool,
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
+        tool_policy: ToolPolicy,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
@@ -60,21 +170,14 @@ impl CommandRunner for ClaudeCliRunner {
         let claude_bin =
             std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&claude_bin);
-        cmd.arg("-p").arg(prompt);
-        cmd.arg("--model").arg(&self.model);
-        if let Some(sid) = resume_session_id {
-            cmd.arg("--resume").arg(sid);
-        }
-        cmd.arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
-        if plan_only {
-            cmd.arg("--permission-mode").arg("plan");
-        }
-        if let Some(path) = mcp_config {
-            cmd.arg("--mcp-config").arg(path);
-            cmd.arg("--allowedTools").arg("mcp__nucleos__*");
-        }
+        cmd.args(cli_args(
+            prompt,
+            &self.model,
+            plan_only,
+            resume_session_id,
+            mcp_config,
+            tool_policy,
+        ));
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -153,6 +256,7 @@ pub struct FakeCommandRunner {
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -170,6 +274,7 @@ impl CommandRunner for FakeCommandRunner {
         plan_only: bool,
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
+        tool_policy: ToolPolicy,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         {
@@ -186,6 +291,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_plan_only.lock().unwrap() = Some(plan_only);
         *self.last_resume.lock().unwrap() = resume_session_id.map(|s| s.to_string());
         *self.last_mcp_config.lock().unwrap() = mcp_config.map(|p| p.to_path_buf());
+        *self.last_tool_policy.lock().unwrap() = Some(tool_policy);
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
         let outcome = {
             let guard = self.canned.lock().unwrap();
@@ -228,7 +334,16 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = runner
-            .run_prompt("what is 6*7", &[], None, false, None, None, tx)
+            .run_prompt(
+                "what is 6*7",
+                &[],
+                None,
+                false,
+                None,
+                None,
+                ToolPolicy::Unrestricted,
+                tx,
+            )
             .await
             .unwrap();
         assert_eq!(outcome.stdout, "42");
@@ -242,7 +357,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
             runner
-                .run_prompt("hi", &[], None, false, None, None, tx)
+                .run_prompt(
+                    "hi",
+                    &[],
+                    None,
+                    false,
+                    None,
+                    None,
+                    ToolPolicy::Unrestricted,
+                    tx,
+                )
                 .await
         });
         let sid = rx.recv().await;
@@ -256,7 +380,16 @@ mod tests {
         let runner = FakeCommandRunner::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         runner
-            .run_prompt("resume please", &[], None, false, Some("sess-9"), None, tx)
+            .run_prompt(
+                "resume please",
+                &[],
+                None,
+                false,
+                Some("sess-9"),
+                None,
+                ToolPolicy::Unrestricted,
+                tx,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -277,6 +410,7 @@ mod tests {
                 false,
                 None,
                 Some(std::path::Path::new("C:/tmp/mcp.json")),
+                ToolPolicy::McpOnly,
                 tx,
             )
             .await
@@ -284,6 +418,64 @@ mod tests {
         assert_eq!(
             *runner.last_mcp_config.lock().unwrap(),
             Some(std::path::PathBuf::from("C:/tmp/mcp.json"))
+        );
+    }
+
+    fn args_for(policy: ToolPolicy, mcp: Option<&Path>) -> Vec<String> {
+        cli_args("triage this", "sonnet", false, None, mcp, policy)
+    }
+
+    /// An autopilot run keeps the full tool set — the hook and the classifier are what govern it,
+    /// and denying tools here would break every real run.
+    #[test]
+    fn unrestricted_adds_no_tool_restriction_flags() {
+        let args = args_for(ToolPolicy::Unrestricted, None);
+        assert!(!args.iter().any(|a| a == "--disallowedTools"));
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    /// The orchestrator reaches NucleOS through its MCP server and must reach nothing else. This is
+    /// the property the `--allowedTools` line alone was wrongly believed to provide.
+    #[test]
+    fn mcp_only_denies_the_built_in_tools() {
+        let args = args_for(ToolPolicy::McpOnly, None);
+        let denied = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("McpOnly must deny built-ins");
+        for tool in [
+            "Read",
+            "Bash",
+            "Write",
+            "Edit",
+            "Task",
+            "WebFetch",
+            "PowerShell",
+        ] {
+            assert!(
+                denied.split(',').any(|t| t == tool),
+                "{tool} must be denied under McpOnly"
+            );
+        }
+    }
+
+    /// Every MCP server the user happens to have configured is ambient to a spawned run, including
+    /// file-writing connectors. Only the server the daemon passes in may survive.
+    #[test]
+    fn mcp_only_drops_the_ambient_mcp_servers() {
+        let args = args_for(ToolPolicy::McpOnly, None);
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    /// The restriction must not cost the orchestrator the one server it exists to call.
+    #[test]
+    fn mcp_only_keeps_the_nucleos_server_reachable() {
+        let args = args_for(ToolPolicy::McpOnly, Some(Path::new("C:/tmp/mcp.json")));
+        assert!(args.windows(2).any(|w| w[0] == "--mcp-config"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--allowedTools" && w[1] == "mcp__nucleos__*")
         );
     }
 
@@ -298,7 +490,16 @@ mod tests {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             assert!(
                 runner
-                    .run_prompt("x", &[], None, false, None, None, tx)
+                    .run_prompt(
+                        "x",
+                        &[],
+                        None,
+                        false,
+                        None,
+                        None,
+                        ToolPolicy::Unrestricted,
+                        tx
+                    )
                     .await
                     .is_err()
             );
@@ -306,7 +507,16 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(
             runner
-                .run_prompt("x", &[], None, false, None, None, tx)
+                .run_prompt(
+                    "x",
+                    &[],
+                    None,
+                    false,
+                    None,
+                    None,
+                    ToolPolicy::Unrestricted,
+                    tx
+                )
                 .await
                 .is_ok()
         );

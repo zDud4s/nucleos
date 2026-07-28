@@ -248,6 +248,8 @@ fn spawn_run(
                     plan_only,
                     resume_session_id.as_deref(),
                     None,
+                    // Autopilot runs need real tools; the hook and the classifier govern them.
+                    crate::runner::ToolPolicy::Unrestricted,
                     session_tx,
                 ),
             )

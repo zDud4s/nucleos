@@ -197,6 +197,10 @@ fn spawn_assistant_turn(
                 false,
                 resume.as_deref(),
                 Some(turn.mcp_path.as_path()),
+                // The orchestrator talks to NucleOS and to nothing else. The MCP allowlist below
+                // does not enforce that on its own — an allowlist only grants — so the policy is
+                // what actually keeps a Telegram turn away from the filesystem and the shell.
+                crate::runner::ToolPolicy::McpOnly,
                 session_tx,
             ),
         )
@@ -439,6 +443,33 @@ mod tests {
 
         assert_eq!(status, "completed");
         assert_eq!(session, Some("fake-session-id".to_string()));
+    }
+
+    /// The orchestrator is supposed to reach NucleOS and nothing else, and for a long time the
+    /// only thing standing between a Telegram message and the filesystem was an `--allowedTools`
+    /// line that does not restrict anything (measured against CLI 2.1.198: an allowlist grants,
+    /// it never revokes). The restriction is the tool policy, so the policy is what is asserted.
+    #[tokio::test]
+    async fn a_turn_launches_the_cli_restricted_to_the_nucleos_server() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+
+        send_message(&state, "assistant-tool-policy-chat", "hello")
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if runner.last_tool_policy.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert_eq!(
+            *runner.last_tool_policy.lock().unwrap(),
+            Some(crate::runner::ToolPolicy::McpOnly),
+            "a Telegram turn must not be launched with the built-in tools available"
+        );
     }
 
     /// A cancelled turn's future is dropped where it is parked, but `abort()` reaches it only at
