@@ -28,6 +28,8 @@ const helpText = `Talk normally to reach the orchestrator.
 /cancel — cancel the last turn in this chat
 /projects — list registered projects (no agent)
 /proj [name] — list registered projects, optionally filtered by name
+/inbox — show what is waiting in the mailbox (free)
+/mail — read and classify what is waiting (costs a run)
 /help — show this help`
 
 type Bot interface {
@@ -47,6 +49,8 @@ type Daemon interface {
 	GetFeed() ([]map[string]any, error)
 	GetBudget() (map[string]any, error)
 	GetKill() (bool, error)
+	TriageEmail() (map[string]any, error)
+	GetEmailQueue() ([]map[string]any, error)
 	SetKill(engaged bool) error
 	CancelRun(id int64) error
 }
@@ -212,6 +216,10 @@ func HandleMessage(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
 		sendProposals(bot, dc, chatID)
 	case shortcuts.Proj:
 		sendProjects(bot, dc, chatID, intent.Arg)
+	case shortcuts.Mail:
+		sendTriage(bot, dc, chatID)
+	case shortcuts.Inbox:
+		sendInbox(bot, dc, chatID)
 	default:
 		startTurn(bot, dc, tr, chatID, intent.Text)
 	}
@@ -374,6 +382,74 @@ func sendProposals(bot Bot, dc Daemon, chatID int64) {
 	for _, p := range props {
 		_ = bot.SendMessageWithButtons(chatID, formatProposal(p), approveRejectRow(idOf(p)))
 	}
+}
+
+// sendTriage spends a run, deliberately and only here: `/mail` is the whole point of the pillar
+// being on demand. It answers with what it STARTED, not with verdicts — a run takes minutes, and
+// the verdicts arrive by themselves through the feed notifier.
+func sendTriage(bot Bot, dc Daemon, chatID int64) {
+	outcome, err := dc.TriageEmail()
+	if err != nil {
+		_ = bot.SendMessage(chatID, "couldn't triage the mailbox: "+err.Error())
+		return
+	}
+	queued := 0
+	if n, ok := outcome["queued"].(float64); ok {
+		queued = int(n)
+	}
+	if _, started := outcome["run_id"].(float64); !started {
+		reason := "nothing to do"
+		if r, ok := outcome["reason"].(string); ok && r != "" {
+			reason = r
+		}
+		_ = bot.SendMessage(chatID, "no triage started: "+reason)
+		return
+	}
+	_ = bot.SendMessage(chatID, fmt.Sprintf(
+		"reading %d message(s) — the verdicts arrive here in a few minutes", queued))
+}
+
+// sendInbox costs nothing: it reports what is already known, which is what makes it safe to ask
+// for at any time.
+func sendInbox(bot Bot, dc Daemon, chatID int64) {
+	queue, err := dc.GetEmailQueue()
+	if err != nil {
+		_ = bot.SendMessage(chatID, "couldn't read the mailbox: "+err.Error())
+		return
+	}
+	if len(queue) == 0 {
+		_ = bot.SendMessage(chatID, "nothing in the mailbox yet")
+		return
+	}
+
+	var waiting, judged []string
+	for _, mail := range queue {
+		who := strOr(mail, "from_name", "")
+		if who == "" {
+			who = strOr(mail, "from_addr", "(unknown sender)")
+		}
+		class, triaged := mail["triage_class"].(string)
+		if !triaged || class == "" {
+			waiting = append(waiting, fmt.Sprintf("· %s — %s",
+				who, strOr(mail, "subject", "(no subject)")))
+			continue
+		}
+		if len(judged) < 10 {
+			judged = append(judged, fmt.Sprintf("[%s] %s — %s",
+				class, who, strOr(mail, "triage_summary", strOr(mail, "subject", ""))))
+		}
+	}
+
+	var out []string
+	if len(waiting) > 0 {
+		out = append(out, fmt.Sprintf("waiting to be read (%d) — send /mail to triage:", len(waiting)))
+		out = append(out, waiting...)
+	}
+	if len(judged) > 0 {
+		out = append(out, "", "already read:")
+		out = append(out, judged...)
+	}
+	_ = bot.SendMessage(chatID, strings.Join(out, "\n"))
 }
 
 func sendProjects(bot Bot, dc Daemon, chatID int64, filter string) {

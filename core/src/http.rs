@@ -67,6 +67,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
         .route("/scoreboard", get(get_scoreboard))
         .route("/email/cursor", get(get_email_cursor))
+        .route("/email/triage", post(post_email_triage))
+        .route("/email/queue", get(get_email_queue))
         .route("/email/incoming", post(post_email_incoming))
         .route("/email/{id}/requeue", post(post_email_requeue))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
@@ -241,6 +243,70 @@ async fn post_email_incoming(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await?
+}
+
+/// Triage what is waiting, now.
+///
+/// Reading the mailbox happens on its own because it is free; spending a run does not. This is the
+/// request — so it launches a batch immediately rather than raising a flag and waiting up to a
+/// minute for the loop's own tick to notice.
+///
+/// It answers with what it started, not with verdicts: a run takes minutes, and holding an HTTP
+/// request open for it would only make the caller's timeout the deadline for the mail.
+async fn post_email_triage(
+    State(state): State<AppState>,
+) -> Result<Json<crate::triage::TriageOutcome>, StatusCode> {
+    if !state.email.armed.load(std::sync::atomic::Ordering::Relaxed) {
+        // Not an error the caller can fix by retrying: the pillar is off, or its barrier failed
+        // verification at startup and it is deliberately staying off.
+        return Ok(Json(crate::triage::TriageOutcome {
+            queued: 0,
+            run_id: None,
+            reason: Some("the email pillar is not armed".to_string()),
+        }));
+    }
+
+    // Launching writes a claim across the batch's rows; a client that disconnects must not leave
+    // that half-written.
+    let state = state.clone();
+    uncancellable(async move {
+        let mut loop_state = crate::triage::LoopState::default();
+        crate::triage::triage_now(&state, &mut loop_state, chrono::Utc::now()).await
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct QueuedEmail {
+    id: i64,
+    from_addr: String,
+    from_name: Option<String>,
+    subject: Option<String>,
+    received_at: String,
+    triage_class: Option<String>,
+    triage_summary: Option<String>,
+    triaged_at: Option<String>,
+    has_attachments: i64,
+}
+
+/// The mail the pillar knows about: what is waiting, and what it most recently said.
+async fn get_email_queue(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<QueuedEmail>>, StatusCode> {
+    // Pending first (that is what a person acts on), then the newest verdicts. `failed` sorts with
+    // the rest rather than being hidden: it is the class the user may want to requeue.
+    sqlx::query_as::<_, QueuedEmail>(
+        "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
+                triaged_at, has_attachments
+           FROM emails
+          ORDER BY triage_class IS NOT NULL, COALESCE(triaged_at, ingested_at) DESC
+          LIMIT 50",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn post_email_requeue(

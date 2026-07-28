@@ -124,6 +124,29 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Triage whatever mail is waiting, now. Returns what was started, not the verdicts — those
+    /// arrive in the feed a few minutes later.
+    pub async fn triage_email(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/email/triage")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// What the pillar knows about: pending mail first, then the newest verdicts.
+    pub async fn get_email_queue(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/email/queue")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn get_kill(&self) -> Result<Value, String> {
         self.request(reqwest::Method::GET, "/autopilot/kill")
             .send()

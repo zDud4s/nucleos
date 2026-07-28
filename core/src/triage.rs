@@ -218,11 +218,6 @@ pub async fn verify_hook_barrier(
     interpret_barrier_probe(&probe?)
 }
 
-/// A batch fires at five pending messages, or when the oldest has waited a quarter of an hour.
-/// The two together behave correctly in both regimes: a busy mailbox aggregates and amortises the
-/// fixed prompt cost, a quiet one never leaves something urgent sitting.
-pub const BATCH_MIN: usize = 5;
-pub const BATCH_MAX_AGE_MINUTES: i64 = 15;
 /// Twenty keeps a batch around 10k tokens with 2 KB of body each (spec §5.2).
 pub const BATCH_MAX: usize = 20;
 
@@ -254,20 +249,6 @@ pub struct PendingRow {
     /// The daemon's clock, not the sender's: queue order must not be something a stranger sets.
     pub ingested_at: chrono::DateTime<chrono::Utc>,
     pub infra_failures: i64,
-}
-
-/// PURE (spec §5.1): is there enough waiting, or has something waited long enough?
-pub fn should_triage(pending: &[PendingRow], now: chrono::DateTime<chrono::Utc>) -> bool {
-    if pending.is_empty() {
-        return false;
-    }
-    if pending.len() >= BATCH_MIN {
-        return true;
-    }
-    pending.iter().any(|row| {
-        now.signed_duration_since(row.ingested_at)
-            > chrono::Duration::minutes(BATCH_MAX_AGE_MINUTES)
-    })
 }
 
 /// PURE (spec §5.1/§7.1): which messages go in the next run.
@@ -771,34 +752,79 @@ async fn release_after_infra_failure(
     Ok(())
 }
 
-/// One pass of the loop. Returns whether it started a run, which is only used by the tests.
-pub async fn triage_tick(
+/// What one requested pass did, so the caller that asked gets an answer rather than a shrug.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TriageOutcome {
+    /// How many messages went into the run. Zero means nothing was waiting.
+    pub queued: usize,
+    pub run_id: Option<i64>,
+    /// Why nothing started, when nothing started.
+    pub reason: Option<String>,
+}
+
+/// What the loop does every minute: file the verdicts of a run that has finished, and nothing else.
+///
+/// Collecting is NOT on demand, and the asymmetry is deliberate — a run already paid for must be
+/// filed whether or not anyone asks again, or its verdicts would sit unread until the next request.
+pub async fn collect_tick(
     state: &crate::state::AppState,
     loop_state: &mut LoopState,
     now: chrono::DateTime<chrono::Utc>,
-) -> bool {
+) {
+    pass(state, loop_state, now, false).await;
+}
+
+/// Triage what is waiting, now. This is what an explicit request runs, and the only path that
+/// spends money.
+pub async fn triage_now(
+    state: &crate::state::AppState,
+    loop_state: &mut LoopState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> TriageOutcome {
+    pass(state, loop_state, now, true).await
+}
+
+async fn pass(
+    state: &crate::state::AppState,
+    loop_state: &mut LoopState,
+    now: chrono::DateTime<chrono::Utc>,
+    launch: bool,
+) -> TriageOutcome {
+    let nothing = |reason: &str| TriageOutcome {
+        queued: 0,
+        run_id: None,
+        reason: Some(reason.to_string()),
+    };
+
     if let Some(until) = loop_state.paused_until {
         if now < until {
-            return false;
+            return nothing("triage is paused after repeated infrastructure failures");
         }
         loop_state.paused_until = None;
     }
 
-    // Collect before launching. The loop never waits on a run — it inspects it on a later tick.
+    // Collect before launching, and unconditionally: a run already spent must be filed whether or
+    // not anyone is asking for another one.
     match claimed_batch(&state.pool).await {
         Ok(Some((run_id, batch, terminal))) => {
             if !terminal {
                 // One run at a time, always.
-                return false;
+                return nothing("a batch is already in flight");
             }
             collect_run(state, loop_state, run_id, &batch, now).await;
-            return false;
+            return nothing("filed the results of the previous batch");
         }
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(%error, "email triage: could not read the claimed batch");
-            return false;
+            return nothing("could not read the claimed batch");
         }
+    }
+
+    // Everything below spends money, and spending only ever happens because someone asked. The
+    // loop reaches here with `launch = false`: it collects finished work, it never starts new work.
+    if !launch {
+        return nothing("triage runs on demand — nothing was requested");
     }
 
     if let Err(block) = gates_permit(&state.pool, now).await {
@@ -817,29 +843,28 @@ pub async fn triage_tick(
             }
         }
         tracing::debug!(?block, "email triage: gate closed");
-        return false;
+        return nothing(&format!("a governance gate is closed: {block:?}"));
     }
 
     let pending = match pending_rows(&state.pool).await {
         Ok(pending) => pending,
         Err(error) => {
             tracing::warn!(%error, "email triage: could not read the pending queue");
-            return false;
+            return nothing("could not read the pending queue");
         }
     };
-    if !should_triage(&pending, now) {
-        return false;
-    }
+    // No count or age threshold here. Those exist to decide WHEN autonomous work is worth starting;
+    // when a person asks, the answer is "whatever is waiting", even if it is one message.
     let batch = select_batch(&pending);
     if batch.is_empty() {
-        return false;
+        return nothing("nothing is waiting to be triaged");
     }
 
     let inputs = match triage_inputs(&state.pool, &batch).await {
         Ok(inputs) => inputs,
         Err(error) => {
             tracing::warn!(%error, "email triage: could not read the batch");
-            return false;
+            return nothing("could not read the batch");
         }
     };
 
@@ -855,7 +880,7 @@ pub async fn triage_tick(
         Ok(run_id) => run_id,
         Err(error) => {
             tracing::warn!(?error, "email triage: could not start the run");
-            return false;
+            return nothing("could not start the run");
         }
     };
 
@@ -874,7 +899,11 @@ pub async fn triage_tick(
         }
     }
     tracing::info!(run_id, batch = batch.len(), "email triage: batch launched");
-    true
+    TriageOutcome {
+        queued: batch.len(),
+        run_id: Some(run_id),
+        reason: None,
+    }
 }
 
 /// Reads a finished run and files what it said (spec §5.4).
@@ -1113,8 +1142,9 @@ pub async fn run_triage_loop(state: crate::state::AppState) {
         housekeeping(&state, &mut loop_state, now).await;
         // The pillar can be off and still owe the housekeeping above: bodies already stored do not
         // stop needing to expire because polling was switched off.
+        // Collecting only — starting a batch is what waits to be asked for.
         if state.email.enabled && state.email.armed.load(std::sync::atomic::Ordering::Relaxed) {
-            triage_tick(&state, &mut loop_state, now).await;
+            collect_tick(&state, &mut loop_state, now).await;
         }
     }
 }
@@ -1156,30 +1186,6 @@ mod tests {
             ingested_at: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
             infra_failures,
         }
-    }
-
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now()
-    }
-
-    #[test]
-    fn a_batch_waits_for_five_messages() {
-        let four: Vec<PendingRow> = (1..=4).map(|i| at(1, 0, i)).collect();
-        assert!(!should_triage(&four, now()));
-        let five: Vec<PendingRow> = (1..=5).map(|i| at(1, 0, i)).collect();
-        assert!(should_triage(&five, now()));
-    }
-
-    /// A quiet mailbox must not leave one urgent message waiting for four more to arrive.
-    #[test]
-    fn one_old_message_is_enough() {
-        assert!(should_triage(&[at(16, 0, 1)], now()));
-        assert!(!should_triage(&[at(14, 0, 1)], now()));
-    }
-
-    #[test]
-    fn an_empty_queue_triages_nothing() {
-        assert!(!should_triage(&[], now()));
     }
 
     #[test]
@@ -1323,12 +1329,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_queue_launches_a_run_and_claims_its_batch() {
+    async fn a_requested_pass_launches_a_run_and_claims_its_batch() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 5, 1).await;
 
-        let launched = triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
-        assert!(launched, "five pending messages should start a run");
+        let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
+        assert!(launched, "a requested pass should start a run");
 
         let run_mode: String = sqlx::query_scalar("SELECT mode FROM runs ORDER BY id DESC LIMIT 1")
             .fetch_one(&state.pool)
@@ -1340,20 +1349,112 @@ mod tests {
         }
     }
 
+    /// The whole point of the pillar being on demand: a full queue is not a reason to spend money.
+    /// Mail is collected in the background because that is free; classifying it is not.
+    #[tokio::test]
+    async fn a_full_queue_does_nothing_until_it_is_asked_for() {
+        let state = triage_state().await;
+        seed_pending(&state.pool, 20, 60).await;
+
+        // The loop's own tick, which is the only thing that runs by itself.
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            runs, 0,
+            "twenty messages waiting an hour must still cost nothing"
+        );
+    }
+
+    /// The count and age thresholds decided when AUTONOMOUS work was worth starting. When a person
+    /// asks, the answer is whatever is waiting — one message included.
+    #[tokio::test]
+    async fn a_request_triages_a_single_message() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 0).await;
+
+        let outcome = triage_now(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+
+        assert_eq!(outcome.queued, 1);
+        assert!(outcome.run_id.is_some());
+        assert!(claimed_by(&state.pool, ids[0]).await.is_some());
+    }
+
+    /// Asking once does not turn the loop back on. Otherwise the first click would restore exactly
+    /// the background spending that being on demand exists to remove.
+    #[tokio::test]
+    async fn asking_once_does_not_make_the_loop_start_another() {
+        let state = triage_state().await;
+        seed_pending(&state.pool, 2, 1).await;
+        assert!(
+            triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+                .await
+                .run_id
+                .is_some()
+        );
+
+        // Finish the batch so the single-flight guard is not what stops the second pass.
+        sqlx::query("UPDATE runs SET status = 'completed'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE emails SET triage_run_id = NULL")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "the loop must not have started a second run");
+    }
+
+    /// Collecting is NOT on demand: a run already paid for must be filed whether or not anyone is
+    /// asking for another one, or its verdicts would sit unread until the next request.
+    #[tokio::test]
+    async fn verdicts_are_filed_without_a_new_request() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let stdout = transcript(serde_json::json!([
+            {"id": ids[0], "class": "urgent", "summary": "server down"},
+        ]));
+        seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
+
+        // No request anywhere in this test.
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+
+        let class: Option<String> =
+            sqlx::query_scalar("SELECT triage_class FROM emails WHERE id = ?")
+                .bind(ids[0])
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(class.as_deref(), Some("urgent"));
+    }
+
     /// One run at a time, always: without this the 60s tick would relaunch the same batch while it
     /// was still running, doubling the spend and racing two verdicts onto the same rows.
     #[tokio::test]
     async fn a_live_claim_stops_the_next_tick() {
         let state = triage_state().await;
         seed_pending(&state.pool, 5, 1).await;
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        triage_now(&state, &mut LoopState::default(), chrono::Utc::now()).await;
         seed_pending(&state.pool, 5, 1).await;
 
         sqlx::query("UPDATE runs SET status = 'running'")
             .execute(&state.pool)
             .await
             .unwrap();
-        let launched = triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
         assert!(!launched, "a batch is still in flight");
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -1364,7 +1465,10 @@ mod tests {
 
     async fn assert_gate_blocks(state: &crate::state::AppState) {
         seed_pending(&state.pool, 5, 1).await;
-        let launched = triage_tick(state, &mut LoopState::default(), chrono::Utc::now()).await;
+        let launched = triage_now(state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
         assert!(!launched);
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -1409,7 +1513,10 @@ mod tests {
         .unwrap();
 
         seed_pending(&state.pool, 5, 1).await;
-        let launched = triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
         assert!(
             !launched,
             "triage must respect the budget it now counts towards"
@@ -1435,7 +1542,10 @@ mod tests {
         seed_pending(&state.pool, 5, 1).await;
 
         // A fresh LoopState is exactly what a restart looks like.
-        let launched = triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
         assert!(!launched);
         let paused: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'email_triage_paused'")
@@ -1444,8 +1554,8 @@ mod tests {
                 .unwrap();
         assert_eq!(paused, 1);
 
-        // A second tick the same day must not add a second announcement.
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        // A second request the same day must not add a second announcement.
+        triage_now(&state, &mut LoopState::default(), chrono::Utc::now()).await;
         let paused: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'email_triage_paused'")
                 .fetch_one(&state.pool)
@@ -1500,7 +1610,7 @@ mod tests {
         ]));
         seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
 
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
 
         let (class, summary): (Option<String>, Option<String>) =
             sqlx::query_as("SELECT triage_class, triage_summary FROM emails WHERE id = ?")
@@ -1523,7 +1633,7 @@ mod tests {
         for _ in 0..10 {
             seed_finished_run(&state.pool, "failed", "", &ids).await;
             let mut loop_state = LoopState::default();
-            triage_tick(&state, &mut loop_state, chrono::Utc::now()).await;
+            collect_tick(&state, &mut loop_state, chrono::Utc::now()).await;
         }
 
         let attempts: i64 = sqlx::query_scalar("SELECT triage_attempts FROM emails WHERE id = ?")
@@ -1549,7 +1659,7 @@ mod tests {
                 {"id": ids[0], "class": "info", "summary": "fine"},
             ]));
             seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
-            triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+            collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
             // Put the answered row back so the same pair rides together again.
             sqlx::query(
                 "UPDATE emails SET triage_class = NULL, triage_summary = NULL WHERE id = ?",
@@ -1584,7 +1694,7 @@ mod tests {
         )
         .await;
 
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
 
         for id in &ids {
             let (attempts, infra): (i64, i64) =
@@ -1613,7 +1723,7 @@ mod tests {
             {"id": ids[0], "class": "info", "summary": "answered"},
         ]));
         seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
 
         for id in &ids {
             let infra: i64 = sqlx::query_scalar("SELECT infra_failures FROM emails WHERE id = ?")
@@ -1632,7 +1742,7 @@ mod tests {
 
         for _ in 0..QUARANTINE_THRESHOLD {
             seed_finished_run(&state.pool, "failed", "", &ids).await;
-            triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+            collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
         }
 
         let (class, body): (Option<String>, Option<String>) =
@@ -1656,13 +1766,13 @@ mod tests {
 
         for _ in 0..STALL_THRESHOLD {
             seed_finished_run(&state.pool, "failed", "", &ids).await;
-            triage_tick(&state, &mut loop_state, chrono::Utc::now()).await;
+            collect_tick(&state, &mut loop_state, chrono::Utc::now()).await;
         }
         assert!(loop_state.paused_until.is_some());
 
         // More ticks inside the pause must not announce again.
         for _ in 0..3 {
-            triage_tick(&state, &mut loop_state, chrono::Utc::now()).await;
+            collect_tick(&state, &mut loop_state, chrono::Utc::now()).await;
         }
         let stalled: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'email_triage_stalled'")
@@ -1702,7 +1812,7 @@ mod tests {
         ]));
         seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
 
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
 
         assert_eq!(feed_kinds(&state.pool).await, vec!["email_urgent"]);
     }
@@ -1717,7 +1827,7 @@ mod tests {
             {"id": ids[0], "class": "urgent", "summary": "server down"},
         ]));
         seed_finished_run(&state.pool, "completed", &stdout, &ids).await;
-        triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+        collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
         assert!(feed_kinds(&state.pool).await.is_empty());
 
         // An operational entry still gets through.
@@ -1725,7 +1835,7 @@ mod tests {
         seed_finished_run(&state.pool, "failed", "", &more).await;
         for _ in 0..QUARANTINE_THRESHOLD {
             seed_finished_run(&state.pool, "failed", "", &more).await;
-            triage_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
+            collect_tick(&state, &mut LoopState::default(), chrono::Utc::now()).await;
         }
         assert!(
             feed_kinds(&state.pool)
@@ -1743,9 +1853,19 @@ mod tests {
             .and_utc()
     }
 
-    async fn seed_triaged(pool: &sqlx::SqlitePool, class: &str, subject: &str, hours_ago: i64) {
+    /// `hours_ago` is measured from `now` — the SAME instant the digest under test is evaluated at.
+    /// Seeding from `Utc::now()` while evaluating at `at_hour(7)` puts the fixture and the code on
+    /// two different clocks, and whether a row falls inside the 24h window then depends on what
+    /// time of day the suite happens to run: the digest test passed only before 13:30 UTC.
+    async fn seed_triaged(
+        pool: &sqlx::SqlitePool,
+        class: &str,
+        subject: &str,
+        hours_ago: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
         let seq = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let when = (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339();
+        let when = (now - chrono::Duration::hours(hours_ago)).to_rfc3339();
         sqlx::query(
             "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
                                  received_at, ingested_at, triage_class, triage_summary, triaged_at)
@@ -1766,15 +1886,14 @@ mod tests {
     #[tokio::test]
     async fn the_digest_counts_the_last_day_and_lists_what_needs_action() {
         let state = triage_state().await;
-        seed_triaged(&state.pool, "urgent", "incident", 2).await;
-        seed_triaged(&state.pool, "action", "sign this", 3).await;
-        seed_triaged(&state.pool, "info", "fyi", 4).await;
-        seed_triaged(&state.pool, "urgent", "yesterday's news", 30).await;
+        let now = at_hour(7);
+        seed_triaged(&state.pool, "urgent", "incident", 2, now).await;
+        seed_triaged(&state.pool, "action", "sign this", 3, now).await;
+        seed_triaged(&state.pool, "info", "fyi", 4, now).await;
+        seed_triaged(&state.pool, "urgent", "yesterday's news", 30, now).await;
 
         assert!(
-            maybe_write_digest(&state.pool, 7, at_hour(7))
-                .await
-                .unwrap(),
+            maybe_write_digest(&state.pool, 7, now).await.unwrap(),
             "the window is open and nothing has been sent today"
         );
 
@@ -1795,7 +1914,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_digest_the_same_day_is_not_written() {
         let state = triage_state().await;
-        seed_triaged(&state.pool, "urgent", "incident", 1).await;
+        seed_triaged(&state.pool, "urgent", "incident", 1, at_hour(7)).await;
         assert!(
             maybe_write_digest(&state.pool, 7, at_hour(7))
                 .await
@@ -1812,7 +1931,7 @@ mod tests {
     #[tokio::test]
     async fn no_digest_outside_the_window() {
         let state = triage_state().await;
-        seed_triaged(&state.pool, "urgent", "incident", 1).await;
+        seed_triaged(&state.pool, "urgent", "incident", 1, at_hour(7)).await;
         assert!(
             !maybe_write_digest(&state.pool, 7, at_hour(22))
                 .await

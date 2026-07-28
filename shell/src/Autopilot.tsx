@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  approveProposal, getBudget, getFeed, getProjects, getProposals,
+  approveProposal, getBudget, getEmailQueue, getFeed, getProjects, getProposals,
   getScopedKills, getScoreboard, getShadowDecisions, rejectProposal,
-  setProjectMode, setScopedKill, setVerdict,
+  setProjectMode, setScopedKill, setVerdict, triageEmail,
   type AutopilotMode, type Budget, type ClassTally, type ConnectionState,
-  type FeedEntry, type ProjectSummary, type Proposal, type ScopedKill,
-  type ShadowDecision,
+  type FeedEntry, type ProjectSummary, type Proposal, type QueuedEmail,
+  type ScopedKill, type ShadowDecision,
 } from "./api";
 import {
   agreementRate, autopilotState, budgetStatusLabel, formatUsd, groupScoreboardByMode,
@@ -149,6 +149,54 @@ function FeedPanel({ feed, loading, selectedProject }: FeedPanelProps) {
             <div className="f-meta"><time dateTime={entry.created_at} title={entry.created_at}>{relativeTime(entry.created_at)}</time><span>{entry.kind}</span></div>
             <p className="f-body"><b>{entry.project_id ?? "global"}</b> — {entry.summary}</p>
           </article>)}
+    </Panel>
+  );
+}
+
+interface MailPanelProps { token: string; queue: QueuedEmail[] | null; onTriaged: () => void; }
+/**
+ * Mail is collected in the background because that costs nothing. Classifying it costs a run, so
+ * it happens only when asked — and this button is the asking. The panel therefore leads with the
+ * count waiting, not with a status: what the user decides is whether it is worth spending on yet.
+ */
+function MailPanel({ token, queue, onTriaged }: MailPanelProps) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const waiting = (queue ?? []).filter((mail) => mail.triage_class === null);
+  const judged = (queue ?? []).filter((mail) => mail.triage_class !== null).slice(0, 8);
+
+  async function triage() {
+    setBusy(true);
+    setNote(null);
+    const outcome = await triageEmail(token);
+    setBusy(false);
+    if (outcome === null) { setNote("The daemon did not answer."); return; }
+    setNote(outcome.run_id === null
+      ? outcome.reason ?? "Nothing to do."
+      : `Reading ${outcome.queued} message${outcome.queued === 1 ? "" : "s"} — the verdicts land in the feed.`);
+    onTriaged();
+  }
+
+  return (
+    <Panel dim title="Mail" aside={waiting.length > 0 ? `${waiting.length} waiting` : "nothing waiting"}>
+      <Button onClick={triage} disabled={busy || waiting.length === 0}>
+        {busy ? "Reading…" : waiting.length === 0 ? "Nothing to read" : `Read ${waiting.length} now`}
+      </Button>
+      {note !== null && <p className="gate-note">{note}</p>}
+      {queue === null
+        ? <ErrorNote>Could not load the mailbox from the daemon.</ErrorNote>
+        : queue.length === 0
+          ? <Teach title="No mail yet.">Messages appear here as they arrive. Nothing is classified until you ask.</Teach>
+          : <>
+              {waiting.map((mail) => <article className="feed-item" key={mail.id}>
+                <div className="f-meta"><time dateTime={mail.received_at} title={mail.received_at}>{relativeTime(mail.received_at)}</time><span>waiting</span></div>
+                <p className="f-body"><b>{mail.from_name ?? mail.from_addr}</b> — {mail.subject ?? "(no subject)"}</p>
+              </article>)}
+              {judged.map((mail) => <article className="feed-item" key={mail.id}>
+                <div className="f-meta"><time dateTime={mail.triaged_at ?? mail.received_at}>{relativeTime(mail.triaged_at ?? mail.received_at)}</time><Badge tone={mail.triage_class === "urgent" ? "pending" : "off"}>{mail.triage_class}</Badge></div>
+                <p className="f-body"><b>{mail.from_name ?? mail.from_addr}</b> — {mail.triage_summary ?? mail.subject ?? "(no summary)"}</p>
+              </article>)}
+            </>}
     </Panel>
   );
 }
@@ -305,6 +353,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [scopedKills, setScopedKills] = useState<ScopedKill[] | null>(null);
   const [feed, setFeed] = useState<FeedEntry[] | null>(null);
+  const [mail, setMail] = useState<QueuedEmail[] | null>(null);
   const [scoreboard, setScoreboard] = useState<ClassTally[] | null>(null);
   const [shadowDecisions, setShadowDecisions] = useState<ShadowDecision[] | null>(null);
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
@@ -327,6 +376,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
         getBudget(token),
         getScopedKills(token),
       ]);
+    const nextMail = await getEmailQueue(token);
     let nextScoreboard: ClassTally[] | null = null;
     let nextShadowDecisions: ShadowDecision[] | null = null;
     if (selectedProject !== null) {
@@ -338,6 +388,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
     setProjects(nextProjects);
     setScopedKills(nextScopedKills);
     setFeed(nextFeed);
+    setMail(nextMail);
     setScoreboard(nextScoreboard);
     setShadowDecisions(nextShadowDecisions);
     setProposals(nextProposals);
@@ -439,6 +490,9 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
             {selectedProject !== null && <div className="panel-scope"><strong>Viewing {selectedProject}</strong><Button size="sm" onClick={() => setSelectedProject(null)}>Show all</Button></div>}
             {selectedProject !== null && <><ShadowReviewPanel projectId={selectedProject} decisions={shadowDecisions} loading={loading} token={token} refresh={refresh} /><ScoreboardPanel projectId={selectedProject} scoreboard={scoreboard} /></>}
             <ScopedKillPanel scopedKills={scopedKills} token={token} refresh={refresh} />
+            {token !== null && (
+              <MailPanel token={token} queue={mail} onTriaged={() => void refresh(true)} />
+            )}
             <FeedPanel feed={feed} loading={loading} selectedProject={selectedProject} />
           </div>
         </div>

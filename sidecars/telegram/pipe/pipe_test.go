@@ -57,6 +57,8 @@ type recordingDaemon struct {
 	setKillCalls       []bool
 	cancelCalls        []int64
 	approveCalls       []int64
+	triageCalls        int
+	emailQueue         []map[string]any
 }
 
 type fakeDownloader struct {
@@ -109,6 +111,17 @@ func (d *recordingDaemon) GetBudget() (map[string]any, error) {
 
 func (d *recordingDaemon) GetKill() (bool, error) {
 	return false, nil
+}
+
+// Recorded rather than stubbed silently: triaging is the one shortcut that spends money, so a test
+// that accidentally reaches it should be able to notice.
+func (d *recordingDaemon) TriageEmail() (map[string]any, error) {
+	d.triageCalls++
+	return map[string]any{"queued": float64(3), "run_id": float64(77)}, nil
+}
+
+func (d *recordingDaemon) GetEmailQueue() ([]map[string]any, error) {
+	return d.emailQueue, nil
 }
 
 func (d *recordingDaemon) SetKill(engaged bool) error {

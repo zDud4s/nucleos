@@ -61,6 +61,24 @@ impl NucleosTools {
         json_result(self.client.cancel_run(id).await)
     }
 
+    #[tool(
+        description = "Triage the email waiting in the mailbox now. Mail is collected in the \
+                       background for free, but classifying it costs a run, so it only happens \
+                       when asked. Returns how many messages were queued into the run; the \
+                       verdicts arrive in the feed a few minutes later."
+    )]
+    async fn triage_email(&self) -> String {
+        json_result(self.client.triage_email().await)
+    }
+
+    #[tool(
+        description = "Show what the email pillar knows: mail still waiting to be triaged first, \
+                       then the most recent verdicts with their class and summary."
+    )]
+    async fn get_email_queue(&self) -> String {
+        json_result(self.client.get_email_queue().await)
+    }
+
     #[tool(description = "List NucleOS proposals")]
     async fn list_proposals(&self) -> String {
         json_result(self.client.list_proposals().await)
@@ -135,12 +153,14 @@ mod tests {
                 "cancel_run",
                 "create_run",
                 "get_budget",
+                "get_email_queue",
                 "get_kill",
                 "get_run",
                 "list_projects",
                 "list_proposals",
                 "reject_proposal",
                 "set_kill",
+                "triage_email",
             ]
         );
     }

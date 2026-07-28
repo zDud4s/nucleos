@@ -11,6 +11,11 @@ const (
 	Budget
 	Proposals
 	Proj
+	// Mail triages whatever is waiting, now. Collecting mail is free and happens on its own;
+	// classifying it costs a run, so it waits to be asked for — this is the asking.
+	Mail
+	// Inbox shows what the pillar knows without spending anything.
+	Inbox
 	Help
 )
 
@@ -39,6 +44,10 @@ func Route(text string) Intent {
 		return Intent{Kind: Proposals}
 	case "/proj", "/projects":
 		return Intent{Kind: Proj}
+	case "/mail":
+		return Intent{Kind: Mail}
+	case "/inbox":
+		return Intent{Kind: Inbox}
 	}
 
 	if strings.HasPrefix(trimmed, "/kill") {

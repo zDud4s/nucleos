@@ -104,6 +104,27 @@ export interface ScopedKill {
   engaged: boolean;
 }
 
+/** One message the pillar knows about: waiting, or already judged. */
+export interface QueuedEmail {
+  id: number;
+  from_addr: string;
+  from_name: string | null;
+  subject: string | null;
+  received_at: string;
+  /** null means still waiting to be triaged. */
+  triage_class: string | null;
+  triage_summary: string | null;
+  triaged_at: string | null;
+  has_attachments: number;
+}
+
+/** What a requested triage pass started. The verdicts arrive later, in the feed. */
+export interface TriageOutcome {
+  queued: number;
+  run_id: number | null;
+  reason: string | null;
+}
+
 export interface Budget {
   limit_usd: number | null;
   period: "daily" | "weekly" | "monthly";
@@ -362,6 +383,38 @@ export async function getScopedKills(token: string): Promise<ScopedKill[] | null
     });
     if (!res.ok) return null;
     return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** What the pillar knows about, waiting mail first. */
+export async function getEmailQueue(token: string): Promise<QueuedEmail[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/queue`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as QueuedEmail[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Triage what is waiting, now.
+ *
+ * Mail is collected in the background because that costs nothing; classifying it costs a run, so
+ * it happens only when asked. This is the asking.
+ */
+export async function triageEmail(token: string): Promise<TriageOutcome | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/triage`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TriageOutcome;
   } catch {
     return null;
   }

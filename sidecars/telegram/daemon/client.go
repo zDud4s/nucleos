@@ -142,6 +142,39 @@ func (c *Client) GetBudget() (map[string]any, error) {
 	return c.getObject("get budget", "/autopilot/budget")
 }
 
+// TriageEmail asks the núcleo to classify whatever mail is waiting. Collecting mail is free and
+// happens on its own; this is the part that costs a run, so it only happens when asked.
+func (c *Client) TriageEmail() (map[string]any, error) {
+	body, status, err := c.do(http.MethodPost, "/email/triage", nil)
+	if err != nil {
+		return nil, fmt.Errorf("triage email: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("triage email: daemon returned %d", status)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("triage email: %w", err)
+	}
+	return out, nil
+}
+
+// GetEmailQueue shows what the pillar knows, and costs nothing.
+func (c *Client) GetEmailQueue() ([]map[string]any, error) {
+	body, status, err := c.do(http.MethodGet, "/email/queue", nil)
+	if err != nil {
+		return nil, fmt.Errorf("get email queue: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("get email queue: daemon returned %d", status)
+	}
+	var out []map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("get email queue: %w", err)
+	}
+	return out, nil
+}
+
 func (c *Client) GetKill() (bool, error) {
 	body, status, err := c.do(http.MethodGet, "/autopilot/kill", nil)
 	if err != nil {
