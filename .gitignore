@@ -6,6 +6,22 @@
 .agents/
 # <<< AI WORKFLOW MANAGED <<<
 
+# Two files under .claude/ are NucleOS, not the workflow footprint the block above excludes.
+# core/src/autopilot.rs reads settings.json and refuses to activate autopilot unless it registers
+# ask_daemon.py and that script is present on disk — the PreToolUse hook is the single point where
+# the safety gate meets a running tool. Excluding them made them tracked-but-uncommittable:
+# editable forever, and a fix to the security hook could never land.
+#
+# Deliberately below the managed block so the template's installer can rewrite its own lines
+# without taking these with it. The directory has to be re-included before a file inside it can be:
+# git never descends into an excluded directory, so `!.claude/settings.json` alone does nothing.
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/hooks/*
+!.claude/hooks/ask_daemon.py
+
 # ─────────────────────────────────────────────────────────────
 # Rust + Tauri + Node build artifacts
 # ─────────────────────────────────────────────────────────────

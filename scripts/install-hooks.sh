@@ -22,7 +22,12 @@ cat > "$hooks_dir/pre-commit" <<'HOOK'
 #!/bin/sh
 # Reject commits that stage files under the workflow-local, gitignored directories.
 forbidden_re='^(\.ai|\.claude|\.agents)/'
-bad="$(git diff --cached --name-only | grep -E "$forbidden_re")"
+# Except these two, which are NucleOS rather than workflow footprint: core/src/autopilot.rs reads
+# settings.json and will not activate autopilot unless it registers ask_daemon.py and that file
+# exists. Blocking them made the security hook uncommittable — editable, never fixable.
+# .gitignore carves out the same two paths; change one and change the other.
+allowed_re='^\.claude/(settings\.json|hooks/ask_daemon\.py)$'
+bad="$(git diff --cached --name-only | grep -E "$forbidden_re" | grep -vE "$allowed_re")"
 
 if [ -n "$bad" ]; then
   echo "commit blocked: staged file(s) under .ai/, .claude/, or .agents/ (must stay untracked):" >&2
