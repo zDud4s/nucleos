@@ -76,8 +76,14 @@ pub async fn list_unreviewed(
     .await
 }
 
-/// Records a human verdict, exactly once. `Ok(false)` when the id is unknown OR the decision was
-/// already judged — `http::post_shadow_verdict` answers 404 to both.
+/// The only two verdicts the agreement arithmetic understands. Anything else was stored happily
+/// and then counted as reviewed-and-disagreeing, which silently pushed the readiness ratio down
+/// and could hold promotion back forever with no way to see why.
+pub const VALID_VERDICTS: &[&str] = &["approve", "reject"];
+
+/// Records a human verdict, exactly once, and only if it is one this can count. `Ok(false)` when the
+/// verdict is not recognised, when the id is unknown, or when the decision was already judged —
+/// `http::post_shadow_verdict` answers 404 to all three.
 ///
 /// The `human_verdict IS NULL` guard is the load-bearing half, and mirrors `proposals::transition`,
 /// which has always carried `AND status = 'pending'`. Without it the UPDATE matched on the id alone:
@@ -85,6 +91,9 @@ pub async fn list_unreviewed(
 /// handler ("a verdict is recorded once — replaying it answers 404") and silently moving the only
 /// record of WHEN a decision was judged.
 pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Result<bool> {
+    if !VALID_VERDICTS.contains(&verdict) {
+        return Ok(false);
+    }
     let reviewed_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "UPDATE shadow_decisions SET human_verdict = ?, reviewed_at = ?

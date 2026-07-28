@@ -112,7 +112,15 @@ pub async fn pretooluse_decision(
     // can never satisfy (a resume expects a worktree run). Allow the sanctioned MCP tools, block
     // everything else, and never create a proposal or terminate the turn.
     if mode == "assistant" {
-        return if payload.tool_name.starts_with("mcp__nucleos__") {
+        // Whole segment, not a prefix. MCP tool names are `mcp__<server>__<tool>`, so a server
+        // called `nucleos__x` produced `mcp__nucleos__x__...`, which passed a prefix test and
+        // inherited the orchestrator's unconditional allow — in the one mode that skips the
+        // classifier, the proposals and the termination entirely.
+        return if payload
+            .tool_name
+            .strip_prefix("mcp__nucleos__")
+            .is_some_and(|tool| !tool.contains("__"))
+        {
             Json(Decision {
                 decision: "allow".to_owned(),
                 reason: "orchestrator NucleOS tool".to_owned(),

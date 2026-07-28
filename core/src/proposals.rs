@@ -134,7 +134,13 @@ pub async fn reject_proposal(pool: &SqlitePool, id: i64) -> Result<(), RejectErr
     if proposal.kind != "action-approval" || proposal.status != "pending" {
         return Err(RejectError::NotPending);
     }
-    transition(pool, id, "rejected", "rejected by user").await?;
+    // `transition` is a compare-and-set and returns false when the proposal is no longer pending.
+    // Discarding that answered 204 No Content to a rejection that had lost the race to a concurrent
+    // approve: the user was told their refusal landed while the resume run was already executing
+    // the action they refused. Report the loss instead of hiding it.
+    if !transition(pool, id, "rejected", "rejected by user").await? {
+        return Err(RejectError::NotPending);
+    }
     if let Some(run_id) = proposal.run_id {
         crate::worktree::release(pool, run_id).await?;
     }

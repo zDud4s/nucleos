@@ -111,7 +111,13 @@ pub fn load_email_config(path: &Path) -> EmailConfig {
     }
 }
 
+/// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
+/// `schedule:` for `schedules:` parses cleanly into an empty ruleset, and all autonomy for that
+/// project silently stops. That direction is fail-closed, which is precisely why nobody notices —
+/// the contract this module advertises is "error on malformed YAML rather than guess", and a
+/// misspelt key is malformed.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduleRule {
     pub name: String,
     pub cron: String,
@@ -120,6 +126,7 @@ pub struct ScheduleRule {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RepoTrigger {
     pub name: String,
     pub branch: String,
@@ -127,6 +134,7 @@ pub struct RepoTrigger {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AutopilotRules {
     #[serde(default)]
     pub schedules: Vec<ScheduleRule>,
