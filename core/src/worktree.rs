@@ -374,6 +374,25 @@ pub(crate) async fn gc_pass(
                 .await;
                 feed_branch_outcome(pool, &worktree, branch_deleted).await;
             }
+            // A directory that is no longer there is the outcome this pass wanted, however it got
+            // that way — a hand-deleted stale worktree, a `git worktree remove` that ran elsewhere,
+            // a volume that came back empty. `git worktree remove` still fails on a path git has
+            // forgotten, so without this the row stayed a candidate: same backoff, same failure,
+            // another feed row, every half hour forever.
+            Err(_) if !Path::new(&worktree.path).exists() => {
+                if let Err(error) = mark_removed(pool, worktree.run_id).await {
+                    tracing::warn!(
+                        run_id = worktree.run_id,
+                        %error,
+                        "failed to retire a worktree row whose directory had already gone"
+                    );
+                }
+                tracing::info!(
+                    run_id = worktree.run_id,
+                    path = %worktree.path,
+                    "worktree directory was already gone; retiring its row"
+                );
+            }
             Err(error) => {
                 let summary = format!("failed to remove worktree {}: {}", worktree.path, error);
                 let _ = feed::append(
@@ -1185,8 +1204,13 @@ mod tests {
         );
     }
 
+    /// A worktree whose directory is already gone is the outcome the GC is trying to reach, so it
+    /// has to converge on it. `git worktree remove` fails on a path git no longer knows about, and
+    /// the failure arm never marked the row — so the same candidate came back every half hour,
+    /// ran the full backoff, failed again and appended another feed row, forever. Someone deleting
+    /// a stale directory by hand was enough to start it.
     #[tokio::test(flavor = "current_thread")]
-    async fn gc_reports_failure_and_keeps_the_row_when_removal_fails() {
+    async fn gc_converges_when_the_directory_is_already_gone() {
         let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
@@ -1203,6 +1227,7 @@ mod tests {
         try_remove_once(repo.path(), &info.path)
             .await
             .expect("pre-remove worktree");
+        assert!(!info.path.exists(), "the fixture must leave no directory");
 
         gc_pass(
             &pool,
@@ -1218,15 +1243,31 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(removed_at.is_none());
-        let entries = crate::feed::list_feed(&pool, Some("project-a"), 50)
+        assert!(
+            removed_at.is_some(),
+            "a vanished directory must retire its row, not be retried forever"
+        );
+
+        // A second pass must find nothing left to do, which is the property "converges" means.
+        let before = crate::feed::list_feed(&pool, Some("project-a"), 50)
+            .await
+            .unwrap()
+            .len();
+        gc_pass(
+            &pool,
+            timestamp("2026-07-19T01:00:00+00:00"),
+            chrono::Duration::hours(72),
+            &[],
+        )
+        .await;
+        let after = crate::feed::list_feed(&pool, Some("project-a"), 50)
             .await
             .unwrap();
-        assert!(entries.iter().any(|entry| {
-            entry.kind == "worktree_gc_failed"
-                && entry.run_id == Some(run_id)
-                && entry.summary.contains(info.path.to_string_lossy().as_ref())
-        }));
+        assert_eq!(after.len(), before, "the second pass must be a no-op");
+        assert!(
+            !after.iter().any(|entry| entry.kind == "worktree_gc_failed"),
+            "a directory that is already gone is not a failure"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
