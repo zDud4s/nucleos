@@ -12,6 +12,26 @@ const SELF_GOVERNING_FILES: &[&str] = &[
     ".claude/settings.json",
     ".claude/settings.local.json",
 ];
+
+/// Files whose contents are EXECUTED by a command this classifier already allows.
+///
+/// Writing one of these is not an ordinary file write, it is scheduling code to run: a payload in
+/// `.githooks/pre-commit` runs on the next `git commit` (allow/vcs-local), and one in `build.rs` or
+/// `Cargo.toml`'s `[build-dependencies]` runs on the next `cargo check`/`test`/`clippy` (all
+/// allow/read-local). Neither step needs a metacharacter, and neither is denied, so without this
+/// the whole chain is green.
+///
+/// The other half of that trade — reclassifying the cargo commands — is not affordable: autonomy
+/// that cannot run the test suite cannot do the job. Guarding the inputs is what is left.
+///
+/// `Cargo.toml` earns its place despite being edited often: an autonomous run adding a dependency
+/// is a supply-chain change, which is precisely the sort of thing a person should see.
+/// Lowercase: `normalize_path` case-folds, so these are compared against folded paths.
+const EXECUTES_ON_NEXT_COMMAND_FILES: &[&str] = &["build.rs", "cargo.toml", ".mcp.json"];
+
+/// Directories where EVERY file is executable surface, matched as a whole path segment.
+/// `.git/` subsumes `.git/hooks/` and `.git/config`; `.cargo/` covers `config.toml`'s `runner`.
+const EXECUTES_ON_NEXT_COMMAND_DIRS: &[&str] = &[".githooks/", ".git/", ".cargo/"];
 const APPROVAL_COMMAND_PATTERNS: &[&str] = &[
     "git push",
     "git merge",
@@ -79,11 +99,35 @@ pub fn classify(tool_name: &str, tool_input: &Value, cwd: Option<&Path>) -> Clas
         );
     }
 
+    // Ahead of the no-workspace check below because it is the more specific answer and it does not
+    // need a cwd: a governance file is recognised by its path suffix either way, and the scoreboard
+    // reads these classes, so the narrower one is the one worth recording.
     if WRITE_TOOLS.contains(&tool_name) && targets_self_governing_file(tool_input, cwd) {
         return classification(
             "pending_approval",
             "self-governing-file",
             "changes to autopilot governance files require approval",
+        );
+    }
+
+    if WRITE_TOOLS.contains(&tool_name) && targets_file_that_runs_on_next_command(tool_input, cwd) {
+        return classification(
+            "pending_approval",
+            "executes-on-next-command",
+            "writes to files that run on the next allowed command require approval",
+        );
+    }
+
+    // Both containment guards answer "not outside" when there is no cwd to be outside OF, which
+    // silently widened the workspace to the whole filesystem exactly when it was least knowable.
+    // `runs.cwd` is NULL for every mode but worktree, and the hook drops the cwd for a run that has
+    // left `run_handles`, so this is an ordinary state rather than a corner case. A boundary we
+    // cannot establish is a reason to ask a human, not a reason to skip the check.
+    if WRITE_TOOLS.contains(&tool_name) && cwd.is_none() {
+        return classification(
+            "pending_approval",
+            "no-workspace",
+            "writes without a known workspace require approval",
         );
     }
 
@@ -282,6 +326,20 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
         .any(|suffix| path_has_suffix(&normalized, suffix))
         || normalized.contains("/.claude/hooks/")
         || normalized.starts_with(".claude/hooks/")
+}
+
+fn targets_file_that_runs_on_next_command(tool_input: &Value, cwd: Option<&Path>) -> bool {
+    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+        return false;
+    };
+    let normalized = normalize_path(file_path, cwd);
+
+    EXECUTES_ON_NEXT_COMMAND_FILES
+        .iter()
+        .any(|suffix| path_has_suffix(&normalized, suffix))
+        || EXECUTES_ON_NEXT_COMMAND_DIRS
+            .iter()
+            .any(|dir| normalized.starts_with(dir) || normalized.contains(&format!("/{dir}")))
 }
 
 fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
@@ -813,12 +871,87 @@ mod tests {
     }
 
     #[test]
-    fn containment_is_inert_without_cwd() {
-        assert_classification(
-            classify("Edit", &json!({"file_path": r"C:\anywhere\x.rs"}), None),
-            "allow",
-            "read-local",
-        );
+    fn a_write_with_no_workspace_boundary_requires_approval() {
+        // Containment used to be inert without a `cwd`: both guards return "not outside" when
+        // there is nothing to be outside OF, so `Write C:\anywhere\x.rs` came back allow. That is
+        // a reachable state, not a hypothetical — `runs.cwd` is only populated for worktree mode,
+        // and the hook drops the cwd for any run that has left `run_handles`.
+        //
+        // A missing boundary is a reason to ask, not a licence to write anywhere.
+        for tool_name in ["Edit", "Write"] {
+            assert_classification(
+                classify(tool_name, &json!({"file_path": r"C:\anywhere\x.rs"}), None),
+                "pending_approval",
+                "no-workspace",
+            );
+            assert_classification(
+                classify(tool_name, &json!({"file_path": "src/main.rs"}), None),
+                "pending_approval",
+                "no-workspace",
+            );
+        }
+    }
+
+    #[test]
+    fn reads_do_not_need_a_workspace_boundary() {
+        // Reads were never contained by cwd, so demanding one here would cost every ordinary read
+        // and buy no containment.
+        for tool_name in ["Read", "Grep", "Glob"] {
+            assert_classification(classify(tool_name, &json!({}), None), "allow", "read-local");
+        }
+    }
+
+    #[test]
+    fn files_that_run_on_the_next_allowed_command_require_approval() {
+        // The chain this closes needs no metacharacter and no denied step: write a payload into a
+        // file that some *already-allowed* command executes, then run that command.
+        //
+        //   Write .githooks/pre-commit   -> was allow/read-local
+        //   git add -A ; git commit -m x -> allow/vcs-local, and the payload runs
+        //
+        // `cargo check`, `cargo test` and `cargo clippy` are the same shape via `build.rs` or a
+        // proc macro: all three are classified read-local, and all three compile and execute code
+        // that lives in the tree. Protecting the inputs is the affordable half of that trade —
+        // reclassifying `cargo test` would stop autonomy running the suite at all.
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for file_path in [
+            ".githooks/pre-commit",
+            r".githooks\commit-msg",
+            ".git/hooks/pre-push",
+            ".git/config",
+            ".cargo/config.toml",
+            "build.rs",
+            "crates/thing/build.rs",
+            "Cargo.toml",
+            ".mcp.json",
+            r"C:\work\repo\.githooks\pre-commit",
+        ] {
+            assert_classification(
+                classify("Write", &json!({"file_path": file_path}), cwd),
+                "pending_approval",
+                "executes-on-next-command",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_source_files_are_still_allowed() {
+        // The list above has to stay narrow: if writing normal code needed approval, autonomy
+        // would be a prompt generator.
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for file_path in [
+            "src/main.rs",
+            "src/build_helper.rs",
+            "docs/build.md",
+            "tests/rebuild.rs",
+            "cargo.lock",
+        ] {
+            assert_classification(
+                classify("Write", &json!({"file_path": file_path}), cwd),
+                "allow",
+                "read-local",
+            );
+        }
     }
 
     #[test]
