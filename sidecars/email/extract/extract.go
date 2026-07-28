@@ -5,6 +5,7 @@
 package extract
 
 import (
+	"html"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -120,7 +121,9 @@ func bodyAndAttachments(msg *mail.Message) (string, bool) {
 	}
 
 	reader := multipart.NewReader(msg.Body, params["boundary"])
-	var plain, html string
+	// Not named `html`: that is now an imported package, and shadowing it here would make a later
+	// `html.UnescapeString` in this function fail to compile for a non-obvious reason.
+	var plain, htmlPart string
 	hasAttachments := false
 	for {
 		part, err := reader.NextPart()
@@ -138,8 +141,8 @@ func bodyAndAttachments(msg *mail.Message) (string, bool) {
 		switch {
 		case strings.HasPrefix(partType, "text/plain") && plain == "":
 			plain = string(content)
-		case strings.HasPrefix(partType, "text/html") && html == "":
-			html = string(content)
+		case strings.HasPrefix(partType, "text/html") && htmlPart == "":
+			htmlPart = string(content)
 		}
 		part.Close()
 	}
@@ -147,15 +150,18 @@ func bodyAndAttachments(msg *mail.Message) (string, bool) {
 	if plain != "" {
 		return plain, hasAttachments
 	}
-	return StripHTML(html), hasAttachments
+	return StripHTML(htmlPart), hasAttachments
 }
 
 // StripHTML reduces markup to the text a triage prompt needs.
-func StripHTML(html string) string {
-	text := tagPattern.ReplaceAllString(html, " ")
-	text = strings.ReplaceAll(text, "&nbsp;", " ")
-	text = strings.ReplaceAll(text, "&amp;", "&")
-	text = strings.ReplaceAll(text, "&lt;", "<")
-	text = strings.ReplaceAll(text, "&gt;", ">")
+//
+// Decoding is a SINGLE pass, which sequential `strings.ReplaceAll` calls are not: replacing
+// `&amp;` before `&lt;` decodes `&amp;lt;` twice and yields `<`, so a sender could smuggle markup
+// past the tag pass above (which runs first, and sees no tag in `&amp;lt;`) by encoding it twice.
+// `html.UnescapeString` resolves each entity once and covers the numeric forms the hand-rolled list
+// missed. `&nbsp;` becomes U+00A0, which `strings.Fields` counts as space, so it still collapses.
+func StripHTML(markup string) string {
+	text := tagPattern.ReplaceAllString(markup, " ")
+	text = html.UnescapeString(text)
 	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
 }

@@ -129,6 +129,25 @@ func TestABodyIsTruncatedWithoutSplittingACharacter(t *testing.T) {
 	}
 }
 
+// Entities are decoded once, not twice. Tags are stripped BEFORE decoding, so a decoder that runs
+// `&amp;` -> `&` and then `&lt;` -> `<` lets a sender smuggle markup past the stripper by encoding
+// it twice: `&amp;lt;` survives the tag pass untouched and only then turns into `<`. Correct
+// single-pass decoding yields the literal `&lt;` the sender actually wrote. This text is triage
+// input taken from a stranger, so it must mean what it said.
+func TestEntitiesAreDecodedOnce(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"&amp;lt;script&amp;gt;", "&lt;script&gt;"},
+		{"&amp;amp;", "&amp;"},
+		{"a &amp; b", "a & b"},
+		{"&lt;b&gt;", "<b>"},
+		{"hello&nbsp;there", "hello there"},
+	} {
+		if got := StripHTML(c.in); got != c.want {
+			t.Errorf("StripHTML(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestASubjectIsMimeDecoded(t *testing.T) {
 	raw := []byte("From: a@b\r\nSubject: =?utf-8?B?cmV1bmnDo28=?=\r\n\r\nbody\r\n")
 	message, err := Message(raw, 1, at("2026-07-28T10:00:00Z"))
