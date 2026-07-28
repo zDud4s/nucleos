@@ -396,6 +396,28 @@ async fn get_project_diff(
         .map_err(inspect_status)
 }
 
+/// Runs `work` in its own task so a request that goes away cannot abandon it half-done.
+///
+/// A client that disconnects cancels the request it was making, and the handler's future is dropped
+/// — the same mechanism `abort()` uses on a run's task, with the same consequence: everything
+/// sequenced after the drop point is silently never done. That is only a missing reply when the
+/// handler reads; when it mutates durable state across awaits, it strands the half it had finished,
+/// and the half-states here (a `running` or `awaiting_approval` worktree run) block their whole
+/// project through `one_open_worktree_run_per_project` (migration 0009).
+///
+/// Awaiting the JoinHandle leaves the response exactly as it was; dropping a JoinHandle only
+/// detaches its task, so the work still runs to the end. A panicking task becomes a 500 — the task
+/// is gone, so there is no result left to return.
+pub(crate) async fn uncancellable<T, F>(work: F) -> Result<T, StatusCode>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(work)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     match error {
         CreateRunError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -440,7 +462,9 @@ async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match crate::runs::resume_approved_run(&state, id).await {
+    // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
+    // request dropped in between leaves a `running` run nothing will ever drive.
+    match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await }).await? {
         Ok(resume_id) => Ok(Json(serde_json::json!({ "resume_run_id": resume_id }))),
         Err(crate::runs::ResumeError::ProposalNotFound) => Err(StatusCode::NOT_FOUND),
         Err(crate::runs::ResumeError::ProposalNotPending)
@@ -453,7 +477,11 @@ async fn post_proposal_reject(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
-    match crate::proposals::reject_proposal(&state.pool, id).await {
+    // Uncancellable: rejecting flips the proposal first and discards the paused run second, and the
+    // first half cannot be replayed — a retry finds the proposal no longer `pending` and answers 409.
+    match uncancellable(async move { crate::proposals::reject_proposal(&state.pool, id).await })
+        .await?
+    {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(crate::proposals::RejectError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(crate::proposals::RejectError::NotPending) => Err(StatusCode::CONFLICT),
@@ -465,7 +493,9 @@ async fn post_worktree_release(
     State(state): State<AppState>,
     Path(run_id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
-    match worktree::release(&state.pool, run_id).await {
+    // Uncancellable, and the widest window of the three: `git worktree remove` retries on a backoff
+    // that can run for half a minute before the run is finally marked `cancelled`.
+    match uncancellable(async move { worktree::release(&state.pool, run_id).await }).await? {
         Ok(ReleaseOutcome::Released) => Ok(StatusCode::NO_CONTENT),
         Ok(ReleaseOutcome::NotAwaitingApproval) => Err(StatusCode::CONFLICT),
         Ok(ReleaseOutcome::NotFound) => Err(StatusCode::NOT_FOUND),
@@ -582,6 +612,100 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    /// Rejecting a proposal is two commits with a gap between them: the proposal flips to
+    /// `rejected`, and only then is the paused run discarded and its worktree slot freed. A client
+    /// that disconnects cancels the request, dropping the handler future the way `abort()` drops a
+    /// run's — and what is left behind cannot be undone through the same door, because the proposal
+    /// is no longer `pending` and a retry answers 409. The run stays `awaiting_approval`, which
+    /// `one_open_worktree_run_per_project` (migration 0009) turns into a project-wide block that
+    /// only the separate release queue can lift.
+    #[tokio::test]
+    async fn a_dropped_reject_request_still_discards_the_paused_run() {
+        use std::future::Future;
+
+        let dir = tempfile::tempdir().unwrap();
+        // File-backed, with room for a second connection: the assertions have to watch the handler's
+        // progress while the handler itself is parked on the pool.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(dir.path().join("reject.db"))
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let state = AppState {
+            token: Token("test-token".into()),
+            pool: pool.clone(),
+            runner: Arc::new(FakeCommandRunner::default()),
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        };
+
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('proj', 'x', 'awaiting_approval', 'worktree', '2026-07-28T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = proposals::create_action_approval(
+            &pool,
+            run_id,
+            None,
+            Some("proj"),
+            "Bash",
+            "needs approval",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut handler = Box::pin(post_proposal_reject(State(state), Path(proposal_id)));
+
+        // Drive the handler by hand and drop it once the proposal has been rejected — the commit
+        // that cannot be replayed, and the point from which the run is on its own.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut rejected = false;
+        for _ in 0..10_000 {
+            assert!(
+                handler.as_mut().poll(&mut context).is_pending(),
+                "the handler ran to completion before the request could be dropped"
+            );
+            let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+                .bind(proposal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if status == "rejected" {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "the handler never rejected the proposal");
+        drop(handler);
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if status != "awaiting_approval" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            status, "cancelled",
+            "a rejected proposal must not leave its run pinning the project"
+        );
     }
 
     #[tokio::test]

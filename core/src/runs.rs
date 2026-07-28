@@ -108,18 +108,15 @@ pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, StatusCode> {
-    // In its own task, on purpose. A client that disconnects cancels the request it was making,
-    // dropping this future exactly the way `abort()` drops a run's — and the run row is INSERTed
-    // `running` before the worktree is provisioned, so `git worktree add` holds that window open for
-    // as long as git takes. A drop inside it strands a `running` worktree row with no task and no
-    // abort handle, which `one_open_worktree_run_per_project` (migration 0009) turns into a
-    // project-wide block until the daemon restarts. Awaiting the JoinHandle leaves the response
-    // unchanged; dropping a JoinHandle only detaches its task, so the run still gets finished.
-    let id = tokio::spawn(async move {
+    // Uncancellable: the run row is INSERTed `running` before the worktree is provisioned, so
+    // `git worktree add` holds that window open for as long as git takes. A request dropped inside
+    // it strands a `running` worktree row with no task and no abort handle — `/cancel` answers 404,
+    // the GC skips it, and `one_open_worktree_run_per_project` (migration 0009) blocks the whole
+    // project until the daemon restarts, the only thing that reconciles `running` rows.
+    let id = crate::http::uncancellable(async move {
         create_run_inner(&state, req.prompt, req.project_id, req.cwd, &req.mode).await
     })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .await?
     .map_err(|error| crate::http::create_run_status(&error))?;
 
     Ok(Json(CreateRunResponse { id }))
