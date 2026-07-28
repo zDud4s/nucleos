@@ -234,6 +234,10 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
         .collect()
 }
 
+/// The hook script that makes a project's tool calls reach this daemon. Written with forward
+/// slashes because it is compared against a JSON command string, where that is the spelling.
+const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
+
 fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> {
     if !project_root.join(".ai/workflow/workflow.md").is_file() {
         return Err(ActivationError::NotOnboarded);
@@ -243,13 +247,39 @@ fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> 
         .map_err(|_| ActivationError::HookNotRegistered)?;
     let settings: serde_json::Value =
         serde_json::from_str(&settings).map_err(|_| ActivationError::HookNotRegistered)?;
+    // "Some PreToolUse hook exists" was never the property worth checking: a formatter satisfied it
+    // just as well as ours, and activation then let a project act autonomously with nothing
+    // classifying its actions. What has to be true is that OUR hook script is the one wired up,
+    // and that it is actually on disk — a registered command that cannot execute classifies
+    // nothing either.
+    //
+    // Matching on the script's path rather than the whole command line, because the invocation
+    // around it is the user's business (`python`, `py -3`, a venv, extra flags) and only the
+    // script identifies the hook as this daemon's.
     let registered = settings
         .get("hooks")
         .and_then(|hooks| hooks.get("PreToolUse"))
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|hooks| !hooks.is_empty());
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|inner| {
+                        inner.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|command| command.contains(HOOK_SCRIPT))
+                        })
+                    })
+            })
+        });
 
     if !registered {
+        return Err(ActivationError::HookNotRegistered);
+    }
+
+    if !project_root.join(HOOK_SCRIPT).is_file() {
         return Err(ActivationError::HookNotRegistered);
     }
 
@@ -351,6 +381,18 @@ mod tests {
         let claude_dir = root.path().join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         fs::write(claude_dir.join("settings.json"), contents).unwrap();
+    }
+
+    /// Settings wired to THIS daemon's hook, plus the script on disk — both of which activation
+    /// now requires. Anything less specific would pass a formatter off as the safety gate.
+    fn write_nucleos_hook(root: &TempDir) {
+        write_settings(
+            root,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
+        );
+        let hooks_dir = root.path().join(".claude/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
     }
 
     fn git_init(root: &TempDir) {
@@ -646,10 +688,7 @@ mod tests {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
         write_workflow(&root);
-        write_settings(
-            &root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        write_nucleos_hook(&root);
 
         set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
             .await
@@ -665,10 +704,7 @@ mod tests {
     async fn missing_workflow_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_settings(
-            &root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        write_nucleos_hook(&root);
 
         let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
             .await
@@ -720,6 +756,67 @@ mod tests {
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
     }
 
+    /// The prerequisite is supposed to prove that tool calls will be classified. It only proved
+    /// that SOME PreToolUse hook existed — so a formatter, a linter, or anything else at all
+    /// satisfied it, and autonomy was activated for a project whose actions nothing would gate.
+    #[tokio::test]
+    async fn a_pretooluse_hook_that_is_not_ours_rejects_shadow() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(
+            &root,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"npx prettier --write ."}]}]}}"#,
+        );
+
+        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ActivationError::HookNotRegistered));
+        assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
+    }
+
+    #[tokio::test]
+    async fn the_real_hook_satisfies_the_prerequisite() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(
+            &root,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
+        );
+        std::fs::create_dir_all(root.path().join(".claude/hooks")).unwrap();
+        std::fs::write(root.path().join(".claude/hooks/ask_daemon.py"), "#").unwrap();
+
+        set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
+            .await
+            .expect("the nucleos hook is registered and present");
+        assert_eq!(
+            project_mode(&pool, "project-a").await.unwrap(),
+            Mode::Shadow
+        );
+    }
+
+    /// Registered but missing from disk is the same as not registered: the CLI would run a hook
+    /// command that cannot execute, and a hook that cannot run classifies nothing.
+    #[tokio::test]
+    async fn a_registered_hook_whose_script_is_absent_rejects_shadow() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_workflow(&root);
+        write_settings(
+            &root,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
+        );
+
+        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ActivationError::HookNotRegistered));
+    }
+
     #[tokio::test]
     async fn empty_pretooluse_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
@@ -740,10 +837,7 @@ mod tests {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
         write_workflow(&root);
-        write_settings(
-            &root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        write_nucleos_hook(&root);
         git_init(&root);
 
         set_project_mode(&pool, "project-a", Mode::Active, Some(root.path()))
@@ -769,10 +863,7 @@ mod tests {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
         write_workflow(&root);
-        write_settings(
-            &root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        write_nucleos_hook(&root);
 
         let error = set_project_mode(&pool, "project-a", Mode::Active, Some(root.path()))
             .await
@@ -786,10 +877,8 @@ mod tests {
     async fn active_mode_still_requires_onboarding_and_hook() {
         let pool = test_pool().await;
         let missing_workflow_root = tempfile::tempdir().unwrap();
-        write_settings(
-            &missing_workflow_root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        // Everything else in place, so the failure can only be the missing onboarding.
+        write_nucleos_hook(&missing_workflow_root);
         git_init(&missing_workflow_root);
 
         let error = set_project_mode(
@@ -823,16 +912,10 @@ mod tests {
         let pool = test_pool().await;
         let shadow_root = tempfile::tempdir().unwrap();
         write_workflow(&shadow_root);
-        write_settings(
-            &shadow_root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        write_nucleos_hook(&shadow_root);
         let active_root = tempfile::tempdir().unwrap();
         write_workflow(&active_root);
-        write_settings(
-            &active_root,
-            r#"{"hooks":{"PreToolUse":[{"command":"nucleos hook"}]}}"#,
-        );
+        write_nucleos_hook(&active_root);
         git_init(&active_root);
 
         set_project_mode(
