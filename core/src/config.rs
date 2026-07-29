@@ -123,6 +123,14 @@ pub struct ScheduleRule {
     pub cron: String,
     pub prompt: String,
     pub cwd: Option<String>,
+    /// The IANA zone the cron is read in — `Europe/Lisbon`, `America/New_York`.
+    ///
+    /// Absent means UTC, which is what every rule written before this field already meant, so no
+    /// existing schedule moves by adding it. It exists because UTC is the one answer that is wrong
+    /// twice a year for most of the world: `0 8 * * *` is 08:00 local in winter and 09:00 in
+    /// summer, and the daily task that quietly starts an hour late for half the year is a worse
+    /// failure than one that never runs, because nothing about it looks broken.
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

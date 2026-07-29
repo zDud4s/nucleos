@@ -8,6 +8,7 @@ async-trait = "0.1.89"
 axum = "0.8.9"
 base64 = "0.23.0"
 chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
 croner = "3.0.1"
 directories = "6.0.0"
 keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use croner::Cron;
 
 use crate::autopilot::Mode;
@@ -58,6 +59,20 @@ pub fn catch_up_preamble(late: chrono::Duration, head_moved: bool) -> String {
     preamble
 }
 
+/// PURE: the zone a rule's cron is read in.
+///
+/// Absent means UTC, which is what every rule written before the field meant, so adding it moves
+/// nothing. An unknown name is an error rather than a fallback to UTC: silently reading
+/// `Europe/Lisbon` as UTC would fire the rule an hour off and look like it worked.
+pub fn rule_timezone(rule: &ScheduleRule) -> Result<Tz, String> {
+    match rule.timezone.as_deref() {
+        None => Ok(Tz::UTC),
+        Some(name) => name
+            .parse::<Tz>()
+            .map_err(|_| format!("'{name}' is not an IANA timezone")),
+    }
+}
+
 /// Returns each due rule paired with the occurrence that made it due, so the caller can tell a run
 /// served on time from one recovering a window missed hours or days ago.
 pub fn due_rules<'a>(
@@ -87,6 +102,18 @@ pub fn due_rules<'a>(
                 }
             };
 
+            let zone = match rule_timezone(rule) {
+                Ok(zone) => zone,
+                Err(error) => {
+                    tracing::debug!(
+                        rule_name = %rule.name,
+                        error = %error,
+                        "skipping schedule rule with an unknown timezone"
+                    );
+                    return None;
+                }
+            };
+
             let last_fired_at = last_fired.get(&rule.name)?;
 
             if now.signed_duration_since(*last_fired_at) < min_interval {
@@ -97,8 +124,14 @@ pub fn due_rules<'a>(
                 return None;
             }
 
-            match cron.find_next_occurrence(last_fired_at, false) {
-                Ok(next) if next <= now => Some((rule, next.with_timezone(&Utc))),
+            // Anchored in the rule's own zone, so `0 8 * * *` means 08:00 there — including across
+            // a DST change, when the wall-clock hour the user wrote and the UTC hour it lands on
+            // stop agreeing. `croner` reads the fields off whatever zone the anchor carries, so
+            // this conversion is the whole mechanism.
+            match cron.find_next_occurrence(&last_fired_at.with_timezone(&zone), false) {
+                Ok(next) if next.with_timezone(&Utc) <= now => {
+                    Some((rule, next.with_timezone(&Utc)))
+                }
                 Ok(_) => None,
                 Err(error) => {
                     tracing::warn!(
@@ -309,18 +342,24 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 continue;
             }
 
-            // Said once, here, where a rule is first seen. An unparseable cron simply never comes
-            // due, so the only sign of a typo was a `warn!` every 30 seconds for as long as the
-            // rule existed — which is the same as no sign at all, in a log nobody is watching while
-            // they wonder why their automation stopped. The feed is where a person looks.
-            if let Err(error) = rule.cron.parse::<Cron>() {
+            // Said once, here, where a rule is first seen. A rule that cannot be read simply never
+            // comes due, so the only sign of a typo was a `warn!` every 30 seconds for as long as
+            // the rule existed — which is the same as no sign at all, in a log nobody is watching
+            // while they wonder why their automation stopped. The feed is where a person looks.
+            let unreadable = rule
+                .cron
+                .parse::<Cron>()
+                .err()
+                .map(|error| format!("an unreadable cron ({}): {error}", rule.cron))
+                .or_else(|| rule_timezone(rule).err());
+            if let Some(problem) = unreadable {
                 let _ = crate::feed::append(
                     &state.pool,
                     Some(&project_id),
                     "schedule_rule_invalid",
                     &format!(
-                        "schedule rule '{}' has an unreadable cron ({}): {error} — it will never fire",
-                        rule.name, rule.cron
+                        "schedule rule '{}' has {problem} — it will never fire",
+                        rule.name
                     ),
                     None,
                 )
@@ -808,7 +847,88 @@ mod tests {
             cron: cron.to_string(),
             prompt: "test prompt".to_string(),
             cwd: None,
+            timezone: None,
         }
+    }
+
+    fn rule_in(name: &str, cron: &str, timezone: &str) -> ScheduleRule {
+        ScheduleRule {
+            timezone: Some(timezone.to_string()),
+            ..rule(name, cron)
+        }
+    }
+
+    /// UTC is the one answer that is wrong twice a year for most of the world. `0 8 * * *` written
+    /// by someone in Lisbon means 08:00 there — 08:00 UTC in winter and 07:00 UTC in summer — and
+    /// reading it as UTC year-round makes the task start an hour late for half of it. That failure
+    /// is worse than one that never runs, because nothing about it looks broken.
+    #[test]
+    fn a_rule_with_a_timezone_keeps_its_wall_clock_hour_across_a_dst_change() {
+        let fires_today = HashMap::new();
+        let rules = vec![rule_in("morning", "0 8 * * *", "Europe/Lisbon")];
+
+        // Winter: Lisbon is UTC+0, so 08:00 local is 08:00 UTC.
+        let mut last_fired = HashMap::new();
+        last_fired.insert("morning".to_string(), timestamp("2026-01-14T08:00:00Z"));
+        let due = due_rules(
+            &rules,
+            &last_fired,
+            &fires_today,
+            timestamp("2026-01-15T08:05:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, timestamp("2026-01-15T08:00:00Z"));
+
+        // Summer: Lisbon is UTC+1, so the same rule is due an hour earlier in UTC. The wall clock
+        // the user wrote has not moved; the instant it names has.
+        let mut last_fired = HashMap::new();
+        last_fired.insert("morning".to_string(), timestamp("2026-07-14T07:00:00Z"));
+        let due = due_rules(
+            &rules,
+            &last_fired,
+            &fires_today,
+            timestamp("2026-07-15T07:05:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, timestamp("2026-07-15T07:00:00Z"));
+
+        // And without the field, the same rule is read in UTC — which is what every schedule
+        // written before this existed already meant, so none of them move. Same July date, same
+        // cron: only the absence of the zone changes where it lands.
+        let utc_rules = vec![rule("morning", "0 8 * * *")];
+        let mut last_fired = HashMap::new();
+        last_fired.insert("morning".to_string(), timestamp("2026-07-14T08:00:00Z"));
+        let due = due_rules(
+            &utc_rules,
+            &last_fired,
+            &fires_today,
+            timestamp("2026-07-15T08:05:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert_eq!(due[0].1, timestamp("2026-07-15T08:00:00Z"));
+    }
+
+    /// A zone nobody recognises must not quietly become UTC: that fires the rule an hour off and
+    /// looks like it worked.
+    #[test]
+    fn an_unknown_timezone_stops_the_rule_rather_than_defaulting_to_utc() {
+        let mut last_fired = HashMap::new();
+        last_fired.insert("morning".to_string(), timestamp("2026-07-14T08:00:00Z"));
+        let rules = vec![rule_in("morning", "0 8 * * *", "Europe/Lisboa")];
+        let due = due_rules(
+            &rules,
+            &last_fired,
+            &HashMap::new(),
+            timestamp("2026-07-15T08:05:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert!(due.is_empty());
     }
 
     #[test]
