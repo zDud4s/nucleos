@@ -191,6 +191,36 @@ async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
     token
 }
 
+/// Records that a run's context now holds text a third party wrote.
+///
+/// One direction only: a turn that has read a mail body cannot un-read it, and every tool call that
+/// follows in that turn is downstream of it.
+///
+/// On the row rather than in memory because the two readers are not the same task — `hooks.rs`
+/// decides the next tool call, `assistant.rs` decides whether the turn may leave a resumable
+/// session behind — and because a daemon restart in between must not lose it. A resumed session
+/// carries the same words whether or not the process that read them is still alive.
+pub(crate) async fn mark_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Whether this run has read third-party text.
+///
+/// A row that is not there answers `true`. The callers use this to decide whether to REFUSE
+/// something, so the absent-row case has to fail in the direction that refuses: an id naming no run
+/// is not evidence that a turn is clean.
+pub(crate) async fn read_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, i64>("SELECT read_untrusted FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map(|flag| flag.unwrap_or(1) != 0)
+}
+
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
 /// aborted, including aborted before its first poll, when the task drops its captured state without
 /// running a line of the body.

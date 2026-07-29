@@ -51,14 +51,43 @@ impl Drop for TurnGuard {
     }
 }
 
+/// The session a chat's next turn resumes, or `None` when it must start clean.
+///
+/// The `NOT EXISTS` is the second half of the barrier `hooks.rs` opens. That one refuses to let a
+/// turn act after it has read third-party text; this one stops the text outliving the turn. Without
+/// it the barrier holds for one message and no longer: `--resume` hands the next turn the same
+/// context, that turn's own row is clean, and so the `approve_proposal` a mail body asked for is
+/// simply made in the message after the one that read it.
+///
+/// Expressed as a condition on the READ rather than as a delete when the turn ends, deliberately.
+/// A turn ends by completing, by failing, by timing out, by being cancelled, and by the daemon
+/// being killed underneath it — five paths, of which the last runs no cleanup code at all. A
+/// session that is unresumable because of what the database says about it is unresumable on every
+/// one of them, including across a restart.
 pub async fn get_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
-    let session_id: Option<Option<String>> =
-        sqlx::query_scalar("SELECT session_id FROM assistant_sessions WHERE chat_id = ?")
-            .bind(chat_id)
-            .fetch_optional(pool)
-            .await?;
+    let session_id: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT s.session_id FROM assistant_sessions s
+          WHERE s.chat_id = ?
+            AND NOT EXISTS (SELECT 1 FROM runs r
+                             WHERE r.session_id = s.session_id
+                               AND r.read_untrusted = 1)",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
 
     Ok(session_id.flatten())
+}
+
+/// Leaves a chat with nothing to resume, so its next turn starts on a fresh context.
+///
+/// Not an error path: this is what a turn that read third-party text is supposed to leave behind.
+pub async fn forget_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM assistant_sessions WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 pub async fn upsert_session(
@@ -179,18 +208,31 @@ fn spawn_assistant_turn(
             let chat_id = turn.slot.chat_id.clone();
             tokio::spawn(async move {
                 if let Some(session_id) = session_rx.recv().await {
-                    let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                    // The run takes the id first, and the chat's resumable session is recorded only
+                    // if it did. `get_session` decides whether a session may be resumed by looking
+                    // at the runs that produced it, so the two writes are not independent: a
+                    // session recorded against a run that never took the id has nothing pointing at
+                    // it, and would stay resumable no matter what that turn went on to read.
+                    let stored = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
                         .bind(&session_id)
                         .bind(id)
                         .execute(&pool)
                         .await;
-                    let _ = upsert_session(
-                        &pool,
-                        &chat_id,
-                        &session_id,
-                        &chrono::Utc::now().to_rfc3339(),
-                    )
-                    .await;
+                    if let Err(error) = stored {
+                        tracing::warn!(
+                            run_id = id,
+                            %error,
+                            "could not record the turn's session id; the chat will start its next turn clean"
+                        );
+                    } else {
+                        let _ = upsert_session(
+                            &pool,
+                            &chat_id,
+                            &session_id,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await;
+                    }
                 }
             });
         }
@@ -236,8 +278,26 @@ fn spawn_assistant_turn(
                 .await;
                 crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
                 if let Some(session_id) = o.session_id.as_deref() {
-                    let _ =
-                        upsert_session(&pool, &turn.slot.chat_id, session_id, &completed_at).await;
+                    // `get_session` would refuse to resume this session anyway, by looking at the
+                    // runs that produced it. Dropping the row here as well closes the one case that
+                    // check cannot see: a session recorded against a run that never took the id has
+                    // nothing pointing at it, so nothing marks it as having read anything.
+                    match crate::runs::read_untrusted_context(&pool, id).await {
+                        Ok(false) => {
+                            let _ = upsert_session(
+                                &pool,
+                                &turn.slot.chat_id,
+                                session_id,
+                                &completed_at,
+                            )
+                            .await;
+                        }
+                        // Including the error: a turn whose record cannot be read is not a turn
+                        // that can be shown to be clean.
+                        _ => {
+                            let _ = forget_session(&pool, &turn.slot.chat_id).await;
+                        }
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -337,6 +397,133 @@ mod tests {
         assert_eq!(
             get_session(&pool, "chat-1").await.unwrap(),
             Some("session-2".to_string())
+        );
+    }
+
+    /// The half of the barrier that has to survive the daemon dying.
+    ///
+    /// `hooks.rs` refuses to let a turn act after it has read third-party text, and that refusal is
+    /// recorded against the RUN. A session outlives the run: `--resume` hands the next turn the same
+    /// context, and the next turn's own row is clean, so a mail body refused once would simply be
+    /// obeyed one message later. The check therefore lives on the read, where no cleanup code has to
+    /// have run for it to hold — this test writes the rows directly for that reason, standing in for
+    /// a turn that was cancelled, timed out, or killed with the daemon.
+    #[tokio::test]
+    async fn a_session_a_turn_read_mail_in_is_never_resumed() {
+        let pool = test_pool().await;
+        let chat_id = "assistant-untrusted-session-chat";
+
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, read_untrusted, created_at)
+             VALUES ('x', 'completed', 'assistant', 'sess-mail', 1, '2026-07-29T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_session(&pool, chat_id, "sess-mail", "2026-07-29T00:00:00Z")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_session(&pool, chat_id).await.unwrap(),
+            None,
+            "a session whose turn read a stranger's words must not be resumable"
+        );
+    }
+
+    /// The contrast, so the test above cannot pass by refusing everything: an ordinary turn is what
+    /// makes the bot conversational, and it keeps its session.
+    #[tokio::test]
+    async fn a_session_no_turn_read_mail_in_is_resumed_as_before() {
+        let pool = test_pool().await;
+        let chat_id = "assistant-clean-session-chat";
+
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, created_at)
+             VALUES ('x', 'completed', 'assistant', 'sess-clean', '2026-07-29T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_session(&pool, chat_id, "sess-clean", "2026-07-29T00:00:00Z")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_session(&pool, chat_id).await.unwrap(),
+            Some("sess-clean".to_string())
+        );
+    }
+
+    /// End to end, through the turn machinery rather than through hand-written rows: a turn reads
+    /// mail while it runs, and the message after it starts the CLI with no `--resume` at all.
+    ///
+    /// The session is recorded early — the CLI announces it in its first event, long before any tool
+    /// call — so "do not store it" was never available as a fix. What the turn can do is not leave it
+    /// behind, and what the read can do is refuse it anyway.
+    #[tokio::test]
+    async fn the_message_after_a_mail_read_starts_a_fresh_conversation() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner {
+            delay: Mutex::new(Some(Duration::from_millis(150))),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let chat_id = "assistant-forget-after-mail-chat";
+
+        let first = send_message(&state, chat_id, "what is in my mail?")
+            .await
+            .unwrap();
+
+        // The session id is announced before the simulated delay, so this is the window in which a
+        // real turn calls `get_email` and `hooks.rs` marks the run.
+        for _ in 0..500 {
+            if get_session(&state.pool, chat_id).await.unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            get_session(&state.pool, chat_id).await.unwrap(),
+            Some("fake-session-id".to_string()),
+            "the turn should have recorded its session before reading anything"
+        );
+        crate::runs::mark_untrusted_context(&state.pool, first)
+            .await
+            .unwrap();
+
+        for _ in 0..500 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(first)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            get_session(&state.pool, chat_id).await.unwrap(),
+            None,
+            "a turn that read mail must leave the chat nothing to resume"
+        );
+
+        *runner.last_resume.lock().unwrap() = Some("not-cleared".to_string());
+        send_message(&state, chat_id, "approve proposal 4")
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if runner.last_resume.lock().unwrap().as_deref() != Some("not-cleared") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *runner.last_resume.lock().unwrap(),
+            None,
+            "the next message must start on a context no mail body has spoken into"
         );
     }
 

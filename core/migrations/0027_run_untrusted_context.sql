@@ -1,0 +1,20 @@
+-- Whether a run's context has been exposed to text a third party wrote.
+--
+-- An orchestrator turn is the one agent that holds the control token, and `hooks.rs` allows it
+-- every NucleOS MCP tool unconditionally — no classifier, no proposal, no termination. Its tool set
+-- reaches a stranger's words (`get_email` returns a mail body verbatim) and the daemon's controls
+-- (`approve_proposal`, `set_kill`, `create_run`) with nothing in between. A body asking for a
+-- proposal to be approved was therefore read by the one agent able to approve it, in the one mode
+-- that skips every gate. Spec §5.5's two barriers stand around the TRIAGE run; this path went
+-- around them rather than through them.
+--
+-- A column on the run rather than a set held in memory, for three reasons. The decision point
+-- (`hooks.rs`) and the turn's own cleanup (`assistant.rs`) are separate tasks that share only the
+-- run id. A process-wide set keyed by run id collides across the in-memory databases the tests use,
+-- since every one of them starts numbering at 1. And a set does not survive the daemon restarting,
+-- which is exactly when a resumed session would carry a stranger's words into a turn that believes
+-- itself clean.
+--
+-- 0 for every row written before this migration: a run that has read nothing cannot have read
+-- anything untrusted, and the flag only ever moves in one direction.
+ALTER TABLE runs ADD COLUMN read_untrusted INTEGER NOT NULL DEFAULT 0;

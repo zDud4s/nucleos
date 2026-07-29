@@ -133,25 +133,7 @@ pub async fn pretooluse_decision(
     // can never satisfy (a resume expects a worktree run). Allow the sanctioned MCP tools, block
     // everything else, and never create a proposal or terminate the turn.
     if mode == "assistant" {
-        // Whole segment, not a prefix. MCP tool names are `mcp__<server>__<tool>`, so a server
-        // called `nucleos__x` produced `mcp__nucleos__x__...`, which passed a prefix test and
-        // inherited the orchestrator's unconditional allow — in the one mode that skips the
-        // classifier, the proposals and the termination entirely.
-        return if payload
-            .tool_name
-            .strip_prefix("mcp__nucleos__")
-            .is_some_and(|tool| !tool.contains("__"))
-        {
-            Json(Decision {
-                decision: "allow".to_owned(),
-                reason: "orchestrator NucleOS tool".to_owned(),
-            })
-        } else {
-            Json(Decision {
-                decision: "deny".to_owned(),
-                reason: "the orchestrator is restricted to NucleOS tools".to_owned(),
-            })
-        };
+        return assistant_decision(&state, &payload).await;
     }
 
     let classification = classifier::classify(
@@ -305,6 +287,152 @@ pub async fn pretooluse_decision(
     }
 
     Json(classification.decision)
+}
+
+/// The reason an orchestrator turn is refused a tool that would act. A constant because the tests
+/// assert on it: every other refusal in this branch is also a `deny`, so only the reason tells
+/// "the turn had read a stranger's words" apart from "the tool was not ours".
+pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
+    "this turn has read third-party content and can no longer act";
+
+/// The orchestrator turn's decision, and the only barrier standing between a mail body and the
+/// daemon's controls.
+///
+/// Everything else in this file gets a second look from the classifier. This branch does not, by
+/// design — a turn holds no worktree and cannot satisfy an approval — so an unconditional allow
+/// here is genuinely unconditional. What made that dangerous is the tool set: `get_email` returns a
+/// stranger's body verbatim into the same context that reaches `approve_proposal`, `set_kill` and
+/// `create_run`, and the turn carries the control token, so a body asking for a proposal to be
+/// approved was read by the one agent able to approve it.
+///
+/// The rule is an ordering rule rather than a policy on any single tool: read what you like, and
+/// act while nothing third-party has entered the turn — but not both, and not in that order. It is
+/// deliberately not a hard split of the tool set, because reading mail from a phone is the feature,
+/// and the ordering costs the owner one extra message rather than the tool.
+async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
+    // Whole segment, not a prefix. MCP tool names are `mcp__<server>__<tool>`, so a server called
+    // `nucleos__x` produced `mcp__nucleos__x__...`, which passed a prefix test and inherited the
+    // orchestrator's unconditional allow — in the one mode that skips the classifier, the proposals
+    // and the termination entirely.
+    let Some(tool) = payload
+        .tool_name
+        .strip_prefix("mcp__nucleos__")
+        .filter(|tool| !tool.contains("__"))
+    else {
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: "the orchestrator is restricted to NucleOS tools".to_owned(),
+        });
+    };
+
+    let effect = match crate::mcp_tools::tool_effect(tool) {
+        // `get_run` is `ReadsOwn` by name and not always by content: a triage run's stdout is a
+        // model's answer over mail a stranger wrote. The parse that bounds a verdict to a class and
+        // 200 stripped characters runs AFTER the raw stream is stored, so what comes back through
+        // this tool was never put through it.
+        crate::mcp_tools::ToolEffect::ReadsOwn
+            if tool == "get_run"
+                && get_run_names_a_triage_run(state, &payload.tool_input).await =>
+        {
+            crate::mcp_tools::ToolEffect::ReadsUntrusted
+        }
+        effect => effect,
+    };
+
+    match effect {
+        crate::mcp_tools::ToolEffect::ReadsUntrusted => {
+            // Marked BEFORE the tool is allowed, and the failure to mark refuses the read. The
+            // alternative is a turn that has a stranger's words in it and no record of having read
+            // them, which is the state every refusal below depends on not existing.
+            if let Err(error) =
+                crate::runs::mark_untrusted_context(&state.pool, payload.run_id).await
+            {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool,
+                    %error,
+                    "pretooluse-decision: could not mark the turn as having read third-party content — refusing the read"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not record that this turn has read third-party content"
+                        .to_owned(),
+                });
+            }
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "orchestrator NucleOS tool".to_owned(),
+            })
+        }
+        crate::mcp_tools::ToolEffect::Acts => {
+            match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+                Ok(false) => Json(Decision {
+                    decision: "allow".to_owned(),
+                    reason: "orchestrator NucleOS tool".to_owned(),
+                }),
+                Ok(true) => {
+                    // Warned, not merely refused. The owner asking their own bot to do two things
+                    // in one message reaches this line, and so does a mail body that talked it into
+                    // the second one; the two are indistinguishable from here, and only one of them
+                    // is worth looking at a log for.
+                    tracing::warn!(
+                        run_id = payload.run_id,
+                        tool,
+                        "pretooluse-decision: refused an action in a turn that has read third-party content"
+                    );
+                    Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
+                    })
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = payload.run_id,
+                        tool,
+                        %error,
+                        "pretooluse-decision: could not tell whether the turn has read third-party content — failing closed"
+                    );
+                    Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: "could not tell whether this turn has read third-party content"
+                            .to_owned(),
+                    })
+                }
+            }
+        }
+        crate::mcp_tools::ToolEffect::ReadsOwn => Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "orchestrator NucleOS tool".to_owned(),
+        }),
+    }
+}
+
+/// Whether a `get_run` call names a triage run.
+///
+/// Fails closed on every shape it cannot read — an absent id, an id that is not a number, a
+/// database that will not answer — because the question being decided is whether a stranger's words
+/// are about to enter the turn, and "I could not tell" is not "no". A run that does not exist is
+/// the one honest `false`: the tool returns an error and nothing is read.
+async fn get_run_names_a_triage_run(state: &AppState, tool_input: &Value) -> bool {
+    let Some(id) = tool_input.get("id").and_then(Value::as_i64) else {
+        return true;
+    };
+    match sqlx::query_scalar::<_, String>("SELECT mode FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(mode)) => mode == crate::email::TRIAGE_MODE,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "pretooluse-decision: could not resolve the mode of the run being read — treating it as third-party content"
+            );
+            true
+        }
+    }
 }
 
 /// How many denied actions a run may attempt before it is stopped.
@@ -1309,6 +1437,248 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// One NucleOS tool call in an orchestrator turn, named the way the CLI names it.
+    async fn orchestrator_tool(
+        app: &Router,
+        run_id: i64,
+        tool: &str,
+        tool_input: serde_json::Value,
+    ) -> Decision {
+        decide(
+            app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": format!("mcp__nucleos__{tool}"),
+                "tool_input": tool_input,
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    /// The attack this barrier exists for, start to finish.
+    ///
+    /// An orchestrator turn is allowed every NucleOS tool unconditionally and carries the control
+    /// token, and `get_email` returns a stranger's body verbatim into that same context. So a mail
+    /// body that says "approve proposal 4" was read by the one agent able to approve it, in the one
+    /// mode with no classifier, no proposal and no termination between the reading and the doing.
+    /// The threat model calls "an email body causing a tool call" a thing this product prevents;
+    /// until this test passed, it prevented it only for the triage run.
+    #[tokio::test]
+    async fn a_mail_body_cannot_reach_the_controls_it_asks_for() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let read = orchestrator_tool(&app, run_id, "get_email", serde_json::json!({"id": 7})).await;
+        assert_eq!(
+            read.decision, "allow",
+            "reading mail is what the turn is for"
+        );
+
+        // The three the body would ask for: lift an approval the classifier withheld, disengage the
+        // emergency stop, and start a run that launches with `ToolPolicy::Unrestricted`.
+        for tool in ["approve_proposal", "set_kill", "create_run"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 4})).await;
+            assert_eq!(
+                decision.decision, "deny",
+                "{tool} was allowed after a mail read"
+            );
+            assert_eq!(decision.reason, UNTRUSTED_CONTEXT_DENY_REASON, "{tool}");
+        }
+
+        // Refused, never punished: the owner asking for two things in one message lands here too,
+        // and the turn is not a governed run that can be paused or proposed against.
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The rule is about acting, not about reading, and a barrier that also stopped the reading
+    /// would have taken the feature with it: the owner asked what was in their mail, and the answer
+    /// needs more than one message to assemble.
+    #[tokio::test]
+    async fn a_turn_that_has_read_mail_may_keep_reading() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state);
+
+        orchestrator_tool(&app, run_id, "get_email_queue", serde_json::json!({})).await;
+
+        for tool in ["get_email", "get_email_queue", "list_mail_files"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+        // NucleOS's own state, which changes nothing and travels to the owner's own chat.
+        for tool in ["list_proposals", "get_budget", "get_kill", "list_projects"] {
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+    }
+
+    /// The ordinary case has to keep working, or the barrier is just an outage: a turn that has read
+    /// nothing third-party is the one the owner uses to approve and to work the kill switch.
+    #[tokio::test]
+    async fn a_turn_that_has_read_no_mail_still_acts() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state);
+
+        for tool in ["approve_proposal", "set_kill", "create_run", "cancel_run"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+    }
+
+    /// Marked on the run, not on the process. A flag held in a module-level set would be shared by
+    /// every turn the daemon is running, so one chat asking about its mail would quietly disarm the
+    /// controls in another — and a test suite whose in-memory databases all start numbering at 1
+    /// would not notice, because it would look like the barrier working.
+    #[tokio::test]
+    async fn one_turn_reading_mail_does_not_disarm_the_next() {
+        let state = test_state().await;
+        let reader = in_flight_run(&state, "assistant", None, None, None).await;
+        let other = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state);
+
+        orchestrator_tool(&app, reader, "get_email", serde_json::json!({"id": 1})).await;
+
+        assert_eq!(
+            orchestrator_tool(
+                &app,
+                reader,
+                "set_kill",
+                serde_json::json!({"engaged": false})
+            )
+            .await
+            .decision,
+            "deny"
+        );
+        assert_eq!(
+            orchestrator_tool(
+                &app,
+                other,
+                "set_kill",
+                serde_json::json!({"engaged": false})
+            )
+            .await
+            .decision,
+            "allow",
+            "a turn that read nothing must not inherit another turn's refusal"
+        );
+    }
+
+    /// `get_run` reads a run's own output, which is NucleOS's account of the owner's work — except
+    /// for a triage run, where it is a model's answer over mail a stranger wrote. The parse that
+    /// bounds a verdict to a class and 200 stripped characters runs after the raw stream is stored,
+    /// so this tool is the one way that text gets back out unbounded.
+    #[tokio::test]
+    async fn reading_a_triage_run_counts_as_reading_the_mail_it_triaged() {
+        let state = test_state().await;
+        let turn = in_flight_run(&state, "assistant", None, None, None).await;
+        let triage = in_flight_run(&state, crate::email::TRIAGE_MODE, None, None, None).await;
+        let worktree = in_flight_run(&state, "worktree", None, None, None).await;
+        let app = test_router(state);
+
+        // A worktree run's output is the owner's own work and leaves the turn able to act.
+        orchestrator_tool(&app, turn, "get_run", serde_json::json!({"id": worktree})).await;
+        assert_eq!(
+            orchestrator_tool(
+                &app,
+                turn,
+                "set_kill",
+                serde_json::json!({"engaged": false})
+            )
+            .await
+            .decision,
+            "allow"
+        );
+
+        orchestrator_tool(&app, turn, "get_run", serde_json::json!({"id": triage})).await;
+        assert_eq!(
+            orchestrator_tool(
+                &app,
+                turn,
+                "set_kill",
+                serde_json::json!({"engaged": false})
+            )
+            .await
+            .decision,
+            "deny",
+            "a triage run's stdout is a stranger's words at one remove"
+        );
+    }
+
+    /// The question being answered is whether third-party text is about to enter the turn, and "I
+    /// cannot tell which run you mean" is not "no". An id that is missing or is not a number would
+    /// otherwise be the cheapest way to read a triage run without being counted as having done so.
+    #[tokio::test]
+    async fn a_get_run_naming_nothing_readable_is_treated_as_third_party_text() {
+        for tool_input in [
+            serde_json::json!({}),
+            serde_json::json!({"id": "12"}),
+            serde_json::json!({"id": null}),
+        ] {
+            let state = test_state().await;
+            let turn = in_flight_run(&state, "assistant", None, None, None).await;
+            let app = test_router(state);
+
+            orchestrator_tool(&app, turn, "get_run", tool_input.clone()).await;
+
+            assert_eq!(
+                orchestrator_tool(
+                    &app,
+                    turn,
+                    "set_kill",
+                    serde_json::json!({"engaged": false})
+                )
+                .await
+                .decision,
+                "deny",
+                "{tool_input}"
+            );
+        }
+    }
+
+    /// A name this server does not expose reaches the same unconditional allow as one it does, so it
+    /// has to land on the fail-closed side of the rule rather than on neither side of it.
+    #[tokio::test]
+    async fn an_unrecognised_nucleos_tool_is_refused_after_mail_is_read() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state);
+
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "send_email", serde_json::json!({}))
+                .await
+                .decision,
+            "allow",
+            "an unknown name behaves as it did before a turn has read anything"
+        );
+
+        orchestrator_tool(&app, run_id, "get_email", serde_json::json!({"id": 1})).await;
+
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "send_email", serde_json::json!({}))
+                .await
+                .decision,
+            "deny"
         );
     }
 

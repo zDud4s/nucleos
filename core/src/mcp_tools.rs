@@ -143,6 +143,73 @@ impl NucleosTools {
 #[tool_handler(name = "nucleos", instructions = "NucleOS daemon control")]
 impl ServerHandler for NucleosTools {}
 
+/// What calling one NucleOS tool does to the turn that called it.
+///
+/// This partition exists because an orchestrator turn is the only agent that both reads a
+/// stranger's words and holds the daemon's controls, and `hooks.rs` allows every tool on this
+/// server unconditionally. The tool description on `get_email` tells the model the body is data —
+/// which is worth saying and is not a boundary, because the thing being instructed is the thing
+/// under attack. Knowing which tool brought third-party text into the turn and which tool would act
+/// on it is what lets the daemon refuse the second after the first, whatever the model concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffect {
+    /// Returns text a third party chose. Always permitted — reading mail is what the turn is for —
+    /// but it marks the run, and every `Acts` tool called afterwards is refused.
+    ReadsUntrusted,
+    /// Changes something outside the turn: starts or stops a run, lifts an approval the classifier
+    /// withheld, works the kill switch. Refused once the turn has read third-party text.
+    Acts,
+    /// Reads only what NucleOS recorded about the owner's own work. Neither marks the turn nor is
+    /// refused: it changes nothing, and the answer travels to the owner's own chat.
+    ReadsOwn,
+}
+
+/// Every tool this server exposes, and what calling it does to the turn. Ordered as the router
+/// lists them, so the two can be read side by side.
+///
+/// The three mail entries are the whole reason the table exists. A body is the obvious carrier of
+/// a stranger's words; the other two are less obvious and no less sender-chosen. `get_email_queue`
+/// carries subjects, which arrive exactly as written and are capped nowhere on this path, next to
+/// the triage summaries — a model's words about a stranger's. `list_mail_files` returns filenames,
+/// and the sender picks the filename.
+///
+/// `triage_email` is an action despite reading nothing back: it spends the budget, and a gate that
+/// let a mail body choose when to spend money would be missing the point narrowly. `get_run` is
+/// `ReadsOwn` only lexically — a triage run's stdout is a model's answer over mail — so `hooks.rs`
+/// looks at WHICH run is named before it settles that one.
+const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
+    ("approve_proposal", ToolEffect::Acts),
+    ("cancel_run", ToolEffect::Acts),
+    ("create_run", ToolEffect::Acts),
+    ("get_budget", ToolEffect::ReadsOwn),
+    ("get_email", ToolEffect::ReadsUntrusted),
+    ("get_email_queue", ToolEffect::ReadsUntrusted),
+    ("get_kill", ToolEffect::ReadsOwn),
+    ("get_run", ToolEffect::ReadsOwn),
+    ("list_mail_files", ToolEffect::ReadsUntrusted),
+    ("list_projects", ToolEffect::ReadsOwn),
+    ("list_proposals", ToolEffect::ReadsOwn),
+    ("reject_proposal", ToolEffect::Acts),
+    ("set_kill", ToolEffect::Acts),
+    ("triage_email", ToolEffect::Acts),
+];
+
+/// PURE: what one tool name does, by name alone.
+///
+/// A name absent from the table resolves to `Acts`, which is the fail-closed direction for a tool
+/// that does not exist: refused after untrusted text rather than waved through. That default is a
+/// backstop and not the guarantee — a tool ADDED to this server and left out of the table would
+/// become `Acts` too, and if it happened to read mail it would bring a stranger's words into the
+/// turn without marking it, which is the one failure that looks like nothing.
+/// `every_registered_tool_is_classified` is what actually holds the table to the server, by failing
+/// the moment the two disagree.
+pub fn tool_effect(tool: &str) -> ToolEffect {
+    match TOOL_EFFECTS.iter().find(|(name, _)| *name == tool) {
+        Some((_, effect)) => *effect,
+        None => ToolEffect::Acts,
+    }
+}
+
 fn json_result<T: Serialize>(result: Result<T, String>) -> String {
     match result {
         Ok(value) => serde_json::to_string(&value).unwrap_or_else(|e| error_json(e.to_string())),
@@ -202,5 +269,58 @@ mod tests {
                 "triage_email",
             ]
         );
+    }
+
+    /// The lists in this module are a safety boundary, and a boundary that a new tool can walk past
+    /// silently is not one.
+    ///
+    /// `tool_effect` defaults an unknown name to `Acts`, which is safe for a name that does not
+    /// exist and NOT safe for one that does: a mail-reading tool added here and left out of
+    /// `READS_UNTRUSTED` would be allowed, would bring a stranger's words into the turn, and would
+    /// leave the turn unmarked — so the `approve_proposal` after it would still be allowed. Nothing
+    /// about that failure looks like a failure. Asserting the partition against the router's own
+    /// list is what turns it into a test that fails on the day the tool is added.
+    #[test]
+    fn every_registered_tool_is_classified() {
+        let mut classified: Vec<&str> = TOOL_EFFECTS.iter().map(|(name, _)| *name).collect();
+        classified.sort_unstable();
+        let before = classified.len();
+        classified.dedup();
+        assert_eq!(before, classified.len(), "a tool is in the table twice");
+
+        let mut registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        registered.sort_unstable();
+
+        assert_eq!(
+            registered, classified,
+            "every tool this server exposes must be classified, and nothing else"
+        );
+    }
+
+    /// The three that carry a stranger's text, named one by one rather than derived from the table,
+    /// so that reclassifying one of them has to be done twice and on purpose.
+    #[test]
+    fn the_mail_tools_are_what_brings_third_party_text_into_a_turn() {
+        assert_eq!(tool_effect("get_email"), ToolEffect::ReadsUntrusted);
+        assert_eq!(tool_effect("get_email_queue"), ToolEffect::ReadsUntrusted);
+        assert_eq!(tool_effect("list_mail_files"), ToolEffect::ReadsUntrusted);
+
+        assert_eq!(tool_effect("approve_proposal"), ToolEffect::Acts);
+        assert_eq!(tool_effect("set_kill"), ToolEffect::Acts);
+        assert_eq!(tool_effect("create_run"), ToolEffect::Acts);
+
+        assert_eq!(tool_effect("list_proposals"), ToolEffect::ReadsOwn);
+        assert_eq!(tool_effect("get_budget"), ToolEffect::ReadsOwn);
+    }
+
+    /// A name this server does not have must not read as harmless.
+    #[test]
+    fn an_unknown_tool_is_treated_as_one_that_acts() {
+        assert_eq!(tool_effect("send_email"), ToolEffect::Acts);
+        assert_eq!(tool_effect(""), ToolEffect::Acts);
     }
 }
