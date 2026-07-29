@@ -17,6 +17,7 @@ mod logging;
 mod mailfiles;
 mod mcp_tools;
 mod presets;
+mod priority;
 mod proposals;
 mod redact;
 mod repo_trigger;
