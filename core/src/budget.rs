@@ -204,14 +204,38 @@ pub async fn window_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result
     Ok(compute_spend(&rows, now, &cfg))
 }
 
+/// PURE: whether a run was still spending at some point in `[since, now]`.
+///
+/// The test used to be `created_at >= since`, which asks when a run STARTED rather than whether it
+/// was running. A run that began 61 minutes ago and is burning money right now was invisible to
+/// the hourly cap — and it is the long expensive run, not the short one, that the cap exists to
+/// catch. A run is in the window if it had not finished when the window opened.
+fn overlaps_window(row: &SpendRow, since: DateTime<Utc>) -> bool {
+    row.completed_at.unwrap_or(DateTime::<Utc>::MAX_UTC) >= since
+}
+
 /// Total autonomous spend in the trailing 60 minutes (independent of the window boundary).
+///
+/// Counted in full rather than apportioned to the part of the run inside the hour. Splitting a
+/// reported cost across time would be inventing a spending curve the CLI never reports, and it
+/// would contradict this module's own rule that a known cost is authoritative. Counting in full
+/// over-counts a run that finished early in the hour, which is the direction a limit should round:
+/// a $40 run that ended twenty minutes ago is recent spending, and it drops out an hour later.
 pub async fn hourly_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<f64> {
     let cfg = load_budget_config(pool).await?;
     let since = now - chrono::Duration::hours(1);
     let rows: Vec<SpendRow> = autonomous_rows(pool)
         .await?
         .into_iter()
-        .filter(|row| row.created_at >= since)
+        .filter(|row| overlaps_window(row, since))
+        .map(|row| SpendRow {
+            // Only for the rows whose cost is approximated from elapsed time: there the model
+            // already says cost is linear in duration, so clipping the start to the window is that
+            // model applied, not a new one. `cost_usd` ignores this field entirely, which is what
+            // keeps a known cost whole and authoritative.
+            created_at: row.created_at.max(since),
+            ..row
+        })
         .collect();
     Ok(compute_spend(&rows, now, &cfg))
 }
@@ -607,6 +631,96 @@ mod tests {
         .await; // older today
 
         approx(hourly_spend(&pool, now).await.unwrap(), 0.4);
+    }
+
+    /// The hourly cap is a brake on bursts, and the run it most needs to see is the long expensive
+    /// one — which was the single shape it could not see, because the test asked when a run started
+    /// rather than whether it was running.
+    #[tokio::test]
+    async fn hourly_spend_sees_a_run_that_started_before_the_hour_and_is_still_going() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z");
+        // Started 90 minutes ago, still running, $40 reported so far.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("long"),
+            Some(40.0),
+            "2026-07-20T10:30:00Z",
+            None,
+        )
+        .await;
+
+        approx(hourly_spend(&pool, now).await.unwrap(), 40.0);
+    }
+
+    /// Counted in full, not apportioned: splitting a reported cost across time would invent a
+    /// spending curve the CLI never reports. Over-counting a run that ended early in the hour is
+    /// the direction a limit should round, and it drops out an hour after it finishes.
+    #[tokio::test]
+    async fn a_known_cost_stays_whole_while_it_overlaps_the_hour() {
+        let pool = test_pool().await;
+        insert_run(
+            &pool,
+            "worktree",
+            Some("spanning"),
+            Some(40.0),
+            "2026-07-20T09:00:00Z",
+            Some("2026-07-20T11:30:00Z"),
+        )
+        .await;
+
+        // Half an hour after it finished: still inside the trailing hour, counted whole.
+        approx(
+            hourly_spend(&pool, ts("2026-07-20T12:00:00Z"))
+                .await
+                .unwrap(),
+            40.0,
+        );
+        // An hour and a minute after: gone.
+        approx(
+            hourly_spend(&pool, ts("2026-07-20T12:31:00Z"))
+                .await
+                .unwrap(),
+            0.0,
+        );
+    }
+
+    /// An unknown cost is approximated from elapsed time, so for those rows the linear model is the
+    /// whole basis of the number — and clipping the start to the window is that model applied
+    /// rather than a second one invented on top.
+    #[tokio::test]
+    async fn an_approximated_cost_counts_only_its_time_inside_the_hour() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: None,
+                period: BudgetPeriod::Daily,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.0,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        // Three hours in, no reported cost, still running. Only the last hour is inside the window.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("slow"),
+            None,
+            "2026-07-20T09:00:00Z",
+            None,
+        )
+        .await;
+
+        approx(
+            hourly_spend(&pool, ts("2026-07-20T12:00:00Z"))
+                .await
+                .unwrap(),
+            3.0,
+        );
     }
 
     #[tokio::test]
