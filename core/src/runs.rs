@@ -34,6 +34,40 @@ pub struct AwaitingRun {
     pub created_at: String,
 }
 
+/// A lean run index entry. It intentionally excludes the full prompt and captured command output.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RunSearchResult {
+    pub id: i64,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub mode: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub prompt_excerpt: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchFilter {
+    pub project_id: Option<String>,
+    pub status: Option<String>,
+    pub mode: Option<String>,
+    pub q: Option<String>,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    pub limit: i64,
+}
+
+/// Keep search results useful without turning the index into a prompt or output retrieval endpoint.
+const PROMPT_EXCERPT_CHARS: i64 = 500;
+
+fn escape_like(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<AwaitingRun>> {
     sqlx::query_as::<_, AwaitingRun>(
         "SELECT id, project_id, prompt, cwd, created_at
@@ -41,6 +75,51 @@ pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec
     )
     .fetch_all(pool)
     .await
+}
+
+/// Searches run metadata newest-first. The result is an index, so it never returns stdout or stderr.
+pub async fn search(
+    pool: &sqlx::SqlitePool,
+    filter: &SearchFilter,
+) -> sqlx::Result<Vec<RunSearchResult>> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+        "SELECT id, project_id, status, mode, created_at, completed_at, cost_usd, \
+         substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt FROM runs WHERE 1 = 1"
+    ));
+
+    if let Some(project_id) = &filter.project_id {
+        query.push(" AND project_id = ").push_bind(project_id);
+    }
+    if let Some(status) = &filter.status {
+        query.push(" AND status = ").push_bind(status);
+    }
+    if let Some(mode) = &filter.mode {
+        query.push(" AND mode = ").push_bind(mode);
+    }
+    if let Some(q) = &filter.q {
+        query
+            .push(" AND prompt LIKE ")
+            .push_bind(format!("%{}%", escape_like(q)))
+            .push(" ESCAPE '\\'");
+    }
+    if let Some(since) = &filter.since {
+        query
+            .push(" AND created_at >= ")
+            .push_bind(since.to_rfc3339());
+    }
+    if let Some(until) = &filter.until {
+        query
+            .push(" AND created_at <= ")
+            .push_bind(until.to_rfc3339());
+    }
+    query
+        .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+        .push_bind(filter.limit);
+
+    query
+        .build_query_as::<RunSearchResult>()
+        .fetch_all(pool)
+        .await
 }
 
 #[derive(Debug)]
@@ -2583,5 +2662,125 @@ mod tests {
         assert_eq!(status, "failed");
         assert_eq!(attempt, 1); // manual runs never retry
         assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    async fn search_test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_search_run(
+        pool: &sqlx::SqlitePool,
+        project_id: &str,
+        status: &str,
+        mode: &str,
+        prompt: &str,
+        created_at: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, stdout, stderr, created_at)
+             VALUES (?, ?, ?, ?, 'secret stdout', 'secret stderr', ?)",
+        )
+        .bind(project_id)
+        .bind(prompt)
+        .bind(status)
+        .bind(mode)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn search_filters_runs_and_returns_only_a_prompt_excerpt() {
+        let pool = search_test_pool().await;
+        let matching_prompt = "ã".repeat(PROMPT_EXCERPT_CHARS as usize + 100);
+        let matching = insert_search_run(
+            &pool,
+            "project-a",
+            "completed",
+            "worktree",
+            &matching_prompt,
+            "2026-03-10T12:00:00+00:00",
+        )
+        .await;
+        insert_search_run(
+            &pool,
+            "project-a",
+            "failed",
+            "worktree",
+            "March Autopilot work",
+            "2026-03-11T12:00:00+00:00",
+        )
+        .await;
+        insert_search_run(
+            &pool,
+            "project-a",
+            "completed",
+            "shadow",
+            "March Autopilot work",
+            "2026-03-12T12:00:00+00:00",
+        )
+        .await;
+        insert_search_run(
+            &pool,
+            "project-b",
+            "completed",
+            "worktree",
+            "March Autopilot work",
+            "2026-03-13T12:00:00+00:00",
+        )
+        .await;
+        insert_search_run(
+            &pool,
+            "project-a",
+            "completed",
+            "worktree",
+            "March Autopilot work outside window",
+            "2026-04-01T00:00:00+00:00",
+        )
+        .await;
+
+        let entries = search(
+            &pool,
+            &SearchFilter {
+                project_id: Some("project-a".into()),
+                status: Some("completed".into()),
+                mode: Some("worktree".into()),
+                q: Some("ã".into()),
+                since: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                until: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-03-31T23:59:59Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, matching);
+        let excerpt_chars = entries[0].prompt_excerpt.chars().count();
+        assert_eq!(excerpt_chars, PROMPT_EXCERPT_CHARS as usize);
+        assert!(entries[0].prompt_excerpt.len() > excerpt_chars);
+        assert_eq!(
+            entries[0].prompt_excerpt,
+            "ã".repeat(PROMPT_EXCERPT_CHARS as usize)
+        );
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert!(json.get("stdout").is_none());
+        assert!(json.get("stderr").is_none());
     }
 }

@@ -58,7 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/grep", get(get_project_grep))
         .route("/projects/{id}/diff", get(get_project_diff))
         .route("/feed", get(get_feed))
-        .route("/runs", post(create_run))
+        .route("/runs", get(get_runs).post(create_run))
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
@@ -138,6 +138,22 @@ struct ProjectQuery {
 struct FeedQuery {
     project_id: Option<String>,
     scope: Option<String>,
+    q: Option<String>,
+    kind: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RunsQuery {
+    project_id: Option<String>,
+    status: Option<String>,
+    mode: Option<String>,
+    q: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1064,18 +1080,94 @@ pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     }
 }
 
+/// The search endpoints never return more than this many rows, even when a caller requests more.
+const SEARCH_LIMIT_MAX: i64 = 200;
+
+fn parse_time_bound(
+    value: Option<String>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, StatusCode> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|time| time.with_timezone(&chrono::Utc))
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+fn parse_search_limit(value: Option<String>) -> Result<i64, StatusCode> {
+    match value {
+        Some(value) => value
+            .parse::<i64>()
+            .map(|limit| limit.clamp(1, SEARCH_LIMIT_MAX))
+            .map_err(|_| StatusCode::BAD_REQUEST),
+        None => Ok(50),
+    }
+}
+
 async fn get_feed(
     State(state): State<AppState>,
     Query(query): Query<FeedQuery>,
 ) -> Result<Json<Vec<FeedEntry>>, StatusCode> {
-    let entries = if query.scope.as_deref() == Some("all") {
-        feed::list_all(&state.pool, 50).await
+    let has_search_filters = query.q.is_some()
+        || query.kind.is_some()
+        || query.since.is_some()
+        || query.until.is_some()
+        || query.limit.is_some();
+    if !has_search_filters {
+        let entries = if query.scope.as_deref() == Some("all") {
+            feed::list_all(&state.pool, 50).await
+        } else {
+            feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
+        };
+        return entries
+            .map(Json)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let scope = if query.scope.as_deref() == Some("all") {
+        feed::FeedScope::All
+    } else if let Some(project_id) = query.project_id {
+        feed::FeedScope::Project(project_id)
     } else {
-        feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
+        feed::FeedScope::Global
     };
+    let entries = feed::search(
+        &state.pool,
+        &feed::SearchFilter {
+            scope,
+            q: query.q,
+            kind: query.kind,
+            since: parse_time_bound(query.since)?,
+            until: parse_time_bound(query.until)?,
+            limit: parse_search_limit(query.limit)?,
+        },
+    )
+    .await;
     entries
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_runs(
+    State(state): State<AppState>,
+    Query(query): Query<RunsQuery>,
+) -> Result<Json<Vec<runs::RunSearchResult>>, StatusCode> {
+    runs::search(
+        &state.pool,
+        &runs::SearchFilter {
+            project_id: query.project_id,
+            status: query.status,
+            mode: query.mode,
+            q: query.q,
+            since: parse_time_bound(query.since)?,
+            until: parse_time_bound(query.until)?,
+            limit: parse_search_limit(query.limit)?,
+        },
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn list_awaiting_approval_runs(
@@ -2459,6 +2551,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let legacy_entries = crate::feed::list_feed(&pool, None, 50).await.unwrap();
         let app = build_router(state);
 
         let response = app
@@ -2481,6 +2574,112 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
         assert_eq!(entries[0]["summary"], "global summary");
+        assert_eq!(parsed, serde_json::to_value(legacy_entries).unwrap());
+    }
+
+    #[tokio::test]
+    async fn feed_search_query_and_time_bound_filter_results() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO feed (project_id, kind, summary, created_at)
+             VALUES ('project-a', 'worktree_run_completed', 'Autopilot March work',
+                     '2026-03-12T00:00:00+00:00'),
+                    ('project-a', 'worktree_run_completed', 'Autopilot April work',
+                     '2026-04-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?scope=all&q=Autopilot%20March&since=2026-03-01T00%3A00%3A00Z")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["summary"], "Autopilot March work");
+    }
+
+    #[tokio::test]
+    async fn runs_search_filters_by_project_and_hides_command_output() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, stdout, stderr, created_at)
+             VALUES ('project-a', 'Autopilot March work', 'completed', 'worktree',
+                     'not for the index', 'also not for the index', '2026-03-12T00:00:00+00:00'),
+                    ('project-b', 'Autopilot March work', 'completed', 'worktree',
+                     'not for the index', 'also not for the index', '2026-03-13T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/runs?project_id=project-a")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["project_id"], "project-a");
+        assert!(entries[0].get("stdout").is_none());
+        assert!(entries[0].get("stderr").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_search_bound_returns_bad_request() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?since=not-a-timestamp")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_search_limit_returns_bad_request() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/runs?limit=all")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
