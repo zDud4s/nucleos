@@ -12,6 +12,7 @@ use crate::auth::require_token;
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::budget;
 use crate::feed::{self, FeedEntry};
+use crate::health;
 use crate::hooks::pretooluse_decision;
 use crate::inspect;
 use crate::presets;
@@ -37,6 +38,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route("/health/readout", get(health_readout))
         .route(
             "/autopilot/state",
             get(get_autopilot_state).post(post_autopilot_state),
@@ -130,6 +132,10 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn health_readout(State(state): State<AppState>) -> Json<health::HealthReadout> {
+    Json(health::readout(state).await)
 }
 
 async fn status() -> impl IntoResponse {
@@ -2225,6 +2231,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn health_readout_requires_the_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/readout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn health_readout_returns_200_when_the_verdict_is_down() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/readout")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let readout: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(readout["status"], "down");
     }
 
     #[tokio::test]

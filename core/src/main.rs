@@ -8,6 +8,7 @@ mod config;
 mod daemon_client;
 mod email;
 mod feed;
+mod health;
 mod hooks;
 mod http;
 mod inspect;
