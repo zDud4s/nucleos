@@ -4,16 +4,19 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::require_token;
+use crate::auth::{ApiTokenLevel, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
+use crate::backup;
 use crate::budget;
 use crate::feed::{self, FeedEntry};
+use crate::health;
 use crate::hooks::pretooluse_decision;
 use crate::inspect;
+use crate::presets;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
@@ -36,6 +39,10 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route("/health/readout", get(health_readout))
+        .route("/backup", post(post_backup))
+        .route("/backups", get(get_backups))
+        .route("/backups/{name}/restore", post(post_backup_restore))
         .route(
             "/autopilot/state",
             get(get_autopilot_state).post(post_autopilot_state),
@@ -58,7 +65,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/grep", get(get_project_grep))
         .route("/projects/{id}/diff", get(get_project_diff))
         .route("/feed", get(get_feed))
-        .route("/runs", post(create_run))
+        .route("/runs", get(get_runs).post(create_run))
+        .route("/presets", get(list_presets).post(create_preset))
+        .route(
+            "/presets/{id}",
+            get(get_preset).put(update_preset).delete(delete_preset),
+        )
+        .route("/presets/{id}/run", post(run_preset))
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
@@ -109,6 +122,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mail-files", get(get_mail_files))
         .route("/mail-files/folder", post(post_mail_folder))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        .route("/api-tokens", get(list_api_tokens).post(create_api_token))
+        .route(
+            "/api-tokens/{name}",
+            axum::routing::delete(revoke_api_token),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -125,8 +143,190 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+async fn health_readout(State(state): State<AppState>) -> Json<health::HealthReadout> {
+    Json(health::readout(state).await)
+}
+
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+#[derive(Deserialize)]
+struct CreateApiTokenRequest {
+    name: String,
+    level: ApiTokenLevel,
+}
+
+#[derive(Serialize)]
+struct CreatedApiToken {
+    name: String,
+    level: ApiTokenLevel,
+    created_at: String,
+    /// The complete bearer credential. It is returned only by creation, never by listing.
+    token: String,
+}
+
+#[derive(Serialize)]
+struct ApiTokenSummary {
+    name: String,
+    level: ApiTokenLevel,
+    created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiTokenRow {
+    name: String,
+    access_level: String,
+    created_at: String,
+}
+
+fn valid_api_token_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+async fn create_api_token(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiTokenRequest>,
+) -> Result<(StatusCode, Json<CreatedApiToken>), StatusCode> {
+    if !valid_api_token_name(&body.name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let (token, secret) = mint_api_token(&body.name);
+    let result = sqlx::query(
+        "INSERT INTO api_tokens (name, token, access_level, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&body.name)
+    .bind(secret)
+    .bind(body.level.as_str())
+    .bind(&created_at)
+    .execute(&state.pool)
+    .await;
+
+    if let Err(error) = result {
+        if error
+            .as_database_error()
+            .is_some_and(|database| database.is_unique_violation())
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedApiToken {
+            name: body.name,
+            level: body.level,
+            created_at,
+            token,
+        }),
+    ))
+}
+
+async fn list_api_tokens(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiTokenSummary>>, StatusCode> {
+    let rows = sqlx::query_as::<_, ApiTokenRow>(
+        "SELECT name, access_level, created_at FROM api_tokens ORDER BY created_at, name",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(ApiTokenSummary {
+                name: row.name,
+                level: ApiTokenLevel::from_str(&row.access_level)
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+                created_at: row.created_at,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn revoke_api_token(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let result = sqlx::query("DELETE FROM api_tokens WHERE name = ?")
+        .bind(name)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if result.rows_affected() == 0 {
+        Err(StatusCode::NOT_FOUND)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+async fn post_backup(
+    State(state): State<AppState>,
+) -> Result<Json<backup::BackupInfo>, StatusCode> {
+    backup::take_backup(&state.pool, backup::DEFAULT_RETENTION)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+async fn get_backups(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<backup::BackupInfo>>, StatusCode> {
+    backup::list_backups(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+async fn post_backup_restore(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<backup::StagedRestore>, StatusCode> {
+    if !plain_filename(&name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    backup::stage_restore(&state.pool, &name)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+fn plain_filename(name: &str) -> bool {
+    if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+
+    let mut components = std::path::Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn backup_status(error: &backup::BackupError) -> StatusCode {
+    match error {
+        backup::BackupError::InvalidName | backup::BackupError::InvalidRetention => {
+            StatusCode::BAD_REQUEST
+        }
+        backup::BackupError::NotFound => StatusCode::NOT_FOUND,
+        backup::BackupError::ExistingTarget(_) | backup::BackupError::PendingRestoreExists => {
+            StatusCode::CONFLICT
+        }
+        backup::BackupError::Verification(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        backup::BackupError::Database(_) | backup::BackupError::Io(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -138,6 +338,22 @@ struct ProjectQuery {
 struct FeedQuery {
     project_id: Option<String>,
     scope: Option<String>,
+    q: Option<String>,
+    kind: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RunsQuery {
+    project_id: Option<String>,
+    status: Option<String>,
+    mode: Option<String>,
+    q: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1064,18 +1280,192 @@ pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     }
 }
 
+/// The search endpoints never return more than this many rows, even when a caller requests more.
+const SEARCH_LIMIT_MAX: i64 = 200;
+
+fn parse_time_bound(
+    value: Option<String>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, StatusCode> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|time| time.with_timezone(&chrono::Utc))
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+fn parse_search_limit(value: Option<String>) -> Result<i64, StatusCode> {
+    match value {
+        Some(value) => value
+            .parse::<i64>()
+            .map(|limit| limit.clamp(1, SEARCH_LIMIT_MAX))
+            .map_err(|_| StatusCode::BAD_REQUEST),
+        None => Ok(50),
+    }
+}
+
 async fn get_feed(
     State(state): State<AppState>,
     Query(query): Query<FeedQuery>,
 ) -> Result<Json<Vec<FeedEntry>>, StatusCode> {
-    let entries = if query.scope.as_deref() == Some("all") {
-        feed::list_all(&state.pool, 50).await
+    let has_search_filters = query.q.is_some()
+        || query.kind.is_some()
+        || query.since.is_some()
+        || query.until.is_some()
+        || query.limit.is_some();
+    if !has_search_filters {
+        let entries = if query.scope.as_deref() == Some("all") {
+            feed::list_all(&state.pool, 50).await
+        } else {
+            feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
+        };
+        return entries
+            .map(Json)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let scope = if query.scope.as_deref() == Some("all") {
+        feed::FeedScope::All
+    } else if let Some(project_id) = query.project_id {
+        feed::FeedScope::Project(project_id)
     } else {
-        feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
+        feed::FeedScope::Global
     };
+    let entries = feed::search(
+        &state.pool,
+        &feed::SearchFilter {
+            scope,
+            q: query.q,
+            kind: query.kind,
+            since: parse_time_bound(query.since)?,
+            until: parse_time_bound(query.until)?,
+            limit: parse_search_limit(query.limit)?,
+        },
+    )
+    .await;
     entries
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_runs(
+    State(state): State<AppState>,
+    Query(query): Query<RunsQuery>,
+) -> Result<Json<Vec<runs::RunSearchResult>>, StatusCode> {
+    runs::search(
+        &state.pool,
+        &runs::SearchFilter {
+            project_id: query.project_id,
+            status: query.status,
+            mode: query.mode,
+            q: query.q,
+            since: parse_time_bound(query.since)?,
+            until: parse_time_bound(query.until)?,
+            limit: parse_search_limit(query.limit)?,
+        },
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn preset_status(error: &presets::PresetError) -> StatusCode {
+    match error {
+        presets::PresetError::DuplicateName => StatusCode::CONFLICT,
+        presets::PresetError::Invalid(_) => StatusCode::BAD_REQUEST,
+        presets::PresetError::NotFound => StatusCode::NOT_FOUND,
+        presets::PresetError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn list_presets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<presets::Preset>>, StatusCode> {
+    presets::list(&state.pool).await.map(Json).map_err(|error| {
+        tracing::warn!(%error, "listing presets failed");
+        preset_status(&error)
+    })
+}
+
+async fn create_preset(
+    State(state): State<AppState>,
+    Json(request): Json<presets::PresetRequest>,
+) -> Result<Json<presets::Preset>, StatusCode> {
+    presets::create(&state.pool, &request.name, request.run)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "creating preset failed");
+            preset_status(&error)
+        })
+}
+
+async fn get_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<presets::Preset>, StatusCode> {
+    presets::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "reading preset failed");
+            preset_status(&error)
+        })?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn update_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<presets::PresetRequest>,
+) -> Result<Json<presets::Preset>, StatusCode> {
+    presets::update(&state.pool, id, &request.name, request.run)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "updating preset failed");
+            preset_status(&error)
+        })
+}
+
+async fn delete_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    presets::delete(&state.pool, id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "deleting preset failed");
+            preset_status(&error)
+        })
+}
+
+async fn run_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<runs::CreateRunResponse>, StatusCode> {
+    let preset = presets::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "reading preset to run failed");
+            preset_status(&error)
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Delegate to the sole person-initiated run front door. It owns the fail-closed global kill
+    // switch, uncancellable launch window, and conversion from run-domain errors to HTTP status.
+    runs::create_run(
+        State(state),
+        Json(runs::CreateRunRequest {
+            prompt: preset.prompt,
+            project_id: preset.project_id,
+            cwd: preset.cwd,
+            mode: preset.mode,
+        }),
+    )
+    .await
 }
 
 async fn list_awaiting_approval_runs(
@@ -1255,6 +1645,99 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    async fn file_test_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::storage::open(&dir.path().join("nucleos.db"))
+            .await
+            .unwrap();
+        (
+            AppState {
+                token: Token("test-token".into()),
+                pool,
+                runner: Arc::new(FakeCommandRunner::default()),
+                triage_runner: None,
+                local_triage_disabled: None,
+                run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+                run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+                progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            },
+            dir,
+        )
+    }
+
+    async fn backup_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        build_router(state)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_backup_route_requires_the_bearer_token() {
+        for (method, uri) in [
+            ("POST", "/backup"),
+            ("GET", "/backups"),
+            (
+                "POST",
+                "/backups/nucleos-20260729T010203.000000000Z-0000.db/restore",
+            ),
+        ] {
+            let response = backup_request(test_state().await, method, uri, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_route_rejects_traversal_and_path_separators() {
+        for name in ["bad..name.db", "bad%5Cname.db"] {
+            let response = backup_request(
+                test_state().await,
+                "POST",
+                &format!("/backups/{name}/restore"),
+                Some("test-token"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backups_route_lists_newest_first() {
+        let (state, dir) = file_test_state().await;
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let older = "nucleos-20260729T010203.000000000Z-0000.db";
+        let newer = "nucleos-20260729T020203.000000000Z-0000.db";
+        std::fs::write(backup_dir.join(older), b"old").unwrap();
+        std::fs::write(backup_dir.join(newer), b"new").unwrap();
+
+        let response = backup_request(state.clone(), "GET", "/backups", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed[0]["name"], newer);
+        assert_eq!(listed[1]["name"], older);
+
+        state.pool.close().await;
+        drop(dir);
+    }
+
     async fn test_state() -> AppState {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -1277,6 +1760,114 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    async fn api_token_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(body) => {
+                request = request.header("Content-Type", "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        build_router(state)
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_api_token_routes_create_list_once_and_revoke() {
+        let state = test_state().await;
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/api-tokens",
+            "test-token",
+            Some(serde_json::json!({
+                "name": "administrator",
+                "level": "admin"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let admin_token = created["token"].as_str().unwrap().to_owned();
+        assert_eq!(created["name"], "administrator");
+        assert_eq!(created["level"], "admin");
+
+        let stored_secret: String =
+            sqlx::query_scalar("SELECT token FROM api_tokens WHERE name = 'administrator'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(admin_token.split_once('.').unwrap().1, stored_secret);
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/api-tokens",
+            &admin_token,
+            Some(serde_json::json!({
+                "name": "reader",
+                "level": "read-only"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reader: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let reader_token = reader["token"].as_str().unwrap().to_owned();
+
+        let response =
+            api_token_request(state.clone(), "GET", "/api-tokens", &reader_token, None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response =
+            api_token_request(state.clone(), "GET", "/api-tokens", &admin_token, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.iter().all(|entry| entry.get("token").is_none()),
+            "listing existing keys must never return their secrets"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry["name"] == "reader" && entry["level"] == "read-only")
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "DELETE",
+            "/api-tokens/reader",
+            &admin_token,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = api_token_request(state, "GET", "/status", &reader_token, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn email_batch(messages: serde_json::Value) -> Body {
@@ -2030,6 +2621,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn health_readout_requires_the_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/readout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn health_readout_returns_200_when_the_verdict_is_down() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/readout")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let readout: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(readout["status"], "down");
     }
 
     #[tokio::test]
@@ -2461,6 +3092,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let legacy_entries = crate::feed::list_feed(&pool, None, 50).await.unwrap();
         let app = build_router(state);
 
         let response = app
@@ -2483,6 +3115,264 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
         assert_eq!(entries[0]["summary"], "global summary");
+        assert_eq!(parsed, serde_json::to_value(legacy_entries).unwrap());
+    }
+
+    fn preset_body(name: &str, prompt: &str, mode: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "name": name,
+                "prompt": prompt,
+                "project_id": "project-a",
+                "cwd": "C:/repo/project-a",
+                "mode": mode,
+            })
+            .to_string(),
+        )
+    }
+
+    async fn preset_response(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Body,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn presets_are_stored_and_duplicate_or_unknown_requests_are_mapped() {
+        let state = test_state().await;
+        let (status, created) = preset_response(
+            state.clone(),
+            "POST",
+            "/presets",
+            preset_body("daily", "check the branch", "real"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = created["id"].as_i64().unwrap();
+
+        let (status, fetched) = preset_response(
+            state.clone(),
+            "GET",
+            &format!("/presets/{id}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["name"], "daily");
+        assert_eq!(fetched["prompt"], "check the branch");
+
+        assert_eq!(
+            preset_response(
+                state.clone(),
+                "POST",
+                "/presets",
+                preset_body("daily", "another", "real"),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            preset_response(state.clone(), "GET", "/presets/999", Body::empty())
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            preset_response(
+                state,
+                "POST",
+                "/presets",
+                Body::from(r#"{"name":"bad","prompt":"x","mode":"worktree"}"#),
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_run_obeys_the_global_kill_switch() {
+        let state = test_state().await;
+        let (_, preset) = preset_response(
+            state.clone(),
+            "POST",
+            "/presets",
+            preset_body("stopped", "do not start", "real"),
+        )
+        .await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preset_response(
+                state,
+                "POST",
+                &format!("/presets/{}/run", preset["id"].as_i64().unwrap()),
+                Body::empty(),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_run_uses_the_saved_run_request_fields() {
+        let state = test_state().await;
+        let (_, preset) = preset_response(
+            state.clone(),
+            "POST",
+            "/presets",
+            preset_body("launch", "inspect project", "real"),
+        )
+        .await;
+        let (_, started) = preset_response(
+            state.clone(),
+            "POST",
+            &format!("/presets/{}/run", preset["id"].as_i64().unwrap()),
+            Body::empty(),
+        )
+        .await;
+        let id = started["id"].as_i64().unwrap();
+        let row: (String, Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT prompt, project_id, cwd, mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "inspect project");
+        assert_eq!(row.1.as_deref(), Some("project-a"));
+        assert_eq!(row.2.as_deref(), Some("C:/repo/project-a"));
+        assert_eq!(row.3, "real");
+    }
+
+    #[tokio::test]
+    async fn feed_search_query_and_time_bound_filter_results() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO feed (project_id, kind, summary, created_at)
+             VALUES ('project-a', 'worktree_run_completed', 'Autopilot March work',
+                     '2026-03-12T00:00:00+00:00'),
+                    ('project-a', 'worktree_run_completed', 'Autopilot April work',
+                     '2026-04-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?scope=all&q=Autopilot%20March&since=2026-03-01T00%3A00%3A00Z")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["summary"], "Autopilot March work");
+    }
+
+    #[tokio::test]
+    async fn runs_search_filters_by_project_and_hides_command_output() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, stdout, stderr, created_at)
+             VALUES ('project-a', 'Autopilot March work', 'completed', 'worktree',
+                     'not for the index', 'also not for the index', '2026-03-12T00:00:00+00:00'),
+                    ('project-b', 'Autopilot March work', 'completed', 'worktree',
+                     'not for the index', 'also not for the index', '2026-03-13T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/runs?project_id=project-a")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["project_id"], "project-a");
+        assert!(entries[0].get("stdout").is_none());
+        assert!(entries[0].get("stderr").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_search_bound_returns_bad_request() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?since=not-a-timestamp")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_search_limit_returns_bad_request() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/runs?limit=all")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

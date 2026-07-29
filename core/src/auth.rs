@@ -48,6 +48,36 @@ pub enum Scope {
     Run(i64),
     /// A sidecar's key, good for the routes that sidecar's pillar owns and nothing else.
     Service(Service),
+    /// A durable caller key, limited to the access level chosen when it was minted.
+    ApiToken(ApiTokenLevel),
+}
+
+/// The three durable API-key levels, named for what a holder may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiTokenLevel {
+    ReadOnly,
+    RunCreating,
+    Admin,
+}
+
+impl ApiTokenLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::RunCreating => "run-creating",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "read-only" => Some(Self::ReadOnly),
+            "run-creating" => Some(Self::RunCreating),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
 }
 
 /// The only route a run token opens, and the reason a run token exists.
@@ -64,6 +94,48 @@ const EMAIL_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/email/incoming"),
 ];
 
+/// Routes that expose state without changing it.
+///
+/// This is deliberately not "every GET": adding a route must not silently disclose it to every
+/// read-only key. Kill-switch and budget readouts stay administrative because the packet treats
+/// those control surfaces as a family, and token listing stays administrative because it reveals
+/// durable credential metadata.
+const READ_ONLY_ROUTES: &[(Method, &str)] = &[
+    (Method::GET, "/status"),
+    (Method::GET, "/health/readout"),
+    (Method::GET, "/backups"),
+    (Method::GET, "/autopilot/state"),
+    (Method::GET, "/projects"),
+    (Method::GET, "/projects/{id}/ls"),
+    (Method::GET, "/projects/{id}/cat"),
+    (Method::GET, "/projects/{id}/grep"),
+    (Method::GET, "/projects/{id}/diff"),
+    (Method::GET, "/feed"),
+    (Method::GET, "/runs"),
+    (Method::GET, "/presets"),
+    (Method::GET, "/presets/{id}"),
+    (Method::GET, "/runs/awaiting-approval"),
+    (Method::GET, "/runs/{id}"),
+    (Method::GET, "/assistant/{turn_id}"),
+    (Method::GET, "/proposals"),
+    (Method::GET, "/shadow-decisions"),
+    (Method::GET, "/scoreboard"),
+    (Method::GET, "/email/cursor"),
+    (Method::GET, "/email/queue"),
+    (Method::GET, "/email/{id}"),
+    (Method::GET, "/email/{id}/attachments/{position}"),
+    (Method::GET, "/email/{id}/attachments"),
+    (Method::GET, "/mail-files"),
+];
+
+/// The current HTTP entry points that create a new run.
+const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
+    (Method::POST, "/runs"),
+    (Method::POST, "/presets/{id}/run"),
+    (Method::POST, "/assistant/message"),
+    (Method::POST, "/email/triage"),
+];
+
 /// PURE: whether `scope` may perform `method` on `path`.
 ///
 /// One table rather than a capability declared beside each route: this is a safety boundary, and a
@@ -73,9 +145,36 @@ fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     match scope {
         Scope::Control => true,
         Scope::Run(_) => method == Method::POST && path == HOOK_ROUTE,
-        Scope::Service(Service::Email) => EMAIL_ROUTES
-            .iter()
-            .any(|(allowed, route)| allowed == method && *route == path),
+        Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
+        Scope::ApiToken(ApiTokenLevel::ReadOnly) => route_is_listed(READ_ONLY_ROUTES, method, path),
+        Scope::ApiToken(ApiTokenLevel::RunCreating) => {
+            route_is_listed(READ_ONLY_ROUTES, method, path)
+                || route_is_listed(RUN_CREATING_ROUTES, method, path)
+        }
+        Scope::ApiToken(ApiTokenLevel::Admin) => true,
+    }
+}
+
+fn route_is_listed(routes: &[(Method, &str)], method: &Method, path: &str) -> bool {
+    routes
+        .iter()
+        .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path))
+}
+
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let mut pattern = pattern.trim_matches('/').split('/');
+    let mut actual = path.trim_matches('/').split('/');
+
+    loop {
+        match (pattern.next(), actual.next()) {
+            (None, None) => return true,
+            (Some(expected), Some(found))
+                if expected == found
+                    || (expected.starts_with('{')
+                        && expected.ends_with('}')
+                        && !found.is_empty()) => {}
+            _ => return false,
+        }
     }
 }
 
@@ -86,6 +185,12 @@ fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
 pub fn mint_run_token(id: i64) -> (String, String) {
     let secret = generate_token();
     (format!("{id}.{secret}"), secret)
+}
+
+/// A durable API key and the secret stored for it: `api:<name>.<secret>`.
+pub fn mint_api_token(name: &str) -> (String, String) {
+    let secret = generate_token();
+    (format!("api:{name}.{secret}"), secret)
 }
 
 /// A sidecar the daemon launches, and which therefore gets a key of its own.
@@ -145,8 +250,23 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
 
     let (prefix, secret) = presented.split_once('.')?;
 
-    // A service name never parses as an integer and a run id always does, so the prefix picks the
-    // table without a second marker to keep in sync.
+    // `api:<name>` contains a colon: it is neither the integer prefix of a run nor any service
+    // name (service names are fixed enum values), so the three credential families cannot collide.
+    if let Some(name) = prefix.strip_prefix("api:") {
+        let (stored, level) = sqlx::query_as::<_, (String, String)>(
+            "SELECT token, access_level FROM api_tokens WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()??;
+        let level = ApiTokenLevel::from_str(&level)?;
+        return bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
+            .then_some(Scope::ApiToken(level));
+    }
+
+    // A service name never parses as an integer and a run id always does, so the remaining prefix
+    // picks the table without a second marker to keep in sync.
     if let Some(service) = Service::from_name(prefix) {
         let stored: String = sqlx::query_scalar("SELECT token FROM service_tokens WHERE name = ?")
             .bind(prefix)
@@ -220,7 +340,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -252,15 +372,40 @@ mod tests {
     fn protected_router(state: AppState) -> Router {
         Router::new()
             .route("/secret", get(|| async { "top secret" }))
+            .route("/status", get(|| async {}))
+            .route("/health/readout", get(|| async {}))
+            .route("/backup", post(|| async {}))
+            .route("/backups", get(|| async {}))
+            .route("/backups/{name}/restore", post(|| async {}))
+            .route("/autopilot/state", get(|| async {}).post(|| async {}))
+            .route("/autopilot/kill", get(|| async {}).post(|| async {}))
+            .route("/autopilot/budget", get(|| async {}).post(|| async {}))
+            .route("/projects", get(|| async {}))
+            .route("/projects/{id}/cat", get(|| async {}))
+            .route("/feed", get(|| async {}))
+            .route("/runs", get(|| async {}).post(|| async {}))
+            .route("/runs/{id}", get(|| async {}))
+            .route("/presets", get(|| async {}).post(|| async {}))
+            .route("/presets/{id}/run", post(|| async {}))
+            .route("/assistant/message", post(|| async {}))
+            .route("/assistant/{turn_id}", get(|| async {}))
+            .route("/proposals", get(|| async {}))
             // A stand-in for the real gate route: these tests are about who may reach it, and the
             // path is what `permits` matches on.
-            .route(HOOK_ROUTE, axum::routing::post(|| async { "decided" }))
-            .route(
-                "/proposals/{id}/approve",
-                axum::routing::post(|| async { "" }),
-            )
+            .route(HOOK_ROUTE, post(|| async { "decided" }))
+            .route("/proposals/{id}/approve", post(|| async {}))
+            .route("/worktrees/{run_id}/release", post(|| async {}))
+            .route("/shadow-decisions", get(|| async {}))
+            .route("/shadow-decisions/{id}/verdict", post(|| async {}))
+            .route("/scoreboard", get(|| async {}))
             .route("/email/cursor", get(|| async { "" }).post(|| async { "" }))
-            .route("/email/incoming", axum::routing::post(|| async { "" }))
+            .route("/email/incoming", post(|| async { "" }))
+            .route("/email/triage", post(|| async {}))
+            .route("/email/{id}/attachments", get(|| async {}))
+            .route("/mail-files", get(|| async {}))
+            .route("/mail-files/folder", post(|| async {}))
+            .route("/api-tokens", get(|| async {}).post(|| async {}))
+            .route("/api-tokens/{name}", axum::routing::delete(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -290,6 +435,21 @@ mod tests {
         (id, token)
     }
 
+    async fn stored_api_token(state: &AppState, name: &str, level: ApiTokenLevel) -> String {
+        let (token, secret) = mint_api_token(name);
+        sqlx::query(
+            "INSERT INTO api_tokens (name, token, access_level, created_at)
+             VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(name)
+        .bind(secret)
+        .bind(level.as_str())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        token
+    }
+
     async fn status_of(app: &Router, method: &str, uri: &str, bearer: &str) -> StatusCode {
         app.clone()
             .oneshot(
@@ -304,6 +464,26 @@ mod tests {
             .unwrap()
             .status()
     }
+
+    const ROUTE_FAMILY_CASES: &[(&str, &str)] = &[
+        ("GET", "/status"),
+        ("GET", "/health/readout"),
+        ("POST", "/backup"),
+        ("GET", "/autopilot/state"),
+        ("GET", "/projects"),
+        ("GET", "/feed"),
+        ("GET", "/runs"),
+        ("GET", "/presets"),
+        ("POST", "/assistant/message"),
+        ("GET", "/proposals"),
+        ("POST", "/worktrees/7/release"),
+        ("GET", "/shadow-decisions"),
+        ("GET", "/scoreboard"),
+        ("GET", "/email/cursor"),
+        ("GET", "/mail-files"),
+        ("POST", HOOK_ROUTE),
+        ("GET", "/api-tokens"),
+    ];
 
     #[tokio::test]
     async fn rejects_missing_token() {
@@ -503,6 +683,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_only_is_exactly_the_explicit_read_route_table() {
+        let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        for (method, pattern) in READ_ONLY_ROUTES {
+            let path = pattern
+                .split('/')
+                .map(|segment| {
+                    if segment.starts_with('{') {
+                        "7"
+                    } else {
+                        segment
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            assert!(
+                permits(&scope, method, &path),
+                "{method} {path} should be explicitly readable"
+            );
+        }
+        assert!(!permits(&scope, &Method::GET, "/future-sensitive-route"));
+        assert!(!permits(&scope, &Method::POST, "/status"));
+    }
+
+    #[tokio::test]
+    async fn a_read_only_api_key_is_refused_on_each_privileged_route() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let app = protected_router(state);
+
+        for uri in ["/status", "/runs/7", "/projects/demo/cat", "/mail-files"] {
+            assert_eq!(
+                status_of(&app, "GET", uri, &token).await,
+                StatusCode::OK,
+                "GET {uri} is an allowlisted read"
+            );
+        }
+        for (method, uri) in [
+            ("POST", "/runs"),
+            ("POST", "/autopilot/kill"),
+            ("POST", "/autopilot/budget"),
+            ("POST", "/autopilot/state"),
+            ("POST", "/proposals/7/approve"),
+            ("POST", "/backups/snapshot.db/restore"),
+            ("POST", "/api-tokens"),
+            ("GET", "/api-tokens"),
+        ] {
+            assert_eq!(
+                status_of(&app, method, uri, &token).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_creating_api_key_starts_runs_but_not_admin_actions() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let app = protected_router(state);
+
+        for uri in [
+            "/runs",
+            "/presets/7/run",
+            "/assistant/message",
+            "/email/triage",
+        ] {
+            assert_eq!(
+                status_of(&app, "POST", uri, &token).await,
+                StatusCode::OK,
+                "POST {uri} starts a run"
+            );
+        }
+        for (method, uri) in [
+            ("POST", "/autopilot/kill"),
+            ("POST", "/autopilot/budget"),
+            ("POST", "/autopilot/state"),
+            ("POST", "/proposals/7/approve"),
+            ("POST", "/backups/snapshot.db/restore"),
+            ("POST", "/api-tokens"),
+            ("GET", "/api-tokens"),
+        ] {
+            assert_eq!(
+                status_of(&app, method, uri, &token).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_and_revoked_api_keys_authenticate_nothing() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "temporary", ApiTokenLevel::ReadOnly).await;
+        let app = protected_router(state.clone());
+
+        assert_eq!(
+            status_of(&app, "GET", "/status", "api:missing.unknown").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(&app, "GET", "/status", &token).await,
+            StatusCode::OK
+        );
+
+        sqlx::query("DELETE FROM api_tokens WHERE name = 'temporary'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_of(&app, "GET", "/status", &token).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn api_run_and_service_prefixes_do_not_cross_over() {
+        let state = test_state("control-token").await;
+        let (run_id, run_token) = running_run_with_token(&state).await;
+        let service_token = mint_service_token(&state.pool, Service::Email)
+            .await
+            .unwrap();
+        let api_token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let app = protected_router(state);
+
+        let run_secret = run_token.split_once('.').unwrap().1;
+        let service_secret = service_token.split_once('.').unwrap().1;
+        let api_secret = api_token.split_once('.').unwrap().1;
+        for forged in [
+            format!("{run_id}.{api_secret}"),
+            format!("email.{api_secret}"),
+            format!("api:reader.{run_secret}"),
+            format!("api:reader.{service_secret}"),
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", "/status", &forged).await,
+                StatusCode::UNAUTHORIZED,
+                "{forged:?}"
+            );
+        }
+    }
+
     /// The email sidecar's key opens the two routes it builds a URL for, and none of the rest.
     #[tokio::test]
     async fn the_email_sidecars_key_opens_its_two_routes_and_nothing_else() {
@@ -596,18 +918,29 @@ mod tests {
     /// The shell is unaffected — this narrows what a *run* and a *sidecar* hold, not what the
     /// daemon's own key opens.
     #[tokio::test]
-    async fn the_control_token_still_reaches_everything() {
+    async fn the_control_token_still_reaches_a_route_from_every_family() {
         let state = test_state("control-token").await;
         let app = protected_router(state);
 
-        for (method, uri) in [
-            ("GET", "/secret"),
-            ("POST", HOOK_ROUTE),
-            ("POST", "/proposals/7/approve"),
-        ] {
+        for (method, uri) in ROUTE_FAMILY_CASES {
             assert_eq!(
                 status_of(&app, method, uri, "control-token").await,
                 StatusCode::OK,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admin_api_key_reaches_everything_control_reaches() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "administrator", ApiTokenLevel::Admin).await;
+        let app = protected_router(state);
+
+        for (method, uri) in ROUTE_FAMILY_CASES {
+            assert_eq!(
+                status_of(&app, method, uri, &token).await,
+                status_of(&app, method, uri, "control-token").await,
                 "{method} {uri}"
             );
         }
