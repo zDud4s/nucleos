@@ -96,6 +96,27 @@ fn advertised_tools_violate(policy: ToolPolicy, advertised: Option<&[String]>) -
     })
 }
 
+/// Whether a run whose stream is exhausted ever got the chance to verify its tool policy.
+///
+/// Separate from `advertised_tools_violate` because the two absences are different failures. An
+/// `init` that omits `tools` is a CLI that answered the question badly; no `init` at all is a CLI
+/// that was never asked, because the assertion only runs inside the `init` branch. Both must fail
+/// closed under a restrictive policy: the assertion exists so that a CLI change cannot turn barrier
+/// 1 of the triage model into a silent no-op, and renaming or dropping the event is exactly such a
+/// change — the one the field-level check above cannot see.
+///
+/// This does not make the run unsafe on its own. `ToolPolicy::None` is enforced by the CLI's own
+/// refusal (see the variant's doc comment), not by this check; what would be lost without it is the
+/// evidence that the refusal took effect, which is the whole point of measuring it.
+fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option<String> {
+    if policy == ToolPolicy::Unrestricted || init_seen {
+        return None;
+    }
+    Some(format!(
+        "ToolPolicy::{policy:?} could not be verified: CLI stream contained no system init event"
+    ))
+}
+
 /// Built-in tool names denied under `ToolPolicy::McpOnly`.
 ///
 /// This list still applies the restriction, but the init-event assertion means it is no longer the
@@ -733,6 +754,7 @@ impl CommandRunner for ClaudeCliRunner {
 
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
+        let mut init_seen = false;
         let mut progress_timeout_elapsed: Option<Duration> = None;
 
         loop {
@@ -767,6 +789,7 @@ impl CommandRunner for ClaudeCliRunner {
                 if v.get("type").and_then(|x| x.as_str()) == Some("system")
                     && v.get("subtype").and_then(|x| x.as_str()) == Some("init")
                 {
+                    init_seen = true;
                     let advertised = advertised_tools_from_init(&v);
                     if let Some(reason) =
                         advertised_tools_violate(tool_policy, advertised.as_deref())
@@ -786,6 +809,17 @@ impl CommandRunner for ClaudeCliRunner {
                     }
                 }
             }
+        }
+
+        // Only once the stream has ENDED ON ITS OWN can absence of an `init` be read as the CLI
+        // never having sent one. A progress timeout or a mid-stream read error means we stopped
+        // listening, not that the event was never coming, and asserting otherwise would swap a true
+        // diagnosis for a false one.
+        if policy_violation.is_none()
+            && progress_timeout_elapsed.is_none()
+            && post_launch_error.is_none()
+        {
+            policy_violation = policy_unverified_after_stream(tool_policy, init_seen);
         }
 
         if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
@@ -1220,6 +1254,34 @@ mod tests {
             advertised_tools_from_event(r#"{"type":"system","subtype":"init","tools":[]}"#);
 
         assert!(advertised_tools_violate(ToolPolicy::None, advertised.as_deref()).is_none());
+    }
+
+    /// The hole the field-level check cannot see. `advertised_tools_violate` only ever runs inside
+    /// the `init` branch, so a CLI that renamed or dropped the event would skip the assertion
+    /// entirely and the run would complete looking verified. That is the same failure the assertion
+    /// exists to prevent, one level up.
+    #[test]
+    fn a_restrictive_policy_that_never_saw_an_init_event_is_unverified() {
+        for policy in [ToolPolicy::None, ToolPolicy::McpOnly] {
+            assert!(
+                policy_unverified_after_stream(policy, false).is_some(),
+                "{policy:?} must fail closed when no init event arrived"
+            );
+        }
+    }
+
+    #[test]
+    fn an_init_event_that_did_arrive_leaves_the_stream_level_check_silent() {
+        for policy in [ToolPolicy::None, ToolPolicy::McpOnly] {
+            assert!(policy_unverified_after_stream(policy, true).is_none());
+        }
+    }
+
+    /// `Unrestricted` asserts nothing about tools, so it has nothing to be unable to verify.
+    /// Failing it here would break every ordinary run whose transcript happens to lack an `init`.
+    #[test]
+    fn unrestricted_needs_no_init_event() {
+        assert!(policy_unverified_after_stream(ToolPolicy::Unrestricted, false).is_none());
     }
 
     #[test]
