@@ -6,6 +6,7 @@ import {
   autopilotState,
   base64ToBytes,
   budgetStatusLabel,
+  classifierVerdictLabel,
   formatBytes,
   formatUsd,
   groupScoreboardByMode,
@@ -19,6 +20,8 @@ import {
   readinessCriterionLabel,
   readinessGap,
   relativeTime,
+  REVIEW_ALLOW,
+  REVIEW_BLOCK,
   safeDownloadName,
   scoreboardReadiness,
   totalPending,
@@ -407,5 +410,56 @@ describe("pure UI derivations", () => {
     expect(safeDownloadName("")).toBe("attachment.bin");
     expect(safeDownloadName("..")).toBe("attachment.bin");
     expect(safeDownloadName("MÉDIAS_ESPERADAS.docx")).toBe("MÉDIAS_ESPERADAS.docx");
+  });
+});
+
+describe("shadow review asks the question the gate actually scores", () => {
+  /**
+   * The daemon's `AGREE_CASE` (core/src/shadow.rs), mirrored here ONLY to prove the buttons
+   * answer the same question it asks: `approve` agrees with `allow`, and `reject` agrees with
+   * both `deny` and `pending_approval`.
+   */
+  function daemonScoresAsAgreement(verdict: string, classifierDecision: string): boolean {
+    if (verdict === "approve") return classifierDecision === "allow";
+    if (verdict === "reject") return classifierDecision === "deny" || classifierDecision === "pending_approval";
+    return false;
+  }
+
+  const CLASSIFIER_VERDICTS = ["allow", "deny", "pending_approval"];
+
+  it("scores agreement whenever the reviewer would do what the classifier proposed", () => {
+    const wouldDoTheSame = (decision: string) =>
+      decision === "allow" ? REVIEW_ALLOW.verdict : REVIEW_BLOCK.verdict;
+
+    for (const decision of CLASSIFIER_VERDICTS) {
+      expect(daemonScoresAsAgreement(wouldDoTheSame(decision), decision)).toBe(true);
+    }
+  });
+
+  it("scores disagreement whenever the reviewer would do the opposite", () => {
+    const wouldDoTheOpposite = (decision: string) =>
+      decision === "allow" ? REVIEW_BLOCK.verdict : REVIEW_ALLOW.verdict;
+
+    for (const decision of CLASSIFIER_VERDICTS) {
+      expect(daemonScoresAsAgreement(wouldDoTheOpposite(decision), decision)).toBe(false);
+    }
+  });
+
+  it("labels each button by the action it takes, never by agreement", () => {
+    // Pinning the literal copy on purpose. The labels ARE the semantics here: they used to read
+    // "Agree"/"Disagree", which asks about the CLASSIFICATION rather than the ACTION. The two
+    // questions are inverse on every row the classifier did not `allow`, so agreeing that an
+    // action should require approval sent `approve` — scored above as a disagreement. The gate
+    // then punished the reviewer who read and rewarded the one who waved everything through.
+    expect(REVIEW_ALLOW.label).toBe("Allow");
+    expect(REVIEW_BLOCK.label).toBe("Block");
+  });
+
+  it("phrases the classifier's own verdict as an answer to that same question", () => {
+    expect(classifierVerdictLabel("allow")).toBe("would allow");
+    expect(classifierVerdictLabel("deny")).toBe("would block");
+    expect(classifierVerdictLabel("pending_approval")).toBe("would ask you");
+    // A verdict the daemon gains later still renders, rather than vanishing from the row.
+    expect(classifierVerdictLabel("quarantine")).toBe("would quarantine");
   });
 });

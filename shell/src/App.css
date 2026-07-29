@@ -338,6 +338,10 @@
 .dc-meta .deny { color: var(--red); }
 .dc-meta .allow { color: var(--green); }
 .dc-why { font-size: var(--fs-sm); color: var(--muted); }
+/* The question the two buttons answer. Load-bearing, not decoration: without it the pair reads
+   as "agree/disagree with the classifier", which is the inverse question on every row the
+   classifier did not allow. See REVIEW_ALLOW in derive.ts. */
+.dc-ask { font-size: var(--fs-xs); color: var(--faint); margin-right: auto; }
 
 .dc-input { margin-top: var(--sp-1); }
 .dc-input summary,

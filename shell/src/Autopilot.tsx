@@ -8,10 +8,11 @@ import {
   type ScopedKill, type ShadowDecision,
 } from "./api";
 import {
-  agreementRate, autopilotState, budgetStatusLabel, formatUsd, groupScoreboardByMode,
-  killSwitchLabel, periodLabel, promotionBlock, promotionReadiness, queueBlock,
-  readinessCriterionLabel,
-  readinessGap, relativeTime, scoreboardReadiness, SWAMPED_THRESHOLD, totalPending,
+  agreementRate, autopilotState, budgetStatusLabel, classifierVerdictLabel, formatUsd,
+  groupScoreboardByMode, killSwitchLabel, periodLabel, promotionBlock, promotionReadiness,
+  queueBlock, readinessCriterionLabel,
+  readinessGap, relativeTime, REVIEW_ALLOW, REVIEW_BLOCK, scoreboardReadiness,
+  SWAMPED_THRESHOLD, totalPending,
 } from "./derive";
 import { Badge, Banner, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
@@ -192,12 +193,13 @@ function ShadowReviewPanel({ projectId, decisions, loading, token, refresh }: Sh
       {decisions === null ? !loading && <ErrorNote>Could not load shadow decisions from the daemon.</ErrorNote>
         : decisions.length === 0 ? <Teach title="Nothing needs a second pair of eyes.">Shadow verdicts appear here when the agent has an action for you to judge.</Teach>
         : decisions.map((decision) => { const pending = pendingIds.has(decision.id); return <article className="decision" key={decision.id}>
-            <div className="dc-meta"><span className="tool">{decision.tool_name}</span><span className="class">{decision.action_class}</span><span className={decision.decision === "deny" ? "deny" : "allow"}>would {decision.decision}</span></div>
+            <div className="dc-meta"><span className="tool">{decision.tool_name}</span><span className="class">{decision.action_class}</span><span className={decision.decision === "deny" ? "deny" : "allow"}>{classifierVerdictLabel(decision.decision)}</span></div>
             {decision.reason !== null && <p className="dc-why">{decision.reason}</p>}
             {decision.tool_input !== null && <details className="dc-input"><summary>input</summary><pre>{decision.tool_input}</pre></details>}
             <div className="dc-act">
-              <Button size="sm" intent="go" disabled={pending} onClick={() => void reviewDecision(decision.id, "approve")}>Agree</Button>
-              <Button size="sm" intent="stop" disabled={pending} onClick={() => void reviewDecision(decision.id, "reject")}>Disagree</Button>
+              <span className="dc-ask">Would you have allowed it?</span>
+              <Button size="sm" intent="go" disabled={pending} onClick={() => void reviewDecision(decision.id, REVIEW_ALLOW.verdict)}>{REVIEW_ALLOW.label}</Button>
+              <Button size="sm" intent="stop" disabled={pending} onClick={() => void reviewDecision(decision.id, REVIEW_BLOCK.verdict)}>{REVIEW_BLOCK.label}</Button>
             </div>
             {errors[decision.id] !== undefined && <ErrorNote>{errors[decision.id]}</ErrorNote>}
           </article>; })}

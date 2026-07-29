@@ -241,6 +241,38 @@ export function budgetStatusLabel(budget: Budget): string {
 }
 
 /**
+ * The two shadow-review answers, and the verdict string the daemon expects behind each.
+ *
+ * The daemon's `AGREE_CASE` (core/src/shadow.rs) reads a verdict as the answer to "would you
+ * have allowed this ACTION?": `approve` agrees with `allow`, and `reject` agrees with BOTH
+ * `deny` and `pending_approval` — withholding an action the classifier also withheld IS
+ * agreement.
+ *
+ * These buttons used to read "Agree"/"Disagree", which asks about the CLASSIFICATION instead.
+ * The two questions coincide only on `allow` rows and are inverse everywhere else: agreeing that
+ * an action should require approval sent `approve`, which the gate scored as a disagreement. The
+ * promotion scoreboard therefore punished the reviewer who read carefully and rewarded the one
+ * who waved everything through — the exact failure the shadow gate exists to prevent. Do not
+ * relabel these without changing `AGREE_CASE` to match.
+ */
+export const REVIEW_ALLOW = { label: "Allow", verdict: "approve" } as const;
+export const REVIEW_BLOCK = { label: "Block", verdict: "reject" } as const;
+
+/** The classifier's own verdict, phrased as an answer to the same question the buttons ask. */
+export function classifierVerdictLabel(decision: string): string {
+  switch (decision) {
+    case "allow":
+      return "would allow";
+    case "deny":
+      return "would block";
+    case "pending_approval":
+      return "would ask you";
+    default:
+      return `would ${decision}`;
+  }
+}
+
+/**
  * A compact, human relative time like "12 min ago" for feed/proposal metadata;
  * the exact ISO instant belongs in a `title`. `nowMs` defaults to the current
  * time so callers pass just the ISO string, while tests pin it. Unparseable
