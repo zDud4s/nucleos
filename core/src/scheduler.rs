@@ -111,29 +111,31 @@ pub fn due_rules<'a>(
         .collect()
 }
 
+/// One rule's persisted scheduler state, as the tick reads it.
+#[derive(sqlx::FromRow)]
+struct RuleState {
+    rule_name: String,
+    /// Kept verbatim rather than parsed, because it is the value the claim compare-and-sets
+    /// against: a round trip through `DateTime` can change the spelling (offset form, sub-second
+    /// digits) without changing the instant, and then the claim matches nothing.
+    last_fired_at: String,
+    last_head_sha: Option<String>,
+    /// The day `fires_today` counts for. A count carrying another day's date is a count of nothing,
+    /// which is what makes the daily reset a comparison rather than a sweep somebody has to run at
+    /// midnight.
+    fires_date: Option<String>,
+    fires_today: i64,
+}
+
 pub async fn run_scheduler(state: AppState) {
     let mut interval = tokio::time::interval(TICK);
-    let mut fires_today: HashMap<(String, String), u32> = HashMap::new();
-    let mut current_date = None;
-
     loop {
         interval.tick().await;
-
-        let now = Utc::now();
-        if current_date != Some(now.date_naive()) {
-            fires_today.clear();
-            current_date = Some(now.date_naive());
-        }
-
-        scheduler_tick(&state, now, &mut fires_today).await;
+        scheduler_tick(&state, Utc::now()).await;
     }
 }
 
-pub(crate) async fn scheduler_tick(
-    state: &AppState,
-    now: DateTime<Utc>,
-    fires_today: &mut HashMap<(String, String), u32>,
-) {
+pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
     if crate::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
@@ -196,8 +198,8 @@ pub(crate) async fn scheduler_tick(
             }
         };
 
-        let rows: Vec<(String, String, Option<String>)> = match sqlx::query_as(
-            "SELECT rule_name, last_fired_at, last_head_sha
+        let rows: Vec<RuleState> = match sqlx::query_as(
+            "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today
              FROM scheduler_state
              WHERE project_id = ?",
         )
@@ -216,23 +218,26 @@ pub(crate) async fn scheduler_tick(
             }
         };
 
-        let persisted_names: HashSet<&str> = rows.iter().map(|(name, ..)| name.as_str()).collect();
+        let persisted_names: HashSet<&str> =
+            rows.iter().map(|row| row.rule_name.as_str()).collect();
         // The HEAD each rule was last armed/fired at, so a catch-up can tell whether the repo moved
         // under it. Absent for rules armed before migration 0018 — treated as "cannot tell", which
         // is not the same as "did not move", so those simply skip the re-triage warning.
         let last_head_shas: HashMap<&str, &str> = rows
             .iter()
-            .filter_map(|(name, _, sha)| Some((name.as_str(), sha.as_deref()?)))
+            .filter_map(|row| Some((row.rule_name.as_str(), row.last_head_sha.as_deref()?)))
             .collect();
-        // The stored timestamp verbatim, not the parsed one: it is the value the claim below
-        // compare-and-sets against, and a round-trip through `DateTime` can change the spelling
-        // (offset form, sub-second digits) without changing the instant.
         let last_fired_raw: HashMap<&str, &str> = rows
             .iter()
-            .map(|(name, value, _)| (name.as_str(), value.as_str()))
+            .map(|row| (row.rule_name.as_str(), row.last_fired_at.as_str()))
             .collect();
         let mut last_fired = HashMap::new();
-        for (rule_name, value, _) in &rows {
+        for RuleState {
+            rule_name,
+            last_fired_at: value,
+            ..
+        } in &rows
+        {
             match DateTime::parse_from_rfc3339(value) {
                 Ok(timestamp) => {
                     last_fired.insert(rule_name.clone(), timestamp.with_timezone(&Utc));
@@ -267,10 +272,14 @@ pub(crate) async fn scheduler_tick(
             }
         }
 
-        let project_fires: HashMap<String, u32> = fires_today
+        // From the row, not from a counter the loop holds: the map reset on every daemon start, and
+        // the Task Scheduler registration restarts the daemon three times on failure. A crashing
+        // daemon is the one situation this cap is named for, and it was the one that rearmed it.
+        let today = now.date_naive().to_string();
+        let project_fires: HashMap<String, u32> = rows
             .iter()
-            .filter(|((stored_project_id, _), _)| stored_project_id == &project_id)
-            .map(|((_, rule_name), count)| (rule_name.clone(), *count))
+            .filter(|row| row.fires_date.as_deref() == Some(today.as_str()))
+            .map(|row| (row.rule_name.clone(), row.fires_today.max(0) as u32))
             .collect();
         let due = due_rules(
             &rules,
@@ -319,8 +328,7 @@ pub(crate) async fn scheduler_tick(
 
         let mut fired_this_tick = HashSet::new();
         for (rule, due_at) in due {
-            let fire_key = (project_id.clone(), rule.name.clone());
-            if fires_today.get(&fire_key).copied().unwrap_or(0) >= DAILY_CAP {
+            if project_fires.get(&rule.name).copied().unwrap_or(0) >= DAILY_CAP {
                 tracing::warn!(
                     project_id = %project_id,
                     rule_name = %rule.name,
@@ -413,14 +421,25 @@ pub(crate) async fn scheduler_tick(
             // The sha rides along with the timestamp because both describe the state the NEXT
             // window is scheduled from, so a later catch-up would otherwise compare against a HEAD
             // from the wrong moment.
+            //
+            // The daily allowance is spent in the same statement, for the same reason: two writes
+            // would leave a window where the run has been claimed and not counted, and a daemon
+            // that dies there would come back with the allowance intact. `fires_date` carries the
+            // day the count belongs to, so a stale count from yesterday resets rather than
+            // accumulating — there is no midnight sweep to miss.
             let previous_fired_at = last_fired_raw.get(rule.name.as_str()).copied();
             let claim = sqlx::query(
                 "UPDATE scheduler_state
-                 SET last_fired_at = ?, last_head_sha = ?
+                 SET last_fired_at = ?,
+                     last_head_sha = ?,
+                     fires_today = CASE WHEN fires_date = ? THEN fires_today + 1 ELSE 1 END,
+                     fires_date = ?
                  WHERE project_id = ? AND rule_name = ? AND last_fired_at IS ?",
             )
             .bind(now.to_rfc3339())
             .bind(head_sha.as_deref())
+            .bind(&today)
+            .bind(&today)
             .bind(&project_id)
             .bind(&rule.name)
             .bind(previous_fired_at)
@@ -452,8 +471,8 @@ pub(crate) async fn scheduler_tick(
                 .await
             {
                 Ok(run_id) => {
-                    let count = fires_today.entry(fire_key).or_insert(0);
-                    *count += 1;
+                    // +1 for the claim above, which is where the allowance was actually spent.
+                    let spent = project_fires.get(&rule.name).copied().unwrap_or(0) + 1;
                     tracing::info!(
                         project_id = %project_id,
                         rule_name = %rule.name,
@@ -461,7 +480,7 @@ pub(crate) async fn scheduler_tick(
                         run_mode,
                         "fired scheduled run"
                     );
-                    if *count == DAILY_CAP {
+                    if spent == DAILY_CAP {
                         tracing::warn!(
                             project_id = %project_id,
                             rule_name = %rule.name,
@@ -648,6 +667,59 @@ mod tests {
         .unwrap();
     }
 
+    /// The runaway guard used to be a `HashMap` the scheduler loop held, so it emptied every time
+    /// the daemon started — and the Task Scheduler registration restarts the daemon three times on
+    /// failure. A crashing daemon is the one situation this cap is named for, and it was the
+    /// situation that rearmed it. `scheduler_tick` is called directly here, which is exactly what a
+    /// restart looks like: no loop state survives between the calls.
+    #[tokio::test]
+    async fn the_daily_cap_survives_a_daemon_restart() {
+        let state = test_state(None).await;
+        let container = space_free_tempdir("nucleos-scheduler-cap-");
+        let repo = container.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        seed_project(
+            &state,
+            &repo,
+            "shadow",
+            &timestamp("2026-07-18T09:00:00Z").to_rfc3339(),
+        )
+        .await;
+
+        // A rule that has already spent its allowance today, recorded where a restart cannot lose
+        // it. Nothing else in this test carries state between the ticks below.
+        sqlx::query("UPDATE scheduler_state SET fires_date = '2026-07-18', fires_today = ?")
+            .bind(i64::from(DAILY_CAP))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        scheduler_tick(&state, timestamp("2026-07-18T10:10:00Z")).await;
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "a spent allowance must survive the restart");
+
+        // And it is spent for that day only — the date is what resets it, so there is no midnight
+        // sweep to miss.
+        scheduler_tick(&state, timestamp("2026-07-19T10:10:00Z")).await;
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "the next day starts with a fresh allowance");
+
+        let (date, count): (Option<String>, i64) =
+            sqlx::query_as("SELECT fires_date, fires_today FROM scheduler_state")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(date.as_deref(), Some("2026-07-19"));
+        assert_eq!(count, 1, "the stale count resets rather than accumulating");
+    }
+
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -787,7 +859,7 @@ mod tests {
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, &repo, "active", &old).await;
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let (run_id, mode, project_id): (i64, String, Option<String>) =
             sqlx::query_as("SELECT id, mode, project_id FROM runs")
@@ -854,7 +926,7 @@ mod tests {
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let (mode, prompt): (String, String) = sqlx::query_as("SELECT mode, prompt FROM runs")
             .fetch_one(&state.pool)
@@ -885,7 +957,7 @@ mod tests {
         .await
         .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs")
             .fetch_one(&state.pool)
@@ -915,7 +987,7 @@ mod tests {
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs")
             .fetch_one(&state.pool)
@@ -932,7 +1004,7 @@ mod tests {
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let (mode, project_id): (String, Option<String>) =
             sqlx::query_as("SELECT mode, project_id FROM runs")
@@ -959,7 +1031,7 @@ mod tests {
         .await
         .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -982,7 +1054,7 @@ mod tests {
         let now = timestamp("2026-07-18T10:10:00Z");
         seed_project(&state, project.path(), "shadow", "not-a-date").await;
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let stored: String = sqlx::query_scalar(
             "SELECT last_fired_at FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'r1'",
@@ -1009,7 +1081,7 @@ mod tests {
             .await
             .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -1049,7 +1121,7 @@ mod tests {
         .await
         .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         // Only the pre-existing spend row remains; the over-budget scheduler fired no new run.
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
@@ -1070,7 +1142,7 @@ mod tests {
             .await
             .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -1090,7 +1162,7 @@ mod tests {
             .await
             .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -1110,7 +1182,7 @@ mod tests {
             .await
             .unwrap();
 
-        scheduler_tick(&state, now, &mut HashMap::new()).await;
+        scheduler_tick(&state, now).await;
 
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
