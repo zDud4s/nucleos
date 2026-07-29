@@ -14,6 +14,7 @@ use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::hooks::pretooluse_decision;
 use crate::inspect;
+use crate::presets;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
@@ -59,6 +60,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/diff", get(get_project_diff))
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
+        .route("/presets", get(list_presets).post(create_preset))
+        .route(
+            "/presets/{id}",
+            get(get_preset).put(update_preset).delete(delete_preset),
+        )
+        .route("/presets/{id}/run", post(run_preset))
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
@@ -1168,6 +1175,104 @@ async fn get_runs(
     .await
     .map(Json)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn preset_status(error: &presets::PresetError) -> StatusCode {
+    match error {
+        presets::PresetError::DuplicateName => StatusCode::CONFLICT,
+        presets::PresetError::Invalid(_) => StatusCode::BAD_REQUEST,
+        presets::PresetError::NotFound => StatusCode::NOT_FOUND,
+        presets::PresetError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn list_presets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<presets::Preset>>, StatusCode> {
+    presets::list(&state.pool).await.map(Json).map_err(|error| {
+        tracing::warn!(%error, "listing presets failed");
+        preset_status(&error)
+    })
+}
+
+async fn create_preset(
+    State(state): State<AppState>,
+    Json(request): Json<presets::PresetRequest>,
+) -> Result<Json<presets::Preset>, StatusCode> {
+    presets::create(&state.pool, &request.name, request.run)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "creating preset failed");
+            preset_status(&error)
+        })
+}
+
+async fn get_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<presets::Preset>, StatusCode> {
+    presets::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "reading preset failed");
+            preset_status(&error)
+        })?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn update_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<presets::PresetRequest>,
+) -> Result<Json<presets::Preset>, StatusCode> {
+    presets::update(&state.pool, id, &request.name, request.run)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "updating preset failed");
+            preset_status(&error)
+        })
+}
+
+async fn delete_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    presets::delete(&state.pool, id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "deleting preset failed");
+            preset_status(&error)
+        })
+}
+
+async fn run_preset(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<runs::CreateRunResponse>, StatusCode> {
+    let preset = presets::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(preset_id = id, %error, "reading preset to run failed");
+            preset_status(&error)
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Delegate to the sole person-initiated run front door. It owns the fail-closed global kill
+    // switch, uncancellable launch window, and conversion from run-domain errors to HTTP status.
+    runs::create_run(
+        State(state),
+        Json(runs::CreateRunRequest {
+            prompt: preset.prompt,
+            project_id: preset.project_id,
+            cwd: preset.cwd,
+            mode: preset.mode,
+        }),
+    )
+    .await
 }
 
 async fn list_awaiting_approval_runs(
@@ -2575,6 +2680,158 @@ mod tests {
         assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
         assert_eq!(entries[0]["summary"], "global summary");
         assert_eq!(parsed, serde_json::to_value(legacy_entries).unwrap());
+    }
+
+    fn preset_body(name: &str, prompt: &str, mode: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "name": name,
+                "prompt": prompt,
+                "project_id": "project-a",
+                "cwd": "C:/repo/project-a",
+                "mode": mode,
+            })
+            .to_string(),
+        )
+    }
+
+    async fn preset_response(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Body,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn presets_are_stored_and_duplicate_or_unknown_requests_are_mapped() {
+        let state = test_state().await;
+        let (status, created) = preset_response(
+            state.clone(),
+            "POST",
+            "/presets",
+            preset_body("daily", "check the branch", "real"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = created["id"].as_i64().unwrap();
+
+        let (status, fetched) = preset_response(
+            state.clone(),
+            "GET",
+            &format!("/presets/{id}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["name"], "daily");
+        assert_eq!(fetched["prompt"], "check the branch");
+
+        assert_eq!(
+            preset_response(
+                state.clone(),
+                "POST",
+                "/presets",
+                preset_body("daily", "another", "real"),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            preset_response(state.clone(), "GET", "/presets/999", Body::empty())
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            preset_response(
+                state,
+                "POST",
+                "/presets",
+                Body::from(r#"{"name":"bad","prompt":"x","mode":"worktree"}"#),
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_run_obeys_the_global_kill_switch() {
+        let state = test_state().await;
+        let (_, preset) = preset_response(
+            state.clone(),
+            "POST",
+            "/presets",
+            preset_body("stopped", "do not start", "real"),
+        )
+        .await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preset_response(
+                state,
+                "POST",
+                &format!("/presets/{}/run", preset["id"].as_i64().unwrap()),
+                Body::empty(),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_run_uses_the_saved_run_request_fields() {
+        let state = test_state().await;
+        let (_, preset) = preset_response(
+            state.clone(),
+            "POST",
+            "/presets",
+            preset_body("launch", "inspect project", "real"),
+        )
+        .await;
+        let (_, started) = preset_response(
+            state.clone(),
+            "POST",
+            &format!("/presets/{}/run", preset["id"].as_i64().unwrap()),
+            Body::empty(),
+        )
+        .await;
+        let id = started["id"].as_i64().unwrap();
+        let row: (String, Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT prompt, project_id, cwd, mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "inspect project");
+        assert_eq!(row.1.as_deref(), Some("project-a"));
+        assert_eq!(row.2.as_deref(), Some("C:/repo/project-a"));
+        assert_eq!(row.3, "real");
     }
 
     #[tokio::test]

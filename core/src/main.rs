@@ -14,6 +14,7 @@ mod inspect;
 mod logging;
 mod mailfiles;
 mod mcp_tools;
+mod presets;
 mod proposals;
 mod redact;
 mod repo_trigger;
