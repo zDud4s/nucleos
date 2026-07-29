@@ -203,14 +203,11 @@ pub fn class_ready(reviewed: i64, agree: i64) -> bool {
     reviewed >= READINESS_MIN_REVIEWED && agree * 100 >= READINESS_MIN_AGREE_PERCENT * reviewed
 }
 
-/// The classifier decisions that mean it held an action BACK, rather than waving it through.
-const WITHHELD_DECISIONS: [&str; 2] = ["pending_approval", "deny"];
-
 /// A project may leave shadow once it has exercised at least one action class, EVERY exercised
-/// class clears the bar, and at least one of those ready classes is one the classifier WITHHELD
-/// (`pending_approval` or `deny`). Classes never exercised don't block (a project would otherwise
-/// wait forever on a `deploy` it never attempts), but zero exercised classes is NOT promotable —
-/// "no evidence" must not read as "all the evidence is good".
+/// class clears the bar, and at least one of those ready classes contains ONLY decisions where the
+/// classifier WITHHELD (`pending_approval` or `deny`). Classes never exercised don't block (a
+/// project would otherwise wait forever on a `deploy` it never attempts), but zero exercised
+/// classes is NOT promotable — "no evidence" must not read as "all the evidence is good".
 ///
 /// The withheld requirement is the part that looks redundant and is not: a corpus made entirely of
 /// `allow` decisions validates the classifier's PERMISSIVENESS — that it lets through what it
@@ -227,11 +224,10 @@ pub fn promotable(classes_ready: i64, classes_total: i64, withheld_classes_ready
 /// `worktree`-mode decision was actually enforced, not a hypothetical the human could still overrule.
 /// Projects with no shadow decisions are absent from the map (the caller reads that as `(0, 0, 0)`).
 ///
-/// `decision` joins the GROUP BY without changing its cardinality: every exit point in
-/// `classifier.rs` fixes one decision per action class, so the pair is a functional dependency and
-/// the rows are exactly the ones grouping by class alone produced. Grouped rather than aggregated
-/// for that reason — a `MAX(CASE ...)` would imply a choice among several decisions that a class
-/// cannot have.
+/// Each action class contributes exactly one row, even when historical classifier versions recorded
+/// different decisions for it. Review and agreement counts therefore cover the whole class. A class
+/// counts as withheld only when every recorded decision is `pending_approval` or `deny`; any
+/// `allow` makes the conservative result "not withheld" so mixed evidence cannot unlock promotion.
 pub async fn shadow_readiness(
     pool: &SqlitePool,
 ) -> sqlx::Result<std::collections::HashMap<String, (i64, i64, i64)>> {
@@ -239,28 +235,31 @@ pub async fn shadow_readiness(
         "SELECT
              runs.project_id AS project_id,
              shadow_decisions.action_class AS action_class,
-             shadow_decisions.decision AS decision,
+             MIN(CASE
+                 WHEN shadow_decisions.decision IN ('pending_approval', 'deny') THEN 1
+                 ELSE 0
+             END) AS withheld,
              {REVIEWED_DISTINCT} AS reviewed,
              {AGREE_DISTINCT} AS agree
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.mode = 'shadow'
-         GROUP BY runs.project_id, shadow_decisions.action_class, shadow_decisions.decision"
+         GROUP BY runs.project_id, shadow_decisions.action_class"
     );
 
     // Same `AssertSqlSafe` reasoning as `scoreboard`: the only interpolation is `AGREE_CASE`.
-    let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    let rows: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
         .await?;
 
     let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
-    for (project_id, _action_class, decision, reviewed, agree) in rows {
+    for (project_id, _action_class, withheld, reviewed, agree) in rows {
         let entry = readiness.entry(project_id).or_insert((0, 0, 0));
         entry.1 += 1;
         if class_ready(reviewed, agree) {
             entry.0 += 1;
-            if WITHHELD_DECISIONS.contains(&decision.as_str()) {
+            if withheld != 0 {
                 entry.2 += 1;
             }
         }
@@ -698,6 +697,37 @@ mod tests {
         assert_eq!(
             (classes_ready, classes_total, withheld_classes_ready),
             (2, 2, 0)
+        );
+        assert!(!promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_class_with_two_decisions_counts_as_one_class() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // Historical classifier versions can leave one action class carrying more than one
+        // decision. Both row-groups independently clear the review bar, but they are still evidence
+        // for one exercised class.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+            insert_shadow(&pool, run, "read-local", "pending_approval", Some("reject")).await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap();
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (1, 1, 0),
+            "one action class must not become two readiness classes when its decision changes"
         );
         assert!(!promotable(
             classes_ready,

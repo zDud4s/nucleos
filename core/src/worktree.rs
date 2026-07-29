@@ -1303,6 +1303,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn release_defers_removal_on_a_failed_preserve() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-29T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+        std::fs::write(info.path.join("failure.txt"), "must survive release\n")
+            .expect("write uncommitted work");
+
+        // `--no-verify` does not bypass commit signing. Pointing signing at an absent binary makes
+        // preservation fail before release can remove the worktree.
+        assert!(git_ok(
+            &info.path,
+            &[
+                OsStr::new("config"),
+                OsStr::new("commit.gpgSign"),
+                OsStr::new("true"),
+            ],
+        ));
+        let missing_signer = root.path().join("missing-gpg.exe");
+        assert!(git_ok(
+            &info.path,
+            &[
+                OsStr::new("config"),
+                OsStr::new("gpg.program"),
+                missing_signer.as_os_str(),
+            ],
+        ));
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::Released
+        );
+
+        assert!(info.path.is_dir(), "the worktree directory must survive");
+        assert_eq!(
+            std::fs::read_to_string(info.path.join("failure.txt")).expect("read surviving work"),
+            "must survive release\n"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn preserve_skips_ignored_paths_and_respects_the_ceiling() {
         let _lock = env_lock();
         let repo = init_space_free_repo();
