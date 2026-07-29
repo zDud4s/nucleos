@@ -13,13 +13,13 @@
 # Every stack runs even when an earlier one fails — a summary of three real failures beats
 # stopping at the first and re-running twice to discover the other two.
 #
-# Usage: scripts/gates.sh [core|sidecars|shell|all]   (default: all)
+# Usage: scripts/gates.sh [core|sidecars|shell|security|all]   (default: all)
 set -uo pipefail
 
 target="${1:-all}"
 case "$target" in
-  core|sidecars|shell|all) ;;
-  *) echo "usage: $0 [core|sidecars|shell|all]" >&2; exit 2 ;;
+  core|sidecars|shell|security|all) ;;
+  *) echo "usage: $0 [core|sidecars|shell|security|all]" >&2; exit 2 ;;
 esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -91,6 +91,26 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     # outright ("referenced project may not disable emit").
     run "shell: typecheck" shell npx tsc -b
     run "shell: test"      shell npm test
+  fi
+fi
+
+# The stack targets are offline and hermetic; these are neither. `cargo audit` fetches RustSec's
+# advisory database, and both need tools the other gates do not, so putting them in `all` would make
+# the everyday local command need network access and two extra installs.
+if [ "$target" = security ]; then
+  if ! command -v cargo-audit >/dev/null 2>&1; then
+    echo "cargo-audit missing — run cargo install cargo-audit --locked first" >&2
+    failures="$failures  security: cargo-audit not installed"$'\n'
+  else
+    run "security: deps" . cargo audit
+  fi
+
+  if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "gitleaks missing — run go install github.com/zricethezav/gitleaks/v8@v8.30.0 first" >&2
+    failures="$failures  security: gitleaks not installed"$'\n'
+  else
+    # Never print a detected secret into a CI log: `--redact` is part of this gate's contract.
+    run "security: secrets" . gitleaks detect --redact --no-banner
   fi
 fi
 
