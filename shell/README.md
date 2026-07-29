@@ -49,8 +49,9 @@ npx tsc -b            # NOT `tsc -b --noEmit` — a referenced project may not d
 ```
 
 Those last two are the shell's half of the gate; `bash scripts/gates.sh shell`
-from the repo root runs exactly them. There is no CI to defer to — the
-repository has no remote, so nothing runs these but you.
+from the repo root runs exactly them, and `.github/workflows/ci.yml` calls that
+same script. The workflow does not run yet — the repository has no remote, and
+Actions reads workflows server-side — so for now nothing runs these but you.
 
 ## Things that are load-bearing
 

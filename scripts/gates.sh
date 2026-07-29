@@ -2,9 +2,13 @@
 # Run every gate this repo treats as its definition of green, for all three stacks.
 #
 # These commands used to live only in people's shell history, which is how a red suite and an
-# AGENTS.md claiming "green" managed to coexist. They are not in a GitHub workflow because this
-# repo has no remote and Actions reads workflows server-side: a committed .github/ would describe
-# checks that never run. Here they run.
+# AGENTS.md claiming "green" managed to coexist. This script is where they live now, and
+# `.github/workflows/ci.yml` calls it rather than repeating them — one definition of green, run in
+# two places.
+#
+# The workflow does not run yet: this repo has no remote, and Actions reads workflows server-side.
+# It is committed anyway because it is the thing you need in place BEFORE the first push, not
+# after — otherwise whoever adds the remote has to know to write it.
 #
 # Every stack runs even when an earlier one fails — a summary of three real failures beats
 # stopping at the first and re-running twice to discover the other two.

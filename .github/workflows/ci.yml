@@ -1,0 +1,87 @@
+# The three gates `scripts/gates.sh` runs, run again on push.
+#
+# windows-latest is not a preference. The núcleo is Windows-only by construction: `keyring` builds
+# with the windows-native-keyring-store backend, autostart shells out to `schtasks`, and the run
+# supervisor to `taskkill /T /F`. There is no other runner this crate compiles on.
+#
+# Each job calls `scripts/gates.sh <stack>` rather than repeating its commands. The commands moved
+# into that script precisely because living in shell history is how a red suite and an AGENTS.md
+# claiming "green" managed to coexist; copying them here would recreate the same split, one file
+# further away.
+#
+# Three jobs rather than one `gates.sh all`, because the script deliberately runs every stack even
+# after one fails — the useful property locally, where you want all three answers in one pass. In CI
+# the jobs give the same completeness in parallel, and name which stack broke without reading a log.
+
+name: gates
+
+on:
+  push:
+  pull_request:
+
+# A second push supersedes the first: the older run is answering a question nobody is asking now.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain is named here on purpose: `rust-toolchain.toml` pins
+      # stable-x86_64-pc-windows-gnu, and `rustup show` is what installs it from that file rather
+      # than assuming a later command will. The components are then added explicitly, because the
+      # pin does not list them and a default-profile install is a convention, not a guarantee.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          rustup component add clippy rustfmt
+
+      # The workspace root is the repo root (`Cargo.toml` has `members = ["core"]`), which is this
+      # action's default — `shell/src-tauri` is deliberately excluded from it and keeps its own
+      # lockfile, and no gate builds it.
+      - uses: Swatinem/rust-cache@v2
+
+      - run: bash scripts/gates.sh core
+
+  sidecars:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The highest any sidecar's go.mod asks for. `gates.sh` discovers the modules rather than
+          # listing them, so a new sidecar needs nothing here unless it needs a newer Go.
+          go-version: '1.26.x'
+          cache-dependency-path: sidecars/*/go.sum
+
+      - run: bash scripts/gates.sh sidecars
+
+  shell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: shell/package-lock.json
+
+      # `gates.sh shell` refuses to run without node_modules rather than installing them, because
+      # locally that state means "you have not set this up", not "install it for me".
+      - name: Install shell dependencies
+        working-directory: shell
+        run: npm ci
+
+      - run: bash scripts/gates.sh shell
