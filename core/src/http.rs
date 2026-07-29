@@ -68,6 +68,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/diff", get(get_project_diff))
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
+        .route(
+            "/webhooks/push",
+            post(post_webhook_push)
+                .layer(DefaultBodyLimit::max(crate::webhook::WEBHOOK_BODY_LIMIT)),
+        )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -147,6 +152,32 @@ async fn health() -> impl IntoResponse {
 
 async fn health_readout(State(state): State<AppState>) -> Json<health::HealthReadout> {
     Json(health::readout(state).await)
+}
+
+async fn post_webhook_push(
+    State(state): State<AppState>,
+    Json(delivery): Json<crate::webhook::Delivery>,
+) -> Result<(StatusCode, Json<crate::webhook::DeliveryOutcome>), StatusCode> {
+    let outcome = crate::webhook::deliver(&state, delivery, chrono::Utc::now())
+        .await
+        .map_err(|error| match error {
+            crate::webhook::DeliveryError::Invalid => StatusCode::BAD_REQUEST,
+            crate::webhook::DeliveryError::Unconfigured => StatusCode::NOT_FOUND,
+            crate::webhook::DeliveryError::Storage(error) => {
+                tracing::warn!(%error, "webhook delivery storage failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            crate::webhook::DeliveryError::Config(error) => {
+                tracing::warn!(%error, "webhook project configuration could not be read");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    let status = match outcome {
+        crate::webhook::DeliveryOutcome::Fired { .. } => StatusCode::ACCEPTED,
+        crate::webhook::DeliveryOutcome::Duplicate => StatusCode::OK,
+        crate::webhook::DeliveryOutcome::Deferred { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    Ok((status, Json(outcome)))
 }
 
 async fn status() -> impl IntoResponse {
@@ -1782,6 +1813,28 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_webhook_body_is_refused() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/push")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(vec![
+                        b'x';
+                        crate::webhook::WEBHOOK_BODY_LIMIT + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     async fn api_token_request(

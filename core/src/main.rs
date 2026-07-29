@@ -31,6 +31,7 @@ mod sidecar;
 mod state;
 mod storage;
 mod triage;
+mod webhook;
 mod wip;
 mod worktree;
 

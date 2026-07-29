@@ -131,6 +131,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// The current HTTP entry points that create a new run.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
+    (Method::POST, "/webhooks/push"),
     (Method::POST, "/presets/{id}/run"),
     (Method::POST, "/assistant/message"),
     (Method::POST, "/email/triage"),
@@ -385,6 +386,7 @@ mod tests {
             .route("/feed", get(|| async {}))
             .route("/runs", get(|| async {}).post(|| async {}))
             .route("/runs/{id}", get(|| async {}))
+            .route("/webhooks/push", post(|| async {}))
             .route("/presets", get(|| async {}).post(|| async {}))
             .route("/presets/{id}/run", post(|| async {}))
             .route("/assistant/message", post(|| async {}))
@@ -722,6 +724,7 @@ mod tests {
         }
         for (method, uri) in [
             ("POST", "/runs"),
+            ("POST", "/webhooks/push"),
             ("POST", "/autopilot/kill"),
             ("POST", "/autopilot/budget"),
             ("POST", "/autopilot/state"),
@@ -746,6 +749,7 @@ mod tests {
 
         for uri in [
             "/runs",
+            "/webhooks/push",
             "/presets/7/run",
             "/assistant/message",
             "/email/triage",
