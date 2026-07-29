@@ -31,6 +31,25 @@ fn git_bin() -> String {
     std::env::var("NUCLEOS_GIT_BIN").unwrap_or_else(|_| "git".into())
 }
 
+/// Every git invocation in this module goes through here.
+///
+/// `core.fsmonitor` is a COMMAND STRING read from the repository git is pointed at, and these
+/// commands run inside project roots the daemon does not control — so a target repository can name
+/// a program that the daemon then executes as itself. Measured on git 2.50.1: `worktree add` runs
+/// it exactly once; `worktree prune`, `worktree remove` and `branch -d` do not, today. The flag
+/// goes on all of them anyway, because which commands refresh the index is a git implementation
+/// detail a later version may widen, and a guarantee that has to be re-derived per command is one
+/// that quietly stops holding.
+///
+/// The diff-side command strings `inspect.rs` disables (`diff.external`, a `textconv` filter) are
+/// deliberately absent: nothing here produces a diff, and carrying flags that cannot apply would
+/// advertise a protection that was never at issue in this module.
+fn git() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(git_bin());
+    command.arg("-c").arg("core.fsmonitor=");
+    command
+}
+
 pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo> {
     let root = worktree_root(project_root);
     if root.to_string_lossy().contains(' ') {
@@ -44,7 +63,7 @@ pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo
     let path = root.join(format!("run-{run_id}"));
     tokio::fs::create_dir_all(&root).await?;
 
-    let output = tokio::process::Command::new(git_bin())
+    let output = git()
         .arg("-C")
         .arg(project_root)
         .arg("worktree")
@@ -65,7 +84,7 @@ pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo
 }
 
 pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
-    let output = tokio::process::Command::new(git_bin())
+    let output = git()
         .arg("-C")
         .arg(project_root)
         .arg("worktree")
@@ -86,7 +105,7 @@ pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Res
 
 pub async fn remove(project_root: &Path, path: &Path, backoff: &[Duration]) -> io::Result<()> {
     let result = retry_with_backoff(backoff, || try_remove_once(project_root, path)).await;
-    let _ = tokio::process::Command::new(git_bin())
+    let _ = git()
         .arg("-C")
         .arg(project_root)
         .arg("worktree")
@@ -260,7 +279,7 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
 /// has not seen. The common case for a discarded run is a branch with no commits at all, which `-d`
 /// removes happily, so this collects the branches that actually accumulate.
 async fn delete_branch_if_merged(project_root: &str, branch: &str) -> bool {
-    tokio::process::Command::new(git_bin())
+    git()
         .arg("-C")
         .arg(project_root)
         .arg("branch")
@@ -331,7 +350,7 @@ pub(crate) async fn gc_pass(
         .map(|worktree| worktree.project_root.clone())
         .collect::<std::collections::HashSet<_>>();
     for project_root in project_roots {
-        let _ = tokio::process::Command::new(git_bin())
+        let _ = git()
             .arg("-C")
             .arg(project_root)
             .arg("worktree")
@@ -728,6 +747,46 @@ mod tests {
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
         assert_eq!(worktree_root(Path::new(r"C:\work\repo")), root.path());
+    }
+
+    /// `core.fsmonitor` is a command string, and git runs it whenever it refreshes the index —
+    /// measured on git 2.50.1, a `worktree add` fires it exactly once. The project root is a
+    /// repository the daemon does not control, so without `-c core.fsmonitor=` provisioning a
+    /// worktree executes whatever that repository named, as the daemon user. Run against the
+    /// unhardened command first, where the canary file appears.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_does_not_run_a_command_the_target_repository_names() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        // Forward slashes both ways: git hands the value to a shell, which reads a Windows
+        // backslash as an escape rather than a separator.
+        let canary = root.path().join("fsmonitor-canary.txt");
+        let canary_arg = canary.to_string_lossy().replace('\\', "/");
+        let hook = root.path().join("fsmonitor-probe.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho fired >> '{canary_arg}'\nexit 0\n"),
+        )
+        .expect("write fsmonitor probe");
+        let hook_arg = hook.to_string_lossy().replace('\\', "/");
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("core.fsmonitor"),
+                OsStr::new(hook_arg.as_str()),
+            ],
+        ));
+
+        create(repo.path(), 4242).await.expect("create worktree");
+
+        assert!(
+            !canary.exists(),
+            "the target repository's core.fsmonitor command was executed"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
