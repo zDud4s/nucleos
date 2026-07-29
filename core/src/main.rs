@@ -5,6 +5,7 @@ mod autostart;
 mod budget;
 mod classifier;
 mod config;
+mod contacts;
 mod daemon_client;
 mod email;
 mod feed;
