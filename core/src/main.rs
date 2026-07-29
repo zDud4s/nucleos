@@ -10,6 +10,7 @@ mod config;
 mod daemon_client;
 mod email;
 mod feed;
+mod gate;
 mod health;
 mod hooks;
 mod http;
@@ -287,6 +288,7 @@ async fn main() {
             mail_files_root,
         )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
 

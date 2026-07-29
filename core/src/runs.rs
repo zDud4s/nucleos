@@ -176,6 +176,7 @@ pub struct RunStatusResponse {
     pub id: i64,
     pub project_id: Option<String>,
     pub status: String,
+    pub gate_status: Option<String>,
     pub exit_code: Option<i32>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
@@ -384,6 +385,36 @@ pub(crate) fn warn_on_terminal_write_err(
     }
 }
 
+/// Stores the runner's complete event stream without making observability part of run correctness.
+async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    for (seq, payload) in stdout.lines().enumerate() {
+        let kind = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        // Observability must stay best-effort: a missing or temporarily unavailable history table
+        // cannot turn successfully completed work into a failed run.
+        let _ = sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(seq as i64)
+        .bind(kind)
+        .bind(payload)
+        .bind(&created_at)
+        .execute(pool)
+        .await;
+    }
+}
+
 /// Deliberately wide rather than taking an options struct: these are the axes on which a run's
 /// lifecycle actually differs (plan-only, resumed, retried, worktree-bound), and naming each one at
 /// every call site is what makes those differences readable where the runs are created.
@@ -398,12 +429,14 @@ fn spawn_run(
     plan_only: bool,
     resume_session_id: Option<String>,
     completion_feed: Option<(String, String)>,
+    gate_command: Option<String>,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
     daemon_token: String,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
+    let progress_timeout = state.progress_timeout;
     let run_timeout = state.run_timeout;
     let env = run_env(&daemon_token, id);
 
@@ -436,6 +469,7 @@ fn spawn_run(
                     resume_session_id.as_deref(),
                     None,
                     tool_policy,
+                    Some(progress_timeout),
                     session_tx,
                 ),
             )
@@ -454,13 +488,45 @@ fn spawn_run(
                     // user reads. The runner now also reports -1 for a stream that broke after
                     // launch, so that lands here as a failure rather than being mistaken for a
                     // launch failure and retried over work that was already applied.
-                    let terminal_status = if o.exit_code == 0 {
-                        "completed"
-                    } else {
-                        "failed"
+                    let terminal_status =
+                        if o.exit_code == crate::runner::PROGRESS_TIMEOUT_EXIT_CODE {
+                            "timed_out"
+                        } else if o.exit_code == 0 {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
+                    append_run_events(&pool, id, &o.stdout).await;
+                    // `run_prompt` does not return until the CLI process is dead and reaped. The
+                    // gate belongs after that boundary: an orphaned build can otherwise retain file
+                    // locks in the worktree for the lifetime of every later cleanup retry.
+                    let gate_outcome = match (
+                        terminal_status,
+                        gate_command.as_deref(),
+                        spawn_cwd.as_deref(),
+                    ) {
+                        ("completed", Some(command), Some(worktree)) => Some(
+                            crate::gate::run_gate(
+                                worktree,
+                                command,
+                                crate::state::DEFAULT_GATE_TIMEOUT,
+                            )
+                            .await,
+                        ),
+                        _ => None,
+                    };
+                    let (gate_status, gate_exit_code, gate_output) = match &gate_outcome {
+                        Some(crate::gate::GateOutcome::Passed) => (Some("passed"), None, None),
+                        Some(crate::gate::GateOutcome::Failed { exit_code, output }) => {
+                            (Some("failed"), Some(*exit_code), Some(output.as_str()))
+                        }
+                        Some(crate::gate::GateOutcome::Errored { reason }) => {
+                            (Some("errored"), None, Some(reason.as_str()))
+                        }
+                        None => (None, None, None),
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -468,27 +534,60 @@ fn spawn_run(
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.num_turns)
                     .bind(&completed_at)
                     .bind(attempt as i64)
+                    .bind(gate_status)
+                    .bind(gate_exit_code)
+                    .bind(gate_output)
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    warn_on_terminal_write_err(&completed, id, "completed");
+                    warn_on_terminal_write_err(&completed, id, terminal_status);
                     // The feed row announces this run *finished* — only true if this write won the
                     // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
                     // there first, so this attempt never actually completed as far as the runs table
                     // is concerned; appending anyway would announce a completion it denies.
-                    if matches!(&completed, Ok(result) if result.rows_affected() == 1)
-                        && let Some((kind, summary)) = completion_feed.as_ref()
+                    if terminal_status == "completed"
+                        && matches!(&completed, Ok(result) if result.rows_affected() == 1)
                     {
-                        let _ = crate::feed::append(
-                            &pool,
-                            feed_project_id.as_deref(),
-                            kind,
-                            summary,
-                            Some(id),
-                        )
-                        .await;
+                        match gate_outcome {
+                            Some(crate::gate::GateOutcome::Failed { exit_code, .. }) => {
+                                let _ = crate::feed::append(
+                                    &pool,
+                                    feed_project_id.as_deref(),
+                                    "worktree_gate_failed",
+                                    &format!("worktree gate failed with exit code {exit_code}"),
+                                    Some(id),
+                                )
+                                .await;
+                            }
+                            Some(crate::gate::GateOutcome::Errored { reason }) => {
+                                let _ = crate::feed::append(
+                                    &pool,
+                                    feed_project_id.as_deref(),
+                                    "worktree_gate_failed",
+                                    &format!("worktree gate errored: {reason}"),
+                                    Some(id),
+                                )
+                                .await;
+                            }
+                            Some(crate::gate::GateOutcome::Passed) | None => {
+                                if let Some((kind, summary)) = completion_feed.as_ref() {
+                                    let _ = crate::feed::append(
+                                        &pool,
+                                        feed_project_id.as_deref(),
+                                        kind,
+                                        summary,
+                                        Some(id),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                     }
                     break;
                 }
@@ -635,12 +734,26 @@ pub async fn create_run_inner(
             "shadow run completed".to_owned(),
         )
     });
+    let mut gate_command = None;
 
     if mode == "worktree" {
         let project_root = cwd.as_deref().expect("worktree cwd validated above");
         let worktree_project_id = project_id
             .as_deref()
             .expect("worktree project_id validated above");
+        gate_command = match crate::config::load_schedule_rules(std::path::Path::new(project_root))
+        {
+            Ok(rules) => rules.gate_command,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = worktree_project_id,
+                    project_root,
+                    %error,
+                    "failed to load worktree gate configuration"
+                );
+                None
+            }
+        };
         let info = match crate::worktree::create(std::path::Path::new(project_root), id).await {
             Ok(info) => info,
             Err(error) => {
@@ -727,6 +840,7 @@ pub async fn create_run_inner(
         plan_only,
         None,
         completion_feed,
+        gate_command,
         max_attempts,
         tool_policy,
         daemon_token,
@@ -755,8 +869,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .clone()
         .ok_or(ResumeError::NotResumable("proposal has no tool_name"))?;
 
-    let (wt_project_id, wt_path) = sqlx::query_as::<_, (String, String)>(
-        "SELECT project_id, path FROM worktrees WHERE run_id = ? AND removed_at IS NULL",
+    let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT project_id, project_root, path
+         FROM worktrees WHERE run_id = ? AND removed_at IS NULL",
     )
     .bind(original_run_id)
     .fetch_optional(&state.pool)
@@ -849,6 +964,19 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 
     // After the commit, because the resume row does not exist to be UPDATEd before it.
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
+    let gate_command = match crate::config::load_schedule_rules(std::path::Path::new(&project_root))
+    {
+        Ok(rules) => rules.gate_command,
+        Err(error) => {
+            tracing::warn!(
+                project_id = %wt_project_id,
+                project_root = %project_root,
+                %error,
+                "failed to load worktree gate configuration for resumed run"
+            );
+            None
+        }
+    };
     spawn_run(
         state,
         state.runner.clone(),
@@ -862,6 +990,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             "worktree_run_completed".to_owned(),
             format!("resumed run completed on nucleos/run-{original_run_id}"),
         )),
+        gate_command,
         1,
         // A resume continues an approved worktree run, which is autopilot work: the hook and the
         // classifier govern it, exactly as they governed the run being resumed.
@@ -878,9 +1007,20 @@ pub async fn get_run(
 ) -> Result<Json<RunStatusResponse>, StatusCode> {
     let row = sqlx::query_as::<
         _,
-        (i64, Option<String>, String, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>),
+        (
+            i64,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<i32>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+        ),
     >(
-        "SELECT id, project_id, status, exit_code, stdout, stderr, session_id, cost_usd FROM runs WHERE id = ?",
+        "SELECT id, project_id, status, gate_status, exit_code, stdout, stderr, session_id, cost_usd
+         FROM runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -892,11 +1032,12 @@ pub async fn get_run(
         id: row.0,
         project_id: row.1,
         status: row.2,
-        exit_code: row.3,
-        stdout: row.4,
-        stderr: row.5,
-        session_id: row.6,
-        cost_usd: row.7,
+        gate_status: row.3,
+        exit_code: row.4,
+        stdout: row.5,
+        stderr: row.6,
+        session_id: row.7,
+        cost_usd: row.8,
     }))
 }
 
@@ -1017,6 +1158,7 @@ pub async fn reconcile_stranded_approvals(pool: &sqlx::SqlitePool) -> Result<u64
     Ok(reconciled.len() as u64)
 }
 
+#[rustfmt::skip]
 #[cfg(test)]
 mod tests {
     // These `current_thread` async tests hold `worktree::test_env_lock()` — a
@@ -1063,6 +1205,10 @@ mod tests {
                 stderr: String::new(),
                 session_id: Some("fake-session-id".into()),
                 cost_usd: Some(0.05),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             })),
             delay: std::sync::Mutex::new(delay),
             last_plan_only: std::sync::Mutex::new(None),
@@ -1078,6 +1224,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout,
         };
         (state, runner)
@@ -1162,6 +1309,24 @@ mod tests {
         let repo = container.path().join("repo");
         initialize_repo(&repo);
         (container, repo)
+    }
+
+    fn configure_gate(repo: &FsPath, command: &str) {
+        std::fs::create_dir_all(repo.join(".ai")).expect("create project config directory");
+        std::fs::write(
+            repo.join(".ai").join("autopilot.yaml"),
+            format!("gate_command: '{command}'\n"),
+        )
+        .expect("write project gate command");
+        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("configure gate"),
+            ],
+        ));
     }
 
     async fn test_state_with(delay: Option<Duration>, run_timeout: Duration) -> AppState {
@@ -1507,6 +1672,87 @@ mod tests {
         panic!("run did not reach completed status in time, last status: {status}");
     }
 
+    #[tokio::test]
+    async fn a_completed_run_persists_its_token_usage() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: "measured".into(),
+            stderr: String::new(),
+            session_id: Some("usage-session".into()),
+            cost_usd: Some(0.08),
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cache_read_tokens: Some(20_000),
+            num_turns: Some(12),
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "persist usage").await;
+
+        for _ in 0..20 {
+            let parsed = get_run_status(&app, created.id).await;
+            if parsed.status == "completed" {
+                let usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+                    "SELECT input_tokens, output_tokens, cache_read_tokens, num_turns
+                         FROM runs WHERE id = ?",
+                )
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(usage, (Some(1000), Some(500), Some(20_000), Some(12)));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach completed status in time");
+    }
+
+    #[tokio::test]
+    async fn a_run_persists_its_trajectory_events() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"system","subtype":"init","session_id":"trajectory-session"}"#,
+                r#"{"type":"assistant","message":{"content":[]}}"#,
+                r#"{"type":"result","result":"done"}"#,
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            session_id: Some("trajectory-session".into()),
+            cost_usd: Some(0.01),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "persist trajectory").await;
+
+        for _ in 0..20 {
+            let parsed = get_run_status(&app, created.id).await;
+            if parsed.status == "completed" {
+                let events: Vec<(i64,)> =
+                    sqlx::query_as("SELECT seq FROM run_events WHERE run_id = ? ORDER BY seq")
+                        .bind(created.id)
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(events.len(), 3);
+                assert_eq!(
+                    events.into_iter().map(|(seq,)| seq).collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach completed status in time");
+    }
+
     /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by
     /// strangers, so the CLI must launch unable to touch anything — and every other mode must keep
     /// the tools its work depends on, or this hardening silently breaks the autopilot.
@@ -1781,6 +2027,136 @@ mod tests {
         assert!(summary.contains(&branch));
 
         let _ = crate::worktree::remove(&repo, &spawn_cwd, &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worktree_run_records_its_gate_verdict() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-gate-passes-");
+        configure_gate(&repo, r#"sh -c "exit 0""#);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = get_run_status(&app, id).await.status;
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, "completed");
+
+        let gate_status: Option<String> =
+            sqlx::query_scalar("SELECT gate_status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(gate_status.as_deref(), Some("passed"));
+
+        let worktree_path: String =
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failing_gate_is_announced_in_the_feed() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-gate-fails-");
+        configure_gate(&repo, r#"sh -c "exit 7""#);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let mut feed_kind = None;
+        for _ in 0..100 {
+            feed_kind = sqlx::query_scalar::<_, String>(
+                "SELECT kind FROM feed WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if feed_kind.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(feed_kind.as_deref(), Some("worktree_gate_failed"));
+
+        let worktree_path: String =
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_project_without_a_gate_command_is_unaffected() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-without-gate-");
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = get_run_status(&app, id).await.status;
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, "completed");
+
+        let gate_status: Option<String> =
+            sqlx::query_scalar("SELECT gate_status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(gate_status, None);
+
+        let feed_kind: String =
+            sqlx::query_scalar("SELECT kind FROM feed WHERE run_id = ? ORDER BY id DESC LIMIT 1")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(feed_kind, "worktree_run_completed");
+
+        let worktree_path: String =
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
     }
 
     /// The kill switch has to stop the endpoint, not just the schedulers. Every spawned CLI holds
@@ -2445,6 +2821,34 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("run did not reach timed_out status in time, last status: {status}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_run_is_timed_out_before_the_wall_clock() {
+        let run_timeout = Duration::from_secs(10);
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), run_timeout).await;
+        state.progress_timeout = Duration::from_millis(50);
+        let app = test_router(state);
+        let started = tokio::time::Instant::now();
+        let created = create_run_via_http(&app, "a run whose event stream goes silent").await;
+
+        let mut status = String::new();
+        for _ in 0..50 {
+            let parsed = get_run_status(&app, created.id).await;
+            status = parsed.status.clone();
+            if status == "timed_out" {
+                assert!(
+                    started.elapsed() < run_timeout,
+                    "the progress deadline must fire before the wall-clock timeout"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "silent run did not reach timed_out before its wall clock, last status: {status}"
+        );
     }
 
     #[tokio::test]

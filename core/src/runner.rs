@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
@@ -8,6 +9,20 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Ollama stays on loopback so local triage cannot accidentally send message bodies off-machine,
 /// matching the daemon's own localhost-only transport boundary.
 pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+
+/// Internal outcome code for a process terminated after its event stream stopped making progress.
+///
+/// OS process exit codes cannot produce this value, so callers can distinguish a progress deadline
+/// from an ordinary CLI failure without treating already-started work as a retryable launch error.
+pub const PROGRESS_TIMEOUT_EXIT_CODE: i32 = i32::MIN;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub num_turns: Option<i64>,
+}
 
 // `cost_usd` is an `f64`, which is not `Eq`, so `RunOutcome` can only derive `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +35,10 @@ pub struct RunOutcome {
     pub session_id: Option<String>,
     /// Captured from the CLI's final `result` message — only known when the run ends (spec §3.3/§8.5).
     pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub num_turns: Option<i64>,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
@@ -38,7 +57,49 @@ pub enum ToolPolicy {
     None,
 }
 
+fn advertised_tools_from_init(init: &serde_json::Value) -> Option<Vec<String>> {
+    init.get("tools")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .map(|tool| tool.as_str().map(str::to_string))
+        .collect()
+}
+
+fn advertised_tools_violate(policy: ToolPolicy, advertised: Option<&[String]>) -> Option<String> {
+    if policy == ToolPolicy::Unrestricted {
+        return None;
+    }
+    let Some(advertised) = advertised else {
+        return Some(format!(
+            "ToolPolicy::{policy:?} could not be verified: CLI init event did not advertise tools"
+        ));
+    };
+
+    let offending: Vec<&str> = match policy {
+        ToolPolicy::Unrestricted => unreachable!("handled above"),
+        ToolPolicy::None => advertised.iter().map(String::as_str).collect(),
+        ToolPolicy::McpOnly => advertised
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                name.strip_prefix("mcp__nucleos__")
+                    .is_none_or(|tool| tool.contains("__"))
+            })
+            .collect(),
+    };
+
+    (!offending.is_empty()).then(|| {
+        format!(
+            "ToolPolicy::{policy:?} violated by CLI-advertised tools: {}",
+            offending.join(", ")
+        )
+    })
+}
+
 /// Built-in tool names denied under `ToolPolicy::McpOnly`.
+///
+/// This list still applies the restriction, but the init-event assertion means it is no longer the
+/// only thing standing between a CLI upgrade and a silently wider policy.
 ///
 /// A blocklist, and deliberately so: measured against CLI 2.1.198, `--allowedTools` does not
 /// restrict anything — it only GRANTS permission on top of what is already allowed — and a
@@ -171,6 +232,40 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
         }
     }
     reply
+}
+
+/// Usage reported by the final `result` event of a Claude `stream-json` transcript.
+///
+/// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
+/// result event itself; the token counts live under its `usage` object.
+pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
+    let mut usage = RunUsage::default();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+            && value.get("type").and_then(|kind| kind.as_str()) == Some("result")
+        {
+            usage = RunUsage {
+                input_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                output_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("output_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                cache_read_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("cache_read_input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                num_turns: value.get("num_turns").and_then(serde_json::Value::as_i64),
+            };
+        }
+    }
+    usage
 }
 
 /// Kills a spawned CLI's whole process TREE when a run is dropped mid-flight.
@@ -379,6 +474,7 @@ pub trait CommandRunner: Send + Sync {
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome>;
 }
@@ -449,6 +545,7 @@ impl CommandRunner for OllamaRunner {
         _resume_session_id: Option<&str>,
         _mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        _progress_timeout: Option<Duration>,
         _session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         if tool_policy != ToolPolicy::None {
@@ -533,6 +630,10 @@ impl CommandRunner for OllamaRunner {
                 stderr,
                 session_id: None,
                 cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             });
         }
 
@@ -542,6 +643,10 @@ impl CommandRunner for OllamaRunner {
             stderr: String::new(),
             session_id: None,
             cost_usd: Some(0.0),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
         })
     }
 }
@@ -561,6 +666,7 @@ impl CommandRunner for ClaudeCliRunner {
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
@@ -623,11 +729,24 @@ impl CommandRunner for ClaudeCliRunner {
         let mut stdout_acc = String::new();
         let mut session_id: Option<String> = None;
         let mut cost_usd: Option<f64> = None;
+        let mut usage = RunUsage::default();
 
         let mut post_launch_error: Option<std::io::Error> = None;
+        let mut policy_violation: Option<String> = None;
+        let mut progress_timeout_elapsed: Option<Duration> = None;
 
         loop {
-            let line = match lines.next_line().await {
+            let next_line = match progress_timeout {
+                Some(deadline) => match tokio::time::timeout(deadline, lines.next_line()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        progress_timeout_elapsed = Some(deadline);
+                        break;
+                    }
+                },
+                None => lines.next_line().await,
+            };
+            let line = match next_line {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(error) => {
@@ -645,15 +764,34 @@ impl CommandRunner for ClaudeCliRunner {
                     // Best-effort: the receiver may already be gone if the run was cancelled.
                     let _ = session_tx.send(sid.to_string());
                 }
-                if v.get("type").and_then(|x| x.as_str()) == Some("result")
-                    && let Some(c) = v
+                if v.get("type").and_then(|x| x.as_str()) == Some("system")
+                    && v.get("subtype").and_then(|x| x.as_str()) == Some("init")
+                {
+                    let advertised = advertised_tools_from_init(&v);
+                    if let Some(reason) =
+                        advertised_tools_violate(tool_policy, advertised.as_deref())
+                    {
+                        policy_violation = Some(reason);
+                        break;
+                    }
+                }
+                if v.get("type").and_then(|x| x.as_str()) == Some("result") {
+                    usage = extract_usage(&line);
+                    if let Some(c) = v
                         .get("total_cost_usd")
                         .or_else(|| v.get("cost_usd"))
                         .and_then(|x| x.as_f64())
-                {
-                    cost_usd = Some(c);
+                    {
+                        cost_usd = Some(c);
+                    }
                 }
             }
+        }
+
+        if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
+            // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
+            drop(tree_killer.take());
+            let _ = child.start_kill();
         }
 
         let status = match child.wait().await {
@@ -669,14 +807,34 @@ impl CommandRunner for ClaudeCliRunner {
         }
 
         let mut stderr_str = stderr_task.await.unwrap_or_default();
-        let exit_code = match &post_launch_error {
+        if let Some(reason) = &policy_violation {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!("nucleos: {reason}\n"));
+        }
+        if let Some(deadline) = progress_timeout_elapsed {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
+            ));
+        }
+        let exit_code = match (
+            progress_timeout_elapsed,
+            &policy_violation,
+            &post_launch_error,
+        ) {
+            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            (None, Some(_), _) => -1,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            Some(error) => {
+            (None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            None => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         Ok(RunOutcome {
@@ -685,6 +843,10 @@ impl CommandRunner for ClaudeCliRunner {
             stderr: stderr_str,
             session_id,
             cost_usd,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            num_turns: usage.num_turns,
         })
     }
 }
@@ -723,6 +885,7 @@ impl CommandRunner for FakeCommandRunner {
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         {
@@ -752,6 +915,10 @@ impl CommandRunner for FakeCommandRunner {
                 stderr: String::new(),
                 session_id: Some("fake-session-id".into()),
                 cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             })
         };
         // Emit session_id *before* any simulated delay — mirrors the real CLI's early `init` message.
@@ -759,8 +926,36 @@ impl CommandRunner for FakeCommandRunner {
             let _ = session_tx.send(sid.clone());
         }
         let delay = *self.delay.lock().unwrap();
-        if let Some(d) = delay {
-            tokio::time::sleep(d).await;
+        match (delay, progress_timeout) {
+            (Some(delay), Some(deadline)) => {
+                let mut emitted_stdout = String::new();
+                let stdout_lines = outcome
+                    .stdout
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                for line in stdout_lines {
+                    if tokio::time::timeout(deadline, tokio::time::sleep(delay))
+                        .await
+                        .is_err()
+                    {
+                        let mut timed_out = outcome;
+                        timed_out.exit_code = PROGRESS_TIMEOUT_EXIT_CODE;
+                        timed_out.stdout = emitted_stdout;
+                        if !timed_out.stderr.is_empty() && !timed_out.stderr.ends_with('\n') {
+                            timed_out.stderr.push('\n');
+                        }
+                        timed_out.stderr.push_str(&format!(
+                            "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
+                        ));
+                        return Ok(timed_out);
+                    }
+                    emitted_stdout.push_str(&line);
+                    emitted_stdout.push('\n');
+                }
+            }
+            (Some(delay), None) => tokio::time::sleep(delay).await,
+            (None, _) => {}
         }
         Ok(outcome)
     }
@@ -779,6 +974,10 @@ mod tests {
                 stderr: String::new(),
                 session_id: Some("sess-1".into()),
                 cost_usd: Some(1.5),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             })),
             last_plan_only: std::sync::Mutex::new(None),
             ..Default::default()
@@ -793,6 +992,7 @@ mod tests {
                 None,
                 None,
                 ToolPolicy::Unrestricted,
+                None,
                 tx,
             )
             .await
@@ -800,6 +1000,61 @@ mod tests {
         assert_eq!(outcome.stdout, "42");
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.cost_usd, Some(1.5));
+    }
+
+    #[tokio::test]
+    async fn progress_deadline_holds_while_events_arrive() {
+        let progress_timeout = std::time::Duration::from_millis(30);
+        let runner = FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(RunOutcome {
+                exit_code: 0,
+                stdout: [
+                    r#"{"type":"system","subtype":"init","session_id":"sess-progress"}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"one"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"two"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"three"}]}}"#,
+                    r#"{"type":"result","subtype":"success","result":"done"}"#,
+                ]
+                .join("\n"),
+                stderr: String::new(),
+                session_id: Some("sess-progress".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
+            })),
+            // The fake releases one canned event per interval. The complete run therefore lasts
+            // well beyond the progress deadline while every individual quiet gap stays below it.
+            delay: std::sync::Mutex::new(Some(std::time::Duration::from_millis(20))),
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runner.run_prompt(
+                "keep working",
+                &[],
+                None,
+                false,
+                None,
+                None,
+                ToolPolicy::Unrestricted,
+                Some(progress_timeout),
+                tx,
+            ),
+        )
+        .await
+        .expect("events should keep the progress deadline alive")
+        .expect("the fake run should complete");
+
+        assert_eq!(outcome.exit_code, 0);
+        assert!(
+            started.elapsed() >= progress_timeout * 3,
+            "the fixture must outlive the progress deadline several times over"
+        );
     }
 
     #[tokio::test]
@@ -816,6 +1071,7 @@ mod tests {
                     None,
                     None,
                     ToolPolicy::Unrestricted,
+                    None,
                     tx,
                 )
                 .await
@@ -839,6 +1095,7 @@ mod tests {
                 Some("sess-9"),
                 None,
                 ToolPolicy::Unrestricted,
+                None,
                 tx,
             )
             .await
@@ -862,6 +1119,7 @@ mod tests {
                 None,
                 Some(std::path::Path::new("C:/tmp/mcp.json")),
                 ToolPolicy::McpOnly,
+                None,
                 tx,
             )
             .await
@@ -892,6 +1150,32 @@ mod tests {
         assert_eq!(extract_reply(stdout), None);
     }
 
+    #[test]
+    fn usage_absent_is_none_not_zero() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.08}"#;
+
+        let usage = extract_usage(stdout);
+
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.num_turns, None);
+    }
+
+    #[test]
+    fn partial_usage_keeps_missing_fields_none() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.08,"num_turns":12,"usage":{"input_tokens":1000,"output_tokens":500,"num_turns":99}}"#;
+
+        let usage = extract_usage(stdout);
+
+        assert_eq!(usage.input_tokens, Some(1000));
+        assert_eq!(usage.output_tokens, Some(500));
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.num_turns, Some(12));
+    }
+
     /// The transcript a triage run actually produces: the model's own text arrives in a `content`
     /// array several events BEFORE the `result`, and any parse that takes the first JSON array it
     /// sees would answer with the model's thinking instead of its verdict.
@@ -909,6 +1193,87 @@ mod tests {
 
     fn args_for(policy: ToolPolicy, mcp: Option<&Path>) -> Vec<String> {
         cli_args("triage this", "sonnet", false, None, mcp, policy)
+    }
+
+    fn advertised_tools_from_event(json: &str) -> Option<Vec<String>> {
+        let init = serde_json::from_str(json).expect("test init event must be valid JSON");
+        advertised_tools_from_init(&init)
+    }
+
+    #[test]
+    fn an_init_without_tools_fails_a_toolless_policy_run() {
+        let advertised = advertised_tools_from_event(r#"{"type":"system","subtype":"init"}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::None, advertised.as_deref()).is_some());
+    }
+
+    #[test]
+    fn an_init_without_tools_fails_an_mcp_only_policy_run() {
+        let advertised = advertised_tools_from_event(r#"{"type":"system","subtype":"init"}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, advertised.as_deref()).is_some());
+    }
+
+    #[test]
+    fn an_explicitly_empty_tool_advertisement_passes_a_toolless_policy_run() {
+        let advertised =
+            advertised_tools_from_event(r#"{"type":"system","subtype":"init","tools":[]}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::None, advertised.as_deref()).is_none());
+    }
+
+    #[test]
+    fn unrestricted_is_unaffected_by_missing_or_empty_tool_advertisements() {
+        let missing = advertised_tools_from_event(r#"{"type":"system","subtype":"init"}"#);
+        let empty = advertised_tools_from_event(r#"{"type":"system","subtype":"init","tools":[]}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, missing.as_deref()).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, empty.as_deref()).is_none());
+    }
+
+    #[test]
+    fn a_toolless_policy_that_receives_tools_fails_the_run() {
+        let empty = Vec::new();
+        assert!(advertised_tools_violate(ToolPolicy::None, Some(&empty)).is_none());
+
+        let advertised = vec!["Bash".to_string()];
+        assert!(advertised_tools_violate(ToolPolicy::None, Some(&advertised)).is_some());
+    }
+
+    #[test]
+    fn mcp_only_rejects_an_advertised_builtin() {
+        let mcp_tools = vec![
+            "mcp__nucleos__get_run".to_string(),
+            "mcp__nucleos__list_projects".to_string(),
+        ];
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&mcp_tools)).is_none());
+
+        let mut with_builtin = mcp_tools;
+        with_builtin.push("Bash".to_string());
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&with_builtin)).is_some());
+    }
+
+    #[test]
+    fn advertised_tool_match_is_segment_not_prefix() {
+        let valid = vec!["mcp__nucleos__get_run".to_string()];
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&valid)).is_none());
+
+        let nested_server = vec!["mcp__nucleos__x__evil".to_string()];
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&nested_server)).is_some());
+    }
+
+    #[test]
+    fn unrestricted_accepts_any_advertised_tool_set() {
+        let empty = Vec::new();
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, Some(&empty)).is_none());
+
+        let builtins = vec![
+            "Read".to_string(),
+            "Bash".to_string(),
+            "Write".to_string(),
+            "Edit".to_string(),
+        ];
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, Some(&builtins)).is_none());
     }
 
     /// An autopilot run keeps the full tool set — the hook and the classifier are what govern it,
@@ -999,6 +1364,7 @@ mod tests {
                         None,
                         None,
                         ToolPolicy::Unrestricted,
+                        None,
                         tx
                     )
                     .await
@@ -1016,6 +1382,7 @@ mod tests {
                     None,
                     None,
                     ToolPolicy::Unrestricted,
+                    None,
                     tx
                 )
                 .await
@@ -1064,6 +1431,7 @@ mod tests {
                 None,
                 None,
                 tool_policy,
+                None,
                 session_tx,
             )
             .await

@@ -250,6 +250,7 @@ fn spawn_assistant_turn(
                 // does not enforce that on its own — an allowlist only grants — so the policy is
                 // what actually keeps a Telegram turn away from the filesystem and the shell.
                 crate::runner::ToolPolicy::McpOnly,
+                None,
                 session_tx,
             ),
         )
@@ -360,6 +361,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }

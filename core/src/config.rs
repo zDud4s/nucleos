@@ -162,6 +162,8 @@ pub struct AutopilotRules {
     pub schedules: Vec<ScheduleRule>,
     #[serde(default)]
     pub repo_triggers: Vec<RepoTrigger>,
+    #[serde(default)]
+    pub gate_command: Option<String>,
 }
 
 pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRules> {

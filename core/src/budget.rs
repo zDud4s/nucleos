@@ -48,6 +48,16 @@ pub enum BudgetDecision {
 pub struct SpendRow {
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    // Retained as loaded run telemetry for non-pricing readers. Without a price table these fields
+    // must not influence the conservative time approximation.
+    #[allow(dead_code)]
+    pub input_tokens: Option<i64>,
+    #[allow(dead_code)]
+    pub output_tokens: Option<i64>,
+    #[allow(dead_code)]
+    pub cache_read_tokens: Option<i64>,
+    #[allow(dead_code)]
+    pub num_turns: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -58,7 +68,8 @@ const MIN_APPROX_SECONDS: i64 = 60;
 
 fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
     let end = row.completed_at.unwrap_or(now);
-    let seconds = (end - row.created_at).num_seconds().max(MIN_APPROX_SECONDS);
+    let elapsed_seconds = (end - row.created_at).num_seconds();
+    let seconds = elapsed_seconds.max(MIN_APPROX_SECONDS);
     (seconds as f64 / 3600.0) * rate_per_hour
 }
 
@@ -162,10 +173,21 @@ fn window_start(period: BudgetPeriod, now: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
-    // (session_id, cost_usd, created_at, completed_at)
-    type RawRow = (Option<String>, Option<f64>, String, Option<String>);
+    // (session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
+    // created_at, completed_at)
+    type RawRow = (
+        Option<String>,
+        Option<f64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+    );
     let raw: Vec<RawRow> = sqlx::query_as(
-        "SELECT session_id, cost_usd, created_at, completed_at
+        "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
+                created_at, completed_at
          FROM runs
          WHERE mode IN ('shadow', 'worktree', 'email_triage')",
     )
@@ -181,14 +203,29 @@ async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
     };
 
     raw.into_iter()
-        .map(|(session_id, cost_usd, created_at, completed_at)| {
-            Ok(SpendRow {
+        .map(
+            |(
                 session_id,
                 cost_usd,
-                created_at: parse(&created_at)?,
-                completed_at: completed_at.as_deref().map(parse).transpose()?,
-            })
-        })
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                num_turns,
+                created_at,
+                completed_at,
+            )| {
+                Ok(SpendRow {
+                    session_id,
+                    cost_usd,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    num_turns,
+                    created_at: parse(&created_at)?,
+                    completed_at: completed_at.as_deref().map(parse).transpose()?,
+                })
+            },
+        )
         .collect()
 }
 
@@ -361,10 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn time_approx_keeps_its_floor_even_when_usage_was_reported() {
+        let measured = SpendRow {
+            session_id: Some("measured".into()),
+            cost_usd: None,
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cache_read_tokens: Some(20_000),
+            num_turns: Some(12),
+            created_at: ts("2026-07-20T10:00:00Z"),
+            completed_at: Some(ts("2026-07-20T10:00:30Z")),
+        };
+        let now = ts("2026-07-20T11:00:00Z");
+
+        // Usage without a reported price cannot make an unknown-cost run free or cheaper.
+        approx(time_approx(&measured, now, 3.0), 0.05);
+    }
+
+    #[test]
     fn single_completed_run_counts_its_cost() {
         let rows = vec![SpendRow {
             session_id: Some("s1".into()),
             cost_usd: Some(0.5),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:05:00Z")),
         }];
@@ -382,12 +441,20 @@ mod tests {
             SpendRow {
                 session_id: Some("s1".into()),
                 cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
             },
             SpendRow {
                 session_id: Some("s1".into()),
                 cost_usd: Some(0.9),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:40:00Z"),
                 completed_at: Some(ts("2026-07-20T10:50:00Z")),
             },
@@ -408,12 +475,20 @@ mod tests {
             SpendRow {
                 session_id: Some("s1".into()),
                 cost_usd: Some(40.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
             },
             SpendRow {
                 session_id: Some("s1".into()),
                 cost_usd: Some(0.02),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:40:00Z"),
                 completed_at: Some(ts("2026-07-20T10:50:00Z")),
             },
@@ -430,6 +505,10 @@ mod tests {
         let rows = vec![SpendRow {
             session_id: Some("s1".into()),
             cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:30:00Z")),
         }];
@@ -445,12 +524,20 @@ mod tests {
             SpendRow {
                 session_id: Some("s1".into()),
                 cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
             },
             SpendRow {
                 session_id: Some("s1".into()),
                 cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:40:00Z"),
                 completed_at: Some(ts("2026-07-20T11:10:00Z")),
             },
@@ -467,6 +554,10 @@ mod tests {
         let rows = vec![SpendRow {
             session_id: Some("s1".into()),
             cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:00:00Z")),
         }];
@@ -483,12 +574,20 @@ mod tests {
             SpendRow {
                 session_id: None,
                 cost_usd: Some(0.2),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:05:00Z")),
             },
             SpendRow {
                 session_id: None,
                 cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
             },
@@ -505,6 +604,10 @@ mod tests {
         let rows = vec![SpendRow {
             session_id: Some("s1".into()),
             cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: None,
         }];
@@ -534,6 +637,24 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_gate_execution_is_not_an_autonomous_row() {
+        let pool = test_pool().await;
+        let worktree = tempfile::tempdir().expect("create temporary worktree");
+        let before = autonomous_rows(&pool).await.unwrap();
+
+        let outcome = crate::gate::run_gate(
+            worktree.path(),
+            r#"sh -c "exit 0""#,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, crate::gate::GateOutcome::Passed));
+        let after = autonomous_rows(&pool).await.unwrap();
+        assert_eq!(after.len(), before.len());
     }
 
     #[tokio::test]
