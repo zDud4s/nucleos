@@ -270,6 +270,15 @@ pub async fn pretooluse_decision(
         }
     }
 
+    // A denied action is answered and then counted. Answering was all this used to do, which left
+    // the run free to try the next spelling immediately — and against an unbounded number of
+    // attempts a lexical classifier is a puzzle with a solution rather than a boundary. The two
+    // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
+    // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
+    if classification.decision.decision == "deny" && is_in_flight {
+        count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+    }
+
     if classification.decision.decision == "pending_approval" {
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
@@ -296,6 +305,71 @@ pub async fn pretooluse_decision(
     }
 
     Json(classification.decision)
+}
+
+/// How many denied actions a run may attempt before it is stopped.
+///
+/// Not one: a run that reaches for something destructive, is told no, and takes a different route
+/// is behaving exactly as the gate intends, and killing it there would turn the gate into a
+/// tripwire. Not unbounded either, which is what it was. Three leaves room for an honest mistake
+/// and a retry, and far too little to search a grammar with.
+const DENIAL_LIMIT: i64 = 3;
+
+/// Records a denied attempt and, once a run has spent its allowance, stops it.
+///
+/// Terminated to `failed` rather than `awaiting_approval`: a denied action is destructive by
+/// classification, and the pause path exists to make an action approvable. Offering a human an
+/// "approve" button here would launder precisely the verdict that is supposed to be final — the
+/// single-use grant deliberately only ever lifts a `pending_approval`.
+async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name: &str) {
+    let denials: i64 = match sqlx::query_scalar(
+        "UPDATE runs SET denials = denials + 1 WHERE id = ? RETURNING denials",
+    )
+    .bind(run_id)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(count) => count,
+        // The action is still denied — that part never depended on this write. Only the allowance
+        // does, and the pool this shares with feed appends and status writes makes SQLITE_BUSY an
+        // ordinary event here. Sustained probing is many calls, of which lost counts are a
+        // minority; treating one lost count as a reason to kill the run would make a busy database
+        // indistinguishable from an attack.
+        Err(error) => {
+            tracing::warn!(run_id, %error, "could not count a denied action against the run");
+            return;
+        }
+    };
+
+    tracing::warn!(
+        run_id,
+        tool = %tool_name,
+        denials,
+        "pretooluse-decision: denied action {denials}/{DENIAL_LIMIT} for this run"
+    );
+    if denials < DENIAL_LIMIT {
+        return;
+    }
+
+    // Spawned and then awaited, for the same reason `pause_for_approval` is: terminating the run
+    // kills the CLI whose hook script owns the connection this handler is answering, so the request
+    // can vanish mid-handler and take an inline continuation with it.
+    let state = state.clone();
+    let tool_name = tool_name.to_owned();
+    let _ = tokio::spawn(async move {
+        if !finalize_termination(&state, run_id, "failed").await {
+            return;
+        }
+        let _ = crate::feed::append(
+            &state.pool,
+            None,
+            "run_stopped_probing",
+            &format!("run {run_id} was stopped after {denials} denied actions (last: {tool_name})"),
+            Some(run_id),
+        )
+        .await;
+    })
+    .await;
 }
 
 /// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
@@ -550,6 +624,92 @@ mod tests {
         )
         .await;
         assert_eq!(own.decision, "allow");
+    }
+
+    /// A `deny` used to cost the run nothing, so a lexical classifier could be searched: try a
+    /// spelling, get told no, try the next, forever, with nothing counting the attempts and nothing
+    /// watching. The allowance leaves room for an honest mistake and stops a search.
+    #[tokio::test]
+    async fn a_run_that_keeps_reaching_for_denied_actions_is_stopped() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+        let body = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"rm -rf /"}}}}"#
+        );
+
+        for attempt in 1..DENIAL_LIMIT {
+            assert_eq!(decide(&app, &body).await.decision, "deny");
+            assert!(
+                state.run_handles.lock().unwrap().contains_key(&run_id),
+                "attempt {attempt} is within the allowance and must not stop the run"
+            );
+        }
+
+        // The one that spends it. The action is still denied — being stopped is on top of the
+        // refusal, never instead of it.
+        assert_eq!(decide(&app, &body).await.decision, "deny");
+        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        // `failed`, not `awaiting_approval`: a denied action must never acquire an approve button.
+        assert_eq!(status, "failed");
+
+        let proposals = proposals::list_pending(&state.pool).await.unwrap();
+        assert!(
+            proposals.is_empty(),
+            "stopping a prober must not mint something a human can approve"
+        );
+    }
+
+    /// The allowance is per run, so one run spending it does not shorten another's.
+    #[tokio::test]
+    async fn each_run_gets_its_own_allowance() {
+        let state = test_state().await;
+        let spender = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let bystander = in_flight_run(&state, "worktree", Some("proj-2"), None, None).await;
+        let app = test_router(state.clone());
+
+        for _ in 0..DENIAL_LIMIT {
+            let body = format!(
+                r#"{{"run_id":{spender},"tool_name":"Bash","tool_input":{{"command":"rm -rf /"}}}}"#
+            );
+            decide(&app, &body).await;
+        }
+
+        assert!(!state.run_handles.lock().unwrap().contains_key(&spender));
+        assert!(state.run_handles.lock().unwrap().contains_key(&bystander));
+        let untouched: i64 = sqlx::query_scalar("SELECT denials FROM runs WHERE id = ?")
+            .bind(bystander)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(untouched, 0);
+    }
+
+    /// Shadow mode denies everything that is not read-only — that is its whole job, not evidence of
+    /// a run probing the gate. It returns before the classifier's verdict is ever counted.
+    #[tokio::test]
+    async fn a_shadow_runs_ordinary_refusals_do_not_spend_an_allowance() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "shadow", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+
+        for _ in 0..DENIAL_LIMIT + 2 {
+            let body = format!(
+                r#"{{"run_id":{run_id},"tool_name":"Edit","tool_input":{{"file_path":"a.txt"}}}}"#
+            );
+            assert_eq!(decide(&app, &body).await.decision, "deny");
+        }
+
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&run_id),
+            "a shadow run must survive doing exactly what shadow mode expects of it"
+        );
     }
 
     /// The single most important assertion in this pillar: a triage run gets NO tool, of any kind.
