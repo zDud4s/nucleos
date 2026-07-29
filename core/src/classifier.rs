@@ -412,28 +412,34 @@ fn path_has_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
 }
 
+/// Whether the command deletes something outside the run's workspace.
+///
+/// Read from every position and with the program's directory stripped, for the same reason
+/// `has_destructive_flags` is: anchoring on the first token whole meant `rm ../../secrets` was
+/// denied and `/bin/rm ../../secrets` — the same delete, escaping the same workspace — was not
+/// recognised as a delete at all.
 fn deletes_outside_cwd(command: &str, cwd: Option<&Path>) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
-    let tokens = shell_words(command);
-    let Some(program) = tokens.first().map(|value| value.to_ascii_lowercase()) else {
-        return false;
-    };
-    if !matches!(
-        program.as_str(),
-        "rm" | "rd" | "rmdir" | "del" | "remove-item"
-    ) {
-        return false;
-    }
+    let tokens: Vec<String> = shell_words(command)
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    let workspace = normalize_path(&cwd.to_string_lossy(), None);
 
-    delete_targets(&program, &tokens[1..])
-        .into_iter()
-        .any(|target| {
-            let target = normalize_path(target, Some(cwd));
-            let cwd = normalize_path(&cwd.to_string_lossy(), None);
-            target != cwd && !target.starts_with(&format!("{cwd}/"))
-        })
+    tokens.iter().enumerate().any(|(index, token)| {
+        let program = program_name(token);
+        if !matches!(program, "rm" | "rd" | "rmdir" | "del" | "remove-item") {
+            return false;
+        }
+        delete_targets(program, &tokens[index + 1..])
+            .into_iter()
+            .any(|target| {
+                let target = normalize_path(target, Some(cwd));
+                target != workspace && !target.starts_with(&format!("{workspace}/"))
+            })
+    })
 }
 
 fn delete_targets<'a>(program: &str, arguments: &'a [String]) -> Vec<&'a str> {
@@ -550,6 +556,34 @@ mod tests {
                 "destructive",
             );
         }
+    }
+
+    /// The containment check had the same first-token anchor as the flag check: `rm ../../secrets`
+    /// was denied, and the same delete spelled with a path was not recognised as a delete at all.
+    #[tokio::test]
+    async fn a_delete_escaping_the_workspace_is_denied_however_the_program_is_named() {
+        let cwd = Path::new(r"C:\work\repo");
+        for command in [
+            "rm ../../secrets",
+            "/bin/rm ../../secrets",
+            "sudo rm ../../secrets",
+            r"C:\tools\rm.exe C:\Windows\System32\drivers\etc\hosts",
+            "remove-item ../../secrets",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), Some(cwd)),
+                "deny",
+                "destructive",
+            );
+        }
+
+        // Inside the workspace stays ordinary — the check is about leaving it, not about deleting.
+        assert_eq!(
+            classify("Bash", &json!({ "command": "rm build/out.o" }), Some(cwd))
+                .decision
+                .decision,
+            "pending_approval"
+        );
     }
 
     /// The widening above must not swallow ordinary commands that merely mention a flag letter.
