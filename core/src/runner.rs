@@ -5,6 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Ollama stays on loopback so local triage cannot accidentally send message bodies off-machine,
+/// matching the daemon's own localhost-only transport boundary.
+pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+
 // `cost_usd` is an `f64`, which is not `Eq`, so `RunOutcome` can only derive `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunOutcome {
@@ -211,6 +215,153 @@ impl Drop for TreeKiller {
     }
 }
 
+/// Why an Ollama model cannot safely accept the local triage prompt.
+///
+/// The distinctions are operational rather than cosmetic: a smaller context needs a different
+/// model, an absent model needs installation, and an unreadable response means the probe itself is
+/// untrustworthy. Collapsing them would leave startup unable to tell an unsafe configuration from
+/// broken infrastructure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+    /// The model exists but Ollama reports a context below the prompt capacity contract.
+    ContextTooSmall {
+        available_tokens: usize,
+        required_tokens: usize,
+    },
+    /// Ollama explicitly reported that the requested model is unavailable.
+    ModelUnavailable(String),
+    /// A syntactically valid response omitted the object that describes the model.
+    MissingModelInfo,
+    /// Model information exists, but no architecture-specific context-length key does.
+    MissingContextLength,
+    /// Multiple context lengths without a declared architecture are unsafe to resolve by guessing:
+    /// choosing the wrong subsystem can make the probe bless a model that truncates the prompt.
+    AmbiguousContextLength,
+    /// A context-length key exists but does not contain a non-negative integer usable here.
+    InvalidContextLength,
+    /// The response was empty or was not JSON, so no safety claim can be made from it.
+    UnparseableResponse(String),
+}
+
+/// Whether startup may expose the configured local runner to triage runs.
+///
+/// `Disabled` means local triage does not run; it does **not** authorize substituting the remote
+/// CLI. Local inference exists so message bodies never leave the machine, and a silent remote
+/// fallback would violate that promise precisely when the failed probe is least visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalTriageDecision {
+    Enabled,
+    Disabled(String),
+}
+
+/// PURE: converts every context-probe outcome into an operator-readable startup decision.
+pub fn local_triage_decision(probe: Result<(), ModelError>) -> LocalTriageDecision {
+    match probe {
+        Ok(()) => LocalTriageDecision::Enabled,
+        Err(ModelError::ContextTooSmall {
+            available_tokens,
+            required_tokens,
+        }) => LocalTriageDecision::Disabled(format!(
+            "local model context has {available_tokens} tokens but {required_tokens} are required"
+        )),
+        Err(ModelError::ModelUnavailable(reason)) => {
+            LocalTriageDecision::Disabled(if reason.trim().is_empty() {
+                "the configured local model is unavailable".to_string()
+            } else {
+                format!("the configured local model is unavailable: {reason}")
+            })
+        }
+        Err(ModelError::MissingModelInfo) => {
+            LocalTriageDecision::Disabled("the local model probe omitted model_info".to_string())
+        }
+        Err(ModelError::MissingContextLength) => LocalTriageDecision::Disabled(
+            "the local model probe omitted its context length".to_string(),
+        ),
+        Err(ModelError::AmbiguousContextLength) => LocalTriageDecision::Disabled(
+            "the local model probe reported ambiguous context lengths".to_string(),
+        ),
+        Err(ModelError::InvalidContextLength) => LocalTriageDecision::Disabled(
+            "the local model probe reported an invalid context length".to_string(),
+        ),
+        Err(ModelError::UnparseableResponse(reason)) => {
+            LocalTriageDecision::Disabled(if reason.trim().is_empty() {
+                "the local model probe returned an unreadable response".to_string()
+            } else {
+                format!("the local model probe returned an unreadable response: {reason}")
+            })
+        }
+    }
+}
+
+/// PURE: decides whether an Ollama `/api/show` response proves the model can hold the local prompt.
+///
+/// Ollama prefixes `context_length` with the model architecture, and multimodal models may report
+/// several such keys. The declared architecture is therefore authoritative; without it, only a
+/// single unambiguous key can support a safety claim. Every missing or unreadable field fails
+/// closed because guessing a limit lets Ollama silently truncate third-party mail before it is
+/// classified.
+pub fn interpret_context_probe(
+    response_json: &str,
+    required_tokens: usize,
+) -> Result<(), ModelError> {
+    if response_json.trim().is_empty() {
+        return Err(ModelError::UnparseableResponse(
+            "empty response".to_string(),
+        ));
+    }
+
+    let response: serde_json::Value = serde_json::from_str(response_json)
+        .map_err(|error| ModelError::UnparseableResponse(error.to_string()))?;
+
+    if let Some(error) = response.get("error") {
+        let reason = error
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        return Err(ModelError::ModelUnavailable(reason));
+    }
+
+    let model_info = response
+        .get("model_info")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ModelError::MissingModelInfo)?;
+    let context_length = match model_info.get("general.architecture") {
+        Some(architecture) => {
+            let architecture = architecture
+                .as_str()
+                .ok_or(ModelError::MissingContextLength)?;
+            let context_key = format!("{architecture}.context_length");
+            model_info
+                .get(&context_key)
+                .ok_or(ModelError::MissingContextLength)?
+        }
+        None => {
+            let mut context_lengths = model_info
+                .iter()
+                .filter(|(key, _)| key.ends_with(".context_length"));
+            let Some((_, context_length)) = context_lengths.next() else {
+                return Err(ModelError::MissingContextLength);
+            };
+            if context_lengths.next().is_some() {
+                return Err(ModelError::AmbiguousContextLength);
+            }
+            context_length
+        }
+    };
+    let available_tokens = context_length
+        .as_u64()
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .ok_or(ModelError::InvalidContextLength)?;
+
+    if available_tokens < required_tokens {
+        return Err(ModelError::ContextTooSmall {
+            available_tokens,
+            required_tokens,
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Runs one `claude -p` invocation. `cwd`, when set, is the run's working directory (spec §3.3).
@@ -230,6 +381,169 @@ pub trait CommandRunner: Send + Sync {
         tool_policy: ToolPolicy,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome>;
+}
+
+/// A tool-free Ollama boundary for local triage.
+///
+/// This is deliberately a separate `CommandRunner` rather than a mode on `ClaudeCliRunner`: the
+/// chat endpoint has no tool or session protocol, and pretending otherwise would make ignored CLI
+/// controls look enforced. The retained client also reuses connections across local batches.
+pub struct OllamaRunner {
+    client: reqwest::Client,
+    base_url: String,
+    model: String,
+}
+
+impl OllamaRunner {
+    /// Builds a runner for one Ollama model. Trimming trailing slashes keeps the endpoint stable
+    /// when configuration uses either `http://localhost:11434` spelling.
+    pub fn new(base_url: String, model: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model,
+        }
+    }
+}
+
+/// Returns the reason an answer cannot safely enter the content-verdict path.
+///
+/// Ollama's grammar guarantees JSON shape at sampling time, not useful content. A measured 4B
+/// model returned `[]` deterministically for real receipt mail; treating that as success increments
+/// per-message content failures and can permanently file valid mail as `failed`.
+fn unusable_local_answer(answer: &str) -> Option<String> {
+    let value: serde_json::Value = match serde_json::from_str(answer) {
+        Ok(value) => value,
+        Err(error) => {
+            return Some(format!("local triage answer was not valid JSON: {error}"));
+        }
+    };
+    let Some(entries) = value.as_array() else {
+        return Some("local triage answer was not a JSON array".to_string());
+    };
+    if entries.is_empty() {
+        return Some("local triage answer contained no verdicts".to_string());
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let usable_summary = entry
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|summary| !summary.trim().is_empty());
+        if !usable_summary {
+            return Some(format!(
+                "local triage verdict {index} had no usable summary"
+            ));
+        }
+    }
+    None
+}
+
+#[async_trait]
+impl CommandRunner for OllamaRunner {
+    async fn run_prompt(
+        &self,
+        prompt: &str,
+        _env: &[(String, String)],
+        _cwd: Option<&Path>,
+        _plan_only: bool,
+        _resume_session_id: Option<&str>,
+        _mcp_config: Option<&Path>,
+        tool_policy: ToolPolicy,
+        _session_tx: UnboundedSender<String>,
+    ) -> std::io::Result<RunOutcome> {
+        if tool_policy != ToolPolicy::None {
+            return Err(std::io::Error::other(
+                "Ollama local inference supports only ToolPolicy::None",
+            ));
+        }
+
+        let message_count = prompt.matches("=== BEGIN MESSAGE id=").count();
+        if message_count > crate::triage::LOCAL_BATCH_MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "local triage prompt contains {message_count} messages; at most {} fit the probed context contract",
+                    crate::triage::LOCAL_BATCH_MAX
+                ),
+            ));
+        }
+        let required_items = message_count.max(1);
+        let mut format = serde_json::json!({
+            "type": "array",
+            "minItems": required_items,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "class": {
+                        "type": "string",
+                        "enum": ["urgent", "action", "info", "noise"]
+                    },
+                    "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                    }
+                },
+                "required": ["id", "class", "summary"]
+            }
+        });
+        if message_count > 0 {
+            format
+                .as_object_mut()
+                .expect("format is constructed as an object above")
+                .insert("maxItems".to_string(), serde_json::json!(message_count));
+        }
+
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&serde_json::json!({
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false,
+                "think": false,
+                "options": {
+                    "num_ctx": crate::triage::LOCAL_NUM_CTX,
+                    "temperature": 0
+                },
+                "format": format
+            }))
+            .send()
+            .await
+            .map_err(std::io::Error::other)?
+            .error_for_status()
+            .map_err(std::io::Error::other)?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(std::io::Error::other)?;
+        let answer = response
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                std::io::Error::other("Ollama response did not contain message.content")
+            })?
+            .to_string();
+
+        if let Some(stderr) = unusable_local_answer(&answer) {
+            return Ok(RunOutcome {
+                exit_code: 1,
+                stdout: answer,
+                stderr,
+                session_id: None,
+                cost_usd: Some(0.0),
+            });
+        }
+
+        Ok(RunOutcome {
+            exit_code: 0,
+            stdout: answer,
+            stderr: String::new(),
+            session_id: None,
+            cost_usd: Some(0.0),
+        })
+    }
 }
 
 pub struct ClaudeCliRunner {
@@ -708,5 +1022,227 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(*runner.calls.lock().unwrap(), 3);
+    }
+
+    async fn ollama_runner_returning(answer: &'static str) -> OllamaRunner {
+        let app = axum::Router::new()
+            .route(
+                "/api/show",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "model_info": {"qwen2.context_length": 8192}
+                    }))
+                }),
+            )
+            .fallback(axum::routing::post(move || async move {
+                axum::Json(serde_json::json!({
+                    "response": answer,
+                    "message": {"role": "assistant", "content": answer},
+                    "done": true
+                }))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        OllamaRunner::new(format!("http://{address}"), "qwen2".to_string())
+    }
+
+    async fn run_local(
+        runner: &OllamaRunner,
+        tool_policy: ToolPolicy,
+    ) -> std::io::Result<RunOutcome> {
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+        runner
+            .run_prompt(
+                "triage this message",
+                &[],
+                None,
+                false,
+                None,
+                None,
+                tool_policy,
+                session_tx,
+            )
+            .await
+    }
+
+    /// A local inference has no billable session. Leaving the cost unknown is not neutral:
+    /// `budget::time_approx` assigns every unknown-cost run a paid sixty-second floor, so free mail
+    /// triage would steadily consume the autonomy budget.
+    #[tokio::test]
+    async fn local_triage_run_reports_zero_cost() {
+        let runner =
+            ollama_runner_returning(r#"[{"id":1,"class":"info","summary":"monthly report"}]"#)
+                .await;
+
+        let outcome = run_local(&runner, ToolPolicy::None).await.unwrap();
+
+        assert_eq!(outcome.cost_usd, Some(0.0));
+        assert_eq!(outcome.session_id, None);
+    }
+
+    /// The local model boundary has no tool protocol at all. Accepting a wider policy would turn a
+    /// caller mistake into an apparently sandboxed triage run whose actual capability was never
+    /// enforced.
+    #[tokio::test]
+    async fn a_local_runner_refuses_a_tool_policy_other_than_none() {
+        let runner =
+            ollama_runner_returning(r#"[{"id":1,"class":"info","summary":"monthly report"}]"#)
+                .await;
+
+        for policy in [ToolPolicy::Unrestricted, ToolPolicy::McpOnly] {
+            assert!(
+                run_local(&runner, policy).await.is_err(),
+                "{policy:?} must be rejected before local inference"
+            );
+        }
+    }
+
+    /// Structurally valid JSON can still contain no usable verdict. Treating that as success sends
+    /// every unanswered message through the content-failure counter and can permanently file it as
+    /// failed after two model answers that said nothing.
+    #[tokio::test]
+    async fn an_empty_or_summaryless_answer_is_an_infrastructure_failure() {
+        for answer in ["[]", r#"[{"id":1,"class":"info","summary":""}]"#] {
+            let runner = ollama_runner_returning(answer).await;
+            let outcome = run_local(&runner, ToolPolicy::None).await.unwrap();
+            assert_ne!(
+                outcome.exit_code, 0,
+                "an unusable answer must not look like a completed triage run: {answer}"
+            );
+        }
+    }
+
+    /// Ollama's response grammar cannot make a verdict useful: malformed JSON, the wrong top-level
+    /// shape, or a missing usable summary must fail at the runner boundary. Otherwise unanswered
+    /// mail is counted as a content failure and can be permanently filed as unreadable.
+    #[tokio::test]
+    async fn a_verdict_without_a_summary_key_is_unusable() {
+        for answer in [
+            r#"[{"id":1,"class":"info"}]"#,
+            r#"[{"id":1,"class":"info","summary":"   "}]"#,
+            r#"{"id":1,"class":"info","summary":"x"}"#,
+            "not json at all",
+        ] {
+            let runner = ollama_runner_returning(answer).await;
+            let outcome = run_local(&runner, ToolPolicy::None).await.unwrap();
+
+            assert_ne!(
+                outcome.exit_code, 0,
+                "an unusable local verdict must not look successful: {answer}"
+            );
+        }
+    }
+
+    /// The negative cases carry the safety property: a missing key, a missing model, or a context
+    /// one token too small must all fail closed instead of letting Ollama truncate the worst-case
+    /// Portuguese mail batch.
+    #[test]
+    fn the_context_probe_rejects_a_model_that_cannot_hold_the_worst_case() {
+        let required_tokens = 8192;
+        for response in [
+            r#"{"model_info":{"qwen2.context_length":8191}}"#,
+            r#"{"error":"model 'qwen2' not found"}"#,
+            r#"{"model_info":{}}"#,
+            "",
+            "{not-json",
+        ] {
+            let result: Result<(), ModelError> = interpret_context_probe(response, required_tokens);
+            assert!(
+                result.is_err(),
+                "an unsafe or unreadable probe must fail closed: {response:?}"
+            );
+        }
+
+        let result: Result<(), ModelError> = interpret_context_probe(
+            r#"{"model_info":{"qwen2.context_length":8192}}"#,
+            required_tokens,
+        );
+        assert!(result.is_ok());
+    }
+
+    /// Startup must fail closed for every unsafe or unreadable probe result: silently substituting
+    /// the remote CLI would leak the message bodies that selecting local triage was meant to keep
+    /// on the machine.
+    #[test]
+    fn a_failed_startup_probe_disables_local_triage() {
+        assert!(matches!(
+            local_triage_decision(Ok(())),
+            LocalTriageDecision::Enabled
+        ));
+
+        for error in [
+            ModelError::ContextTooSmall {
+                available_tokens: 4096,
+                required_tokens: 8192,
+            },
+            ModelError::ModelUnavailable("qwen3.5:4b is not installed".to_string()),
+            ModelError::MissingModelInfo,
+            ModelError::MissingContextLength,
+            ModelError::InvalidContextLength,
+            ModelError::UnparseableResponse("invalid JSON".to_string()),
+            ModelError::AmbiguousContextLength,
+        ] {
+            match local_triage_decision(Err(error)) {
+                LocalTriageDecision::Disabled(reason) => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "a disabled local runner needs an operator-facing reason"
+                    );
+                }
+                LocalTriageDecision::Enabled => {
+                    panic!("a failed probe must never enable local triage")
+                }
+            }
+        }
+
+        let LocalTriageDecision::Disabled(reason) =
+            local_triage_decision(Err(ModelError::ContextTooSmall {
+                available_tokens: 4096,
+                required_tokens: 8192,
+            }))
+        else {
+            panic!("an undersized context must disable local triage");
+        };
+        assert!(reason.contains("4096"), "{reason}");
+        assert!(reason.contains("8192"), "{reason}");
+    }
+
+    /// Multimodal model metadata can advertise several context lengths. Selecting the first key
+    /// lets an unrelated projector either reject a safe model or bless an unsafe one, while
+    /// accepting ambiguous metadata makes a safety claim the probe cannot support.
+    #[test]
+    fn the_probe_picks_the_context_of_the_declared_architecture() {
+        let required_tokens = 8192;
+
+        let language_model = interpret_context_probe(
+            r#"{"model_info":{"general.architecture":"qwen2","clip.context_length":77,"qwen2.context_length":32768}}"#,
+            required_tokens,
+        );
+        assert!(
+            language_model.is_ok(),
+            "the declared qwen2 architecture has enough context: {language_model:?}"
+        );
+
+        let vision_model = interpret_context_probe(
+            r#"{"model_info":{"general.architecture":"clip","clip.context_length":77,"qwen2.context_length":32768}}"#,
+            required_tokens,
+        );
+        assert!(
+            vision_model.is_err(),
+            "the declared clip architecture is too small"
+        );
+
+        let ambiguous = interpret_context_probe(
+            r#"{"model_info":{"clip.context_length":77,"qwen2.context_length":32768}}"#,
+            required_tokens,
+        );
+        assert!(
+            ambiguous.is_err(),
+            "multiple context lengths without an architecture must fail closed"
+        );
     }
 }

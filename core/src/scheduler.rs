@@ -639,6 +639,8 @@ mod tests {
                 delay: Mutex::new(delay),
                 ..Default::default()
             }),
+            triage_runner: None,
+            local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: DEFAULT_RUN_TIMEOUT,

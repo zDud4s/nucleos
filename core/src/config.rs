@@ -5,6 +5,10 @@ use std::path::Path;
 pub struct ModelsConfig {
     pub claude_model: String,
     pub codex_model: String,
+    /// Absent keeps the established CLI path active, which lets local triage ship dark until an
+    /// operator explicitly names a model that can keep message bodies on the machine.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub local_triage_model: Option<String>,
 }
 
 impl Default for ModelsConfig {
@@ -12,8 +16,18 @@ impl Default for ModelsConfig {
         ModelsConfig {
             claude_model: "claude-sonnet-5".to_string(),
             codex_model: "gpt-5.6-terra".to_string(),
+            local_triage_model: None,
         }
     }
+}
+
+fn deserialize_optional_model<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty()))
 }
 
 pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
@@ -261,6 +275,40 @@ mod tests {
         let config = load_models_config(&path).unwrap();
         assert_eq!(config.claude_model, "claude-opus-4-8");
         assert_eq!(config.codex_model, "gpt-5.6-sol");
+    }
+
+    /// Local inference must remain an explicit opt-in: an absent or blank model keeps the proven
+    /// CLI path active, while a real name is preserved for startup to construct the local runner.
+    #[test]
+    fn local_triage_model_is_optional_and_absent_means_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\n",
+        )
+        .unwrap();
+        let absent = load_models_config(&path).unwrap();
+        assert_eq!(absent.claude_model, "claude-opus-4-8");
+        assert_eq!(absent.local_triage_model, None);
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nlocal_triage_model: qwen3.5:4b\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_models_config(&path).unwrap().local_triage_model,
+            Some("qwen3.5:4b".to_string())
+        );
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nlocal_triage_model: \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(load_models_config(&path).unwrap().local_triage_model, None);
     }
 
     #[test]

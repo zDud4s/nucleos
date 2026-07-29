@@ -80,6 +80,18 @@ pub struct AppState {
     pub token: Token,
     pub pool: SqlitePool,
     pub runner: Arc<dyn CommandRunner>,
+    /// Present only when startup proved a configured loopback model can hold the full local triage
+    /// prompt. `None` preserves the CLI path, which is the feature's ship-dark default.
+    pub triage_runner: Option<Arc<dyn CommandRunner>>,
+    /// Why local triage is unavailable, when a local model WAS configured but could not be trusted.
+    ///
+    /// This is deliberately separate from `triage_runner` being `None`. `None` alone means "no local
+    /// model configured", and that correctly falls back to the CLI — the ship-dark guarantee.
+    /// `Some(reason)` means the operator ASKED for local inference and it could not be provided, and
+    /// the whole reason they asked is that message bodies must not leave this machine. Falling back
+    /// to the remote CLI there would violate that at exactly the moment nobody is watching, so triage
+    /// stops instead and mail queues, the same way it already does for the kill switch and the budget.
+    pub local_triage_disabled: Option<String>,
     /// Read-only after startup, so it is shared rather than copied per clone of the state.
     pub email: Arc<EmailRuntime>,
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns

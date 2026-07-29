@@ -311,6 +311,7 @@ pub(crate) fn warn_on_terminal_write_err(
 #[allow(clippy::too_many_arguments)]
 fn spawn_run(
     state: &AppState,
+    runner: std::sync::Arc<dyn crate::runner::CommandRunner>,
     id: i64,
     prompt: String,
     project_id: Option<String>,
@@ -323,7 +324,6 @@ fn spawn_run(
     daemon_token: String,
 ) {
     let pool = state.pool.clone();
-    let runner = state.runner.clone();
     let feed_project_id = project_id.clone();
     let run_timeout = state.run_timeout;
     let env = run_env(&daemon_token, id);
@@ -628,8 +628,19 @@ pub async fn create_run_inner(
         1
     };
     let daemon_token = mint_run_token(&state.pool, id).await;
+    // Falling back toward the CLI preserves the operator's pre-feature behavior when no local
+    // model is configured; that direction is the ship-dark guarantee.
+    let runner = if mode == crate::email::TRIAGE_MODE {
+        state
+            .triage_runner
+            .clone()
+            .unwrap_or_else(|| state.runner.clone())
+    } else {
+        state.runner.clone()
+    };
     spawn_run(
         state,
+        runner,
         id,
         prompt,
         project_id,
@@ -761,6 +772,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
     spawn_run(
         state,
+        state.runner.clone(),
         resume_id,
         prompt,
         Some(wt_project_id),
@@ -983,6 +995,8 @@ mod tests {
             token: Token("test-token".into()),
             pool,
             runner: runner.clone(),
+            triage_runner: None,
+            local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout,
@@ -1442,6 +1456,60 @@ mod tests {
                 "mode {mode}"
             );
         }
+    }
+
+    /// Selecting the local runner by mode keeps message bodies on-machine without accidentally
+    /// diverting ordinary autonomous work away from the established CLI runner.
+    #[tokio::test]
+    async fn a_triage_run_uses_the_local_runner_when_one_is_configured() {
+        let (mut state, default_runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let local_runner = Arc::new(FakeCommandRunner::default());
+        state.triage_runner = Some(local_runner.clone());
+
+        let triage_id = create_run_inner(
+            &state,
+            "private message body".into(),
+            None,
+            None,
+            crate::email::TRIAGE_MODE,
+        )
+        .await
+        .unwrap();
+        let (triage_status, _) = poll_run(&state, triage_id, "completed").await;
+        assert_eq!(triage_status, "completed");
+        assert_eq!(*local_runner.calls.lock().unwrap(), 1);
+        assert_eq!(*default_runner.calls.lock().unwrap(), 0);
+
+        let ordinary_id = create_run_inner(&state, "ordinary work".into(), None, None, "real")
+            .await
+            .unwrap();
+        let (ordinary_status, _) = poll_run(&state, ordinary_id, "completed").await;
+        assert_eq!(ordinary_status, "completed");
+        assert_eq!(*local_runner.calls.lock().unwrap(), 1);
+        assert_eq!(*default_runner.calls.lock().unwrap(), 1);
+    }
+
+    /// Shipping the wiring dark depends on this fallback: without an opted-in local model, triage
+    /// must keep using the existing CLI runner instead of becoming silently inoperable.
+    #[tokio::test]
+    async fn a_triage_run_falls_back_to_the_cli_when_no_local_model_is_configured() {
+        let (state, default_runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+
+        let id = create_run_inner(
+            &state,
+            "message body".into(),
+            None,
+            None,
+            crate::email::TRIAGE_MODE,
+        )
+        .await
+        .unwrap();
+        let (status, _) = poll_run(&state, id, "completed").await;
+
+        assert_eq!(status, "completed");
+        assert_eq!(*default_runner.calls.lock().unwrap(), 1);
     }
 
     /// An autonomous run launches with `ToolPolicy::Unrestricted`, so it has a Bash tool, and the

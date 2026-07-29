@@ -195,6 +195,43 @@ async fn main() {
         tracing::warn!("failed to parse .ai/nucleos-models.yaml ({e}), using defaults");
         config::ModelsConfig::default()
     });
+    let (triage_runner, local_triage_disabled): (
+        Option<Arc<dyn runner::CommandRunner>>,
+        Option<String>,
+    ) = if let Some(model) = models_config.local_triage_model.clone() {
+        let local_runner =
+            runner::OllamaRunner::new(runner::OLLAMA_BASE_URL.to_string(), model.clone());
+        let probe = match reqwest::Client::new()
+            .post(format!("{}/api/show", runner::OLLAMA_BASE_URL))
+            .json(&serde_json::json!({ "model": &model }))
+            .send()
+            .await
+        {
+            Ok(response) => match response.text().await {
+                Ok(body) => runner::interpret_context_probe(&body, triage::LOCAL_NUM_CTX),
+                Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
+                    "could not read the local model probe response: {error}"
+                ))),
+            },
+            Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
+                "could not reach the loopback Ollama endpoint: {error}"
+            ))),
+        };
+        match runner::local_triage_decision(probe) {
+            runner::LocalTriageDecision::Enabled => {
+                tracing::info!(%model, "local triage model enabled");
+                (Some(Arc::new(local_runner)), None)
+            }
+            runner::LocalTriageDecision::Disabled(reason) => {
+                // Local triage is optional at startup: a bad probe must not take down unrelated
+                // daemon services, just as a failed autostart registration does not.
+                tracing::warn!(%model, %reason, "local triage model disabled");
+                (None, Some(reason))
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     // Relative to the working directory, so it matters where the daemon was launched from — which
     // is exactly why the "off" message below has to name the path it looked at.
@@ -226,6 +263,8 @@ async fn main() {
         runner: Arc::new(runner::ClaudeCliRunner {
             model: models_config.claude_model.clone(),
         }),
+        triage_runner,
+        local_triage_disabled,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
