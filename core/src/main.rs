@@ -2,6 +2,7 @@ mod assistant;
 mod auth;
 mod autopilot;
 mod autostart;
+mod backup;
 mod budget;
 mod classifier;
 mod config;
@@ -143,6 +144,17 @@ async fn main() {
     }
 
     let db_path = dirs.data_local_dir().join("nucleos.db");
+    match backup::apply_pending_restore(&db_path).await {
+        Ok(Some(applied)) => tracing::warn!(
+            "applied pending database restore from {}; safety backup at {}",
+            applied.restored_from,
+            applied.safety_backup.display()
+        ),
+        Ok(None) => tracing::info!("no pending database restore to apply"),
+        Err(e) => tracing::error!(
+            "failed to apply pending database restore; continuing startup and retrying next start: {e}"
+        ),
+    }
     let pool = storage::open(&db_path)
         .await
         .expect("failed to open local database");

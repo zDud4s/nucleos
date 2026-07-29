@@ -10,6 +10,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_token;
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
+use crate::backup;
 use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::health;
@@ -39,6 +40,9 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/status", get(status))
         .route("/health/readout", get(health_readout))
+        .route("/backup", post(post_backup))
+        .route("/backups", get(get_backups))
+        .route("/backups/{name}/restore", post(post_backup_restore))
         .route(
             "/autopilot/state",
             get(get_autopilot_state).post(post_autopilot_state),
@@ -140,6 +144,66 @@ async fn health_readout(State(state): State<AppState>) -> Json<health::HealthRea
 
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+async fn post_backup(
+    State(state): State<AppState>,
+) -> Result<Json<backup::BackupInfo>, StatusCode> {
+    backup::take_backup(&state.pool, backup::DEFAULT_RETENTION)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+async fn get_backups(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<backup::BackupInfo>>, StatusCode> {
+    backup::list_backups(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+async fn post_backup_restore(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<backup::StagedRestore>, StatusCode> {
+    if !plain_filename(&name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    backup::stage_restore(&state.pool, &name)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+fn plain_filename(name: &str) -> bool {
+    if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+
+    let mut components = std::path::Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn backup_status(error: &backup::BackupError) -> StatusCode {
+    match error {
+        backup::BackupError::InvalidName | backup::BackupError::InvalidRetention => {
+            StatusCode::BAD_REQUEST
+        }
+        backup::BackupError::NotFound => StatusCode::NOT_FOUND,
+        backup::BackupError::ExistingTarget(_) | backup::BackupError::PendingRestoreExists => {
+            StatusCode::CONFLICT
+        }
+        backup::BackupError::Verification(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        backup::BackupError::Database(_) | backup::BackupError::Io(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1457,6 +1521,98 @@ mod tests {
     use axum::http::Request;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    async fn file_test_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::storage::open(&dir.path().join("nucleos.db"))
+            .await
+            .unwrap();
+        (
+            AppState {
+                token: Token("test-token".into()),
+                pool,
+                runner: Arc::new(FakeCommandRunner::default()),
+                triage_runner: None,
+                local_triage_disabled: None,
+                run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+                run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+            },
+            dir,
+        )
+    }
+
+    async fn backup_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        build_router(state)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_backup_route_requires_the_bearer_token() {
+        for (method, uri) in [
+            ("POST", "/backup"),
+            ("GET", "/backups"),
+            (
+                "POST",
+                "/backups/nucleos-20260729T010203.000000000Z-0000.db/restore",
+            ),
+        ] {
+            let response = backup_request(test_state().await, method, uri, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_route_rejects_traversal_and_path_separators() {
+        for name in ["bad..name.db", "bad%5Cname.db"] {
+            let response = backup_request(
+                test_state().await,
+                "POST",
+                &format!("/backups/{name}/restore"),
+                Some("test-token"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backups_route_lists_newest_first() {
+        let (state, dir) = file_test_state().await;
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let older = "nucleos-20260729T010203.000000000Z-0000.db";
+        let newer = "nucleos-20260729T020203.000000000Z-0000.db";
+        std::fs::write(backup_dir.join(older), b"old").unwrap();
+        std::fs::write(backup_dir.join(newer), b"new").unwrap();
+
+        let response = backup_request(state.clone(), "GET", "/backups", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed[0]["name"], newer);
+        assert_eq!(listed[1]["name"], older);
+
+        state.pool.close().await;
+        drop(dir);
+    }
 
     async fn test_state() -> AppState {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
