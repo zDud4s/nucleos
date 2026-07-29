@@ -193,6 +193,17 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
         return;
     }
 
+    if let crate::attention::AttentionDecision::Defer { reason, scope } =
+        crate::attention::attention_permits_new_run(&state.pool, &state.run_handles, "", now).await
+    {
+        tracing::info!(
+            attention_scope = ?scope,
+            reason = %reason,
+            "owner attention brake refused global scheduled work; scheduler paused this tick"
+        );
+        return;
+    }
+
     let projects = match crate::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {
@@ -218,6 +229,27 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 reason = %reason,
                 "approval queue full; deferring this project's scheduled work"
             );
+            continue;
+        }
+
+        if let crate::attention::AttentionDecision::Defer { reason, scope } =
+            crate::attention::attention_permits_new_run(
+                &state.pool,
+                &state.run_handles,
+                &project_id,
+                now,
+            )
+            .await
+        {
+            tracing::info!(
+                project_id = %project_id,
+                attention_scope = ?scope,
+                reason = %reason,
+                "owner attention brake refused this project's scheduled work"
+            );
+            if matches!(scope, crate::attention::AttentionScope::Global) {
+                return;
+            }
             continue;
         }
 
@@ -713,10 +745,21 @@ mod tests {
         mode: &str,
         last_fired_at: &str,
     ) {
+        seed_named_project(state, "proj", project_root, mode, last_fired_at).await;
+    }
+
+    async fn seed_named_project(
+        state: &AppState,
+        project_id: &str,
+        project_root: &FsPath,
+        mode: &str,
+        last_fired_at: &str,
+    ) {
         write_schedule(project_root);
         sqlx::query(
-            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', ?, ?)",
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)",
         )
+        .bind(project_id)
         .bind(mode)
         .bind(project_root.to_string_lossy().as_ref())
         .execute(&state.pool)
@@ -724,8 +767,9 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at)
-             VALUES ('proj', 'r1', ?)",
+             VALUES (?, 'r1', ?)",
         )
+        .bind(project_id)
         .bind(last_fired_at)
         .execute(&state.pool)
         .await
@@ -1279,6 +1323,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_project_heartbeat_only_stops_that_projects_scheduled_rule() {
+        let projects = tempfile::tempdir().expect("create project roots");
+        let project_a = projects.path().join("project-a");
+        let project_b = projects.path().join("project-b");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_named_project(&state, "project-a", &project_a, "shadow", &old).await;
+        seed_named_project(&state, "project-b", &project_b, "shadow", &old).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Project("project-a".to_string()),
+            now,
+        )
+        .await
+        .unwrap();
+
+        scheduler_tick(&state, now).await;
+
+        let fired_projects: Vec<String> =
+            sqlx::query_scalar("SELECT project_id FROM runs ORDER BY project_id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(fired_projects, ["project-b"]);
+    }
+
+    #[tokio::test]
+    async fn a_global_heartbeat_stops_all_scheduled_rules() {
+        let projects = tempfile::tempdir().expect("create project roots");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_named_project(
+            &state,
+            "project-a",
+            &projects.path().join("project-a"),
+            "shadow",
+            &old,
+        )
+        .await;
+        seed_named_project(
+            &state,
+            "project-b",
+            &projects.path().join("project-b"),
+            "shadow",
+            &old,
+        )
+        .await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            now,
+        )
+        .await
+        .unwrap();
+
+        scheduler_tick(&state, now).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn no_heartbeat_leaves_scheduled_firing_unchanged() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+
+        scheduler_tick(&state, now).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 1);
     }
 
     #[tokio::test]
