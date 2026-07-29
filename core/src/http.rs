@@ -4,11 +4,11 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::require_token;
+use crate::auth::{ApiTokenLevel, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::backup;
 use crate::budget;
@@ -122,6 +122,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mail-files", get(get_mail_files))
         .route("/mail-files/folder", post(post_mail_folder))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        .route("/api-tokens", get(list_api_tokens).post(create_api_token))
+        .route(
+            "/api-tokens/{name}",
+            axum::routing::delete(revoke_api_token),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -144,6 +149,124 @@ async fn health_readout(State(state): State<AppState>) -> Json<health::HealthRea
 
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+#[derive(Deserialize)]
+struct CreateApiTokenRequest {
+    name: String,
+    level: ApiTokenLevel,
+}
+
+#[derive(Serialize)]
+struct CreatedApiToken {
+    name: String,
+    level: ApiTokenLevel,
+    created_at: String,
+    /// The complete bearer credential. It is returned only by creation, never by listing.
+    token: String,
+}
+
+#[derive(Serialize)]
+struct ApiTokenSummary {
+    name: String,
+    level: ApiTokenLevel,
+    created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiTokenRow {
+    name: String,
+    access_level: String,
+    created_at: String,
+}
+
+fn valid_api_token_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+async fn create_api_token(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiTokenRequest>,
+) -> Result<(StatusCode, Json<CreatedApiToken>), StatusCode> {
+    if !valid_api_token_name(&body.name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let (token, secret) = mint_api_token(&body.name);
+    let result = sqlx::query(
+        "INSERT INTO api_tokens (name, token, access_level, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&body.name)
+    .bind(secret)
+    .bind(body.level.as_str())
+    .bind(&created_at)
+    .execute(&state.pool)
+    .await;
+
+    if let Err(error) = result {
+        if error
+            .as_database_error()
+            .is_some_and(|database| database.is_unique_violation())
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedApiToken {
+            name: body.name,
+            level: body.level,
+            created_at,
+            token,
+        }),
+    ))
+}
+
+async fn list_api_tokens(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiTokenSummary>>, StatusCode> {
+    let rows = sqlx::query_as::<_, ApiTokenRow>(
+        "SELECT name, access_level, created_at FROM api_tokens ORDER BY created_at, name",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(ApiTokenSummary {
+                name: row.name,
+                level: ApiTokenLevel::from_str(&row.access_level)
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+                created_at: row.created_at,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn revoke_api_token(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let result = sqlx::query("DELETE FROM api_tokens WHERE name = ?")
+        .bind(name)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if result.rows_affected() == 0 {
+        Err(StatusCode::NOT_FOUND)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 async fn post_backup(
@@ -1635,6 +1758,114 @@ mod tests {
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    async fn api_token_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(body) => {
+                request = request.header("Content-Type", "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        build_router(state)
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_api_token_routes_create_list_once_and_revoke() {
+        let state = test_state().await;
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/api-tokens",
+            "test-token",
+            Some(serde_json::json!({
+                "name": "administrator",
+                "level": "admin"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let admin_token = created["token"].as_str().unwrap().to_owned();
+        assert_eq!(created["name"], "administrator");
+        assert_eq!(created["level"], "admin");
+
+        let stored_secret: String =
+            sqlx::query_scalar("SELECT token FROM api_tokens WHERE name = 'administrator'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(admin_token.split_once('.').unwrap().1, stored_secret);
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/api-tokens",
+            &admin_token,
+            Some(serde_json::json!({
+                "name": "reader",
+                "level": "read-only"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reader: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let reader_token = reader["token"].as_str().unwrap().to_owned();
+
+        let response =
+            api_token_request(state.clone(), "GET", "/api-tokens", &reader_token, None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response =
+            api_token_request(state.clone(), "GET", "/api-tokens", &admin_token, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.iter().all(|entry| entry.get("token").is_none()),
+            "listing existing keys must never return their secrets"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry["name"] == "reader" && entry["level"] == "read-only")
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "DELETE",
+            "/api-tokens/reader",
+            &admin_token,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = api_token_request(state, "GET", "/status", &reader_token, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn email_batch(messages: serde_json::Value) -> Body {
