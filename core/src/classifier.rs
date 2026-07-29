@@ -182,7 +182,9 @@ fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
     // character, so `\n`, `\r` and `\t` are gone before the check below could ever see them —
     // which made the `'\n'`/`'\r'` entries in `SHELL_CONTROL` unreachable and let a second command
     // hide behind a safe-looking leading token (`ls\nrm -r -f ~/.ssh` classified `read-local`).
-    // Both guards downstream anchor on `tokens.first()`, so they collapse with it.
+    // The two destructive guards used to anchor on `tokens.first()` and collapsed with it; they
+    // read every position now, so this is no longer the only thing standing between a hidden
+    // command and an `allow` — but it is still what catches the ones the blocklist does not know.
     //
     // This sits AFTER the destructive checks on purpose: a hidden command the blocklist already
     // recognizes must keep its stronger `deny`, not be demoted to an approval prompt.
