@@ -9,6 +9,14 @@ use tokio::sync::mpsc::UnboundedSender;
 /// matching the daemon's own localhost-only transport boundary.
 pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub num_turns: Option<i64>,
+}
+
 // `cost_usd` is an `f64`, which is not `Eq`, so `RunOutcome` can only derive `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunOutcome {
@@ -20,6 +28,10 @@ pub struct RunOutcome {
     pub session_id: Option<String>,
     /// Captured from the CLI's final `result` message — only known when the run ends (spec §3.3/§8.5).
     pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub num_turns: Option<i64>,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
@@ -171,6 +183,40 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
         }
     }
     reply
+}
+
+/// Usage reported by the final `result` event of a Claude `stream-json` transcript.
+///
+/// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
+/// result event itself; the token counts live under its `usage` object.
+pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
+    let mut usage = RunUsage::default();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+            && value.get("type").and_then(|kind| kind.as_str()) == Some("result")
+        {
+            usage = RunUsage {
+                input_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                output_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("output_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                cache_read_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("cache_read_input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                num_turns: value.get("num_turns").and_then(serde_json::Value::as_i64),
+            };
+        }
+    }
+    usage
 }
 
 /// Kills a spawned CLI's whole process TREE when a run is dropped mid-flight.
@@ -533,6 +579,10 @@ impl CommandRunner for OllamaRunner {
                 stderr,
                 session_id: None,
                 cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             });
         }
 
@@ -542,6 +592,10 @@ impl CommandRunner for OllamaRunner {
             stderr: String::new(),
             session_id: None,
             cost_usd: Some(0.0),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
         })
     }
 }
@@ -623,6 +677,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut stdout_acc = String::new();
         let mut session_id: Option<String> = None;
         let mut cost_usd: Option<f64> = None;
+        let mut usage = RunUsage::default();
 
         let mut post_launch_error: Option<std::io::Error> = None;
 
@@ -645,13 +700,15 @@ impl CommandRunner for ClaudeCliRunner {
                     // Best-effort: the receiver may already be gone if the run was cancelled.
                     let _ = session_tx.send(sid.to_string());
                 }
-                if v.get("type").and_then(|x| x.as_str()) == Some("result")
-                    && let Some(c) = v
+                if v.get("type").and_then(|x| x.as_str()) == Some("result") {
+                    usage = extract_usage(&line);
+                    if let Some(c) = v
                         .get("total_cost_usd")
                         .or_else(|| v.get("cost_usd"))
                         .and_then(|x| x.as_f64())
-                {
-                    cost_usd = Some(c);
+                    {
+                        cost_usd = Some(c);
+                    }
                 }
             }
         }
@@ -685,6 +742,10 @@ impl CommandRunner for ClaudeCliRunner {
             stderr: stderr_str,
             session_id,
             cost_usd,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            num_turns: usage.num_turns,
         })
     }
 }
@@ -752,6 +813,10 @@ impl CommandRunner for FakeCommandRunner {
                 stderr: String::new(),
                 session_id: Some("fake-session-id".into()),
                 cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             })
         };
         // Emit session_id *before* any simulated delay — mirrors the real CLI's early `init` message.
@@ -779,6 +844,10 @@ mod tests {
                 stderr: String::new(),
                 session_id: Some("sess-1".into()),
                 cost_usd: Some(1.5),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             })),
             last_plan_only: std::sync::Mutex::new(None),
             ..Default::default()
@@ -890,6 +959,32 @@ mod tests {
 {"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#;
 
         assert_eq!(extract_reply(stdout), None);
+    }
+
+    #[test]
+    fn usage_absent_is_none_not_zero() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.08}"#;
+
+        let usage = extract_usage(stdout);
+
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.num_turns, None);
+    }
+
+    #[test]
+    fn partial_usage_keeps_missing_fields_none() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.08,"num_turns":12,"usage":{"input_tokens":1000,"output_tokens":500,"num_turns":99}}"#;
+
+        let usage = extract_usage(stdout);
+
+        assert_eq!(usage.input_tokens, Some(1000));
+        assert_eq!(usage.output_tokens, Some(500));
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.num_turns, Some(12));
     }
 
     /// The transcript a triage run actually produces: the model's own text arrives in a `content`

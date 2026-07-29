@@ -381,7 +381,7 @@ fn spawn_run(
                         "failed"
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -389,6 +389,10 @@ fn spawn_run(
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.num_turns)
                     .bind(&completed_at)
                     .bind(attempt as i64)
                     .bind(id)
@@ -984,6 +988,10 @@ mod tests {
                 stderr: String::new(),
                 session_id: Some("fake-session-id".into()),
                 cost_usd: Some(0.05),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
             })),
             delay: std::sync::Mutex::new(delay),
             last_plan_only: std::sync::Mutex::new(None),
@@ -1426,6 +1434,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run did not reach completed status in time, last status: {status}");
+    }
+
+    #[tokio::test]
+    async fn a_completed_run_persists_its_token_usage() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: "measured".into(),
+            stderr: String::new(),
+            session_id: Some("usage-session".into()),
+            cost_usd: Some(0.08),
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cache_read_tokens: Some(20_000),
+            num_turns: Some(12),
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "persist usage").await;
+
+        for _ in 0..20 {
+            let parsed = get_run_status(&app, created.id).await;
+            if parsed.status == "completed" {
+                let usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+                    "SELECT input_tokens, output_tokens, cache_read_tokens, num_turns
+                         FROM runs WHERE id = ?",
+                )
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(usage, (Some(1000), Some(500), Some(20_000), Some(12)));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach completed status in time");
     }
 
     /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by
