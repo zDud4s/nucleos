@@ -643,6 +643,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: DEFAULT_RUN_TIMEOUT,
         }
     }

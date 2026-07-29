@@ -10,6 +10,12 @@ use tokio::task::AbortHandle;
 /// process killed. Tests override `AppState.run_timeout` to something much shorter.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Production default for how long a run may stay silent between streamed events.
+///
+/// This measures silence, not total run duration. The independent `DEFAULT_RUN_TIMEOUT` remains
+/// unchanged at 600 seconds.
+pub const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// In-flight runs' abort handles, keyed by `runs.id`.
 pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 
@@ -97,5 +103,7 @@ pub struct AppState {
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns
     /// (`runs::create_run`), removed when it completes/times out/is cancelled.
     pub run_handles: RunHandles,
+    /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
+    pub progress_timeout: Duration,
     pub run_timeout: Duration,
 }

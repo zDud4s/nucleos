@@ -272,6 +272,7 @@ async fn main() {
             mail_files_root,
         )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
 

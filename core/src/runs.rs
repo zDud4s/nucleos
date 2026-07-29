@@ -325,6 +325,7 @@ fn spawn_run(
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
+    let progress_timeout = state.progress_timeout;
     let run_timeout = state.run_timeout;
     let env = run_env(&daemon_token, id);
 
@@ -357,6 +358,7 @@ fn spawn_run(
                     resume_session_id.as_deref(),
                     None,
                     tool_policy,
+                    Some(progress_timeout),
                     session_tx,
                 ),
             )
@@ -375,11 +377,14 @@ fn spawn_run(
                     // user reads. The runner now also reports -1 for a stream that broke after
                     // launch, so that lands here as a failure rather than being mistaken for a
                     // launch failure and retried over work that was already applied.
-                    let terminal_status = if o.exit_code == 0 {
-                        "completed"
-                    } else {
-                        "failed"
-                    };
+                    let terminal_status =
+                        if o.exit_code == crate::runner::PROGRESS_TIMEOUT_EXIT_CODE {
+                            "timed_out"
+                        } else if o.exit_code == 0 {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
                     let completed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
@@ -398,12 +403,13 @@ fn spawn_run(
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    warn_on_terminal_write_err(&completed, id, "completed");
+                    warn_on_terminal_write_err(&completed, id, terminal_status);
                     // The feed row announces this run *finished* — only true if this write won the
                     // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
                     // there first, so this attempt never actually completed as far as the runs table
                     // is concerned; appending anyway would announce a completion it denies.
-                    if matches!(&completed, Ok(result) if result.rows_affected() == 1)
+                    if terminal_status == "completed"
+                        && matches!(&completed, Ok(result) if result.rows_affected() == 1)
                         && let Some((kind, summary)) = completion_feed.as_ref()
                     {
                         let _ = crate::feed::append(
@@ -942,6 +948,7 @@ pub async fn reconcile_stranded_approvals(pool: &sqlx::SqlitePool) -> Result<u64
     Ok(reconciled.len() as u64)
 }
 
+#[rustfmt::skip]
 #[cfg(test)]
 mod tests {
     // These `current_thread` async tests hold `worktree::test_env_lock()` — a
@@ -1007,6 +1014,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout,
         };
         (state, runner)
@@ -2411,6 +2419,34 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("run did not reach timed_out status in time, last status: {status}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_run_is_timed_out_before_the_wall_clock() {
+        let run_timeout = Duration::from_secs(10);
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), run_timeout).await;
+        state.progress_timeout = Duration::from_millis(50);
+        let app = test_router(state);
+        let started = tokio::time::Instant::now();
+        let created = create_run_via_http(&app, "a run whose event stream goes silent").await;
+
+        let mut status = String::new();
+        for _ in 0..50 {
+            let parsed = get_run_status(&app, created.id).await;
+            status = parsed.status.clone();
+            if status == "timed_out" {
+                assert!(
+                    started.elapsed() < run_timeout,
+                    "the progress deadline must fire before the wall-clock timeout"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "silent run did not reach timed_out before its wall clock, last status: {status}"
+        );
     }
 
     #[tokio::test]

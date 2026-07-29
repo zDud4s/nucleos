@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
@@ -8,6 +9,12 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Ollama stays on loopback so local triage cannot accidentally send message bodies off-machine,
 /// matching the daemon's own localhost-only transport boundary.
 pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+
+/// Internal outcome code for a process terminated after its event stream stopped making progress.
+///
+/// OS process exit codes cannot produce this value, so callers can distinguish a progress deadline
+/// from an ordinary CLI failure without treating already-started work as a retryable launch error.
+pub const PROGRESS_TIMEOUT_EXIT_CODE: i32 = i32::MIN;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunUsage {
@@ -450,6 +457,7 @@ pub trait CommandRunner: Send + Sync {
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome>;
 }
@@ -520,6 +528,7 @@ impl CommandRunner for OllamaRunner {
         _resume_session_id: Option<&str>,
         _mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        _progress_timeout: Option<Duration>,
         _session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         if tool_policy != ToolPolicy::None {
@@ -640,6 +649,7 @@ impl CommandRunner for ClaudeCliRunner {
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
@@ -706,9 +716,20 @@ impl CommandRunner for ClaudeCliRunner {
 
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
+        let mut progress_timeout_elapsed: Option<Duration> = None;
 
         loop {
-            let line = match lines.next_line().await {
+            let next_line = match progress_timeout {
+                Some(deadline) => match tokio::time::timeout(deadline, lines.next_line()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        progress_timeout_elapsed = Some(deadline);
+                        break;
+                    }
+                },
+                None => lines.next_line().await,
+            };
+            let line = match next_line {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(error) => {
@@ -755,7 +776,7 @@ impl CommandRunner for ClaudeCliRunner {
             }
         }
 
-        if policy_violation.is_some() {
+        if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -780,15 +801,28 @@ impl CommandRunner for ClaudeCliRunner {
             }
             stderr_str.push_str(&format!("nucleos: {reason}\n"));
         }
-        let exit_code = match (&policy_violation, &post_launch_error) {
-            (Some(_), _) => -1,
+        if let Some(deadline) = progress_timeout_elapsed {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
+            ));
+        }
+        let exit_code = match (
+            progress_timeout_elapsed,
+            &policy_violation,
+            &post_launch_error,
+        ) {
+            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            (None, Some(_), _) => -1,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, Some(error)) => {
+            (None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         Ok(RunOutcome {
@@ -839,6 +873,7 @@ impl CommandRunner for FakeCommandRunner {
         resume_session_id: Option<&str>,
         mcp_config: Option<&Path>,
         tool_policy: ToolPolicy,
+        progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
     ) -> std::io::Result<RunOutcome> {
         {
@@ -879,8 +914,36 @@ impl CommandRunner for FakeCommandRunner {
             let _ = session_tx.send(sid.clone());
         }
         let delay = *self.delay.lock().unwrap();
-        if let Some(d) = delay {
-            tokio::time::sleep(d).await;
+        match (delay, progress_timeout) {
+            (Some(delay), Some(deadline)) => {
+                let mut emitted_stdout = String::new();
+                let stdout_lines = outcome
+                    .stdout
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                for line in stdout_lines {
+                    if tokio::time::timeout(deadline, tokio::time::sleep(delay))
+                        .await
+                        .is_err()
+                    {
+                        let mut timed_out = outcome;
+                        timed_out.exit_code = PROGRESS_TIMEOUT_EXIT_CODE;
+                        timed_out.stdout = emitted_stdout;
+                        if !timed_out.stderr.is_empty() && !timed_out.stderr.ends_with('\n') {
+                            timed_out.stderr.push('\n');
+                        }
+                        timed_out.stderr.push_str(&format!(
+                            "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
+                        ));
+                        return Ok(timed_out);
+                    }
+                    emitted_stdout.push_str(&line);
+                    emitted_stdout.push('\n');
+                }
+            }
+            (Some(delay), None) => tokio::time::sleep(delay).await,
+            (None, _) => {}
         }
         Ok(outcome)
     }
@@ -917,6 +980,7 @@ mod tests {
                 None,
                 None,
                 ToolPolicy::Unrestricted,
+                None,
                 tx,
             )
             .await
@@ -924,6 +988,61 @@ mod tests {
         assert_eq!(outcome.stdout, "42");
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.cost_usd, Some(1.5));
+    }
+
+    #[tokio::test]
+    async fn progress_deadline_holds_while_events_arrive() {
+        let progress_timeout = std::time::Duration::from_millis(30);
+        let runner = FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(RunOutcome {
+                exit_code: 0,
+                stdout: [
+                    r#"{"type":"system","subtype":"init","session_id":"sess-progress"}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"one"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"two"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"three"}]}}"#,
+                    r#"{"type":"result","subtype":"success","result":"done"}"#,
+                ]
+                .join("\n"),
+                stderr: String::new(),
+                session_id: Some("sess-progress".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
+            })),
+            // The fake releases one canned event per interval. The complete run therefore lasts
+            // well beyond the progress deadline while every individual quiet gap stays below it.
+            delay: std::sync::Mutex::new(Some(std::time::Duration::from_millis(20))),
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runner.run_prompt(
+                "keep working",
+                &[],
+                None,
+                false,
+                None,
+                None,
+                ToolPolicy::Unrestricted,
+                Some(progress_timeout),
+                tx,
+            ),
+        )
+        .await
+        .expect("events should keep the progress deadline alive")
+        .expect("the fake run should complete");
+
+        assert_eq!(outcome.exit_code, 0);
+        assert!(
+            started.elapsed() >= progress_timeout * 3,
+            "the fixture must outlive the progress deadline several times over"
+        );
     }
 
     #[tokio::test]
@@ -940,6 +1059,7 @@ mod tests {
                     None,
                     None,
                     ToolPolicy::Unrestricted,
+                    None,
                     tx,
                 )
                 .await
@@ -963,6 +1083,7 @@ mod tests {
                 Some("sess-9"),
                 None,
                 ToolPolicy::Unrestricted,
+                None,
                 tx,
             )
             .await
@@ -986,6 +1107,7 @@ mod tests {
                 None,
                 Some(std::path::Path::new("C:/tmp/mcp.json")),
                 ToolPolicy::McpOnly,
+                None,
                 tx,
             )
             .await
@@ -1194,6 +1316,7 @@ mod tests {
                         None,
                         None,
                         ToolPolicy::Unrestricted,
+                        None,
                         tx
                     )
                     .await
@@ -1211,6 +1334,7 @@ mod tests {
                     None,
                     None,
                     ToolPolicy::Unrestricted,
+                    None,
                     tx
                 )
                 .await
@@ -1259,6 +1383,7 @@ mod tests {
                 None,
                 None,
                 tool_policy,
+                None,
                 session_tx,
             )
             .await
