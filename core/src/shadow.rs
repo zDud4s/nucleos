@@ -76,15 +76,25 @@ pub async fn list_unreviewed(
     .await
 }
 
+/// Records a human verdict, exactly once. `Ok(false)` when the id is unknown OR the decision was
+/// already judged — `http::post_shadow_verdict` answers 404 to both.
+///
+/// The `human_verdict IS NULL` guard is the load-bearing half, and mirrors `proposals::transition`,
+/// which has always carried `AND status = 'pending'`. Without it the UPDATE matched on the id alone:
+/// a replay rewrote `reviewed_at` and still answered 204, contradicting the promise written at that
+/// handler ("a verdict is recorded once — replaying it answers 404") and silently moving the only
+/// record of WHEN a decision was judged.
 pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Result<bool> {
     let reviewed_at = chrono::Utc::now().to_rfc3339();
-    let result =
-        sqlx::query("UPDATE shadow_decisions SET human_verdict = ?, reviewed_at = ? WHERE id = ?")
-            .bind(verdict)
-            .bind(reviewed_at)
-            .bind(id)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query(
+        "UPDATE shadow_decisions SET human_verdict = ?, reviewed_at = ?
+         WHERE id = ? AND human_verdict IS NULL",
+    )
+    .bind(verdict)
+    .bind(reviewed_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
 
     Ok(result.rows_affected() == 1)
 }
@@ -521,6 +531,39 @@ mod tests {
         let tally = &scoreboard(&pool, "project-a").await.unwrap()[0];
         assert_eq!(tally.mode, "real");
         assert_eq!((tally.reviewed, tally.agree, tally.disagree), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_recorded_once_and_a_replay_leaves_it_alone() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let id = insert_shadow(&pool, run_id, "read-local", "allow", None).await;
+
+        assert!(set_verdict(&pool, id, "approve").await.unwrap());
+        let first: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT human_verdict, reviewed_at FROM shadow_decisions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // The replay must change nothing AND report that it changed nothing: `post_shadow_verdict`
+        // turns `Ok(false)` into 404, which is the behaviour its own comment already promises.
+        // Before the `human_verdict IS NULL` guard this returned true, answered 204, and moved
+        // `reviewed_at` — so a double click rewrote when the decision was judged, and a correction
+        // destroyed the original instant with no trace that there had been one.
+        assert!(!set_verdict(&pool, id, "reject").await.unwrap());
+        let after: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT human_verdict, reviewed_at FROM shadow_decisions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after, first);
+        assert_eq!(after.0.as_deref(), Some("approve"));
+
+        // An unknown id is the other honest `false`, and the handler answers it the same way.
+        assert!(!set_verdict(&pool, id + 999, "approve").await.unwrap());
     }
 
     #[test]
