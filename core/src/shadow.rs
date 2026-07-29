@@ -197,6 +197,19 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
 pub const READINESS_MIN_REVIEWED: i64 = 10;
 pub const READINESS_MIN_AGREE_PERCENT: i64 = 95;
 
+/// Named hazard classes whose ready, uniformly withheld decisions demonstrate restraint.
+///
+/// Agreeing with the classifier's caution about something it did not recognise says nothing about
+/// its judgement on the hazards it did. This allowlist therefore fails closed: a new classifier
+/// class is not evidence of restraint until it is deliberately added here.
+const RESTRAINT_EVIDENCE_CLASSES: &[&str] = &[
+    "push-merge-deploy",
+    "destructive",
+    "self-governing-file",
+    "outside-workspace",
+    "executes-on-next-command",
+];
+
 /// `agree / reviewed >= 0.95` in integer arithmetic — a float ratio rounds at the boundary, and this
 /// is exactly the boundary the gate is decided on.
 pub fn class_ready(reviewed: i64, agree: i64) -> bool {
@@ -254,12 +267,12 @@ pub async fn shadow_readiness(
 
     let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
-    for (project_id, _action_class, withheld, reviewed, agree) in rows {
+    for (project_id, action_class, withheld, reviewed, agree) in rows {
         let entry = readiness.entry(project_id).or_insert((0, 0, 0));
         entry.1 += 1;
         if class_ready(reviewed, agree) {
             entry.0 += 1;
-            if withheld != 0 {
+            if withheld != 0 && RESTRAINT_EVIDENCE_CLASSES.contains(&action_class.as_str()) {
                 entry.2 += 1;
             }
         }
@@ -775,6 +788,80 @@ mod tests {
         ));
 
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_catch_all_class_is_not_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(
+                &pool,
+                run,
+                "unrecognized",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = project_readiness(&pool, "project-a").await.unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 0));
+        assert!(!promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn a_named_hazard_class_is_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(
+                &pool,
+                run,
+                "push-merge-deploy",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = shadow_readiness(&pool)
+            .await
+            .unwrap()
+            .get("project-a")
+            .copied()
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 1));
+        assert!(promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workspace_is_not_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(
+                &pool,
+                run,
+                "no-workspace",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = project_readiness(&pool, "project-a").await.unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 0));
+        assert!(!promotable(readiness.0, readiness.1, readiness.2));
     }
 
     #[tokio::test]
