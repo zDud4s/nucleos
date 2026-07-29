@@ -306,6 +306,36 @@ pub(crate) fn warn_on_terminal_write_err(
     }
 }
 
+/// Stores the runner's complete event stream without making observability part of run correctness.
+async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    for (seq, payload) in stdout.lines().enumerate() {
+        let kind = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        // Observability must stay best-effort: a missing or temporarily unavailable history table
+        // cannot turn successfully completed work into a failed run.
+        let _ = sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(seq as i64)
+        .bind(kind)
+        .bind(payload)
+        .bind(&created_at)
+        .execute(pool)
+        .await;
+    }
+}
+
 /// Deliberately wide rather than taking an options struct: these are the axes on which a run's
 /// lifecycle actually differs (plan-only, resumed, retried, worktree-bound), and naming each one at
 /// every call site is what makes those differences readable where the runs are created.
@@ -387,6 +417,7 @@ fn spawn_run(
                         } else {
                             "failed"
                         };
+                    append_run_events(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
@@ -1587,6 +1618,50 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(usage, (Some(1000), Some(500), Some(20_000), Some(12)));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach completed status in time");
+    }
+
+    #[tokio::test]
+    async fn a_run_persists_its_trajectory_events() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"system","subtype":"init","session_id":"trajectory-session"}"#,
+                r#"{"type":"assistant","message":{"content":[]}}"#,
+                r#"{"type":"result","result":"done"}"#,
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            session_id: Some("trajectory-session".into()),
+            cost_usd: Some(0.01),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "persist trajectory").await;
+
+        for _ in 0..20 {
+            let parsed = get_run_status(&app, created.id).await;
+            if parsed.status == "completed" {
+                let events: Vec<(i64,)> =
+                    sqlx::query_as("SELECT seq FROM run_events WHERE run_id = ? ORDER BY seq")
+                        .bind(created.id)
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(events.len(), 3);
+                assert_eq!(
+                    events.into_iter().map(|(seq,)| seq).collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
