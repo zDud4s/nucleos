@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::attention::{self, AttentionScope};
 use crate::auth::{ApiTokenLevel, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::backup;
@@ -59,6 +60,7 @@ pub fn build_router(state: AppState) -> Router {
             "/autopilot/budget",
             get(get_autopilot_budget).post(post_autopilot_budget),
         )
+        .route("/autopilot/attention", post(post_attention_heartbeat))
         .route("/projects", get(get_projects))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -428,6 +430,11 @@ struct BudgetRequest {
     hourly_limit_usd: Option<f64>,
     per_run_reserve_usd: f64,
     time_cost_per_hour_usd: f64,
+}
+
+#[derive(Deserialize)]
+struct AttentionHeartbeatRequest {
+    project_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1127,6 +1134,21 @@ async fn post_autopilot_budget(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     budget_response(&state).await.map(Json)
+}
+
+async fn post_attention_heartbeat(
+    State(state): State<AppState>,
+    Json(body): Json<AttentionHeartbeatRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let scope = match body.project_id {
+        None => AttentionScope::Global,
+        Some(project_id) if project_id.trim().is_empty() => return Err(StatusCode::BAD_REQUEST),
+        Some(project_id) => AttentionScope::Project(project_id),
+    };
+    attention::record_heartbeat(&state.pool, &scope, chrono::Utc::now())
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode> {
@@ -1868,6 +1890,91 @@ mod tests {
 
         let response = api_token_request(state, "GET", "/status", &reader_token, None).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn store_api_token_at_level(
+        state: &AppState,
+        name: &str,
+        level: ApiTokenLevel,
+    ) -> String {
+        let (token, secret) = mint_api_token(name);
+        sqlx::query(
+            "INSERT INTO api_tokens (name, token, access_level, created_at)
+             VALUES (?, ?, ?, '2026-07-29T12:00:00Z')",
+        )
+        .bind(name)
+        .bind(secret)
+        .bind(level.as_str())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        token
+    }
+
+    #[tokio::test]
+    async fn attention_heartbeat_requires_a_bearer_and_records_the_requested_scope() {
+        let state = test_state().await;
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/attention")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/autopilot/attention",
+            "test-token",
+            Some(serde_json::json!({ "project_id": "project-a" })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let stored: (String, String) = sqlx::query_as(
+            "SELECT scope, project_id FROM attention_heartbeats WHERE project_id = 'project-a'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("project".to_string(), "project-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn only_control_and_admin_tokens_may_post_attention_heartbeats() {
+        let state = test_state().await;
+        let read_only = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let admin = store_api_token_at_level(&state, "administrator", ApiTokenLevel::Admin).await;
+
+        for token in [&read_only, &run_creating] {
+            let response = api_token_request(
+                state.clone(),
+                "POST",
+                "/autopilot/attention",
+                token,
+                Some(serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let response = api_token_request(
+            state,
+            "POST",
+            "/autopilot/attention",
+            &admin,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     fn email_batch(messages: serde_json::Value) -> Body {

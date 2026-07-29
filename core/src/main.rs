@@ -1,4 +1,5 @@
 mod assistant;
+mod attention;
 mod auth;
 mod autopilot;
 mod autostart;
