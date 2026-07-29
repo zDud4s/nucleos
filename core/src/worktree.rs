@@ -12,6 +12,11 @@ pub const GC_BACKOFF: &[Duration] = &[
     Duration::from_secs(25),
 ];
 
+/// Bounds the amount of unseen work autonomous cleanup will commit at once.
+/// 256 MiB accommodates normal source trees and generated assets without silently preserving an
+/// unexpectedly large build output; larger worktrees are left in place for explicit inspection.
+const DEFAULT_PRESERVATION_BYTE_CEILING: u64 = 256 * 1024 * 1024;
+
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: String,
@@ -103,7 +108,195 @@ pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Res
     Ok(())
 }
 
+#[derive(Debug)]
+struct PreservationFailure(io::Error);
+
+impl std::fmt::Display for PreservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "failed to preserve uncommitted work: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreservationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn preservation_failure(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), PreservationFailure(error))
+}
+
+fn is_preservation_failure(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PreservationFailure>())
+        .is_some()
+}
+
+async fn directory_is_empty(path: &Path) -> io::Result<bool> {
+    let mut entries = tokio::fs::read_dir(path).await?;
+    Ok(entries.next_entry().await?.is_none())
+}
+
+fn path_from_git_bytes(path: &[u8]) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+    }
+
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(path.to_vec())
+            .map(PathBuf::from)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("git returned a non-UTF-8 worktree path: {error}"),
+                )
+            })
+    }
+}
+
+async fn measure_status_paths(
+    worktree_path: &Path,
+    status: &[u8],
+    byte_ceiling: u64,
+) -> io::Result<()> {
+    let mut cursor = 0;
+    let mut measured = 0_u64;
+
+    while cursor < status.len() {
+        if status.len() - cursor < 4 || status[cursor + 2] != b' ' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "git status returned malformed porcelain output",
+            ));
+        }
+
+        let x = status[cursor];
+        let y = status[cursor + 1];
+        let path_start = cursor + 3;
+        let path_end = status[path_start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| path_start + offset)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "git status returned an unterminated path",
+                )
+            })?;
+        let relative_path = path_from_git_bytes(&status[path_start..path_end])?;
+        cursor = path_end + 1;
+
+        // Porcelain v1 `-z` emits a second NUL-terminated source path for renames and copies. The
+        // first path is the destination whose current contents `git add -A` would stage.
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            let source_end = status[cursor..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| cursor + offset)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "git status returned an unterminated rename source",
+                    )
+                })?;
+            cursor = source_end + 1;
+        }
+
+        let bytes = match tokio::fs::symlink_metadata(worktree_path.join(relative_path)).await {
+            Ok(metadata) if metadata.file_type().is_dir() => 0,
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        measured = measured.checked_add(bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "uncommitted work exceeds the preservation byte ceiling",
+            )
+        })?;
+        if measured > byte_ceiling {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "uncommitted work is {measured} bytes, above the {byte_ceiling}-byte preservation ceiling"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn preserve_uncommitted(
+    worktree_path: &Path,
+    byte_ceiling: u64,
+) -> io::Result<bool> {
+    let status = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--untracked-files=all")
+        .output()
+        .await?;
+    if !status.status.success() {
+        // Startup may find an empty `run-*` directory that git never registered. It contains
+        // nothing to preserve, so let the ordinary removal failure reach the filesystem fallback.
+        if directory_is_empty(worktree_path).await.unwrap_or(false) {
+            return Ok(false);
+        }
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        return Err(io::Error::other(format!("git status failed: {stderr}")));
+    }
+    if status.stdout.is_empty() {
+        return Ok(false);
+    }
+
+    measure_status_paths(worktree_path, &status.stdout, byte_ceiling).await?;
+
+    let add = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("add")
+        .arg("-A")
+        .output()
+        .await?;
+    if !add.status.success() {
+        let stderr = String::from_utf8_lossy(&add.stderr);
+        return Err(io::Error::other(format!("git add failed: {stderr}")));
+    }
+
+    let commit = git()
+        .arg("-c")
+        .arg("user.name=nucleos")
+        .arg("-c")
+        .arg("user.email=nucleos@localhost")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("commit")
+        .arg("--no-verify")
+        .arg("-m")
+        .arg("Preserve uncommitted work before worktree removal")
+        .output()
+        .await?;
+    if !commit.status.success() {
+        let stderr = String::from_utf8_lossy(&commit.stderr);
+        return Err(io::Error::other(format!("git commit failed: {stderr}")));
+    }
+
+    Ok(true)
+}
+
 pub async fn remove(project_root: &Path, path: &Path, backoff: &[Duration]) -> io::Result<()> {
+    preserve_uncommitted(path, DEFAULT_PRESERVATION_BYTE_CEILING)
+        .await
+        .map_err(preservation_failure)?;
     let result = retry_with_backoff(backoff, || try_remove_once(project_root, path)).await;
     let _ = git()
         .arg("-C")
@@ -235,6 +428,14 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
         )
         .await
         {
+            if is_preservation_failure(&error) {
+                tracing::warn!(
+                    run_id,
+                    %error,
+                    "failed to preserve released worktree; deferring removal"
+                );
+                return Ok(ReleaseOutcome::Released);
+            }
             tracing::warn!(
                 run_id,
                 %error,
@@ -274,10 +475,11 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
 
 /// Best-effort `git branch -d`, reporting whether the branch went away.
 ///
-/// Always `-d`, never `-D`: git refuses to delete a branch holding unmerged commits, and that
-/// refusal is the safety property — autonomous cleanup must never be able to destroy work the human
-/// has not seen. The common case for a discarded run is a branch with no commits at all, which `-d`
-/// removes happily, so this collects the branches that actually accumulate.
+/// Cleanup first commits every non-ignored, uncommitted path that fits the preservation ceiling;
+/// overflow or any preservation failure leaves the worktree in place. Always `-d`, never `-D`, then
+/// keeps that preservation commit (and any other unmerged work) on its branch. Together those two
+/// refusals ensure autonomous cleanup cannot destroy work the human has not seen. A discarded run
+/// with no commits remains the common branch this safely collects.
 async fn delete_branch_if_merged(project_root: &str, branch: &str) -> bool {
     git()
         .arg("-C")
@@ -511,8 +713,11 @@ pub async fn reconcile_orphaned_worktrees(
         for orphan in orphaned_worktrees(pool, project_root, min_age).await? {
             // `git worktree remove` first, so git's own bookkeeping is updated when it still knows
             // about the worktree; a bare directory it never registered falls through to the fs.
-            let removed = remove(project_root, &orphan, backoff).await.is_ok()
-                || tokio::fs::remove_dir_all(&orphan).await.is_ok();
+            let removed = match remove(project_root, &orphan, backoff).await {
+                Ok(()) => true,
+                Err(error) if is_preservation_failure(&error) => false,
+                Err(_) => tokio::fs::remove_dir_all(&orphan).await.is_ok(),
+            };
             if removed {
                 collected += 1;
                 tracing::warn!(
@@ -697,6 +902,47 @@ mod tests {
             .expect("create space-free tempdir")
     }
 
+    fn init_space_free_repo() -> tempfile::TempDir {
+        let repo = space_free_tempdir();
+        assert!(git_ok(repo.path(), &[OsStr::new("init")]));
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("user.email"),
+                OsStr::new("test@x"),
+            ],
+        ));
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("user.name"),
+                OsStr::new("test"),
+            ],
+        ));
+        std::fs::write(repo.path().join("seed.txt"), "seed\n").expect("write seed file");
+        assert!(git_ok(repo.path(), &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            repo.path(),
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("seed"),],
+        ));
+        repo
+    }
+
+    fn commit_count(dir: &Path, revision: &str) -> usize {
+        git_stdout(
+            dir,
+            &[
+                OsStr::new("rev-list"),
+                OsStr::new("--count"),
+                OsStr::new(revision),
+            ],
+        )
+        .parse()
+        .expect("commit count should be a number")
+    }
+
     fn env_lock() -> MutexGuard<'static, ()> {
         super::test_env_lock()
     }
@@ -864,6 +1110,298 @@ mod tests {
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
         assert!(create(not_repo.path(), 1).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_commits_uncommitted_work_before_removal() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), 101).await.expect("create worktree");
+        let commits_before = commit_count(repo.path(), &info.branch);
+
+        std::fs::write(info.path.join("seed.txt"), "modified\n").expect("modify tracked file");
+        std::fs::write(info.path.join("staged.txt"), "staged\n").expect("write staged file");
+        assert!(git_ok(
+            &info.path,
+            &[OsStr::new("add"), OsStr::new("staged.txt")]
+        ));
+        std::fs::write(info.path.join("untracked.txt"), "untracked\n")
+            .expect("write untracked file");
+
+        // Preservation commits must bypass project hooks: a repository-controlled hook must not
+        // get to turn cleanup into data loss.
+        std::fs::write(
+            repo.path().join(".git").join("hooks").join("pre-commit"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .expect("write rejecting pre-commit hook");
+
+        remove(repo.path(), &info.path, &[])
+            .await
+            .expect("preserve and remove worktree");
+
+        assert!(!info.path.exists());
+        assert_eq!(
+            commit_count(repo.path(), &info.branch),
+            commits_before + 1,
+            "removal must leave exactly one preservation commit on the worktree branch"
+        );
+        let identity = git_stdout(
+            repo.path(),
+            &[
+                OsStr::new("show"),
+                OsStr::new("-s"),
+                OsStr::new("--format=%an <%ae>"),
+                OsStr::new(&info.branch),
+            ],
+        );
+        assert_eq!(identity, "nucleos <nucleos@localhost>");
+        for (path, expected) in [
+            ("seed.txt", "modified"),
+            ("staged.txt", "staged"),
+            ("untracked.txt", "untracked"),
+        ] {
+            let object = format!("{}:{path}", info.branch);
+            assert_eq!(
+                git_stdout(
+                    repo.path(),
+                    &[OsStr::new("show"), OsStr::new(object.as_str())],
+                ),
+                expected,
+                "{path} must survive in the preservation commit"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_preserves_before_collecting_an_orphan() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('project-a', 'active', ?)",
+        )
+        .bind(repo.path().to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let orphan = create(repo.path(), 102).await.expect("create orphan");
+        let commits_before = commit_count(repo.path(), &orphan.branch);
+        std::fs::write(orphan.path.join("crash-recovery.txt"), "survived startup\n")
+            .expect("write orphaned work");
+
+        let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
+            .await
+            .expect("reconcile orphaned worktrees");
+
+        assert_eq!(collected, 1);
+        assert!(!orphan.path.exists());
+        assert_eq!(
+            commit_count(repo.path(), &orphan.branch),
+            commits_before + 1
+        );
+        let object = format!("{}:crash-recovery.txt", orphan.branch);
+        assert_eq!(
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("show"), OsStr::new(object.as_str())],
+            ),
+            "survived startup"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clean_worktree_is_removed_without_an_empty_commit() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), 103).await.expect("create worktree");
+        let commits_before = commit_count(repo.path(), &info.branch);
+
+        remove(repo.path(), &info.path, &[])
+            .await
+            .expect("remove clean worktree");
+
+        assert!(!info.path.exists());
+        assert_eq!(
+            commit_count(repo.path(), &info.branch),
+            commits_before,
+            "a clean worktree must not gain an empty preservation commit"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_preserve_leaves_the_worktree_alone() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('project-a', 'active', ?)",
+        )
+        .bind(repo.path().to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let info = create(repo.path(), 104).await.expect("create worktree");
+        let commits_before = commit_count(repo.path(), &info.branch);
+        std::fs::write(info.path.join("failure.txt"), "must survive\n")
+            .expect("write uncommitted work");
+
+        // `--no-verify` does not bypass commit signing. Pointing signing at an absent binary makes
+        // the preservation commit fail while leaving `git worktree remove` itself fully usable.
+        assert!(git_ok(
+            &info.path,
+            &[
+                OsStr::new("config"),
+                OsStr::new("commit.gpgSign"),
+                OsStr::new("true"),
+            ],
+        ));
+        let missing_signer = root.path().join("missing-gpg.exe");
+        assert!(git_ok(
+            &info.path,
+            &[
+                OsStr::new("config"),
+                OsStr::new("gpg.program"),
+                missing_signer.as_os_str(),
+            ],
+        ));
+
+        let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
+            .await
+            .expect("reconcile should defer a failed preservation");
+
+        assert_eq!(
+            collected, 0,
+            "the filesystem fallback must not count a failed preservation as collected"
+        );
+        assert!(info.path.is_dir(), "the worktree directory must survive");
+        assert_eq!(commit_count(repo.path(), &info.branch), commits_before);
+        assert_eq!(
+            std::fs::read_to_string(info.path.join("failure.txt")).expect("read surviving work"),
+            "must survive\n"
+        );
+        assert!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            )
+            .contains("failure.txt"),
+            "the uncommitted file must remain visible to git"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_skips_ignored_paths_and_respects_the_ceiling() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        std::fs::write(repo.path().join(".gitignore"), "ignored/\n")
+            .expect("write project ignore rule");
+        assert!(git_ok(repo.path(), &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("add ignore rule"),
+            ],
+        ));
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), 105).await.expect("create worktree");
+        let ceiling = 64_u64;
+        let commits_before = commit_count(repo.path(), &info.branch);
+
+        std::fs::create_dir_all(info.path.join("ignored")).expect("create ignored directory");
+        std::fs::write(
+            info.path.join("ignored").join("cache.bin"),
+            vec![b'i'; 1024],
+        )
+        .expect("write ignored file above ceiling");
+        std::fs::write(info.path.join("seed.txt"), "small change\n").expect("modify tracked file");
+        std::fs::write(info.path.join("keep.txt"), "keep\n").expect("write small untracked file");
+
+        assert!(
+            preserve_uncommitted(&info.path, ceiling)
+                .await
+                .expect("preserve non-ignored changes"),
+            "the helper should report that it created a commit"
+        );
+        assert_eq!(commit_count(repo.path(), &info.branch), commits_before + 1);
+        assert_eq!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            ),
+            "",
+            "all non-ignored changes should be committed"
+        );
+        assert!(info.path.join("ignored").join("cache.bin").exists());
+        let ignored_object = format!("{}:ignored/cache.bin", info.branch);
+        assert!(
+            !git_ok(
+                repo.path(),
+                &[
+                    OsStr::new("cat-file"),
+                    OsStr::new("-e"),
+                    OsStr::new(ignored_object.as_str()),
+                ],
+            ),
+            "a project-ignored path must not enter the preservation commit"
+        );
+
+        let commits_before_overflow = commit_count(repo.path(), &info.branch);
+        std::fs::write(
+            info.path.join("too-large.bin"),
+            vec![b'x'; ceiling as usize + 1],
+        )
+        .expect("write file above ceiling");
+
+        let error = preserve_uncommitted(&info.path, ceiling)
+            .await
+            .expect_err("ceiling overflow must fail before committing");
+
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "ceiling overflow must be distinguishable from a clean worktree"
+        );
+        assert_eq!(
+            commit_count(repo.path(), &info.branch),
+            commits_before_overflow,
+            "overflow must not create a partial preservation commit"
+        );
+        assert!(info.path.is_dir());
+        assert!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            )
+            .contains("too-large.bin")
+        );
+        let overflow_object = format!("{}:too-large.bin", info.branch);
+        assert!(
+            !git_ok(
+                repo.path(),
+                &[
+                    OsStr::new("cat-file"),
+                    OsStr::new("-e"),
+                    OsStr::new(overflow_object.as_str()),
+                ],
+            ),
+            "overflowing content must not be partially committed"
+        );
     }
 
     #[tokio::test]
