@@ -139,6 +139,17 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
         return;
     }
 
+    if let crate::attention::AttentionDecision::Defer { reason, scope } =
+        crate::attention::attention_permits_new_run(&state.pool, &state.run_handles, "", now).await
+    {
+        tracing::info!(
+            attention_scope = ?scope,
+            reason = %reason,
+            "owner attention brake refused global repo-trigger work; repo poller paused this tick"
+        );
+        return;
+    }
+
     let projects = match crate::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {
@@ -165,6 +176,27 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
                 reason = %reason,
                 "approval queue full; deferring this project's repo triggers"
             );
+            continue;
+        }
+
+        if let crate::attention::AttentionDecision::Defer { reason, scope } =
+            crate::attention::attention_permits_new_run(
+                &state.pool,
+                &state.run_handles,
+                &project_id,
+                now,
+            )
+            .await
+        {
+            tracing::info!(
+                project_id = %project_id,
+                attention_scope = ?scope,
+                reason = %reason,
+                "owner attention brake refused this project's repo triggers"
+            );
+            if matches!(scope, crate::attention::AttentionScope::Global) {
+                return;
+            }
             continue;
         }
 
@@ -482,6 +514,100 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    async fn seed_due_repo_project(state: &crate::state::AppState, project_id: &str, repo: &Path) {
+        let branch = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        std::fs::create_dir_all(repo.join(".ai")).unwrap();
+        std::fs::write(
+            repo.join(".ai").join("autopilot.yaml"),
+            format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
+        )
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES (?, 'shadow', ?)",
+        )
+        .bind(project_id)
+        .bind(repo.to_string_lossy().as_ref())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let old_head = git_stdout(repo, &["rev-parse", "HEAD"]);
+        record_sha(&state.pool, project_id, "t1", &old_head)
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join(format!("{project_id}.txt")), "changed\n").unwrap();
+        assert!(git_ok(repo, &["add", "-A"]));
+        assert!(git_ok(repo, &["commit", "-m", "trigger change"]));
+    }
+
+    #[tokio::test]
+    async fn a_project_heartbeat_only_stops_that_projects_repo_trigger() {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let state = test_state().await;
+        seed_due_repo_project(&state, "project-a", repo_a.path()).await;
+        seed_due_repo_project(&state, "project-b", repo_b.path()).await;
+        let now = ts("2026-07-20T10:00:00Z");
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Project("project-a".to_string()),
+            now,
+        )
+        .await
+        .unwrap();
+
+        poll_tick(&state, now).await;
+
+        let fired_projects: Vec<String> =
+            sqlx::query_scalar("SELECT project_id FROM runs ORDER BY project_id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(fired_projects, ["project-b"]);
+    }
+
+    #[tokio::test]
+    async fn a_global_heartbeat_stops_all_repo_triggers() {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let state = test_state().await;
+        seed_due_repo_project(&state, "project-a", repo_a.path()).await;
+        seed_due_repo_project(&state, "project-b", repo_b.path()).await;
+        let now = ts("2026-07-20T10:00:00Z");
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            now,
+        )
+        .await
+        .unwrap();
+
+        poll_tick(&state, now).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn no_heartbeat_leaves_repo_trigger_firing_unchanged() {
+        let repo = init_repo();
+        let state = test_state().await;
+        seed_due_repo_project(&state, "project", repo.path()).await;
+
+        poll_tick(&state, ts("2026-07-20T10:00:00Z")).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 1);
     }
 
     #[tokio::test]
