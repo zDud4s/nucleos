@@ -654,6 +654,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gate_execution_is_not_an_autonomous_row() {
+        let pool = test_pool().await;
+        let worktree = tempfile::tempdir().expect("create temporary worktree");
+        let before = autonomous_rows(&pool).await.unwrap();
+
+        let outcome = crate::gate::run_gate(
+            worktree.path(),
+            r#"sh -c "exit 0""#,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, crate::gate::GateOutcome::Passed));
+        let after = autonomous_rows(&pool).await.unwrap();
+        assert_eq!(after.len(), before.len());
+    }
+
+    #[tokio::test]
     async fn window_spend_counts_only_autonomous_runs_in_window() {
         let pool = test_pool().await;
         let now = ts("2026-07-20T12:00:00Z"); // default period = monthly -> window from 2026-07-01
