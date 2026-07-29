@@ -1,14 +1,12 @@
-// The contact API has no production call site yet: the triage adjustment (packet P2) and the
-// ingestion wiring (packet P4) are what consume it. Remove this allow when they land — the
-// repository's clippy gate runs with `-D warnings`, so the module cannot compile without it
-// until then.
-#![allow(dead_code)]
-
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub struct Profile {
     pub messages_in: i64,
+    // Consumed by the later contact display surface.
+    #[allow(dead_code)]
     pub first_seen: String,
+    // Consumed by the later contact display surface.
+    #[allow(dead_code)]
     pub last_seen: String,
     pub outbound_ever: bool,
 }
@@ -30,6 +28,8 @@ pub fn normalize_address(address: &str) -> String {
 #[derive(Clone, Copy)]
 enum MessageDirection {
     Inbound,
+    // Consumed by the Sent-folder ingestion packet (P4).
+    #[allow(dead_code)]
     Outbound,
 }
 
@@ -125,6 +125,8 @@ pub async fn record_inbound(
     .await
 }
 
+// Consumed by the Sent-folder ingestion packet (P4).
+#[allow(dead_code)]
 pub async fn record_outbound(
     transaction: &mut Transaction<'_, Sqlite>,
     to_addrs: &[&str],

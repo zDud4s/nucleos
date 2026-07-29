@@ -417,6 +417,8 @@ pub async fn ingest_batch(
         .await?;
 
         if result.rows_affected() == 1 {
+            crate::contacts::record_inbound(&mut tx, &message.from_addr, &message.received_at)
+                .await?;
             ingested += 1;
             // Only for a row this batch actually created. A duplicate already has its attachments,
             // and re-inserting them would either collide on the UNIQUE or silently double a list
@@ -1142,6 +1144,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_ingestao_acumula_o_contacto() {
+        let pool = test_pool().await;
+        let sender = "primeiro.contacto@example.com";
+        let mut inbound = message(20);
+        inbound.from_addr = sender.into();
+
+        ingest(&pool, &[inbound], 20).await;
+
+        let profile = crate::contacts::profile_for(&pool, sender).await.unwrap();
+        assert!(
+            profile.is_some(),
+            "ingesting an inbound message must create the sender's contact profile"
+        );
+        let profile = profile.unwrap();
+        assert_eq!(profile.messages_in, 1);
+        assert!(!profile.outbound_ever);
+    }
+
+    #[tokio::test]
+    async fn um_email_duplicado_nao_conta_duas_vezes() {
+        let pool = test_pool().await;
+        let sender = "redelivery@example.com";
+        let mut inbound = message(21);
+        inbound.from_addr = sender.into();
+
+        let first = ingest(&pool, std::slice::from_ref(&inbound), 21).await;
+        let duplicate = ingest(&pool, std::slice::from_ref(&inbound), 21).await;
+        assert_eq!(first.ingested, 1);
+        assert_eq!(duplicate.ingested, 0);
+        assert_eq!(duplicate.duplicates, 1);
+
+        let profile = crate::contacts::profile_for(&pool, sender).await.unwrap();
+        assert!(
+            profile.is_some(),
+            "the first delivery must create the sender's contact profile"
+        );
+        let profile = profile.unwrap();
+        assert_eq!(
+            profile.messages_in, 1,
+            "a redelivery ignored by the email insert must not inflate contact history"
+        );
+        assert!(!profile.outbound_ever);
     }
 
     #[tokio::test]

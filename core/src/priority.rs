@@ -1,8 +1,3 @@
-// The priority policy has no production call site yet: the triage call site lands in a later
-// packet. Remove this allow when that wiring lands — the repository's clippy gate runs with
-// `-D warnings`, so the module cannot compile without it until then.
-#![allow(dead_code)]
-
 pub fn adjust(
     model_class: &str,
     profile: Option<&crate::contacts::Profile>,
@@ -31,6 +26,8 @@ pub fn adjust(
     }
 }
 
+// Consumed by the `o_derivado_nunca_promove` policy invariant test.
+#[allow(dead_code)]
 fn rank(class: &str) -> u8 {
     match class {
         "urgent" => 3,

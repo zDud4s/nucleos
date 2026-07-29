@@ -740,6 +740,27 @@ async fn apply_verdicts(
 ) -> sqlx::Result<()> {
     let now_str = now.to_rfc3339();
     for verdict in verdicts {
+        let from_addr: String = sqlx::query_scalar("SELECT from_addr FROM emails WHERE id = ?")
+            .bind(verdict.id)
+            .fetch_one(pool)
+            .await?;
+        let profile = crate::contacts::profile_for(pool, &from_addr).await?;
+        let override_verdict: Option<String> = sqlx::query_scalar(
+            "SELECT overrides.verdict
+               FROM contact_overrides AS overrides
+               JOIN contact_addresses AS addresses
+                 ON addresses.contact_id = overrides.contact_id
+              WHERE addresses.address = ?",
+        )
+        .bind(crate::contacts::normalize_address(&from_addr))
+        .fetch_optional(pool)
+        .await?;
+        let triage_class = crate::priority::adjust(
+            &verdict.class,
+            profile.as_ref(),
+            override_verdict.as_deref(),
+        );
+
         // The body goes only in the steady state; the default keeps it for the calibration week.
         if retain_bodies_days == 0 {
             sqlx::query(
@@ -747,7 +768,7 @@ async fn apply_verdicts(
                                    triage_run_id = NULL, body_text = NULL
                   WHERE id = ?",
             )
-            .bind(&verdict.class)
+            .bind(triage_class)
             .bind(&verdict.summary)
             .bind(&now_str)
             .bind(verdict.id)
@@ -759,7 +780,7 @@ async fn apply_verdicts(
                                    triage_run_id = NULL
                   WHERE id = ?",
             )
-            .bind(&verdict.class)
+            .bind(triage_class)
             .bind(&verdict.summary)
             .bind(&now_str)
             .bind(verdict.id)
@@ -1566,6 +1587,16 @@ mod tests {
     async fn verdicts_are_filed_without_a_new_request() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 1, 1).await;
+        // Seed established history so this test remains about filing verdicts, not priority policy.
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
         let stdout = transcript(serde_json::json!([
             {"id": ids[0], "class": "urgent", "summary": "server down"},
         ]));
@@ -1749,6 +1780,16 @@ mod tests {
     async fn a_completed_run_files_its_verdicts() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 2, 1).await;
+        // Seed established history so this test remains about filing verdicts, not priority policy.
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
         let stdout = transcript(serde_json::json!([
             {"id": ids[0], "class": "urgent", "summary": "server down"},
             {"id": ids[1], "class": "noise", "summary": "newsletter"},
@@ -1766,6 +1807,88 @@ mod tests {
         assert_eq!(class.as_deref(), Some("urgent"));
         assert_eq!(summary.as_deref(), Some("server down"));
         assert!(claimed_by(&state.pool, ids[0]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_triagem_aplica_o_ajuste_ao_que_grava() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 2, 1).await;
+        let first_contact = "first.contact@example.com";
+        let established_contact = "established.contact@example.com";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(first_contact)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(established_contact)
+            .bind(ids[1])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, established_contact, &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, established_contact, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let first_profile = crate::contacts::profile_for(&state.pool, first_contact)
+            .await
+            .unwrap();
+        assert!(
+            first_profile.is_none(),
+            "the first sender must have no accumulated history"
+        );
+        let established_profile = crate::contacts::profile_for(&state.pool, established_contact)
+            .await
+            .unwrap()
+            .expect("the established sender must have accumulated history");
+        assert_eq!(established_profile.messages_in, 2);
+
+        let verdicts = vec![
+            Verdict {
+                id: ids[0],
+                class: "urgent".into(),
+                summary: "first contact".into(),
+            },
+            Verdict {
+                id: ids[1],
+                class: "urgent".into(),
+                summary: "known contact".into(),
+            },
+        ];
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let first_class: Option<String> =
+            sqlx::query_scalar("SELECT triage_class FROM emails WHERE id = ?")
+                .bind(ids[0])
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let established_class: Option<String> =
+            sqlx::query_scalar("SELECT triage_class FROM emails WHERE id = ?")
+                .bind(ids[1])
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            first_class.as_deref(),
+            Some("action"),
+            "an urgent verdict for a sender with no history must be demoted"
+        );
+        assert_eq!(
+            established_class.as_deref(),
+            Some("urgent"),
+            "the derived rule must not demote an established sender"
+        );
     }
 
     /// The rule that keeps this pillar from destroying mail: ten infrastructure failures in a row
