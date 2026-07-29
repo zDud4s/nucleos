@@ -1,4 +1,4 @@
-# The three gates `scripts/gates.sh` runs, run again on push.
+# CI reruns the four `scripts/gates.sh` targets for each push and pull request.
 #
 # windows-latest is not a preference. The núcleo is Windows-only by construction: `keyring` builds
 # with the windows-native-keyring-store backend, autostart shells out to `schtasks`, and the run
@@ -9,9 +9,10 @@
 # claiming "green" managed to coexist; copying them here would recreate the same split, one file
 # further away.
 #
-# Three jobs rather than one `gates.sh all`, because the script deliberately runs every stack even
-# after one fails — the useful property locally, where you want all three answers in one pass. In CI
-# the jobs give the same completeness in parallel, and name which stack broke without reading a log.
+# Four jobs rather than one `gates.sh all`: `all` covers the three hermetic stack targets, while the
+# separate security target is deliberately outside it. The script still runs every stack after one
+# fails — the useful property locally, where you want all three stack answers in one pass. In CI the
+# jobs give the same completeness in parallel, and name which target broke without reading a log.
 
 name: gates
 
@@ -52,6 +53,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: bash scripts/gates.sh core
+
+  security:
+    runs-on: windows-latest
+    steps:
+      # A depth-1 checkout only sees the tip; a secret committed then removed is exactly what this
+      # job must find, so it needs the full history.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # `rustup show` installs the pinned GNU toolchain from rust-toolchain.toml before cargo-audit
+      # is compiled, just as the core job does for its Rust commands.
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit --locked
+          gitleaks_version=8.30.0
+          curl --fail --location --silent --show-error \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/gitleaks_${gitleaks_version}_windows_x64.zip" \
+            --output "$RUNNER_TEMP/gitleaks.zip"
+          unzip -q "$RUNNER_TEMP/gitleaks.zip" -d "$RUNNER_TEMP/gitleaks"
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+
+      - run: bash scripts/gates.sh security
 
   sidecars:
     runs-on: windows-latest
