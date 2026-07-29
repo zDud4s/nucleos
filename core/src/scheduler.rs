@@ -73,8 +73,11 @@ pub fn due_rules<'a>(
         .filter_map(|rule| {
             let cron = match rule.cron.parse::<Cron>() {
                 Ok(cron) => cron,
+                // Debug, not warn: this runs every 30 seconds for as long as the rule exists, and
+                // the same fact is announced once to the feed when the rule is armed. A line
+                // repeated 2,880 times a day is not a louder warning, it is a quieter log.
                 Err(error) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         rule_name = %rule.name,
                         cron = %rule.cron,
                         error = %error,
@@ -306,6 +309,27 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 continue;
             }
 
+            // Said once, here, where a rule is first seen. An unparseable cron simply never comes
+            // due, so the only sign of a typo was a `warn!` every 30 seconds for as long as the
+            // rule existed — which is the same as no sign at all, in a log nobody is watching while
+            // they wonder why their automation stopped. The feed is where a person looks.
+            if let Err(error) = rule.cron.parse::<Cron>() {
+                let _ = crate::feed::append(
+                    &state.pool,
+                    Some(&project_id),
+                    "schedule_rule_invalid",
+                    &format!(
+                        "schedule rule '{}' has an unreadable cron ({}): {error} — it will never fire",
+                        rule.name, rule.cron
+                    ),
+                    None,
+                )
+                .await;
+            }
+
+            // Armed regardless, so this branch runs once rather than every tick. A rule that cannot
+            // be read is still a rule the user wrote, and forgetting it would only mean announcing
+            // it again in 30 seconds.
             if let Err(error) = sqlx::query(
                 "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at, last_head_sha)
                  VALUES (?, ?, ?, ?)",
@@ -718,6 +742,51 @@ mod tests {
                 .unwrap();
         assert_eq!(date.as_deref(), Some("2026-07-19"));
         assert_eq!(count, 1, "the stale count resets rather than accumulating");
+    }
+
+    /// A cron nobody can parse is a rule that never comes due, so the only evidence of a typo was a
+    /// log line every 30 seconds — which is where you look after you already know something is
+    /// wrong, not how you find out. Said once, to the feed, when the rule is first seen.
+    #[tokio::test]
+    async fn an_unreadable_cron_is_reported_once_where_a_person_looks() {
+        let state = test_state(None).await;
+        let container = space_free_tempdir("nucleos-scheduler-badcron-");
+        let repo = container.path().join("repo");
+        std::fs::create_dir_all(repo.join(".ai")).unwrap();
+        std::fs::write(
+            repo.join(".ai").join("autopilot.yaml"),
+            "schedules:\n  - name: r1\n    cron: \"not a cron\"\n    prompt: \"go\"\n",
+        )
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('proj', 'shadow', ?)",
+        )
+        .bind(repo.to_string_lossy().as_ref())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // Three ticks: the rule is armed on the first and merely re-read on the rest.
+        for minute in ["10:00:00", "10:00:30", "10:01:00"] {
+            scheduler_tick(&state, timestamp(&format!("2026-07-18T{minute}Z"))).await;
+        }
+
+        let entries: Vec<String> = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'schedule_rule_invalid' ORDER BY id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(entries.len(), 1, "once, not once per tick: {entries:?}");
+        assert!(entries[0].contains("r1"), "{}", entries[0]);
+        assert!(entries[0].contains("never fire"), "{}", entries[0]);
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "an unreadable rule must not fire either");
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
