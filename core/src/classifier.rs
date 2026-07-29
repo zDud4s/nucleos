@@ -374,7 +374,7 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
     let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
         return false;
     };
-    let normalized = normalize_path(file_path, cwd);
+    let normalized = fold_for_match(&normalize_path(file_path, cwd));
 
     SELF_GOVERNING_FILES
         .iter()
@@ -387,7 +387,7 @@ fn targets_file_that_runs_on_next_command(tool_input: &Value, cwd: Option<&Path>
     let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
         return false;
     };
-    let normalized = normalize_path(file_path, cwd);
+    let normalized = fold_for_match(&normalize_path(file_path, cwd));
 
     EXECUTES_ON_NEXT_COMMAND_FILES
         .iter()
@@ -405,8 +405,8 @@ fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
         return false;
     };
 
-    let target = normalize_path(file_path, Some(cwd));
-    let cwd = normalize_path(&cwd.to_string_lossy(), None);
+    let target = fold_for_containment(&normalize_path(file_path, Some(cwd)));
+    let cwd = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
     target != cwd && !target.starts_with(&format!("{cwd}/"))
 }
 
@@ -424,21 +424,22 @@ fn deletes_outside_cwd(command: &str, cwd: Option<&Path>) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
-    let tokens: Vec<String> = shell_words(command)
-        .iter()
-        .map(|token| token.to_ascii_lowercase())
-        .collect();
-    let workspace = normalize_path(&cwd.to_string_lossy(), None);
+    // Tokens kept as written. Only the program name is case-folded, to match the list below; the
+    // delete TARGETS go to `fold_for_containment`, which folds a path only where the filesystem
+    // does — folding them here would widen the workspace behind its back.
+    let tokens = shell_words(command);
+    let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
 
     tokens.iter().enumerate().any(|(index, token)| {
-        let program = program_name(token);
+        let lowered = token.to_ascii_lowercase();
+        let program = program_name(&lowered);
         if !matches!(program, "rm" | "rd" | "rmdir" | "del" | "remove-item") {
             return false;
         }
         delete_targets(program, &tokens[index + 1..])
             .into_iter()
             .any(|target| {
-                let target = normalize_path(target, Some(cwd));
+                let target = fold_for_containment(&normalize_path(target, Some(cwd)));
                 target != workspace && !target.starts_with(&format!("{workspace}/"))
             })
     })
@@ -504,7 +505,37 @@ fn normalize_path(path: &str, cwd: Option<&Path>) -> String {
             _ => components.push(component),
         }
     }
-    components.join("/").to_ascii_lowercase()
+    components.join("/")
+}
+
+/// PURE: case-folds a path for comparison against the lowercase blocklists at the top of this file.
+///
+/// Unconditional, unlike `fold_for_containment`, because folding can only ever WIDEN a blocklist:
+/// `Build.rs` and `build.rs` both end up needing approval. On a filesystem where those really are
+/// two files, the cost is an approval prompt for the wrong one — not a missed one.
+fn fold_for_match(path: &str) -> String {
+    path.to_ascii_lowercase()
+}
+
+/// PURE: case-folds a path for a containment check, but only where the filesystem itself does.
+///
+/// Folding works the opposite way round here from `fold_for_match`: it makes more paths look like
+/// they are INSIDE the workspace, so on a case-sensitive filesystem `/home/me/Work` would pass as
+/// contained by `/home/me/work` and the boundary would be quietly wider than it reads. On Windows
+/// not folding would be the bug instead — `C:\Work\Repo` and `c:\work\repo` are one directory, and
+/// denying a write between the two spellings would be a false alarm on every run.
+///
+/// The daemon only builds for Windows today (`schtasks`, `taskkill`, Credential Manager), so this
+/// is here to keep the boundary correct if that ever stops being true, rather than to fix something
+/// reachable now.
+#[cfg(windows)]
+fn fold_for_containment(path: &str) -> String {
+    path.to_ascii_lowercase()
+}
+
+#[cfg(not(windows))]
+fn fold_for_containment(path: &str) -> String {
+    path.to_owned()
 }
 
 fn is_absolute_path(path: &str) -> bool {
@@ -558,6 +589,73 @@ mod tests {
                 "destructive",
             );
         }
+    }
+
+    /// Pins both folds directly, including the branch this platform does not take — the whole point
+    /// of splitting them is that they must not drift back into being the same function.
+    #[test]
+    fn the_two_folds_answer_differently_on_purpose() {
+        assert_eq!(fold_for_match("C:/Work/Build.RS"), "c:/work/build.rs");
+
+        let folded = fold_for_containment("C:/Work/Repo");
+        if cfg!(windows) {
+            assert_eq!(folded, "c:/work/repo", "Windows folds, so this must too");
+        } else {
+            assert_eq!(
+                folded, "C:/Work/Repo",
+                "a case-sensitive filesystem means these are different directories"
+            );
+        }
+    }
+
+    /// Case-folding cuts both ways, and the two uses want opposite answers. Against the blocklists
+    /// it only ever widens what needs approval, so it is unconditional. In a containment check it
+    /// widens the WORKSPACE — more paths look contained — so it happens only where the filesystem
+    /// folds too.
+    #[test]
+    fn case_folding_widens_the_blocklist_and_never_the_workspace() {
+        let cwd = Path::new(r"C:\work\repo");
+
+        // Blocklist: an odd spelling must not escape it.
+        for file_path in [
+            r"C:\work\repo\Build.rs",
+            r"C:\work\repo\CARGO.TOML",
+            r"C:\work\repo\.GitHooks\pre-commit",
+        ] {
+            assert_eq!(
+                classify("Write", &json!({ "file_path": file_path }), Some(cwd))
+                    .decision
+                    .decision,
+                "pending_approval",
+                "{file_path}"
+            );
+        }
+
+        // Containment: on Windows the two spellings are one directory, so this must stay allowed
+        // rather than becoming a false alarm on every run.
+        #[cfg(windows)]
+        assert_eq!(
+            classify(
+                "Write",
+                &json!({ "file_path": r"C:\Work\Repo\src\main.rs" }),
+                Some(cwd)
+            )
+            .decision
+            .decision,
+            "allow"
+        );
+
+        // Leaving the workspace is denied whatever the case of the parts that do match.
+        assert_eq!(
+            classify(
+                "Write",
+                &json!({ "file_path": r"C:\Work\Other\x.rs" }),
+                Some(cwd)
+            )
+            .decision
+            .decision,
+            "deny"
+        );
     }
 
     /// The containment check had the same first-token anchor as the flag check: `rm ../../secrets`
