@@ -203,58 +203,81 @@ pub fn class_ready(reviewed: i64, agree: i64) -> bool {
     reviewed >= READINESS_MIN_REVIEWED && agree * 100 >= READINESS_MIN_AGREE_PERCENT * reviewed
 }
 
-/// A project may leave shadow once it has exercised at least one action class and EVERY exercised
-/// class clears the bar. Classes never exercised don't block (a project would otherwise wait forever
-/// on a `deploy` it never attempts), but zero exercised classes is NOT promotable — "no evidence"
-/// must not read as "all the evidence is good".
-pub fn promotable(classes_ready: i64, classes_total: i64) -> bool {
-    classes_total > 0 && classes_ready == classes_total
+/// The classifier decisions that mean it held an action BACK, rather than waving it through.
+const WITHHELD_DECISIONS: [&str; 2] = ["pending_approval", "deny"];
+
+/// A project may leave shadow once it has exercised at least one action class, EVERY exercised
+/// class clears the bar, and at least one of those ready classes is one the classifier WITHHELD
+/// (`pending_approval` or `deny`). Classes never exercised don't block (a project would otherwise
+/// wait forever on a `deploy` it never attempts), but zero exercised classes is NOT promotable —
+/// "no evidence" must not read as "all the evidence is good".
+///
+/// The withheld requirement is the part that looks redundant and is not: a corpus made entirely of
+/// `allow` decisions validates the classifier's PERMISSIVENESS — that it lets through what it
+/// should — and says nothing whatsoever about its RESTRAINT. Restraint is the only property that
+/// matters once the project starts acting on its own, so it has to have been checked before it may.
+pub fn promotable(classes_ready: i64, classes_total: i64, withheld_classes_ready: i64) -> bool {
+    classes_total > 0 && classes_ready == classes_total && withheld_classes_ready > 0
 }
 
-/// `(classes_ready, classes_total)` per project, over SHADOW-mode decisions only.
+/// `(classes_ready, classes_total, withheld_classes_ready)` per project, over SHADOW-mode decisions
+/// only.
 ///
 /// Shadow-mode only because promotion OUT of shadow is earned by evidence gathered IN shadow: a
 /// `worktree`-mode decision was actually enforced, not a hypothetical the human could still overrule.
-/// Projects with no shadow decisions are absent from the map (the caller reads that as `(0, 0)`).
+/// Projects with no shadow decisions are absent from the map (the caller reads that as `(0, 0, 0)`).
+///
+/// `decision` joins the GROUP BY without changing its cardinality: every exit point in
+/// `classifier.rs` fixes one decision per action class, so the pair is a functional dependency and
+/// the rows are exactly the ones grouping by class alone produced. Grouped rather than aggregated
+/// for that reason — a `MAX(CASE ...)` would imply a choice among several decisions that a class
+/// cannot have.
 pub async fn shadow_readiness(
     pool: &SqlitePool,
-) -> sqlx::Result<std::collections::HashMap<String, (i64, i64)>> {
+) -> sqlx::Result<std::collections::HashMap<String, (i64, i64, i64)>> {
     let sql = format!(
         "SELECT
              runs.project_id AS project_id,
              shadow_decisions.action_class AS action_class,
+             shadow_decisions.decision AS decision,
              {REVIEWED_DISTINCT} AS reviewed,
              {AGREE_DISTINCT} AS agree
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.mode = 'shadow'
-         GROUP BY runs.project_id, shadow_decisions.action_class"
+         GROUP BY runs.project_id, shadow_decisions.action_class, shadow_decisions.decision"
     );
 
     // Same `AssertSqlSafe` reasoning as `scoreboard`: the only interpolation is `AGREE_CASE`.
-    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
         .await?;
 
-    let mut readiness: std::collections::HashMap<String, (i64, i64)> =
+    let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
-    for (project_id, _action_class, reviewed, agree) in rows {
-        let entry = readiness.entry(project_id).or_insert((0, 0));
+    for (project_id, _action_class, decision, reviewed, agree) in rows {
+        let entry = readiness.entry(project_id).or_insert((0, 0, 0));
         entry.1 += 1;
         if class_ready(reviewed, agree) {
             entry.0 += 1;
+            if WITHHELD_DECISIONS.contains(&decision.as_str()) {
+                entry.2 += 1;
+            }
         }
     }
     Ok(readiness)
 }
 
-/// `(classes_ready, classes_total)` for one project — same rule as `shadow_readiness`, used by the
-/// promotion nudge to spot the moment a project crosses the bar.
-pub async fn project_readiness(pool: &SqlitePool, project_id: &str) -> sqlx::Result<(i64, i64)> {
+/// `(classes_ready, classes_total, withheld_classes_ready)` for one project — same rule as
+/// `shadow_readiness`, used by the promotion nudge to spot the moment a project crosses the bar.
+pub async fn project_readiness(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<(i64, i64, i64)> {
     Ok(shadow_readiness(pool)
         .await?
         .remove(project_id)
-        .unwrap_or((0, 0)))
+        .unwrap_or((0, 0, 0)))
 }
 
 /// The project a shadow decision belongs to, or `None` when the decision id is unknown.
@@ -650,11 +673,99 @@ mod tests {
     #[test]
     fn promotable_requires_evidence_not_just_the_absence_of_failure() {
         // A project that has never exercised a class has not earned anything.
-        assert!(!promotable(0, 0));
-        assert!(promotable(1, 1));
-        assert!(promotable(4, 4));
+        assert!(!promotable(0, 0, 0));
+        assert!(promotable(1, 1, 1));
+        assert!(promotable(4, 4, 1));
         // One class still short holds the whole project.
-        assert!(!promotable(3, 4));
+        assert!(!promotable(3, 4, 1));
+    }
+
+    #[tokio::test]
+    async fn promotable_requires_a_withheld_class_not_just_reads() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // Both exercised classes are classifier allows, and both clear the existing review bar.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+            insert_shadow(&pool, run, "vcs-local", "allow", Some("approve")).await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap();
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (2, 2, 0)
+        );
+        assert!(!promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn promotable_once_a_withheld_class_is_reviewed_and_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // The same ready allow-only corpus is not enough by itself.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+            insert_shadow(&pool, run, "vcs-local", "allow", Some("approve")).await;
+        }
+        // A reviewed class where the classifier withheld supplies the missing evidence.
+        for _ in 0..10 {
+            insert_shadow(
+                &pool,
+                run,
+                "push-merge-deploy",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap();
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (3, 3, 1)
+        );
+        assert!(promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn zero_exercised_classes_is_still_not_promotable() {
+        let pool = test_pool().await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap_or((0, 0, 0));
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (0, 0, 0)
+        );
+        assert!(!promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -678,8 +789,9 @@ mod tests {
 
         let readiness = shadow_readiness(&pool).await.unwrap();
 
-        assert_eq!(readiness.get("project-a").copied(), Some((1, 2)));
-        assert!(!promotable(1, 2));
+        // The only ready class is an `allow` one, so nothing withheld has been validated yet.
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 2, 0)));
+        assert!(!promotable(1, 2, 0));
     }
 
     /// The promotion bar exists to say the classifier has been checked against enough real
@@ -706,10 +818,10 @@ mod tests {
 
         assert_eq!(
             readiness.get("project-a").copied(),
-            Some((0, 1)),
+            Some((0, 1, 0)),
             "one action reviewed ten times is one piece of evidence"
         );
-        assert!(!promotable(0, 1));
+        assert!(!promotable(0, 1, 0));
     }
 
     /// A person disagreeing about an action means the classifier does not handle it, however many
@@ -741,7 +853,7 @@ mod tests {
         let readiness = shadow_readiness(&pool).await.unwrap();
 
         // 10 distinct actions reviewed, 9 agreed = 90%, under the 95% bar.
-        assert_eq!(readiness.get("project-a").copied(), Some((0, 1)));
+        assert_eq!(readiness.get("project-a").copied(), Some((0, 1, 0)));
     }
 
     #[tokio::test]
@@ -758,7 +870,10 @@ mod tests {
             shadow_readiness(&pool).await.unwrap().get("project-a"),
             None
         );
-        assert_eq!(project_readiness(&pool, "project-a").await.unwrap(), (0, 0));
+        assert_eq!(
+            project_readiness(&pool, "project-a").await.unwrap(),
+            (0, 0, 0)
+        );
     }
 
     #[tokio::test]
@@ -771,9 +886,18 @@ mod tests {
         }
         insert_shadow(&pool, run_b, "read-local", "allow", None).await;
 
-        assert_eq!(project_readiness(&pool, "project-a").await.unwrap(), (1, 1));
-        assert_eq!(project_readiness(&pool, "project-b").await.unwrap(), (0, 1));
-        assert_eq!(project_readiness(&pool, "project-c").await.unwrap(), (0, 0));
+        assert_eq!(
+            project_readiness(&pool, "project-a").await.unwrap(),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            project_readiness(&pool, "project-b").await.unwrap(),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            project_readiness(&pool, "project-c").await.unwrap(),
+            (0, 0, 0)
+        );
     }
 
     #[tokio::test]

@@ -1626,7 +1626,7 @@ async fn post_shadow_verdict(
     let was_promotable = match &project {
         Some(project_id) => shadow::project_readiness(&state.pool, project_id)
             .await
-            .map(|(ready, total)| shadow::promotable(ready, total))
+            .map(|(ready, total, withheld)| shadow::promotable(ready, total, withheld))
             .unwrap_or(false),
         None => false,
     };
@@ -1661,10 +1661,10 @@ async fn announce_promotable(pool: &sqlx::SqlitePool, project_id: &str, was_prom
     if was_promotable {
         return;
     }
-    let Ok((ready, total)) = shadow::project_readiness(pool, project_id).await else {
+    let Ok((ready, total, withheld)) = shadow::project_readiness(pool, project_id).await else {
         return;
     };
-    if !shadow::promotable(ready, total) {
+    if !shadow::promotable(ready, total, withheld) {
         return;
     }
 
@@ -4048,6 +4048,12 @@ mod tests {
 
     /// Seeds one shadow-mode run whose `read-local` class has `reviewed` approved decisions plus one
     /// still-unreviewed decision, and returns that unreviewed decision's id.
+    ///
+    /// Alongside it, a `push-merge-deploy` class that ALREADY clears the bar — because `promotable`
+    /// also requires one ready class the classifier withheld. Without it no project seeded here could
+    /// ever be promotable, and these three tests would all be asserting against a project held back
+    /// by a criterion none of them is about: one would fail, and the other two would pass for a
+    /// reason their names deny.
     async fn seed_shadow_class(pool: &sqlx::SqlitePool, project_id: &str, reviewed: usize) -> i64 {
         sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
@@ -4061,6 +4067,23 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
+
+        // Seeded first and complete, so the `read-local` class below stays the one whose crossing
+        // these tests observe. `reject` agrees with `pending_approval`, so the class is unanimous.
+        for index in 0..shadow::READINESS_MIN_REVIEWED {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, tool_input, decision, reason, action_class,
+                  classifier_version, human_verdict, reviewed_at, created_at)
+                 VALUES (?, 'Bash', ?, 'pending_approval', 'seed', 'push-merge-deploy', 1,
+                         'reject', NULL, '2026-07-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(format!(r#"{{"command":"git push seed-{index}"}}"#))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
 
         let mut last = 0;
         for index in 0..=reviewed {

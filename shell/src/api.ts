@@ -60,6 +60,14 @@ export interface ProjectSummary {
   /** Action classes clearing the shadow-exit bar, out of those the project has exercised. */
   classes_ready: number;
   classes_total: number;
+  /**
+   * How many of those ready classes are ones the classifier WITHHELD (`pending_approval`/`deny`).
+   *
+   * Optional because the shell can be newer than the daemon it is talking to, and an absent value
+   * reads as zero — which keeps the promote control locked rather than unlocking it, the safe
+   * direction for a field that is not there.
+   */
+  withheld_classes_ready?: number;
   /** Whether the promote-to-active control should unlock. Decided by the daemon (`shadow.rs`). */
   promotable: boolean;
   /** WIP brake: proposals waiting on you, the ceiling (null = off), and whether it is reached. */

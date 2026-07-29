@@ -15,6 +15,7 @@ import {
   mailTone,
   periodLabel,
   promotionBlock,
+  promotionCriterionGap,
   promotionReadiness,
   queueBlock,
   readinessCriterionLabel,
@@ -305,6 +306,23 @@ describe("pure UI derivations", () => {
 
   it("states the promotion criterion", () => {
     expect(readinessCriterionLabel()).toBe("Ready at 10+ reviews, ≥95% agreement");
+  });
+
+  it("names_the_unmet_promotion_criterion", () => {
+    expect(
+      promotionCriterionGap({
+        classes_ready: 2,
+        classes_total: 2,
+        withheld_classes_ready: 0,
+      }),
+    ).toBe("No withheld action class has cleared the review bar");
+    expect(
+      promotionCriterionGap({
+        classes_ready: 1,
+        classes_total: 2,
+        withheld_classes_ready: 0,
+      }),
+    ).toBe("1/2 action classes ready");
   });
 
   it("derives the headline autopilot state in priority order", () => {

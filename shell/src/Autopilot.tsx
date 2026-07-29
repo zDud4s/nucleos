@@ -33,7 +33,9 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
   const [root, setRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [changing, setChanging] = useState(false);
-  // The §8.2 shadow-exit gate: `active` stays locked until the scoreboard says the project earned it.
+  // The §8.2 shadow-exit gate: `active` stays locked until the scoreboard says the project earned
+  // it — every exercised class cleared, AND at least one of those a class the classifier withheld,
+  // since a corpus of pure `allow` only ever proves it is permissive in the right places.
   const blocked = promotionBlock(project);
   const gateId = `gate-${project.project_id}`;
   // The WIP brake: a full approval queue is why an otherwise healthy project has gone quiet.
