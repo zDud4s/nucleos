@@ -50,7 +50,32 @@ pub enum ToolPolicy {
     None,
 }
 
+fn advertised_tools_violate(policy: ToolPolicy, advertised: &[String]) -> Option<String> {
+    let offending: Vec<&str> = match policy {
+        ToolPolicy::Unrestricted => return None,
+        ToolPolicy::None => advertised.iter().map(String::as_str).collect(),
+        ToolPolicy::McpOnly => advertised
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                name.strip_prefix("mcp__nucleos__")
+                    .is_none_or(|tool| tool.contains("__"))
+            })
+            .collect(),
+    };
+
+    (!offending.is_empty()).then(|| {
+        format!(
+            "ToolPolicy::{policy:?} violated by CLI-advertised tools: {}",
+            offending.join(", ")
+        )
+    })
+}
+
 /// Built-in tool names denied under `ToolPolicy::McpOnly`.
+///
+/// This list still applies the restriction, but the init-event assertion means it is no longer the
+/// only thing standing between a CLI upgrade and a silently wider policy.
 ///
 /// A blocklist, and deliberately so: measured against CLI 2.1.198, `--allowedTools` does not
 /// restrict anything — it only GRANTS permission on top of what is already allowed — and a
@@ -680,6 +705,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut usage = RunUsage::default();
 
         let mut post_launch_error: Option<std::io::Error> = None;
+        let mut policy_violation: Option<String> = None;
 
         loop {
             let line = match lines.next_line().await {
@@ -700,6 +726,22 @@ impl CommandRunner for ClaudeCliRunner {
                     // Best-effort: the receiver may already be gone if the run was cancelled.
                     let _ = session_tx.send(sid.to_string());
                 }
+                if v.get("type").and_then(|x| x.as_str()) == Some("system")
+                    && v.get("subtype").and_then(|x| x.as_str()) == Some("init")
+                {
+                    let advertised = v
+                        .get("tools")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if let Some(reason) = advertised_tools_violate(tool_policy, &advertised) {
+                        policy_violation = Some(reason);
+                        break;
+                    }
+                }
                 if v.get("type").and_then(|x| x.as_str()) == Some("result") {
                     usage = extract_usage(&line);
                     if let Some(c) = v
@@ -711,6 +753,12 @@ impl CommandRunner for ClaudeCliRunner {
                     }
                 }
             }
+        }
+
+        if policy_violation.is_some() {
+            // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
+            drop(tree_killer.take());
+            let _ = child.start_kill();
         }
 
         let status = match child.wait().await {
@@ -726,14 +774,21 @@ impl CommandRunner for ClaudeCliRunner {
         }
 
         let mut stderr_str = stderr_task.await.unwrap_or_default();
-        let exit_code = match &post_launch_error {
+        if let Some(reason) = &policy_violation {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!("nucleos: {reason}\n"));
+        }
+        let exit_code = match (&policy_violation, &post_launch_error) {
+            (Some(_), _) => -1,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            Some(error) => {
+            (None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            None => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         Ok(RunOutcome {
@@ -1004,6 +1059,51 @@ mod tests {
 
     fn args_for(policy: ToolPolicy, mcp: Option<&Path>) -> Vec<String> {
         cli_args("triage this", "sonnet", false, None, mcp, policy)
+    }
+
+    #[test]
+    fn a_toolless_policy_that_receives_tools_fails_the_run() {
+        let empty = Vec::new();
+        assert!(advertised_tools_violate(ToolPolicy::None, &empty).is_none());
+
+        let advertised = vec!["Bash".to_string()];
+        assert!(advertised_tools_violate(ToolPolicy::None, &advertised).is_some());
+    }
+
+    #[test]
+    fn mcp_only_rejects_an_advertised_builtin() {
+        let mcp_tools = vec![
+            "mcp__nucleos__get_run".to_string(),
+            "mcp__nucleos__list_projects".to_string(),
+        ];
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &mcp_tools).is_none());
+
+        let mut with_builtin = mcp_tools;
+        with_builtin.push("Bash".to_string());
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &with_builtin).is_some());
+    }
+
+    #[test]
+    fn advertised_tool_match_is_segment_not_prefix() {
+        let valid = vec!["mcp__nucleos__get_run".to_string()];
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &valid).is_none());
+
+        let nested_server = vec!["mcp__nucleos__x__evil".to_string()];
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &nested_server).is_some());
+    }
+
+    #[test]
+    fn unrestricted_accepts_any_advertised_tool_set() {
+        let empty = Vec::new();
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, &empty).is_none());
+
+        let builtins = vec![
+            "Read".to_string(),
+            "Bash".to_string(),
+            "Write".to_string(),
+            "Edit".to_string(),
+        ];
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, &builtins).is_none());
     }
 
     /// An autopilot run keeps the full tool set — the hook and the classifier are what govern it,
