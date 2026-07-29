@@ -48,9 +48,15 @@ pub enum BudgetDecision {
 pub struct SpendRow {
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    // Retained as loaded run telemetry for non-pricing readers. Without a price table these fields
+    // must not influence the conservative time approximation.
+    #[allow(dead_code)]
     pub input_tokens: Option<i64>,
+    #[allow(dead_code)]
     pub output_tokens: Option<i64>,
+    #[allow(dead_code)]
     pub cache_read_tokens: Option<i64>,
+    #[allow(dead_code)]
     pub num_turns: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -63,15 +69,7 @@ const MIN_APPROX_SECONDS: i64 = 60;
 fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
     let end = row.completed_at.unwrap_or(now);
     let elapsed_seconds = (end - row.created_at).num_seconds();
-    let reported_usage = row.input_tokens.is_some()
-        || row.output_tokens.is_some()
-        || row.cache_read_tokens.is_some()
-        || row.num_turns.is_some();
-    let seconds = if reported_usage {
-        elapsed_seconds.max(0)
-    } else {
-        elapsed_seconds.max(MIN_APPROX_SECONDS)
-    };
+    let seconds = elapsed_seconds.max(MIN_APPROX_SECONDS);
     (seconds as f64 / 3600.0) * rate_per_hour
 }
 
@@ -400,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn time_approx_prefers_measured_usage() {
+    fn time_approx_keeps_its_floor_even_when_usage_was_reported() {
         let measured = SpendRow {
             session_id: Some("measured".into()),
             cost_usd: None,
@@ -411,22 +409,10 @@ mod tests {
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:00:30Z")),
         };
-        let unmeasured = SpendRow {
-            session_id: Some("unmeasured".into()),
-            cost_usd: None,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            num_turns: None,
-            created_at: ts("2026-07-20T10:00:00Z"),
-            completed_at: Some(ts("2026-07-20T10:00:30Z")),
-        };
         let now = ts("2026-07-20T11:00:00Z");
 
-        // Measured usage makes the real 30-second duration authoritative; only an entirely
-        // unmeasured run receives the conservative 60-second floor.
-        approx(time_approx(&measured, now, 3.0), 0.025);
-        approx(time_approx(&unmeasured, now, 3.0), 0.05);
+        // Usage without a reported price cannot make an unknown-cost run free or cheaper.
+        approx(time_approx(&measured, now, 3.0), 0.05);
     }
 
     #[test]

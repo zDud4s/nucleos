@@ -1,6 +1,3 @@
-// This phase introduces the gate module before a later phase wires it into the daemon.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
@@ -28,6 +25,10 @@ pub enum GateOutcome {
 }
 
 /// Runs a verification command in `worktree` without involving agent hooks or classification.
+///
+/// `command` is a program followed by arguments, not a shell line. Shell operators such as `&&`
+/// are passed as ordinary arguments; callers that need them must name a shell explicitly, for
+/// example `bash -c "cargo test && cargo clippy"`.
 pub async fn run_gate(worktree: &Path, command: &str, timeout: Duration) -> GateOutcome {
     let words = match split_command(command) {
         Ok(words) => words,
@@ -124,6 +125,10 @@ pub async fn run_gate(worktree: &Path, command: &str, timeout: Duration) -> Gate
     }
 }
 
+/// Splits a program-and-arguments command while preserving single- or double-quoted argument groups.
+///
+/// This is not a shell parser: operators such as `&&` have no special meaning. Use an explicit
+/// shell command such as `bash -c "cargo test && cargo clippy"` when shell evaluation is required.
 fn split_command(command: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut current = String::new();

@@ -16,6 +16,12 @@ pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 /// unchanged at 600 seconds.
 pub const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Production default for how long a repository verification gate may run.
+///
+/// A gate is a subprocess over a repository the daemon does not control, so its deadline answers a
+/// different question from how long the agent itself may run and must remain independently chosen.
+pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// In-flight runs' abort handles, keyed by `runs.id`.
 pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 

@@ -426,9 +426,14 @@ fn spawn_run(
                         gate_command.as_deref(),
                         spawn_cwd.as_deref(),
                     ) {
-                        ("completed", Some(command), Some(worktree)) => {
-                            Some(crate::gate::run_gate(worktree, command, run_timeout).await)
-                        }
+                        ("completed", Some(command), Some(worktree)) => Some(
+                            crate::gate::run_gate(
+                                worktree,
+                                command,
+                                crate::state::DEFAULT_GATE_TIMEOUT,
+                            )
+                            .await,
+                        ),
                         _ => None,
                     };
                     let (gate_status, gate_exit_code, gate_output) = match &gate_outcome {

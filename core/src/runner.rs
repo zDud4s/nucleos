@@ -57,9 +57,26 @@ pub enum ToolPolicy {
     None,
 }
 
-fn advertised_tools_violate(policy: ToolPolicy, advertised: &[String]) -> Option<String> {
+fn advertised_tools_from_init(init: &serde_json::Value) -> Option<Vec<String>> {
+    init.get("tools")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .map(|tool| tool.as_str().map(str::to_string))
+        .collect()
+}
+
+fn advertised_tools_violate(policy: ToolPolicy, advertised: Option<&[String]>) -> Option<String> {
+    if policy == ToolPolicy::Unrestricted {
+        return None;
+    }
+    let Some(advertised) = advertised else {
+        return Some(format!(
+            "ToolPolicy::{policy:?} could not be verified: CLI init event did not advertise tools"
+        ));
+    };
+
     let offending: Vec<&str> = match policy {
-        ToolPolicy::Unrestricted => return None,
+        ToolPolicy::Unrestricted => unreachable!("handled above"),
         ToolPolicy::None => advertised.iter().map(String::as_str).collect(),
         ToolPolicy::McpOnly => advertised
             .iter()
@@ -750,15 +767,10 @@ impl CommandRunner for ClaudeCliRunner {
                 if v.get("type").and_then(|x| x.as_str()) == Some("system")
                     && v.get("subtype").and_then(|x| x.as_str()) == Some("init")
                 {
-                    let advertised = v
-                        .get("tools")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>();
-                    if let Some(reason) = advertised_tools_violate(tool_policy, &advertised) {
+                    let advertised = advertised_tools_from_init(&v);
+                    if let Some(reason) =
+                        advertised_tools_violate(tool_policy, advertised.as_deref())
+                    {
                         policy_violation = Some(reason);
                         break;
                     }
@@ -1183,13 +1195,49 @@ mod tests {
         cli_args("triage this", "sonnet", false, None, mcp, policy)
     }
 
+    fn advertised_tools_from_event(json: &str) -> Option<Vec<String>> {
+        let init = serde_json::from_str(json).expect("test init event must be valid JSON");
+        advertised_tools_from_init(&init)
+    }
+
+    #[test]
+    fn an_init_without_tools_fails_a_toolless_policy_run() {
+        let advertised = advertised_tools_from_event(r#"{"type":"system","subtype":"init"}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::None, advertised.as_deref()).is_some());
+    }
+
+    #[test]
+    fn an_init_without_tools_fails_an_mcp_only_policy_run() {
+        let advertised = advertised_tools_from_event(r#"{"type":"system","subtype":"init"}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, advertised.as_deref()).is_some());
+    }
+
+    #[test]
+    fn an_explicitly_empty_tool_advertisement_passes_a_toolless_policy_run() {
+        let advertised =
+            advertised_tools_from_event(r#"{"type":"system","subtype":"init","tools":[]}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::None, advertised.as_deref()).is_none());
+    }
+
+    #[test]
+    fn unrestricted_is_unaffected_by_missing_or_empty_tool_advertisements() {
+        let missing = advertised_tools_from_event(r#"{"type":"system","subtype":"init"}"#);
+        let empty = advertised_tools_from_event(r#"{"type":"system","subtype":"init","tools":[]}"#);
+
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, missing.as_deref()).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, empty.as_deref()).is_none());
+    }
+
     #[test]
     fn a_toolless_policy_that_receives_tools_fails_the_run() {
         let empty = Vec::new();
-        assert!(advertised_tools_violate(ToolPolicy::None, &empty).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::None, Some(&empty)).is_none());
 
         let advertised = vec!["Bash".to_string()];
-        assert!(advertised_tools_violate(ToolPolicy::None, &advertised).is_some());
+        assert!(advertised_tools_violate(ToolPolicy::None, Some(&advertised)).is_some());
     }
 
     #[test]
@@ -1198,26 +1246,26 @@ mod tests {
             "mcp__nucleos__get_run".to_string(),
             "mcp__nucleos__list_projects".to_string(),
         ];
-        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &mcp_tools).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&mcp_tools)).is_none());
 
         let mut with_builtin = mcp_tools;
         with_builtin.push("Bash".to_string());
-        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &with_builtin).is_some());
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&with_builtin)).is_some());
     }
 
     #[test]
     fn advertised_tool_match_is_segment_not_prefix() {
         let valid = vec!["mcp__nucleos__get_run".to_string()];
-        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &valid).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&valid)).is_none());
 
         let nested_server = vec!["mcp__nucleos__x__evil".to_string()];
-        assert!(advertised_tools_violate(ToolPolicy::McpOnly, &nested_server).is_some());
+        assert!(advertised_tools_violate(ToolPolicy::McpOnly, Some(&nested_server)).is_some());
     }
 
     #[test]
     fn unrestricted_accepts_any_advertised_tool_set() {
         let empty = Vec::new();
-        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, &empty).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, Some(&empty)).is_none());
 
         let builtins = vec![
             "Read".to_string(),
@@ -1225,7 +1273,7 @@ mod tests {
             "Write".to_string(),
             "Edit".to_string(),
         ];
-        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, &builtins).is_none());
+        assert!(advertised_tools_violate(ToolPolicy::Unrestricted, Some(&builtins)).is_none());
     }
 
     /// An autopilot run keeps the full tool set — the hook and the classifier are what govern it,
