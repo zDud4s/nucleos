@@ -3008,6 +3008,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_response_exposes_the_gate_verdict_and_its_reason() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, gate_status, gate_exit_code, gate_output, created_at)
+             VALUES ('gate diagnostics', 'completed', 'worktree', 'errored', NULL,
+                     'gate configuration is unreadable', '2026-07-29T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["gate_status"], "errored");
+        assert_eq!(parsed.get("gate_exit_code"), Some(&serde_json::Value::Null));
+        assert_eq!(parsed["gate_output"], "gate configuration is unreadable");
+    }
+
+    #[tokio::test]
+    async fn a_run_response_exposes_its_token_usage() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, input_tokens, output_tokens, cache_read_tokens, num_turns,
+              created_at)
+             VALUES ('measured run', 'completed', 'real', 1000, 500, 20000, 12,
+                     '2026-07-29T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["input_tokens"], 1000);
+        assert_eq!(parsed["output_tokens"], 500);
+        assert_eq!(parsed["cache_read_tokens"], 20000);
+        assert_eq!(parsed["num_turns"], 12);
+    }
+
+    #[tokio::test]
     async fn awaiting_approval_runs_returns_seeded_run_with_bearer_token() {
         let state = test_state().await;
         let pool = state.pool.clone();

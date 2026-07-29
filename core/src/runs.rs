@@ -177,11 +177,17 @@ pub struct RunStatusResponse {
     pub project_id: Option<String>,
     pub status: String,
     pub gate_status: Option<String>,
+    pub gate_exit_code: Option<i32>,
+    pub gate_output: Option<String>,
     pub exit_code: Option<i32>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub num_turns: Option<i64>,
 }
 
 pub async fn create_run(
@@ -418,6 +424,12 @@ async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
 /// Deliberately wide rather than taking an options struct: these are the axes on which a run's
 /// lifecycle actually differs (plan-only, resumed, retried, worktree-bound), and naming each one at
 /// every call site is what makes those differences readable where the runs are created.
+enum GateConfig {
+    NotConfigured,
+    Command(String),
+    Unreadable(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_run(
     state: &AppState,
@@ -429,7 +441,7 @@ fn spawn_run(
     plan_only: bool,
     resume_session_id: Option<String>,
     completion_feed: Option<(String, String)>,
-    gate_command: Option<String>,
+    gate_config: GateConfig,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
     daemon_token: String,
@@ -500,12 +512,8 @@ fn spawn_run(
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
-                    let gate_outcome = match (
-                        terminal_status,
-                        gate_command.as_deref(),
-                        spawn_cwd.as_deref(),
-                    ) {
-                        ("completed", Some(command), Some(worktree)) => Some(
+                    let gate_outcome = match (terminal_status, &gate_config, spawn_cwd.as_deref()) {
+                        ("completed", GateConfig::Command(command), Some(worktree)) => Some(
                             crate::gate::run_gate(
                                 worktree,
                                 command,
@@ -513,6 +521,11 @@ fn spawn_run(
                             )
                             .await,
                         ),
+                        ("completed", GateConfig::Unreadable(reason), _) => {
+                            Some(crate::gate::GateOutcome::Errored {
+                                reason: reason.clone(),
+                            })
+                        }
                         _ => None,
                     };
                     let (gate_status, gate_exit_code, gate_output) = match &gate_outcome {
@@ -734,16 +747,17 @@ pub async fn create_run_inner(
             "shadow run completed".to_owned(),
         )
     });
-    let mut gate_command = None;
+    let mut gate_config = GateConfig::NotConfigured;
 
     if mode == "worktree" {
         let project_root = cwd.as_deref().expect("worktree cwd validated above");
         let worktree_project_id = project_id
             .as_deref()
             .expect("worktree project_id validated above");
-        gate_command = match crate::config::load_schedule_rules(std::path::Path::new(project_root))
-        {
-            Ok(rules) => rules.gate_command,
+        gate_config = match crate::config::load_schedule_rules(std::path::Path::new(project_root)) {
+            Ok(rules) => rules
+                .gate_command
+                .map_or(GateConfig::NotConfigured, GateConfig::Command),
             Err(error) => {
                 tracing::warn!(
                     project_id = worktree_project_id,
@@ -751,7 +765,7 @@ pub async fn create_run_inner(
                     %error,
                     "failed to load worktree gate configuration"
                 );
-                None
+                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
             }
         };
         let info = match crate::worktree::create(std::path::Path::new(project_root), id).await {
@@ -840,7 +854,7 @@ pub async fn create_run_inner(
         plan_only,
         None,
         completion_feed,
-        gate_command,
+        gate_config,
         max_attempts,
         tool_policy,
         daemon_token,
@@ -964,9 +978,11 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 
     // After the commit, because the resume row does not exist to be UPDATEd before it.
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
-    let gate_command = match crate::config::load_schedule_rules(std::path::Path::new(&project_root))
+    let gate_config = match crate::config::load_schedule_rules(std::path::Path::new(&project_root))
     {
-        Ok(rules) => rules.gate_command,
+        Ok(rules) => rules
+            .gate_command
+            .map_or(GateConfig::NotConfigured, GateConfig::Command),
         Err(error) => {
             tracing::warn!(
                 project_id = %wt_project_id,
@@ -974,7 +990,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
                 %error,
                 "failed to load worktree gate configuration for resumed run"
             );
-            None
+            GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
         }
     };
     spawn_run(
@@ -990,7 +1006,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             "worktree_run_completed".to_owned(),
             format!("resumed run completed on nucleos/run-{original_run_id}"),
         )),
-        gate_command,
+        gate_config,
         1,
         // A resume continues an approved worktree run, which is autopilot work: the hook and the
         // classifier govern it, exactly as they governed the run being resumed.
@@ -1014,12 +1030,20 @@ pub async fn get_run(
             Option<String>,
             Option<i32>,
             Option<String>,
+            Option<i32>,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<f64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
         ),
     >(
-        "SELECT id, project_id, status, gate_status, exit_code, stdout, stderr, session_id, cost_usd
+        "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
+                stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
+                num_turns
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -1033,11 +1057,17 @@ pub async fn get_run(
         project_id: row.1,
         status: row.2,
         gate_status: row.3,
-        exit_code: row.4,
-        stdout: row.5,
-        stderr: row.6,
-        session_id: row.7,
-        cost_usd: row.8,
+        gate_exit_code: row.4,
+        gate_output: row.5,
+        exit_code: row.6,
+        stdout: row.7,
+        stderr: row.8,
+        session_id: row.9,
+        cost_usd: row.10,
+        input_tokens: row.11,
+        output_tokens: row.12,
+        cache_read_tokens: row.13,
+        num_turns: row.14,
     }))
 }
 
@@ -1325,6 +1355,24 @@ mod tests {
                 OsStr::new("commit"),
                 OsStr::new("-m"),
                 OsStr::new("configure gate"),
+            ],
+        ));
+    }
+
+    fn configure_unreadable_gate(repo: &FsPath) {
+        std::fs::create_dir_all(repo.join(".ai")).expect("create project config directory");
+        std::fs::write(
+            repo.join(".ai").join("autopilot.yaml"),
+            "gate_command: [unterminated\n",
+        )
+        .expect("write malformed project gate configuration");
+        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("configure unreadable gate"),
             ],
         ));
     }
@@ -2111,11 +2159,109 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_project_without_a_gate_command_is_unaffected() {
+    async fn an_unreadable_gate_config_fails_the_run_closed() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-unreadable-gate-");
+        configure_unreadable_gate(&repo);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = get_run_status(&app, id).await.status;
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, "completed");
+
+        let (gate_status, gate_output): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT gate_status, gate_output FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(gate_status.as_deref(), Some("errored"));
+        let reason = gate_output.expect("an errored gate must record its reason");
+        let reason = reason.to_ascii_lowercase();
+        assert!(
+            reason.contains("configuration") && reason.contains("unreadable"),
+            "unexpected gate error reason: {reason}"
+        );
+
+        let worktree_path: String =
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreadable_gate_config_creates_no_proposal() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-unreadable-gate-");
+        configure_unreadable_gate(&repo);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = get_run_status(&app, id).await.status;
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, "completed");
+
+        let proposals: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(proposals, 0);
+        let feed_kind: String =
+            sqlx::query_scalar("SELECT kind FROM feed WHERE run_id = ? ORDER BY id DESC LIMIT 1")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(feed_kind, "worktree_gate_failed");
+
+        let worktree_path: String =
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_absent_gate_config_is_still_not_a_gate() {
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-without-gate-");
+        assert!(!repo.join(".ai").join("autopilot.yaml").exists());
         let (state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
         let project_root = repo.to_string_lossy().into_owned();
