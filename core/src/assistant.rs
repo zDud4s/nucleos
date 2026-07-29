@@ -356,6 +356,8 @@ mod tests {
             token: Token("t".into()),
             pool: test_pool().await,
             runner: Arc::new(FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,

@@ -475,6 +475,8 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             runner: Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
