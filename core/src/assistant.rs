@@ -288,6 +288,10 @@ fn spawn_assistant_turn(
                     // as its own turn on the resumed session, which is where a Telegram reply
                     // already goes. Nothing here needs a stdin, so it keeps a closed one.
                     steerable: false,
+                    // An orchestrator turn is answered by a person watching a chat, so the CLI's
+                    // own permission surface is the right one: there IS somebody to approve. It is
+                    // `McpOnly` besides, so the surface being argued over is nearly empty.
+                    classifier_governs_tools: false,
                     messages: None,
                 },
                 session_tx,
