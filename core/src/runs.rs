@@ -366,6 +366,49 @@ pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
     }
 }
 
+/// PURE: whether a run in `mode` proceeds with nobody there to answer it.
+///
+/// Three policies read this, for the same reason each time — there is no human in the loop: how
+/// many attempts a failure gets, how long the wall clock runs, and whether the classifier replaces
+/// the CLI's permission surface. `email_triage` is unattended too and is deliberately NOT in this
+/// set: it is one toolless classification against a local model, so it has no tools to permit, no
+/// build to outlast, and nothing a retry would fix.
+///
+/// One definition rather than the same `if` at each reader, because the day a fourth unattended
+/// mode appears, three policies have to learn about it together or two of them quietly won't.
+pub(crate) fn runs_unattended(mode: &str) -> bool {
+    mode == "shadow" || mode == "worktree"
+}
+
+/// Whether this run's actions are governed by the classifier rather than by the CLI's allow-list.
+///
+/// Reads the disk, so not pure: the answer depends on what is wired up in `dir`, which for a
+/// worktree run is the worktree the CLI will start in and not the project root.
+///
+/// Every condition is a refusal, and the AND between them is the point:
+///
+///   * unattended only — an interactive run has somebody who can approve, and taking that decision
+///     away from them is not this function's business;
+///   * `Unrestricted` only — a run with no tools has no permissions worth changing;
+///   * classifier verified present — the load-bearing one. Standing the CLI's barrier down is only
+///     safe because another barrier takes over. With no hook there is no second barrier, and the
+///     run would be governed by nothing at all.
+///
+/// The third condition means a project that has not wired the hook keeps today's behaviour, which
+/// is also today's failure: its unattended runs still cannot execute what the interactive list
+/// omits. That is the right trade — the answer for such a project is to wire the classifier, not
+/// to stand the barrier down without one.
+fn classifier_governs_tools(
+    mode: &str,
+    tool_policy: crate::runner::ToolPolicy,
+    dir: Option<&std::path::Path>,
+) -> bool {
+    if !runs_unattended(mode) || tool_policy != crate::runner::ToolPolicy::Unrestricted {
+        return false;
+    }
+    dir.is_some_and(crate::autopilot::classifier_hook_is_wired)
+}
+
 /// PURE: the wall clock a run in `mode` gets, given the interactive default `base`.
 ///
 /// `shadow` and `worktree` are the modes that check out a tree, edit it, build it and run a gate,
@@ -377,7 +420,7 @@ pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
 /// Derived from `base` rather than given a constant of its own, so a test that shortens the clock
 /// still gets a short one, and an operator who tunes the deadline moves both together.
 fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
-    if mode == "shadow" || mode == "worktree" {
+    if runs_unattended(mode) {
         base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER
     } else {
         base
@@ -759,6 +802,7 @@ async fn spawn_handoff_if_needed(
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
     run_timeout: std::time::Duration,
+    classifier_governs_tools: bool,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -801,6 +845,9 @@ async fn spawn_handoff_if_needed(
         // Inherited, not re-derived: a successor continues one task, and a handoff that reset the
         // clock would let a run outlive its deadline by handing itself on.
         run_timeout,
+        // Inherited for the same reason, and it is the same tree: re-deriving would let a handoff
+        // quietly change what the work is allowed to do halfway through it.
+        classifier_governs_tools,
     );
 }
 
@@ -825,6 +872,7 @@ fn spawn_run(
     env: Vec<(String, String)>,
     steerable: bool,
     run_timeout: std::time::Duration,
+    classifier_governs_tools: bool,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -872,6 +920,7 @@ fn spawn_run(
                 fork_session,
                 include_partial_messages: false,
                 steerable,
+                classifier_governs_tools,
                 messages: None,
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
@@ -1040,6 +1089,7 @@ fn spawn_run(
                             max_attempts,
                             tool_policy,
                             run_timeout,
+                            classifier_governs_tools,
                         ))
                         .await;
                     }
@@ -1129,6 +1179,7 @@ fn spawn_run(
                             max_attempts,
                             tool_policy,
                             run_timeout,
+                            classifier_governs_tools,
                         ))
                         .await;
                     }
@@ -1422,7 +1473,7 @@ async fn create_run_with(
         spawn_cwd = Some(info.path);
     }
 
-    let max_attempts = if mode == "shadow" || mode == "worktree" {
+    let max_attempts = if runs_unattended(mode) {
         MAX_AUTONOMOUS_ATTEMPTS
     } else {
         1
@@ -1438,6 +1489,11 @@ async fn create_run_with(
     } else {
         state.runner.clone()
     };
+    // Answered before the call, because `spawn_cwd` is moved into it. `spawn_cwd` and not `cwd`:
+    // for a worktree run the CLI starts in the worktree provisioned above, and settings are read
+    // from where the process starts — asking the project root would answer about a directory this
+    // run never enters.
+    let governed_by_classifier = classifier_governs_tools(mode, tool_policy, spawn_cwd.as_deref());
     spawn_run(
         state,
         runner,
@@ -1456,6 +1512,7 @@ async fn create_run_with(
         run_env(&daemon_token, id, node_artifacts.as_deref()),
         steerable,
         run_timeout_for_mode(state.run_timeout, mode),
+        governed_by_classifier,
     );
 
     Ok(id)
@@ -1665,6 +1722,15 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // A resume is a worktree run, so it gets the worktree clock — the same one the run it
         // continues was given.
         run_timeout_for_mode(state.run_timeout, "worktree"),
+        // Asked again against the worktree being resumed rather than inherited, because it is a
+        // fresh launch into a tree that has since been worked in: the run it continues may have
+        // rewritten the very settings file this reads. Re-checking is the conservative direction —
+        // a tree that no longer wires the hook stops getting the classifier's surface.
+        classifier_governs_tools(
+            "worktree",
+            crate::runner::ToolPolicy::Unrestricted,
+            Some(std::path::Path::new(&wt_path)),
+        ),
     );
 
     Ok(resume_id)
@@ -1958,6 +2024,33 @@ mod tests {
         let repo = container.path().join("repo");
         initialize_repo(&repo);
         (container, repo)
+    }
+
+    /// Wires this daemon's classifier hook into `dir`, the way a project that has onboarded has it:
+    /// registered in `.claude/settings.json` AND executable on disk. Both, because
+    /// `autopilot::classifier_hook_is_wired` requires both — a registered command that cannot run
+    /// classifies nothing.
+    fn wire_classifier_hook(dir: &FsPath) {
+        std::fs::create_dir_all(dir.join(".claude/hooks")).expect("create hook directory");
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
+        )
+        .expect("write settings");
+        std::fs::write(dir.join(".claude/hooks/ask_daemon.py"), "# hook").expect("write hook");
+    }
+
+    /// The same project WITHOUT the classifier: settings present and valid, a `PreToolUse` entry
+    /// even, but it names somebody else's script. This is the shape the check exists to reject —
+    /// "some PreToolUse hook exists" was never the property worth having.
+    fn wire_someone_elses_hook(dir: &FsPath) {
+        std::fs::create_dir_all(dir.join(".claude/hooks")).expect("create hook directory");
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"prettier --write"}]}]}}"#,
+        )
+        .expect("write settings");
+        std::fs::write(dir.join(".claude/hooks/ask_daemon.py"), "# hook").expect("write hook");
     }
 
     fn configure_gate(repo: &FsPath, command: &str) {
@@ -4149,6 +4242,62 @@ mod tests {
             autonomous_status, "completed",
             "the same work fits in the autonomous clock, which is what the multiplier is for"
         );
+    }
+
+    /// The invariant, run rather than asserted: the CLI's permission barrier is stood down ONLY
+    /// where the classifier that replaces it is verified present.
+    ///
+    /// Three cases, and the second and third are the ones that matter. The same unattended run in a
+    /// tree whose `PreToolUse` entry names somebody else's script gets nothing — "a hook exists" is
+    /// not the property. And an interactive run in the fully wired tree gets nothing either, because
+    /// there is a person there who can approve, and this must not decide for them.
+    ///
+    /// Mutation-checked: dropping the `runs_unattended` guard fails the third case, dropping the
+    /// hook lookup fails the second.
+    #[tokio::test]
+    async fn only_a_verified_classifier_stands_the_cli_permission_barrier_down() {
+        let (state, runner) = test_state_with_runner(None, Duration::from_secs(30)).await;
+
+        let wired = space_free_tempdir("nucleos-wired-");
+        wire_classifier_hook(wired.path());
+        let unwired = space_free_tempdir("nucleos-unwired-");
+        wire_someone_elses_hook(unwired.path());
+
+        for (label, dir, mode, expected) in [
+            ("unattended, classifier wired", wired.path(), "shadow", true),
+            (
+                "unattended, PreToolUse names another script",
+                unwired.path(),
+                "shadow",
+                false,
+            ),
+            (
+                "interactive, classifier wired",
+                wired.path(),
+                "real",
+                false,
+            ),
+        ] {
+            *runner.last_classifier_governs_tools.lock().unwrap() = None;
+            let id = create_run_inner(
+                &state,
+                "work".into(),
+                None,
+                Some(dir.to_string_lossy().into_owned()),
+                mode,
+                false,
+            )
+            .await
+            .unwrap();
+            let (status, _) = poll_run(&state, id, "completed").await;
+            assert_eq!(status, "completed", "{label}: the run must reach the runner");
+
+            assert_eq!(
+                *runner.last_classifier_governs_tools.lock().unwrap(),
+                Some(expected),
+                "{label}"
+            );
+        }
     }
 
     /// The wall clock drops the run future, taking the `RunOutcome` and every byte of stdout it

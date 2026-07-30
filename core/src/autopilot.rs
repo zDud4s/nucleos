@@ -257,15 +257,22 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 /// slashes because it is compared against a JSON command string, where that is the spelling.
 const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
-fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> {
-    if !project_root.join(".ai/workflow/workflow.md").is_file() {
-        return Err(ActivationError::NotOnboarded);
-    }
-
-    let settings = std::fs::read_to_string(project_root.join(".claude/settings.json"))
-        .map_err(|_| ActivationError::HookNotRegistered)?;
-    let settings: serde_json::Value =
-        serde_json::from_str(&settings).map_err(|_| ActivationError::HookNotRegistered)?;
+/// Whether THIS daemon's classifier hook is both registered in `dir` and executable there.
+///
+/// Two callers ask this, and they must never diverge. Activation asks it before letting a project
+/// act autonomously at all. `runs.rs` asks it before opening the CLI's own permission surface for
+/// an unattended run — because the classifier is what governs that run's actions, and a run whose
+/// permissions are opened without one is the same mistake as a project activated without one.
+///
+/// `dir` is the directory the CLI will actually run in, which for a worktree run is the worktree
+/// and not the project root: settings are read from where the process starts.
+pub(crate) fn classifier_hook_is_wired(dir: &Path) -> bool {
+    let Ok(settings) = std::fs::read_to_string(dir.join(".claude/settings.json")) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings) else {
+        return false;
+    };
     // "Some PreToolUse hook exists" was never the property worth checking: a formatter satisfied it
     // just as well as ours, and activation then let a project act autonomously with nothing
     // classifying its actions. What has to be true is that OUR hook script is the one wired up,
@@ -294,14 +301,16 @@ fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> 
             })
         });
 
-    if !registered {
+    registered && dir.join(HOOK_SCRIPT).is_file()
+}
+
+fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> {
+    if !project_root.join(".ai/workflow/workflow.md").is_file() {
+        return Err(ActivationError::NotOnboarded);
+    }
+    if !classifier_hook_is_wired(project_root) {
         return Err(ActivationError::HookNotRegistered);
     }
-
-    if !project_root.join(HOOK_SCRIPT).is_file() {
-        return Err(ActivationError::HookNotRegistered);
-    }
-
     Ok(())
 }
 

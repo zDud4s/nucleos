@@ -83,6 +83,22 @@ pub struct RunRequest {
     /// a later turn can arrive on, and a process already spawned without it has nothing listening.
     /// Every path that does not ask keeps today's `-p <prompt>` vector and a closed stdin.
     pub steerable: bool,
+    /// Whether the classifier — not the CLI's own allow-list — decides what this run may do.
+    ///
+    /// The daemon's design has two barriers (spec §5.5): the tool policy decides what tools exist,
+    /// and the `PreToolUse` classifier decides which calls go through. The CLI's `permissions.allow`
+    /// is a third barrier nobody designed, and left in place it is the binding one — those lists are
+    /// written for INTERACTIVE work, where whatever is missing gets approved with a click. An
+    /// unattended run has nobody to click, so every call outside the list comes back "requires
+    /// approval" and the run burns its turns achieving nothing while still exiting 0.
+    ///
+    /// Measured 2026-07-30: an autonomous run in this very repository could not execute
+    /// `cargo --version`. 28 turns, $1.47, zero files touched.
+    ///
+    /// Only ever `true` where the classifier is verified present — see
+    /// `autopilot::classifier_hook_is_wired`. Opening this barrier without the one that replaces it
+    /// leaves a run with nothing governing it at all.
+    pub classifier_governs_tools: bool,
     /// Where a steerable run's LATER turns arrive from; the first one is always `prompt`.
     ///
     /// `None` beside `steerable: true` is a real state, not an oversight: the prompt still travels
@@ -255,9 +271,14 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("stream-json".to_string());
     }
     args.push("--verbose".to_string());
+    // `plan_only` first, and `else`, not a second `if`: a plan-only run must be unable to act no
+    // matter what else is true of it, so the two must never both be able to write this flag.
     if request.plan_only {
         args.push("--permission-mode".to_string());
         args.push("plan".to_string());
+    } else if request.classifier_governs_tools {
+        args.push("--permission-mode".to_string());
+        args.push("bypassPermissions".to_string());
     }
     if let Some(path) = &request.mcp_config {
         args.push("--mcp-config".to_string());
@@ -1208,6 +1229,17 @@ impl CommandRunner for CodexCliRunner {
                 "codex exec cannot honour mcp_config: it has no flag that loads one, nor the tool narrowing that comes with it",
             ));
         }
+        // Reachable only if the tool-policy guard above is ever loosened, and refused anyway,
+        // because of which way it fails. This flag says the daemon has stood the CLI's permission
+        // barrier down on the strength of the classifier taking over — and the classifier is a
+        // `PreToolUse` hook, which is a Claude Code mechanism `codex exec` knows nothing about.
+        // Dropped silently it would not weaken THIS launch, but it would leave the daemon believing
+        // a run is governed by something that never ran.
+        if request.classifier_governs_tools {
+            return Err(std::io::Error::other(
+                "codex exec cannot honour classifier_governs_tools: it has no PreToolUse hook, so nothing would replace the barrier this stands down",
+            ));
+        }
         // Not a safety control, and refused all the same. A caller asks for partial messages because
         // something downstream is waiting on them; a stream that silently never emits any is a
         // feature that looks broken rather than absent.
@@ -1390,6 +1422,9 @@ pub struct FakeCommandRunner {
     /// reason `last_tool_policy` is: it decides what a run CAN have done to it, so which value
     /// reached the runner is a safety property rather than a detail of the request.
     pub last_steerable: std::sync::Mutex<Option<bool>>,
+    /// Whether the launch handed the run the classifier's permission surface instead of the CLI's.
+    /// Recorded for the same reason `last_tool_policy` is: it decides what a run CAN do.
+    pub last_classifier_governs_tools: std::sync::Mutex<Option<bool>>,
     /// What the CLI was handed in its environment. Recorded because a run with a Bash tool can read
     /// its own environment, so which key lands here is a safety property and not a detail.
     pub last_env: std::sync::Mutex<Option<Vec<(String, String)>>>,
@@ -1453,6 +1488,8 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_include_partial_messages.lock().unwrap() =
             Some(request.include_partial_messages);
         *self.last_steerable.lock().unwrap() = Some(request.steerable);
+        *self.last_classifier_governs_tools.lock().unwrap() =
+            Some(request.classifier_governs_tools);
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
         let mut outcome = {
             let guard = self.canned.lock().unwrap();
@@ -1557,6 +1594,59 @@ mod tests {
 
         assert!(forked_args.iter().any(|arg| arg == "--fork-session"));
         assert!(!not_forked_args.iter().any(|arg| arg == "--fork-session"));
+    }
+
+    /// The default matters more than the opt-in here: a request that did not ask for this must not
+    /// carry the flag, or every run in the daemon quietly gets it.
+    #[test]
+    fn cli_args_stands_the_cli_permission_barrier_down_only_when_asked() {
+        let mut governed = baseline_run_request();
+        governed.classifier_governs_tools = true;
+        let governed_args = cli_args(&governed, "sonnet");
+
+        let default_args = cli_args(&baseline_run_request(), "sonnet");
+
+        assert!(
+            governed_args.windows(2).any(|pair| pair
+                == [
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string()
+                ]),
+            "a run the classifier governs must say so on the command line: {governed_args:?}"
+        );
+        assert!(
+            !default_args.iter().any(|arg| arg == "--permission-mode"),
+            "an ordinary run must carry no permission mode at all: {default_args:?}"
+        );
+    }
+
+    /// A plan-only run is how a run is made unable to act — a catch-up run recovering a schedule the
+    /// machine slept through is forced plan-only precisely because nobody chose for it to run NOW.
+    /// If both flags could write `--permission-mode`, the order would decide whether that restraint
+    /// survives, and order is not where a safety property belongs.
+    #[test]
+    fn plan_only_outranks_the_classifier_permission_surface() {
+        let mut both = baseline_run_request();
+        both.plan_only = true;
+        both.classifier_governs_tools = true;
+        let args = cli_args(&both, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode".to_string(), "plan".to_string()]),
+            "plan must win: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "bypassPermissions"),
+            "a plan-only run must never also be handed the standing-down flag: {args:?}"
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--permission-mode")
+                .count(),
+            1,
+            "two permission modes on one command line is the CLI's choice, not ours: {args:?}"
+        );
     }
 
     #[test]
@@ -1712,6 +1802,7 @@ mod tests {
             fork_session: false,
             include_partial_messages: false,
             steerable: false,
+            classifier_governs_tools: false,
             messages: None,
         }
     }
@@ -1730,6 +1821,7 @@ mod tests {
             fork_session: false,
             include_partial_messages: false,
             steerable: false,
+            classifier_governs_tools: false,
             messages: None,
         }
     }
