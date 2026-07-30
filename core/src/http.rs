@@ -1195,7 +1195,7 @@ async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode>
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (paused, reason) = match budget::budget_permits_new_run(&state.pool, now).await {
         budget::BudgetDecision::Allow => (false, None),
-        budget::BudgetDecision::Pause { reason } => (true, Some(reason)),
+        budget::BudgetDecision::Pause { reason, .. } => (true, Some(reason)),
     };
     Ok(BudgetResponse {
         limit_usd: config.limit_usd,
