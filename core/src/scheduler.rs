@@ -895,6 +895,7 @@ mod tests {
             prompt: "test prompt".to_string(),
             cwd: None,
             timezone: None,
+            graph: None,
         }
     }
 
