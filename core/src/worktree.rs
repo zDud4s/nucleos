@@ -584,11 +584,15 @@ pub async fn gc_candidates(
 ) -> sqlx::Result<Vec<WorktreeRow>> {
     let cutoff = (now - retention).to_rfc3339();
     sqlx::query_as(
-        // `owner_kind = 'run'` is load-bearing, not decoration. The join matches `r.id` against
-        // `w.owner_id`, and run ids and job ids come from different sequences — without the filter a
-        // job whose id happens to equal a terminal run's id would have its worktree collected while
-        // the job is still using it. Chunk 2 adds the job arm, once `jobs.status` exists to gate on;
-        // until then a job-owned worktree is never collected, which is the safe direction.
+        // Two arms rather than one join, because a worktree's owner decides which table says whether
+        // it is finished. `owner_kind` is load-bearing in both: the joins match on the bare id, and
+        // run ids and job ids come from different sequences, so without the filters a job whose id
+        // happened to equal a terminal run's would have its worktree collected mid-use. There is a
+        // test on exactly that (`a_job_worktree_is_not_collected_by_a_run_of_the_same_id`).
+        //
+        // The job arm lists terminal statuses explicitly rather than excluding live ones. Adding a
+        // status later then defaults to *not collected* — a stale directory — instead of to deleting
+        // the worktree of a job still using it.
         "SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
          FROM worktrees w
          JOIN runs r ON r.id = w.owner_id
@@ -596,9 +600,19 @@ pub async fn gc_candidates(
            AND w.removed_at IS NULL
            AND r.status IN ('completed','failed','cancelled','timed_out','interrupted')
            AND COALESCE(r.completed_at, w.created_at) <= ?
-         ORDER BY w.owner_id",
+         UNION ALL
+         SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
+         FROM worktrees w
+         JOIN jobs j ON j.id = w.owner_id
+         WHERE w.owner_kind = 'job'
+           AND w.removed_at IS NULL
+           AND j.status IN ('completed','failed','gate_failed','gate_errored','expired',
+                            'cancelled','interrupted')
+           AND COALESCE(j.completed_at, w.created_at) <= ?
+         ORDER BY 1, 2",
     )
-    .bind(cutoff)
+    .bind(&cutoff)
+    .bind(&cutoff)
     .fetch_all(pool)
     .await
 }
@@ -1887,6 +1901,90 @@ mod tests {
             candidates.is_empty(),
             "a job's worktree must not be collected because a run happens to share its id"
         );
+    }
+
+    async fn insert_job(
+        pool: &sqlx::SqlitePool,
+        status: &str,
+        completed_at: Option<&str>,
+        created_at: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at, completed_at)
+             VALUES ('project-a', '/project/a', ?, 5, ?, ?)",
+        )
+        .bind(status)
+        .bind(created_at)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn gc_collects_a_finished_jobs_worktree() {
+        let pool = test_pool().await;
+        let job_id = insert_job(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            Owner::Job(job_id),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-9",
+            "nucleos/job-9",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at_for(&pool, Owner::Job(job_id), "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].owner_kind, "job");
+        assert_eq!(candidates[0].owner_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn gc_never_collects_a_live_jobs_worktree_however_old() {
+        let pool = test_pool().await;
+        // `waiting` is the sharpest case: an hourly budget limit can hold a job there for a long
+        // time, so age alone must never make its worktree collectable. The job is coming back to
+        // it, and deleting it would destroy work a gate had already measured as good.
+        let job_id = insert_job(&pool, "waiting", None, "2020-01-01T00:00:00+00:00").await;
+        record(
+            &pool,
+            Owner::Job(job_id),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-10",
+            "nucleos/job-10",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at_for(&pool, Owner::Job(job_id), "2020-01-01T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2030-01-01T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates.is_empty(), "a live job keeps its worktree");
     }
 
     #[tokio::test(flavor = "current_thread")]
