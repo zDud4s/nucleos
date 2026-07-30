@@ -15,6 +15,7 @@ mod health;
 mod hooks;
 mod http;
 mod inspect;
+mod job;
 mod logging;
 mod mailfiles;
 mod mcp_tools;
