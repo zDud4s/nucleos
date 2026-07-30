@@ -258,10 +258,23 @@ fn node_in_flight(status: &str) -> bool {
 /// "there was no work" night, and report itself complete without having planned anything.
 fn effective_status<'a>(status: &'a str, resume_status: Option<&'a str>) -> &'a str {
     match (status, resume_status) {
-        ("waiting", Some(stage)) => stage,
+        (status, Some(stage)) if is_paused(status) => stage,
         _ => status,
     }
 }
+
+/// The statuses that stand in front of a stage rather than replacing it.
+///
+/// Both are things happening *to* a job rather than things it is doing, and both end with it going
+/// back to what it was at. `STATUS_AWAITING_APPROVAL` is not `waiting` because they are answered
+/// differently: one clears itself when a window reopens, the other never clears until a person
+/// looks at the approval queue.
+fn is_paused(status: &str) -> bool {
+    matches!(status, "waiting" | STATUS_AWAITING_APPROVAL)
+}
+
+/// A job whose node stopped to ask permission for one action.
+pub const STATUS_AWAITING_APPROVAL: &str = "awaiting_approval";
 
 /// Assembles what `next_step` needs from the two tables.
 pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> {
@@ -387,15 +400,24 @@ pub async fn finish(pool: &SqlitePool, job_id: i64, outcome: Outcome) -> sqlx::R
 /// `reason` is stored because `waiting` now means two different things — a budget window that will
 /// reopen, and a slot another run is holding — and they call for opposite responses from a reader.
 pub async fn wait(pool: &SqlitePool, job_id: i64, reason: &str) -> sqlx::Result<()> {
-    // The CASE is what makes this safe to call twice. Parking an already-parked job would otherwise
-    // record `waiting` as the stage to come back to, and the job would never find its way home.
+    pause(pool, job_id, "waiting", reason).await
+}
+
+/// Puts a pause in front of a job's stage, keeping the stage to come back to.
+///
+/// The CASE is what makes this safe to call on an already-paused job — every pass re-applies the
+/// pause while the reason still holds. Without it, the second call would record `waiting` as the
+/// stage to return to and the job would never find its way home.
+pub async fn pause(pool: &SqlitePool, job_id: i64, status: &str, reason: &str) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE jobs
-         SET resume_status = CASE WHEN status <> 'waiting' THEN status ELSE resume_status END,
-             status = 'waiting',
+         SET resume_status = CASE WHEN status NOT IN ('waiting','awaiting_approval')
+                                  THEN status ELSE resume_status END,
+             status = ?,
              wait_reason = ?
          WHERE id = ?",
     )
+    .bind(status)
     .bind(reason)
     .bind(job_id)
     .execute(pool)
@@ -416,7 +438,7 @@ pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE jobs
          SET status = COALESCE(resume_status, 'planning'), resume_status = NULL
-         WHERE id = ? AND status = 'waiting'",
+         WHERE id = ? AND status IN ('waiting','awaiting_approval')",
     )
     .bind(job_id)
     .execute(pool)
@@ -727,6 +749,20 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
         ingest_plan(state, job).await?;
     }
     Ok(())
+}
+
+/// Whether one of this job's nodes has stopped to ask permission.
+///
+/// The job row otherwise reads `implementing` while the whole chain is blocked on a person, and
+/// the only sign anywhere is a proposal in a queue that never names the job it came from.
+async fn node_awaiting_approval(pool: &SqlitePool, job_id: i64) -> sqlx::Result<bool> {
+    let paused: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE job_id = ? AND status = 'awaiting_approval' LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(paused.is_some())
 }
 
 /// Turns a finished plan node into the job's queue.
@@ -1292,8 +1328,23 @@ async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
 
     // Unparked before the brakes are read, never by the brake that lifted: the job does not have to
     // remember which one stopped it, and whatever is still on parks it again below.
-    if job.status == "waiting" && resume(pool, job.id).await.is_err() {
+    if is_paused(&job.status) && resume(pool, job.id).await.is_err() {
         return;
+    }
+
+    // Said on the job itself, not left to be inferred from the approval queue. Until this, the row
+    // read `implementing` while the entire chain was blocked on a person, and nothing connected the
+    // proposal they were looking at to the job it came from.
+    match node_awaiting_approval(pool, job.id).await {
+        Ok(true) => {
+            let _ = pause(pool, job.id, STATUS_AWAITING_APPROVAL, "approval").await;
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read a job's paused nodes");
+            return;
+        }
     }
 
     for _ in 0..MAX_STEPS_PER_PASS {
@@ -2072,6 +2123,64 @@ mod tests {
                 "`{status}` both holds the project's slot and is collectable"
             );
         }
+    }
+
+    /// The job row has to say it is blocked on a person. Until it did, it read `implementing` while
+    /// the whole chain waited, and the only sign anywhere was a proposal in a queue that never
+    /// names the job it came from.
+    #[tokio::test]
+    async fn a_job_whose_node_stopped_to_ask_says_so_on_the_job() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["running"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "awaiting_approval").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        job_tick(&state, Utc::now()).await;
+        assert_eq!(job_status(&pool, job_id).await, STATUS_AWAITING_APPROVAL);
+
+        // And it goes back to what it was doing once the node moves on, rather than staying stuck
+        // in a status nothing clears.
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        job_tick(&state, Utc::now()).await;
+        assert_ne!(job_status(&pool, job_id).await, STATUS_AWAITING_APPROVAL);
+        // Past `running`, wherever the same pass carried it — this project configures no gate, so
+        // the item is waved through to `passed` in the step after the one being tested here.
+        assert_ne!(item_statuses(&pool, job_id).await[0], "running");
+    }
+
+    /// The hazard of putting anything in front of a job's stage: `planning` is the one status that
+    /// carries meaning the job cannot rebuild. A plan node that stops to ask permission must not
+    /// come back as planned-with-an-empty-queue and report itself complete having planned nothing.
+    #[tokio::test]
+    async fn a_plan_node_stopping_to_ask_does_not_cost_the_job_its_queue() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let run_id = seed_node(&pool, job_id, "plan", "awaiting_approval").await;
+
+        job_tick(&state, Utc::now()).await;
+        assert_eq!(job_status(&pool, job_id).await, STATUS_AWAITING_APPROVAL);
+        assert!(!load_view(&pool, job_id).await.unwrap().planned);
+
+        sqlx::query("UPDATE runs SET status = 'cancelled' WHERE id = ?")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        resume(&pool, job_id).await.unwrap();
+
+        assert_eq!(job_status(&pool, job_id).await, "planning");
     }
 
     /// Both levels of cancellation end the job, because a stopped node leaves the tree holding
