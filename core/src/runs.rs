@@ -14,6 +14,15 @@ pub struct CreateRunRequest {
     pub cwd: Option<String>,
     #[serde(default = "default_run_mode")]
     pub mode: String,
+    /// Whether this run may be spoken to again after it starts.
+    ///
+    /// `#[serde(default)]` is load-bearing rather than tidy: every caller that predates this field —
+    /// the shell, the sidecars, and every preset already stored — sends a body without it, and the
+    /// answer for all of them has to stay the one they were built against. Opting in is therefore
+    /// something a caller does on purpose, in the request, and never something a run acquires by
+    /// being created a particular way.
+    #[serde(default)]
+    pub steerable: bool,
 }
 
 fn default_run_mode() -> String {
@@ -205,6 +214,7 @@ pub struct RunStatusResponse {
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub num_turns: Option<i64>,
+    pub context_fill: Option<i64>,
 }
 
 pub async fn create_run(
@@ -237,7 +247,15 @@ pub async fn create_run(
     // the GC skips it, and `one_open_worktree_run_per_project` (migration 0009) blocks the whole
     // project until the daemon restarts, the only thing that reconciles `running` rows.
     let id = crate::http::uncancellable(async move {
-        create_run_inner(&state, req.prompt, req.project_id, req.cwd, &req.mode).await
+        create_run_inner(
+            &state,
+            req.prompt,
+            req.project_id,
+            req.cwd,
+            &req.mode,
+            req.steerable,
+        )
+        .await
     })
     .await?
     .map_err(|error| crate::http::create_run_status(&error))?;
@@ -324,18 +342,57 @@ pub(crate) async fn read_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> 
         .map(|flag| flag.unwrap_or(1) != 0)
 }
 
+/// PURE: barrier 1 of spec §5.5 — the tools a run in `mode` launches with.
+///
+/// One function rather than the same `if` at each reader, because the two readers ask opposite
+/// questions about the same fact: `create_run_inner` asks what to launch, and
+/// `http::post_run_message` asks whether a live run may be given a second author. A toolless run
+/// exists to read words nobody vouches for, so it is the last run that may be spoken to — and the day
+/// a second such mode appears, both answers have to change together or the barrier narrows to one
+/// mode without anyone deciding to narrow it.
+pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
+    if mode == crate::email::TRIAGE_MODE {
+        crate::runner::ToolPolicy::None
+    } else {
+        crate::runner::ToolPolicy::Unrestricted
+    }
+}
+
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
 /// aborted, including aborted before its first poll, when the task drops its captured state without
 /// running a line of the body.
 struct Registration {
     handles: crate::state::RunHandles,
+    /// Released here rather than by the steering endpoint or the runner, because the same three ways
+    /// a task can end are the three ways a run stops listening — and a sender outliving its receiver
+    /// would let `post_run_message` accept a turn nothing will ever read.
+    messages: crate::state::RunMessages,
     id: i64,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         self.handles.lock().unwrap().remove(&self.id);
+        self.messages.lock().unwrap().remove(&self.id);
     }
+}
+
+/// Tells a steerable run that no more turns are coming.
+///
+/// Dropping the run's sender is the whole mechanism, and it is the same event the registry already
+/// uses to mean "this run is no longer listening". `--input-format stream-json` ends the CLI's turn
+/// at stdin EOF, and the writing task reaches EOF only once the last sender is gone — so a sender
+/// kept for the run's whole life is not neutral bookkeeping. It holds stdin open, and a steerable
+/// run then had no way to finish except its progress deadline: recorded `timed_out`, a failure
+/// status, for a run that did exactly what it was asked and was simply never told to stop.
+///
+/// Idempotent, and reports nothing. A run with no channel is a run already not listening — because
+/// it never opted in, because it has ended, or because it was closed a moment ago — and all three
+/// are the state the caller asked for. What a closed run does with a later turn is the refusal
+/// matrix's job, unchanged: `post_run_message` finds no sender and refuses it exactly as it refuses
+/// every other run nothing is listening to.
+pub(crate) fn close_steering_channel(state: &AppState, id: i64) {
+    state.run_messages.lock().unwrap().remove(&id);
 }
 
 /// Spawn a run's driver task and register its abort handle so an in-flight run can be terminated
@@ -357,6 +414,7 @@ where
 {
     let registration = Registration {
         handles: state.run_handles.clone(),
+        messages: state.run_messages.clone(),
         id,
     };
     let mut handles = state.run_handles.lock().unwrap();
@@ -438,13 +496,250 @@ async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
     }
 }
 
+/// How often a LIVE run's context fill is copied from the stream mirror into its row.
+///
+/// Throttled on purpose. The mirror is rewritten on every streamed line — many per second — and the
+/// number is only ever read by a human or by the handoff check, neither of which needs line
+/// resolution. A period plus a change check bounds this to at most one small UPDATE per run per
+/// period, and to zero for a run that is thinking rather than emitting.
+const CONTEXT_FILL_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Aborts the task it names when whatever owns it is dropped.
+///
+/// The run body is left by more paths than it returns from: the wall clock drops its future and
+/// `finalize_termination` aborts it, and neither runs a statement placed after the await. A guard is
+/// the only cleanup that fires on all of them — the same reason `Registration` is one.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Mirrors a live run's context fill into `runs.context_fill` until the returned guard is dropped.
+///
+/// The number was measured from the stream all along, but it only ever reached the database in the
+/// terminal UPDATE — so `GET /runs/{id}` answered `context_fill: null` for the entire life of every
+/// run, which is exactly when someone deciding whether to steer or to hand off wants to read it.
+///
+/// Written through to the row rather than kept in an `AppState` map beside `run_handles`: a cancel
+/// aborts the run task and `finalize_termination` writes only a status, so an in-memory number would
+/// be dropped with the task and the killed run — the one most worth inspecting — would report
+/// nothing. A column already written outlives every one of those paths.
+///
+/// Compare-and-set on `status = 'running'` because this task is not the only writer: a tick that
+/// lands after the terminal UPDATE must not put a stale number back onto a finished run.
+fn mirror_context_fill(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+) -> AbortOnDrop {
+    let pool = pool.clone();
+    AbortOnDrop(
+        tokio::spawn(async move {
+            let mut persisted: Option<i64> = None;
+            loop {
+                tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL).await;
+                let current = context_fill.lock().map(|fill| *fill).unwrap_or(None);
+                if current.is_none() || current == persisted {
+                    continue;
+                }
+                let written = sqlx::query(
+                    "UPDATE runs SET context_fill = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(current)
+                .bind(id)
+                .execute(&pool)
+                .await;
+                // Only a write that landed counts as persisted, so a transient database error is
+                // retried on the next tick instead of being remembered as done.
+                if written.is_ok() {
+                    persisted = current;
+                }
+            }
+        })
+        .abort_handle(),
+    )
+}
+
+/// Reduces the mirrored stream as a fallback for runners that do not publish context separately.
+fn observed_context_fill(mirror: &std::sync::Mutex<Option<i64>>, transcript: &str) -> Option<i64> {
+    let current = mirror.lock().map(|fill| *fill).unwrap_or(None);
+    transcript.lines().fold(current, |fill, line| {
+        crate::runner::context_fill_from_line(line, fill)
+    })
+}
+
+/// The runner abstraction does not expose reliable per-model window metadata, and model aliases can
+/// change underneath the daemon. 200k is therefore a conservative floor shared by the supported
+/// Claude models: using the floor hands off early rather than risking a context-overflowing run.
+const HANDOFF_CONTEXT_LIMIT_FLOOR: i64 = 200_000;
+const HANDOFF_CONTINUATION_PROMPT: &str =
+    "Continue the previous run in a fresh context. Re-check what remains, then finish the task.";
+
+struct HandoffSuccessor {
+    id: i64,
+    session_id: String,
+}
+
+/// Applies the durable handoff policy to a prepared successor.
+///
+/// Both inputs to `already_handed_off` come from the run row rather than task-local state. That
+/// makes a retry after a daemon restart observe the same decision and prevents a second event or
+/// successor link for one crossing.
+async fn record_handoff_if_needed(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    successor_run_id: i64,
+) -> sqlx::Result<bool> {
+    let (context_fill, existing_successor): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT context_fill, successor_run_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await?;
+    let Some(context_fill) = context_fill else {
+        return Ok(false);
+    };
+    if !crate::handoff::should_hand_off(
+        context_fill,
+        HANDOFF_CONTEXT_LIMIT_FLOOR,
+        existing_successor.is_some(),
+    ) {
+        return Ok(false);
+    }
+
+    crate::handoff::record_handoff(pool, run_id, successor_run_id, context_fill).await?;
+    Ok(true)
+}
+
+async fn prepare_handoff_successor(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+) -> sqlx::Result<Option<HandoffSuccessor>> {
+    let (context_fill, existing_successor): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT context_fill, successor_run_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await?;
+    let Some(context_fill) = context_fill else {
+        return Ok(None);
+    };
+    if !crate::handoff::should_hand_off(
+        context_fill,
+        HANDOFF_CONTEXT_LIMIT_FLOOR,
+        existing_successor.is_some(),
+    ) {
+        return Ok(None);
+    }
+
+    let session_id = crate::auth::generate_uuid_v4();
+    let inserted = sqlx::query(
+        "INSERT INTO runs (
+             project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at
+         )
+         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?
+         FROM runs WHERE id = ?",
+    )
+    .bind(HANDOFF_CONTINUATION_PROMPT)
+    .bind(&session_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    let successor_id = inserted.last_insert_rowid();
+
+    if !record_handoff_if_needed(pool, run_id, successor_id).await? {
+        let _ = sqlx::query(
+            "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(successor_id)
+        .execute(pool)
+        .await;
+        return Ok(None);
+    }
+
+    // A worktree handoff continues in the same checkout. Moving its ownership keeps approval,
+    // cancellation, and GC pointed at the live successor instead of the completed predecessor.
+    sqlx::query("UPDATE worktrees SET run_id = ? WHERE run_id = ? AND removed_at IS NULL")
+        .bind(successor_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+
+    Ok(Some(HandoffSuccessor {
+        id: successor_id,
+        session_id,
+    }))
+}
+
 /// Deliberately wide rather than taking an options struct: these are the axes on which a run's
 /// lifecycle actually differs (plan-only, resumed, retried, worktree-bound), and naming each one at
 /// every call site is what makes those differences readable where the runs are created.
+#[derive(Clone)]
 enum GateConfig {
     NotConfigured,
-    Command(String),
+    /// The command, and the project root it was read from. They travel together because the gate
+    /// verifies the second before trusting the first: a script the run rewrote inside its worktree
+    /// is compared against the project root's copy, which is the one the operator configured.
+    Command {
+        command: String,
+        project_root: String,
+    },
     Unreadable(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_handoff_if_needed(
+    state: AppState,
+    runner: std::sync::Arc<dyn crate::runner::CommandRunner>,
+    run_id: i64,
+    original_session_id: String,
+    project_id: Option<String>,
+    spawn_cwd: Option<std::path::PathBuf>,
+    plan_only: bool,
+    completion_feed: Option<(String, String)>,
+    gate_config: GateConfig,
+    max_attempts: u32,
+    tool_policy: crate::runner::ToolPolicy,
+) {
+    let successor = match prepare_handoff_successor(&state.pool, run_id).await {
+        Ok(Some(successor)) => successor,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(run_id, %error, "could not prepare context handoff");
+            return;
+        }
+    };
+    let daemon_token = mint_run_token(&state.pool, successor.id).await;
+    spawn_run(
+        &state,
+        runner,
+        successor.id,
+        HANDOFF_CONTINUATION_PROMPT.to_owned(),
+        project_id,
+        spawn_cwd,
+        plan_only,
+        Some(original_session_id),
+        successor.session_id,
+        true,
+        completion_feed,
+        gate_config,
+        max_attempts,
+        tool_policy,
+        daemon_token,
+        // A successor is not steerable, whatever its predecessor was. `prepare_handoff_successor`
+        // writes its row with the column's default, so a listening successor would contradict its
+        // own record: `post_run_message` reads the row, refuses, and nothing would ever close the
+        // stdin the launch had opened — a run that can only end on a deadline. Continuing a steered
+        // conversation across a handoff means giving the successor row the flag too, which is a
+        // decision to take deliberately rather than inherit.
+        false,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -457,17 +752,22 @@ fn spawn_run(
     spawn_cwd: Option<std::path::PathBuf>,
     plan_only: bool,
     resume_session_id: Option<String>,
+    session_id: String,
+    fork_session: bool,
     completion_feed: Option<(String, String)>,
     gate_config: GateConfig,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
     daemon_token: String,
+    steerable: bool,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
     let progress_timeout = state.progress_timeout;
     let run_timeout = state.run_timeout;
     let env = run_env(&daemon_token, id);
+    let handoff_state = state.clone();
+    let run_messages = state.run_messages.clone();
 
     spawn_registered(state, id, async move {
         let mut attempt: u32 = 1;
@@ -490,19 +790,48 @@ fn spawn_run(
 
             // Owned out here so it survives the timeout below dropping the run future.
             let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
+            // Held for this attempt only: a retry starts a fresh CLI on a fresh context, so the
+            // previous attempt's mirror has nothing left to say. Dropping the guard at the end of
+            // the iteration stops it on every path out of the body, abort included.
+            let _live_context_fill =
+                mirror_context_fill(&pool, id, std::sync::Arc::clone(&context_fill));
+            let mut request = crate::runner::RunRequest {
+                prompt: prompt.clone(),
+                env: env.clone(),
+                cwd: spawn_cwd.clone(),
+                plan_only,
+                resume_session_id: resume_session_id.clone(),
+                mcp_config: None,
+                tool_policy,
+                progress_timeout: Some(progress_timeout),
+                session_id: Some(session_id.clone()),
+                fork_session,
+                include_partial_messages: false,
+                steerable,
+                messages: None,
+            };
+            // Driven by the request's own flag, and beside the spawn that decides it: which run may
+            // be spoken to is settled where its argument vector is chosen, not by whatever later
+            // change opens the door. The flag arrives from `create_run_inner`, which has already
+            // refused the modes that must never be steerable — this is where that decision is read,
+            // not where it is made.
+            //
+            // A fresh channel per attempt, because a turn addressed to an attempt that has already
+            // failed is not owed to its retry — and `insert` replaces the previous attempt's sender,
+            // so nothing can go on holding a stale one.
+            if request.steerable {
+                let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                run_messages.lock().unwrap().insert(id, messages_tx);
+                request.messages = Some(messages_rx);
+            }
             let result = tokio::time::timeout(
                 run_timeout,
-                runner.run_prompt(
-                    &prompt,
-                    &env,
-                    spawn_cwd.as_deref(),
-                    plan_only,
-                    resume_session_id.as_deref(),
-                    None,
-                    tool_policy,
-                    Some(progress_timeout),
+                runner.run_prompt_with_context_fill(
+                    request,
                     session_tx,
                     std::sync::Arc::clone(&transcript),
+                    std::sync::Arc::clone(&context_fill),
                 ),
             )
             .await;
@@ -528,14 +857,23 @@ fn spawn_run(
                         } else {
                             "failed"
                         };
+                    let context_fill = observed_context_fill(&context_fill, &o.stdout);
                     append_run_events(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
                     let gate_outcome = match (terminal_status, &gate_config, spawn_cwd.as_deref()) {
-                        ("completed", GateConfig::Command(command), Some(worktree)) => Some(
+                        (
+                            "completed",
+                            GateConfig::Command {
+                                command,
+                                project_root,
+                            },
+                            Some(worktree),
+                        ) => Some(
                             crate::gate::run_gate(
                                 worktree,
+                                std::path::Path::new(project_root),
                                 command,
                                 crate::state::DEFAULT_GATE_TIMEOUT,
                             )
@@ -559,7 +897,7 @@ fn spawn_run(
                         None => (None, None, None),
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, context_fill = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -571,6 +909,7 @@ fn spawn_run(
                     .bind(o.output_tokens)
                     .bind(o.cache_read_tokens)
                     .bind(o.num_turns)
+                    .bind(context_fill)
                     .bind(&completed_at)
                     .bind(attempt as i64)
                     .bind(gate_status)
@@ -580,13 +919,13 @@ fn spawn_run(
                     .execute(&pool)
                     .await;
                     warn_on_terminal_write_err(&completed, id, terminal_status);
+                    let terminal_write_won =
+                        matches!(&completed, Ok(result) if result.rows_affected() == 1);
                     // The feed row announces this run *finished* — only true if this write won the
                     // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
                     // there first, so this attempt never actually completed as far as the runs table
                     // is concerned; appending anyway would announce a completion it denies.
-                    if terminal_status == "completed"
-                        && matches!(&completed, Ok(result) if result.rows_affected() == 1)
-                    {
+                    if terminal_status == "completed" && terminal_write_won {
                         match gate_outcome {
                             Some(crate::gate::GateOutcome::Failed { exit_code, .. }) => {
                                 let _ = crate::feed::append(
@@ -621,6 +960,24 @@ fn spawn_run(
                                 }
                             }
                         }
+                    }
+                    if terminal_write_won {
+                        let original_session_id =
+                            o.session_id.clone().unwrap_or_else(|| session_id.clone());
+                        Box::pin(spawn_handoff_if_needed(
+                            handoff_state.clone(),
+                            runner.clone(),
+                            id,
+                            original_session_id,
+                            project_id.clone(),
+                            spawn_cwd.clone(),
+                            plan_only,
+                            completion_feed.clone(),
+                            gate_config.clone(),
+                            max_attempts,
+                            tool_policy,
+                        ))
+                        .await;
                     }
                     break;
                 }
@@ -680,18 +1037,36 @@ fn spawn_run(
                         .lock()
                         .map(|shared| shared.clone())
                         .unwrap_or_default();
+                    let context_fill = observed_context_fill(&context_fill, &seen);
                     append_run_events(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', stdout = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&seen)
+                    .bind(context_fill)
                     .bind(&completed_at)
                     .bind(attempt as i64)
                     .bind(id)
                     .execute(&pool)
                     .await;
                     warn_on_terminal_write_err(&timed_out, id, "timed_out");
+                    if matches!(&timed_out, Ok(result) if result.rows_affected() == 1) {
+                        Box::pin(spawn_handoff_if_needed(
+                            handoff_state.clone(),
+                            runner.clone(),
+                            id,
+                            session_id.clone(),
+                            project_id.clone(),
+                            spawn_cwd.clone(),
+                            plan_only,
+                            completion_feed.clone(),
+                            gate_config.clone(),
+                            max_attempts,
+                            tool_policy,
+                        ))
+                        .await;
+                    }
                     break;
                 }
             }
@@ -730,22 +1105,44 @@ pub async fn create_run_inner(
     project_id: Option<String>,
     cwd: Option<String>,
     mode: &str,
+    steerable: bool,
 ) -> Result<i64, CreateRunError> {
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
             "worktree mode requires project_id and cwd (the project root)",
         ));
     }
+    // Spec §5.5 asked here, where the run is MADE, and not only where it is later spoken to.
+    // `http::post_run_message` refuses these same runs and that refusal stays — but it is a second
+    // barrier, not the first one. A run that must never gain a second author should never be created
+    // able to hear one: the flag on the row is what decides the argument vector, so a `steerable`
+    // triage run would be launched with a stdin open to whatever else can reach this process,
+    // leaving the endpoint's refusal as the only thing between a stranger's words and a live
+    // session.
+    //
+    // Two questions, asked separately for the reason the endpoint asks them separately: where the
+    // run came from, and what it may touch. They coincide only while there is one toolless mode.
+    if steerable
+        && (mode == crate::email::TRIAGE_MODE
+            || tool_policy_for_mode(mode) == crate::runner::ToolPolicy::None)
+    {
+        return Err(CreateRunError::Invalid(
+            "a run that launches without tools cannot be created steerable",
+        ));
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let session_id = crate::auth::generate_uuid_v4();
     let inserted = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, created_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
     )
     .bind(&project_id)
     .bind(&cwd)
     .bind(&prompt)
     .bind(mode)
+    .bind(&session_id)
+    .bind(i64::from(steerable))
     .bind(&now)
     .execute(&state.pool)
     .await;
@@ -762,15 +1159,9 @@ pub async fn create_run_inner(
     };
 
     let plan_only = mode == "shadow";
-    // Barrier 1 of spec §5.5, derived here for the same reason `plan_only` is: the mode is what the
-    // caller asked for, and `spawn_run` must not learn to read modes. A triage run handles content
-    // written by strangers, so it launches with no tools rather than trusting the hook to refuse
-    // each one.
-    let tool_policy = if mode == crate::email::TRIAGE_MODE {
-        crate::runner::ToolPolicy::None
-    } else {
-        crate::runner::ToolPolicy::Unrestricted
-    };
+    // Derived here for the same reason `plan_only` is: the mode is what the caller asked for, and
+    // `spawn_run` must not learn to read modes.
+    let tool_policy = tool_policy_for_mode(mode);
     let mut spawn_cwd = cwd.clone().map(std::path::PathBuf::from);
     let mut completion_feed = plan_only.then(|| {
         (
@@ -788,7 +1179,10 @@ pub async fn create_run_inner(
         gate_config = match crate::config::load_schedule_rules(std::path::Path::new(project_root)) {
             Ok(rules) => rules
                 .gate_command
-                .map_or(GateConfig::NotConfigured, GateConfig::Command),
+                .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                    command,
+                    project_root: project_root.to_string(),
+                }),
             Err(error) => {
                 tracing::warn!(
                     project_id = worktree_project_id,
@@ -884,11 +1278,14 @@ pub async fn create_run_inner(
         spawn_cwd,
         plan_only,
         None,
+        session_id,
+        false,
         completion_feed,
         gate_config,
         max_attempts,
         tool_policy,
         daemon_token,
+        steerable,
     );
 
     Ok(id)
@@ -943,12 +1340,13 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .execute(&mut *tx)
         .await?;
     let result = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
-         VALUES (?, ?, ?, 'running', 'worktree', ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, created_at)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?)",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
     .bind(&prompt)
+    .bind(&session_id)
     .bind(&now)
     .execute(&mut *tx)
     .await?;
@@ -1013,7 +1411,10 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     {
         Ok(rules) => rules
             .gate_command
-            .map_or(GateConfig::NotConfigured, GateConfig::Command),
+            .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                command,
+                project_root: project_root.clone(),
+            }),
         Err(error) => {
             tracing::warn!(
                 project_id = %wt_project_id,
@@ -1032,7 +1433,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         Some(wt_project_id),
         Some(std::path::PathBuf::from(&wt_path)),
         false,
-        Some(session_id),
+        Some(session_id.clone()),
+        session_id,
+        false,
         Some((
             "worktree_run_completed".to_owned(),
             format!("resumed run completed on nucleos/run-{original_run_id}"),
@@ -1043,6 +1446,10 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // classifier govern it, exactly as they governed the run being resumed.
         crate::runner::ToolPolicy::Unrestricted,
         daemon_token,
+        // Not steerable, for the reason the handoff successor is not: the resume row carries the
+        // column's default, and a process listening on a stdin its own row denies could never be
+        // told the conversation is over.
+        false,
     );
 
     Ok(resume_id)
@@ -1070,11 +1477,12 @@ pub async fn get_run(
             Option<i64>,
             Option<i64>,
             Option<i64>,
+            Option<i64>,
         ),
     >(
         "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
                 stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns
+                num_turns, context_fill
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -1099,6 +1507,7 @@ pub async fn get_run(
         output_tokens: row.12,
         cache_read_tokens: row.13,
         num_turns: row.14,
+        context_fill: row.15,
     }))
 }
 
@@ -1284,6 +1693,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -1442,7 +1852,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 Some(project_id.to_owned()),
                 Some(project_root.to_owned()),
                 "worktree",
-            )
+            false,)
             .await;
             match result {
                 Err(CreateRunError::Worktree(_)) if attempt < 99 => {
@@ -1833,6 +2243,55 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         panic!("run did not reach completed status in time");
     }
 
+    #[tokio::test]
+    async fn a_run_crossing_the_threshold_records_a_handoff() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let threshold = HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, context_fill, created_at)
+             VALUES (42001, 'crossing', 'completed', 'real', ?, '2026-07-30T12:00:00Z'),
+                    (42002, 'crossing successor', 'running', 'real', NULL, '2026-07-30T12:01:00Z'),
+                    (42003, 'below', 'completed', 'real', ?, '2026-07-30T12:02:00Z'),
+                    (42004, 'below successor', 'running', 'real', NULL, '2026-07-30T12:03:00Z')",
+        )
+        .bind(threshold)
+        .bind(threshold - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(record_handoff_if_needed(&pool, 42001, 42002).await.unwrap());
+        assert!(!record_handoff_if_needed(&pool, 42001, 42002).await.unwrap());
+        assert!(!record_handoff_if_needed(&pool, 42003, 42004).await.unwrap());
+
+        let links: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT
+                 (SELECT successor_run_id FROM runs WHERE id = 42001),
+                 (SELECT successor_run_id FROM runs WHERE id = 42003)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(links, (Some(42002), None));
+
+        let event_counts: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM run_events
+                  WHERE run_id = 42001 AND kind = 'context_handoff'),
+                 (SELECT COUNT(*) FROM run_events
+                  WHERE run_id = 42003 AND kind = 'context_handoff')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_counts, (1, 0));
+    }
+
     /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by
     /// strangers, so the CLI must launch unable to touch anything — and every other mode must keep
     /// the tools its work depends on, or this hardening silently breaks the autopilot.
@@ -1846,7 +2305,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             ("shadow", crate::runner::ToolPolicy::Unrestricted),
         ] {
             *runner.last_tool_policy.lock().unwrap() = None;
-            create_run_inner(&state, "prompt".into(), None, None, mode)
+            create_run_inner(&state, "prompt".into(), None, None, mode, false)
                 .await
                 .unwrap();
             for _ in 0..50 {
@@ -1859,6 +2318,135 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 *runner.last_tool_policy.lock().unwrap(),
                 Some(expected),
                 "mode {mode}"
+            );
+        }
+    }
+
+    /// The production opt-in, and the thing that was missing: `spawn_run` hardcoded `steerable:
+    /// false`, so no caller outside a test fixture could make a run that `POST /runs/{id}/message`
+    /// would accept — the whole authorization matrix guarded a door nothing could reach.
+    ///
+    /// Asserted on both readers, because they are two separate facts that must agree. The launch is
+    /// what opens a stdin at all, and the row is what the endpoint consults minutes later on a
+    /// different task; a run listening while its row says it is not would be refused every turn and
+    /// never told the conversation was over.
+    #[tokio::test]
+    async fn a_run_can_be_created_steerable() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+
+        let id = create_run_inner(&state, "keep going".into(), None, None, "real", true)
+            .await
+            .expect("a real-mode run may ask to be steerable");
+
+        let recorded: i64 = sqlx::query_scalar("SELECT steerable FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(recorded, 1, "the row the endpoint reads must say so too");
+
+        for _ in 0..50 {
+            if runner.last_steerable.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *runner.last_steerable.lock().unwrap(),
+            Some(true),
+            "the opt-in must reach the launch, which is what decides the argument vector"
+        );
+    }
+
+    /// The ship-dark half of the opt-in, and the reason the field defaults rather than being
+    /// required. Every caller that predates it — the shell, the sidecars, every preset already
+    /// stored — sends a body with no `steerable` key, and each of them has to keep the run it has
+    /// always had: launched with a closed stdin, and a row that tells the endpoint to refuse.
+    #[tokio::test]
+    async fn a_run_that_does_not_ask_is_not_steerable() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let app = test_router(state.clone());
+
+        let created = create_run_via_http(&app, "do the thing").await;
+
+        let recorded: i64 = sqlx::query_scalar("SELECT steerable FROM runs WHERE id = ?")
+            .bind(created.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(recorded, 0, "a body that says nothing asks for nothing");
+
+        for _ in 0..50 {
+            if runner.last_steerable.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *runner.last_steerable.lock().unwrap(),
+            Some(false),
+            "the launch must keep the closed stdin every existing caller was built against"
+        );
+    }
+
+    /// The creation-side half of spec §5.5. `http::post_run_message` already refuses a triage run,
+    /// and that refusal stays — but it is the SECOND barrier. A run whose whole premise is that a
+    /// stranger's words never meet a tool must not be launched holding an open stdin in the first
+    /// place, or the endpoint's check is the only thing standing between the two.
+    #[tokio::test]
+    async fn a_triage_run_cannot_be_created_steerable() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+
+        let refused = create_run_inner(
+            &state,
+            "a stranger wrote this".into(),
+            None,
+            None,
+            crate::email::TRIAGE_MODE,
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(refused, Err(CreateRunError::Invalid(_))),
+            "the email pillar's runs must be refused a stdin, not merely refused turns on one"
+        );
+        assert_eq!(
+            crate::http::create_run_status(&refused.unwrap_err()),
+            StatusCode::BAD_REQUEST,
+            "the caller has to learn its request was rejected, not that the daemon failed"
+        );
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "no row may be written for a refused run");
+        assert_eq!(
+            *runner.last_steerable.lock().unwrap(),
+            None,
+            "nothing may be launched for a refused run"
+        );
+    }
+
+    /// Keyed on the tool policy rather than on where the run came from, and separate from the triage
+    /// test above for exactly that reason: the two rules coincide on today's single toolless mode,
+    /// and each has to hold on its own the day a second one appears. Asked of
+    /// `tool_policy_for_mode`, the same function the endpoint asks, so a mode added there is refused
+    /// by both or by neither.
+    #[tokio::test]
+    async fn a_toolless_run_cannot_be_created_steerable() {
+        let state = test_state().await;
+
+        for mode in ["real", "shadow", crate::email::TRIAGE_MODE] {
+            let toolless =
+                tool_policy_for_mode(mode) == crate::runner::ToolPolicy::None;
+            let result =
+                create_run_inner(&state, "prompt".into(), None, None, mode, true).await;
+
+            assert_eq!(
+                matches!(result, Err(CreateRunError::Invalid(_))),
+                toolless,
+                "{mode}: a run launched with no tools is the one run that must not be steerable"
             );
         }
     }
@@ -1878,7 +2466,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             None,
             None,
             crate::email::TRIAGE_MODE,
-        )
+        false,)
         .await
         .unwrap();
         let (triage_status, _) = poll_run(&state, triage_id, "completed").await;
@@ -1886,7 +2474,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(*local_runner.calls.lock().unwrap(), 1);
         assert_eq!(*default_runner.calls.lock().unwrap(), 0);
 
-        let ordinary_id = create_run_inner(&state, "ordinary work".into(), None, None, "real")
+        let ordinary_id = create_run_inner(&state, "ordinary work".into(), None, None, "real", false)
             .await
             .unwrap();
         let (ordinary_status, _) = poll_run(&state, ordinary_id, "completed").await;
@@ -1908,7 +2496,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             None,
             None,
             crate::email::TRIAGE_MODE,
-        )
+        false,)
         .await
         .unwrap();
         let (status, _) = poll_run(&state, id, "completed").await;
@@ -1928,7 +2516,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 
         for mode in [crate::email::TRIAGE_MODE, "real", "shadow"] {
             *runner.last_env.lock().unwrap() = None;
-            let id = create_run_inner(&state, "prompt".into(), None, None, mode)
+            let id = create_run_inner(&state, "prompt".into(), None, None, mode, false)
                 .await
                 .unwrap();
             for _ in 0..50 {
@@ -1976,7 +2564,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
     async fn create_run_inner_persists_mode_and_threads_plan_only_per_run() {
         let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
 
-        let shadow_id = create_run_inner(&state, "shadow".into(), None, None, "shadow")
+        let shadow_id = create_run_inner(&state, "shadow".into(), None, None, "shadow", false)
             .await
             .unwrap();
         for _ in 0..20 {
@@ -2006,7 +2594,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(shadow_feed[0].kind, "shadow_run_completed");
         assert_eq!(shadow_feed[0].run_id, Some(shadow_id));
 
-        let real_id = create_run_inner(&state, "real".into(), None, None, "real")
+        let real_id = create_run_inner(&state, "real".into(), None, None, "real", false)
             .await
             .unwrap();
         for _ in 0..20 {
@@ -2432,6 +3020,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 project_id: None,
                 cwd: None,
                 mode: "real".to_owned(),
+                steerable: false,
             }),
         )
         .await;
@@ -2455,6 +3044,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 project_id: None,
                 cwd: None,
                 mode: "real".to_owned(),
+                steerable: false,
             }),
         )
         .await;
@@ -2488,6 +3078,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 project_id: Some("proj".to_owned()),
                 cwd: Some(repo.to_string_lossy().into_owned()),
                 mode: "worktree".to_owned(),
+                steerable: false,
             }),
         ));
 
@@ -2675,7 +3266,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
     async fn a_completion_write_never_overwrites_a_finalised_status() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(1)), Duration::from_secs(600)).await;
-        let id = create_run_inner(&state, "a slow one".into(), None, None, "real")
+        let id = create_run_inner(&state, "a slow one".into(), None, None, "real", false)
             .await
             .unwrap();
 
@@ -2745,7 +3336,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
     async fn a_lost_completion_race_never_appends_its_completion_feed_row() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(1)), Duration::from_secs(600)).await;
-        let id = create_run_inner(&state, "a slow shadow one".into(), None, None, "shadow")
+        let id = create_run_inner(&state, "a slow shadow one".into(), None, None, "shadow", false)
             .await
             .unwrap();
 
@@ -2809,7 +3400,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             None,
             Some("root".into()),
             "worktree",
-        )
+        false,)
         .await;
         assert!(matches!(missing_project, Err(CreateRunError::Invalid(_))));
 
@@ -2819,7 +3410,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             Some("proj".into()),
             None,
             "worktree",
-        )
+        false,)
         .await;
         assert!(matches!(missing_cwd, Err(CreateRunError::Invalid(_))));
     }
@@ -2843,7 +3434,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             Some("proj".into()),
             Some(project_root),
             "worktree",
-        )
+        false,)
         .await;
 
         assert!(matches!(second, Err(CreateRunError::Busy)));
@@ -2891,7 +3482,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             Some("proj".into()),
             Some(project_root),
             "worktree",
-        )
+        false,)
         .await;
 
         assert!(matches!(result, Err(CreateRunError::Busy)));
@@ -2927,7 +3518,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         for mode in ["shadow", "real"] {
             for prompt in ["first", "second"] {
                 let result =
-                    create_run_inner(&state, prompt.into(), Some("proj".into()), None, mode).await;
+                    create_run_inner(&state, prompt.into(), Some("proj".into()), None, mode, false).await;
                 assert!(result.is_ok(), "{mode} run failed: {result:?}");
             }
         }
@@ -2949,7 +3540,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             Some("proj".into()),
             Some(non_repo.to_string_lossy().into_owned()),
             "worktree",
-        )
+        false,)
         .await;
         assert!(
             matches!(result, Err(CreateRunError::Worktree(_))),
@@ -3356,7 +3947,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         let (state, runner) = test_state_with_runner(None, Duration::from_secs(5)).await;
         *runner.fail_times.lock().unwrap() = 1; // 1st attempt fails to launch, 2nd succeeds
 
-        let id = create_run_inner(&state, "go".into(), None, None, "shadow")
+        let id = create_run_inner(&state, "go".into(), None, None, "shadow", false)
             .await
             .unwrap();
 
@@ -3371,7 +3962,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         let (state, runner) = test_state_with_runner(None, Duration::from_secs(5)).await;
         *runner.fail_times.lock().unwrap() = 5; // always fails to launch
 
-        let id = create_run_inner(&state, "go".into(), None, None, "shadow")
+        let id = create_run_inner(&state, "go".into(), None, None, "shadow", false)
             .await
             .unwrap();
 
@@ -3386,7 +3977,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         let (state, runner) = test_state_with_runner(None, Duration::from_secs(5)).await;
         *runner.fail_times.lock().unwrap() = 5;
 
-        let id = create_run_inner(&state, "go".into(), None, None, "real")
+        let id = create_run_inner(&state, "go".into(), None, None, "real", false)
             .await
             .unwrap();
 

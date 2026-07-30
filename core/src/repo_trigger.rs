@@ -233,6 +233,7 @@ pub(crate) async fn fire_configured_trigger(
         Some(project_id.to_string()),
         Some(project_root.to_string()),
         run_mode,
+        false,
     )
     .await
     {
@@ -573,6 +574,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
+            run_messages: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,

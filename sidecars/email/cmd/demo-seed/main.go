@@ -18,18 +18,22 @@ const defaultDaemonURL = "http://127.0.0.1:8791"
 //go:embed mailbox.json
 var mailboxJSON []byte
 
+//go:embed sent.json
+var sentJSON []byte
+
 func main() {
 	mailbox := flag.String("mailbox", "INBOX", "mailbox name to seed")
+	sentMailbox := flag.String("sent-mailbox", "Sent", "sent-folder name to seed; empty skips it")
 	dryRun := flag.Bool("dry-run", false, "print the batch without delivering it")
 	flag.Parse()
 
-	batch, err := seededBatch(*mailbox)
+	batches, err := batchesToSeed(*mailbox, *sentMailbox)
 	if err != nil {
 		log.Fatalf("load embedded mailbox: %v", err)
 	}
 
 	if *dryRun {
-		printJSON(batch)
+		printJSON(batches)
 		return
 	}
 
@@ -43,16 +47,48 @@ func main() {
 		daemonURL = defaultDaemonURL
 	}
 
-	result, err := daemon.New(daemonURL, token).Deliver(batch)
-	if err != nil {
-		log.Fatalf("deliver demo mailbox: %v", err)
+	client := daemon.New(daemonURL, token)
+	for _, batch := range batches {
+		result, err := client.Deliver(batch)
+		if err != nil {
+			log.Fatalf("deliver demo mailbox %q: %v", batch.Mailbox, err)
+		}
+		printJSON(result)
 	}
-	printJSON(result)
+}
+
+// batchesToSeed returns what the demo delivers, in the order it must be delivered.
+func batchesToSeed(mailbox, sentMailbox string) ([]daemon.Batch, error) {
+	inbox, err := seededBatch(mailbox)
+	if err != nil {
+		return nil, err
+	}
+	inbox.Direction = "inbound"
+	if strings.TrimSpace(sentMailbox) == "" {
+		return []daemon.Batch{inbox}, nil
+	}
+
+	sent, err := seededSentBatch(sentMailbox)
+	if err != nil {
+		return nil, err
+	}
+	// Sent mail makes a correspondent known, so it must reach the database before the inbox mail
+	// whose judgement it changes. This ordering is behaviour, not presentation.
+	return []daemon.Batch{sent, inbox}, nil
 }
 
 func seededBatch(mailbox string) (daemon.Batch, error) {
 	var batch daemon.Batch
 	if err := json.Unmarshal(mailboxJSON, &batch); err != nil {
+		return daemon.Batch{}, err
+	}
+	batch.Mailbox = mailbox
+	return batch, nil
+}
+
+func seededSentBatch(mailbox string) (daemon.Batch, error) {
+	var batch daemon.Batch
+	if err := json.Unmarshal(sentJSON, &batch); err != nil {
 		return daemon.Batch{}, err
 	}
 	batch.Mailbox = mailbox

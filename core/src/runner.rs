@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -55,6 +55,56 @@ pub enum ToolPolicy {
     /// shell, or the network. This is what lets a run process untrusted third-party content at all
     /// (spec §5.5), and it is the CLI's own refusal rather than a hook's cooperation.
     None,
+}
+
+/// Every caller-chosen input to one runner invocation.
+///
+/// This deliberately does not implement `Default`. The old positional signature kept one
+/// parameter per CLI flag so adding a flag could not silently inherit a default nobody chose; a
+/// struct with no `Default` preserves that property by requiring every construction site to name
+/// every field.
+#[derive(Debug)]
+pub struct RunRequest {
+    pub prompt: String,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<PathBuf>,
+    pub plan_only: bool,
+    pub resume_session_id: Option<String>,
+    pub mcp_config: Option<PathBuf>,
+    pub tool_policy: ToolPolicy,
+    pub progress_timeout: Option<Duration>,
+    pub session_id: Option<String>,
+    pub fork_session: bool,
+    pub include_partial_messages: bool,
+    /// Whether this run's turns arrive on stdin instead of in its argument vector.
+    ///
+    /// The opt-in is made once, here, because it decides the shape of the launch and cannot be
+    /// changed afterwards: `--input-format stream-json` is what turns the CLI's stdin into a channel
+    /// a later turn can arrive on, and a process already spawned without it has nothing listening.
+    /// Every path that does not ask keeps today's `-p <prompt>` vector and a closed stdin.
+    pub steerable: bool,
+    /// Where a steerable run's LATER turns arrive from; the first one is always `prompt`.
+    ///
+    /// `None` beside `steerable: true` is a real state, not an oversight: the prompt still travels
+    /// stdin as a `user` line, and stdin then closes, which is exactly the one-turn run the argv path
+    /// performs. What it costs is the ability to say anything more.
+    pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+}
+
+/// One line of `--input-format stream-json` stdin: a single user turn.
+///
+/// Measured against CLI 2.1.198, this shape is accepted and the run proceeds — the `init` event fires
+/// and the process exits 0. Built through `serde_json` rather than `format!` because a turn is
+/// delimited by a newline: a prompt containing one, or a quote, would otherwise arrive as two
+/// half-parsed lines instead of the single instruction it is.
+pub(crate) fn user_message_line(text: &str) -> String {
+    let mut line = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+    })
+    .to_string();
+    line.push('\n');
+    line
 }
 
 fn advertised_tools_from_init(init: &serde_json::Value) -> Option<Vec<String>> {
@@ -175,38 +225,47 @@ const BUILTIN_TOOLS: &[&str] = &[
 
 /// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
 /// reach are asserted in tests instead of inspected on a live process.
-pub(crate) fn cli_args(
-    prompt: &str,
-    model: &str,
-    plan_only: bool,
-    resume_session_id: Option<&str>,
-    mcp_config: Option<&Path>,
-    tool_policy: ToolPolicy,
-) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        prompt.to_string(),
-        "--model".to_string(),
-        model.to_string(),
-    ];
-    if let Some(sid) = resume_session_id {
+pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
+    let mut args = vec!["-p".to_string()];
+    // A steerable run's prompt is written to stdin instead. Measured against CLI 2.1.198,
+    // `-p <prompt> --input-format stream-json` reads the positional AND waits on stdin, so leaving
+    // the prompt here as well would enqueue the same instruction twice.
+    if !request.steerable {
+        args.push(request.prompt.clone());
+    }
+    args.push("--model".to_string());
+    args.push(model.to_string());
+    if let Some(sid) = &request.resume_session_id {
         args.push("--resume".to_string());
-        args.push(sid.to_string());
+        args.push(sid.clone());
+    } else if let Some(sid) = &request.session_id {
+        args.push("--session-id".to_string());
+        args.push(sid.clone());
+    }
+    if request.fork_session {
+        args.push("--fork-session".to_string());
+    }
+    if request.include_partial_messages {
+        args.push("--include-partial-messages".to_string());
     }
     args.push("--output-format".to_string());
     args.push("stream-json".to_string());
+    if request.steerable {
+        args.push("--input-format".to_string());
+        args.push("stream-json".to_string());
+    }
     args.push("--verbose".to_string());
-    if plan_only {
+    if request.plan_only {
         args.push("--permission-mode".to_string());
         args.push("plan".to_string());
     }
-    if let Some(path) = mcp_config {
+    if let Some(path) = &request.mcp_config {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());
         args.push("--allowedTools".to_string());
         args.push("mcp__nucleos__*".to_string());
     }
-    match tool_policy {
+    match request.tool_policy {
         ToolPolicy::Unrestricted => {}
         ToolPolicy::McpOnly => {
             // Drops every MCP server this user happens to have configured — the ambient surface a
@@ -253,6 +312,45 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
         }
     }
     reply
+}
+
+/// Context occupied while a Claude `stream-json` run is still alive.
+///
+/// This is deliberately separate from `extract_usage`: assistant events describe current context
+/// pressure during a run, while the final result describes aggregate usage after it has ended.
+pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return current;
+    };
+
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("assistant") {
+        let usage = value
+            .get("message")
+            .and_then(|message| message.get("usage"));
+        let input_tokens = usage
+            .and_then(|usage| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_i64);
+        let cache_read_tokens = usage
+            .and_then(|usage| usage.get("cache_read_input_tokens"))
+            .and_then(serde_json::Value::as_i64);
+
+        if let (Some(input_tokens), Some(cache_read_tokens)) = (input_tokens, cache_read_tokens) {
+            // Cache-read tokens occupy the context window exactly as fresh input tokens do.
+            return input_tokens.checked_add(cache_read_tokens).or(current);
+        }
+    }
+
+    if current.is_none()
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("thinking_tokens")
+    {
+        return value
+            .get("estimated_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .or(current);
+    }
+
+    current
 }
 
 /// Usage reported by the final `result` event of a Claude `stream-json` transcript.
@@ -483,8 +581,8 @@ pub trait CommandRunner: Send + Sync {
     /// Runs one `claude -p` invocation. `cwd`, when set, is the run's working directory (spec §3.3).
     /// `session_tx` receives the `session_id` the instant the CLI's `init` message is parsed.
     ///
-    /// Mostly one parameter per CLI flag, kept positional so adding a flag cannot silently inherit a
-    /// default nobody chose. The two exceptions are the escape hatches: `session_tx` and
+    /// `RunRequest` intentionally has no `Default`, so adding a CLI flag cannot silently inherit a
+    /// value nobody chose. The two parameters outside it are the escape hatches: `session_tx` and
     /// `transcript`, which exist so a caller can learn something before this future resolves.
     ///
     /// `transcript` accumulates stdout as it arrives, and is the ONLY way a caller sees any of it
@@ -492,20 +590,26 @@ pub trait CommandRunner: Send + Sync {
     /// when that fires the future is dropped, and everything owned by it — the returned
     /// `RunOutcome`, its stdout, its usage — is destroyed with it. A run killed by that clock used to
     /// persist no transcript and no trajectory at all, which is precisely the run worth inspecting.
-    #[allow(clippy::too_many_arguments)]
     async fn run_prompt(
         &self,
-        prompt: &str,
-        env: &[(String, String)],
-        cwd: Option<&Path>,
-        plan_only: bool,
-        resume_session_id: Option<&str>,
-        mcp_config: Option<&Path>,
-        tool_policy: ToolPolicy,
-        progress_timeout: Option<Duration>,
+        request: RunRequest,
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome>;
+
+    /// Runs a prompt while also mirroring the latest known context fill.
+    ///
+    /// Runners without a streaming context signal keep the default behavior. The CLI runner
+    /// overrides this so `runs.rs` can retain the number when its wall clock drops the run future.
+    async fn run_prompt_with_context_fill(
+        &self,
+        request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        _context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    ) -> std::io::Result<RunOutcome> {
+        self.run_prompt(request, session_tx, transcript).await
+    }
 }
 
 /// A tool-free Ollama boundary for local triage.
@@ -620,24 +724,17 @@ pub async fn ollama_chat(
 impl CommandRunner for OllamaRunner {
     async fn run_prompt(
         &self,
-        prompt: &str,
-        _env: &[(String, String)],
-        _cwd: Option<&Path>,
-        _plan_only: bool,
-        _resume_session_id: Option<&str>,
-        _mcp_config: Option<&Path>,
-        tool_policy: ToolPolicy,
-        _progress_timeout: Option<Duration>,
+        request: RunRequest,
         _session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
-        if tool_policy != ToolPolicy::None {
+        if request.tool_policy != ToolPolicy::None {
             return Err(std::io::Error::other(
                 "Ollama local inference supports only ToolPolicy::None",
             ));
         }
 
-        let message_count = prompt.matches("=== BEGIN MESSAGE id=").count();
+        let message_count = request.prompt.matches("=== BEGIN MESSAGE id=").count();
         if message_count > crate::triage::LOCAL_BATCH_MAX {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -675,11 +772,15 @@ impl CommandRunner for OllamaRunner {
                 .insert("maxItems".to_string(), serde_json::json!(message_count));
         }
 
+        // The extracted call, against master's request-struct signature: `prompt` is now
+        // `request.prompt`, and the body this builds is pinned by
+        // `ollama_request_body_carries_ctx_grammar_and_think` so the wire format could not drift
+        // while being moved out of here.
         let answer = ollama_chat(
             &self.client,
             &self.base_url,
             &self.model,
-            prompt,
+            &request.prompt,
             serde_json::json!({
                 "num_ctx": crate::triage::LOCAL_NUM_CTX,
                 "temperature": 0
@@ -731,16 +832,25 @@ pub struct ClaudeCliRunner {
 impl CommandRunner for ClaudeCliRunner {
     async fn run_prompt(
         &self,
-        prompt: &str,
-        env: &[(String, String)],
-        cwd: Option<&Path>,
-        plan_only: bool,
-        resume_session_id: Option<&str>,
-        mcp_config: Option<&Path>,
-        tool_policy: ToolPolicy,
-        progress_timeout: Option<Duration>,
+        request: RunRequest,
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> std::io::Result<RunOutcome> {
+        self.run_prompt_with_context_fill(
+            request,
+            session_tx,
+            transcript,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        )
+        .await
+    }
+
+    async fn run_prompt_with_context_fill(
+        &self,
+        mut request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
         // npm-installed `claude` is a `.cmd` shim that Rust's `Command` can't spawn by name — the
@@ -748,21 +858,20 @@ impl CommandRunner for ClaudeCliRunner {
         let claude_bin =
             std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&claude_bin);
-        cmd.args(cli_args(
-            prompt,
-            &self.model,
-            plan_only,
-            resume_session_id,
-            mcp_config,
-            tool_policy,
-        ));
-        for (k, v) in env {
+        cmd.args(cli_args(&request, &self.model));
+        for (k, v) in &request.env {
             cmd.env(k, v);
         }
-        if let Some(dir) = cwd {
+        if let Some(dir) = &request.cwd {
             cmd.current_dir(dir);
         }
-        cmd.stdin(Stdio::null());
+        // A closed stdin for every run that did not opt in: there is then no channel for a second
+        // author to arrive on, which is the property the email pillar's triage runs depend on.
+        if request.steerable {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         // kill_on_drop turns an aborted awaiting-task (cancel/timeout, Task 4) into the OS `claude`
@@ -786,6 +895,45 @@ impl CommandRunner for ClaudeCliRunner {
         // exactly what makes `git worktree remove` fail through its whole backoff afterwards.
         let mut tree_killer = child.id().map(TreeKiller::new);
 
+        // A steerable run's turns are written in their OWN task, concurrently with the stdout loop
+        // below, for the same reason stderr is drained in one: a turn written while the CLI is
+        // mid-answer must not stop anything reading what it is saying.
+        //
+        // The task owns the writer, so its end closes the CLI's stdin. That is deliberate and is the
+        // whole of the lifetime rule: with no channel it ends after the opening turn, which is the
+        // one-turn run the argv path performs; with one it ends when the sender is dropped, or when
+        // the abort below reaps it.
+        let mut steering_task = None;
+        if request.steerable {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("stdin piped above when steerable");
+            let opening = user_message_line(&request.prompt);
+            let mut messages = request.messages.take();
+            steering_task = Some(tokio::spawn(async move {
+                // `ChildStdin` writes straight to the OS pipe, so a completed `write_all` has
+                // already been handed over — there is no buffer left to flush. A failed one means
+                // the CLI is gone, which the exit code and stderr below already report; there is
+                // nothing this task could add and nobody awaiting it to tell.
+                if stdin.write_all(opening.as_bytes()).await.is_err() {
+                    return;
+                }
+                let Some(messages) = messages.as_mut() else {
+                    return;
+                };
+                while let Some(text) = messages.recv().await {
+                    if stdin
+                        .write_all(user_message_line(&text).as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }));
+        }
+
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");
 
@@ -800,9 +948,14 @@ impl CommandRunner for ClaudeCliRunner {
 
         let mut lines = BufReader::new(stdout).lines();
         let mut stdout_acc = String::new();
-        let mut session_id: Option<String> = None;
+        let mut session_id = request
+            .session_id
+            .clone()
+            .or_else(|| request.resume_session_id.clone());
+        let mut cli_session_seen = false;
         let mut cost_usd: Option<f64> = None;
         let mut usage = RunUsage::default();
+        let mut running_context_fill: Option<i64> = None;
 
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
@@ -810,7 +963,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut progress_timeout_elapsed: Option<Duration> = None;
 
         loop {
-            let next_line = match progress_timeout {
+            let next_line = match request.progress_timeout {
                 Some(deadline) => match tokio::time::timeout(deadline, lines.next_line()).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -837,10 +990,14 @@ impl CommandRunner for ClaudeCliRunner {
                 shared.push_str(&line);
                 shared.push('\n');
             }
+            running_context_fill = context_fill_from_line(&line, running_context_fill);
+            if let Ok(mut shared) = context_fill.lock() {
+                *shared = running_context_fill;
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if session_id.is_none()
-                    && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
+                if !cli_session_seen && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
                 {
+                    cli_session_seen = true;
                     session_id = Some(sid.to_string());
                     // Best-effort: the receiver may already be gone if the run was cancelled.
                     let _ = session_tx.send(sid.to_string());
@@ -851,7 +1008,7 @@ impl CommandRunner for ClaudeCliRunner {
                     init_seen = true;
                     let advertised = advertised_tools_from_init(&v);
                     if let Some(reason) =
-                        advertised_tools_violate(tool_policy, advertised.as_deref())
+                        advertised_tools_violate(request.tool_policy, advertised.as_deref())
                     {
                         policy_violation = Some(reason);
                         break;
@@ -878,13 +1035,20 @@ impl CommandRunner for ClaudeCliRunner {
             && progress_timeout_elapsed.is_none()
             && post_launch_error.is_none()
         {
-            policy_violation = policy_unverified_after_stream(tool_policy, init_seen);
+            policy_violation = policy_unverified_after_stream(request.tool_policy, init_seen);
         }
 
         if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
+        }
+
+        // Before `wait()`, and unconditionally: dropping the writer the task owns is the only way a
+        // steerable run is told no more turns are coming, and a CLI still listening for one has not
+        // finished — so waiting first would be waiting on a process this call is what releases.
+        if let Some(steering) = steering_task.take() {
+            steering.abort();
         }
 
         let status = match child.wait().await {
@@ -944,6 +1108,308 @@ impl CommandRunner for ClaudeCliRunner {
     }
 }
 
+/// The full `codex exec` argument vector for one run, or the reason this tool cannot perform the
+/// run that was asked for. Pure for the same reason `cli_args` is: the flags deciding which model
+/// answers and where it is allowed to work are asserted in tests instead of inspected on a live
+/// process.
+///
+/// The `Result` is what differs from `cli_args`. Claude's CLI has a flag for every control
+/// `RunRequest` carries, so building that vector cannot fail. `codex exec` has no counterpart for a
+/// forked session or for a stdin later turns arrive on, and each of those decides what a run IS
+/// rather than how it is decorated — so a vector that quietly dropped one would hand the caller a
+/// different run than it asked for (one that loses the history it was meant to branch from, or that
+/// answers once and then ignores every steering message) while `runs.rs` recorded it as completed.
+/// Naming the field in the refusal is what tells an operator which request cannot take this path.
+pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<String>, String> {
+    if request.fork_session {
+        return Err(
+            "codex exec cannot honour fork_session: it has no way to branch an existing session"
+                .to_string(),
+        );
+    }
+    if request.steerable {
+        return Err(
+            "codex exec cannot honour steerable: it has no stdin a later turn can arrive on"
+                .to_string(),
+        );
+    }
+
+    let mut args = vec![
+        // The non-interactive subcommand leads the vector; anything else opens a TUI, and a
+        // daemon-spawned run has no terminal for one.
+        "exec".to_string(),
+        // A run works inside a worktree or a plain folder, and the CLI otherwise refuses to start
+        // over the shape of that directory — a refusal about the ground rather than about the work.
+        "--skip-git-repo-check".to_string(),
+        "-m".to_string(),
+        model.to_string(),
+    ];
+    // `-C` is the only thing keeping a run inside the project it was spawned for: the CLI resolves
+    // its own project root from this flag, so a vector missing it works wherever the daemon happened
+    // to be launched. An absent `cwd` passes no flag rather than inventing a directory.
+    if let Some(dir) = &request.cwd {
+        args.push("-C".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    // Trailing positional, after every flag that takes a value, so a prompt can never be consumed as
+    // the argument of the option before it.
+    args.push(request.prompt.clone());
+    Ok(args)
+}
+
+/// Usage reported by a `codex exec` transcript's final `turn.completed` event.
+///
+/// Absent measurements stay `None` rather than becoming measured zeroes, exactly as `extract_usage`
+/// keeps them for the Claude CLI. `budget.rs` bills autonomy against these fields, and this runner
+/// exists to be the cheaper path once a spend ceiling has paused the first one — so a `Some(0)`
+/// standing in for a tool that said nothing would make every run on this path look free and leave
+/// the ceiling with nothing to pause on.
+///
+/// A plain-text transcript and a structured event carrying no `usage` object are the same silence:
+/// unknown in both, and unknown is not zero. `num_turns` has no counterpart in this stream and stays
+/// `None` for that reason — counting the events that happened to be read is not the tool reporting a
+/// turn count.
+pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
+    let mut usage = RunUsage::default();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+            && value.get("type").and_then(serde_json::Value::as_str) == Some("turn.completed")
+        {
+            let reported = value.get("usage");
+            usage = RunUsage {
+                input_tokens: reported
+                    .and_then(|reported| reported.get("input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                output_tokens: reported
+                    .and_then(|reported| reported.get("output_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                cache_read_tokens: reported
+                    .and_then(|reported| reported.get("cached_input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                num_turns: None,
+            };
+        }
+    }
+    usage
+}
+
+/// The second agent CLI, reached only when configuration names it.
+///
+/// A separate `CommandRunner` rather than a mode on `ClaudeCliRunner`, for the reason `OllamaRunner`
+/// is one: the two tools share neither a launch surface nor an output format, and a mode flag would
+/// let a control only one of them honours look enforced on both.
+pub struct CodexCliRunner {
+    pub model: String,
+}
+
+#[async_trait]
+impl CommandRunner for CodexCliRunner {
+    async fn run_prompt(
+        &self,
+        request: RunRequest,
+        _session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> std::io::Result<RunOutcome> {
+        // Refused before anything is sent, exactly as `OllamaRunner` refuses a policy it cannot
+        // apply. Barrier 1 of the tool model is the CLI's OWN refusal (see `ToolPolicy`), and
+        // `codex exec` has neither a flag that denies a tool nor an init event advertising which
+        // ones survived — so a run launched here under a restrictive policy would hold every tool
+        // while `runs.rs` recorded the restriction as applied.
+        if request.tool_policy != ToolPolicy::Unrestricted {
+            return Err(std::io::Error::other(format!(
+                "codex exec cannot honour ToolPolicy::{:?}: it has no tool-restriction flag",
+                request.tool_policy
+            )));
+        }
+        // The same guard, extended to the other controls this launch surface has no counterpart for.
+        // Each was accepted and dropped, which is the one outcome a control must never have: the
+        // caller is told the run it asked for started, and the record says so too.
+        //
+        // `plan_only` is the reason this is a refusal rather than a log line. It is how a run is made
+        // unable to act — a catch-up run, recovering a schedule the machine slept through, is forced
+        // plan-only precisely because nobody chose for it to run NOW. A runner that ignores it turns
+        // a deliberately restrained run into an unrestrained one, in the one case where the operator
+        // was not watching, and leaves nothing behind that says the restraint was lifted.
+        if request.plan_only {
+            return Err(std::io::Error::other(
+                "codex exec cannot honour plan_only: it has no permission mode that withholds action",
+            ));
+        }
+        // `mcp_config` is half of a pairing: on the Claude path the file arrives with an
+        // `--allowedTools mcp__nucleos__*` that narrows the run to that server alone. Dropping the
+        // flag drops the narrowing with it, so the run keeps every tool it had — the opposite of what
+        // naming an MCP config asks for.
+        if request.mcp_config.is_some() {
+            return Err(std::io::Error::other(
+                "codex exec cannot honour mcp_config: it has no flag that loads one, nor the tool narrowing that comes with it",
+            ));
+        }
+        // Not a safety control, and refused all the same. A caller asks for partial messages because
+        // something downstream is waiting on them; a stream that silently never emits any is a
+        // feature that looks broken rather than absent.
+        if request.include_partial_messages {
+            return Err(std::io::Error::other(
+                "codex exec cannot honour include_partial_messages: its stream has no partial-message events",
+            ));
+        }
+        // KNOWN LIMITATION, left un-refused on purpose: `resume_session_id` is not honoured here.
+        //
+        // A run resumed on this path gets a FRESH session carrying the continuation prompt — it
+        // re-reads rather than continues — because `codex exec` has no `--resume` flag; resuming is
+        // a separate subcommand with its own argument shape, so it is a launch this builder does not
+        // yet construct rather than a capability the tool lacks. That is a degraded resume, not an
+        // ignored safety control: nothing is loosened by it, and every barrier the run launches
+        // under is unchanged.
+        //
+        // Refusing it would also refuse more than itself. `session_id` — the id the daemon assigns
+        // every run so its record has a name — travels the same pair of fields, and the run's outcome
+        // is filed under whichever of the two is set; a refusal keyed on either would fail runs whose
+        // only unusual property is having been given an identity.
+        //
+        // The args are built before anything is spawned so a refusal reaches the caller as the `Err` that means
+        // the CLI never ran — which `runs::spawn_run` reads as "a retry cannot double-apply a
+        // mutation", and that is precisely true of a launch that did not happen.
+        let args = codex_cli_args(&request, &self.model).map_err(std::io::Error::other)?;
+
+        // The Codex CLI binary. Overridable via `NUCLEOS_CODEX_BIN` for the same reason
+        // `NUCLEOS_CLAUDE_BIN` exists: on Windows the npm-installed `codex` is a `.cmd` shim that
+        // Rust's `Command` can't spawn by name, so the daemon points this at the real executable.
+        // Defaults to `codex` where it's on PATH.
+        let codex_bin = std::env::var("NUCLEOS_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+        let mut cmd = Command::new(&codex_bin);
+        cmd.args(args);
+        for (k, v) in &request.env {
+            cmd.env(k, v);
+        }
+        if let Some(dir) = &request.cwd {
+            cmd.current_dir(dir);
+        }
+        // Nothing steerable survives `codex_cli_args`, so stdin is always closed here: there is then
+        // no channel for a second author to arrive on.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        // The ONLY `?` from here on, for the reason spelled out in `ClaudeCliRunner`: past the spawn
+        // a failure becomes a failed `RunOutcome`, because an `Err` claims no work was done.
+        let mut child = cmd.spawn()?;
+
+        // Declared after the child so it drops FIRST, which is what keeps the pid it names ours —
+        // see `TreeKiller`. `codex` supervises its own tools, so terminating just the parent orphans
+        // a build still holding locks inside the worktree the run was supposed to release.
+        let mut tree_killer = child.id().map(TreeKiller::new);
+
+        let stdout = child.stdout.take().expect("stdout piped above");
+        let stderr = child.stderr.take().expect("stderr piped above");
+
+        // Concurrent, because reading only stdout while the child writes stderr deadlocks the moment
+        // the OS stderr pipe buffer fills.
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let mut reader = BufReader::new(stderr);
+            let _ = reader.read_to_string(&mut buf).await;
+            buf
+        });
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut stdout_acc = String::new();
+        let mut post_launch_error: Option<std::io::Error> = None;
+        let mut progress_timeout_elapsed: Option<Duration> = None;
+
+        loop {
+            let next_line = match request.progress_timeout {
+                Some(deadline) => match tokio::time::timeout(deadline, lines.next_line()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        progress_timeout_elapsed = Some(deadline);
+                        break;
+                    }
+                },
+                None => lines.next_line().await,
+            };
+            let line = match next_line {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    post_launch_error = Some(error);
+                    break;
+                }
+            };
+            stdout_acc.push_str(&line);
+            stdout_acc.push('\n');
+            // Mirrored as it arrives rather than at the end, because the end is exactly what a
+            // wall-clock timeout never reaches, and the transcript is all a dropped run leaves.
+            if let Ok(mut shared) = transcript.lock() {
+                shared.push_str(&line);
+                shared.push('\n');
+            }
+        }
+
+        if progress_timeout_elapsed.is_some() {
+            // Kill the whole tree first, so terminating the supervisor cannot orphan its tools.
+            drop(tree_killer.take());
+            let _ = child.start_kill();
+        }
+
+        let status = match child.wait().await {
+            Ok(status) => Some(status),
+            Err(error) => {
+                post_launch_error.get_or_insert(error);
+                None
+            }
+        };
+        // Reaped, so the process is gone and there is nothing left to kill.
+        if let Some(killer) = tree_killer.as_mut() {
+            killer.disarm();
+        }
+
+        let mut stderr_str = stderr_task.await.unwrap_or_default();
+        if let Some(deadline) = progress_timeout_elapsed {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
+            ));
+        }
+        let exit_code = match (progress_timeout_elapsed, &post_launch_error) {
+            (Some(_), _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
+            // incomplete, so "succeeded" is a claim this cannot make.
+            (None, Some(error)) => {
+                stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
+                -1
+            }
+            (None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+        };
+
+        let usage = codex_extract_usage(&stdout_acc);
+        Ok(RunOutcome {
+            exit_code,
+            stdout: stdout_acc,
+            stderr: stderr_str,
+            // `codex exec` names no session in what it prints, so a run stays known by the id its
+            // caller assigned; inventing one here would file it under an id nothing else holds.
+            session_id: request
+                .session_id
+                .clone()
+                .or_else(|| request.resume_session_id.clone()),
+            // This tool reports no price. Unknown, not free — `budget.rs` bills against this field,
+            // and a `Some(0.0)` would make every run on this path look like it spent nothing.
+            cost_usd: None,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            num_turns: usage.num_turns,
+        })
+    }
+}
+
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
 #[cfg(test)]
@@ -957,6 +1423,13 @@ pub struct FakeCommandRunner {
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
+    pub last_session_id: std::sync::Mutex<Option<String>>,
+    pub last_fork_session: std::sync::Mutex<Option<bool>>,
+    pub last_include_partial_messages: std::sync::Mutex<Option<bool>>,
+    /// Whether the launch was given a stdin a second author could arrive on. Recorded for the same
+    /// reason `last_tool_policy` is: it decides what a run CAN have done to it, so which value
+    /// reached the runner is a safety property rather than a detail of the request.
+    pub last_steerable: std::sync::Mutex<Option<bool>>,
     /// What the CLI was handed in its environment. Recorded because a run with a Bash tool can read
     /// its own environment, so which key lands here is a safety property and not a detail.
     pub last_env: std::sync::Mutex<Option<Vec<(String, String)>>>,
@@ -971,14 +1444,7 @@ pub struct FakeCommandRunner {
 impl CommandRunner for FakeCommandRunner {
     async fn run_prompt(
         &self,
-        _prompt: &str,
-        env: &[(String, String)],
-        cwd: Option<&Path>,
-        plan_only: bool,
-        resume_session_id: Option<&str>,
-        mcp_config: Option<&Path>,
-        tool_policy: ToolPolicy,
-        progress_timeout: Option<Duration>,
+        request: RunRequest,
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
@@ -987,7 +1453,7 @@ impl CommandRunner for FakeCommandRunner {
         }
         // Before the failure injection below: what a run was handed is worth knowing even when the
         // launch is made to fail.
-        *self.last_env.lock().unwrap() = Some(env.to_vec());
+        *self.last_env.lock().unwrap() = Some(request.env.clone());
         {
             let mut remaining = self.fail_times.lock().unwrap();
             if *remaining > 0 {
@@ -995,13 +1461,18 @@ impl CommandRunner for FakeCommandRunner {
                 return Err(std::io::Error::other("fake launch failure"));
             }
         }
-        *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());
-        *self.last_plan_only.lock().unwrap() = Some(plan_only);
-        *self.last_resume.lock().unwrap() = resume_session_id.map(|s| s.to_string());
-        *self.last_mcp_config.lock().unwrap() = mcp_config.map(|p| p.to_path_buf());
-        *self.last_tool_policy.lock().unwrap() = Some(tool_policy);
+        *self.last_cwd.lock().unwrap() = request.cwd.clone();
+        *self.last_plan_only.lock().unwrap() = Some(request.plan_only);
+        *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
+        *self.last_mcp_config.lock().unwrap() = request.mcp_config.clone();
+        *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
+        *self.last_session_id.lock().unwrap() = request.session_id.clone();
+        *self.last_fork_session.lock().unwrap() = Some(request.fork_session);
+        *self.last_include_partial_messages.lock().unwrap() =
+            Some(request.include_partial_messages);
+        *self.last_steerable.lock().unwrap() = Some(request.steerable);
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
-        let outcome = {
+        let mut outcome = {
             let guard = self.canned.lock().unwrap();
             guard.clone().unwrap_or(RunOutcome {
                 exit_code: 0,
@@ -1015,13 +1486,19 @@ impl CommandRunner for FakeCommandRunner {
                 num_turns: None,
             })
         };
+        if outcome.session_id.is_none() {
+            outcome.session_id = request
+                .session_id
+                .clone()
+                .or_else(|| request.resume_session_id.clone());
+        }
         // Emit session_id *before* any simulated delay — mirrors the real CLI's early `init` message.
         if let Some(sid) = &outcome.session_id {
             let _ = session_tx.send(sid.clone());
         }
         let delay = *self.delay.lock().unwrap();
         let mut streamed = false;
-        match (delay, progress_timeout) {
+        match (delay, request.progress_timeout) {
             (Some(delay), Some(deadline)) => {
                 streamed = true;
                 let mut emitted_stdout = String::new();
@@ -1076,6 +1553,205 @@ mod tests {
         std::sync::Arc::new(std::sync::Mutex::new(String::new()))
     }
 
+    #[test]
+    fn cli_args_always_assigns_a_session_id() {
+        let request = baseline_run_request();
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--session-id" && pair[1] == "123e4567-e89b-42d3-a456-426614174000"
+        }));
+    }
+
+    #[test]
+    fn cli_args_forks_the_session_only_when_asked() {
+        let mut forked = baseline_run_request();
+        forked.fork_session = true;
+        let forked_args = cli_args(&forked, "sonnet");
+
+        let not_forked = baseline_run_request();
+        let not_forked_args = cli_args(&not_forked, "sonnet");
+
+        assert!(forked_args.iter().any(|arg| arg == "--fork-session"));
+        assert!(!not_forked_args.iter().any(|arg| arg == "--fork-session"));
+    }
+
+    #[test]
+    fn cli_args_streams_partial_messages_only_when_asked() {
+        let mut streaming = baseline_run_request();
+        streaming.include_partial_messages = true;
+        let streaming_args = cli_args(&streaming, "sonnet");
+
+        let not_streaming = baseline_run_request();
+        let not_streaming_args = cli_args(&not_streaming, "sonnet");
+
+        assert!(
+            streaming_args
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
+        );
+        assert!(
+            !not_streaming_args
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
+        );
+    }
+
+    /// The opt-in path. `--input-format stream-json` is what turns the CLI's stdin into a channel a
+    /// later turn can arrive on, and the initial prompt has to travel that same channel: measured
+    /// against CLI 2.1.198, `-p <prompt> --input-format stream-json` reads the positional AND waits
+    /// on stdin, so leaving the prompt in argv would enqueue the same instruction twice.
+    // The final assertion is `!args.iter().any(...)`, which clippy would rather see as
+    // `!args.contains(...)`. Allowed rather than rewritten: this test is frozen, and an assertion is
+    // evidence — rephrasing one to satisfy a style lint edits the record of what was checked, even
+    // when the two forms agree.
+    #[allow(clippy::manual_contains)]
+    #[test]
+    fn a_steerable_run_writes_its_prompt_as_a_stream_json_user_line() {
+        let mut request = baseline_run_request();
+        request.steerable = true;
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--input-format" && pair[1] == "stream-json"),
+            "a steerable run reads its turns from stdin: {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == "-p" && pair[1] == request.prompt),
+            "the prompt belongs on stdin as a user line, not after -p: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| *arg == request.prompt),
+            "a steered run's prompt must not reach argv at all: {args:?}"
+        );
+    }
+
+    /// The regression guard for every path that did not ask to be steerable — the email pillar's
+    /// triage runs among them. Whatever the opt-in adds, a run without it keeps today's argument
+    /// vector: `-p <prompt>`, no `--input-format`, and therefore a stdin nothing can write to.
+    #[test]
+    fn a_non_steerable_run_keeps_the_argv_prompt() {
+        let request = baseline_run_request();
+        assert!(!request.steerable, "the baseline must not opt in");
+
+        let args = cli_args(&request, "sonnet");
+
+        assert_eq!(args.first().map(String::as_str), Some("-p"));
+        assert_eq!(
+            args.get(1).map(String::as_str),
+            Some(request.prompt.as_str()),
+            "the prompt must stay the argv positional it is today: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--input-format"),
+            "a run that did not opt in must keep its stdin closed: {args:?}"
+        );
+    }
+
+    /// The other half of the opt-in: the argv assertions above prove the prompt LEFT argv, and this
+    /// proves what it became. The shape was measured against CLI 2.1.198 by probe; a probe is a
+    /// finding until something holds it in place.
+    ///
+    /// Asserted on a text carrying a newline and a quote because a turn is delimited by a newline:
+    /// building this line by hand would split such a prompt into two half-parsed instructions, and
+    /// the CLI would act on the first one alone.
+    #[test]
+    fn a_steering_turn_is_one_json_user_line_whatever_its_text_contains() {
+        let text = "stop after this file\nand say \"done\"";
+
+        let line = user_message_line(text);
+
+        assert!(line.ends_with('\n'), "a turn is terminated: {line:?}");
+        let body = line.strip_suffix('\n').unwrap();
+        assert_eq!(
+            body.lines().count(),
+            1,
+            "one turn must be one line: {line:?}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(
+            parsed["message"]["content"], text,
+            "the text must survive framing intact: {line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_init_event_still_reports_the_assigned_session_id() {
+        let assigned_session_id = "123e4567-e89b-42d3-a456-426614174000";
+        let stdout =
+            r#"{"type":"result","subtype":"success","result":"done","total_cost_usd":0.08}"#;
+        let runner = FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(RunOutcome {
+                exit_code: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                session_id: None,
+                cost_usd: Some(0.08),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
+            })),
+            ..Default::default()
+        };
+        let request = baseline_run_request();
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = runner
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.session_id.as_deref(),
+            Some(assigned_session_id),
+            "the assigned session id must survive a stream with no init event"
+        );
+    }
+
+    fn baseline_run_request() -> RunRequest {
+        RunRequest {
+            prompt: "test prompt".to_string(),
+            env: Vec::new(),
+            cwd: None,
+            plan_only: false,
+            resume_session_id: None,
+            mcp_config: None,
+            tool_policy: ToolPolicy::Unrestricted,
+            progress_timeout: None,
+            session_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
+            fork_session: false,
+            include_partial_messages: false,
+            steerable: false,
+            messages: None,
+        }
+    }
+
+    fn test_run_request(prompt: &str) -> RunRequest {
+        RunRequest {
+            prompt: prompt.to_string(),
+            env: Vec::new(),
+            cwd: None,
+            plan_only: false,
+            resume_session_id: None,
+            mcp_config: None,
+            tool_policy: ToolPolicy::Unrestricted,
+            progress_timeout: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            steerable: false,
+            messages: None,
+        }
+    }
+
     #[tokio::test]
     async fn fake_runner_returns_canned_outcome() {
         let runner = FakeCommandRunner {
@@ -1095,18 +1771,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = runner
-            .run_prompt(
-                "what is 6*7",
-                &[],
-                None,
-                false,
-                None,
-                None,
-                ToolPolicy::Unrestricted,
-                None,
-                tx,
-                discard_transcript(),
-            )
+            .run_prompt(test_run_request("what is 6*7"), tx, discard_transcript())
             .await
             .unwrap();
         assert_eq!(outcome.stdout, "42");
@@ -1143,21 +1808,12 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let started = tokio::time::Instant::now();
+        let mut request = test_run_request("keep working");
+        request.progress_timeout = Some(progress_timeout);
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            runner.run_prompt(
-                "keep working",
-                &[],
-                None,
-                false,
-                None,
-                None,
-                ToolPolicy::Unrestricted,
-                Some(progress_timeout),
-                tx,
-                discard_transcript(),
-            ),
+            runner.run_prompt(request, tx, discard_transcript()),
         )
         .await
         .expect("events should keep the progress deadline alive")
@@ -1176,18 +1832,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
             runner
-                .run_prompt(
-                    "hi",
-                    &[],
-                    None,
-                    false,
-                    None,
-                    None,
-                    ToolPolicy::Unrestricted,
-                    None,
-                    tx,
-                    discard_transcript(),
-                )
+                .run_prompt(test_run_request("hi"), tx, discard_transcript())
                 .await
         });
         let sid = rx.recv().await;
@@ -1200,19 +1845,10 @@ mod tests {
     async fn fake_runner_records_the_resume_session_id() {
         let runner = FakeCommandRunner::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = test_run_request("resume please");
+        request.resume_session_id = Some("sess-9".to_string());
         runner
-            .run_prompt(
-                "resume please",
-                &[],
-                None,
-                false,
-                Some("sess-9"),
-                None,
-                ToolPolicy::Unrestricted,
-                None,
-                tx,
-                discard_transcript(),
-            )
+            .run_prompt(request, tx, discard_transcript())
             .await
             .unwrap();
         assert_eq!(
@@ -1225,19 +1861,11 @@ mod tests {
     async fn fake_runner_records_the_mcp_config() {
         let runner = FakeCommandRunner::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = test_run_request("use mcp");
+        request.mcp_config = Some(std::path::PathBuf::from("C:/tmp/mcp.json"));
+        request.tool_policy = ToolPolicy::McpOnly;
         runner
-            .run_prompt(
-                "use mcp",
-                &[],
-                None,
-                false,
-                None,
-                Some(std::path::Path::new("C:/tmp/mcp.json")),
-                ToolPolicy::McpOnly,
-                None,
-                tx,
-                discard_transcript(),
-            )
+            .run_prompt(request, tx, discard_transcript())
             .await
             .unwrap();
         assert_eq!(
@@ -1292,6 +1920,29 @@ mod tests {
         assert_eq!(usage.num_turns, Some(12));
     }
 
+    #[test]
+    fn context_fill_reads_usage_from_an_assistant_event() {
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":9000}}}"#;
+
+        assert_eq!(
+            crate::runner::context_fill_from_line(line, None),
+            Some(10_000)
+        );
+    }
+
+    #[test]
+    fn context_fill_falls_back_to_thinking_tokens_when_usage_is_absent() {
+        let thinking = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":125}"#;
+        let unrelated = r#"{"type":"assistant","message":{"content":[]}}"#;
+
+        let current = crate::runner::context_fill_from_line(thinking, None);
+        assert_eq!(current, Some(125));
+        assert_eq!(
+            crate::runner::context_fill_from_line(unrelated, current),
+            Some(125)
+        );
+    }
+
     /// The transcript a triage run actually produces: the model's own text arrives in a `content`
     /// array several events BEFORE the `result`, and any parse that takes the first JSON array it
     /// sees would answer with the model's thinking instead of its verdict.
@@ -1307,8 +1958,11 @@ mod tests {
         assert!(!reply.contains("noise"), "the draft must not win: {reply}");
     }
 
-    fn args_for(policy: ToolPolicy, mcp: Option<&Path>) -> Vec<String> {
-        cli_args("triage this", "sonnet", false, None, mcp, policy)
+    fn args_for(policy: ToolPolicy, mcp: Option<&std::path::Path>) -> Vec<String> {
+        let mut request = test_run_request("triage this");
+        request.mcp_config = mcp.map(std::path::Path::to_path_buf);
+        request.tool_policy = policy;
+        cli_args(&request, "sonnet")
     }
 
     fn advertised_tools_from_event(json: &str) -> Option<Vec<String>> {
@@ -1481,7 +2135,10 @@ mod tests {
     /// The restriction must not cost the orchestrator the one server it exists to call.
     #[test]
     fn mcp_only_keeps_the_nucleos_server_reachable() {
-        let args = args_for(ToolPolicy::McpOnly, Some(Path::new("C:/tmp/mcp.json")));
+        let args = args_for(
+            ToolPolicy::McpOnly,
+            Some(std::path::Path::new("C:/tmp/mcp.json")),
+        );
         assert!(args.windows(2).any(|w| w[0] == "--mcp-config"));
         assert!(
             args.windows(2)
@@ -1500,18 +2157,7 @@ mod tests {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             assert!(
                 runner
-                    .run_prompt(
-                        "x",
-                        &[],
-                        None,
-                        false,
-                        None,
-                        None,
-                        ToolPolicy::Unrestricted,
-                        None,
-                        tx,
-                        discard_transcript()
-                    )
+                    .run_prompt(test_run_request("x"), tx, discard_transcript())
                     .await
                     .is_err()
             );
@@ -1519,18 +2165,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(
             runner
-                .run_prompt(
-                    "x",
-                    &[],
-                    None,
-                    false,
-                    None,
-                    None,
-                    ToolPolicy::Unrestricted,
-                    None,
-                    tx,
-                    discard_transcript()
-                )
+                .run_prompt(test_run_request("x"), tx, discard_transcript())
                 .await
                 .is_ok()
         );
@@ -1599,19 +2234,13 @@ mod tests {
         prompt: &str,
     ) -> std::io::Result<RunOutcome> {
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+        // `prompt`, not a fixed string: this helper exists so the batch-bounds and
+        // context-contract tests can vary what is sent, and hardcoding it would make both of them
+        // assert against a prompt they did not choose.
+        let mut request = test_run_request(prompt);
+        request.tool_policy = tool_policy;
         runner
-            .run_prompt(
-                prompt,
-                &[],
-                None,
-                false,
-                None,
-                None,
-                tool_policy,
-                None,
-                session_tx,
-                discard_transcript(),
-            )
+            .run_prompt(request, session_tx, discard_transcript())
             .await
     }
 
@@ -1869,5 +2498,270 @@ mod tests {
             ambiguous.is_err(),
             "multiple context lengths without an architecture must fail closed"
         );
+    }
+
+    /// The `codex exec` launch surface, asserted the way `cli_args` is: purely, so the flags that
+    /// decide which model answers and where it is allowed to work are checked here rather than
+    /// inspected on a live process.
+    ///
+    /// `--skip-git-repo-check` is what lets a run start at all in a directory the CLI would
+    /// otherwise refuse, and `-C` is the only thing keeping a run inside the project it was spawned
+    /// for — a vector missing it runs wherever the daemon happens to have been launched.
+    #[test]
+    fn codex_cli_args_carry_the_model_and_the_working_directory() {
+        let mut request = baseline_run_request();
+        request.cwd = Some(std::path::PathBuf::from("C:/work/repo"));
+
+        let args = codex_cli_args(&request, "gpt-5.6-terra")
+            .expect("a baseline request asks for nothing the tool cannot honour");
+
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("exec"),
+            "the non-interactive subcommand leads the vector: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--skip-git-repo-check"),
+            "a run must not be refused for the shape of the directory it works in: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-m" && pair[1] == "gpt-5.6-terra"),
+            "the model must immediately follow -m: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == "C:/work/repo"),
+            "the working directory must immediately follow -C: {args:?}"
+        );
+
+        let directoryless = baseline_run_request();
+        assert!(
+            directoryless.cwd.is_none(),
+            "the baseline must name no directory"
+        );
+        let directoryless_args = codex_cli_args(&directoryless, "gpt-5.6-terra")
+            .expect("a request without a directory is still honourable");
+        assert!(
+            !directoryless_args.iter().any(|arg| arg == "-C"),
+            "an absent cwd must not invent a directory: {directoryless_args:?}"
+        );
+    }
+
+    /// A control this tool cannot honour must fail the launch instead of vanishing from it.
+    ///
+    /// `fork_session` and `steerable` each change what a run IS, not how it is decorated: a fork
+    /// continues someone else's session rather than starting a new one, and a steerable run promises
+    /// a stdin that later turns can arrive on. Building a vector that silently omits either hands the
+    /// caller a different run than the one it asked for — a run that answers once and then ignores
+    /// every steering message, or one that loses the history it was supposed to branch from — and
+    /// `runs.rs` records that as a completed run. The refusal names the flag so an operator reading
+    /// the failure learns which request cannot take this cheaper path.
+    #[test]
+    fn codex_cli_args_refuse_what_the_tool_cannot_honour() {
+        let honourable = baseline_run_request();
+        assert!(
+            codex_cli_args(&honourable, "gpt-5.6-terra").is_ok(),
+            "the control case must build, or a refusal proves nothing"
+        );
+
+        let mut forked = baseline_run_request();
+        forked.fork_session = true;
+        let forked_refusal = codex_cli_args(&forked, "gpt-5.6-terra")
+            .expect_err("a forked session cannot be honoured here");
+        assert!(
+            forked_refusal.contains("fork_session"),
+            "the refusal must name what it could not honour: {forked_refusal}"
+        );
+
+        let mut steerable = baseline_run_request();
+        steerable.steerable = true;
+        let steerable_refusal = codex_cli_args(&steerable, "gpt-5.6-terra")
+            .expect_err("a steerable run cannot be honoured here");
+        assert!(
+            steerable_refusal.contains("steerable"),
+            "the refusal must name what it could not honour: {steerable_refusal}"
+        );
+    }
+
+    /// Barrier 1 of the tool model is the CLI's OWN refusal, and `codex exec` cannot perform it: it
+    /// has no flag that denies a tool and no init event advertising which ones survived, so a
+    /// restrictive policy could be neither applied at launch nor verified from the stream. A run
+    /// started anyway would hold every tool while `runs.rs` recorded the restriction as honoured —
+    /// and `ToolPolicy::None` is what lets a run read a stranger's mail at all.
+    ///
+    /// Asserted against `run_prompt` rather than `codex_cli_args`, because the refusal lives in the
+    /// runner and the arg builder never sees the policy. Cheap for the same reason it is safe: it
+    /// returns before the spawn, so no `codex` binary has to exist for this to run.
+    #[tokio::test]
+    async fn the_codex_runner_refuses_a_restricted_tool_policy() {
+        let runner = CodexCliRunner {
+            model: "gpt-5.6-terra".to_string(),
+        };
+
+        for policy in [ToolPolicy::None, ToolPolicy::McpOnly] {
+            let mut request = baseline_run_request();
+            request.tool_policy = policy;
+            let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+            let refusal = runner
+                .run_prompt(request, session_tx, std::sync::Arc::clone(&transcript))
+                .await
+                .expect_err("a policy the tool cannot apply must not reach a launch");
+
+            assert!(
+                refusal.to_string().contains(&format!("{policy:?}")),
+                "the refusal must name the policy it could not honour: {refusal}"
+            );
+            assert!(
+                transcript.lock().unwrap().is_empty(),
+                "{policy:?}: a refused run must produce no transcript, because nothing ran"
+            );
+            assert!(
+                session_rx.try_recv().is_err(),
+                "{policy:?}: a run that never launched must not announce a session"
+            );
+        }
+
+        // The control, without which a runner that refused EVERY policy would pass the loop above
+        // while quietly making the second CLI unusable.
+        //
+        // `Unrestricted` plus a request the arg builder rejects: the run gets past the policy gate
+        // and dies one step later, on `fork_session`. That is the whole point of choosing this
+        // request — a control that only set `Unrestricted` would have to spawn `codex` to prove
+        // anything, and a unit test must not start an agent on whatever machine it runs on.
+        let mut allowed = baseline_run_request();
+        allowed.tool_policy = ToolPolicy::Unrestricted;
+        allowed.fork_session = true;
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stopped_later = runner
+            .run_prompt(
+                allowed,
+                session_tx,
+                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            )
+            .await
+            .expect_err("this control request is refused by the arg builder, not by the policy")
+            .to_string();
+
+        assert!(
+            stopped_later.contains("fork_session"),
+            "an unrestricted run must reach the arg builder: {stopped_later}"
+        );
+        assert!(
+            !stopped_later.contains("ToolPolicy"),
+            "the tool policy must not be what stops an unrestricted run: {stopped_later}"
+        );
+    }
+
+    /// The other controls `codex exec` has no counterpart for. Each was accepted and dropped, which
+    /// is the one outcome a control must never have: the caller was told the run it asked for
+    /// started, and the record agreed.
+    ///
+    /// `plan_only` is why this is a refusal rather than a warning. It is how a run is made unable to
+    /// act — a catch-up run, recovering a schedule the machine slept through, is forced plan-only
+    /// precisely because nobody chose for it to run now — so a runner that ignores it converts a
+    /// deliberately restrained run into an unrestrained one, in the one case where the operator is
+    /// not watching. `mcp_config` is half of a pairing on the Claude path, where the file arrives
+    /// with the `--allowedTools` narrowing that keeps the run to that server alone; dropping the flag
+    /// drops the narrowing, leaving MORE reachable than was asked for, not less.
+    ///
+    /// `resume_session_id` is deliberately NOT here. It is unhonourable too, and documented as such
+    /// on the runner — but a run resumed on this path merely re-reads its prompt in a fresh session,
+    /// which loosens nothing, and refusing it would refuse `session_id` with it: the id the daemon
+    /// assigns every run travels the same pair of fields, so the control below would stop being a
+    /// control and start being a ban on runs that have a name.
+    ///
+    /// Asserted against `run_prompt` rather than `codex_cli_args`, because that builder's purity
+    /// contract is frozen. Cheap for the same reason it is safe: every case returns before the
+    /// spawn, so no `codex` binary has to exist for this to run.
+    #[tokio::test]
+    async fn the_codex_runner_refuses_flags_it_cannot_honour() {
+        let runner = CodexCliRunner {
+            model: "gpt-5.6-terra".to_string(),
+        };
+
+        let mut restrained = baseline_run_request();
+        restrained.plan_only = true;
+        let mut narrowed = baseline_run_request();
+        narrowed.mcp_config = Some(std::path::PathBuf::from("C:/nucleos/mcp.json"));
+        let mut streaming = baseline_run_request();
+        streaming.include_partial_messages = true;
+
+        for (field, request) in [
+            ("plan_only", restrained),
+            ("mcp_config", narrowed),
+            ("include_partial_messages", streaming),
+        ] {
+            let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+            let refusal = runner
+                .run_prompt(request, session_tx, std::sync::Arc::clone(&transcript))
+                .await
+                .expect_err("a control the tool cannot apply must not reach a launch")
+                .to_string();
+
+            assert!(
+                refusal.contains(field),
+                "the refusal must name the field it could not honour: {refusal}"
+            );
+            assert!(
+                transcript.lock().unwrap().is_empty(),
+                "{field}: a refused run must produce no transcript, because nothing ran"
+            );
+            assert!(
+                session_rx.try_recv().is_err(),
+                "{field}: a run that never launched must not announce a session"
+            );
+        }
+
+        // The control. A runner that refused everything would pass the loop above while making the
+        // second CLI unusable — and the baseline carries a caller-assigned `session_id`, so this also
+        // pins that identity is not what a refusal keys on.
+        let honourable = baseline_run_request();
+        assert!(
+            honourable.session_id.is_some(),
+            "the control must carry the identity the daemon assigns every run"
+        );
+        assert!(
+            codex_cli_args(&honourable, "gpt-5.6-terra").is_ok(),
+            "a request asking for none of the above must still build a launch"
+        );
+
+        // The documented limitation, pinned as a limitation: a resumed run is not refused here, so
+        // whoever changes that has to change this line and read why it says so.
+        let mut resumed = baseline_run_request();
+        resumed.resume_session_id = Some("123e4567-e89b-42d3-a456-426614174001".to_string());
+        assert!(
+            codex_cli_args(&resumed, "gpt-5.6-terra").is_ok(),
+            "resume is degraded on this path, not refused — see the comment in `run_prompt`"
+        );
+    }
+
+    /// A missing measurement must not read as a measurement of zero — the same invariant
+    /// `usage_absent_is_none_not_zero` pins for the Claude CLI and the local runner returns `None`
+    /// for by construction.
+    ///
+    /// These are the `RunOutcome` fields `budget.rs` bills autonomy against. A second runner exists
+    /// precisely to be the cheaper path once a spend ceiling has paused the first one, so one that
+    /// reported `Some(0)` for a tool that said nothing would make every fallback run look free and
+    /// leave the ceiling unable to pause anything.
+    ///
+    /// Both a plain-text transcript and a structured event carrying no usage object are silence: the
+    /// answer is unknown in each, and unknown is not zero.
+    #[test]
+    fn codex_usage_absent_is_none_not_zero() {
+        for stdout in [
+            "the crate builds and the suite is green\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+        ] {
+            let usage = codex_extract_usage(stdout);
+
+            assert_eq!(usage.input_tokens, None, "{stdout}");
+            assert_eq!(usage.output_tokens, None, "{stdout}");
+            assert_eq!(usage.cache_read_tokens, None, "{stdout}");
+        }
     }
 }

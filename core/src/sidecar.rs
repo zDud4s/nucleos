@@ -68,6 +68,13 @@ pub fn telegram_env(
 /// (8792). Loopback is not a default here — the sidecar refuses to bind anything else.
 pub const EMAIL_FETCH_ADDR: &str = "127.0.0.1:8793";
 
+fn sent_mailbox_env(config: &crate::config::EmailConfig) -> Option<(String, String)> {
+    config
+        .sent_mailbox
+        .as_ref()
+        .map(|mailbox| ("EMAIL_SENT_MAILBOX".to_string(), mailbox.clone()))
+}
+
 /// The email sidecar's environment (spec §3.4). This list is the contract between the núcleo and
 /// the Go sidecar: it reads nothing from disk and holds no config of its own, so anything it needs
 /// is here or it does not exist. The password comes from Credential Manager and never touches a
@@ -83,7 +90,7 @@ pub fn email_env(
     config: &crate::config::EmailConfig,
     password: &str,
 ) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
         ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
         ("EMAIL_FETCH_ADDR".to_string(), EMAIL_FETCH_ADDR.to_string()),
@@ -96,7 +103,9 @@ pub fn email_env(
             "EMAIL_POLL_INTERVAL_SECS".to_string(),
             config.poll_interval_secs.to_string(),
         ),
-    ]
+    ];
+    env.extend(sent_mailbox_env(config));
+    env
 }
 
 #[cfg(test)]
@@ -132,6 +141,35 @@ mod tests {
         assert_eq!(env["EMAIL_IMAP_PASSWORD"], "app-password");
         assert_eq!(env["EMAIL_MAILBOX"], "INBOX");
         assert_eq!(env["EMAIL_POLL_INTERVAL_SECS"], "300");
+    }
+
+    #[test]
+    fn o_sidecar_recebe_a_pasta_de_enviados() {
+        let without_sent = crate::config::EmailConfig {
+            sent_mailbox: None,
+            ..Default::default()
+        };
+        let without_sent_env: HashMap<String, String> =
+            email_env("http://127.0.0.1:8791", "tok", &without_sent, "password")
+                .into_iter()
+                .collect();
+        assert!(
+            !without_sent_env.contains_key("EMAIL_SENT_MAILBOX"),
+            "an unconfigured sent mailbox must leave EMAIL_SENT_MAILBOX absent"
+        );
+
+        let with_sent = crate::config::EmailConfig {
+            sent_mailbox: Some("[Gmail]/Sent Mail".into()),
+            ..Default::default()
+        };
+        let with_sent_env: HashMap<String, String> =
+            email_env("http://127.0.0.1:8791", "tok", &with_sent, "password")
+                .into_iter()
+                .collect();
+        assert_eq!(
+            with_sent_env.get("EMAIL_SENT_MAILBOX").map(String::as_str),
+            Some("[Gmail]/Sent Mail")
+        );
     }
 
     #[test]

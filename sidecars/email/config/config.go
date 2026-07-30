@@ -22,6 +22,7 @@ type Config struct {
 	Username     string
 	Password     string
 	Mailbox      string
+	SentMailbox  string
 	PollInterval time.Duration
 	// FetchAddr is the loopback address this sidecar serves attachments on.
 	FetchAddr string
@@ -69,6 +70,7 @@ func Load() (Config, error) {
 	if mailbox == "" {
 		mailbox = "INBOX"
 	}
+	sentMailbox := os.Getenv("EMAIL_SENT_MAILBOX")
 
 	interval := 300 * time.Second
 	if raw := os.Getenv("EMAIL_POLL_INTERVAL_SECS"); raw != "" {
@@ -100,6 +102,7 @@ func Load() (Config, error) {
 		Username:     username,
 		Password:     password,
 		Mailbox:      mailbox,
+		SentMailbox:  sentMailbox,
 		PollInterval: interval,
 		FetchAddr:    fetchAddr,
 	}, nil

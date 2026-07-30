@@ -25,6 +25,9 @@ pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(900);
 /// In-flight runs' abort handles, keyed by `runs.id`.
 pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 
+/// In-flight steerable runs' turn channels, keyed by `runs.id`.
+pub type RunMessages = Arc<Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender<String>>>>;
+
 /// The email pillar's process-wide settings, resolved once at startup.
 ///
 /// Grouped into one struct rather than spread across `AppState` because they are read together and
@@ -115,6 +118,15 @@ pub struct AppState {
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns
     /// (`runs::create_run`), removed when it completes/times out/is cancelled.
     pub run_handles: RunHandles,
+    /// In-flight steerable runs' turn channels, keyed by `runs.id`. Inserted when a run that opted
+    /// in spawns (`runs::spawn_run`), removed beside the abort handle when its task ends, so the two
+    /// maps never disagree about which runs are still listening.
+    ///
+    /// Carries the caller's text, not the CLI's wire format: framing a turn is `runner.rs`'s job, so
+    /// the receiving end wraps it. An entry here is plumbing and never permission —
+    /// `http::post_run_message` decides on the run's own recorded facts and only then looks for the
+    /// channel.
+    pub run_messages: RunMessages,
     /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
     pub progress_timeout: Duration,
     pub run_timeout: Duration,

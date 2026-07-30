@@ -51,12 +51,74 @@ pub enum GateOutcome {
     Errored { reason: String },
 }
 
+/// The command's arguments that name files inside the worktree. Repo-relative only: an absolute
+/// path is the interpreter, which lives outside the worktree and the run cannot have rewritten it.
+fn worktree_scripts(worktree: &Path, words: &[String]) -> Vec<String> {
+    words
+        .iter()
+        .filter(|word| !Path::new(word.as_str()).is_absolute())
+        .filter(|word| worktree.join(word.as_str()).is_file())
+        .cloned()
+        .collect()
+}
+
+/// Whether the gate is about to run a script the run it measures could have rewritten.
+///
+/// The configuration was already safe: `runs.rs` reads `gate_command` from the project root before
+/// the worktree exists, so an agent cannot repoint the gate. The script that configuration NAMES
+/// was not. `scripts/gates.sh core` resolves inside the worktree and is an ordinary tracked file, so
+/// an agent that could not make the suite green could make the gate green instead — and the verdict
+/// stopped being independent of the work it judges.
+///
+/// Compared against the project root rather than against a base commit: the question is whether this
+/// is the gate the operator configured, and the project root is where they configured it. It also
+/// catches an uncommitted edit, which a git comparison would miss.
+fn tampered_gate_script(
+    project_root: &Path,
+    worktree: &Path,
+    scripts: &[String],
+) -> Option<String> {
+    for relative in scripts {
+        match (
+            std::fs::read(project_root.join(relative)),
+            std::fs::read(worktree.join(relative)),
+        ) {
+            (Ok(configured), Ok(used)) if configured == used => {}
+            (Ok(_), Ok(_)) => {
+                return Some(format!(
+                    "gate script `{relative}` differs from the project root's copy; the run modified \
+                     the command that measures it"
+                ));
+            }
+            (Err(error), _) => {
+                return Some(format!(
+                    "gate script `{relative}` is unreadable in the project root: {error}"
+                ));
+            }
+            (_, Err(error)) => {
+                return Some(format!(
+                    "gate script `{relative}` is unreadable in the worktree: {error}"
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Runs a verification command in `worktree` without involving agent hooks or classification.
 ///
 /// `command` is a program followed by arguments, not a shell line. Shell operators such as `&&`
 /// are passed as ordinary arguments; callers that need them must name a shell explicitly, for
 /// example `bash -c "cargo test && cargo clippy"`.
-pub async fn run_gate(worktree: &Path, command: &str, timeout: Duration) -> GateOutcome {
+///
+/// `project_root` is the un-agented copy of the repository. It is not where the command runs — that
+/// is always the worktree — but the reference the gate's own script is checked against first.
+pub async fn run_gate(
+    worktree: &Path,
+    project_root: &Path,
+    command: &str,
+    timeout: Duration,
+) -> GateOutcome {
     let words = match split_command(command) {
         Ok(words) => words,
         Err(reason) => return GateOutcome::Errored { reason },
@@ -66,6 +128,13 @@ pub async fn run_gate(worktree: &Path, command: &str, timeout: Duration) -> Gate
             reason: "gate command is empty".to_owned(),
         };
     };
+
+    // Before anything is spawned: a gate the measured run rewrote is not a measurement. `Errored`,
+    // not `Failed` — the code may be perfectly fine; what broke is our ability to tell.
+    let scripts = worktree_scripts(worktree, &words);
+    if let Some(reason) = tampered_gate_script(project_root, worktree, &scripts) {
+        return GateOutcome::Errored { reason };
+    }
 
     let mut command = Command::new(program);
     command
@@ -316,6 +385,7 @@ mod tests {
 
         let outcome = run_gate(
             worktree.path(),
+            worktree.path(),
             "nucleos-no-such-program-xyz",
             Duration::from_secs(1),
         )
@@ -335,6 +405,7 @@ mod tests {
         let worktree = tempfile::tempdir().expect("create temporary worktree");
 
         let outcome = run_gate(
+            worktree.path(),
             worktree.path(),
             r#"sh -c "exit 3""#,
             Duration::from_secs(1),
@@ -361,6 +432,7 @@ mod tests {
             Duration::from_secs(2),
             run_gate(
                 worktree.path(),
+                worktree.path(),
                 r#"sh -c "sleep 5""#,
                 Duration::from_millis(100),
             ),
@@ -375,6 +447,59 @@ mod tests {
             }
             GateOutcome::Passed => panic!("a gate that timed out cannot pass"),
         }
+    }
+
+    /// The gate runs a script from inside the worktree the agent just wrote to. The CONFIG was
+    /// already safe — read from the project root before the worktree exists — but the script it
+    /// names was not, so an agent that could not make the suite green could make the gate green.
+    #[tokio::test]
+    async fn a_gate_script_the_run_rewrote_is_not_a_measurement() {
+        let project = tempfile::tempdir().expect("project root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        std::fs::create_dir_all(project.path().join("scripts")).unwrap();
+        std::fs::create_dir_all(worktree.path().join("scripts")).unwrap();
+        std::fs::write(project.path().join("scripts/g.sh"), "exit 1\n").unwrap();
+        // What the agent left behind: same path, now passing.
+        std::fs::write(worktree.path().join("scripts/g.sh"), "exit 0\n").unwrap();
+
+        let outcome = run_gate(
+            worktree.path(),
+            project.path(),
+            "sh scripts/g.sh",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match outcome {
+            GateOutcome::Errored { reason } => {
+                assert!(reason.contains("scripts/g.sh"), "must name it: {reason}");
+            }
+            other => panic!("a rewritten gate script must not yield a verdict, got {other:?}"),
+        }
+    }
+
+    /// The control. Without it the test above could pass because the gate errors on everything.
+    #[tokio::test]
+    async fn an_untouched_gate_script_still_measures() {
+        let project = tempfile::tempdir().expect("project root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        for root in [project.path(), worktree.path()] {
+            std::fs::create_dir_all(root.join("scripts")).unwrap();
+            std::fs::write(root.join("scripts/g.sh"), "exit 0\n").unwrap();
+        }
+
+        let outcome = run_gate(
+            worktree.path(),
+            project.path(),
+            "sh scripts/g.sh",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, GateOutcome::Passed),
+            "an untouched script must be trusted, got {outcome:?}"
+        );
     }
 
     /// A signal death carries no exit code, and `unwrap_or(-1)` used to turn that into

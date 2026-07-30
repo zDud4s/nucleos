@@ -1,6 +1,60 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
+/// A write that has been made durable but is not yet visible at its destination.
+#[must_use = "a staged write does nothing until it is committed"]
+pub struct Staged {
+    path: std::path::PathBuf,
+}
+
+static STAGED_WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes `bytes` somewhere durable that is NOT `dest`, leaving `dest` as it was.
+pub fn stage(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<Staged> {
+    use std::io::Write;
+
+    let parent = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let sequence = STAGED_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut file_name = dest
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("staged"))
+        .to_os_string();
+    file_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+    let path = parent.join(file_name);
+
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+
+    Ok(Staged { path })
+}
+
+/// Makes a staged write visible at its destination, replacing whatever was there.
+pub fn commit(staged: Staged, dest: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(&staged.path, dest) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A failed commit must not accumulate anonymous staged files in repeated callers.
+            let _ = std::fs::remove_file(&staged.path);
+            Err(error)
+        }
+    }
+}
+
+/// Writes a file all-or-nothing: readers see the old bytes or the new ones, never a prefix.
+///
+/// `std::fs::write` truncates and then fills, so a process that dies in between leaves a file
+/// that exists, is readable, and is wrong. Every caller here hands its file to something that
+/// reads it immediately afterwards — an agent CLI, `schtasks` — so a truncated file is not a
+/// state anyone notices before it is used.
+pub fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let staged = stage(dest, bytes)?;
+    commit(staged, dest)
+}
+
 pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
@@ -69,6 +123,53 @@ impl TempDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uma_escrita_por_confirmar_nao_toca_no_destino() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("estado");
+        std::fs::write(&path, b"antigo").unwrap();
+
+        let staged = stage(&path, b"novo").unwrap();
+
+        // Staging without committing is the only way to observe atomicity without killing this
+        // process. A test that merely writes and reads back would pass both before and after GREEN.
+        assert_eq!(std::fs::read(&path).unwrap(), b"antigo");
+
+        commit(staged, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"novo");
+    }
+
+    #[test]
+    fn uma_escrita_atomica_substitui_o_ficheiro_por_inteiro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("estado");
+
+        write_atomic(&path, b"conteudo antigo deliberadamente muito comprido").unwrap();
+        write_atomic(&path, b"curto").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"curto");
+    }
+
+    #[test]
+    fn uma_escrita_atomica_cria_o_que_ainda_nao_existe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("novo");
+
+        write_atomic(&path, b"primeiro conteudo").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"primeiro conteudo");
+    }
+
+    #[test]
+    fn uma_escrita_atomica_nao_deixa_temporarios() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("estado");
+
+        write_atomic(&path, b"conteudo").unwrap();
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// The guard for the whole mechanism above. It asserts the absence that every other test here
     /// depends on and none of them would notice: a leaked directory breaks nothing, it just stays.

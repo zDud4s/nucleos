@@ -20,6 +20,32 @@ pub fn generate_token() -> String {
         .collect()
 }
 
+/// Generates an RFC 9562 UUID version 4 without adding a second randomness dependency.
+pub fn generate_uuid_v4() -> String {
+    let mut bytes = rand::rng().random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
 /// What a presented bearer token is allowed to reach.
 ///
 /// The daemon had exactly one key, and `runs::run_env` handed it to every spawned CLI. `worktree`
@@ -129,6 +155,13 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 ];
 
 /// The current HTTP entry points that create a new run.
+///
+/// `POST /runs/{id}/message` is deliberately absent and must not be added. Creating a run authorises
+/// the prompt supplied at that moment, in advance of the run existing; steering injects text into a
+/// live session that already holds tools, past every check its creation went through — a prompt
+/// nobody reviewed reaching a process nothing is about to review again. That is precisely what the
+/// email pillar's design forbids for content nobody vouches for, so speaking into a run stays its own
+/// authorization rather than a consequence of being allowed to start one.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     (Method::POST, "/webhooks/push"),
@@ -345,6 +378,29 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    #[test]
+    fn generated_uuid_v4_has_the_required_format_version_and_variant() {
+        let uuid = generate_uuid_v4();
+        let bytes = uuid.as_bytes();
+
+        assert_eq!(uuid.len(), 36);
+        assert!(uuid.is_ascii());
+        assert!(
+            [8, 13, 18, 23]
+                .into_iter()
+                .all(|index| bytes[index] == b'-')
+        );
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+        );
+        assert_eq!(bytes[14], b'4');
+        assert!(matches!(bytes[19], b'8' | b'9' | b'a' | b'b'));
+        assert_eq!(uuid, uuid.to_ascii_lowercase());
+    }
+
     async fn test_state(token: &str) -> AppState {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -364,6 +420,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
