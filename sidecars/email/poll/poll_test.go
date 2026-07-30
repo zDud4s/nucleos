@@ -2,11 +2,13 @@ package poll
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	imapv2 "github.com/emersion/go-imap/v2"
 
+	"nucleosemail/config"
 	"nucleosemail/imap"
 )
 
@@ -48,6 +50,69 @@ func uidRange(from, to uint32) []imapv2.UID {
 		uids = append(uids, imapv2.UID(uid))
 	}
 	return uids
+}
+
+func TestACycleContinuesAfterOneMailboxFails(t *testing.T) {
+	failure := errors.New("mailbox unavailable")
+	tests := []struct {
+		name    string
+		targets []Target
+	}{
+		{
+			name: "inbox fails first",
+			targets: []Target{
+				{Mailbox: "INBOX", Direction: "inbound"},
+				{Mailbox: "Sent Items", Direction: "outbound"},
+			},
+		},
+		{
+			name: "sent fails first",
+			targets: []Target{
+				{Mailbox: "Sent Items", Direction: "outbound"},
+				{Mailbox: "INBOX", Direction: "inbound"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var called []Target
+			errs := Cycle(test.targets, func(target Target) error {
+				called = append(called, target)
+				if len(called) == 1 {
+					return failure
+				}
+				return nil
+			})
+
+			if !reflect.DeepEqual(called, test.targets) {
+				t.Fatalf("polled %v, want every target in order %v", called, test.targets)
+			}
+			if len(errs) != 1 || !errors.Is(errs[0], failure) {
+				t.Fatalf("errors = %v, want exactly the first target's failure", errs)
+			}
+		})
+	}
+}
+
+func TestTargetsOmitsSentWhenUnconfigured(t *testing.T) {
+	withoutSent := Targets(config.Config{Mailbox: "INBOX"})
+	wantWithoutSent := []Target{{Mailbox: "INBOX", Direction: "inbound"}}
+	if !reflect.DeepEqual(withoutSent, wantWithoutSent) {
+		t.Fatalf("Targets without sent mailbox = %v, want %v", withoutSent, wantWithoutSent)
+	}
+
+	withSent := Targets(config.Config{
+		Mailbox:     "INBOX",
+		SentMailbox: "[Gmail]/Sent Mail",
+	})
+	wantWithSent := []Target{
+		{Mailbox: "INBOX", Direction: "inbound"},
+		{Mailbox: "[Gmail]/Sent Mail", Direction: "outbound"},
+	}
+	if !reflect.DeepEqual(withSent, wantWithSent) {
+		t.Fatalf("Targets with sent mailbox = %v, want %v", withSent, wantWithSent)
+	}
 }
 
 // The reading that would lose mail: reporting the highest uid the SEARCH returned rather than the
