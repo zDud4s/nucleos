@@ -3532,6 +3532,74 @@ mod tests {
         );
     }
 
+    /// Two facts the daemon records about a run were invisible to every client reading it back:
+    /// whether the run can be spoken to at all, and which run continued it after a context handoff.
+    /// Both are columns on `runs`; neither was in `RunStatusResponse`, so the only way to learn
+    /// either was to open the database. A steering caller could not tell a refusal it deserved
+    /// (`steerable = 0`) from one caused by something else, and a handoff's successor could be found
+    /// only by guessing at ids.
+    #[tokio::test]
+    async fn a_run_reports_whether_it_is_steerable_and_which_run_succeeded_it() {
+        let state = test_state().await;
+        let run_id = crate::runs::create_run_inner(
+            &state,
+            "a run that may be spoken to".to_string(),
+            None,
+            None,
+            "real",
+            true,
+        )
+        .await
+        .expect("a real-mode run needs neither a project nor a worktree");
+
+        // A real row, because `successor_run_id` carries `REFERENCES runs(id)` (migration 0041) —
+        // an invented id is rejected, which is the constraint doing its job.
+        let successor_id = crate::runs::create_run_inner(
+            &state,
+            "the run that continued the work".to_string(),
+            None,
+            None,
+            "real",
+            false,
+        )
+        .await
+        .expect("a real-mode run needs neither a project nor a worktree");
+
+        sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+            .bind(successor_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .expect("link a successor the way a handoff does");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            parsed["steerable"],
+            serde_json::json!(true),
+            "a run created steerable must say so when read back"
+        );
+        assert_eq!(
+            parsed["successor_run_id"],
+            serde_json::json!(successor_id),
+            "the run that continued this one must be reachable without reading the database"
+        );
+    }
+
     #[tokio::test]
     async fn awaiting_approval_runs_returns_seeded_run_with_bearer_token() {
         let state = test_state().await;

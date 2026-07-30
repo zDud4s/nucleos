@@ -180,7 +180,11 @@ impl std::error::Error for CreateRunError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+// `FromRow` rather than a positional tuple: sqlx only implements `FromRow` for tuples up to 16
+// elements, and this row outgrew that. Deriving it also removes the column-order-to-field-order
+// correspondence that a tuple made load-bearing and invisible — adding a column in the middle of
+// the SELECT used to silently shift every field after it.
+#[derive(Serialize, Deserialize, sqlx::FromRow)]
 pub struct RunStatusResponse {
     pub id: i64,
     pub project_id: Option<String>,
@@ -198,6 +202,12 @@ pub struct RunStatusResponse {
     pub cache_read_tokens: Option<i64>,
     pub num_turns: Option<i64>,
     pub context_fill: Option<i64>,
+    /// Whether this run accepts `POST /runs/{id}/message`. Reported because a caller that is
+    /// refused otherwise cannot tell a run that never opted in from one that has already ended.
+    pub steerable: bool,
+    /// The run that continued this one after a context handoff, when there was one. Without it the
+    /// link the handoff records is reachable only by reading the database directly.
+    pub successor_run_id: Option<i64>,
 }
 
 pub async fn create_run(
@@ -1470,30 +1480,10 @@ pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<RunStatusResponse>, StatusCode> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            i64,
-            Option<String>,
-            String,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<f64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-        ),
-    >(
+    let run = sqlx::query_as::<_, RunStatusResponse>(
         "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
                 stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns, context_fill
+                num_turns, context_fill, steerable, successor_run_id
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -1502,24 +1492,7 @@ pub async fn get_run(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(RunStatusResponse {
-        id: row.0,
-        project_id: row.1,
-        status: row.2,
-        gate_status: row.3,
-        gate_exit_code: row.4,
-        gate_output: row.5,
-        exit_code: row.6,
-        stdout: row.7,
-        stderr: row.8,
-        session_id: row.9,
-        cost_usd: row.10,
-        input_tokens: row.11,
-        output_tokens: row.12,
-        cache_read_tokens: row.13,
-        num_turns: row.14,
-        context_fill: row.15,
-    }))
+    Ok(Json(run))
 }
 
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
