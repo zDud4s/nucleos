@@ -409,6 +409,14 @@ pub async fn ingest_batch(
                     .map(|(_, value)| value.as_str())
             }
         };
+        // The names of files the user sent are what they wrote, not who they wrote to, and nothing
+        // reads them. SentMessage omits them, but refusing both the flag and attachment rows here
+        // keeps that guarantee if a future client sends them anyway. The flag must describe what is
+        // stored; claiming attachments while recording none would be a worse lie than either answer.
+        let has_attachments = match direction {
+            crate::contacts::MessageDirection::Inbound => message.has_attachments,
+            crate::contacts::MessageDirection::Outbound => false,
+        };
         let triaged_at = entry.triage_class.map(|_| now_str.as_str());
 
         let result = sqlx::query(
@@ -426,7 +434,7 @@ pub async fn ingest_batch(
         .bind(message.from_name.as_deref())
         .bind(message.subject.as_deref())
         .bind(body)
-        .bind(i64::from(message.has_attachments))
+        .bind(i64::from(has_attachments))
         .bind(&message.received_at)
         .bind(&now_str)
         .bind(entry.triage_class)
@@ -465,19 +473,21 @@ pub async fn ingest_batch(
             let email_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
                 .fetch_one(tx.as_mut())
                 .await?;
-            for attachment in &message.attachments {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO email_attachments
-                         (email_id, position, filename, mime_type, size_bytes)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(email_id)
-                .bind(attachment.position)
-                .bind(attachment.filename.as_deref())
-                .bind(attachment.mime_type.as_deref())
-                .bind(attachment.size_bytes)
-                .execute(tx.as_mut())
-                .await?;
+            if matches!(direction, crate::contacts::MessageDirection::Inbound) {
+                for attachment in &message.attachments {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO email_attachments
+                             (email_id, position, filename, mime_type, size_bytes)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(email_id)
+                    .bind(attachment.position)
+                    .bind(attachment.filename.as_deref())
+                    .bind(attachment.mime_type.as_deref())
+                    .bind(attachment.size_bytes)
+                    .execute(tx.as_mut())
+                    .await?;
+                }
             }
         } else {
             duplicates += 1;
@@ -1337,6 +1347,47 @@ mod tests {
         assert_eq!(
             (stored_both, first_profile, second_profile),
             (true, Some((0, true)), Some((0, true)))
+        );
+    }
+
+    #[tokio::test]
+    async fn um_enviado_nao_guarda_o_que_anexaste() {
+        let pool = test_pool().await;
+        let recipient = "destinatario@example.com";
+        let mut sent = message_with_attachment(24);
+        sent.headers.insert("to".into(), recipient.into());
+
+        // Even if the sidecar sends attachment details anyway, the núcleo must refuse to store them.
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            24,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let attachment_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM email_attachments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let has_attachments: i64 = sqlx::query_scalar("SELECT has_attachments FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let outbound_ever = crate::contacts::profile_for(&pool, recipient)
+            .await
+            .unwrap()
+            .map(|profile| profile.outbound_ever);
+
+        assert_eq!(
+            (attachment_count, has_attachments, outbound_ever),
+            (0, 0, Some(true))
         );
     }
 

@@ -73,7 +73,10 @@ func Message(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, er
 // the sender; here it is the recipient, because writing to someone is what makes them a known
 // correspondent. Recipients are therefore forwarded only from this path — an inbox message's
 // `To:` line names people the user did not choose to tell us about, and the núcleo discards it
-// anyway.
+// anyway. The núcleo also discards an outbound body and stores no record of an outbound attachment,
+// so putting either on the wire would move the user's own content across a process boundary only to
+// be dropped. Not sending it is the smaller surface, and the threat model need not explain why
+// sending it is harmless.
 func SentMessage(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, error) {
 	message, err := Message(raw, uid, internalDate)
 	if err != nil {
@@ -87,6 +90,9 @@ func SentMessage(raw []byte, uid uint32, internalDate time.Time) (daemon.Message
 	if to := strings.TrimSpace(parsed.Header.Get("To")); to != "" {
 		message.Headers["to"] = to
 	}
+	message.BodyText = ""
+	message.Attachments = nil
+	message.HasAttachments = false
 	return message, nil
 }
 
