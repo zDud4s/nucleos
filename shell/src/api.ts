@@ -689,3 +689,672 @@ export async function setBudget(
     return null;
   }
 }
+
+/**
+ * The daemon's presence heartbeat.
+ *
+ * Sent explicitly rather than inferred from this shell's own polling, because `attention.rs` refuses
+ * to derive presence from API traffic: the shell polls every 3 seconds whether anyone is watching or
+ * not, so traffic-derived presence would mark the owner permanently present and stop autonomy
+ * forever. This is the one call that means "a person is actually looking", and it expires on its own
+ * when the shell closes.
+ */
+export async function sendAttentionHeartbeat(
+  token: string,
+  projectId?: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/autopilot/attention`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(projectId === undefined ? {} : { project_id: projectId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Runs ────────────────────────────────────────────────────────────────────
+
+/** One row of the run index. Carries an excerpt, never the full prompt or output. */
+export interface RunSearchResult {
+  id: number;
+  project_id: string | null;
+  status: string;
+  mode: string;
+  created_at: string;
+  completed_at: string | null;
+  cost_usd: number | null;
+  prompt_excerpt: string;
+}
+
+/** One run in full — what opening a row reads, including its gate verdict and output. */
+export interface RunDetail {
+  id: number;
+  project_id: string | null;
+  status: string;
+  gate_status: string | null;
+  gate_exit_code: number | null;
+  gate_output: string | null;
+  exit_code: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  session_id: string | null;
+  cost_usd: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  num_turns: number | null;
+}
+
+/** Every field the daemon's `/runs` filter accepts. All optional; omitted ones are not sent. */
+export interface RunsFilter {
+  projectId?: string;
+  status?: string;
+  mode?: string;
+  q?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+export interface CreateRunInput {
+  prompt: string;
+  project_id: string | null;
+  cwd: string | null;
+  mode: string;
+}
+
+/**
+ * The modes a person may ASK for. `assistant` also appears in the status filter below because the
+ * daemon writes it, but it is not offered here: an assistant turn is created by talking to the
+ * assistant, not by filling in this form.
+ */
+export const RUN_MODES = ["real", "shadow", "worktree"] as const;
+
+/** Every status a run row can carry, as `runs.rs` writes them. */
+export const RUN_STATUSES = [
+  "pending",
+  "running",
+  "awaiting_approval",
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "timed_out",
+] as const;
+
+/** Every mode a run row can carry — the askable three, plus the one only the assistant creates. */
+export const RUN_MODE_FILTERS = [...RUN_MODES, "assistant"] as const;
+
+function runsQuery(filter: RunsFilter): string {
+  const params = new URLSearchParams();
+  if (filter.projectId) params.set("project_id", filter.projectId);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.mode) params.set("mode", filter.mode);
+  if (filter.q) params.set("q", filter.q);
+  if (filter.since) params.set("since", filter.since);
+  if (filter.until) params.set("until", filter.until);
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  const query = params.toString();
+  return query === "" ? "" : `?${query}`;
+}
+
+export async function getRuns(
+  token: string,
+  filter: RunsFilter = {},
+): Promise<RunSearchResult[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs${runsQuery(filter)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as RunSearchResult[];
+  } catch {
+    return null;
+  }
+}
+
+export async function getRun(token: string, id: number): Promise<RunDetail | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as RunDetail;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Starts a run, reporting the status when it fails.
+ *
+ * Unlike the read-only getters, this one cannot collapse a refusal into `null`: the daemon answers
+ * 503 while the kill switch is engaged and 429 while the budget is paused, and both are states the
+ * person can act on — a bare "it didn't work" would send them looking for an outage instead.
+ */
+export async function createRun(
+  token: string,
+  input: CreateRunInput,
+): Promise<ApiResult<number>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    const data = (await res.json()) as { id: number };
+    return { ok: true, value: data.id };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/** 404 here means the run already ended — a race with its own completion, not a failure. */
+export async function cancelRun(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/${id}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Presets ─────────────────────────────────────────────────────────────────
+
+/** A saved run request: a name, plus the exact body `/runs` would have taken. */
+export interface Preset {
+  id: number;
+  name: string;
+  prompt: string;
+  project_id: string | null;
+  cwd: string | null;
+  mode: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PresetInput {
+  name: string;
+  prompt: string;
+  project_id: string | null;
+  cwd: string | null;
+  mode: string;
+}
+
+export async function listPresets(token: string): Promise<Preset[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/presets`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Preset[];
+  } catch {
+    return null;
+  }
+}
+
+/** 409 means the name is taken — the one failure worth naming, so the status travels back. */
+export async function createPreset(
+  token: string,
+  input: PresetInput,
+): Promise<ApiResult<Preset>> {
+  return writePreset(token, `${DAEMON_URL}/presets`, "POST", input);
+}
+
+export async function updatePreset(
+  token: string,
+  id: number,
+  input: PresetInput,
+): Promise<ApiResult<Preset>> {
+  return writePreset(token, `${DAEMON_URL}/presets/${id}`, "PUT", input);
+}
+
+async function writePreset(
+  token: string,
+  url: string,
+  method: "POST" | "PUT",
+  input: PresetInput,
+): Promise<ApiResult<Preset>> {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as Preset };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function deletePreset(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/presets/${id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Runs a preset.
+ *
+ * The daemon delegates this to the same front door as `createRun`, so it refuses for the same
+ * reasons and the status matters here for the same reason it does there.
+ */
+export async function runPreset(token: string, id: number): Promise<ApiResult<number>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/presets/${id}/run`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    const data = (await res.json()) as { id: number };
+    return { ok: true, value: data.id };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+// ── Assistant ───────────────────────────────────────────────────────────────
+
+/**
+ * The chat this shell speaks as.
+ *
+ * The turn slot in `assistant.rs` is held per chat, so naming the shell's own chat keeps it from
+ * colliding with the Telegram sidecar's: both can be mid-turn at once, and neither cancels the
+ * other. A 409 from `sendAssistantMessage` therefore means THIS chat is still busy.
+ */
+export const SHELL_CHAT_ID = "shell";
+
+export async function sendAssistantMessage(
+  token: string,
+  chatId: string,
+  text: string,
+): Promise<ApiResult<number>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/message`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    const data = (await res.json()) as { turn_id: number };
+    return { ok: true, value: data.turn_id };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * How a turn is going. The daemon answers this from the runs table, so a turn IS a run and carries
+ * the same fields — which is why this reuses `RunDetail` rather than inventing a parallel shape.
+ */
+export async function getAssistantTurn(
+  token: string,
+  turnId: number,
+): Promise<RunDetail | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/${turnId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as RunDetail;
+  } catch {
+    return null;
+  }
+}
+
+// ── Project inspection ──────────────────────────────────────────────────────
+
+export interface InspectEntry {
+  name: string;
+  is_dir: boolean;
+}
+
+export interface InspectMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
+/**
+ * What is in a directory of a project's tree. `path` empty means the project root.
+ *
+ * Every call here is scoped to a project the daemon already knows the root of, and the daemon
+ * refuses a path that leaves it — so the shell passes what the person typed rather than trying to
+ * validate a traversal it cannot see the filesystem to check.
+ *
+ * Reports the status like `getProjectCat` does, rather than collapsing every refusal to `null`. The
+ * inspect routes answer 404 for two very different things — a path that is gone, and a project
+ * whose RECORDED ROOT is gone from disk — and a caller that only knows "it failed" cannot tell
+ * someone which one they are looking at.
+ */
+export async function getProjectLs(
+  token: string,
+  projectId: string,
+  path = "",
+): Promise<ApiResult<InspectEntry[]>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/projects/${encodeURIComponent(projectId)}/ls?path=${encodeURIComponent(path)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as InspectEntry[] };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/** One file's text. The daemon caps how much it will read, so this can be a truncated file. */
+export async function getProjectCat(
+  token: string,
+  projectId: string,
+  path: string,
+): Promise<ApiResult<string>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/projects/${encodeURIComponent(projectId)}/cat?path=${encodeURIComponent(path)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: await res.text() };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function getProjectGrep(
+  token: string,
+  projectId: string,
+  q: string,
+  path = "",
+): Promise<ApiResult<InspectMatch[]>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/projects/${encodeURIComponent(projectId)}/grep?q=${encodeURIComponent(q)}&path=${encodeURIComponent(path)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as InspectMatch[] };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/** The project's uncommitted diff, as `git diff` wrote it. Empty text means a clean tree. */
+export async function getProjectDiff(
+  token: string,
+  projectId: string,
+): Promise<ApiResult<string>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/projects/${encodeURIComponent(projectId)}/diff`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: await res.text() };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+// ── Backups ─────────────────────────────────────────────────────────────────
+
+export interface BackupInfo {
+  name: string;
+  /** null when the file could not be opened to read its schema version. */
+  migration_version: number | null;
+  size_bytes: number;
+}
+
+/**
+ * A restore that has been PREPARED, not performed.
+ *
+ * `applies` says when it takes effect — the daemon writes "on next daemon start". Nothing has been
+ * swapped when this comes back, which is the whole reason it is worth showing rather than a bare
+ * "done".
+ */
+export interface StagedRestore {
+  name: string;
+  migration_version: number;
+  applies: string;
+}
+
+export async function getBackups(token: string): Promise<BackupInfo[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/backups`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as BackupInfo[];
+  } catch {
+    return null;
+  }
+}
+
+export async function takeBackup(token: string): Promise<BackupInfo | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/backup`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as BackupInfo;
+  } catch {
+    return null;
+  }
+}
+
+export async function restoreBackup(
+  token: string,
+  name: string,
+): Promise<StagedRestore | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/backups/${encodeURIComponent(name)}/restore`,
+      { method: "POST", headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as StagedRestore;
+  } catch {
+    return null;
+  }
+}
+
+// ── Health readout ──────────────────────────────────────────────────────────
+
+export type HealthState = "ok" | "degraded" | "down" | "disabled";
+
+/**
+ * One subsystem's verdict.
+ *
+ * `reason` is a closed vocabulary and never free text: the daemon deliberately keeps error strings
+ * out of this, because IMAP and network errors embed credential-bearing URLs. It is absent when the
+ * subsystem is fine.
+ */
+export interface SubsystemReadout {
+  name: string;
+  status: HealthState;
+  reason?: string;
+}
+
+export interface HealthReadout {
+  status: HealthState;
+  subsystems: SubsystemReadout[];
+}
+
+export async function getHealthReadout(token: string): Promise<HealthReadout | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/health/readout`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as HealthReadout;
+  } catch {
+    return null;
+  }
+}
+
+// ── API tokens ──────────────────────────────────────────────────────────────
+
+/** The three durable key levels, mirroring `ApiTokenLevel` in `core/src/auth.rs`. */
+export type ApiTokenLevel = "read-only" | "run-creating" | "admin";
+
+export const API_TOKEN_LEVELS: ApiTokenLevel[] = ["read-only", "run-creating", "admin"];
+
+export interface ApiTokenSummary {
+  name: string;
+  level: ApiTokenLevel;
+  created_at: string;
+}
+
+/** Creation's answer, and the only time the secret exists outside the daemon. */
+export interface CreatedApiToken extends ApiTokenSummary {
+  token: string;
+}
+
+export async function listApiTokens(token: string): Promise<ApiTokenSummary[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/api-tokens`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as ApiTokenSummary[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mints a key. The secret comes back exactly once — listing never returns it again — so a caller
+ * that drops this answer has lost the key and has to revoke and mint another.
+ *
+ * 409 means the name is taken; the status travels so the page can say which of the two it was.
+ */
+export async function createApiToken(
+  token: string,
+  name: string,
+  level: ApiTokenLevel,
+): Promise<ApiResult<CreatedApiToken>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/api-tokens`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name, level }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as CreatedApiToken };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function revokeApiToken(token: string, name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/api-tokens/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Email cursor and requeue ────────────────────────────────────────────────
+
+/** Where collection got to in one mailbox. `null` means nothing has been collected from it yet. */
+export interface EmailCursor {
+  uidvalidity: number;
+  last_uid: number;
+}
+
+export async function getEmailCursor(
+  token: string,
+  mailbox: string,
+): Promise<EmailCursor | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/email/cursor?mailbox=${encodeURIComponent(mailbox)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as EmailCursor | null;
+  } catch {
+    return null;
+  }
+}
+
+/** Why a requeue was refused — each has a different answer, so they are not collapsed. */
+export type RequeueFailure = "unknown" | "conflict" | "failed";
+
+/**
+ * Puts a message back in the queue to be read again.
+ *
+ * 409 is the interesting one and covers two situations the daemon distinguishes internally: the body
+ * was already pruned by retention, or a run currently holds the message. Neither is fixed by
+ * pressing again, which is why this does not report a bare false.
+ */
+export async function requeueEmail(
+  token: string,
+  id: number,
+): Promise<true | RequeueFailure> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/${id}/requeue`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) return true;
+    if (res.status === 404) return "unknown";
+    if (res.status === 409) return "conflict";
+    return "failed";
+  } catch {
+    return "failed";
+  }
+}

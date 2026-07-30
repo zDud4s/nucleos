@@ -1,13 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  fetchAllAttachments, fetchAttachment, getEmail, getEmailQueue, listMailFiles,
-  saveAllAttachments, saveAttachment, triageEmail,
-  type ConnectionState, type EmailAttachment, type EmailDetail, type QueuedEmail,
+  fetchAllAttachments, fetchAttachment, getEmail, getEmailCursor, getEmailQueue, listMailFiles,
+  requeueEmail, saveAllAttachments, saveAttachment, triageEmail,
+  type ConnectionState, type EmailAttachment, type EmailCursor, type EmailDetail,
+  type QueuedEmail,
 } from "./api";
 import {
-  base64ToBytes, formatBytes, mailLabel, mailTone, relativeTime, safeDownloadName,
+  base64ToBytes, formatBytes, mailLabel, mailTone, relativeTime, requeueFailureMessage,
+  safeDownloadName,
 } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
+
+/**
+ * The mailbox the cursor is read for.
+ *
+ * Hard-coded because the daemon exposes no route that reports which mailbox it was configured to
+ * collect from, and `INBOX` is the default `config.rs` ships. A different configured mailbox makes
+ * this read empty rather than wrong — the cursor line simply says nothing has been collected.
+ */
+const MAILBOX = "INBOX";
 
 interface OpenMessageProps {
   token: string;
@@ -214,6 +225,9 @@ function Mail({ token, connection }: MailProps) {
   const [opening, setOpening] = useState(false);
   const openRequest = useRef<number | null>(null);
   const [folders, setFolders] = useState<string[]>([]);
+  const [cursor, setCursor] = useState<EmailCursor | null>(null);
+  const [requeuing, setRequeuing] = useState<number | null>(null);
+  const [requeueNote, setRequeueNote] = useState<string | null>(null);
 
   // Only the top level, and only as suggestions in the folder box. A full browser is a different
   // screen; what this needs is to stop someone retyping "BACMAT" every time.
@@ -227,8 +241,14 @@ function Mail({ token, connection }: MailProps) {
     async (background = false) => {
       if (token === null || connection !== "connected") return;
       if (!background) setLoading(true);
-      const next = await getEmailQueue(token);
+      // The cursor rides along with the queue: it answers "has collection stalled?", which is only
+      // ever asked while looking at how much is waiting.
+      const [next, nextCursor] = await Promise.all([
+        getEmailQueue(token),
+        getEmailCursor(token, MAILBOX),
+      ]);
       setQueue(next);
+      setCursor(nextCursor);
       if (!background) setLoading(false);
     },
     [connection, token],
@@ -295,6 +315,27 @@ function Mail({ token, connection }: MailProps) {
     setDetail(next);
   }
 
+  /**
+   * Sends a message back to be read again.
+   *
+   * Offered on anything already classified, not only on `failed`, because the daemon's own
+   * eligibility rule is "the body is still there" — which covers the verdict that was simply wrong
+   * just as well as the one that errored.
+   */
+  async function requeue(id: number) {
+    if (token === null) return;
+    setRequeuing(id);
+    setRequeueNote(null);
+    const outcome = await requeueEmail(token, id);
+    setRequeuing(null);
+    if (outcome !== true) {
+      setRequeueNote(requeueFailureMessage(outcome));
+      return;
+    }
+    setRequeueNote("Back in the queue — it will be read on the next pass.");
+    void refresh(true);
+  }
+
   const waiting = (queue ?? []).filter((mail) => mail.triage_class === null);
 
   if (unavailable) {
@@ -318,6 +359,10 @@ function Mail({ token, connection }: MailProps) {
       <div className="statusline">
         <span>{queue?.length ?? 0} in the mailbox</span>
         <span>collection is automatic · <b>reading costs a run</b></span>
+        <span title={`Where collection got to in ${MAILBOX}. The cursor lives in the núcleo, so collection resumes here after a restart.`}>
+          {MAILBOX} cursor{" "}
+          <b>{cursor === null ? "nothing collected yet" : `uid ${cursor.last_uid}`}</b>
+        </span>
       </div>
       <Panel
         title="Mailbox"
@@ -331,6 +376,7 @@ function Mail({ token, connection }: MailProps) {
               : `Read ${waiting.length} now`}
         </Button>
         {note !== null && <p className="gate-note">{note}</p>}
+        {requeueNote !== null && <p className="gate-note">{requeueNote}</p>}
         {loading && queue === null && <p className="a-note">Loading…</p>}
         {!loading && queue === null
           ? <ErrorNote>Could not load the mailbox from the daemon.</ErrorNote>
@@ -366,6 +412,20 @@ function Mail({ token, connection }: MailProps) {
                       <p className="f-body">{mail.triage_summary}</p>
                     )}
                   </button>
+                  {/* Outside the row button, not inside it: a button nested in a button is invalid
+                      markup, and clicking it would toggle the message open as well. */}
+                  {mail.triage_class !== null && (
+                    <div className="a-actions">
+                      <Button
+                        size="sm"
+                        disabled={requeuing !== null}
+                        title="Clears the verdict and puts the message back in the queue to be read again."
+                        onClick={() => void requeue(mail.id)}
+                      >
+                        {requeuing === mail.id ? "Requeuing…" : "Read again"}
+                      </Button>
+                    </div>
+                  )}
                   {openId === mail.id && token !== null && (
                     <OpenMessage
                       token={token}

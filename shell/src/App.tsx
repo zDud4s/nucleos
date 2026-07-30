@@ -1,15 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  checkHealth, getKillSwitch, getStatus, setKillSwitch, type ConnectionState,
+  checkHealth, getKillSwitch, getStatus, sendAttentionHeartbeat, setKillSwitch,
+  type ConnectionState,
 } from "./api";
+import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
 import Home from "./Home";
 import Mail from "./Mail";
+import Projects from "./Projects";
+import Runs from "./Runs";
+import System from "./System";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 
-type Tab = "home" | "autopilot" | "mail";
+type Tab = "home" | "autopilot" | "runs" | "projects" | "assistant" | "mail" | "system";
+
+const TABS: { key: Tab; label: string }[] = [
+  { key: "home", label: "Home" },
+  { key: "autopilot", label: "Autopilot" },
+  { key: "runs", label: "Runs" },
+  { key: "projects", label: "Projects" },
+  { key: "assistant", label: "Assistant" },
+  { key: "mail", label: "Mail" },
+  { key: "system", label: "System" },
+];
 
 /**
  * What went wrong reading the daemon token, in the words the OS used. The
@@ -34,6 +49,15 @@ function App() {
   const [tab, setTab] = useState<Tab>("home");
   /** Why a reachable daemon still can't be used — the one failure a retry can't clear on its own. */
   const [blocked, setBlocked] = useState<string | null>(null);
+  /**
+   * The assistant's transcript, held here rather than in the page that draws it.
+   *
+   * Tabs render one page at a time, so leaving the assistant unmounts it — and with the transcript
+   * in its own state, the message you had just sent disappeared, along with the poll that was
+   * waiting for its answer. Owning it at this level costs nothing and is what makes coming back to
+   * the tab show the conversation you left.
+   */
+  const [assistantTurns, setAssistantTurns] = useState<Turn[]>([]);
   const tokenRequest = useRef<Promise<string> | null>(null);
   const polling = useRef(false);
 
@@ -119,6 +143,39 @@ function App() {
     };
   }, []);
 
+  /**
+   * Tells the daemon someone is watching.
+   *
+   * Deliberately separate from the health poll rather than folded into it. The poll runs whether or
+   * not a person is there, and `attention.rs` refuses to infer presence from API traffic for exactly
+   * that reason — a presence signal derived from our own polling would mark the owner permanently
+   * present and stop autonomous work forever.
+   *
+   * So it is sent only while the window is actually VISIBLE. A minimised shell is not a foreground
+   * client, and the daemon's window is 120 seconds, so a beat every 30 survives a couple of missed
+   * ones and expires on its own within two minutes of the window being hidden or closed.
+   *
+   * This is a real behavioural change and not just a screen: with the shell in front of you,
+   * autonomous starts are held back, which is the brake the design intended and that nothing was
+   * previously arming.
+   */
+  useEffect(() => {
+    if (token === null || connection !== "connected") return;
+    const beat = () => {
+      if (document.visibilityState !== "visible") return;
+      void sendAttentionHeartbeat(token);
+    };
+    beat();
+    const id = setInterval(beat, 30000);
+    // Coming back to the window should register immediately rather than at the next tick, since
+    // that is the moment presence actually changed.
+    document.addEventListener("visibilitychange", beat);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", beat);
+    };
+  }, [connection, token]);
+
   const toggleKill = useCallback(
     async (engaged: boolean) => {
       if (token === null) return;
@@ -141,9 +198,17 @@ function App() {
       <header className="command">
         <span className="wordmark">NucleOS</span>
         <nav className="tabs" aria-label="NucleOS views">
-          <button className="tab" type="button" aria-current={tab === "home" ? "page" : undefined} onClick={() => setTab("home")}>Home</button>
-          <button className="tab" type="button" aria-current={tab === "autopilot" ? "page" : undefined} onClick={() => setTab("autopilot")}>Autopilot</button>
-          <button className="tab" type="button" aria-current={tab === "mail" ? "page" : undefined} onClick={() => setTab("mail")}>Mail</button>
+          {TABS.map((entry) => (
+            <button
+              key={entry.key}
+              className="tab"
+              type="button"
+              aria-current={tab === entry.key ? "page" : undefined}
+              onClick={() => setTab(entry.key)}
+            >
+              {entry.label}
+            </button>
+          ))}
         </nav>
         <div className="right">
           {usable && (
@@ -215,7 +280,18 @@ function App() {
               toggleKill={toggleKill}
             />
           )}
+          {tab === "runs" && <Runs token={token} connection={connection} />}
+          {tab === "projects" && <Projects token={token} connection={connection} />}
+          {tab === "assistant" && (
+            <Assistant
+              token={token}
+              connection={connection}
+              turns={assistantTurns}
+              setTurns={setAssistantTurns}
+            />
+          )}
           {tab === "mail" && <Mail token={token} connection={connection} />}
+          {tab === "system" && <System token={token} connection={connection} />}
         </main>
       )}
     </div>

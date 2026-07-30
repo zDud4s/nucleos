@@ -438,3 +438,254 @@ describe("daemon API client", () => {
     });
   });
 });
+
+describe("runs, presets and the assistant", () => {
+  it("sends only the filters that were set, and omits the empty ones", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await api.getRuns(TOKEN, { limit: 50 });
+    expectGetCall(1, `${DAEMON_URL}/runs?limit=50`);
+  });
+
+  it("encodes filter values rather than pasting them into the query", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await api.getRuns(TOKEN, { projectId: "alpha/beta", q: "a b&c", limit: 10 });
+    expectGetCall(
+      1,
+      `${DAEMON_URL}/runs?project_id=alpha%2Fbeta&q=a+b%26c&limit=10`,
+    );
+  });
+
+  it("asks for everything when no filter is given", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await api.getRuns(TOKEN);
+    expectGetCall(1, `${DAEMON_URL}/runs`);
+  });
+
+  it("reports WHY a run was refused, since a 503 and a 500 need different answers", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({ id: 12 }))
+      .mockResolvedValueOnce(nonOk(503))
+      .mockResolvedValueOnce(nonOk(401));
+
+    const input = { prompt: "go", project_id: null, cwd: null, mode: "real" };
+    await expect(api.createRun(TOKEN, input)).resolves.toEqual({ ok: true, value: 12 });
+    await expect(api.createRun(TOKEN, input)).resolves.toEqual({
+      ok: false,
+      fault: "failed",
+      status: 503,
+    });
+    // 401 is the one fault the shell acts on globally, so it must not be flattened into "failed".
+    await expect(api.createRun(TOKEN, input)).resolves.toEqual({
+      ok: false,
+      fault: "unauthorized",
+      status: 401,
+    });
+  });
+
+  it("treats a 404 from cancel as a run that already ended", async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 200 })
+      .mockResolvedValueOnce(nonOk(404));
+
+    await expect(api.cancelRun(TOKEN, 4)).resolves.toBe(true);
+    await expect(api.cancelRun(TOKEN, 4)).resolves.toBe(false);
+  });
+
+  it("carries a duplicate preset name back as a 409 rather than a bare failure", async () => {
+    const preset = {
+      id: 1, name: "nightly", prompt: "sweep", project_id: null, cwd: null,
+      mode: "real", created_at: "2026-07-20T10:00:00Z", updated_at: "2026-07-20T10:00:00Z",
+    };
+    fetchMock
+      .mockResolvedValueOnce(okJson(preset))
+      .mockResolvedValueOnce(nonOk(409));
+
+    const input = { name: "nightly", prompt: "sweep", project_id: null, cwd: null, mode: "real" };
+    await expect(api.createPreset(TOKEN, input)).resolves.toEqual({ ok: true, value: preset });
+    expectPostCall(1, `${DAEMON_URL}/presets`, input);
+    await expect(api.createPreset(TOKEN, input)).resolves.toEqual({
+      ok: false,
+      fault: "failed",
+      status: 409,
+    });
+  });
+
+  it("updates a preset with PUT and deletes it with DELETE", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({ id: 3 }))
+      .mockResolvedValueOnce({ ok: true, status: 204 });
+
+    const input = { name: "n", prompt: "p", project_id: null, cwd: null, mode: "real" };
+    await api.updatePreset(TOKEN, 3, input);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`${DAEMON_URL}/presets/3`);
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe("PUT");
+
+    await expect(api.deletePreset(TOKEN, 3)).resolves.toBe(true);
+    expect((fetchMock.mock.calls[1]?.[1] as RequestInit).method).toBe("DELETE");
+  });
+
+  it("speaks as the shell's own chat, so it never takes the sidecar's turn slot", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ turn_id: 88 }));
+
+    await expect(
+      api.sendAssistantMessage(TOKEN, api.SHELL_CHAT_ID, "hello"),
+    ).resolves.toEqual({ ok: true, value: 88 });
+    expectPostCall(1, `${DAEMON_URL}/assistant/message`, {
+      chat_id: "shell",
+      text: "hello",
+    });
+  });
+
+  it("surfaces a busy chat as 409 rather than as an outage", async () => {
+    fetchMock.mockResolvedValueOnce(nonOk(409));
+
+    await expect(
+      api.sendAssistantMessage(TOKEN, api.SHELL_CHAT_ID, "hello"),
+    ).resolves.toEqual({ ok: false, fault: "failed", status: 409 });
+  });
+});
+
+describe("inspection, backups, health and keys", () => {
+  it("encodes both the project and the path on every inspect route", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson([]))
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => "x" })
+      .mockResolvedValueOnce(okJson([]))
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => "" });
+
+    const project = "a/b";
+    await api.getProjectLs(TOKEN, project, "src/x y");
+    expectGetCall(1, `${DAEMON_URL}/projects/a%2Fb/ls?path=src%2Fx%20y`);
+    await api.getProjectCat(TOKEN, project, "src/x y");
+    expectGetCall(2, `${DAEMON_URL}/projects/a%2Fb/cat?path=src%2Fx%20y`);
+    await api.getProjectGrep(TOKEN, project, "a&b", "src");
+    expectGetCall(3, `${DAEMON_URL}/projects/a%2Fb/grep?q=a%26b&path=src`);
+    await api.getProjectDiff(TOKEN, project);
+    expectGetCall(4, `${DAEMON_URL}/projects/a%2Fb/diff`);
+  });
+
+  it("defaults ls to the project root", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await api.getProjectLs(TOKEN, "alpha");
+    expectGetCall(1, `${DAEMON_URL}/projects/alpha/ls?path=`);
+  });
+
+  it("keeps a cat refusal's status, so a 404 root can be told from a 413 file", async () => {
+    fetchMock.mockResolvedValueOnce(nonOk(413));
+
+    await expect(api.getProjectCat(TOKEN, "alpha", "big")).resolves.toEqual({
+      ok: false,
+      fault: "failed",
+      status: 413,
+    });
+  });
+
+  it("takes, lists and stages a restore without confusing the three", async () => {
+    const info = { name: "nucleos-2026-07-29.db", migration_version: 12, size_bytes: 4096 };
+    fetchMock
+      .mockResolvedValueOnce(okJson(info))
+      .mockResolvedValueOnce(okJson([info]))
+      .mockResolvedValueOnce(okJson({
+        name: info.name, migration_version: 12, applies: "on next daemon start",
+      }));
+
+    await expect(api.takeBackup(TOKEN)).resolves.toEqual(info);
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe("POST");
+    await expect(api.getBackups(TOKEN)).resolves.toEqual([info]);
+    expectGetCall(2, `${DAEMON_URL}/backups`);
+    // A restore reports WHEN it applies, because nothing has been swapped when this returns.
+    await expect(api.restoreBackup(TOKEN, info.name)).resolves.toEqual({
+      name: info.name,
+      migration_version: 12,
+      applies: "on next daemon start",
+    });
+  });
+
+  it("reads the health readout, subsystems and all", async () => {
+    const readout = {
+      status: "degraded",
+      subsystems: [
+        { name: "database", status: "ok" },
+        { name: "email_sidecar_binary", status: "down", reason: "missing" },
+      ],
+    };
+    fetchMock.mockResolvedValueOnce(okJson(readout));
+
+    await expect(api.getHealthReadout(TOKEN)).resolves.toEqual(readout);
+    expectGetCall(1, `${DAEMON_URL}/health/readout`);
+  });
+
+  it("returns the minted secret once and tells a taken name apart from a refusal", async () => {
+    const created = {
+      name: "agent-cli", level: "run-creating",
+      created_at: "2026-07-29T10:00:00Z", token: "nk_secret",
+    };
+    fetchMock
+      .mockResolvedValueOnce(okJson(created))
+      .mockResolvedValueOnce(nonOk(409))
+      .mockResolvedValueOnce(nonOk(403));
+
+    await expect(api.createApiToken(TOKEN, "agent-cli", "run-creating")).resolves.toEqual({
+      ok: true, value: created,
+    });
+    expectPostCall(1, `${DAEMON_URL}/api-tokens`, { name: "agent-cli", level: "run-creating" });
+    await expect(api.createApiToken(TOKEN, "agent-cli", "read-only")).resolves.toMatchObject({
+      ok: false, status: 409,
+    });
+    // 403 means this token may not mint keys — an authorization fault, not a generic failure.
+    await expect(api.createApiToken(TOKEN, "other", "admin")).resolves.toMatchObject({
+      ok: false, fault: "unauthorized", status: 403,
+    });
+  });
+
+  it("encodes a key name on revoke", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 204 });
+
+    await expect(api.revokeApiToken(TOKEN, "a b/c")).resolves.toBe(true);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`${DAEMON_URL}/api-tokens/a%20b%2Fc`);
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe("DELETE");
+  });
+});
+
+describe("mail cursor, requeue and the attention heartbeat", () => {
+  it("reads a cursor per mailbox and passes a null through as null", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({ uidvalidity: 12, last_uid: 340 }))
+      .mockResolvedValueOnce(okJson(null));
+
+    await expect(api.getEmailCursor(TOKEN, "INBOX")).resolves.toEqual({
+      uidvalidity: 12, last_uid: 340,
+    });
+    expectGetCall(1, `${DAEMON_URL}/email/cursor?mailbox=INBOX`);
+    // Never collected from is a state the page shows, not a failure it hides.
+    await expect(api.getEmailCursor(TOKEN, "INBOX")).resolves.toBeNull();
+  });
+
+  it("distinguishes the three requeue refusals, which need three different answers", async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 204 })
+      .mockResolvedValueOnce(nonOk(404))
+      .mockResolvedValueOnce(nonOk(409))
+      .mockResolvedValueOnce(nonOk(500));
+
+    await expect(api.requeueEmail(TOKEN, 1)).resolves.toBe(true);
+    await expect(api.requeueEmail(TOKEN, 1)).resolves.toBe("unknown");
+    await expect(api.requeueEmail(TOKEN, 1)).resolves.toBe("conflict");
+    await expect(api.requeueEmail(TOKEN, 1)).resolves.toBe("failed");
+  });
+
+  it("beats globally by default and scopes to a project when asked", async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 204 })
+      .mockResolvedValueOnce({ ok: true, status: 204 });
+
+    await expect(api.sendAttentionHeartbeat(TOKEN)).resolves.toBe(true);
+    expectPostCall(1, `${DAEMON_URL}/autopilot/attention`, {});
+    await api.sendAttentionHeartbeat(TOKEN, "alpha");
+    expectPostCall(2, `${DAEMON_URL}/autopilot/attention`, { project_id: "alpha" });
+  });
+});

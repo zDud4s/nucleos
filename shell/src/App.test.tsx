@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import App from "./App";
 import { invoke } from "@tauri-apps/api/core";
@@ -140,5 +140,183 @@ describe("App connection handshake", () => {
     });
     await tick();
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/health")).length).toBe(2);
+  });
+});
+
+describe("App navigation and presence", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(healthyDaemon());
+    invokeMock.mockResolvedValue("daemon-token");
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fetchMock.mockReset();
+    invokeMock.mockReset();
+  });
+
+  function heartbeats() {
+    return fetchMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/autopilot/attention"),
+    ).length;
+  }
+
+  /** jsdom reports `visible`; this is how a minimised or backgrounded window is simulated. */
+  function setVisibility(state: "visible" | "hidden") {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => state,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  afterEach(() => setVisibility("visible"));
+
+  it("offers every view the daemon has a page for", async () => {
+    render(<App />);
+    await settle();
+
+    const nav = screen.getByLabelText("NucleOS views");
+    expect(
+      Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
+    ).toEqual(["Home", "Autopilot", "Runs", "Projects", "Assistant", "Mail", "System"]);
+  });
+
+  it("tells the daemon someone is watching, and keeps saying so", async () => {
+    render(<App />);
+    await settle();
+
+    // Immediately on connecting, not at the next tick: the brake should arm as soon as the shell
+    // is in front of someone.
+    expect(heartbeats()).toBe(1);
+
+    // The daemon's window is 120s, so a 30s cadence survives a couple of missed beats.
+    await tick(30000);
+    expect(heartbeats()).toBe(2);
+  });
+
+  it("stops claiming presence while the window is hidden", async () => {
+    render(<App />);
+    await settle();
+    expect(heartbeats()).toBe(1);
+
+    setVisibility("hidden");
+    await tick(60000);
+
+    // A minimised shell is not a foreground client, so the heartbeat lapses and autonomous work is
+    // free to start again — which is the whole point of it expiring.
+    expect(heartbeats()).toBe(1);
+
+    setVisibility("visible");
+    await settle();
+
+    // Coming back registers at once rather than waiting out the rest of the interval.
+    expect(heartbeats()).toBe(2);
+  });
+});
+
+/**
+ * The assistant's transcript belongs to App, not to the page that draws it.
+ *
+ * Tabs render one page at a time, so leaving the assistant unmounts it. With the transcript in the
+ * page's own state, the message you had just sent vanished on the way out — and the poll waiting for
+ * its answer died with it, so the turn could never finish even after the daemon had answered.
+ */
+describe("the assistant transcript survives a tab switch", () => {
+  /** A daemon that takes a message as turn 501 and reports whatever `status` currently says. */
+  function assistantDaemon(status: () => { status: string; stdout: string | null }) {
+    return async (url: string) => {
+      if (url.endsWith("/assistant/message")) {
+        return { ok: true, status: 200, json: async () => ({ turn_id: 501 }) };
+      }
+      if (url.endsWith("/assistant/501")) {
+        const now = status();
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: 501, project_id: null, status: now.status,
+            gate_status: null, gate_exit_code: null, gate_output: null,
+            exit_code: 0, stdout: now.stdout, stderr: null, session_id: null,
+            cost_usd: 0.02, input_tokens: 10, output_tokens: 5,
+            cache_read_tokens: 0, num_turns: 1,
+          }),
+        };
+      }
+      return healthyDaemon()(url);
+    };
+  }
+
+  function go(tab: string) {
+    fireEvent.click(screen.getByRole("button", { name: tab }));
+  }
+
+  async function ask(what: string) {
+    fireEvent.change(screen.getByPlaceholderText("Ask the núcleo…"), { target: { value: what } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await settle();
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    invokeMock.mockResolvedValue("daemon-token");
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fetchMock.mockReset();
+    invokeMock.mockReset();
+  });
+
+  it("still shows the message you just sent after leaving and coming back", async () => {
+    fetchMock.mockImplementation(assistantDaemon(() => ({ status: "running", stdout: null })));
+
+    render(<App />);
+    await settle();
+    go("Assistant");
+    await settle();
+    await ask("olá núcleo");
+
+    expect(screen.getByText("olá núcleo")).toBeTruthy();
+
+    go("Runs");
+    await settle();
+    expect(screen.queryByText("olá núcleo")).toBeNull();
+
+    go("Assistant");
+    await settle();
+
+    // The whole point: the question is still on screen, not lost with the unmounted page.
+    expect(screen.getByText("olá núcleo")).toBeTruthy();
+  });
+
+  it("collects an answer that landed while the tab was closed", async () => {
+    let finished = false;
+    fetchMock.mockImplementation(
+      assistantDaemon(() =>
+        finished
+          ? { status: "completed", stdout: "olá de volta" }
+          : { status: "running", stdout: null },
+      ),
+    );
+
+    render(<App />);
+    await settle();
+    go("Assistant");
+    await settle();
+    await ask("estás aí?");
+
+    go("Runs");
+    await settle();
+    // The turn finishes in the daemon while nothing is watching it.
+    finished = true;
+    await tick(6000);
+
+    go("Assistant");
+    await settle();
+    // Remounting derives the pending turn back out of the transcript, so the poll restarts and
+    // finds the answer. Held as separate state, this stayed on "Working…" forever.
+    await tick(2000);
+
+    expect(screen.getByText("olá de volta")).toBeTruthy();
   });
 });

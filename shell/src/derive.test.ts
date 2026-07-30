@@ -5,15 +5,27 @@ import {
   agreementRate,
   autopilotState,
   base64ToBytes,
+  breadcrumbs,
   budgetStatusLabel,
   classifierVerdictLabel,
   formatBytes,
+  formatTokens,
   formatUsd,
+  gateTone,
   groupScoreboardByMode,
+  healthReasonLabel,
+  healthTone,
+  joinPath,
   killSwitchLabel,
   mailLabel,
   mailTone,
+  parentPath,
   periodLabel,
+  requeueFailureMessage,
+  runIsLive,
+  runStatusLabel,
+  runTone,
+  tokenLevelHint,
   promotionBlock,
   promotionCriterionGap,
   promotionReadiness,
@@ -484,5 +496,106 @@ describe("shadow review asks the question the gate actually scores", () => {
     expect(classifierVerdictLabel("pending_approval")).toBe("would ask you");
     // A verdict the daemon gains later still renders, rather than vanishing from the row.
     expect(classifierVerdictLabel("quarantine")).toBe("would quarantine");
+  });
+});
+
+describe("run, health and key derivations", () => {
+  it("tones a run by whether it wants attention, not by whether it succeeded", () => {
+    expect(runTone("completed")).toBe("active");
+    expect(runTone("running")).toBe("shadow");
+    expect(runTone("pending")).toBe("shadow");
+    // Waiting on a signature is the one state that should be loud.
+    expect(runTone("awaiting_approval")).toBe("pending");
+    expect(runTone("failed")).toBe("paused");
+    expect(runTone("timed_out")).toBe("paused");
+    // Already over and nobody is waiting: it recedes.
+    expect(runTone("cancelled")).toBe("off");
+    expect(runTone("interrupted")).toBe("off");
+    expect(runTone("something_new")).toBe("off");
+  });
+
+  it("reads the two underscored statuses as words", () => {
+    expect(runStatusLabel("awaiting_approval")).toBe("awaiting approval");
+    expect(runStatusLabel("timed_out")).toBe("timed out");
+    expect(runStatusLabel("completed")).toBe("completed");
+  });
+
+  it("counts only pending and running as live, so polling always terminates", () => {
+    expect(runIsLive("pending")).toBe(true);
+    expect(runIsLive("running")).toBe(true);
+    expect(runIsLive("completed")).toBe(false);
+    expect(runIsLive("awaiting_approval")).toBe(false);
+    // An unrecognised status counts as settled: polling forever is the worse mistake.
+    expect(runIsLive("something_new")).toBe(false);
+  });
+
+  it("has no gate tone for a run that never reached the gate", () => {
+    expect(gateTone(null)).toBeNull();
+    expect(gateTone("passed")).toBe("active");
+    expect(gateTone("failed")).toBe("paused");
+  });
+
+  it("makes down louder than degraded, and lets disabled recede", () => {
+    expect(healthTone("ok")).toBe("active");
+    expect(healthTone("degraded")).toBe("paused");
+    expect(healthTone("down")).toBe("pending");
+    // A subsystem nobody turned on is not a fault — health.rs keeps it out of the aggregate too.
+    expect(healthTone("disabled")).toBe("off");
+    expect(healthTone("unknown-to-this-shell")).toBe("off");
+  });
+
+  it("spells out a diagnostic slug, and shows an unknown one rather than hiding it", () => {
+    expect(healthReasonLabel(undefined)).toBeNull();
+    expect(healthReasonLabel("not-configured")).toBe("not configured");
+    expect(healthReasonLabel("low-disk-space")).toBe("low disk space");
+    expect(healthReasonLabel("something-new")).toBe("something-new");
+  });
+
+  it("says what each key level buys its holder", () => {
+    expect(tokenLevelHint("read-only")).toContain("Cannot start a run");
+    expect(tokenLevelHint("run-creating")).toContain("Cannot mint");
+    expect(tokenLevelHint("admin")).toContain("Full access");
+  });
+
+  it("explains a requeue refusal as the thing to do about it", () => {
+    expect(requeueFailureMessage("unknown")).toContain("no longer in the mailbox");
+    expect(requeueFailureMessage("conflict")).toContain("retention");
+    expect(requeueFailureMessage("failed")).toContain("refused");
+  });
+
+  it("builds a breadcrumb trail that always starts at the root", () => {
+    expect(breadcrumbs("")).toEqual([{ label: "/", path: "" }]);
+    expect(breadcrumbs("core/src/http.rs")).toEqual([
+      { label: "/", path: "" },
+      { label: "core", path: "core" },
+      { label: "src", path: "core/src" },
+      { label: "http.rs", path: "core/src/http.rs" },
+    ]);
+    // Stray separators do not become empty crumbs that navigate nowhere.
+    expect(breadcrumbs("/core//src/")).toEqual([
+      { label: "/", path: "" },
+      { label: "core", path: "core" },
+      { label: "src", path: "core/src" },
+    ]);
+  });
+
+  it("joins onto the root without a leading slash, which the daemon reads as absolute", () => {
+    expect(joinPath("", "core")).toBe("core");
+    expect(joinPath("core/src", "http.rs")).toBe("core/src/http.rs");
+  });
+
+  it("walks up to the root and stays there", () => {
+    expect(parentPath("core/src/http.rs")).toBe("core/src");
+    expect(parentPath("core")).toBe("");
+    expect(parentPath("")).toBe("");
+  });
+
+  it("abbreviates token counts, and shows a missing one as a dash", () => {
+    expect(formatTokens(null)).toBe("—");
+    expect(formatTokens(0)).toBe("0");
+    expect(formatTokens(999)).toBe("999");
+    expect(formatTokens(1500)).toBe("1.5k");
+    expect(formatTokens(48000)).toBe("48k");
+    expect(formatTokens(1_400_000)).toBe("1.4M");
   });
 });

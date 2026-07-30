@@ -322,6 +322,173 @@ export function classifierVerdictLabel(decision: string): string {
  * input falls back to the raw string; timestamps older than ~a month fall back
  * to the calendar date.
  */
+/**
+ * The badge tone for a run's status, in the same vocabulary the rest of the app uses.
+ *
+ * The five tones make claims about ATTENTION, not about success: `awaiting_approval` is gold because
+ * it wants your signature, `failed` is outlined gold because it wants a look, and `cancelled` and
+ * `interrupted` recede because they are already over and nobody is waiting on them. A finished run
+ * that succeeded wants nothing, so it is green.
+ *
+ * `running` and `pending` borrow the shadow tone — "in flight, no verdict yet" — which is the same
+ * thing `mailTone` uses it for.
+ */
+export function runTone(status: string): BadgeTone {
+  switch (status) {
+    case "completed":
+      return "active";
+    case "pending":
+    case "running":
+      return "shadow";
+    case "awaiting_approval":
+      return "pending";
+    case "failed":
+    case "timed_out":
+      return "paused";
+    default:
+      // `cancelled`, `interrupted`, and any status a future núcleo invents.
+      return "off";
+  }
+}
+
+/** A run status as a person reads it, rather than as the column stores it. */
+export function runStatusLabel(status: string): string {
+  switch (status) {
+    case "awaiting_approval":
+      return "awaiting approval";
+    case "timed_out":
+      return "timed out";
+    default:
+      return status;
+  }
+}
+
+/**
+ * Whether a run has stopped moving.
+ *
+ * The detail view polls while a run is live and stops when it is not, so this decides when to stop
+ * asking. Unknown statuses count as terminal: a status this shell does not recognise is one it
+ * cannot claim is still running, and polling forever is the worse of the two mistakes.
+ */
+export function runIsLive(status: string): boolean {
+  return status === "pending" || status === "running";
+}
+
+/** The gate's verdict, or null when a run never reached it. `gate.rs` writes only these two. */
+export function gateTone(gateStatus: string | null): BadgeTone | null {
+  if (gateStatus === null) return null;
+  return gateStatus === "passed" ? "active" : "paused";
+}
+
+/**
+ * The badge tone for a subsystem's health.
+ *
+ * `down` is louder than `degraded` — filled gold against outlined — because one is a thing that
+ * stopped and the other is a thing still working with a limp. `disabled` recedes: a subsystem
+ * nobody turned on is not a fault, and `health.rs` deliberately keeps it out of the aggregate for
+ * the same reason.
+ */
+export function healthTone(state: string): BadgeTone {
+  switch (state) {
+    case "ok":
+      return "active";
+    case "degraded":
+      return "paused";
+    case "down":
+      return "pending";
+    default:
+      return "off";
+  }
+}
+
+/** What a diagnostic category means, spelled out. The daemon sends the slug; this is the sentence. */
+export function healthReasonLabel(reason: string | undefined): string | null {
+  if (reason === undefined) return null;
+  switch (reason) {
+    case "timeout":
+      return "did not answer in time";
+    case "not-configured":
+      return "not configured";
+    case "unreachable":
+      return "could not be reached";
+    case "permission-denied":
+      return "permission denied";
+    case "missing":
+      return "missing";
+    case "low-disk-space":
+      return "low disk space";
+    default:
+      return reason;
+  }
+}
+
+/** What holding a key of this level lets its bearer do. */
+export function tokenLevelHint(level: string): string {
+  switch (level) {
+    case "read-only":
+      return "May read. Cannot start a run or change anything.";
+    case "run-creating":
+      return "May read and start runs. Cannot mint or revoke keys.";
+    case "admin":
+      return "Full access, including minting and revoking keys.";
+    default:
+      return level;
+  }
+}
+
+/** Why a requeue was refused, phrased as the thing to do about it. */
+export function requeueFailureMessage(failure: string): string {
+  switch (failure) {
+    case "unknown":
+      return "That message is no longer in the mailbox.";
+    case "conflict":
+      return "Cannot requeue: either a run currently holds this message, or retention already pruned its body — there is nothing left to read.";
+    default:
+      return "The daemon refused the requeue.";
+  }
+}
+
+/**
+ * A path split into its clickable ancestry, root first.
+ *
+ * The root is always present and always the empty path, because that is what the inspect routes read
+ * as "the project root" — an absent `path` and an empty one mean the same thing to the daemon.
+ */
+export function breadcrumbs(path: string): { label: string; path: string }[] {
+  const segments = path.split("/").filter((segment) => segment !== "");
+  const trail: { label: string; path: string }[] = [{ label: "/", path: "" }];
+  let sofar = "";
+  for (const segment of segments) {
+    sofar = sofar === "" ? segment : `${sofar}/${segment}`;
+    trail.push({ label: segment, path: sofar });
+  }
+  return trail;
+}
+
+/** Joins a directory and a child name into the relative path the inspect routes take. */
+export function joinPath(parent: string, name: string): string {
+  return parent === "" ? name : `${parent}/${name}`;
+}
+
+/** The directory holding `path`, or the empty root. */
+export function parentPath(path: string): string {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? "" : path.slice(0, cut);
+}
+
+/**
+ * A token count, abbreviated. Runs routinely report hundreds of thousands of cached tokens, and the
+ * exact digit is never the question being asked of that number.
+ */
+export function formatTokens(count: number | null): string {
+  if (count === null || !Number.isFinite(count)) return "—";
+  if (count < 1000) return String(count);
+  const thousands = count / 1000;
+  if (thousands < 1000) return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
+  const millions = count / 1_000_000;
+  return `${millions < 10 ? millions.toFixed(1) : Math.round(millions)}M`;
+}
+
 export function relativeTime(iso: string, nowMs: number = Date.now()): string {
   const then = Date.parse(iso);
   if (Number.isNaN(then)) return iso;
