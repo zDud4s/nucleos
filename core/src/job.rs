@@ -1569,6 +1569,13 @@ pub async fn reconcile_orphaned_jobs(pool: &SqlitePool) -> sqlx::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    // The walk tests hold `test_env_lock()` across their awaits on purpose: it serialises mutation
+    // of the process-wide `NUCLEOS_WORKTREE_ROOT` override, which is the whole reason it exists. It
+    // is a `std::sync::Mutex` because sync `#[test]`s share it, these are `current_thread` tests, and
+    // there is no multi-thread runtime here to starve — the same false positive `worktree.rs` and
+    // `runs.rs` already carry this allow for.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
@@ -1587,10 +1594,17 @@ mod tests {
     }
 
     async fn test_state(pool: sqlx::SqlitePool) -> AppState {
-        AppState {
+        test_state_with_runner(pool).await.0
+    }
+
+    async fn test_state_with_runner(
+        pool: sqlx::SqlitePool,
+    ) -> (AppState, std::sync::Arc<crate::runner::FakeCommandRunner>) {
+        let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let state = AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
-            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: runner.clone(),
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
@@ -1599,7 +1613,8 @@ mod tests {
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
-        }
+        };
+        (state, runner)
     }
 
     /// A job with a directory it can hand work through, and no git anywhere near it.
@@ -2180,6 +2195,276 @@ mod tests {
             "newest first, and the finished one is still there"
         );
         assert_eq!(list(&pool, None, 20).await.unwrap().len(), 3);
+    }
+
+    // ---- the whole walk ------------------------------------------------------------------------
+
+    /// A repository with a real gate, so a walk measures something rather than waving items
+    /// through. The commands used are `git`, which runs everywhere this daemon does and answers in
+    /// milliseconds.
+    fn walkable_repo(prefix: &str, gate: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let base = std::env::current_dir().expect("resolve current directory");
+        assert!(
+            !base.to_string_lossy().contains(' '),
+            "test checkout must have a space-free path"
+        );
+        let container = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(base)
+            .expect("create space-free tempdir");
+        let repo = container.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repository directory");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@x"],
+            vec!["config", "user.name", "test"],
+        ] {
+            assert!(git_ok(&repo, &args));
+        }
+        std::fs::write(repo.join("seed.txt"), "seed\n").expect("seed the repository");
+        for args in [vec!["add", "-A"], vec!["commit", "-m", "seed"]] {
+            assert!(git_ok(&repo, &args));
+        }
+        std::fs::create_dir_all(repo.join(".ai")).expect("create .ai");
+        std::fs::write(
+            repo.join(".ai").join("autopilot.yaml"),
+            format!("gate_command: {gate}\nschedules: []\n"),
+        )
+        .expect("write the project's gate configuration");
+        (container, repo)
+    }
+
+    fn git_ok(repo: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git")
+            .status
+            .success()
+    }
+
+    struct WorktreeRootEnv(Option<std::ffi::OsString>);
+    impl WorktreeRootEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            unsafe { std::env::set_var("NUCLEOS_WORKTREE_ROOT", path) };
+            Self(previous)
+        }
+    }
+    impl Drop for WorktreeRootEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
+                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+                }
+            }
+        }
+    }
+
+    /// Lets the node a pass started finish before the next pass reads its status.
+    ///
+    /// Nodes run as spawned tasks, so without this every pass would find its own node still
+    /// `running` and answer `Wait` forever — the walk would hang rather than fail, which is the
+    /// least useful way for a test to be wrong.
+    async fn settle(state: &AppState, job_id: i64) {
+        for _ in 0..500 {
+            let running: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM runs WHERE job_id = ? AND status = 'running'",
+            )
+            .bind(job_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            if running == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("a node never finished");
+    }
+
+    /// Drives a job to an ending, one pass per loop, exactly as the daemon's tick would.
+    async fn walk(state: &AppState, job_id: i64) -> String {
+        for _ in 0..20 {
+            job_tick(state, Utc::now()).await;
+            settle(state, job_id).await;
+            let status = job_status(&state.pool, job_id).await;
+            if !LIVE_STATUSES.contains(&status.as_str()) {
+                return status;
+            }
+        }
+        panic!(
+            "the job never reached an ending; last status {}",
+            job_status(&state.pool, job_id).await
+        );
+    }
+
+    async fn start_job_for(
+        state: &AppState,
+        runner: &crate::runner::FakeCommandRunner,
+        repo: &std::path::Path,
+        plan: &str,
+    ) -> i64 {
+        *runner.plan_to_write.lock().unwrap() = Some(plan.to_owned());
+        let root = repo.to_string_lossy().into_owned();
+        let job_id = insert_job(
+            &state.pool,
+            &NewJob {
+                project_id: "project-a",
+                project_root: &root,
+                rule_name: "nightly",
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &state.pool,
+            owner,
+            "project-a",
+            &root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+        )
+        .await
+        .expect("record the job's worktree");
+        job_id
+    }
+
+    /// The thesis of the whole feature, walked end to end for the first time: **one trigger
+    /// produces a sequence of runs over one worktree**, so autonomous work is no longer capped by a
+    /// single context window.
+    ///
+    /// Nothing here reaches around the machinery. The queue is written by the node into the handoff
+    /// directory it learned about through its environment, and read back off disk by the daemon —
+    /// so this covers the env plumbing, `prepare_artifacts`, the file contract of §5.2, the gate,
+    /// and every transition between them. Seeding `job_items` directly would have exercised the
+    /// parts and left the joins between them as the only place a bug could still live.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_trigger_becomes_a_sequence_of_runs_over_one_worktree() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-walk-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = start_job_for(
+            &state,
+            &runner,
+            &repo,
+            r#"{"items":[{"description":"guard the cursor"},{"description":"retry on lock"}]}"#,
+        )
+        .await;
+
+        assert_eq!(walk(&state, job_id).await, "completed");
+
+        // Four runs from one trigger: plan, two items, review. This number IS the feature — one run
+        // per trigger being the ceiling is the whole thing the design exists to remove.
+        let stages: Vec<String> =
+            sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stages, vec!["plan", "implement", "implement", "review"]);
+
+        // One worktree, shared by all four. A second row would give the directory two owners and
+        // let the GC collect it out from under a job still working in it.
+        let trees: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worktrees")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(trees, 1);
+        let cwds: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT cwd FROM runs WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cwds.len(), 1, "every node ran in the same tree");
+
+        // The queue came off disk, in order, and every item was actually measured.
+        let items: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT description, status, gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "guard the cursor");
+        assert_eq!(items[1].0, "retry on lock");
+        assert!(items.iter().all(|item| item.1 == "passed"));
+        assert!(items.iter().all(|item| item.2.as_deref() == Some("passed")));
+
+        let _ =
+            crate::worktree::remove(&repo, &root.path().join(format!("job-{job_id}")), &[]).await;
+    }
+
+    /// Decision 6, walked rather than asserted against a seeded row: a red gate stops the chain
+    /// where it broke, and the item after it never starts. On a shared worktree, letting item i+1
+    /// build on unmeasured work is exactly what makes a later red gate unable to say which item
+    /// caused it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_red_gate_stops_the_chain_before_the_next_item_starts() {
+        let _lock = crate::worktree::test_env_lock();
+        // A command that runs everywhere and always fails, so this measures the chain's answer to a
+        // red gate rather than to a missing binary — which is the other outcome entirely, and one
+        // the design spends a whole section keeping apart from this one.
+        let (_container, repo) =
+            walkable_repo("nucleos-job-red-", "git rev-parse --verify no-such-ref");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = start_job_for(
+            &state,
+            &runner,
+            &repo,
+            r#"{"items":[{"description":"first"},{"description":"second"}]}"#,
+        )
+        .await;
+
+        assert_eq!(walk(&state, job_id).await, "gate_failed");
+
+        let items: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(items[0].0, "gate_failed");
+        assert_eq!(items[0].1.as_deref(), Some("failed"));
+        // Never started. The partial stays on the branch and the second item is still there to do.
+        assert_eq!(items[1].0, "pending");
+        let stages: Vec<String> =
+            sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stages,
+            vec!["plan", "implement"],
+            "no review is spent on a chain that already stopped"
+        );
+
+        let _ =
+            crate::worktree::remove(&repo, &root.path().join(format!("job-{job_id}")), &[]).await;
     }
 
     /// The plan node is the one node with no item to mark, so nothing else stops a second planner

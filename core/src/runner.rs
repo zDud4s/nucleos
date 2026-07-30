@@ -928,6 +928,15 @@ pub struct FakeCommandRunner {
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
     pub calls: std::sync::Mutex<u32>,
+    /// Test-only: the queue a plan node writes, taken by the first call that is given a handoff
+    /// directory.
+    ///
+    /// Written into the directory named by `NUCLEOS_JOB_ARTIFACTS`, exactly where a real plan node
+    /// would put it — so a test of the job chain goes through the env plumbing and reads the queue
+    /// off disk, instead of reaching around both to seed a queue the daemon never saw. Taken rather
+    /// than copied, because only the first node of a job plans: an implement node that rewrote the
+    /// queue it is working from is a fiction no real run can produce.
+    pub plan_to_write: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -958,6 +967,18 @@ impl CommandRunner for FakeCommandRunner {
                 *remaining -= 1;
                 return Err(std::io::Error::other("fake launch failure"));
             }
+        }
+        // Where a plan node's only output goes. Nothing is written unless the caller armed a plan
+        // AND the run was handed a handoff directory, so an ordinary run cannot produce one.
+        if let Some(artifacts) = env
+            .iter()
+            .find(|(key, _)| key == "NUCLEOS_JOB_ARTIFACTS")
+            .map(|(_, value)| value)
+            && let Some(plan) = self.plan_to_write.lock().unwrap().take()
+        {
+            let _ = std::fs::create_dir_all(artifacts);
+            std::fs::write(std::path::Path::new(artifacts).join("plan.json"), plan)
+                .expect("the plan node writes its queue");
         }
         *self.last_cwd.lock().unwrap() = cwd.map(|c| c.to_path_buf());
         *self.last_plan_only.lock().unwrap() = Some(plan_only);
