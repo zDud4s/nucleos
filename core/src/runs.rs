@@ -1009,11 +1009,27 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .clone()
         .ok_or(ResumeError::NotResumable("proposal has no tool_name"))?;
 
+    // A node of a job does not own the tree it is paused in — the job does, and has since before
+    // this node started. Looking it up by run would answer "no live worktree" for every paused job
+    // node, so approving one returned `NotResumable` and the shell offered a button that could not
+    // work. Which owner to ask for is decided by the paused run's own `job_id`.
+    let (job_id, stage): (Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT job_id, stage FROM runs WHERE id = ?")
+            .bind(original_run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or((None, None));
+    let owner = match job_id {
+        Some(job_id) => crate::worktree::Owner::Job(job_id),
+        None => crate::worktree::Owner::Run(original_run_id),
+    };
+
     let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
         "SELECT project_id, project_root, path
-         FROM worktrees WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
+         FROM worktrees WHERE owner_kind = ? AND owner_id = ? AND removed_at IS NULL",
     )
-    .bind(original_run_id)
+    .bind(owner.kind())
+    .bind(owner.id())
     .fetch_optional(&state.pool)
     .await?
     .ok_or(ResumeError::NotResumable(
@@ -1037,18 +1053,34 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // The resume carries the node's identity forward. Without it the new run belongs to no job, so
+    // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
+    // sits there until the four-hour ceiling retires it, with the approved work already done.
     let result = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
-         VALUES (?, ?, ?, 'running', 'worktree', ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at, job_id, stage)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?)",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
     .bind(&prompt)
     .bind(&now)
+    .bind(job_id)
+    .bind(stage.as_deref())
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
+    // The hand-over is a no-op for a job's tree, and must be: the job owns it, and moving ownership
+    // to this one node would let the GC collect it the moment that node finished — with the rest of
+    // the queue still to run in it. Filtering on `owner_kind = 'run'` is what makes that so.
     sqlx::query("UPDATE worktrees SET owner_id=? WHERE owner_kind='run' AND owner_id=?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
+    // The item follows its node. Left pointing at the run just marked `superseded`, the job's next
+    // pass would read a terminal node that did not complete and stop the whole chain — turning an
+    // approval into a failure, and throwing away the work the user just authorised.
+    sqlx::query("UPDATE job_items SET run_id = ? WHERE run_id = ?")
         .bind(resume_id)
         .bind(original_run_id)
         .execute(&mut *tx)
@@ -1137,12 +1169,16 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // A resume continues an approved worktree run, which is autopilot work: the hook and the
         // classifier govern it, exactly as they governed the run being resumed.
         crate::runner::ToolPolicy::Unrestricted,
-        // No handoff directory: this route resumes a *run*, keyed on `worktrees.owner_kind = 'run'`
-        // a few lines above, so it cannot reach a job's node. §6.2 of the design — approving a
-        // paused node and resuming it in the job's worktree — is a separate path that does not
-        // exist yet; until it does, a node that stops for approval leaves its job parked until the
-        // four-hour ceiling retires it.
-        run_env(&daemon_token, resume_id, None),
+        // A resumed job node keeps its handoff directory: it is the same node, in the same tree,
+        // finishing the same item, and the review node after it still reads `plan.json` from there.
+        // An ordinary resumed run gets nothing, as before.
+        run_env(
+            &daemon_token,
+            resume_id,
+            job_id
+                .map(|_| std::path::PathBuf::from(&wt_path).join(crate::worktree::ARTIFACTS_DIR))
+                .as_deref(),
+        ),
     );
 
     Ok(resume_id)
@@ -1729,6 +1765,134 @@ mod tests {
         .unwrap();
 
         (original_run_id, proposal_id, worktree_path)
+    }
+
+    /// §6.2 of the design, and the one path where the shell offered a button that could not work.
+    ///
+    /// A node of a job does not own the tree it is paused in — the job does — so the resume looked
+    /// the worktree up by run, found none, and answered `NotResumable` for every paused job node.
+    /// Three things have to be true afterwards, and getting any of them wrong turns an approval
+    /// into something worse than the refusal it replaced.
+    #[tokio::test]
+    async fn approving_a_job_node_resumes_it_in_the_jobs_worktree() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let worktree_path = "C:/worktrees/proj/job-1";
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: "C:/repos/proj",
+                rule_name: "nightly",
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await
+        .unwrap();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('job', ?, 'proj', 'C:/repos/proj', ?, 'nucleos/job-1', ?)",
+        )
+        .bind(job_id)
+        .bind(worktree_path)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let paused = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at,
+                               job_id, stage)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', 'sess-j', 'worktree', ?, ?, 'implement')",
+        )
+        .bind(worktree_path)
+        .bind(&created_at)
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
+             VALUES (?, 0, 'an item', 'running', ?)",
+        )
+        .bind(job_id)
+        .bind(paused)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            paused,
+            Some("sess-j"),
+            Some("proj"),
+            "Bash",
+            "push needs approval",
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+        let seeded: (Option<i64>, Option<String>, i64) = sqlx::query_as(
+            "SELECT r.job_id, r.stage,
+                    (SELECT COUNT(*) FROM worktrees w
+                     WHERE w.owner_kind = 'job' AND w.owner_id = r.job_id AND w.removed_at IS NULL)
+             FROM runs r WHERE r.id = ?",
+        )
+        .bind(paused)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        // The seed, checked before the thing under test touches it. sqlx fills a `?` with no bind
+        // behind it as NULL without complaining, so a miscounted bind list produces a run with no
+        // job — which is exactly the state whose handling this test exists to prove, and it would
+        // have passed by testing nothing.
+        assert_eq!(
+            (seeded.0, seeded.1.as_deref(), seeded.2),
+            (Some(job_id), Some("implement"), 1),
+            "the seed itself must be what this test claims to be testing"
+        );
+
+        let resume_id = resume_approved_run(&state, proposal_id)
+            .await
+            .expect("a paused job node is resumable");
+
+        // One: the resume belongs to the same job and plays the same part. A run belonging to no
+        // job is invisible to the chain that has to finalise it, so the item would stay `running`
+        // until the four-hour ceiling — with the approved work already done.
+        let (resumed_job, resumed_stage): (Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT job_id, stage FROM runs WHERE id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(resumed_job, Some(job_id));
+        assert_eq!(resumed_stage.as_deref(), Some("implement"));
+
+        // Two: the item follows its node. Left pointing at the run just marked `superseded`, the
+        // next pass would read a terminal node that did not complete and stop the whole chain —
+        // turning the user's approval into a failure.
+        let item_run: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(item_run, Some(resume_id));
+
+        // Three: the tree still belongs to the job. Handed to this one node, the GC would be free
+        // to collect it the moment the node finished, with the rest of the queue still to run in it.
+        let owner: (String, i64) =
+            sqlx::query_as("SELECT owner_kind, owner_id FROM worktrees WHERE path = ?")
+                .bind(worktree_path)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, ("job".to_owned(), job_id));
     }
 
     #[tokio::test]
