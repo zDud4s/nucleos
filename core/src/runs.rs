@@ -243,15 +243,30 @@ const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 /// proposals and disengages the kill switch. Autonomous runs now get their own scoped key
 /// (`auth::mint_run_token`); only orchestrator turns still carry the control token, and only
 /// because `ToolPolicy::McpOnly` leaves them nothing to read it with.
-pub(crate) fn run_env(token: &str, id: i64) -> Vec<(String, String)> {
-    vec![
+///
+/// `artifacts` is the directory a job's nodes hand work to each other through, and is `Some` only
+/// for a node of a job. An ordinary run has no successor to write to, and handing it the variable
+/// anyway would advertise a protocol nothing in its prompt describes.
+pub(crate) fn run_env(
+    token: &str,
+    id: i64,
+    artifacts: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
         (
             "NUCLEOS_DAEMON_URL".to_string(),
             "http://127.0.0.1:8791".to_string(),
         ),
         ("NUCLEOS_DAEMON_TOKEN".to_string(), token.to_string()),
         ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
-    ]
+    ];
+    if let Some(path) = artifacts {
+        env.push((
+            "NUCLEOS_JOB_ARTIFACTS".to_string(),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    env
 }
 
 /// Mints a run's own daemon key and stores its secret, returning what goes in the environment.
@@ -444,13 +459,12 @@ fn spawn_run(
     gate_config: GateConfig,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
-    daemon_token: String,
+    env: Vec<(String, String)>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
     let progress_timeout = state.progress_timeout;
     let run_timeout = state.run_timeout;
-    let env = run_env(&daemon_token, id);
 
     spawn_registered(state, id, async move {
         let mut attempt: u32 = 1;
@@ -735,10 +749,6 @@ pub async fn create_run_inner(
 /// Deliberately `mode = "worktree"` rather than a mode of its own: `plan_only`, the tool policy,
 /// `max_attempts` and migration 0009's exclusivity index all branch on `mode`, and a fourth value
 /// would have to be excluded from each of them. Missing one would be silent.
-///
-/// Unused outside tests until the state machine drives it; the allow comes off with the first
-/// production caller, and if it is still here after that, a node path was built and never wired up.
-#[allow(dead_code)]
 pub async fn create_job_node_run(
     state: &AppState,
     prompt: String,
@@ -813,17 +823,27 @@ async fn create_run_with(
         )
     });
     let mut gate_config = GateConfig::NotConfigured;
+    let mut node_artifacts: Option<std::path::PathBuf> = None;
 
     if mode == "worktree" {
         let project_root = cwd.as_deref().expect("worktree cwd validated above");
         let worktree_project_id = project_id
             .as_deref()
             .expect("worktree project_id validated above");
-        gate_config = match crate::config::load_schedule_rules(std::path::Path::new(project_root)) {
-            Ok(rules) => rules
+        // A job node is not gated here, because the job gates it. Two reasons, either of which is
+        // enough: `gate_after_each_item: false` is a knob the job honours and this path cannot see,
+        // and the plan and review nodes change nothing, so gating them spends a whole suite run to
+        // re-measure the tree the previous gate already measured. The verdict also belongs to the
+        // item it measured, which is a row this path has no access to.
+        gate_config = match (
+            &node,
+            crate::config::load_schedule_rules(std::path::Path::new(project_root)),
+        ) {
+            (Some(_), _) => GateConfig::NotConfigured,
+            (None, Ok(rules)) => rules
                 .gate_command
                 .map_or(GateConfig::NotConfigured, GateConfig::Command),
-            Err(error) => {
+            (None, Err(error)) => {
                 tracing::warn!(
                     project_id = worktree_project_id,
                     project_root,
@@ -907,6 +927,26 @@ async fn create_run_with(
             .await;
             return Err(CreateRunError::Db(error));
         }
+        // The handoff directory, and the exclusion that keeps it out of both the preservation commit
+        // and anything a node commits itself. Prepared per node rather than once per job because a
+        // node is the thing that writes there, and a failure here has to stop this node rather than
+        // be discovered later as an empty plan — which §5.2 of the design maps to `failed` with no
+        // way of telling a planner that found nothing from a directory that was never created.
+        if node.is_some() {
+            match crate::worktree::prepare_artifacts(&info.path).await {
+                Ok(path) => node_artifacts = Some(path),
+                Err(error) => {
+                    fail_provisioning(
+                        state,
+                        id,
+                        project_id.as_deref(),
+                        &format!("the job's handoff directory could not be prepared: {error}"),
+                    )
+                    .await;
+                    return Err(CreateRunError::Worktree(error));
+                }
+            }
+        }
         completion_feed = Some((
             "worktree_run_completed".to_owned(),
             format!("worktree run completed on {}", info.branch),
@@ -943,7 +983,7 @@ async fn create_run_with(
         gate_config,
         max_attempts,
         tool_policy,
-        daemon_token,
+        run_env(&daemon_token, id, node_artifacts.as_deref()),
     );
 
     Ok(id)
@@ -1097,7 +1137,12 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // A resume continues an approved worktree run, which is autopilot work: the hook and the
         // classifier govern it, exactly as they governed the run being resumed.
         crate::runner::ToolPolicy::Unrestricted,
-        daemon_token,
+        // No handoff directory: this route resumes a *run*, keyed on `worktrees.owner_kind = 'run'`
+        // a few lines above, so it cannot reach a job's node. §6.2 of the design — approving a
+        // paused node and resuming it in the job's worktree — is a separate path that does not
+        // exist yet; until it does, a node that stops for approval leaves its job parked until the
+        // four-hour ceiling retires it.
+        run_env(&daemon_token, resume_id, None),
     );
 
     Ok(resume_id)
@@ -1497,9 +1542,21 @@ mod tests {
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
         let project_root = repo.to_string_lossy().into_owned();
 
-        let job_id = crate::job::insert_job(&state.pool, "proj", &project_root, "implementing", 5)
-            .await
-            .expect("start a job");
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &project_root,
+                rule_name: "nightly",
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await
+        .expect("start a job");
         let owner = crate::worktree::Owner::Job(job_id);
         let info = crate::worktree::create(&repo, owner)
             .await

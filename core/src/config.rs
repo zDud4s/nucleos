@@ -180,12 +180,8 @@ pub struct GraphConfig {
 impl GraphConfig {
     /// The fan-out actually allowed, after the daemon's own ceiling.
     ///
-    /// Unused outside tests until the scheduler starts jobs from rules; the allow comes off with
-    /// that caller, and if it is still here afterwards the ceiling is being bypassed.
-    ///
     /// Private field plus this accessor on purpose: a caller that read `max_items` straight off the
     /// struct would silently honour whatever the file said, and the ceiling would be advisory.
-    #[allow(dead_code)]
     pub fn max_items(&self) -> usize {
         self.max_items.min(MAX_ITEMS_CEILING)
     }

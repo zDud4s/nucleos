@@ -182,6 +182,20 @@ async fn main() {
         );
     }
 
+    // After the run reconciliations, and for a reason worth stating: they mark every run left
+    // `running` as `interrupted`, so by now no job has a live node under it — which means "has no
+    // live run" is true of every job, including the ones that died in the gap between two nodes.
+    // Those are exactly the recoverable ones, so the pass below discriminates on HEAD instead.
+    match job::reconcile_orphaned_jobs(&pool).await {
+        Ok(retired) if retired > 0 => {
+            tracing::warn!(
+                "retired {retired} job(s) whose repository moved while the daemon was down -> 'interrupted'"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned-job reconciliation failed"),
+    }
+
     // After the run reconciliations above, so nothing from a previous life still counts as live.
     match worktree::reconcile_orphaned_worktrees(
         &pool,
@@ -334,6 +348,10 @@ async fn main() {
         }
     }
     tokio::spawn(scheduler::run_scheduler(state.clone()));
+    // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
+    // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
+    // one project's test suite.
+    tokio::spawn(job::run_job_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
 

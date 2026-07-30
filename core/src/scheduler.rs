@@ -171,6 +171,166 @@ pub async fn run_scheduler(state: AppState) {
     }
 }
 
+/// Hands a claimed window back, so a busy project retries on the next tick rather than skipping its
+/// schedule for the day.
+///
+/// A compare-and-set on the value just written, so a concurrent tick that has already claimed the
+/// next window is not clobbered. Only ever called where nothing was started: past the point where a
+/// run row or a job row exists, the window stays spent, because re-firing on a maybe is the
+/// duplicate the claim-first ordering exists to prevent.
+async fn release_window(
+    state: &AppState,
+    project_id: &str,
+    rule_name: &str,
+    previous_fired_at: Option<&str>,
+    previous_head_sha: Option<&str>,
+    now: DateTime<Utc>,
+) {
+    let released = sqlx::query(
+        "UPDATE scheduler_state
+         SET last_fired_at = ?, last_head_sha = ?
+         WHERE project_id = ? AND rule_name = ? AND last_fired_at = ?",
+    )
+    .bind(previous_fired_at)
+    .bind(previous_head_sha)
+    .bind(project_id)
+    .bind(rule_name)
+    .bind(now.to_rfc3339())
+    .execute(&state.pool)
+    .await;
+    if let Err(error) = released {
+        tracing::warn!(
+            project_id = %project_id,
+            rule_name = %rule_name,
+            %error,
+            "could not give the scheduler window back; it stays spent"
+        );
+    }
+}
+
+/// What starting a job did.
+enum JobStart {
+    Started(i64),
+    /// The project already has a live job. Refused by `one_live_job_per_project`, not by a check
+    /// here: with the constraint in the storage layer the INSERT is the lock, so this tick and a
+    /// manual request racing for the same project cannot both pass a check and then both proceed.
+    AlreadyLive,
+    Failed,
+}
+
+/// Turns a due `graph:` rule into a job with a worktree of its own.
+///
+/// The worktree belongs to the job, not to any of its nodes — that is the whole reason a job can
+/// outlive one context window, and it is why this provisions it here rather than letting the first
+/// node do it.
+async fn start_job(
+    state: &AppState,
+    project_id: &str,
+    project_root: &str,
+    rule: &ScheduleRule,
+    graph: &config::GraphConfig,
+    head_sha: Option<&str>,
+) -> JobStart {
+    let job_id = match crate::job::insert_job(
+        &state.pool,
+        &crate::job::NewJob {
+            project_id,
+            project_root,
+            rule_name: &rule.name,
+            prompt: &rule.prompt,
+            // The daemon's ceiling, not the file's number. `.ai/autopilot.yaml` is per-developer
+            // and gitignored, so nobody reviews what it asks for; it may lower the fan-out and
+            // never raise it.
+            max_items: graph.max_items() as i64,
+            gate_each: graph.gate_after_each_item,
+            review: graph.review,
+            head_sha,
+        },
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation()) =>
+        {
+            return JobStart::AlreadyLive;
+        }
+        Err(error) => {
+            tracing::warn!(project_id, rule_name = %rule.name, %error, "could not start a job");
+            return JobStart::Failed;
+        }
+    };
+
+    let owner = crate::worktree::Owner::Job(job_id);
+    let info = match crate::worktree::create(Path::new(project_root), owner).await {
+        Ok(info) => info,
+        Err(error) => return fail_job(state, project_id, job_id, &format!("{error}")).await,
+    };
+    let path = info.path.to_string_lossy().into_owned();
+    if let Err(error) = crate::worktree::record(
+        &state.pool,
+        owner,
+        project_id,
+        project_root,
+        &path,
+        &info.branch,
+    )
+    .await
+    {
+        // The directory exists and nothing in the database knows it does. Left alone it would be
+        // invisible to the GC forever; the startup orphan sweeper recognises `job-<id>` and is what
+        // eventually collects it.
+        return fail_job(
+            state,
+            project_id,
+            job_id,
+            &format!("its worktree was created but could not be recorded: {error}"),
+        )
+        .await;
+    }
+
+    let _ = crate::feed::append(
+        &state.pool,
+        Some(project_id),
+        "job_started",
+        &format!(
+            "job {job_id} started for rule '{}' on {}",
+            rule.name, info.branch
+        ),
+        None,
+    )
+    .await;
+    JobStart::Started(job_id)
+}
+
+/// Retires a job that never got as far as its first node, and says so where a person will see it.
+///
+/// A job left live with no worktree would be ticked forever and hold `one_live_job_per_project`,
+/// which would take the whole project's autonomy down with it — silently, since nothing else logs.
+async fn fail_job(state: &AppState, project_id: &str, job_id: i64, why: &str) -> JobStart {
+    if let Err(error) =
+        crate::job::retire(&state.pool, job_id, crate::job::Outcome::Failed.as_status()).await
+    {
+        tracing::error!(
+            project_id,
+            job_id,
+            %error,
+            "a job could not be provisioned AND could not be retired; it holds the project's job slot"
+        );
+    }
+    let _ = crate::feed::append(
+        &state.pool,
+        Some(project_id),
+        "job_failed",
+        &format!("job {job_id} could not start: {why}"),
+        None,
+    )
+    .await;
+    JobStart::Failed
+}
+
 pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
     if crate::autopilot::kill_switch_engaged(&state.pool)
         .await
@@ -562,6 +722,60 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 }
             }
 
+            // A rule with a `graph:` block starts a job instead of a run — but only when the run it
+            // would otherwise start is a real one.
+            //
+            // Not in shadow. Shadow runs are `--permission-mode plan` (`runs.rs` derives
+            // `plan_only` from the mode), so the plan node could not write the `plan.json` that
+            // §5.2 of the design takes the queue from, and every shadow job would fail at its first
+            // node, deterministically. §6.5 wanted the implement nodes' classifier samples and
+            // flagged its own dependency on plan-only mode; this is that dependency coming back
+            // false. A `graph:` rule in shadow therefore behaves exactly as it does today.
+            //
+            // Not on a catch-up either: a catch-up is demoted to plan-only precisely because its
+            // assumptions are as old as the window it missed, and a job is the largest thing this
+            // daemon can start.
+            if let (Mode::Active, false, Some(graph)) =
+                (project_mode, catch_up, rule.graph.as_ref())
+            {
+                match start_job(
+                    state,
+                    &project_id,
+                    &project_root,
+                    rule,
+                    graph,
+                    head_sha.as_deref(),
+                )
+                .await
+                {
+                    JobStart::Started(job_id) => tracing::info!(
+                        project_id = %project_id,
+                        rule_name = %rule.name,
+                        job_id,
+                        "fired a scheduled job"
+                    ),
+                    // The project already has a live job. Nothing was started, so the window goes
+                    // back — the same trade `CreateRunError::Busy` gets below, and for the same
+                    // reason: a busy project should retry next tick rather than skip its schedule.
+                    JobStart::AlreadyLive => {
+                        release_window(
+                            state,
+                            &project_id,
+                            &rule.name,
+                            previous_fired_at,
+                            last_head_shas.get(rule.name.as_str()).copied(),
+                            now,
+                        )
+                        .await;
+                    }
+                    // Past the INSERT: the job row exists and this cannot tell how far provisioning
+                    // got. The window stays spent, because re-firing on a maybe is the duplicate
+                    // the whole claim-first ordering exists to prevent.
+                    JobStart::Failed => {}
+                }
+                continue;
+            }
+
             match create_run_inner(state, prompt, Some(project_id.clone()), Some(cwd), run_mode)
                 .await
             {
@@ -597,26 +811,15 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 // Released with a compare-and-set on the value just written, so a concurrent tick
                 // that has already claimed the next window is not clobbered.
                 Err(error @ (CreateRunError::Busy | CreateRunError::Invalid(_))) => {
-                    let released = sqlx::query(
-                        "UPDATE scheduler_state
-                         SET last_fired_at = ?, last_head_sha = ?
-                         WHERE project_id = ? AND rule_name = ? AND last_fired_at = ?",
+                    release_window(
+                        state,
+                        &project_id,
+                        &rule.name,
+                        previous_fired_at,
+                        last_head_shas.get(rule.name.as_str()).copied(),
+                        now,
                     )
-                    .bind(previous_fired_at)
-                    .bind(last_head_shas.get(rule.name.as_str()).copied())
-                    .bind(&project_id)
-                    .bind(&rule.name)
-                    .bind(now.to_rfc3339())
-                    .execute(&state.pool)
                     .await;
-                    if let Err(release_error) = released {
-                        tracing::warn!(
-                            project_id = %project_id,
-                            rule_name = %rule.name,
-                            %release_error,
-                            "could not give the scheduler window back; it stays spent"
-                        );
-                    }
                     tracing::info!(
                         project_id = %project_id,
                         rule_name = %rule.name,

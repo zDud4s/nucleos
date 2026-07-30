@@ -136,6 +136,82 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
     Ok(WorktreeInfo { path, branch })
 }
 
+/// Where a job's nodes hand work to each other, relative to the worktree they share.
+///
+/// Inside the worktree, not beside it. `classifier.rs` denies any write outside the run's cwd — the
+/// class is `outside-workspace`, it is the classifier's first rule, and it is a hard `deny` with no
+/// single-use grant to fall back on — and a node's cwd *is* the worktree. A sibling directory would
+/// make the plan node's only output unwritable, so every job would fail at its first node, always.
+pub const ARTIFACTS_DIR: &str = ".nucleos";
+
+/// Creates a job's artifacts directory and hides it from git, returning its absolute path.
+///
+/// The exclusion goes in `info/exclude`, not the project's `.gitignore`: that file belongs to the
+/// user and the entry would turn up in their diff.
+///
+/// Excluded rather than merely untracked, because `preserve_uncommitted` runs `git add -A`. Left
+/// visible, the handoff files would ride into the preservation commit — and count against
+/// `DEFAULT_PRESERVATION_BYTE_CEILING`, where going over does not truncate the commit, it blocks
+/// removal of the worktree. A node that commits its own work with `git add -A` would sweep them up
+/// the same way.
+///
+/// It lands in the repository's **common** git directory, which is the one place git reads
+/// `info/exclude` from. A linked worktree has a private git directory of its own, and writing there
+/// looks right and excludes nothing — `info/` is on git's common list, so the per-worktree copy is
+/// never consulted. The design called for "the worktree's `info/exclude`"; this is where that file
+/// actually is. The cost is that the entry is visible to every worktree of the repository including
+/// the user's own checkout, and it is accepted: `.nucleos` is this daemon's own directory name, the
+/// file is per-clone and unversioned, and the alternative is a node committing handoff files onto
+/// the user's branch.
+///
+/// The entry is anchored (`/.nucleos/`) so a directory of the same name deeper in the tree keeps
+/// showing up in the user's status.
+pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
+    let artifacts = worktree.join(ARTIFACTS_DIR);
+    tokio::fs::create_dir_all(&artifacts).await?;
+
+    // Asked of git rather than assumed: in a linked worktree `.git` is a file, not a directory, so
+    // `<worktree>/.git/info/exclude` cannot be written to at all.
+    let output = git()
+        .arg("-C")
+        .arg(worktree)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "could not resolve the repository's common git directory: {stderr}"
+        )));
+    }
+    // Older git answers relatively, and relative to the `-C` directory above.
+    let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let git_dir = if reported.is_absolute() {
+        reported
+    } else {
+        worktree.join(reported)
+    };
+
+    let info = git_dir.join("info");
+    tokio::fs::create_dir_all(&info).await?;
+    let exclude = info.join("exclude");
+    let entry = format!("/{ARTIFACTS_DIR}/");
+    let mut contents = tokio::fs::read_to_string(&exclude)
+        .await
+        .unwrap_or_default();
+    if !contents.lines().any(|line| line.trim() == entry) {
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(&entry);
+        contents.push('\n');
+        tokio::fs::write(&exclude, contents).await?;
+    }
+
+    Ok(artifacts)
+}
+
 pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
     let output = git()
         .arg("-C")
@@ -1487,6 +1563,86 @@ mod tests {
             "must survive release\n"
         );
         pool.close().await;
+    }
+
+    /// The handoff between a job's nodes lives in the worktree, which is the only place the
+    /// classifier lets a node write — and `preserve_uncommitted` runs `git add -A`, so left visible
+    /// it would ride into the preservation commit and count against the byte ceiling, where going
+    /// over blocks removal of the worktree rather than trimming the commit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_jobs_handoff_files_stay_out_of_the_preservation_commit() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(41))
+            .await
+            .expect("create the job's worktree");
+
+        let artifacts = prepare_artifacts(&info.path)
+            .await
+            .expect("prepare the job's artifacts directory");
+        assert!(artifacts.is_dir());
+        std::fs::write(artifacts.join("plan.json"), r#"{"items":[]}"#).expect("write a plan");
+        std::fs::write(info.path.join("seed.txt"), "an item's work\n")
+            .expect("modify tracked file");
+
+        assert!(
+            preserve_uncommitted(&info.path, 1_000_000)
+                .await
+                .expect("preserve the item's work"),
+            "the tracked change alone should still produce a commit"
+        );
+
+        let handoff_object = format!("{}:{ARTIFACTS_DIR}/plan.json", info.branch);
+        assert!(
+            !git_ok(
+                repo.path(),
+                &[
+                    OsStr::new("cat-file"),
+                    OsStr::new("-e"),
+                    OsStr::new(handoff_object.as_str()),
+                ],
+            ),
+            "the handoff must not enter the preservation commit"
+        );
+        // Still on disk: the next node reads it. Excluded means invisible to git, not deleted.
+        assert!(artifacts.join("plan.json").exists());
+        assert_eq!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            ),
+            "",
+            "an excluded handoff leaves the worktree looking clean"
+        );
+    }
+
+    /// Called once per job today, but a resumed job would call it again on a tree that already has
+    /// the entry. Appending it a second time is harmless to git and a lie to anyone reading the
+    /// file, and the same loop that produced two would produce two hundred.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparing_the_handoff_twice_writes_one_exclusion() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(42))
+            .await
+            .expect("create the job's worktree");
+
+        prepare_artifacts(&info.path).await.expect("first call");
+        prepare_artifacts(&info.path).await.expect("second call");
+
+        // Read from the main repository's `.git`, deliberately: that is the common directory, and
+        // the only `info/exclude` git ever reads. A per-worktree copy would be inert.
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude"))
+            .expect("read the repository's exclude file");
+        let entry = format!("/{ARTIFACTS_DIR}/");
+        assert_eq!(
+            exclude.lines().filter(|line| line.trim() == entry).count(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
