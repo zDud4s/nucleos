@@ -459,7 +459,7 @@ pub async fn ingest_batch(
                 crate::contacts::MessageDirection::Outbound => {
                     let recipients = to_addrs
                         .into_iter()
-                        .flat_map(|header| header.split(','))
+                        .flat_map(crate::contacts::split_address_list)
                         .filter(|address| !address.trim().is_empty())
                         .collect::<Vec<_>>();
                     crate::contacts::record_outbound(&mut tx, &recipients, &message.received_at)
@@ -1438,6 +1438,39 @@ mod tests {
             (stored_both, first_profile, second_profile),
             (true, Some((0, true)), Some((0, true)))
         );
+    }
+
+    #[tokio::test]
+    async fn um_nome_com_virgula_nao_inventa_um_contacto() {
+        let pool = test_pool().await;
+        let mut sent = message(25);
+        sent.headers
+            .insert("to".into(), r#""Silva, Maria" <maria@example.com>"#.into());
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            25,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let contact_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contact_addresses")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let address: String = sqlx::query_scalar("SELECT address FROM contact_addresses")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!((contact_count, address.as_str()), (1, "maria@example.com"));
     }
 
     #[tokio::test]

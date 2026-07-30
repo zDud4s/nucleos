@@ -31,6 +31,37 @@ pub fn normalize_address(address: &str) -> String {
     address_only.trim().to_lowercase()
 }
 
+/// Splits a recipient list on the commas that separate addresses.
+///
+/// Not every comma does: a display name may contain one, and `"Silva, Maria" <maria@x>` is one
+/// recipient, not two.
+/// A backslash-escaped display-name quote is the exact case that defeats a quote-aware splitter.
+pub fn split_address_list(header: &str) -> Vec<&str> {
+    let mut addresses = Vec::new();
+    let mut start = 0;
+    let mut inside_quotes = false;
+    let mut inside_angles = false;
+    let mut previous_was_backslash = false;
+
+    for (index, character) in header.char_indices() {
+        match character {
+            '"' if !previous_was_backslash => inside_quotes = !inside_quotes,
+            '<' => inside_angles = true,
+            '>' => inside_angles = false,
+            ',' if !inside_quotes && !inside_angles => {
+                addresses.push(&header[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+
+        previous_was_backslash = character == '\\';
+    }
+
+    addresses.push(&header[start..]);
+    addresses
+}
+
 #[derive(Clone, Copy)]
 pub enum MessageDirection {
     Inbound,
@@ -430,6 +461,31 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn uma_virgula_num_nome_nao_separa_dois_destinatarios() {
+        let normalized =
+            split_address_list(r#""Silva, Maria" <maria@example.com>, oncall@example.com"#)
+                .into_iter()
+                .map(normalize_address)
+                .collect::<Vec<_>>();
+
+        assert_eq!(normalized, vec!["maria@example.com", "oncall@example.com"]);
+    }
+
+    #[test]
+    fn uma_virgula_dentro_dos_angulares_nao_separa() {
+        let recipients = split_address_list("Maria <maria,alias@example.com>");
+
+        assert_eq!(recipients.len(), 1);
+    }
+
+    #[test]
+    fn uma_aspa_escapada_nao_fecha_o_nome() {
+        let recipients = split_address_list(r#""Silva\", Maria" <maria@example.com>"#);
+
+        assert_eq!(recipients.len(), 1);
     }
 
     #[tokio::test]
