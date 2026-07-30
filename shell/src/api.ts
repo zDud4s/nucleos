@@ -139,6 +139,113 @@ export interface ScopedKill {
   engaged: boolean;
 }
 
+/**
+ * One job: a sequence of runs over a shared worktree, so a night's work is not capped by one
+ * context window.
+ */
+export interface Job {
+  id: number;
+  project_id: string;
+  rule_name: string | null;
+  /**
+   * `planning` | `implementing` | `gating` | `reviewing` | `waiting` | `awaiting_approval`, then
+   * one of the endings: `completed`, `failed`, `gate_failed`, `gate_errored`, `expired`,
+   * `stopped`, `cancelled`, `interrupted`.
+   */
+  status: string;
+  /**
+   * Why a `waiting` job waits. Budget and contention ask opposite things of a reader — "spend more
+   * or wait it out" versus "something else has the project" — so `waiting` alone leaves them
+   * guessing which.
+   */
+  wait_reason: string | null;
+  max_items: number;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface JobItem {
+  ordinal: number;
+  description: string;
+  /** `pending` | `running` | `implemented` | `passed` | `failed` | `cancelled` | `gate_*`. */
+  status: string;
+  run_id: number | null;
+  /**
+   * Whether anything measured this item, kept apart from `status` because they answer different
+   * questions. An item reading `passed` with a null gate status was never measured — the project
+   * configures no gate, or this was an intermediate item under `gate_after_each_item: false`.
+   */
+  gate_status: string | null;
+}
+
+export interface JobDetail extends Job {
+  items: JobItem[];
+  /** Where the work is, so a stopped job's partial can be found. Null once the GC took the tree. */
+  branch: string | null;
+}
+
+export async function getJobs(
+  token: string,
+  projectId?: string,
+): Promise<Job[] | null> {
+  const path = projectId === undefined
+    ? "/jobs"
+    : `/jobs?project_id=${encodeURIComponent(projectId)}`;
+  try {
+    const res = await fetch(`${DAEMON_URL}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function getJob(
+  token: string,
+  id: number,
+): Promise<JobDetail | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/jobs/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stops a whole job: the node in flight, and the sequence behind it.
+ *
+ * Distinct from cancelling a run, which stops one node. Both end the job — a stopped node leaves
+ * the tree holding edits no gate measured, so the next item must not build on them — but only this
+ * reaches a job with nothing running: one parked for the budget, waiting for the slot, or between
+ * two nodes.
+ *
+ * A 409 means the job had already ended, which is a different answer from "stopped" and is why
+ * this reports the status rather than a bare boolean.
+ */
+export async function cancelJob(
+  token: string,
+  id: number,
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/jobs/${id}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
 /** One message the pillar knows about: waiting, or already judged. */
 export interface QueuedEmail {
   id: number;

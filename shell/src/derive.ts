@@ -1,4 +1,4 @@
-import type { Budget, ClassTally, ProjectSummary } from "./api";
+import type { Budget, ClassTally, JobItem, ProjectSummary } from "./api";
 import type { BadgeTone } from "./ui/Badge";
 
 /**
@@ -336,4 +336,203 @@ export function relativeTime(iso: string, nowMs: number = Date.now()): string {
   const wk = Math.floor(day / 7);
   if (wk < 5) return `${wk} w ago`;
   return iso.slice(0, 10);
+}
+
+/**
+ * The statuses a job holds the project's exclusivity slot in.
+ *
+ * Mirrors `job::LIVE_STATUSES` in the daemon, which mirrors the partial unique index in migration
+ * 0037. The shell only reads it, so a drift here is cosmetic rather than dangerous — but a job the
+ * shell calls finished while the daemon still drives it is exactly the confusion the cancel button
+ * exists to resolve, so it is worth keeping honest.
+ */
+export const JOB_LIVE_STATUSES = [
+  "planning",
+  "implementing",
+  "gating",
+  "reviewing",
+  "awaiting_approval",
+  "waiting",
+] as const;
+
+export function jobIsLive(status: string): boolean {
+  return (JOB_LIVE_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * What a job is doing, in the user's words.
+ *
+ * `waiting` is the one status that cannot speak for itself: it now covers a budget window that will
+ * reopen and a slot another run is holding, and those ask opposite things of whoever reads it —
+ * spend more and wait, or find out what else is running. A bare "waiting" makes the reader guess.
+ */
+export function jobStageLabel(status: string, waitReason: string | null): string {
+  switch (status) {
+    case "planning":
+      return "working out what to do";
+    case "implementing":
+      return "working through its list";
+    case "gating":
+      return "running the tests";
+    case "reviewing":
+      return "reviewing its own diff";
+    case "awaiting_approval":
+      return "waiting for you to approve an action";
+    case "waiting":
+      switch (waitReason) {
+        case "budget":
+          return "paused — the budget is spent for now";
+        case "slot":
+          return "queued — something else has the project";
+        case "attention":
+          return "holding off — you are at the keyboard";
+        case "kill-switch":
+          return "stopped — the kill switch is engaged";
+        default:
+          return "waiting to continue";
+      }
+    default:
+      return jobEndingLabel(status);
+  }
+}
+
+/**
+ * How a job ended, said in a way that survives being skim-read.
+ *
+ * The pair this function exists for is `gate_failed` and `gate_errored`. A non-zero exit says the
+ * code is broken; a command that would not start says nothing was ever measured. Both are "did not
+ * pass", and the daemon keeps them apart from `gate.rs` all the way up to `jobs.status` — collapsing
+ * them here, at the last step, would waste every one of those and tell somebody their tests failed
+ * when no test ever ran.
+ *
+ * `expired` and `stopped` are the second pair. One means the four-hour clock ran out and the rest
+ * of the queue is still worth doing; the other means the budget window is spent and starting again
+ * today stops in the same place.
+ */
+export function jobEndingLabel(status: string): string {
+  switch (status) {
+    case "completed":
+      return "finished";
+    case "failed":
+      return "stopped — an item did not finish";
+    case "cancelled":
+      return "cancelled";
+    case "gate_failed":
+      return "stopped — the tests went red";
+    case "gate_errored":
+      return "stopped — the tests could not be run, so nothing was measured";
+    case "expired":
+      return "stopped — it ran out of time, and its list was not finished";
+    case "stopped":
+      return "stopped — the budget window is spent";
+    case "interrupted":
+      return "interrupted — the daemon restarted and the repository had moved";
+    default:
+      // A status a newer daemon invented. Shown rather than swallowed: an unrecognised ending is
+      // still an ending, and hiding it would leave the row looking unfinished forever.
+      return status;
+  }
+}
+
+/**
+ * How far a job got, counted in items that are actually done.
+ *
+ * `passed` only. An item that has been implemented but not yet gated is not finished work — that is
+ * the whole reason the gate runs between items — and counting it would let the bar reach the end
+ * while a red gate was still to come.
+ */
+export function jobProgress(items: JobItem[]): { done: number; total: number } {
+  return {
+    done: items.filter((item) => item.status === "passed").length,
+    total: items.length,
+  };
+}
+
+/** The badge tone for one item of a job's queue. */
+export function jobItemTone(status: string): BadgeTone {
+  switch (status) {
+    case "passed":
+      return "active";
+    case "running":
+      return "pending";
+    case "implemented":
+      return "shadow";
+    case "failed":
+    case "cancelled":
+    case "gate_failed":
+    case "gate_errored":
+      return "paused";
+    default:
+      // `pending`, and anything a newer daemon adds. Neither started nor finished, so it recedes.
+      return "off";
+  }
+}
+
+/**
+ * What one item's row says about itself.
+ *
+ * The distinction worth the words is `passed` with no gate status: that item was not measured. It
+ * happens legitimately — the project configures no gate command, or `gate_after_each_item` is off
+ * and this was not the last item — and a row that said a flat "passed" for both would claim a
+ * verdict that nobody ever produced.
+ */
+export function jobItemLabel(item: JobItem): string {
+  switch (item.status) {
+    case "pending":
+      return "not started";
+    case "running":
+      return "in progress";
+    case "implemented":
+      return "done, not yet measured";
+    case "passed":
+      return item.gate_status === "passed" ? "passed the tests" : "done, not measured";
+    case "failed":
+      return "did not finish";
+    case "cancelled":
+      return "cancelled";
+    case "gate_failed":
+      return "the tests went red here";
+    case "gate_errored":
+      return "the tests could not be run here";
+    default:
+      return item.status;
+  }
+}
+
+/**
+ * The feed's own words for a job event.
+ *
+ * The feed prints `kind` verbatim for everything else, which reads fine for `run_retry` and badly
+ * for `job_gate_failed`. Only the job kinds are translated; anything else falls through unchanged,
+ * so a daemon that starts emitting a new kind still shows it rather than showing nothing.
+ */
+export function feedKindLabel(kind: string): string {
+  switch (kind) {
+    case "job_started":
+      return "job started";
+    case "job_planned":
+      return "job planned its work";
+    case "job_plan_failed":
+      return "job could not plan";
+    case "job_item_failed":
+      return "job item did not finish";
+    case "job_gate_failed":
+      return "job gate";
+    case "job_waiting":
+      return "job waiting";
+    case "job_finished":
+      return "job finished";
+    case "job_stopped":
+      return "job stopped";
+    case "job_expired":
+      return "job ran out of time";
+    case "job_cancelled":
+      return "job cancelled";
+    case "job_interrupted":
+      return "job interrupted";
+    case "job_failed":
+      return "job failed";
+    default:
+      return kind;
+  }
 }

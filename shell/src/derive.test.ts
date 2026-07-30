@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import type { Budget, ClassTally, ProjectSummary } from "./api";
+import type { Budget, ClassTally, JobItem, ProjectSummary } from "./api";
 import {
   agreementRate,
   autopilotState,
   base64ToBytes,
   budgetStatusLabel,
   classifierVerdictLabel,
+  feedKindLabel,
   formatBytes,
   formatUsd,
   groupScoreboardByMode,
+  jobEndingLabel,
+  jobIsLive,
+  jobItemLabel,
+  jobItemTone,
+  jobProgress,
+  jobStageLabel,
   killSwitchLabel,
   mailLabel,
   mailTone,
@@ -484,5 +491,98 @@ describe("shadow review asks the question the gate actually scores", () => {
     expect(classifierVerdictLabel("pending_approval")).toBe("would ask you");
     // A verdict the daemon gains later still renders, rather than vanishing from the row.
     expect(classifierVerdictLabel("quarantine")).toBe("would quarantine");
+  });
+});
+
+describe("jobs", () => {
+  const item = (over: Partial<JobItem> = {}): JobItem => ({
+    ordinal: 0,
+    description: "an item",
+    status: "pending",
+    run_id: null,
+    gate_status: null,
+    ...over,
+  });
+
+  it("never lets a gate that could not run read as a gate that failed", () => {
+    // The pair the daemon keeps apart from gate.rs all the way up to jobs.status. A non-zero exit
+    // says the code is broken; a command that would not start says nothing was ever measured.
+    // Collapsing them here, at the last step, wastes every one of those and tells somebody their
+    // tests failed when no test ever ran.
+    const red = jobEndingLabel("gate_failed");
+    const unmeasured = jobEndingLabel("gate_errored");
+    expect(red).not.toBe(unmeasured);
+    expect(unmeasured).toContain("nothing was measured");
+    expect(red).toContain("red");
+  });
+
+  it("keeps running out of time apart from running out of money", () => {
+    // One means the clock beat it and the rest of the list is still worth doing; the other means
+    // starting again today stops in the same place. Same-looking rows, opposite next moves.
+    expect(jobEndingLabel("expired")).toContain("time");
+    expect(jobEndingLabel("stopped")).toContain("budget");
+  });
+
+  it("shows an ending it has never heard of rather than swallowing it", () => {
+    // A shell can be older than the daemon it talks to. An unrecognised ending is still an ending,
+    // and hiding it would leave the row looking unfinished forever.
+    expect(jobEndingLabel("quarantined")).toBe("quarantined");
+  });
+
+  it("says which kind of waiting a waiting job is doing", () => {
+    // `waiting` covers a budget window that will reopen and a slot another run holds, and those
+    // ask opposite things of the reader. A bare "waiting" makes them guess.
+    expect(jobStageLabel("waiting", "budget")).toContain("budget");
+    expect(jobStageLabel("waiting", "slot")).toContain("something else");
+    expect(jobStageLabel("waiting", "attention")).toContain("keyboard");
+    // A reason from a newer daemon still renders as waiting rather than as an ending.
+    expect(jobStageLabel("waiting", "moon-phase")).toBe("waiting to continue");
+  });
+
+  it("hands a finished job's row to the ending vocabulary", () => {
+    expect(jobStageLabel("gate_errored", null)).toBe(jobEndingLabel("gate_errored"));
+    expect(jobStageLabel("planning", null)).toContain("what to do");
+  });
+
+  it("counts only items that were actually finished", () => {
+    // `implemented` means the node finished and the gate has not measured it yet — which is the
+    // whole reason the gate runs between items. Counting it would let the bar reach the end with a
+    // red gate still to come.
+    const progress = jobProgress([
+      item({ status: "passed" }),
+      item({ status: "implemented" }),
+      item({ status: "pending" }),
+    ]);
+    expect(progress).toEqual({ done: 1, total: 3 });
+  });
+
+  it("does not claim a verdict for an item nothing measured", () => {
+    // Legitimate: the project configures no gate command, or gate_after_each_item is off and this
+    // was not the last item. A flat "passed" for both would claim a verdict nobody produced.
+    expect(jobItemLabel(item({ status: "passed", gate_status: "passed" }))).toContain("tests");
+    expect(jobItemLabel(item({ status: "passed" }))).toBe("done, not measured");
+  });
+
+  it("tells a stopped item from an unfinished one in its tone", () => {
+    expect(jobItemTone("passed")).toBe("active");
+    expect(jobItemTone("running")).toBe("pending");
+    expect(jobItemTone("gate_errored")).toBe("paused");
+    expect(jobItemTone("pending")).toBe("off");
+    expect(jobItemTone("something-new")).toBe("off");
+  });
+
+  it("knows which statuses still hold the project", () => {
+    expect(jobIsLive("waiting")).toBe(true);
+    expect(jobIsLive("implementing")).toBe(true);
+    expect(jobIsLive("cancelled")).toBe(false);
+    expect(jobIsLive("completed")).toBe(false);
+  });
+
+  it("translates job feed kinds and leaves every other kind alone", () => {
+    expect(feedKindLabel("job_gate_failed")).toBe("job gate");
+    expect(feedKindLabel("job_expired")).toBe("job ran out of time");
+    // The feed prints kinds verbatim for everything else, and a daemon that starts emitting a new
+    // one must still show it rather than showing nothing.
+    expect(feedKindLabel("run_retry")).toBe("run_retry");
   });
 });
