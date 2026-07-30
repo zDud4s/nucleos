@@ -782,7 +782,8 @@ pub async fn create_run_inner(
                 GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
             }
         };
-        let info = match crate::worktree::create(std::path::Path::new(project_root), id).await {
+        let owner = crate::worktree::Owner::Run(id);
+        let info = match crate::worktree::create(std::path::Path::new(project_root), owner).await {
             Ok(info) => info,
             Err(error) => {
                 fail_provisioning(
@@ -803,7 +804,7 @@ pub async fn create_run_inner(
         let worktree_path = info.path.to_string_lossy().into_owned();
         if let Err(error) = crate::worktree::record(
             &state.pool,
-            id,
+            owner,
             worktree_project_id,
             project_root,
             &worktree_path,
@@ -899,7 +900,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 
     let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
         "SELECT project_id, project_root, path
-         FROM worktrees WHERE run_id = ? AND removed_at IS NULL",
+         FROM worktrees WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
     )
     .bind(original_run_id)
     .fetch_optional(&state.pool)
@@ -936,7 +937,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
-    sqlx::query("UPDATE worktrees SET run_id=? WHERE run_id=?")
+    sqlx::query("UPDATE worktrees SET owner_id=? WHERE owner_kind='run' AND owner_id=?")
         .bind(resume_id)
         .bind(original_run_id)
         .execute(&mut *tx)
@@ -1502,8 +1503,8 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO worktrees
-             (run_id, project_id, project_root, path, branch, created_at)
-             VALUES (?, 'proj', ?, ?, ?, ?)",
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', ?, ?, ?, ?)",
         )
         .bind(original_run_id)
         .bind(project_root)
@@ -1566,7 +1567,7 @@ mod tests {
         assert_eq!(resume_run.3, "worktree");
 
         let transferred_run_id =
-            sqlx::query_scalar::<_, i64>("SELECT run_id FROM worktrees WHERE path = ?")
+            sqlx::query_scalar::<_, i64>("SELECT owner_id FROM worktrees WHERE owner_kind = 'run' AND path = ?")
                 .bind(worktree_path.to_string_lossy().as_ref())
                 .fetch_one(&state.pool)
                 .await
@@ -2062,7 +2063,7 @@ mod tests {
         assert_eq!(PathBuf::from(&run_cwd), spawn_cwd);
 
         let (worktree_path, branch): (String, String) =
-            sqlx::query_as("SELECT path, branch FROM worktrees WHERE run_id = ?")
+            sqlx::query_as("SELECT path, branch FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2125,7 +2126,7 @@ mod tests {
         assert_eq!(gate_status.as_deref(), Some("passed"));
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2164,7 +2165,7 @@ mod tests {
         assert_eq!(feed_kind.as_deref(), Some("worktree_gate_failed"));
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2212,7 +2213,7 @@ mod tests {
         );
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2261,7 +2262,7 @@ mod tests {
         assert_eq!(feed_kind, "worktree_gate_failed");
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2311,7 +2312,7 @@ mod tests {
         assert_eq!(feed_kind, "worktree_run_completed");
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await

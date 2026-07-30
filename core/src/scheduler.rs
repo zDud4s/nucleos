@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(mode, "worktree");
         assert_eq!(project_id.as_deref(), Some("proj"));
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(run_id)
                 .fetch_one(&state.pool)
                 .await

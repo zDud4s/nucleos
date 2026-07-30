@@ -3786,8 +3786,8 @@ mod tests {
         let original_run_id = result.last_insert_rowid();
         sqlx::query(
             "INSERT INTO worktrees
-             (run_id, project_id, project_root, path, branch, created_at)
-             VALUES (?, 'proj', 'C:/repos/proj', 'C:/worktrees/proj/run-paused', ?, ?)",
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', 'C:/repos/proj', 'C:/worktrees/proj/run-paused', ?, ?)",
         )
         .bind(original_run_id)
         .bind(format!("nucleos/run-{original_run_id}"))
