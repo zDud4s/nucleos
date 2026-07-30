@@ -1,7 +1,9 @@
 # The eval task table. Tab-separated; `#` starts a comment; adding a task is one line.
 #
 # id              short, stable, quoted in ablation results
-# reference       the commit that fixes the task AND adds the test that catches it
+# reference       the commit the held-out test is read from, and the commit the base is
+#                 built from -- either `reference~1` (natural base) or `reference` with
+#                 `bases/<id>.patch` applied (synthetic base). See base.sh.
 # test_path       the full Rust path of that test, as `cargo test -- --exact` wants it
 # test_file       the file the test lives in, relative to the repo root, in the reference
 #
@@ -9,5 +11,11 @@
 # own copy of it -- however it got there -- is deleted before the reference version is
 # grafted in, so an agent cannot score by writing a test that passes.
 #
+# A row is not a task until `scripts/eval/verify-task.sh` has shown three things by
+# running them: the base compiles, the held-out test FAILS on the base, and it PASSES
+# on the reference. Two earlier rows were removed for being neither.
+#
 # id	reference	test_path	test_file
+T1	41e9a56	triage::tests::an_exhausted_budget_blocks_triage	core/src/triage.rs
 T2	58e4864	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs
+T3	41e9a56	runs::tests::a_triage_run_uses_the_local_runner_when_one_is_configured	core/src/runs.rs

@@ -7,3 +7,10 @@
 # The task table is split on tabs; a trailing CR would ride along on the last
 # field of every row.
 *.tsv text eol=lf
+
+# A base patch is applied to a tree checked out on this machine, where
+# core.autocrlf=true. `git apply` matches context lines literally, so a patch
+# that arrived as CRLF while the tree it patches is CRLF-on-disk-but-LF-in-git
+# fails on every hunk. Pin it, and the one thing that must not vary stops
+# varying.
+bases/*.patch text eol=lf
