@@ -67,6 +67,29 @@ func Message(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, er
 	}, nil
 }
 
+// SentMessage builds one delivery record for a message the USER wrote.
+//
+// The sent folder is read for a different reason than the inbox: there, the interesting party is
+// the sender; here it is the recipient, because writing to someone is what makes them a known
+// correspondent. Recipients are therefore forwarded only from this path — an inbox message's
+// `To:` line names people the user did not choose to tell us about, and the núcleo discards it
+// anyway.
+func SentMessage(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, error) {
+	message, err := Message(raw, uid, internalDate)
+	if err != nil {
+		return daemon.Message{}, err
+	}
+
+	parsed, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		return daemon.Message{}, err
+	}
+	if to := strings.TrimSpace(parsed.Header.Get("To")); to != "" {
+		message.Headers["to"] = to
+	}
+	return message, nil
+}
+
 // Truncate caps a body without splitting a UTF-8 character.
 func Truncate(body string) string {
 	if len(body) <= MaxBodyBytes {

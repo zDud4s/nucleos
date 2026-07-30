@@ -14,6 +14,36 @@ func at(t string) time.Time {
 	return parsed
 }
 
+func TestSentMessageForwardsRecipients(t *testing.T) {
+	raw := []byte("From: Ana <ana@example.test>\r\n" +
+		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
+		"Subject: hello\r\n\r\nbody\r\n")
+
+	message, err := SentMessage(raw, 7, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipients := message.Headers["to"]
+	if !strings.Contains(recipients, "maria@example.test") ||
+		!strings.Contains(recipients, "oncall@example.test") {
+		t.Fatalf("to header = %q, want both recipients", recipients)
+	}
+}
+
+func TestInboxMessageKeepsRecipientsOut(t *testing.T) {
+	raw := []byte("From: Ana <ana@example.test>\r\n" +
+		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
+		"Subject: hello\r\n\r\nbody\r\n")
+
+	message, err := Message(raw, 7, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := message.Headers["to"]; ok {
+		t.Fatalf("headers = %+v, inbox must not forward recipients", message.Headers)
+	}
+}
+
 // `received_at` comes from the server's INTERNALDATE, never the `Date:` header — the sender writes
 // that one, and it governs the núcleo's backfill cutoff and retention. A hostile value there would
 // decide whether their own message is triaged or filed.

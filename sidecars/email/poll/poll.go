@@ -31,6 +31,19 @@ type Fetcher interface {
 	Fetch(uid imapv2.UID) (imap.Raw, error)
 }
 
+// Extractor turns raw bytes into a delivery record. The inbox and the sent folder use different
+// ones because they are interested in different parties.
+type Extractor func(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, error)
+
+// ExtractorFor picks the reader for a target's direction.
+func ExtractorFor(direction string) Extractor {
+	if direction == "outbound" {
+		return extract.SentMessage
+	}
+	// The inbox reader is the safe default: unknown directions must not expose unchosen recipients.
+	return extract.Message
+}
+
 type Target struct {
 	Mailbox   string
 	Direction string
@@ -70,7 +83,7 @@ func Cycle(targets []Target, poll func(Target) error) []error {
 // A message that cannot be parsed is a DECISION, not a failure: it is recorded as skipped, the
 // watermark passes it, and the user is told. Otherwise one corrupt message stalls the mailbox
 // forever.
-func Collect(fetcher Fetcher, uids []imapv2.UID, limit int) (
+func Collect(fetcher Fetcher, uids []imapv2.UID, limit int, extractor Extractor) (
 	messages []daemon.Message,
 	skipped []daemon.Skipped,
 	maxExamined uint32,
@@ -86,7 +99,7 @@ func Collect(fetcher Fetcher, uids []imapv2.UID, limit int) (
 			break
 		}
 
-		message, err := extract.Message(raw.Body, raw.UID, raw.InternalDate)
+		message, err := extractor(raw.Body, raw.UID, raw.InternalDate)
 		if err != nil {
 			skipped = append(skipped, daemon.Skipped{
 				UID:    raw.UID,
@@ -167,7 +180,12 @@ func Once(cfg config.Config, client *daemon.Client, target Target) error {
 	}
 	log.Printf("email: %s has %d message(s) to read", target.Mailbox, len(uids))
 
-	messages, skipped, maxExamined := Collect(conn, uids, MaxPerBatch)
+	messages, skipped, maxExamined := Collect(
+		conn,
+		uids,
+		MaxPerBatch,
+		ExtractorFor(target.Direction),
+	)
 	if maxExamined == 0 {
 		// Nothing was read all the way through; delivering would move the cursor over mail nobody
 		// examined.

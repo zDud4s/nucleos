@@ -18,6 +18,9 @@ const defaultDaemonURL = "http://127.0.0.1:8791"
 //go:embed mailbox.json
 var mailboxJSON []byte
 
+//go:embed sent.json
+var sentJSON []byte
+
 func main() {
 	mailbox := flag.String("mailbox", "INBOX", "mailbox name to seed")
 	dryRun := flag.Bool("dry-run", false, "print the batch without delivering it")
@@ -53,6 +56,15 @@ func main() {
 func seededBatch(mailbox string) (daemon.Batch, error) {
 	var batch daemon.Batch
 	if err := json.Unmarshal(mailboxJSON, &batch); err != nil {
+		return daemon.Batch{}, err
+	}
+	batch.Mailbox = mailbox
+	return batch, nil
+}
+
+func seededSentBatch(mailbox string) (daemon.Batch, error) {
+	var batch daemon.Batch
+	if err := json.Unmarshal(sentJSON, &batch); err != nil {
 		return daemon.Batch{}, err
 	}
 	batch.Mailbox = mailbox

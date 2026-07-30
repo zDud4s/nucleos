@@ -401,7 +401,12 @@ pub async fn ingest_batch(
         let to_addrs = match direction {
             crate::contacts::MessageDirection::Inbound => None,
             crate::contacts::MessageDirection::Outbound => {
-                message.headers.get("to").map(String::as_str)
+                // As in classify_noise, a casing bug on the Go side must not switch this off silently.
+                message
+                    .headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("to"))
+                    .map(|(_, value)| value.as_str())
             }
         };
         let triaged_at = entry.triage_class.map(|_| now_str.as_str());
@@ -1304,6 +1309,55 @@ mod tests {
             "Sent",
             1,
             23,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let to_addrs: Option<String> =
+            sqlx::query_scalar("SELECT to_addrs FROM emails WHERE mailbox = 'Sent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let first_profile = crate::contacts::profile_for(&pool, first)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let second_profile = crate::contacts::profile_for(&pool, second)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let stored_both = to_addrs
+            .as_deref()
+            .is_some_and(|stored| stored.contains(first) && stored.contains(second));
+
+        assert_eq!(
+            (stored_both, first_profile, second_profile),
+            (true, Some((0, true)), Some((0, true)))
+        );
+    }
+
+    // The noise gate above looks headers up case-insensitively because a casing bug on the Go side
+    // should not be able to switch that gate off silently. Recipients need the same protection,
+    // especially because a hand-written demo fixture leaves casing to a human.
+    #[tokio::test]
+    async fn um_cabecalho_to_com_outra_capitalizacao_ainda_conta() {
+        let pool = test_pool().await;
+        let first = "primeiro.destinatario@example.com";
+        let second = "segundo.destinatario@example.com";
+        let to_header = format!("{first}, {second}");
+        let mut sent = message(24);
+        sent.headers.insert("To".into(), to_header);
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            24,
             &[],
             &[sent],
             14,
