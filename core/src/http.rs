@@ -425,6 +425,10 @@ struct EmailDetail {
     triage_class: Option<String>,
     triage_summary: Option<String>,
     triaged_at: Option<String>,
+    /// What the model answered; NULL when the row was never triaged.
+    model_class: Option<String>,
+    /// Which rule decided the stored class; NULL when none fired or the row was never triaged.
+    priority_rule: Option<String>,
     /// NULL once retention has pruned it (§7.2), which is a state the reader must show rather than
     /// mistake for an empty message.
     body_text: Option<String>,
@@ -445,7 +449,7 @@ async fn get_email(
 ) -> Result<Json<EmailDetailResponse>, StatusCode> {
     let message: EmailDetail = sqlx::query_as(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
-                triaged_at, body_text, has_attachments
+                triaged_at, model_class, priority_rule, body_text, has_attachments
            FROM emails WHERE id = ?",
     )
     .bind(id)
@@ -2171,6 +2175,27 @@ mod tests {
         assert_eq!(detail["body_text"], "o texto que interessa");
         assert_eq!(detail["attachments"][0]["filename"], "cotacao.pdf");
         assert_eq!(detail["attachments"][0]["size_bytes"], 4096);
+    }
+
+    #[tokio::test]
+    async fn abrir_a_mensagem_mostra_a_regra_que_decidiu() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, body_text,
+                                 received_at, ingested_at, triage_class, model_class, priority_rule)
+             VALUES ('<priority-audit@x>', 'INBOX', 1, 77, 'sender@example.com', 'body',
+                     '2026-07-30T10:00:00+00:00', '2026-07-30T10:00:00+00:00',
+                     'action', 'urgent', 'first-contact')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let (status, message) = get_email_detail(state, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(message["model_class"], "urgent");
+        assert_eq!(message["priority_rule"], "first-contact");
     }
 
     /// `/email/queue` must keep winning over `/email/{id}`, or listing the mailbox starts trying to

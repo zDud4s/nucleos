@@ -765,28 +765,35 @@ async fn apply_verdicts(
             override_verdict.as_deref(),
         );
 
+        // A stored class alone cannot be explained; calibration must compare the model's answer
+        // with the rule-adjusted class to ask whether the derived rule was right.
         // The body goes only in the steady state; the default keeps it for the calibration week.
         if retain_bodies_days == 0 {
             sqlx::query(
                 "UPDATE emails SET triage_class = ?, triage_summary = ?, triaged_at = ?,
+                                   model_class = ?, priority_rule = ?,
                                    triage_run_id = NULL, body_text = NULL
                   WHERE id = ?",
             )
             .bind(triage_class.class)
             .bind(&verdict.summary)
             .bind(&now_str)
+            .bind(&verdict.class)
+            .bind(triage_class.rule)
             .bind(verdict.id)
             .execute(pool)
             .await?;
         } else {
             sqlx::query(
                 "UPDATE emails SET triage_class = ?, triage_summary = ?, triaged_at = ?,
-                                   triage_run_id = NULL
+                                   model_class = ?, priority_rule = ?, triage_run_id = NULL
                   WHERE id = ?",
             )
             .bind(triage_class.class)
             .bind(&verdict.summary)
             .bind(&now_str)
+            .bind(&verdict.class)
+            .bind(triage_class.rule)
             .bind(verdict.id)
             .execute(pool)
             .await?;
@@ -1970,6 +1977,142 @@ mod tests {
             established_class.as_deref(),
             Some("urgent"),
             "the derived rule must not demote an established sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn o_registo_diz_o_que_o_modelo_disse_e_quem_decidiu() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let sender = "new.sender@example.com";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(sender)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let verdicts = [Verdict {
+            id: ids[0],
+            class: "urgent".into(),
+            summary: "first contact".into(),
+        }];
+
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let stored: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT triage_class, model_class, priority_rule FROM emails WHERE id = ?",
+        )
+        .bind(ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            (
+                Some("action".into()),
+                Some("urgent".into()),
+                Some("first-contact".into())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sem_regra_o_registo_nao_inventa_uma() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let sender = "established.sender@example.com";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(sender)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, sender, None, &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, sender, None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let verdicts = [Verdict {
+            id: ids[0],
+            class: "info".into(),
+            summary: "known contact".into(),
+        }];
+
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let stored: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT triage_class, model_class, priority_rule FROM emails WHERE id = ?",
+        )
+        .bind(ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, (Some("info".into()), Some("info".into()), None));
+    }
+
+    #[tokio::test]
+    async fn uma_sobreposicao_humana_fica_no_registo() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let sender = "Pinned Person <PINNED@example.com>";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(sender)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, sender, None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let contact_id: i64 =
+            sqlx::query_scalar("SELECT contact_id FROM contact_addresses WHERE address = ?")
+                .bind(crate::contacts::normalize_address(sender))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO contact_overrides (contact_id, verdict, set_at) VALUES (?, 'pin', ?)",
+        )
+        .bind(contact_id)
+        .bind(&received_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let verdicts = [Verdict {
+            id: ids[0],
+            class: "action".into(),
+            summary: "human pin".into(),
+        }];
+
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let stored: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT triage_class, model_class, priority_rule FROM emails WHERE id = ?",
+        )
+        .bind(ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            (
+                Some("urgent".into()),
+                Some("action".into()),
+                Some("human-pin".into())
+            )
         );
     }
 
