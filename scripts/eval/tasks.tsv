@@ -1,0 +1,13 @@
+# The eval task table. Tab-separated; `#` starts a comment; adding a task is one line.
+#
+# id              short, stable, quoted in ablation results
+# reference       the commit that fixes the task AND adds the test that catches it
+# test_path       the full Rust path of that test, as `cargo test -- --exact` wants it
+# test_file       the file the test lives in, relative to the repo root, in the reference
+#
+# The reference commit is the only place the test is ever read from. A candidate tree's
+# own copy of it -- however it got there -- is deleted before the reference version is
+# grafted in, so an agent cannot score by writing a test that passes.
+#
+# id	reference	test_path	test_file
+T2	58e4864	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs
