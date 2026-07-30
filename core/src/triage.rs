@@ -369,10 +369,14 @@ pub struct LoopState {
 }
 
 /// Messages waiting with no batch holding them.
+///
+/// Mail the user wrote is a source of facts about a correspondent, not something to be judged.
+/// Sending it to the model would spend a run only to learn that the user's own message is not
+/// urgent, while also putting their own subject lines in the prompt.
 async fn pending_rows(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<PendingRow>> {
     let raw: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT id, ingested_at, infra_failures FROM emails
-          WHERE triage_class IS NULL AND triage_run_id IS NULL",
+          WHERE triage_class IS NULL AND triage_run_id IS NULL AND direction = 'inbound'",
     )
     .fetch_all(pool)
     .await?;
@@ -1273,12 +1277,17 @@ pub async fn prune(
 
     let row_cutoff = (now - chrono::Duration::days(ROW_RETENTION_DAYS)).to_rfc3339();
     let failed_cutoff = (now - chrono::Duration::days(FAILED_ROW_RETENTION_DAYS)).to_rfc3339();
+    // Expiring an outbound row costs nothing: the facts it produced were accumulated into
+    // `contact_addresses` at ingestion and are not stored here. That is why the design accumulates
+    // them instead of aggregating over retained mail.
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM emails
-          WHERE triage_class IS NOT NULL
-            AND ((triage_class IN {CONTENT_CLASSES} AND COALESCE(triaged_at, ingested_at) < ?)
-              OR (triage_class = 'failed' AND COALESCE(triaged_at, ingested_at) < ?))"
+          WHERE (direction = 'outbound' AND COALESCE(triaged_at, ingested_at) < ?)
+             OR (triage_class IS NOT NULL
+                 AND ((triage_class IN {CONTENT_CLASSES} AND COALESCE(triaged_at, ingested_at) < ?)
+                   OR (triage_class = 'failed' AND COALESCE(triaged_at, ingested_at) < ?)))"
     )))
+    .bind(&row_cutoff)
     .bind(&row_cutoff)
     .bind(&failed_cutoff)
     .execute(pool)
@@ -1484,6 +1493,79 @@ mod tests {
             ids.push(id);
         }
         ids
+    }
+
+    #[tokio::test]
+    async fn o_correio_enviado_nao_entra_na_fila_de_triagem() {
+        let state = triage_state().await;
+        let now = chrono::Utc::now();
+        let inbound = crate::email::IncomingMessage {
+            message_id: Some("<inbound-pending@x>".into()),
+            uid: 1,
+            from_addr: "remetente@example.com".into(),
+            from_name: None,
+            subject: Some("Pedido recebido".into()),
+            received_at: now.to_rfc3339(),
+            body_text: Some("Preciso de uma resposta.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        let mut outbound = crate::email::IncomingMessage {
+            message_id: Some("<outbound-pending@x>".into()),
+            uid: 2,
+            from_addr: "utilizador@example.com".into(),
+            from_name: None,
+            subject: Some("Resposta enviada".into()),
+            received_at: now.to_rfc3339(),
+            body_text: Some("Aqui vai a resposta.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        outbound
+            .headers
+            .insert("to".into(), "destinatario@example.com".into());
+
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            inbound.uid,
+            &[],
+            &[inbound],
+            14,
+            now,
+        )
+        .await
+        .unwrap();
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            outbound.uid,
+            &[],
+            &[outbound],
+            14,
+            now,
+        )
+        .await
+        .unwrap();
+
+        let inbound_id: i64 = sqlx::query_scalar("SELECT id FROM emails WHERE mailbox = 'INBOX'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let pending_ids: Vec<i64> = pending_rows(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert_eq!(pending_ids, vec![inbound_id]);
     }
 
     async fn claimed_by(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
@@ -2316,6 +2398,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, vec!["<oldfailed@x>"]);
+    }
+
+    #[tokio::test]
+    async fn o_correio_enviado_e_apagado_na_mesma_janela() {
+        let state = triage_state().await;
+        let now = chrono::Utc::now();
+        let ingested_at = now - chrono::Duration::days(ROW_RETENTION_DAYS + 1);
+        let mut outbound = crate::email::IncomingMessage {
+            message_id: Some("<old-outbound@x>".into()),
+            uid: 1,
+            from_addr: "utilizador@example.com".into(),
+            from_name: None,
+            subject: Some("Mensagem antiga".into()),
+            received_at: ingested_at.to_rfc3339(),
+            body_text: Some("Conteúdo enviado.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        outbound
+            .headers
+            .insert("to".into(), "destinatario@example.com".into());
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            outbound.uid,
+            &[],
+            &[outbound],
+            14,
+            ingested_at,
+        )
+        .await
+        .unwrap();
+
+        let (_, rows_deleted) = prune(&state.pool, 14, now).await.unwrap();
+        let rows_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!((rows_deleted, rows_left), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn os_factos_do_contacto_sobrevivem_ao_prune_do_enviado() {
+        let state = triage_state().await;
+        let recipient = "contacto@example.com";
+        let now = chrono::Utc::now();
+        let ingested_at = now - chrono::Duration::days(ROW_RETENTION_DAYS + 1);
+        let mut outbound = crate::email::IncomingMessage {
+            message_id: Some("<old-outbound-contact@x>".into()),
+            uid: 1,
+            from_addr: "utilizador@example.com".into(),
+            from_name: None,
+            subject: Some("Mensagem antiga".into()),
+            received_at: ingested_at.to_rfc3339(),
+            body_text: Some("Conteúdo enviado.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        outbound.headers.insert("to".into(), recipient.into());
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            outbound.uid,
+            &[],
+            &[outbound],
+            14,
+            ingested_at,
+        )
+        .await
+        .unwrap();
+
+        let (_, rows_deleted) = prune(&state.pool, 14, now).await.unwrap();
+        let rows_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let profile = crate::contacts::profile_for(&state.pool, recipient)
+            .await
+            .unwrap();
+
+        // The mail expires, but the accumulated fact that the user wrote to this person does not.
+        assert_eq!(
+            (
+                rows_deleted,
+                rows_left,
+                profile.map(|profile| profile.outbound_ever)
+            ),
+            (1, 0, Some(true))
+        );
     }
 
     /// The prompt is the one place a mail body reaches a model, so its framing is asserted rather

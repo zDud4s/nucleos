@@ -806,6 +806,10 @@ async fn get_email_queue(
     // reorders itself while you read it is one you lose your place in. Waiting mail is marked
     // rather than floated for the same reason; the count and the button live above the list.
     //
+    // This list is the mail that came in. The user's own sent mail is held for what it says about a
+    // correspondent, not read back to them; filtering it also stops sent mail consuming
+    // `EMAIL_QUEUE_LIMIT` slots.
+    //
     // Sorting `received_at` as text is a chronological sort because the sidecar normalises the
     // server's INTERNALDATE to UTC (`...Z`), so every value shares one offset. `id` breaks ties
     // within a second, which a bulk delivery produces routinely.
@@ -816,6 +820,7 @@ async fn get_email_queue(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
                 triaged_at, has_attachments
            FROM emails
+          WHERE direction = 'inbound'
           ORDER BY received_at DESC, id DESC
           LIMIT ?",
     )
@@ -1524,6 +1529,23 @@ mod tests {
         )
     }
 
+    fn email_batch_from(
+        mailbox: &str,
+        direction: serde_json::Value,
+        messages: serde_json::Value,
+    ) -> Body {
+        Body::from(
+            serde_json::json!({
+                "mailbox": mailbox,
+                "uidvalidity": 1,
+                "max_uid_examined": 10,
+                "direction": direction,
+                "messages": messages,
+            })
+            .to_string(),
+        )
+    }
+
     fn one_message() -> serde_json::Value {
         serde_json::json!([{
             "message_id": "<a@b>",
@@ -1831,6 +1853,52 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_caixa_nao_mostra_o_que_o_utilizador_escreveu() {
+        let state = test_state().await;
+        let outbound = serde_json::json!([{
+            "message_id": "<sent@user>",
+            "uid": 10,
+            "from_addr": "utilizador@example.com",
+            "received_at": "2026-07-28T10:00:00+00:00",
+            "body_text": "Resposta enviada",
+            "headers": {"to": "destinatario@example.com"},
+        }]);
+        let inbound = serde_json::json!([{
+            "message_id": "<received@contact>",
+            "uid": 9,
+            "from_addr": "remetente@example.com",
+            "received_at": "2026-07-28T11:00:00+00:00",
+            "body_text": "Pedido recebido",
+        }]);
+
+        assert_eq!(
+            post_email(
+                state.clone(),
+                Some("test-token"),
+                email_batch_from("Sent", serde_json::json!("outbound"), outbound)
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_email(
+                state.clone(),
+                Some("test-token"),
+                email_batch_directed(serde_json::json!("inbound"), inbound)
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let queue = get_queue(state).await;
+        let senders: Vec<&str> = queue
+            .iter()
+            .map(|mail| mail["from_addr"].as_str().unwrap())
+            .collect();
+        assert_eq!(senders, vec!["remetente@example.com"]);
     }
 
     /// A mailbox reads newest-arrival-first, and a verdict does not move a message.
