@@ -12,6 +12,33 @@ use tokio::sync::Mutex;
 /// noisy suite from growing the daemon without bound. The retained bytes are the diagnostic tail.
 const GATE_OUTPUT_CAP: usize = 1024 * 1024;
 
+/// Floor for the drain deadline, so a command that exits just as its own timeout expires still gets
+/// a moment to have its output collected rather than losing the tail to arithmetic.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// What a finished gate process's exit status means, as a pure function of that status.
+///
+/// Split out because the async body around it spawns a real process, so the classification could
+/// only ever be tested by arranging a subprocess to die in the right way — which for the signal case
+/// means depending on POSIX signals from a suite that also runs on Windows.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitVerdict {
+    Passed,
+    Failed(i32),
+    /// No exit code at all: a signal took the process. The OOM killer reaping a large suite is the
+    /// common case. That is a measurement that never finished, not a suite that failed — reporting
+    /// it as `Failed` is the exact conflation `GateOutcome`'s variants exist to prevent.
+    Signalled,
+}
+
+fn classify_exit(code: Option<i32>) -> ExitVerdict {
+    match code {
+        Some(0) => ExitVerdict::Passed,
+        Some(code) => ExitVerdict::Failed(code),
+        None => ExitVerdict::Signalled,
+    }
+}
+
 /// The result of measuring a repository gate.
 ///
 /// `Failed` and `Errored` are deliberately distinct: a non-zero exit says the code is broken,
@@ -68,13 +95,12 @@ pub async fn run_gate(worktree: &Path, command: &str, timeout: Duration) -> Gate
     let stdout_task = tokio::spawn(drain_output(stdout, Arc::clone(&output)));
     let stderr_task = tokio::spawn(drain_output(stderr, Arc::clone(&output)));
 
+    let started = std::time::Instant::now();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            if let Some(killer) = tree_killer.as_mut() {
-                killer.disarm();
-            }
-            status
-        }
+        // Deliberately NOT disarming the killer here. `child.wait()` returning says the direct child
+        // exited, not that its pipes closed, and the drain below still needs a way to take down
+        // whatever is holding them.
+        Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             if let Some(killer) = tree_killer.as_mut() {
                 killer.kill_now();
@@ -99,29 +125,54 @@ pub async fn run_gate(worktree: &Path, command: &str, timeout: Duration) -> Gate
         }
     };
 
-    for task in [stdout_task, stderr_task] {
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return GateOutcome::Errored {
-                    reason: format!("failed to capture gate output: {error}"),
-                };
+    // Draining needs its own bound. `drain_output` reads until EOF, and EOF arrives only when EVERY
+    // holder of the write end has closed it — a background process the gate script left behind
+    // inherited that handle and keeps it open after the direct child is gone. Nothing above this
+    // call has a deadline: `runs.rs` wraps the agent run in one but not the gate, so blocking here
+    // would leave the run row `running` for ever and migration 0009 would then refuse every later
+    // worktree run for that project, until a daemon restart reconciled it.
+    let drain = async {
+        for task in [stdout_task, stderr_task] {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(format!("failed to capture gate output: {error}")),
+                Err(error) => return Err(format!("gate output task failed: {error}")),
             }
-            Err(error) => {
-                return GateOutcome::Errored {
-                    reason: format!("gate output task failed: {error}"),
-                };
+        }
+        Ok(())
+    };
+    let drain_budget = timeout.saturating_sub(started.elapsed()).max(DRAIN_GRACE);
+    match tokio::time::timeout(drain_budget, drain).await {
+        Ok(Ok(())) => {
+            if let Some(killer) = tree_killer.as_mut() {
+                killer.disarm();
             }
+        }
+        Ok(Err(reason)) => return GateOutcome::Errored { reason },
+        // The verdict survives a stuck drain. The command ran and its status is known; only the tail
+        // is short. Returning `Errored` here would throw away a real measurement because a leftover
+        // process would not let go of a pipe. The killer stays armed, so dropping it takes the
+        // subtree down on the way out.
+        Err(_) => {
+            tracing::warn!(
+                ?drain_budget,
+                "gate output did not finish draining; reporting the verdict with a truncated tail"
+            );
         }
     }
 
-    if status.success() {
-        GateOutcome::Passed
-    } else {
-        GateOutcome::Failed {
-            exit_code: status.code().unwrap_or(-1),
+    match classify_exit(status.code()) {
+        ExitVerdict::Passed => GateOutcome::Passed,
+        ExitVerdict::Failed(exit_code) => GateOutcome::Failed {
+            exit_code,
             output: output.lock().await.render(),
-        }
+        },
+        ExitVerdict::Signalled => GateOutcome::Errored {
+            reason: format!(
+                "gate command was killed by a signal before it could report a result; captured output: {}",
+                output.lock().await.render()
+            ),
+        },
     }
 }
 
@@ -256,7 +307,7 @@ fn terminate_process_tree(pid: u32) {
 #[rustfmt::skip]
 #[cfg(test)]
 mod tests {
-    use super::{GateOutcome, run_gate};
+    use super::{ExitVerdict, GateOutcome, classify_exit, run_gate};
     use std::time::Duration;
 
     #[tokio::test]
@@ -324,5 +375,22 @@ mod tests {
             }
             GateOutcome::Passed => panic!("a gate that timed out cannot pass"),
         }
+    }
+
+    /// A signal death carries no exit code, and `unwrap_or(-1)` used to turn that into
+    /// `Failed { exit_code: -1 }` — a suite the OOM killer reaped, reported as a suite that failed.
+    /// Pure, because arranging the real thing means sending POSIX signals from a suite that also
+    /// runs on Windows.
+    #[test]
+    fn a_signal_death_is_a_measurement_that_did_not_happen() {
+        assert_eq!(classify_exit(None), ExitVerdict::Signalled);
+    }
+
+    #[test]
+    fn an_exit_code_is_taken_at_face_value() {
+        assert_eq!(classify_exit(Some(0)), ExitVerdict::Passed);
+        assert_eq!(classify_exit(Some(3)), ExitVerdict::Failed(3));
+        // -1 is a real exit code a program may choose, and must not be confused with "no code".
+        assert_eq!(classify_exit(Some(-1)), ExitVerdict::Failed(-1));
     }
 }

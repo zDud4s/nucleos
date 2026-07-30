@@ -172,6 +172,14 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
         return Ok(AutopilotRules::default());
     }
     let contents = std::fs::read_to_string(&path)?;
+    // A file with no YAML document in it -- empty, or nothing but comments -- is a fourth state, and
+    // it must land with "absent" rather than with "unreadable". serde_yaml returns EndOfStream here,
+    // which would otherwise become `GateConfig::Unreadable` and report `gate errored` on every
+    // completed run. The way an operator switches a gate off for an afternoon is to comment the
+    // `gate_command:` line out; in this repository's own config that leaves comments only.
+    if contents.trim().is_empty() {
+        return Ok(AutopilotRules::default());
+    }
     serde_yaml::from_str(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -375,6 +383,25 @@ mod tests {
 
         let rules = load_schedule_rules(dir.path()).unwrap();
         assert_eq!(rules.schedules[0].cwd, None);
+    }
+
+    /// The state between "no file" and "broken file". serde_yaml reports a document-less stream as
+    /// EndOfStream, which reads as malformed — so without this, commenting out the `gate_command:`
+    /// line (the obvious way to switch a gate off) turns every completed worktree run into
+    /// `gate errored`. Both spellings, because a comments-only file is the realistic one.
+    #[test]
+    fn schedule_rules_with_no_yaml_document_is_not_a_gate_rather_than_an_error() {
+        for contents in ["", "   \n\n", "# just a comment\n# and another\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+            std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), contents).unwrap();
+
+            let rules = load_schedule_rules(dir.path())
+                .unwrap_or_else(|e| panic!("{contents:?} must not be an error, got {e}"));
+            assert_eq!(rules.gate_command, None);
+            assert!(rules.schedules.is_empty());
+            assert!(rules.repo_triggers.is_empty());
+        }
     }
 
     #[test]
