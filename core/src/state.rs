@@ -106,6 +106,12 @@ pub struct AppState {
     pub local_triage_disabled: Option<String>,
     /// Read-only after startup, so it is shared rather than copied per clone of the state.
     pub email: Arc<EmailRuntime>,
+    /// The voice pillar's settings, its transcriber and its HTTP client, resolved once at startup.
+    ///
+    /// One field rather than three because they are read together and switched on together, and
+    /// because `VoiceRuntime::default()` means "off" — which is what keeps every test that does not
+    /// care about voice from having to know it exists. Same reasoning as `email` above.
+    pub voice: Arc<crate::voice::VoiceRuntime>,
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns
     /// (`runs::create_run`), removed when it completes/times out/is cancelled.
     pub run_handles: RunHandles,

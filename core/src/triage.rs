@@ -2654,6 +2654,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

@@ -9,6 +9,10 @@ pub struct ModelsConfig {
     /// operator explicitly names a model that can keep message bodies on the machine.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_triage_model: Option<String>,
+    /// Absent leaves voice cleanup unarmed, so a transcript is delivered raw rather than not at all.
+    /// Named here rather than in `.ai/voice.yaml` because pinning models is this file's whole job.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub voice_cleanup_model: Option<String>,
 }
 
 impl Default for ModelsConfig {
@@ -17,6 +21,7 @@ impl Default for ModelsConfig {
             claude_model: "claude-sonnet-5".to_string(),
             codex_model: "gpt-5.6-terra".to_string(),
             local_triage_model: None,
+            voice_cleanup_model: None,
         }
     }
 }
@@ -121,6 +126,106 @@ pub fn load_email_config(path: &Path) -> EmailConfig {
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "email config: could not be read; the pillar stays off");
             EmailConfig::default()
+        }
+    }
+}
+
+/// What the local model is told to do with a raw transcript.
+///
+/// The three prohibitions are the load-bearing part, and each answers a measured failure of a small
+/// model rather than a hypothetical one. Local triage found a 4B model inventing deadlines nobody
+/// wrote and inverting who was asking whom, which two forbidding sentences fixed. The third is
+/// specific to dictation: a dictated sentence is often a question, and a small model handed a question
+/// ANSWERS it — without that line, saying "will this compile?" pastes an opinion about compilation
+/// instead of the words that were said.
+pub const DEFAULT_CLEANUP_PROMPT: &str =
+    "Tidy the transcript below. Fix punctuation, capitalisation, \
+and obvious speech-to-text errors. Remove filler words and false starts.
+Do NOT add any information that is not in the transcript.
+Do NOT change the meaning, the tone, or who is asking whom.
+Do NOT answer, summarise, or comment on the content — you are an editor, not a reader.
+Keep the original language. Return only the corrected text.";
+
+/// `.ai/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
+/// pillar off without comment.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// Opt-in, like the email pillar: this one opens a microphone.
+    pub enabled: bool,
+    /// Whitespace-split into program + args, with the audio path appended last — the contract the
+    /// Telegram sidecar's transcriber already uses. Empty means there is no transcriber, which is
+    /// indistinguishable from the pillar being off and is treated as such.
+    pub stt_command: String,
+    pub hotkey: String,
+    pub memo_hotkey: String,
+    /// Dictations are a searchable record of everything said, in a pillar whose first requirement is
+    /// privacy, so they expire. Memos do not: those are documents somebody asked for.
+    pub retain_dictations_days: u8,
+    /// Terms said often and heard badly. Applied twice on purpose — as decoding bias and as a
+    /// deterministic pass — so a term is fixed even when the bias was not enough.
+    pub hints: Vec<String>,
+    pub cleanup_prompt: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_command: String::new(),
+            hotkey: "Ctrl+Alt+Space".to_string(),
+            memo_hotkey: "Ctrl+Alt+M".to_string(),
+            retain_dictations_days: 7,
+            hints: Vec::new(),
+            cleanup_prompt: DEFAULT_CLEANUP_PROMPT.to_string(),
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// Whether there is a working capability here, as opposed to a file that merely exists.
+    ///
+    /// `enabled: true` with no transcriber is not half-on, it is off: the hotkey would record and then
+    /// have nowhere to send the audio, which presents as the feature being broken rather than absent.
+    pub fn armed(&self) -> bool {
+        self.enabled && !self.stt_command.trim().is_empty()
+    }
+
+    fn validated(mut self) -> Self {
+        if self.retain_dictations_days > 30 {
+            tracing::warn!(
+                retain_dictations_days = self.retain_dictations_days,
+                "voice config: retain_dictations_days must be 0..=30; using 30"
+            );
+            self.retain_dictations_days = 30;
+        }
+        // A blank prompt would ask the model to do anything it liked with the transcript. Deleting the
+        // key is the documented way to reset, so emptying it resolves to the same default.
+        if self.cleanup_prompt.trim().is_empty() {
+            self.cleanup_prompt = DEFAULT_CLEANUP_PROMPT.to_string();
+        }
+        self
+    }
+}
+
+/// Reads `.ai/voice.yaml`. Absent, unreadable or malformed → defaults, with a warning; never an error.
+///
+/// This follows `load_email_config` rather than `load_schedule_rules`, and the choice matters in two
+/// directions: a typo in a dictation aid must not stop the daemon from starting, and "off" is the
+/// inert state for a file holding a command the daemon spawns.
+pub fn load_voice_config(path: &Path) -> VoiceConfig {
+    if !path.exists() {
+        return VoiceConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<VoiceConfig>(&text)) {
+        Ok(Ok(config)) => config.validated(),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "voice config: could not be parsed; the pillar stays off");
+            VoiceConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "voice config: could not be read; the pillar stays off");
+            VoiceConfig::default()
         }
     }
 }
@@ -319,6 +424,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_models_config(&path).unwrap().local_triage_model, None);
+    }
+
+    /// Absent and malformed must reach the SAME inert state, and neither may be an error.
+    ///
+    /// Written in the negative because the failure this guards is a daemon that will not start: this
+    /// reader deliberately follows `load_email_config`, not `load_schedule_rules`, so a typo in a
+    /// dictation aid cannot take down mail, autopilot and the API with it. The malformed case also has
+    /// to land on `armed() == false` rather than merely on defaults — the file holds a command the
+    /// daemon spawns, and "off" is the only safe reading of a file it could not understand.
+    #[test]
+    fn voice_config_absent_and_malformed_both_mean_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.yaml");
+
+        let absent = load_voice_config(&path);
+        assert!(!absent.armed());
+        assert_eq!(absent.cleanup_prompt, DEFAULT_CLEANUP_PROMPT);
+
+        std::fs::write(&path, "enabled: [this is not a bool\n  stt_command:\n").unwrap();
+        let malformed = load_voice_config(&path);
+        assert!(!malformed.armed());
+        assert_eq!(malformed, VoiceConfig::default());
+
+        std::fs::write(
+            &path,
+            "enabled: true\nstt_command: whisper-cli -m model.bin\n",
+        )
+        .unwrap();
+        assert!(load_voice_config(&path).armed());
+    }
+
+    /// `enabled: true` with nothing to transcribe with is off, not half-on.
+    ///
+    /// The direction matters: the alternative is a hotkey that records audio and then has nowhere to
+    /// send it, which reads as a broken feature rather than an absent one. A blank prompt resolves to
+    /// the default for the same reason deleting the key does — that is the documented reset.
+    #[test]
+    fn voice_enabled_without_a_transcriber_is_not_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.yaml");
+
+        std::fs::write(&path, "enabled: true\nstt_command: \"   \"\n").unwrap();
+        assert!(!load_voice_config(&path).armed());
+
+        std::fs::write(
+            &path,
+            "enabled: true\nstt_command: whisper-cli\ncleanup_prompt: \"  \"\nretain_dictations_days: 99\n",
+        )
+        .unwrap();
+        let clamped = load_voice_config(&path);
+        assert_eq!(clamped.cleanup_prompt, DEFAULT_CLEANUP_PROMPT);
+        assert_eq!(clamped.retain_dictations_days, 30);
     }
 
     #[test]

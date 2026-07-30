@@ -118,7 +118,9 @@ pub async fn readout(state: AppState) -> HealthReadout {
 
 async fn collect_readout(state: AppState) -> HealthReadout {
     let email_enabled = state.email.enabled;
-    let (pool, cli, credentials, disk, echo, telegram, email) = tokio::join!(
+    let voice_armed = state.voice.armed;
+    let stt_command = state.voice.stt_command.clone();
+    let (pool, cli, credentials, disk, echo, telegram, email, voice) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
@@ -132,8 +134,9 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             "email_sidecar_binary",
             sidecar_binary_probe("email_sidecar_binary", email_enabled),
         ),
+        run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
     );
-    let subsystems = vec![pool, cli, credentials, disk, echo, telegram, email];
+    let subsystems = vec![pool, cli, credentials, disk, echo, telegram, email, voice];
 
     HealthReadout {
         status: aggregate_state(&subsystems),
@@ -192,6 +195,33 @@ async fn pool_probe(pool: SqlitePool) -> SubsystemReadout {
 async fn cli_probe() -> SubsystemReadout {
     run_probe("cli_binary", async {
         tokio::task::spawn_blocking(resolve_cli_binary)
+            .await
+            .map_err(classify_error)?
+            .map(|_| HealthState::Ok)
+            .ok_or(FailureCategory::Missing)
+    })
+    .await
+}
+
+/// Whether the configured transcriber is a program that exists.
+///
+/// Reports readiness of configuration only, like every other probe here — it resolves the binary and
+/// does not run it. The whitespace split is load-bearing: `stt_command` is a whole command line, so
+/// handing the string to a path lookup unsplit would look for a program whose name contains its own
+/// arguments and report every configured transcriber as missing.
+///
+/// Absent config is `Ok`, not a failure. Voice being off is a state, not a fault.
+async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
+    run_probe("voice_transcriber", async move {
+        if !armed {
+            return Ok(HealthState::Ok);
+        }
+        let program = command
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        tokio::task::spawn_blocking(move || resolve_program(std::ffi::OsStr::new(&program)))
             .await
             .map_err(classify_error)?
             .map(|_| HealthState::Ok)
@@ -298,15 +328,22 @@ fn aggregate_state(subsystems: &[SubsystemReadout]) -> HealthState {
 
 fn resolve_cli_binary() -> Option<PathBuf> {
     let configured = std::env::var_os("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|| "claude".into());
-    let path = PathBuf::from(&configured);
+    resolve_program(&configured)
+}
+
+/// Finds `program` the way a shell would: as a path when it looks like one, else along `PATH`.
+///
+/// Extracted from `resolve_cli_binary` when the voice transcriber became a second configured program
+/// needing the same lookup. Both probes report configuration readiness only — neither runs anything.
+fn resolve_program(program: &std::ffi::OsStr) -> Option<PathBuf> {
+    let path = PathBuf::from(program);
 
     if path.components().count() > 1 || path.is_absolute() {
         return binary_candidate(&path);
     }
 
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .find_map(|directory| binary_candidate(&directory.join(&configured)))
+    std::env::split_paths(&paths).find_map(|directory| binary_candidate(&directory.join(program)))
 }
 
 fn binary_candidate(path: &Path) -> Option<PathBuf> {

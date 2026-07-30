@@ -563,6 +563,59 @@ fn unusable_local_answer(answer: &str) -> Option<String> {
     None
 }
 
+/// POSTs one prompt to Ollama's chat endpoint and returns the model's text.
+///
+/// Lifted out of `OllamaRunner::run_prompt` so a second local-model consumer — the voice pillar's
+/// cleanup pass — reaches the same loopback endpoint without standing up a second HTTP client and a
+/// second copy of this error handling.
+///
+/// Two parameters exist because Ollama's payload shape forces them, not for generality's sake:
+/// `format` carries a sampling grammar for callers that need one and is OMITTED from the body when
+/// `None`, because a grammar is what makes triage's JSON valid by construction and plain-text
+/// cleanup must not be constrained by one. `think` is a top-level sibling of `options` rather than a
+/// key inside it, so a caller cannot fold it into `options` and have it take effect.
+pub async fn ollama_chat(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    options: serde_json::Value,
+    format: Option<serde_json::Value>,
+    think: bool,
+) -> std::io::Result<String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+        "think": think,
+        "options": options
+    });
+    if let Some(format) = format {
+        body.as_object_mut()
+            .expect("body is constructed as an object literal above")
+            .insert("format".to_string(), format);
+    }
+
+    let response = client
+        .post(format!("{base_url}/api/chat"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(std::io::Error::other)?
+        .error_for_status()
+        .map_err(std::io::Error::other)?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(std::io::Error::other)?;
+
+    response
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| std::io::Error::other("Ollama response did not contain message.content"))
+        .map(str::to_string)
+}
+
 #[async_trait]
 impl CommandRunner for OllamaRunner {
     async fn run_prompt(
@@ -622,36 +675,19 @@ impl CommandRunner for OllamaRunner {
                 .insert("maxItems".to_string(), serde_json::json!(message_count));
         }
 
-        let response = self
-            .client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&serde_json::json!({
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": false,
-                "think": false,
-                "options": {
-                    "num_ctx": crate::triage::LOCAL_NUM_CTX,
-                    "temperature": 0
-                },
-                "format": format
-            }))
-            .send()
-            .await
-            .map_err(std::io::Error::other)?
-            .error_for_status()
-            .map_err(std::io::Error::other)?
-            .json::<serde_json::Value>()
-            .await
-            .map_err(std::io::Error::other)?;
-        let answer = response
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                std::io::Error::other("Ollama response did not contain message.content")
-            })?
-            .to_string();
+        let answer = ollama_chat(
+            &self.client,
+            &self.base_url,
+            &self.model,
+            prompt,
+            serde_json::json!({
+                "num_ctx": crate::triage::LOCAL_NUM_CTX,
+                "temperature": 0
+            }),
+            Some(format),
+            false,
+        )
+        .await?;
 
         // One shot, so there is no streaming to mirror — but a caller that reads the transcript
         // after a timeout must not find it empty just because this runner answered all at once.
@@ -1501,7 +1537,17 @@ mod tests {
         assert_eq!(*runner.calls.lock().unwrap(), 3);
     }
 
-    async fn ollama_runner_returning(answer: &'static str) -> OllamaRunner {
+    type SeenBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// Like `ollama_runner_returning`, but keeps every JSON body posted to the chat endpoint.
+    ///
+    /// The stub used to answer with a canned reply and never look at the request, which meant every
+    /// assertion here was about the OUTCOME. An edit that dropped `num_ctx`, dropped the sampling
+    /// grammar, or flipped `think` would have left all of them green — so the wire format needs a test
+    /// that reads the wire.
+    async fn ollama_runner_capturing(answer: &'static str) -> (OllamaRunner, SeenBodies) {
+        let seen: SeenBodies = SeenBodies::default();
+        let recorder = seen.clone();
         let app = axum::Router::new()
             .route(
                 "/api/show",
@@ -1511,30 +1557,51 @@ mod tests {
                     }))
                 }),
             )
-            .fallback(axum::routing::post(move || async move {
-                axum::Json(serde_json::json!({
-                    "response": answer,
-                    "message": {"role": "assistant", "content": answer},
-                    "done": true
-                }))
-            }));
+            .fallback(axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        recorder.lock().unwrap().push(body);
+                        axum::Json(serde_json::json!({
+                            "response": answer,
+                            "message": {"role": "assistant", "content": answer},
+                            "done": true
+                        }))
+                    }
+                },
+            ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let _server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
-        OllamaRunner::new(format!("http://{address}"), "qwen2".to_string())
+        (
+            OllamaRunner::new(format!("http://{address}"), "qwen2".to_string()),
+            seen,
+        )
+    }
+
+    async fn ollama_runner_returning(answer: &'static str) -> OllamaRunner {
+        ollama_runner_capturing(answer).await.0
     }
 
     async fn run_local(
         runner: &OllamaRunner,
         tool_policy: ToolPolicy,
     ) -> std::io::Result<RunOutcome> {
+        run_local_prompt(runner, tool_policy, "triage this message").await
+    }
+
+    async fn run_local_prompt(
+        runner: &OllamaRunner,
+        tool_policy: ToolPolicy,
+        prompt: &str,
+    ) -> std::io::Result<RunOutcome> {
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
         runner
             .run_prompt(
-                "triage this message",
+                prompt,
                 &[],
                 None,
                 false,
@@ -1546,6 +1613,85 @@ mod tests {
                 discard_transcript(),
             )
             .await
+    }
+
+    /// Guards the `ollama_chat` extraction, and it has to read the request because every other test
+    /// here reads only the outcome.
+    ///
+    /// Each field asserted is one whose loss is invisible downstream: without `num_ctx` Ollama
+    /// truncates the prompt in silence and mail gets filed as unreadable; without the grammar a
+    /// malformed answer reaches `parse_verdict`; with `think` on, reasoning tokens land in the
+    /// transcript. A refactor that dropped any of them would otherwise ship green.
+    #[tokio::test]
+    async fn ollama_request_body_carries_ctx_grammar_and_think() {
+        let (runner, seen) =
+            ollama_runner_capturing(r#"[{"id":1,"class":"info","summary":"monthly report"}]"#)
+                .await;
+
+        run_local(&runner, ToolPolicy::None).await.unwrap();
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("run_prompt posted a chat request");
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::triage::LOCAL_NUM_CTX as u64)
+        );
+        assert_eq!(body["options"]["temperature"].as_u64(), Some(0));
+        assert_eq!(body["think"].as_bool(), Some(false));
+        assert_eq!(body["stream"].as_bool(), Some(false));
+        assert_eq!(body["format"]["type"].as_str(), Some("array"));
+        assert_eq!(
+            body["format"]["items"]["required"],
+            serde_json::json!(["id", "class", "summary"])
+        );
+    }
+
+    /// The batch-size half of the same contract, on a prompt that actually carries message markers.
+    ///
+    /// Worth its own test because the fixed `"triage this message"` prompt every other case uses
+    /// contains none, so `message_count` is zero and the `maxItems` branch — the one that stops the
+    /// model returning verdicts for messages that were not in the batch — never executes.
+    #[tokio::test]
+    async fn ollama_request_body_bounds_items_to_the_batch() {
+        let (runner, seen) =
+            ollama_runner_capturing(r#"[{"id":1,"class":"info","summary":"monthly report"}]"#)
+                .await;
+
+        let prompt = "=== BEGIN MESSAGE id=1 ===\nfirst\n=== BEGIN MESSAGE id=2 ===\nsecond";
+        run_local_prompt(&runner, ToolPolicy::None, prompt)
+            .await
+            .unwrap();
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("run_prompt posted a chat request");
+        assert_eq!(body["format"]["minItems"].as_u64(), Some(2));
+        assert_eq!(body["format"]["maxItems"].as_u64(), Some(2));
+    }
+
+    /// A batch bigger than the probed context contract is a programming error, not a case to handle:
+    /// the alternative is letting Ollama truncate the tail and filing the messages it never saw as
+    /// unreadable.
+    #[tokio::test]
+    async fn a_batch_beyond_the_context_contract_is_refused() {
+        let (runner, _seen) = ollama_runner_capturing("[]").await;
+
+        let prompt = (0..=crate::triage::LOCAL_BATCH_MAX)
+            .map(|id| format!("=== BEGIN MESSAGE id={id} ===\nbody"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = run_local_prompt(&runner, ToolPolicy::None, &prompt)
+            .await
+            .expect_err("a prompt past LOCAL_BATCH_MAX must not reach the model");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// A local inference has no billable session. Leaving the cost unknown is not neutral:

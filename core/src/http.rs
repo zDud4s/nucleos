@@ -126,6 +126,23 @@ pub fn build_router(state: AppState) -> Router {
             post(post_email_attachment_save),
         )
         .route("/email/{id}/requeue", post(post_email_requeue))
+        // A twenty-minute memo is ~38 MB of 16 kHz PCM, and every route not given its own ceiling
+        // inherits axum's 2 MB default — which would reject precisely the long recordings that are
+        // least repeatable, and reject them the same way every time. The ceiling is derived from
+        // `voice::MAX_CAPTURE_SECONDS` rather than written out, so the two cannot drift apart.
+        .route(
+            "/voice/capture",
+            post(crate::voice::post_capture)
+                .layer(DefaultBodyLimit::max(crate::voice::max_body_bytes())),
+        )
+        .route("/voice/config", get(crate::voice::get_config))
+        .route("/voice/memos", get(crate::voice::list_memos))
+        // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
+        .route("/voice/dictations", get(crate::voice::list_dictations))
+        .route(
+            "/voice/memos/{id}",
+            get(crate::voice::get_memo).delete(crate::voice::delete_memo),
+        )
         .route("/mail-files", get(get_mail_files))
         .route("/mail-files/folder", post(post_mail_folder))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
@@ -1712,6 +1729,7 @@ mod tests {
                 local_triage_disabled: None,
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+                voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
                 progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             },
@@ -1810,6 +1828,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -2698,6 +2717,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };

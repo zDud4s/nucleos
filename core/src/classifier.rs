@@ -9,6 +9,10 @@ const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
 const SELF_GOVERNING_FILES: &[&str] = &[
     ".ai/autopilot.yaml",
+    // Holds `stt_command`, a string the daemon spawns on a hotkey press. That is the same shape as
+    // `.ai/autopilot.yaml`'s `gate_command`, and it is worse in one respect: the command runs outside
+    // any tool call this classifier ever sees, so nothing downstream would get a second look at it.
+    ".ai/voice.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
 ];
@@ -1056,6 +1060,27 @@ mod tests {
             "pending_approval",
             "self-governing-file",
         );
+    }
+
+    /// `.ai/voice.yaml` holds `stt_command`, which the daemon spawns when a hotkey is pressed.
+    ///
+    /// Without this entry the chain is green end to end: editing the file is an ordinary allowed write,
+    /// and the command it plants then runs outside any tool call the classifier ever sees — so unlike
+    /// `build.rs` or `.githooks/pre-commit`, there is no later `cargo`/`git` step to catch it either.
+    /// An autonomous run could hand itself arbitrary execution and nothing downstream would look twice.
+    #[test]
+    fn voice_yaml_is_self_governing() {
+        for tool in ["Edit", "Write"] {
+            assert_classification(
+                classify(
+                    tool,
+                    &json!({"file_path": ".ai/voice.yaml"}),
+                    Some(Path::new(r"C:\work\repo")),
+                ),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
     }
 
     #[test]

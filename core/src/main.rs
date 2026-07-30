@@ -30,7 +30,9 @@ mod shadow;
 mod sidecar;
 mod state;
 mod storage;
+mod transcribe;
 mod triage;
+mod voice;
 mod webhook;
 mod wip;
 mod worktree;
@@ -275,6 +277,53 @@ async fn main() {
         }
     };
 
+    // Relative to the working directory like the email pillar's, for the same reason: it matters where
+    // the daemon was launched from, so the "off" path has to be discoverable rather than mysterious.
+    let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
+    // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
+    //
+    // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
+    // there the alternative is sending mail bodies off-machine. Here the fallback is a raw transcript
+    // that never leaves the laptop, so the same failure should cost the polish and not the dictation —
+    // exactly what `voice::clean_up` does at runtime, decided once here at startup.
+    let voice_cleanup_model = match models_config.voice_cleanup_model.clone() {
+        Some(model) if voice_config.armed() => {
+            let probe = match reqwest::Client::new()
+                .post(format!("{}/api/show", runner::OLLAMA_BASE_URL))
+                .json(&serde_json::json!({ "model": &model }))
+                .send()
+                .await
+            {
+                Ok(response) => match response.text().await {
+                    Ok(body) => runner::interpret_context_probe(&body, voice::CLEANUP_NUM_CTX),
+                    Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
+                        "could not read the voice cleanup probe response: {error}"
+                    ))),
+                },
+                Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
+                    "could not reach the loopback Ollama endpoint: {error}"
+                ))),
+            };
+            // Reusing the triage-named decision function on purpose: it is a pure mapping from a
+            // context-probe result to an operator-readable reason, and every message it produces talks
+            // about "the local model" rather than about mail. A second copy would drift from this one.
+            match runner::local_triage_decision(probe) {
+                runner::LocalTriageDecision::Enabled => {
+                    tracing::info!(%model, "voice cleanup model enabled");
+                    Some(model)
+                }
+                runner::LocalTriageDecision::Disabled(reason) => {
+                    tracing::warn!(%model, %reason, "voice cleanup disabled; transcripts will be delivered raw");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if voice_config.armed() {
+        tracing::info!("voice pillar armed");
+    }
+
     let state = AppState {
         token: Token(token_value),
         pool,
@@ -287,6 +336,10 @@ async fn main() {
             &email_config,
             triage_sandbox,
             mail_files_root,
+        )),
+        voice: Arc::new(voice::VoiceRuntime::from_config(
+            &voice_config,
+            voice_cleanup_model,
         )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
@@ -339,6 +392,12 @@ async fn main() {
     // Spawned whether or not the pillar is enabled: the loop also owns retention, and bodies
     // already stored do not stop needing to expire because polling was switched off.
     tokio::spawn(triage::run_triage_loop(state.clone()));
+
+    // Unconditional for exactly the reason above, applied to dictations. Gating this on the pillar
+    // being armed would FREEZE the transcript history at the moment somebody switched voice off, which
+    // is the opposite of what switching it off is for — the recordings of what they said would then
+    // outlive the feature that made them.
+    tokio::spawn(voice::run_retention_loop(state.clone()));
 
     // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
     // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a
