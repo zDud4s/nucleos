@@ -11,4 +11,3 @@
 #
 # id	reference	test_path	test_file
 T2	58e4864	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs
-T1	cba1d1c	triage::tests::an_exhausted_budget_blocks_triage	core/src/triage.rs
