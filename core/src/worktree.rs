@@ -64,6 +64,20 @@ pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo
         ));
     }
 
+    // A relative root is resolved twice, against two different directories: `git -C project_root`
+    // places the worktree under the project, while every later `tokio::fs` call on the stored path
+    // resolves against the daemon's own working directory. Removal refuses a path it cannot place,
+    // so allowing one here would create a worktree that can never be cleaned up.
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "worktree root path is relative ({}) — set NUCLEOS_WORKTREE_ROOT to an absolute path",
+                root.display()
+            ),
+        ));
+    }
+
     let branch = format!("nucleos/run-{run_id}");
     let path = root.join(format!("run-{run_id}"));
     tokio::fs::create_dir_all(&root).await?;
@@ -106,6 +120,155 @@ pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Res
     }
 
     Ok(())
+}
+
+fn component_eq(left: &std::path::Component<'_>, right: &std::path::Component<'_>) -> bool {
+    if cfg!(windows) {
+        left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
+    } else {
+        left == right
+    }
+}
+
+/// Component-wise path equality.
+///
+/// String comparison gets this wrong in both directions here: git prints `C:/x/y` where we hold
+/// `C:\x\y`, and Windows paths differ in case without differing. Components normalise the
+/// separator; `component_eq` handles the case rule.
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    let left: Vec<_> = left.components().collect();
+    let right: Vec<_> = right.components().collect();
+    left.len() == right.len() && left.iter().zip(&right).all(|(a, b)| component_eq(a, b))
+}
+
+/// True when `inner` is `outer` or sits beneath it.
+///
+/// Compared by component so a sibling named `repo-backup` is not mistaken for a child of `repo`,
+/// which a string prefix would do.
+fn path_contains(outer: &Path, inner: &Path) -> bool {
+    let outer: Vec<_> = outer.components().collect();
+    let inner: Vec<_> = inner.components().collect();
+    if outer.is_empty() || inner.len() < outer.len() {
+        return false;
+    }
+    outer.iter().zip(&inner).all(|(a, b)| component_eq(a, b))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// Paths a removal must refuse, whatever the caller believes about them.
+///
+/// The orphan sweep already demands a `run-<id>` name under `worktree_root`, but that root comes
+/// from `NUCLEOS_WORKTREE_ROOT` — an environment variable — so the tree being walked is settable
+/// from outside the daemon. This is the backstop for that: a judgement about the path itself,
+/// independent of how it was reached.
+fn is_dangerous_removal_path(path: &Path, project_root: &Path) -> bool {
+    if path.to_string_lossy().trim().is_empty() {
+        return true;
+    }
+    // Every worktree this module creates is absolute. A relative one means we have lost track of
+    // what it is relative to, and would resolve against the daemon's working directory.
+    if !path.is_absolute() || path.parent().is_none() {
+        return true;
+    }
+    // Catches the path being the project itself, and the path being an ancestor of it.
+    if path_contains(path, project_root) {
+        return true;
+    }
+    if home_dir().is_some_and(|home| path_contains(path, &home)) {
+        return true;
+    }
+    // Recursing into a symlink would follow it straight out of the worktree tree.
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// What git's own bookkeeping says about a worktree path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Registration {
+    Absent,
+    Present,
+}
+
+/// Asks git whether it still holds a row for `path`.
+///
+/// This exists so the filesystem fallback never classifies a failure by reading its message.
+/// `git worktree remove`'s stderr is localised and version-dependent, and the distinction that
+/// actually matters — did git refuse, or did it start and not finish — lives in its worktree list,
+/// not in its prose. A failure to ask is an error and never `Absent`: "we could not find out" must
+/// not be allowed to read as "git has nothing".
+async fn registration(project_root: &Path, path: &Path) -> io::Result<Registration> {
+    let output = git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "git worktree list failed: {stderr}"
+        )));
+    }
+
+    let mut unreadable = false;
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(listed) = line.strip_prefix(b"worktree ") else {
+            continue;
+        };
+        match path_from_git_bytes(listed) {
+            Ok(listed) if paths_equal(&listed, path) => return Ok(Registration::Present),
+            Ok(_) => {}
+            // A path elsewhere in the list that cannot be read says nothing about this one, so keep
+            // looking — but remember it, because it could have been the match we were after.
+            Err(_) => unreadable = true,
+        }
+    }
+
+    if unreadable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git listed a worktree path that could not be read, so absence cannot be proven",
+        ));
+    }
+    Ok(Registration::Absent)
+}
+
+/// Clears git's row for a directory that is already gone, and proves it cleared.
+///
+/// Order is the whole point. `prune` only drops rows whose directory is missing, so running it
+/// while the directory still exists — which is what `remove` does — accomplishes nothing. The row
+/// then outlives the directory, and since `orphaned_worktrees` only ever sees directories, nothing
+/// lists it again and nothing prunes it: it leaks for the life of the repository.
+async fn prune_and_verify_registration_gone(project_root: &Path, path: &Path) -> io::Result<()> {
+    let output = git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("prune")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "git worktree prune failed: {stderr}"
+        )));
+    }
+
+    match registration(project_root, path).await? {
+        Registration::Absent => Ok(()),
+        Registration::Present => Err(io::Error::other(format!(
+            "git still registers {} after its directory was removed",
+            path.display()
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -232,10 +395,62 @@ async fn measure_status_paths(
     Ok(())
 }
 
+/// Whether `worktree_path` is the root of a worktree, rather than an ordinary directory that merely
+/// happens to sit inside somebody's repository.
+///
+/// `git status`, `add` and `commit` all discover the *enclosing* repository when handed a plain
+/// directory. A stray `run-<id>` under a worktree root that itself lives inside a repo — nested
+/// projects, or a `NUCLEOS_WORKTREE_ROOT` pointed somewhere inside one — would therefore make
+/// preservation stage and commit that repository's unrelated work under the daemon's name.
+///
+/// Answers `false` only on positive proof: a toplevel that exists and sits strictly above this
+/// path. Every uncertainty — git not run, path unreadable, forms that will not compare — answers
+/// `true`, because the cost of a wrong `false` is deleting a real worktree without preserving it,
+/// while the cost of a wrong `true` is the status quo.
+async fn is_worktree_root(worktree_path: &Path) -> bool {
+    let Ok(output) = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .await
+    else {
+        return true;
+    };
+    // Not inside a repository at all: there is no enclosing work to commit by mistake, and the
+    // ordinary `git status` failure below already handles it.
+    if !output.status.success() {
+        return true;
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if toplevel.is_empty() {
+        return true;
+    }
+
+    // Canonicalise both sides before comparing. Windows hands out 8.3 short names (`PC MULTI~1`)
+    // where git prints the long form, and a spurious mismatch here would read as "not a worktree".
+    let (Ok(toplevel), Ok(here)) = (
+        std::fs::canonicalize(&toplevel),
+        std::fs::canonicalize(worktree_path),
+    ) else {
+        return true;
+    };
+
+    !(path_contains(&toplevel, &here) && !paths_equal(&toplevel, &here))
+}
+
 pub(crate) async fn preserve_uncommitted(
     worktree_path: &Path,
     byte_ceiling: u64,
 ) -> io::Result<bool> {
+    if !is_worktree_root(worktree_path).await {
+        // A plain directory inside someone else's repository. Nothing here belongs to a run, and
+        // staging it would commit that repository's work — so preserve nothing and let the ordinary
+        // removal failure carry it to the filesystem fallback, which proves provenance separately.
+        return Ok(false);
+    }
+
     let status = git()
         .arg("-C")
         .arg(worktree_path)
@@ -294,6 +509,15 @@ pub(crate) async fn preserve_uncommitted(
 }
 
 pub async fn remove(project_root: &Path, path: &Path, backoff: &[Duration]) -> io::Result<()> {
+    if is_dangerous_removal_path(path, project_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to remove a worktree at a dangerous path: {}",
+                path.display()
+            ),
+        ));
+    }
     preserve_uncommitted(path, DEFAULT_PRESERVATION_BYTE_CEILING)
         .await
         .map_err(preservation_failure)?;
@@ -690,6 +914,72 @@ pub async fn orphaned_worktrees(
     Ok(orphans)
 }
 
+/// The last resort for an orphan `git worktree remove` would not take: delete the directory here.
+///
+/// Reached only when git no longer holds a row for the path, and that single condition is what
+/// makes the delete defensible. Git refuses removal for reasons that must be respected — a
+/// worktree someone locked needs `--force` twice, which `try_remove_once` deliberately does not
+/// pass — and every refusal leaves the row in place. So the row is the signal: finishing a removal
+/// git already began is repair, while deleting past one it declined is data loss. The failure's
+/// own message is not consulted, because it is localised and version-dependent.
+async fn collect_by_hand(project_root: &Path, orphan: &Path, cause: &io::Error) -> bool {
+    if is_dangerous_removal_path(orphan, project_root) {
+        tracing::warn!(
+            path = %orphan.display(),
+            %cause,
+            "refusing to recursively delete an orphan at a dangerous path"
+        );
+        return false;
+    }
+
+    match registration(project_root, orphan).await {
+        Ok(Registration::Absent) => {}
+        Ok(Registration::Present) => {
+            tracing::warn!(
+                path = %orphan.display(),
+                %cause,
+                "git still registers this worktree, so its removal was refused rather than \
+                 interrupted; leaving it for the next startup"
+            );
+            return false;
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %orphan.display(),
+                %cause,
+                %error,
+                "could not ask git whether this worktree is still registered; leaving it alone"
+            );
+            return false;
+        }
+    }
+
+    if let Err(error) = tokio::fs::remove_dir_all(orphan).await {
+        tracing::warn!(
+            path = %orphan.display(),
+            %cause,
+            %error,
+            "failed to remove an orphaned worktree directory"
+        );
+        return false;
+    }
+
+    // The directory is gone, so the orphan is collected however the bookkeeping went. Reporting
+    // otherwise would promise a retry that cannot happen — the sweep only ever finds directories,
+    // and this one no longer exists. A surviving row is still worth saying out loud: it is exactly
+    // the leak this step exists to close.
+    if let Err(error) = prune_and_verify_registration_gone(project_root, orphan).await {
+        tracing::warn!(
+            path = %orphan.display(),
+            %error,
+            "removed the orphan directory but git's registration did not clear; \
+             run `git worktree prune` in the project to drop it"
+        );
+    }
+
+    true
+}
+
 /// Sweeps orphaned worktree directories for every project the daemon knows a root for, returning how
 /// many it collected. Runs once at startup, where `reconcile_orphaned_runs` has already established
 /// that nothing from a previous life is still running.
@@ -716,7 +1006,7 @@ pub async fn reconcile_orphaned_worktrees(
             let removed = match remove(project_root, &orphan, backoff).await {
                 Ok(()) => true,
                 Err(error) if is_preservation_failure(&error) => false,
-                Err(_) => tokio::fs::remove_dir_all(&orphan).await.is_ok(),
+                Err(error) => collect_by_hand(project_root, &orphan, &error).await,
             };
             if removed {
                 collected += 1;
@@ -1098,6 +1388,20 @@ mod tests {
         let _env = WorktreeRootEnv::set(Some(&spaced_root));
         let error = match create(repo.path(), 8).await {
             Ok(_) => panic!("spaced root must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Paired with `remove`'s refusal of relative paths: if `create` accepted one, the pair would
+    /// produce a worktree nothing could ever collect.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_rejects_a_relative_root() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let _env = WorktreeRootEnv::set(Some(Path::new("relative-worktree-root")));
+        let error = match create(repo.path(), 9).await {
+            Ok(_) => panic!("relative root must be rejected"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -2251,6 +2555,262 @@ mod tests {
         assert!(
             !branches.contains(&info.branch),
             "branch should be gone, got: {branches}"
+        );
+    }
+
+    /// `git status`/`add`/`commit` discover the enclosing repository when pointed at a plain
+    /// directory, so preserving a stray `run-<id>` that sits inside one would commit that
+    /// repository's unrelated work under the daemon's name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_refuses_a_plain_directory_inside_another_repository() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let stray = repo.path().join("run-77");
+        std::fs::create_dir_all(&stray).expect("create stray directory");
+        std::fs::write(stray.join("scratch.txt"), "unrelated\n").expect("write stray file");
+        let before = commit_count(repo.path(), "HEAD");
+
+        let preserved = preserve_uncommitted(&stray, DEFAULT_PRESERVATION_BYTE_CEILING)
+            .await
+            .expect("a plain directory is not an error");
+
+        assert!(!preserved, "nothing belonging to a run was preserved");
+        assert_eq!(
+            commit_count(repo.path(), "HEAD"),
+            before,
+            "the enclosing repository must not gain a commit"
+        );
+        let status = git_stdout(
+            repo.path(),
+            &[OsStr::new("status"), OsStr::new("--porcelain")],
+        );
+        assert!(
+            status.contains("run-77"),
+            "the stray directory must be left untracked, got: {status}"
+        );
+    }
+
+    /// The counterpart: a real worktree still gets its work preserved. The guard above must not
+    /// answer "not a worktree" for the case preservation exists to serve.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_still_commits_inside_a_real_worktree() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), 78).await.expect("create worktree");
+        std::fs::write(info.path.join("work.txt"), "real work\n").expect("write work file");
+        let before = commit_count(repo.path(), &info.branch);
+
+        let preserved = preserve_uncommitted(&info.path, DEFAULT_PRESERVATION_BYTE_CEILING)
+            .await
+            .expect("preserving a real worktree should succeed");
+
+        assert!(
+            preserved,
+            "uncommitted work in a real worktree is preserved"
+        );
+        assert_eq!(commit_count(repo.path(), &info.branch), before + 1);
+    }
+
+    #[test]
+    fn path_contains_compares_components_not_string_prefixes() {
+        let base = space_free_tempdir();
+        let repo = base.path().join("repo");
+        let backup = base.path().join("repo-backup");
+
+        assert!(path_contains(base.path(), &repo));
+        assert!(path_contains(&repo, &repo));
+        assert!(!path_contains(&repo, base.path()));
+        // `repo-backup` is not inside `repo`, though its string starts the same way.
+        assert!(!path_contains(&repo, &backup));
+    }
+
+    /// git prints `C:/x/y` where the daemon holds `C:\x\y`, and the registration lookup compares
+    /// the two — so separator and case must not make the same path look like two.
+    #[cfg(windows)]
+    #[test]
+    fn paths_equal_ignores_separator_and_case_on_windows() {
+        assert!(paths_equal(
+            Path::new("C:/work/repo"),
+            Path::new(r"C:\work\repo")
+        ));
+        assert!(paths_equal(
+            Path::new(r"c:\work\REPO"),
+            Path::new(r"C:\Work\repo")
+        ));
+        assert!(!paths_equal(
+            Path::new(r"C:\work\repo"),
+            Path::new(r"C:\work\repo-backup")
+        ));
+    }
+
+    #[test]
+    fn is_dangerous_removal_path_rejects_repo_root_filesystem_root_and_home() {
+        let _lock = env_lock();
+        let root = space_free_tempdir();
+        let repo = root.path().join("repo");
+
+        assert!(is_dangerous_removal_path(Path::new(""), &repo));
+        assert!(is_dangerous_removal_path(Path::new("   "), &repo));
+        // Relative: it would resolve against the daemon's working directory, not this root.
+        assert!(is_dangerous_removal_path(Path::new("run-1"), &repo));
+        // A filesystem root has no parent.
+        let filesystem_root = root
+            .path()
+            .ancestors()
+            .last()
+            .expect("every path has a root ancestor");
+        assert!(is_dangerous_removal_path(filesystem_root, &repo));
+        // The project itself, and any ancestor of it.
+        assert!(is_dangerous_removal_path(&repo, &repo));
+        assert!(is_dangerous_removal_path(root.path(), &repo));
+        // The home directory, and any ancestor of it.
+        let home = home_dir().expect("a home directory should be set");
+        assert!(is_dangerous_removal_path(&home, &repo));
+        assert!(is_dangerous_removal_path(
+            home.parent().expect("home has a parent"),
+            &repo
+        ));
+    }
+
+    #[test]
+    fn is_dangerous_removal_path_allows_an_ordinary_run_directory() {
+        let _lock = env_lock();
+        let root = space_free_tempdir();
+        let repo = root.path().join("repo");
+        let ordinary = root.path().join("run-1");
+        std::fs::create_dir_all(&ordinary).expect("create run directory");
+
+        assert!(!is_dangerous_removal_path(&ordinary, &repo));
+    }
+
+    /// A junction rather than a symlink, because `CreateSymbolicLink` needs elevation or Developer
+    /// Mode while `mklink /J` needs neither — so the junction is both the reachable case on a
+    /// normal Windows account and the one this test can actually build. Rust reports it through
+    /// `FileType::is_symlink`, which is what the guard reads.
+    #[test]
+    fn is_dangerous_removal_path_rejects_a_linked_worktree_path() {
+        let _lock = env_lock();
+        let root = space_free_tempdir();
+        let repo = root.path().join("repo");
+        let target = root.path().join("real");
+        std::fs::create_dir(&target).expect("create link target");
+        let link = root.path().join("run-1");
+
+        #[cfg(windows)]
+        {
+            let status = Command::new("cmd")
+                .arg("/c")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&link)
+                .arg(&target)
+                .status()
+                .expect("mklink should start");
+            assert!(status.success(), "mklink /J should not need elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat the link")
+                .file_type()
+                .is_symlink(),
+            "the fixture must actually be a link, or this test proves nothing"
+        );
+        assert!(is_dangerous_removal_path(&link, &repo));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_refuses_a_dangerous_path() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+
+        // The project root itself. A caller that got this wrong would delete the repository, and
+        // `git worktree remove --force` is quite willing to be pointed at it.
+        let error = remove(repo.path(), repo.path(), &[])
+            .await
+            .expect_err("removing the project root must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            repo.path().join("seed.txt").exists(),
+            "the repository must survive"
+        );
+    }
+
+    /// The case that used to lose data. `git worktree remove --force` refuses a *locked* worktree
+    /// — removing one takes `--force` twice, which `try_remove_once` deliberately withholds — and
+    /// the old `Err(_)` arm answered that refusal by deleting the directory anyway.
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_collection_refuses_to_recurse_while_git_still_registers_the_worktree() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('project-a', 'active', ?)")
+            .bind(repo.path().to_string_lossy().as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let orphan = create(repo.path(), 44).await.expect("create worktree");
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("lock"),
+                orphan.path.as_os_str(),
+            ],
+        ));
+
+        let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(collected, 0);
+        assert!(
+            orphan.path.exists(),
+            "a worktree git refused to remove must survive the sweep"
+        );
+        assert_eq!(
+            registration(repo.path(), &orphan.path).await.unwrap(),
+            Registration::Present
+        );
+    }
+
+    /// Prune only drops rows whose directory is already missing, so running it before the
+    /// filesystem fallback — which is what `remove` does — cannot clear anything. Left unpruned
+    /// afterwards, the row outlives the directory and no later sweep ever sees it again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn prune_after_a_filesystem_removal_clears_the_registration() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), 46).await.expect("create worktree");
+        assert_eq!(
+            registration(repo.path(), &info.path).await.unwrap(),
+            Registration::Present
+        );
+
+        tokio::fs::remove_dir_all(&info.path)
+            .await
+            .expect("remove the worktree directory");
+        assert_eq!(
+            registration(repo.path(), &info.path).await.unwrap(),
+            Registration::Present
+        );
+
+        prune_and_verify_registration_gone(repo.path(), &info.path)
+            .await
+            .expect("prune should clear the row once the directory is gone");
+
+        assert_eq!(
+            registration(repo.path(), &info.path).await.unwrap(),
+            Registration::Absent
         );
     }
 }
