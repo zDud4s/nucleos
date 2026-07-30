@@ -134,6 +134,11 @@ fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("nucleos-mcp-{safe}.json"))
 }
 
+fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(config).map_err(std::io::Error::other)?;
+    crate::storage::write_atomic(path, &bytes)
+}
+
 pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
@@ -163,8 +168,7 @@ pub async fn send_message(
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe);
     let mcp_path = mcp_config_path(chat_id);
-    let config_bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
-    std::fs::write(&mcp_path, config_bytes).map_err(|e| e.to_string())?;
+    write_mcp_config(&mcp_path, &config).map_err(|e| e.to_string())?;
 
     // Assigned by the daemon and persisted with the row, exactly as `runs::create_run_inner` does
     // it, so an assistant turn is not the one kind of run that can exist without a session id. A
@@ -585,6 +589,24 @@ mod tests {
         assert_eq!(
             config["mcpServers"]["nucleos"]["args"],
             serde_json::json!(["--mcp-tools"])
+        );
+    }
+
+    #[test]
+    fn a_configuracao_mcp_e_escrita_por_inteiro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let long_path = "C:/um/caminho/deliberadamente/muito/comprido/para/nucleos-core.exe";
+        let short_path = "C:/n.exe";
+
+        write_mcp_config(&path, &build_mcp_config(long_path)).unwrap();
+        write_mcp_config(&path, &build_mcp_config(short_path)).unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["nucleos"]["command"],
+            serde_json::json!(short_path)
         );
     }
 

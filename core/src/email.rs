@@ -332,6 +332,7 @@ impl EntryClass {
 #[allow(clippy::too_many_arguments)]
 pub async fn ingest_batch(
     pool: &sqlx::SqlitePool,
+    direction: crate::contacts::MessageDirection,
     mailbox: &str,
     uidvalidity: i64,
     max_uid_examined: i64,
@@ -341,6 +342,10 @@ pub async fn ingest_batch(
     now: chrono::DateTime<chrono::Utc>,
 ) -> sqlx::Result<IngestOutcome> {
     let now_str = now.to_rfc3339();
+    let direction_value = match direction {
+        crate::contacts::MessageDirection::Inbound => "inbound",
+        crate::contacts::MessageDirection::Outbound => "outbound",
+    };
     let mut tx = pool.begin().await?;
 
     let stored: Option<(i64, i64, String)> = sqlx::query_as(
@@ -386,9 +391,31 @@ pub async fn ingest_batch(
         // calibration week (§9) has a real corpus to judge the classifier against, and dropping
         // them at classification would make that week one-way — a wrong call could never be
         // reviewed. With retention on, periodic pruning is what clears them (§7.2).
-        let body = match entry.triage_class {
-            Some(_) if retain_bodies_days == 0 => None,
-            _ => message.body_text.as_deref().map(truncate_body),
+        let body = match direction {
+            crate::contacts::MessageDirection::Outbound => None,
+            crate::contacts::MessageDirection::Inbound => match entry.triage_class {
+                Some(_) if retain_bodies_days == 0 => None,
+                _ => message.body_text.as_deref().map(truncate_body),
+            },
+        };
+        let to_addrs = match direction {
+            crate::contacts::MessageDirection::Inbound => None,
+            crate::contacts::MessageDirection::Outbound => {
+                // As in classify_noise, a casing bug on the Go side must not switch this off silently.
+                message
+                    .headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("to"))
+                    .map(|(_, value)| value.as_str())
+            }
+        };
+        // The names of files the user sent are what they wrote, not who they wrote to, and nothing
+        // reads them. SentMessage omits them, but refusing both the flag and attachment rows here
+        // keeps that guarantee if a future client sends them anyway. The flag must describe what is
+        // stored; claiming attachments while recording none would be a worse lie than either answer.
+        let has_attachments = match direction {
+            crate::contacts::MessageDirection::Inbound => message.has_attachments,
+            crate::contacts::MessageDirection::Outbound => false,
         };
         let triaged_at = entry.triage_class.map(|_| now_str.as_str());
 
@@ -396,8 +423,8 @@ pub async fn ingest_batch(
             "INSERT OR IGNORE INTO emails
                  (message_id, mailbox, uidvalidity, uid, from_addr, from_name, subject, body_text,
                   has_attachments, received_at, ingested_at, triage_class, triage_summary,
-                  triaged_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  triaged_at, direction, to_addrs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&key)
         .bind(mailbox)
@@ -407,16 +434,38 @@ pub async fn ingest_batch(
         .bind(message.from_name.as_deref())
         .bind(message.subject.as_deref())
         .bind(body)
-        .bind(i64::from(message.has_attachments))
+        .bind(i64::from(has_attachments))
         .bind(&message.received_at)
         .bind(&now_str)
         .bind(entry.triage_class)
         .bind(entry.summary.as_deref())
         .bind(triaged_at)
+        .bind(direction_value)
+        .bind(to_addrs)
         .execute(tx.as_mut())
         .await?;
 
         if result.rows_affected() == 1 {
+            match direction {
+                crate::contacts::MessageDirection::Inbound => {
+                    crate::contacts::record_inbound(
+                        &mut tx,
+                        &message.from_addr,
+                        message.from_name.as_deref(),
+                        &message.received_at,
+                    )
+                    .await?;
+                }
+                crate::contacts::MessageDirection::Outbound => {
+                    let recipients = to_addrs
+                        .into_iter()
+                        .flat_map(crate::contacts::split_address_list)
+                        .filter(|address| !address.trim().is_empty())
+                        .collect::<Vec<_>>();
+                    crate::contacts::record_outbound(&mut tx, &recipients, &message.received_at)
+                        .await?;
+                }
+            }
             ingested += 1;
             // Only for a row this batch actually created. A duplicate already has its attachments,
             // and re-inserting them would either collide on the UNIQUE or silently double a list
@@ -424,19 +473,21 @@ pub async fn ingest_batch(
             let email_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
                 .fetch_one(tx.as_mut())
                 .await?;
-            for attachment in &message.attachments {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO email_attachments
-                         (email_id, position, filename, mime_type, size_bytes)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(email_id)
-                .bind(attachment.position)
-                .bind(attachment.filename.as_deref())
-                .bind(attachment.mime_type.as_deref())
-                .bind(attachment.size_bytes)
-                .execute(tx.as_mut())
-                .await?;
+            if matches!(direction, crate::contacts::MessageDirection::Inbound) {
+                for attachment in &message.attachments {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO email_attachments
+                             (email_id, position, filename, mime_type, size_bytes)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(email_id)
+                    .bind(attachment.position)
+                    .bind(attachment.filename.as_deref())
+                    .bind(attachment.mime_type.as_deref())
+                    .bind(attachment.size_bytes)
+                    .execute(tx.as_mut())
+                    .await?;
+                }
             }
         } else {
             duplicates += 1;
@@ -1098,9 +1149,19 @@ mod tests {
         messages: &[IncomingMessage],
         max_uid_examined: i64,
     ) -> IngestOutcome {
-        ingest_batch(pool, "INBOX", 1, max_uid_examined, &[], messages, 14, now())
-            .await
-            .unwrap()
+        ingest_batch(
+            pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            max_uid_examined,
+            &[],
+            messages,
+            14,
+            now(),
+        )
+        .await
+        .unwrap()
     }
 
     async fn class_of(pool: &sqlx::SqlitePool, message_id: &str) -> Option<String> {
@@ -1142,6 +1203,274 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_ingestao_acumula_o_contacto() {
+        let pool = test_pool().await;
+        let sender = "primeiro.contacto@example.com";
+        let mut inbound = message(20);
+        inbound.from_addr = sender.into();
+
+        ingest(&pool, &[inbound], 20).await;
+
+        let profile = crate::contacts::profile_for(&pool, sender).await.unwrap();
+        assert!(
+            profile.is_some(),
+            "ingesting an inbound message must create the sender's contact profile"
+        );
+        let profile = profile.unwrap();
+        assert_eq!(profile.messages_in, 1);
+        assert!(!profile.outbound_ever);
+    }
+
+    #[tokio::test]
+    async fn um_email_duplicado_nao_conta_duas_vezes() {
+        let pool = test_pool().await;
+        let sender = "redelivery@example.com";
+        let mut inbound = message(21);
+        inbound.from_addr = sender.into();
+
+        let first = ingest(&pool, std::slice::from_ref(&inbound), 21).await;
+        let duplicate = ingest(&pool, std::slice::from_ref(&inbound), 21).await;
+        assert_eq!(first.ingested, 1);
+        assert_eq!(duplicate.ingested, 0);
+        assert_eq!(duplicate.duplicates, 1);
+
+        let profile = crate::contacts::profile_for(&pool, sender).await.unwrap();
+        assert!(
+            profile.is_some(),
+            "the first delivery must create the sender's contact profile"
+        );
+        let profile = profile.unwrap();
+        assert_eq!(
+            profile.messages_in, 1,
+            "a redelivery ignored by the email insert must not inflate contact history"
+        );
+        assert!(!profile.outbound_ever);
+    }
+
+    #[tokio::test]
+    async fn enviados_nunca_guardam_corpo() {
+        let pool = test_pool().await;
+        let secret = "rascunho confidencial que nunca deve entrar na base";
+        let mut sent = message(22);
+        sent.body_text = Some(secret.into());
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            22,
+            &[],
+            std::slice::from_ref(&sent),
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            22,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let outbound: (String, Option<String>) =
+            sqlx::query_as("SELECT direction, body_text FROM emails WHERE mailbox = 'Sent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let inbound: (String, Option<String>) =
+            sqlx::query_as("SELECT direction, body_text FROM emails WHERE mailbox = 'INBOX'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            (outbound, inbound),
+            (
+                ("outbound".to_string(), None),
+                ("inbound".to_string(), Some(secret.to_string()))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn enviados_marcam_o_trinco_sem_contar() {
+        let pool = test_pool().await;
+        let first = "primeiro.destinatario@example.com";
+        let second = "segundo.destinatario@example.com";
+        let to_header = format!("{first}, {second}");
+        let mut sent = message(23);
+        sent.headers.insert("to".into(), to_header);
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            23,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let to_addrs: Option<String> =
+            sqlx::query_scalar("SELECT to_addrs FROM emails WHERE mailbox = 'Sent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let first_profile = crate::contacts::profile_for(&pool, first)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let second_profile = crate::contacts::profile_for(&pool, second)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let stored_both = to_addrs
+            .as_deref()
+            .is_some_and(|stored| stored.contains(first) && stored.contains(second));
+
+        assert_eq!(
+            (stored_both, first_profile, second_profile),
+            (true, Some((0, true)), Some((0, true)))
+        );
+    }
+
+    #[tokio::test]
+    async fn um_enviado_nao_guarda_o_que_anexaste() {
+        let pool = test_pool().await;
+        let recipient = "destinatario@example.com";
+        let mut sent = message_with_attachment(24);
+        sent.headers.insert("to".into(), recipient.into());
+
+        // Even if the sidecar sends attachment details anyway, the núcleo must refuse to store them.
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            24,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let attachment_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM email_attachments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let has_attachments: i64 = sqlx::query_scalar("SELECT has_attachments FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let outbound_ever = crate::contacts::profile_for(&pool, recipient)
+            .await
+            .unwrap()
+            .map(|profile| profile.outbound_ever);
+
+        assert_eq!(
+            (attachment_count, has_attachments, outbound_ever),
+            (0, 0, Some(true))
+        );
+    }
+
+    // The noise gate above looks headers up case-insensitively because a casing bug on the Go side
+    // should not be able to switch that gate off silently. Recipients need the same protection,
+    // especially because a hand-written demo fixture leaves casing to a human.
+    #[tokio::test]
+    async fn um_cabecalho_to_com_outra_capitalizacao_ainda_conta() {
+        let pool = test_pool().await;
+        let first = "primeiro.destinatario@example.com";
+        let second = "segundo.destinatario@example.com";
+        let to_header = format!("{first}, {second}");
+        let mut sent = message(24);
+        sent.headers.insert("To".into(), to_header);
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            24,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let to_addrs: Option<String> =
+            sqlx::query_scalar("SELECT to_addrs FROM emails WHERE mailbox = 'Sent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let first_profile = crate::contacts::profile_for(&pool, first)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let second_profile = crate::contacts::profile_for(&pool, second)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let stored_both = to_addrs
+            .as_deref()
+            .is_some_and(|stored| stored.contains(first) && stored.contains(second));
+
+        assert_eq!(
+            (stored_both, first_profile, second_profile),
+            (true, Some((0, true)), Some((0, true)))
+        );
+    }
+
+    #[tokio::test]
+    async fn um_nome_com_virgula_nao_inventa_um_contacto() {
+        let pool = test_pool().await;
+        let mut sent = message(25);
+        sent.headers
+            .insert("to".into(), r#""Silva, Maria" <maria@example.com>"#.into());
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            25,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let contact_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contact_addresses")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let address: String = sqlx::query_scalar("SELECT address FROM contact_addresses")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!((contact_count, address.as_str()), (1, "maria@example.com"));
     }
 
     #[tokio::test]
@@ -1209,9 +1538,19 @@ mod tests {
         let mut old = message(15);
         old.received_at = ago(72);
 
-        ingest_batch(&pool, "INBOX", 1, 15, &[], &[noisy, old], 0, now())
-            .await
-            .unwrap();
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            15,
+            &[],
+            &[noisy, old],
+            0,
+            now(),
+        )
+        .await
+        .unwrap();
 
         for message_id in ["<m14@x>", "<m15@x>"] {
             let body: Option<String> =
@@ -1276,6 +1615,7 @@ mod tests {
 
         let result = ingest_batch(
             &pool,
+            crate::contacts::MessageDirection::Inbound,
             "INBOX",
             1,
             21,
@@ -1313,6 +1653,7 @@ mod tests {
         let pool = test_pool().await;
         ingest_batch(
             &pool,
+            crate::contacts::MessageDirection::Inbound,
             "INBOX",
             1,
             60,
@@ -1341,9 +1682,19 @@ mod tests {
     async fn a_uidvalidity_change_replaces_the_cursor() {
         let pool = test_pool().await;
         seed_cursor(&pool, 1, 900, 0).await;
-        let outcome = ingest_batch(&pool, "INBOX", 2, 5, &[], &[], 14, now())
-            .await
-            .unwrap();
+        let outcome = ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            2,
+            5,
+            &[],
+            &[],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.cursor, 5, "a rebuilt uid space is not a rewind");
         let cursor = get_cursor(&pool, "INBOX").await.unwrap().unwrap();
         assert_eq!(cursor.uidvalidity, 2);
