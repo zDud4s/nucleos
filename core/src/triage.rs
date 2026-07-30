@@ -1015,6 +1015,7 @@ async fn pass(
         None,
         Some(state.email.sandbox.to_string_lossy().into_owned()),
         crate::email::TRIAGE_MODE,
+        false,
     )
     .await
     {
@@ -2651,6 +2652,9 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

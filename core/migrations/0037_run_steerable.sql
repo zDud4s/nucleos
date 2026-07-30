@@ -1,0 +1,13 @@
+-- Whether a run was launched able to hear a second turn.
+--
+-- Only a run started with `--input-format stream-json` has a stdin anything can be written to, and
+-- that is decided once, at spawn, by the caller that chose the argument vector. The request that
+-- steers arrives much later, on a different task, and needs to know the answer before it writes
+-- anything: an in-memory channel proves a process is listening, not that this run was ever meant to
+-- be spoken to, so the permission has to be a durable fact of the run rather than the presence of a
+-- map entry.
+--
+-- 0 for every row written before this migration, and 0 remains the answer for every path that does
+-- not ask — the email pillar's triage runs among them, whose whole premise is that a session holding
+-- a stranger's words gains no second author.
+ALTER TABLE runs ADD COLUMN steerable INTEGER NOT NULL DEFAULT 0;

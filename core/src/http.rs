@@ -83,6 +83,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route(
+            "/runs/{id}/message",
+            post(post_run_message).delete(delete_run_message),
+        )
         .route("/assistant/message", post(post_assistant_message))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
@@ -1516,6 +1520,11 @@ async fn run_preset(
             project_id: preset.project_id,
             cwd: preset.cwd,
             mode: preset.mode,
+            // A preset records what to run, not who may speak into it afterwards, and there is no
+            // column here that could say otherwise. Every preset already stored was written before
+            // steering existed, so `false` is the answer each of them was saved with — a preset must
+            // not become a way to obtain a listening run that its author never asked for.
+            steerable: false,
         }),
     )
     .await
@@ -1528,6 +1537,113 @@ async fn list_awaiting_approval_runs(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct RunMessageRequest {
+    message: String,
+}
+
+/// Delivers one mid-run turn to a live run that asked to be steerable.
+///
+/// Every condition is read from the run's own recorded facts, never from `run_messages` holding a
+/// sender for it. A channel there says a process is listening; it does not say this run was ever
+/// meant to be spoken to, and treating the two as the same thing would make the barrier below
+/// depend on cleanup timing rather than on a decision anyone made.
+///
+/// The message is queued, not delivered: the run reads it when it next reads stdin, which is why this
+/// answers 202 rather than 200. What is guaranteed by the time it returns is that the text reached
+/// the run's own channel and nothing else's.
+async fn post_run_message(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<RunMessageRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let run = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT status, mode, steerable FROM runs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(run_id = id, %error, "reading a run to steer failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some((status, mode, steerable)) = run else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    // Opting in is what gives the CLI a stdin at all. A run without it has no channel to reach, so
+    // the answer is no rather than text buffered for a process that will never read it.
+    if steerable == 0 {
+        return Err(StatusCode::CONFLICT);
+    }
+    // A finished run has no process left to tell. Accepting anyway would record an instruction
+    // against a transcript that ended before it arrived, which reads afterwards as something the run
+    // was told and ignored.
+    if status != "running" {
+        return Err(StatusCode::CONFLICT);
+    }
+    // Spec §5.5 from the other side. The pillar's premise is that text a stranger wrote never meets a
+    // tool; steering adds a second author to a live session, and the one session that must never gain
+    // an author is the one already holding a stranger's words. Kept as two questions — where the run
+    // came from, and what it may touch — because they coincide only while there is one toolless mode.
+    if mode == crate::email::TRIAGE_MODE {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if runs::tool_policy_for_mode(&mode) == crate::runner::ToolPolicy::None {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let sender = state.run_messages.lock().unwrap().get(&id).cloned();
+    let Some(sender) = sender else {
+        return Err(StatusCode::CONFLICT);
+    };
+    // Raw text: framing a turn as a `stream-json` line is `runner.rs`'s job, because knowing the
+    // CLI's wire format is what that module is for. A second copy of that shape here would drift the
+    // day the format does.
+    sender
+        .send(body.message)
+        .map_err(|_| StatusCode::CONFLICT)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Says that the turn just sent was the last one, and is what lets a steerable run end at all.
+///
+/// A run launched with `--input-format stream-json` reads turns until stdin closes, and the daemon
+/// holds that stdin open for as long as it holds the run's sender. Without a way to let go of it,
+/// such a run could only stop by going silent long enough to trip its progress deadline — and be
+/// recorded `timed_out`, a failure status, for having been left listening. Closing the channel gives
+/// the CLI its EOF, so the turn ends the way an ordinary run's does and the run is recorded on what
+/// it actually did.
+///
+/// DELETE, and idempotent with it: a channel that is already closed is the state the caller asked
+/// for, not a conflict. It answers 204 for any run that exists, whether or not that run was ever
+/// listening, because "no such channel" is also what a run that finished a moment ago looks like —
+/// and a caller that had to tell those two apart would be handling a race instead of ending a
+/// conversation.
+///
+/// No steering barrier here, deliberately, and it does not narrow the one on `post_run_message`.
+/// That barrier exists because steering ADDS an author to a live session; this takes nothing from
+/// the caller and puts nothing in the run's context. The only thing it can do is end a conversation,
+/// and there is no run for which ending one is the unsafe direction.
+async fn delete_run_message(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    let known = sqlx::query_scalar::<_, i64>("SELECT 1 FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(run_id = id, %error, "reading a run to close its turns failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if known.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    runs::close_steering_channel(&state, id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_proposals(
@@ -1711,6 +1827,7 @@ mod tests {
                 triage_runner: None,
                 local_triage_disabled: None,
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
                 progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -1809,6 +1926,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -2697,6 +2815,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -3079,6 +3198,103 @@ mod tests {
         assert_eq!(parsed["num_turns"], 12);
     }
 
+    /// A runner that publishes a context fill and then never returns.
+    ///
+    /// Parked rather than slow: the test needs a run that is genuinely mid-stream when the request
+    /// is served, and a delay long enough to be safe is a delay long enough to be slow.
+    struct LiveContextFillRunner {
+        fill: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runner::CommandRunner for LiveContextFillRunner {
+        async fn run_prompt(
+            &self,
+            _request: crate::runner::RunRequest,
+            _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+        ) -> std::io::Result<crate::runner::RunOutcome> {
+            std::future::pending::<()>().await;
+            unreachable!("a parked run never resolves")
+        }
+
+        async fn run_prompt_with_context_fill(
+            &self,
+            request: crate::runner::RunRequest,
+            session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            transcript: Arc<std::sync::Mutex<String>>,
+            context_fill: Arc<std::sync::Mutex<Option<i64>>>,
+        ) -> std::io::Result<crate::runner::RunOutcome> {
+            // What the CLI runner does per streamed line, done once: the mirror carries the number
+            // while the process is still alive, which is the only state this test is about.
+            *context_fill.lock().unwrap() = Some(self.fill);
+            self.run_prompt(request, session_tx, transcript).await
+        }
+    }
+
+    /// Per-turn context fill is measured from the stream while the run is alive, and has to be
+    /// readable then — that is the whole point of measuring it. The monitor was wired to the stream
+    /// from the start, but `runs.context_fill` was written only by the terminal UPDATE, so a live
+    /// run answered `context_fill: null` and the number landed exactly when it had stopped being
+    /// something anyone could act on.
+    ///
+    /// Driven through the real handler over a run that is genuinely parked mid-stream. The sibling
+    /// tests above write the column themselves and would pass against a daemon that never computed
+    /// anything: they prove `SELECT` can read what `INSERT` wrote, not that a live run reports.
+    #[tokio::test]
+    async fn a_running_run_reports_its_context_fill() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(LiveContextFillRunner { fill: 164_000 });
+        let run_id = crate::runs::create_run_inner(
+            &state,
+            "a run that keeps talking".to_string(),
+            None,
+            None,
+            "real",
+            false,
+        )
+        .await
+        .expect("a real-mode run needs neither a project nor a worktree");
+
+        // Generous, because what is being asserted is that the number arrives at all — the mirror
+        // is throttled, so anything shorter would be measuring the throttle rather than the wiring.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let reported = loop {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/runs/{run_id}"))
+                        .header("Authorization", "Bearer test-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["status"], "running",
+                "the run must still be live, or this says nothing about a live one"
+            );
+            if let Some(fill) = parsed["context_fill"].as_i64() {
+                break fill;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GET /runs/{{id}} never reported the context fill of a run that is still going"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(
+            reported, 164_000,
+            "the number on the wire must be the one the stream reported"
+        );
+    }
+
     #[tokio::test]
     async fn awaiting_approval_runs_returns_seeded_run_with_bearer_token() {
         let state = test_state().await;
@@ -3140,6 +3356,372 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// What a caller sends when it steers a run. One fixed string so every assertion below can say
+    /// whether THIS text reached the run rather than whether something did.
+    const STEERING_MESSAGE: &str = "actually, stop after the current file";
+
+    /// The modes `runs::create_run_inner` derives `ToolPolicy::None` from. Such a run has no tools at
+    /// all because it exists to read words nobody vouches for, and a mode added to that derivation
+    /// belongs here too — this list is what keeps the refusal from silently narrowing to one mode.
+    const TOOLLESS_MODES: &[&str] = &[crate::email::TRIAGE_MODE];
+
+    /// A `runs` row plus everything a live run carries: an abort handle in `run_handles` and a
+    /// steering channel in `run_messages`.
+    ///
+    /// Both are registered even for the runs that must be refused, and deliberately so. A refusal is
+    /// only worth asserting beside evidence that a delivery WOULD have been visible — and a handler
+    /// that read the presence of a handle or a channel as permission to write would pass a test whose
+    /// fixture withheld them.
+    async fn run_to_steer(
+        state: &AppState,
+        status: &str,
+        mode: &str,
+        steerable: bool,
+    ) -> (i64, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, steerable, created_at)
+             VALUES ('keep working', ?, ?, ?, '2026-07-30T00:00:00Z')",
+        )
+        .bind(status)
+        .bind(mode)
+        .bind(i64::from(steerable))
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+
+        let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .run_messages
+            .lock()
+            .unwrap()
+            .insert(run_id, messages_tx);
+
+        (run_id, messages_rx)
+    }
+
+    async fn steer(state: AppState, run_id: i64, token: &str) -> StatusCode {
+        api_token_request(
+            state,
+            "POST",
+            &format!("/runs/{run_id}/message"),
+            token,
+            Some(serde_json::json!({ "message": STEERING_MESSAGE })),
+        )
+        .await
+        .status()
+    }
+
+    /// Steering is opt-in at spawn time because only a run launched with `--input-format stream-json`
+    /// has a stdin anything can be written to. A run that did not opt in is not merely inconvenient
+    /// to reach — there is no channel — so the route must say no rather than buffer the text
+    /// somewhere for a run that will never read it.
+    #[tokio::test]
+    async fn steering_a_run_that_did_not_opt_in_is_refused() {
+        let state = test_state().await;
+        let (run_id, mut messages) = run_to_steer(&state, "running", "real", false).await;
+
+        let status = steer(state.clone(), run_id, "test-token").await;
+
+        assert!(status.is_client_error(), "{status}");
+        assert!(
+            messages.try_recv().is_err(),
+            "a run that did not opt in must receive nothing"
+        );
+    }
+
+    /// A finished run has no process left to say anything to. Accepting the message anyway would
+    /// record an instruction against a transcript that ended before it arrived, which reads
+    /// afterwards as something the run was told and ignored.
+    #[tokio::test]
+    async fn steering_a_run_that_is_not_running_is_refused() {
+        for finished in ["completed", "cancelled"] {
+            let state = test_state().await;
+            let (run_id, mut messages) = run_to_steer(&state, finished, "real", true).await;
+
+            let status = steer(state.clone(), run_id, "test-token").await;
+
+            assert!(status.is_client_error(), "{finished}: {status}");
+            assert!(
+                messages.try_recv().is_err(),
+                "{finished}: a run that has stopped must receive nothing"
+            );
+        }
+    }
+
+    /// The untrusted-content boundary of spec §5.5, from the other side. The email pillar's premise
+    /// is that text a stranger wrote never meets a tool; steering adds a second author to a live
+    /// session, and the one session that must never gain an author is the one already holding a
+    /// stranger's words. Refused with the flag set, the run alive and the control token presented —
+    /// every other condition met.
+    #[tokio::test]
+    async fn steering_a_triage_spawned_run_is_refused() {
+        let state = test_state().await;
+        let (run_id, mut messages) =
+            run_to_steer(&state, "running", crate::email::TRIAGE_MODE, true).await;
+
+        let status = steer(state.clone(), run_id, "test-token").await;
+
+        assert!(status.is_client_error(), "{status}");
+        assert!(
+            messages.try_recv().is_err(),
+            "the email pillar's runs take no instructions from this route"
+        );
+    }
+
+    /// Keyed on the run's tool policy rather than on where it came from, and separate from the triage
+    /// test above for exactly that reason: the two rules coincide on today's single toolless mode,
+    /// and each has to hold on its own the day a second one appears. A toolless run is the one the
+    /// daemon spawns to read content it does not trust, so it is the last run that may be spoken to.
+    #[tokio::test]
+    async fn steering_a_run_under_tool_policy_none_is_refused() {
+        for &mode in TOOLLESS_MODES {
+            let state = test_state().await;
+            let (run_id, mut messages) = run_to_steer(&state, "running", mode, true).await;
+
+            let status = steer(state.clone(), run_id, "test-token").await;
+
+            assert!(status.is_client_error(), "{mode}: {status}");
+            assert!(
+                messages.try_recv().is_err(),
+                "{mode}: a run spawned with no tools must not be given a second author"
+            );
+        }
+    }
+
+    /// Steering is its own authorization, not a consequence of being allowed to start runs. A key
+    /// that creates a run authorises the prompt it supplies at that moment; a later turn into a
+    /// session that already holds tools is a prompt nobody reviewed, reaching a process already past
+    /// every check its creation went through.
+    #[tokio::test]
+    async fn steering_without_the_required_scope_is_refused() {
+        let state = test_state().await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let (run_id, mut messages) = run_to_steer(&state, "running", "real", true).await;
+
+        let status = steer(state.clone(), run_id, &run_creating).await;
+
+        assert!(
+            matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+            "the right to start a run must not imply the right to speak into one: {status}"
+        );
+        assert!(
+            messages.try_recv().is_err(),
+            "an unauthorised steer must not reach the run"
+        );
+    }
+
+    /// The one case that goes through: running, opted in, not a triage run, asked for by the control
+    /// token. Asserted on the delivery and not only on the status, because a route that answers
+    /// "accepted" and drops the text is worse than one that refuses — the caller believes the run was
+    /// told.
+    #[tokio::test]
+    async fn steering_a_running_opted_in_run_delivers_the_message() {
+        let state = test_state().await;
+        let (run_id, mut messages) = run_to_steer(&state, "running", "real", true).await;
+
+        let status = steer(state.clone(), run_id, "test-token").await;
+
+        assert!(status.is_success(), "{status}");
+        let delivered = messages
+            .try_recv()
+            .expect("an accepted steer must reach the run");
+        assert!(
+            delivered.contains(STEERING_MESSAGE),
+            "the run must receive what was sent: {delivered}"
+        );
+    }
+
+    /// A preset records WHAT to run, never who may speak into the run afterwards — `run_presets` has
+    /// no column that could say otherwise, and every preset already stored was written before
+    /// steering existed. Running one must therefore not be a way to obtain a listening run its
+    /// author never asked for, which is the one way a stored row could hand out an opt-in nobody
+    /// made.
+    #[tokio::test]
+    async fn a_preset_run_is_never_steerable() {
+        let state = test_state().await;
+        let preset = crate::presets::create(
+            &state.pool,
+            "nightly",
+            crate::runs::CreateRunRequest {
+                prompt: "do the nightly thing".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "real".to_owned(),
+                steerable: false,
+            },
+        )
+        .await
+        .expect("a real-mode preset needs neither a project nor a worktree");
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/presets/{}/run", preset.id),
+            "test-token",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let steerable: Vec<i64> = sqlx::query_scalar("SELECT steerable FROM runs")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            steerable,
+            vec![0],
+            "a preset must not launch a run holding a stdin its author never asked for"
+        );
+    }
+
+    /// A runner that models the single thing a steerable launch changes: `--input-format stream-json`
+    /// makes the CLI read turns until stdin closes, so this returns only once the turn channel is
+    /// gone. That is what makes the test below able to fail — a runner that answered immediately
+    /// would reach a terminal status whether or not anything ever closed the channel.
+    ///
+    /// It records the turns it was handed, so a refusal can be asserted on what the run received
+    /// rather than only on a status code.
+    struct StdinEofRunner {
+        heard: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runner::CommandRunner for StdinEofRunner {
+        async fn run_prompt(
+            &self,
+            mut request: crate::runner::RunRequest,
+            _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+        ) -> std::io::Result<crate::runner::RunOutcome> {
+            if let Some(messages) = request.messages.as_mut() {
+                while let Some(text) = messages.recv().await {
+                    self.heard.lock().unwrap().push(text);
+                }
+            }
+            Ok(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                session_id: request.session_id.clone(),
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
+            })
+        }
+    }
+
+    /// A steerable run has to be able to STOP, and until it could be closed it could not.
+    ///
+    /// The daemon holds the run's sender for the run's whole life, which holds the CLI's stdin open;
+    /// a run nobody had anything more to say to therefore sat there until its clock ran out and was
+    /// recorded `timed_out` — a failure status for a run that did exactly what it was asked. The
+    /// wall clock here is deliberately short, so that is the status this would land on if closing
+    /// did nothing: the assertion below distinguishes "ended normally" from "ended at all".
+    ///
+    /// Closing twice is not an error, and a closed run refuses further turns exactly as every other
+    /// unreachable run does — asserted on the delivery too, because a route that answers "accepted"
+    /// and drops the text tells the caller the run was informed.
+    #[tokio::test]
+    async fn a_steerable_run_closed_by_its_caller_ends_normally() {
+        let mut state = test_state().await;
+        state.run_timeout = std::time::Duration::from_secs(2);
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state.runner = Arc::new(StdinEofRunner {
+            heard: Arc::clone(&heard),
+        });
+
+        let run_id = crate::runs::create_run_inner(
+            &state,
+            "keep going".to_string(),
+            None,
+            None,
+            "real",
+            true,
+        )
+        .await
+        .expect("a real-mode run may ask to be steerable");
+
+        let status_of = |state: AppState| async move {
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            steer(state.clone(), run_id, "test-token").await,
+            StatusCode::ACCEPTED,
+            "the run is running and opted in, so its turn must be taken"
+        );
+        assert_eq!(
+            status_of(state.clone()).await,
+            "running",
+            "a run still holding an open channel has not finished"
+        );
+
+        let close = |state: AppState| async move {
+            api_token_request(
+                state,
+                "DELETE",
+                &format!("/runs/{run_id}/message"),
+                "test-token",
+                None,
+            )
+            .await
+            .status()
+        };
+        let closed = close(state.clone()).await;
+        assert!(closed.is_success(), "{closed}");
+        let closed_again = close(state.clone()).await;
+        assert!(
+            closed_again.is_success(),
+            "a channel that is already closed is the state the caller asked for: {closed_again}"
+        );
+
+        let refused = steer(state.clone(), run_id, "test-token").await;
+        assert!(
+            refused.is_client_error(),
+            "a closed run must refuse a turn as every other unreachable run does: {refused}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let final_status = loop {
+            let status = status_of(state.clone()).await;
+            if status != "running" {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a closed run must reach a terminal status"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            final_status, "completed",
+            "closing the channel ends the turn normally; a run that could only stop on its deadline \
+             would be recorded timed_out"
+        );
+
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![STEERING_MESSAGE.to_string()],
+            "the run must hear the turn it was sent and nothing sent after it was closed"
+        );
     }
 
     #[tokio::test]
