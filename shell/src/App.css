@@ -862,3 +862,7 @@ details.scoreboard th {
 /* `pre-wrap`: um transcrito ditado traz os seus próprios parágrafos, e colapsá-los juntaria
    pensamentos separados numa parede de texto. */
 .v-text { margin: 0; font-size: var(--fs-sm); line-height: 1.55; white-space: pre-wrap; }
+
+/* Os dois botões de ditado. Em fila, com o memo a seguir ao ditado, porque é a ação menos frequente
+   e a que não escreve em lado nenhum. */
+.v-actions { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); flex-wrap: wrap; }

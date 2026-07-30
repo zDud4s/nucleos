@@ -538,6 +538,25 @@ export function voiceCleanupLabel(state: string): string {
   }
 }
 
+/**
+ * Flattens the chunks an audio callback delivered into the one buffer the host expects.
+ *
+ * The callback fires every few thousand frames and each call owns its own buffer, so a recording
+ * arrives as a list. Copying into a single sized array once, rather than growing one per callback,
+ * is what keeps a twenty-minute memo from reallocating thousands of times while someone is talking.
+ */
+export function concatSamples(chunks: Float32Array[]): Float32Array {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.length;
+  const out = new Float32Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return out;
+}
+
 /** How long someone spoke, from the milliseconds the daemon recorded. */
 export function spokenDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return "—";

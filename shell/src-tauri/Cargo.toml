@@ -29,6 +29,9 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-autostart = "2.5.1"
+tauri-plugin-global-shortcut = "2.3.2"
+arboard = "3.6.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 # No tauri-plugin-updater: it was registered with a placeholder signing key and an
 # example.invalid endpoint, held no updater capability and was imported by no frontend code,
 # so it could never run — yet it shipped in the binary and in the bundle config, advertising

@@ -1381,6 +1381,15 @@ export interface VoiceConfigView {
   cleanup_prompt: string;
   cleanup_model: string | null;
   retain_dictations_days: number;
+  /**
+   * The two chords to register, as configured in `.ai/voice.yaml`.
+   *
+   * They arrive from the daemon rather than being decided here because that file is where they are
+   * set and the shell may not read it. An empty string means the key is unset and nothing is
+   * registered for it.
+   */
+  hotkey: string;
+  memo_hotkey: string;
   max_capture_seconds: number;
   max_body_bytes: number;
 }
@@ -1406,6 +1415,50 @@ export async function getVoiceConfig(token: string): Promise<VoiceConfigView | n
     return (await res.json()) as VoiceConfigView;
   } catch {
     return null;
+  }
+}
+
+export interface VoiceCaptureResult {
+  /** `0` means the text is good but no row was written, so there is nothing to fetch later. */
+  id: number;
+  text: string;
+  state: VoiceCleanupState;
+}
+
+/**
+ * Sends a finished recording as raw WAV bytes.
+ *
+ * Posted from here rather than from the shell's Rust side, and not by preference: capture has to
+ * happen in the webview, and Tauri's IPC serialises arguments as JSON — handing twenty minutes of
+ * samples over would mean roughly 58 million JSON numbers. The daemon is on localhost either way.
+ *
+ * `"silent"` is a distinct answer, not a failure. The daemon replies 204 when the transcriber heard
+ * nothing, and telling someone their microphone picked up nothing is different from telling them
+ * dictation is broken.
+ */
+export async function postVoiceCapture(
+  token: string,
+  kind: VoiceKind,
+  durationMs: number,
+  wav: Uint8Array,
+): Promise<VoiceCaptureResult | "silent" | "failed"> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/voice/capture?kind=${kind}&duration_ms=${durationMs}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(wav) as BodyInit,
+      },
+    );
+    if (res.status === 204) return "silent";
+    if (!res.ok) return "failed";
+    return (await res.json()) as VoiceCaptureResult;
+  } catch {
+    return "failed";
   }
 }
 

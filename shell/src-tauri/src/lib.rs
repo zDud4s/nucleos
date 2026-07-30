@@ -1,4 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+/// The OS calls that carry those decisions out, and nothing else. Holds no rules.
+pub mod dictation;
 /// Dictation decisions. `pub` because it is genuinely this crate's surface: the platform layer
 /// calls into it, and a private module of not-yet-wired functions would be dead code under the
 /// `-D warnings` clippy gate that `scripts/gates.sh` now runs over this package.
@@ -13,6 +15,10 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 /// state: after the first launch the answer belongs to the user, whatever it is.
 const AUTOSTART_MARKER: &str = "autostart-initialised";
 
+// Left at the crate root's default visibility on purpose: `#[tauri::command]` re-exports helper
+// macros with the function's visibility, and `pub(crate)` makes that re-export collide with its own
+// definition (E0255). `dictation` reaches it as `crate::get_daemon_token` because a private item in
+// the crate root is already visible to every module below it.
 #[tauri::command]
 fn get_daemon_token() -> Result<String, String> {
     // The token lives in the OS Credential Manager (spec §3.4/§5), written by the daemon's core under
@@ -31,6 +37,11 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        // The chords themselves are NOT registered here. They live in `.ai/voice.yaml`, which only the
+        // daemon reads, so the Voice tab registers them through `voice_register_hotkeys` once it has
+        // read `GET /voice/config` — and a daemon that is not up yet simply means no hotkey yet.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .manage(dictation::Dictation::default())
         .setup(|app| {
             // Shell-GUI autostart convenience only — the daemon owns its OWN persistence via a
             // Windows Scheduled Task (Part A), independent of this.
@@ -76,7 +87,14 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_daemon_token])
+        .invoke_handler(tauri::generate_handler![
+            get_daemon_token,
+            dictation::voice_hotkey,
+            dictation::voice_phase,
+            dictation::voice_paste,
+            dictation::voice_abandon,
+            dictation::voice_register_hotkeys,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

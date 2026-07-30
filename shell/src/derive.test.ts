@@ -8,6 +8,7 @@ import {
   breadcrumbs,
   budgetStatusLabel,
   classifierVerdictLabel,
+  concatSamples,
   formatBytes,
   formatTokens,
   formatUsd,
@@ -600,6 +601,24 @@ describe("run, health and key derivations", () => {
     expect(formatTokens(1500)).toBe("1.5k");
     expect(formatTokens(48000)).toBe("48k");
     expect(formatTokens(1_400_000)).toBe("1.4M");
+  });
+});
+
+describe("concatSamples", () => {
+  it("joins the callback's chunks in order", () => {
+    const joined = concatSamples([
+      new Float32Array([0.1, 0.2]),
+      new Float32Array([0.3]),
+      new Float32Array([0.4, 0.5]),
+    ]);
+    expect(Array.from(joined).map((n) => Math.round(n * 10) / 10)).toEqual([0.1, 0.2, 0.3, 0.4, 0.5]);
+  });
+
+  it("handles a recording that produced nothing", () => {
+    // A microphone that opened and closed before any callback fired. The caller checks the length
+    // rather than posting an empty WAV to the daemon.
+    expect(concatSamples([]).length).toBe(0);
+    expect(concatSamples([new Float32Array(0)]).length).toBe(0);
   });
 });
 
