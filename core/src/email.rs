@@ -417,8 +417,13 @@ pub async fn ingest_batch(
         .await?;
 
         if result.rows_affected() == 1 {
-            crate::contacts::record_inbound(&mut tx, &message.from_addr, &message.received_at)
-                .await?;
+            crate::contacts::record_inbound(
+                &mut tx,
+                &message.from_addr,
+                message.from_name.as_deref(),
+                &message.received_at,
+            )
+            .await?;
             ingested += 1;
             // Only for a row this batch actually created. A duplicate already has its attachments,
             // and re-inserting them would either collide on the UNIQUE or silently double a list

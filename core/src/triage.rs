@@ -1590,10 +1590,10 @@ mod tests {
         // Seed established history so this test remains about filing verdicts, not priority policy.
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut transaction = state.pool.begin().await.unwrap();
-        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
             .await
             .unwrap();
-        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
@@ -1783,10 +1783,10 @@ mod tests {
         // Seed established history so this test remains about filing verdicts, not priority policy.
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut transaction = state.pool.begin().await.unwrap();
-        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
             .await
             .unwrap();
-        crate::contacts::record_inbound(&mut transaction, "ana@company.com", &received_at)
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
@@ -1830,10 +1830,10 @@ mod tests {
 
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut transaction = state.pool.begin().await.unwrap();
-        crate::contacts::record_inbound(&mut transaction, established_contact, &received_at)
+        crate::contacts::record_inbound(&mut transaction, established_contact, None, &received_at)
             .await
             .unwrap();
-        crate::contacts::record_inbound(&mut transaction, established_contact, &received_at)
+        crate::contacts::record_inbound(&mut transaction, established_contact, None, &received_at)
             .await
             .unwrap();
         transaction.commit().await.unwrap();

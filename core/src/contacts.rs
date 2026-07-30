@@ -1,6 +1,9 @@
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub struct Profile {
+    // Consumed by the later contact display surface.
+    #[allow(dead_code)]
+    pub display_name: Option<String>,
     pub messages_in: i64,
     // Consumed by the later contact display surface.
     #[allow(dead_code)]
@@ -114,6 +117,7 @@ async fn record_message(
 pub async fn record_inbound(
     transaction: &mut Transaction<'_, Sqlite>,
     from_addr: &str,
+    from_name: Option<&str>,
     received_at: &str,
 ) -> sqlx::Result<()> {
     record_message(
@@ -122,7 +126,23 @@ pub async fn record_inbound(
         received_at,
         MessageDirection::Inbound,
     )
-    .await
+    .await?;
+
+    if let Some(from_name) = from_name.filter(|name| !name.trim().is_empty()) {
+        sqlx::query(
+            "UPDATE contact_addresses
+             SET display_name = ?
+             WHERE address = ?
+               AND last_seen <= ?",
+        )
+        .bind(from_name)
+        .bind(normalize_address(from_addr))
+        .bind(received_at)
+        .execute(&mut **transaction)
+        .await?;
+    }
+
+    Ok(())
 }
 
 // Consumed by the Sent-folder ingestion packet (P4).
@@ -141,22 +161,34 @@ pub async fn record_outbound(
 
 pub async fn profile_for(pool: &SqlitePool, address: &str) -> sqlx::Result<Option<Profile>> {
     let address = normalize_address(address);
-    let row: Option<(i64, String, String, i64)> = sqlx::query_as(
-        "SELECT SUM(facts.messages_in),
+    let row: Option<(Option<String>, i64, String, String, i64)> = sqlx::query_as(
+        "SELECT COALESCE(
+                    contacts.display_name,
+                    (
+                        SELECT observed.display_name
+                        FROM contact_addresses AS observed
+                        WHERE observed.contact_id = requested.contact_id
+                        ORDER BY observed.last_seen DESC, observed.address
+                        LIMIT 1
+                    )
+                ),
+                SUM(facts.messages_in),
                 MIN(facts.first_seen),
                 MAX(facts.last_seen),
                 MAX(facts.outbound_ever)
          FROM contact_addresses AS requested
+         JOIN contacts ON contacts.id = requested.contact_id
          JOIN contact_addresses AS facts ON facts.contact_id = requested.contact_id
          WHERE requested.address = ?
-         GROUP BY requested.contact_id",
+         GROUP BY requested.contact_id, contacts.display_name",
     )
     .bind(address)
     .fetch_optional(pool)
     .await?;
 
     Ok(row.map(
-        |(messages_in, first_seen, last_seen, outbound_ever)| Profile {
+        |(display_name, messages_in, first_seen, last_seen, outbound_ever)| Profile {
+            display_name,
             messages_in,
             first_seen,
             last_seen,
@@ -251,7 +283,7 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
-        record_inbound(&mut transaction, address, &received_at)
+        record_inbound(&mut transaction, address, None, &received_at)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
@@ -284,6 +316,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn o_nome_sobrevive_ao_prune() {
+        let pool = test_pool().await;
+        let address = "duarte@example.com";
+        let display_name = "Duarte Ferreira";
+        let now = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
+        let received_at =
+            (now - Duration::days(crate::triage::ROW_RETENTION_DAYS + 1)).to_rfc3339();
+
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO emails (
+                 message_id, mailbox, uidvalidity, uid, from_addr, from_name, received_at,
+                 ingested_at, triage_class, triaged_at, direction
+             )
+             VALUES (?, 'INBOX', 1, 2, ?, ?, ?, ?, 'info', ?, 'inbound')",
+        )
+        .bind("<old-named-inbound@example.com>")
+        .bind(address)
+        .bind(display_name)
+        .bind(&received_at)
+        .bind(&received_at)
+        .bind(&received_at)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        record_inbound(&mut transaction, address, Some(display_name), &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let (_, rows_removed) = crate::triage::prune(&pool, 7, now).await.unwrap();
+        assert_eq!(rows_removed, 1);
+        let emails_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM emails WHERE message_id = '<old-named-inbound@example.com>'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(emails_left, 0);
+
+        let profile = profile_for(&pool, address)
+            .await
+            .unwrap()
+            .expect("pruning the source email must not prune the accumulated display name");
+        assert_eq!(profile.display_name.as_deref(), Some(display_name));
+    }
+
+    #[tokio::test]
+    async fn o_nome_segue_a_mensagem_mais_recente() {
+        let pool = test_pool().await;
+        let address = "duarte@example.com";
+        let earlier = "2026-07-20T09:00:00+00:00";
+        let later = "2026-07-24T09:00:00+00:00";
+        let latest = "2026-07-26T09:00:00+00:00";
+        let unnamed_latest = "2026-07-27T09:00:00+00:00";
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(&mut transaction, address, Some("Duarte Ferreira"), later)
+            .await
+            .unwrap();
+        record_inbound(
+            &mut transaction,
+            address,
+            Some("duarte (old client)"),
+            earlier,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let after_out_of_order = profile_for(&pool, address)
+            .await
+            .unwrap()
+            .expect("the named inbound messages must create a profile");
+        assert_eq!(
+            after_out_of_order.display_name.as_deref(),
+            Some("Duarte Ferreira")
+        );
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(&mut transaction, address, Some("Duarte F."), latest)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let after_new_name = profile_for(&pool, address)
+            .await
+            .unwrap()
+            .expect("the later named inbound message must preserve the profile");
+        assert_eq!(after_new_name.display_name.as_deref(), Some("Duarte F."));
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(&mut transaction, address, None, unnamed_latest)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let after_unnamed = profile_for(&pool, address)
+            .await
+            .unwrap()
+            .expect("an unnamed inbound message must preserve the profile");
+        assert_eq!(after_unnamed.display_name.as_deref(), Some("Duarte F."));
+    }
+
+    #[tokio::test]
+    async fn o_nome_escrito_por_uma_pessoa_ganha() {
+        let pool = test_pool().await;
+        let address = "duarte@example.com";
+        let received_at = "2026-07-24T09:00:00+00:00";
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(
+            &mut transaction,
+            address,
+            Some("duarte (mail client)"),
+            received_at,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let contact_id: i64 =
+            sqlx::query_scalar("SELECT contact_id FROM contact_addresses WHERE address = ?")
+                .bind(address)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE contacts SET display_name = ? WHERE id = ?")
+            .bind("Duarte Ferreira")
+            .bind(contact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let profile = profile_for(&pool, address)
+            .await
+            .unwrap()
+            .expect("the human-named contact must have a profile");
+        assert_eq!(profile.display_name.as_deref(), Some("Duarte Ferreira"));
+    }
+
+    #[tokio::test]
     async fn a_acumulacao_e_monotonica() {
         let pool = test_pool().await;
         let address = "bob@example.com";
@@ -292,7 +466,7 @@ mod tests {
         let later = "2026-07-24T09:00:00+00:00";
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, address, later)
+        record_inbound(&mut transaction, address, None, later)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
@@ -320,7 +494,7 @@ mod tests {
         assert!(after_outbound.outbound_ever);
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, address, earlier)
+        record_inbound(&mut transaction, address, None, earlier)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
@@ -357,7 +531,7 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
-        record_inbound(&mut transaction, address, received_at)
+        record_inbound(&mut transaction, address, None, received_at)
             .await
             .unwrap();
         transaction.rollback().await.unwrap();
@@ -395,16 +569,16 @@ mod tests {
         let latest = "2026-07-24T09:00:00+00:00";
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, keep_address, earliest)
+        record_inbound(&mut transaction, keep_address, None, earliest)
             .await
             .unwrap();
-        record_inbound(&mut transaction, keep_address, second)
+        record_inbound(&mut transaction, keep_address, None, second)
             .await
             .unwrap();
-        record_inbound(&mut transaction, keep_address, third)
+        record_inbound(&mut transaction, keep_address, None, third)
             .await
             .unwrap();
-        record_inbound(&mut transaction, absorbed_address, absorbed_inbound)
+        record_inbound(&mut transaction, absorbed_address, None, absorbed_inbound)
             .await
             .unwrap();
         record_outbound(&mut transaction, &[absorbed_address], latest)
@@ -475,13 +649,13 @@ mod tests {
         let absorbed_last = "2026-07-15T08:00:00+00:00";
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, keep_address, keep_last)
+        record_inbound(&mut transaction, keep_address, None, keep_last)
             .await
             .unwrap();
-        record_inbound(&mut transaction, keep_address, keep_first)
+        record_inbound(&mut transaction, keep_address, None, keep_first)
             .await
             .unwrap();
-        record_inbound(&mut transaction, absorbed_address, absorbed_first)
+        record_inbound(&mut transaction, absorbed_address, None, absorbed_first)
             .await
             .unwrap();
         record_outbound(&mut transaction, &[absorbed_address], absorbed_last)
@@ -636,13 +810,13 @@ mod tests {
         let absorbed_last = "2026-07-05T07:00:00+00:00";
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, keep_address, keep_first)
+        record_inbound(&mut transaction, keep_address, None, keep_first)
             .await
             .unwrap();
-        record_inbound(&mut transaction, keep_address, keep_last)
+        record_inbound(&mut transaction, keep_address, None, keep_last)
             .await
             .unwrap();
-        record_inbound(&mut transaction, absorbed_address, absorbed_first)
+        record_inbound(&mut transaction, absorbed_address, None, absorbed_first)
             .await
             .unwrap();
         record_outbound(&mut transaction, &[absorbed_address], absorbed_last)

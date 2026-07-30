@@ -45,6 +45,7 @@ mod tests {
 
     fn profile(messages_in: i64, outbound_ever: bool) -> Profile {
         Profile {
+            display_name: None,
             messages_in,
             first_seen: "2026-07-01T00:00:00Z".to_string(),
             last_seen: "2026-07-29T00:00:00Z".to_string(),
