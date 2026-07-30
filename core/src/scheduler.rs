@@ -776,8 +776,15 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 continue;
             }
 
-            match create_run_inner(state, prompt, Some(project_id.clone()), Some(cwd), run_mode)
-                .await
+            match create_run_inner(
+                state,
+                prompt,
+                Some(project_id.clone()),
+                Some(cwd),
+                run_mode,
+                false,
+            )
+            .await
             {
                 Ok(run_id) => {
                     // +1 for the claim above, which is where the allowance was actually spent.
@@ -877,6 +884,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
+            run_messages: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: DEFAULT_RUN_TIMEOUT,

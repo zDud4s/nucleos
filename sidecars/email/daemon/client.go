@@ -73,7 +73,8 @@ type Skipped struct {
 }
 
 type Batch struct {
-	Mailbox string `json:"mailbox"`
+	Mailbox   string `json:"mailbox"`
+	Direction string `json:"direction"`
 	// UIDValidity identifies the server's uid space; a change means the old position is not a
 	// position any more.
 	UIDValidity uint32 `json:"uidvalidity"`

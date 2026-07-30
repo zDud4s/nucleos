@@ -662,18 +662,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_gate_execution_is_not_an_autonomous_row() {
+        // This test cannot fail, and is kept only long enough to say so where someone looking for
+        // the property will find it. `run_gate(worktree, command, timeout)` takes no pool and
+        // `gate.rs` contains no SQL, so it is structurally incapable of writing a row; the two
+        // counts below read the same empty table and compare 0 to 0. It was cited during the
+        // instrumentation series as evidence that the gate stays out of the autonomy budget, which
+        // is the mistake this comment exists to stop repeating: a test that exists is not a
+        // property that holds.
+        //
+        // The real claim — that the gate costs the budget nothing because `completed_at` is captured
+        // before it runs — is pinned by `runs::tests::a_gate_is_not_billed_to_the_run_it_measures`,
+        // which can fail. Delete this one once that is habit rather than news.
         let pool = test_pool().await;
-        let worktree = tempfile::tempdir().expect("create temporary worktree");
         let before = autonomous_rows(&pool).await.unwrap();
-
-        let outcome = crate::gate::run_gate(
-            worktree.path(),
-            r#"sh -c "exit 0""#,
-            std::time::Duration::from_secs(1),
-        )
-        .await;
-
-        assert!(matches!(outcome, crate::gate::GateOutcome::Passed));
         let after = autonomous_rows(&pool).await.unwrap();
         assert_eq!(after.len(), before.len());
     }

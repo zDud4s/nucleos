@@ -134,7 +134,7 @@ fn write_utf16_xml(path: &Path, xml: &str) -> std::io::Result<()> {
     for unit in xml.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    std::fs::write(path, bytes)
+    crate::storage::write_atomic(path, &bytes)
 }
 
 #[cfg(test)]
@@ -193,6 +193,25 @@ mod tests {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(String::from_utf16(&utf16_units).unwrap(), "<a>hi</a>");
+    }
+
+    #[test]
+    fn o_xml_da_tarefa_e_escrito_por_inteiro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.xml");
+        let short_xml = "<a/>";
+
+        write_utf16_xml(
+            &path,
+            "<Task><Description>conteudo deliberadamente muito comprido</Description></Task>",
+        )
+        .unwrap();
+        write_utf16_xml(&path, short_xml).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            2 + 2 * short_xml.encode_utf16().count() as u64
+        );
     }
 
     // `is_registered`/`register` touch the real Windows Task Scheduler — no fake backend, same

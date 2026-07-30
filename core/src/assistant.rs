@@ -134,6 +134,11 @@ fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("nucleos-mcp-{safe}.json"))
 }
 
+fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(config).map_err(std::io::Error::other)?;
+    crate::storage::write_atomic(path, &bytes)
+}
+
 pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
@@ -163,20 +168,40 @@ pub async fn send_message(
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe);
     let mcp_path = mcp_config_path(chat_id);
-    let config_bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
-    std::fs::write(&mcp_path, config_bytes).map_err(|e| e.to_string())?;
+    write_mcp_config(&mcp_path, &config).map_err(|e| e.to_string())?;
 
+    // Assigned by the daemon and persisted with the row, exactly as `runs::create_run_inner` does
+    // it, so an assistant turn is not the one kind of run that can exist without a session id. A
+    // first turn had neither `--resume` nor `--session-id`, so its id existed only if the CLI's
+    // stream happened to announce one — and `budget.rs` keys spend on `session_id`, so a turn whose
+    // stream carried no `init` event was money charged against nothing. Continuing a chat keeps the
+    // session being resumed rather than minting a rival id for the same conversation.
+    //
+    // Writing it at INSERT rather than waiting for the stream also closes the read-untrusted
+    // barrier's blind spot: `get_session` refuses to resume a session any run READ mail in, and a
+    // turn killed before its stream reported an id used to leave a row with no session to match on.
+    let session_id = resume.clone().unwrap_or_else(crate::auth::generate_uuid_v4);
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, created_at) VALUES (?, 'running', 'assistant', ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?)",
     )
     .bind(text)
+    .bind(&session_id)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&state.pool)
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
 
-    spawn_assistant_turn(state, id, slot, text.to_string(), resume, mcp_path);
+    spawn_assistant_turn(
+        state,
+        id,
+        slot,
+        text.to_string(),
+        resume,
+        session_id,
+        mcp_path,
+    );
     Ok(id)
 }
 
@@ -186,6 +211,7 @@ fn spawn_assistant_turn(
     slot: ChatSlot,
     text: String,
     resume: Option<String>,
+    session_id: String,
     mcp_path: std::path::PathBuf,
 ) {
     let pool = state.pool.clone();
@@ -240,17 +266,30 @@ fn spawn_assistant_turn(
         let result = tokio::time::timeout(
             run_timeout,
             runner.run_prompt(
-                &text,
-                &env,
-                None,
-                false,
-                resume.as_deref(),
-                Some(turn.mcp_path.as_path()),
-                // The orchestrator talks to NucleOS and to nothing else. The MCP allowlist below
-                // does not enforce that on its own — an allowlist only grants — so the policy is
-                // what actually keeps a Telegram turn away from the filesystem and the shell.
-                crate::runner::ToolPolicy::McpOnly,
-                None,
+                crate::runner::RunRequest {
+                    prompt: text,
+                    env,
+                    cwd: None,
+                    plan_only: false,
+                    resume_session_id: resume,
+                    mcp_config: Some(turn.mcp_path.clone()),
+                    // The orchestrator talks to NucleOS and to nothing else. The MCP allowlist below
+                    // does not enforce that on its own — an allowlist only grants — so the policy is
+                    // what actually keeps a Telegram turn away from the filesystem and the shell.
+                    tool_policy: crate::runner::ToolPolicy::McpOnly,
+                    progress_timeout: None,
+                    // Always set. `cli_args` reads this only when there is no `--resume`, which is
+                    // exactly the first turn — the one that used to be launched with no session id
+                    // at all.
+                    session_id: Some(session_id),
+                    fork_session: false,
+                    include_partial_messages: false,
+                    // An orchestrator turn is one message answered and closed; the next one arrives
+                    // as its own turn on the resumed session, which is where a Telegram reply
+                    // already goes. Nothing here needs a stdin, so it keeps a closed one.
+                    steerable: false,
+                    messages: None,
+                },
                 session_tx,
                 // Unread here, deliberately. An assistant turn's product is the reply that
                 // `extract_reply` pulls out of a completed run; a turn the wall clock killed has no
@@ -366,6 +405,7 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
+            run_messages: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -553,6 +593,24 @@ mod tests {
     }
 
     #[test]
+    fn a_configuracao_mcp_e_escrita_por_inteiro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let long_path = "C:/um/caminho/deliberadamente/muito/comprido/para/nucleos-core.exe";
+        let short_path = "C:/n.exe";
+
+        write_mcp_config(&path, &build_mcp_config(long_path)).unwrap();
+        write_mcp_config(&path, &build_mcp_config(short_path)).unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["nucleos"]["command"],
+            serde_json::json!(short_path)
+        );
+    }
+
+    #[test]
     fn only_one_turn_can_be_in_flight_per_chat() {
         let chat_id = "busy-test-chat";
 
@@ -628,6 +686,72 @@ mod tests {
 
         assert_eq!(status, "completed");
         assert_eq!(session, Some("fake-session-id".to_string()));
+    }
+
+    /// Every run carries a daemon-assigned session id, and an assistant turn is a run. Its first
+    /// turn had nothing to resume, so it was launched with neither `--resume` nor `--session-id`:
+    /// the run had an id only if the CLI's stream volunteered one. `budget.rs` deduplicates spend by
+    /// `session_id`, so a first turn whose stream carried no `init` event — the case `runner.rs`
+    /// already has a test for — was money charged against nothing at all.
+    ///
+    /// Asserted on the row and on what the runner was handed, because either alone is satisfiable
+    /// without the other: a row written and never passed to the CLI leaves the two disagreeing about
+    /// which session the spend belongs to.
+    #[tokio::test]
+    async fn an_assistant_first_turn_is_assigned_a_session_id() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner {
+            // Silent about its session, like a stream that never emits an init event. Whatever the
+            // turn ends up carrying is therefore the daemon's own doing, not the CLI's.
+            canned: Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: "hello back".into(),
+                stderr: String::new(),
+                session_id: None,
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
+            })),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let pool = state.pool.clone();
+
+        let id = send_message(&state, "assistant-first-turn-chat", "hello")
+            .await
+            .unwrap();
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT session_id FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let stored =
+            stored.expect("a first turn's row must carry the session its spend is billed to");
+        assert_eq!(
+            stored.len(),
+            36,
+            "the assigned id must be a v4 uuid, which is what the CLI accepts: {stored}"
+        );
+
+        for _ in 0..500 {
+            if runner.last_session_id.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *runner.last_session_id.lock().unwrap(),
+            Some(stored),
+            "the CLI must be told the same session the row was written with"
+        );
+        assert_eq!(
+            *runner.last_resume.lock().unwrap(),
+            None,
+            "a first turn has nothing to resume, so the id has to be assigned rather than inherited"
+        );
     }
 
     /// The orchestrator is supposed to reach NucleOS and nothing else, and for a long time the

@@ -7,10 +7,12 @@ mod backup;
 mod budget;
 mod classifier;
 mod config;
+mod contacts;
 mod daemon_client;
 mod email;
 mod feed;
 mod gate;
+mod handoff;
 mod health;
 mod hooks;
 mod http;
@@ -20,6 +22,7 @@ mod logging;
 mod mailfiles;
 mod mcp_tools;
 mod presets;
+mod priority;
 mod proposals;
 mod redact;
 mod repo_trigger;
@@ -290,12 +293,33 @@ async fn main() {
         }
     };
 
+    // Which agent CLI answers a run. Ship-dark like the local triage model above: an absent or
+    // unrecognised name keeps the proven Claude path, so the second runner is reachable only once an
+    // operator has asked for it by name. An unrecognised name warns rather than fails startup, for
+    // the same reason a bad local-model probe does — a typo in one config key must not take down
+    // every unrelated daemon service.
+    let claude_runner = || runner::ClaudeCliRunner {
+        model: models_config.claude_model.clone(),
+    };
+    let configured_runner = models_config.primary_runner.as_deref();
+    let primary_runner: Arc<dyn runner::CommandRunner> = match configured_runner {
+        Some("codex") => {
+            tracing::info!(model = %models_config.codex_model, "codex CLI selected as the run runner");
+            Arc::new(runner::CodexCliRunner {
+                model: models_config.codex_model.clone(),
+            })
+        }
+        Some(other) => {
+            tracing::warn!(%other, "unknown primary_runner — keeping the Claude CLI");
+            Arc::new(claude_runner())
+        }
+        None => Arc::new(claude_runner()),
+    };
+
     let state = AppState {
         token: Token(token_value),
         pool,
-        runner: Arc::new(runner::ClaudeCliRunner {
-            model: models_config.claude_model.clone(),
-        }),
+        runner: primary_runner,
         triage_runner,
         local_triage_disabled,
         email: Arc::new(state::EmailRuntime::from_config(
@@ -304,6 +328,7 @@ async fn main() {
             mail_files_root,
         )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };

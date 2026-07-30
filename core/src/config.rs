@@ -9,6 +9,11 @@ pub struct ModelsConfig {
     /// operator explicitly names a model that can keep message bodies on the machine.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_triage_model: Option<String>,
+    /// Which agent CLI answers a run. Absent — or naming anything startup does not recognise — keeps
+    /// the proven Claude path, so the second runner ships dark until an operator asks for it by
+    /// name, the same posture `local_triage_model` gives local inference.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub primary_runner: Option<String>,
 }
 
 impl Default for ModelsConfig {
@@ -17,6 +22,7 @@ impl Default for ModelsConfig {
             claude_model: "claude-sonnet-5".to_string(),
             codex_model: "gpt-5.6-terra".to_string(),
             local_triage_model: None,
+            primary_runner: None,
         }
     }
 }
@@ -50,6 +56,7 @@ pub struct EmailConfig {
     pub port: u16,
     pub username: String,
     pub mailbox: String,
+    pub sent_mailbox: Option<String>,
     pub poll_interval_secs: u64,
     /// Which triage classes are worth interrupting a person for.
     ///
@@ -75,6 +82,7 @@ impl Default for EmailConfig {
             port: 993,
             username: String::new(),
             mailbox: "INBOX".to_string(),
+            sent_mailbox: None,
             poll_interval_secs: 300,
             notify_classes: vec!["urgent".to_string()],
             digest_hour_utc: 7,
@@ -321,6 +329,17 @@ mod tests {
         assert_eq!(config.retain_bodies_days, 14);
     }
 
+    #[test]
+    fn sem_pasta_de_enviados_o_pilar_arranca() {
+        let config = email_config_from("enabled: true\nhost: imap.example.com\n");
+
+        assert!(
+            config.enabled,
+            "the rest of the email config must still load"
+        );
+        assert_eq!(config.sent_mailbox, None);
+    }
+
     /// The distinction the rollout's first week depends on: an EMPTY list means "notify about
     /// nothing", and only an absent key means "urgent". Collapsing the two would page the user from
     /// day one and burn the calibration ramp.
@@ -417,6 +436,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_models_config(&path).unwrap().local_triage_model, None);
+    }
+
+    /// The second runner ships dark, so what this key parses to is what decides whether a run is
+    /// answered by the proven CLI or by one nobody asked for.
+    ///
+    /// The unrecognised case is the one worth a test: startup maps anything but `codex` back to the
+    /// Claude runner, and it can only do that if loading SUCCEEDS and hands it the name. Were the
+    /// deserializer to reject an unknown value instead, a typo in one key would take the whole
+    /// daemon down — email, scheduler and all — rather than costing the operator the runner they
+    /// misspelled.
+    #[test]
+    fn primary_runner_is_optional_and_an_unknown_name_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\n",
+        )
+        .unwrap();
+        let absent = load_models_config(&path).unwrap();
+        assert_eq!(absent.codex_model, "gpt-5.6-sol");
+        assert_eq!(
+            absent.primary_runner, None,
+            "an absent key must not opt a daemon into the second runner"
+        );
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nprimary_runner: codex\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_models_config(&path).unwrap().primary_runner,
+            Some("codex".to_string()),
+            "the one recognised name must survive parsing for startup to act on"
+        );
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nprimary_runner: gemini\n",
+        )
+        .unwrap();
+        let unknown = load_models_config(&path)
+            .expect("an unrecognised runner must cost the operator a warning, not the daemon");
+        assert_eq!(
+            unknown.primary_runner,
+            Some("gemini".to_string()),
+            "startup needs the name it did not recognise in order to warn about it"
+        );
+        assert_ne!(
+            unknown.primary_runner.as_deref(),
+            Some("codex"),
+            "nothing but the exact name may reach the codex branch of the runner match"
+        );
     }
 
     #[test]

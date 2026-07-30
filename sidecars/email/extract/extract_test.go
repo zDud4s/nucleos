@@ -14,6 +14,77 @@ func at(t string) time.Time {
 	return parsed
 }
 
+func TestSentMessageForwardsRecipients(t *testing.T) {
+	raw := []byte("From: Ana <ana@example.test>\r\n" +
+		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
+		"Subject: hello\r\n\r\nbody\r\n")
+
+	message, err := SentMessage(raw, 7, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipients := message.Headers["to"]
+	if !strings.Contains(recipients, "maria@example.test") ||
+		!strings.Contains(recipients, "oncall@example.test") {
+		t.Fatalf("to header = %q, want both recipients", recipients)
+	}
+}
+
+func TestSentMessageCarriesNothingTheUserWrote(t *testing.T) {
+	raw := []byte("From: Ana <ana@example.test>\r\n" +
+		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
+		"Subject: with file\r\n" +
+		"Content-Type: multipart/mixed; boundary=X\r\n\r\n" +
+		"--X\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n" +
+		"--X\r\nContent-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename=\"invoice.pdf\"\r\n\r\n%PDF-1.4\r\n--X--\r\n")
+
+	sent, err := SentMessage(raw, 7, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent.BodyText != "" {
+		t.Fatalf("sent body = %q, want nothing the user wrote", sent.BodyText)
+	}
+	if len(sent.Attachments) != 0 {
+		t.Fatalf("sent attachments = %+v, want no record of what the user attached", sent.Attachments)
+	}
+	if sent.HasAttachments {
+		t.Fatal("sent has_attachments should be false")
+	}
+	recipients := sent.Headers["to"]
+	if !strings.Contains(recipients, "maria@example.test") ||
+		!strings.Contains(recipients, "oncall@example.test") {
+		t.Fatalf("to header = %q, want both recipients", recipients)
+	}
+
+	inbox, err := Message(raw, 7, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inbox.BodyText == "" {
+		t.Fatal("ordinary message body should be present")
+	}
+	if !inbox.HasAttachments || len(inbox.Attachments) != 1 {
+		t.Fatalf("ordinary message got %d attachments (flag %v), want exactly 1",
+			len(inbox.Attachments), inbox.HasAttachments)
+	}
+}
+
+func TestInboxMessageKeepsRecipientsOut(t *testing.T) {
+	raw := []byte("From: Ana <ana@example.test>\r\n" +
+		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
+		"Subject: hello\r\n\r\nbody\r\n")
+
+	message, err := Message(raw, 7, at("2026-07-28T10:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := message.Headers["to"]; ok {
+		t.Fatalf("headers = %+v, inbox must not forward recipients", message.Headers)
+	}
+}
+
 // `received_at` comes from the server's INTERNALDATE, never the `Date:` header — the sender writes
 // that one, and it governs the núcleo's backfill cutoff and retention. A hostile value there would
 // decide whether their own message is triaged or filed.

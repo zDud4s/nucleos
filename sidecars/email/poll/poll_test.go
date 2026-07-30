@@ -2,11 +2,14 @@ package poll
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	imapv2 "github.com/emersion/go-imap/v2"
 
+	"nucleosemail/config"
+	"nucleosemail/extract"
 	"nucleosemail/imap"
 )
 
@@ -50,6 +53,69 @@ func uidRange(from, to uint32) []imapv2.UID {
 	return uids
 }
 
+func TestACycleContinuesAfterOneMailboxFails(t *testing.T) {
+	failure := errors.New("mailbox unavailable")
+	tests := []struct {
+		name    string
+		targets []Target
+	}{
+		{
+			name: "inbox fails first",
+			targets: []Target{
+				{Mailbox: "INBOX", Direction: "inbound"},
+				{Mailbox: "Sent Items", Direction: "outbound"},
+			},
+		},
+		{
+			name: "sent fails first",
+			targets: []Target{
+				{Mailbox: "Sent Items", Direction: "outbound"},
+				{Mailbox: "INBOX", Direction: "inbound"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var called []Target
+			errs := Cycle(test.targets, func(target Target) error {
+				called = append(called, target)
+				if len(called) == 1 {
+					return failure
+				}
+				return nil
+			})
+
+			if !reflect.DeepEqual(called, test.targets) {
+				t.Fatalf("polled %v, want every target in order %v", called, test.targets)
+			}
+			if len(errs) != 1 || !errors.Is(errs[0], failure) {
+				t.Fatalf("errors = %v, want exactly the first target's failure", errs)
+			}
+		})
+	}
+}
+
+func TestTargetsOmitsSentWhenUnconfigured(t *testing.T) {
+	withoutSent := Targets(config.Config{Mailbox: "INBOX"})
+	wantWithoutSent := []Target{{Mailbox: "INBOX", Direction: "inbound"}}
+	if !reflect.DeepEqual(withoutSent, wantWithoutSent) {
+		t.Fatalf("Targets without sent mailbox = %v, want %v", withoutSent, wantWithoutSent)
+	}
+
+	withSent := Targets(config.Config{
+		Mailbox:     "INBOX",
+		SentMailbox: "[Gmail]/Sent Mail",
+	})
+	wantWithSent := []Target{
+		{Mailbox: "INBOX", Direction: "inbound"},
+		{Mailbox: "[Gmail]/Sent Mail", Direction: "outbound"},
+	}
+	if !reflect.DeepEqual(withSent, wantWithSent) {
+		t.Fatalf("Targets with sent mailbox = %v, want %v", withSent, wantWithSent)
+	}
+}
+
 // The reading that would lose mail: reporting the highest uid the SEARCH returned rather than the
 // highest one actually read moves the núcleo's cursor over everything the dead connection never
 // delivered.
@@ -60,7 +126,7 @@ func TestFetchDyingMidwayReportsWhatItRead(t *testing.T) {
 	}
 	fetcher := &fakeFetcher{bodies: bodies, dieAt: 12}
 
-	messages, _, maxExamined := Collect(fetcher, uidRange(1, 50), MaxPerBatch)
+	messages, _, maxExamined := Collect(fetcher, uidRange(1, 50), MaxPerBatch, extract.Message)
 
 	if maxExamined != 11 {
 		t.Fatalf("max examined = %d, want 11 (the last uid actually read)", maxExamined)
@@ -79,7 +145,7 @@ func TestACorruptMessageIsSkippedNotStalled(t *testing.T) {
 		3: validMessage("third"),
 	}}
 
-	messages, skipped, maxExamined := Collect(fetcher, uidRange(1, 3), MaxPerBatch)
+	messages, skipped, maxExamined := Collect(fetcher, uidRange(1, 3), MaxPerBatch, extract.Message)
 
 	if len(messages) != 2 {
 		t.Fatalf("delivered %d messages, want 2", len(messages))
@@ -99,7 +165,7 @@ func TestABatchIsPagedNotDropped(t *testing.T) {
 	}
 	fetcher := &fakeFetcher{bodies: bodies}
 
-	messages, _, maxExamined := Collect(fetcher, uidRange(1, 250), MaxPerBatch)
+	messages, _, maxExamined := Collect(fetcher, uidRange(1, 250), MaxPerBatch, extract.Message)
 
 	if len(messages) != MaxPerBatch {
 		t.Fatalf("delivered %d messages, want %d", len(messages), MaxPerBatch)
@@ -115,7 +181,12 @@ func TestABatchIsPagedNotDropped(t *testing.T) {
 // The first message failing means nothing was read all the way through, so nothing may move.
 func TestAnImmediateFailureExaminesNothing(t *testing.T) {
 	fetcher := &fakeFetcher{bodies: map[uint32][]byte{}, dieAt: 1}
-	messages, skipped, maxExamined := Collect(fetcher, uidRange(1, 5), MaxPerBatch)
+	messages, skipped, maxExamined := Collect(
+		fetcher,
+		uidRange(1, 5),
+		MaxPerBatch,
+		extract.Message,
+	)
 	if len(messages) != 0 || len(skipped) != 0 || maxExamined != 0 {
 		t.Fatalf("got %d messages, %d skipped, watermark %d — want nothing",
 			len(messages), len(skipped), maxExamined)
@@ -144,5 +215,29 @@ func TestStrictlyAboveKeepsEverythingWithoutACursor(t *testing.T) {
 	kept := StrictlyAbove([]imapv2.UID{1, 2, 3}, 0)
 	if len(kept) != 3 {
 		t.Fatalf("kept %v, want all three", kept)
+	}
+}
+
+func TestTheSentFolderIsReadForItsRecipients(t *testing.T) {
+	raw := []byte("From: Ana <ana@example.test>\r\n" +
+		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
+		"Subject: hello\r\n" +
+		"Message-ID: <hello@example.test>\r\n" +
+		"Content-Type: text/plain\r\n\r\n" +
+		"body text\r\n")
+	fetcher := &fakeFetcher{bodies: map[uint32][]byte{1: raw}}
+
+	outbound, _, _ := Collect(fetcher, uidRange(1, 1), MaxPerBatch, ExtractorFor("outbound"))
+	inbound, _, _ := Collect(fetcher, uidRange(1, 1), MaxPerBatch, ExtractorFor("inbound"))
+
+	if len(outbound) != 1 || len(inbound) != 1 {
+		t.Fatalf("got %d outbound and %d inbound messages, want one of each",
+			len(outbound), len(inbound))
+	}
+	if outbound[0].Headers["to"] == "" {
+		t.Fatalf("outbound headers = %+v, want recipients", outbound[0].Headers)
+	}
+	if _, ok := inbound[0].Headers["to"]; ok {
+		t.Fatalf("inbound headers = %+v, must not forward recipients", inbound[0].Headers)
 	}
 }

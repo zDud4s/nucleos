@@ -1061,8 +1061,13 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
         .bind(job.id)
         .execute(pool)
         .await;
-    let outcome =
-        crate::gate::run_gate(&worktree, &command, crate::state::DEFAULT_GATE_TIMEOUT).await;
+    let outcome = crate::gate::run_gate(
+        &worktree,
+        Path::new(&job.project_root),
+        &command,
+        crate::state::DEFAULT_GATE_TIMEOUT,
+    )
+    .await;
     let _ = sqlx::query("UPDATE jobs SET status = 'implementing' WHERE id = ?")
         .bind(job.id)
         .execute(pool)
@@ -1659,6 +1664,9 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

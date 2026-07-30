@@ -1,5 +1,5 @@
 use serde::Serialize;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Proposal {
@@ -69,6 +69,44 @@ pub async fn create_action_approval(
     Ok(proposal_id)
 }
 
+pub async fn create_contact_merge(
+    pool: &SqlitePool,
+    keep_id: i64,
+    absorb_id: i64,
+    reasoning: &str,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let tool_input = serde_json::json!({
+        "keep_id": keep_id,
+        "absorb_id": absorb_id,
+    })
+    .to_string();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('contact-merge', 'pending', NULL, NULL, NULL, NULL, ?, ?, ?, NULL)",
+    )
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
         "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
@@ -100,13 +138,31 @@ pub async fn transition(
 ) -> sqlx::Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
+    let transitioned =
+        transition_in_transaction(&mut transaction, id, to_status, note, &now).await?;
+
+    if !transitioned {
+        return Ok(false);
+    }
+
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub(crate) async fn transition_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: i64,
+    to_status: &str,
+    note: &str,
+    at: &str,
+) -> sqlx::Result<bool> {
     let result = sqlx::query(
         "UPDATE proposals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
     )
     .bind(to_status)
-    .bind(&now)
+    .bind(at)
     .bind(id)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
 
     if result.rows_affected() != 1 {
@@ -120,11 +176,10 @@ pub async fn transition(
     .bind(id)
     .bind(to_status)
     .bind(note)
-    .bind(&now)
-    .execute(&mut *transaction)
+    .bind(at)
+    .execute(&mut **transaction)
     .await?;
 
-    transaction.commit().await?;
     Ok(true)
 }
 
