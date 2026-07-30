@@ -25,7 +25,10 @@ import {
   runIsLive,
   runStatusLabel,
   runTone,
+  spokenDuration,
   tokenLevelHint,
+  voiceCleanupLabel,
+  voiceCleanupTone,
   promotionBlock,
   promotionCriterionGap,
   promotionReadiness,
@@ -597,5 +600,39 @@ describe("run, health and key derivations", () => {
     expect(formatTokens(1500)).toBe("1.5k");
     expect(formatTokens(48000)).toBe("48k");
     expect(formatTokens(1_400_000)).toBe("1.4M");
+  });
+});
+
+describe("voice", () => {
+  it("does not paint an uncleaned transcript as a failure", () => {
+    // Both `raw` and `shrunk` still carry a complete transcript -- the daemon refuses a cleanup
+    // rather than letting it damage what was said -- so neither may read as something broken.
+    expect(voiceCleanupTone("cleaned")).toBe("active");
+    expect(voiceCleanupTone("shrunk")).toBe("paused");
+    expect(voiceCleanupTone("raw")).toBe("off");
+  });
+
+  it("falls back to the state's own name rather than inventing a tone", () => {
+    // A shell can be newer or older than the daemon it talks to; an unknown state must recede, not
+    // claim anything.
+    expect(voiceCleanupTone("something-new")).toBe("off");
+    expect(voiceCleanupLabel("something-new")).toBe("something-new");
+  });
+
+  it("says what the three states mean in words", () => {
+    expect(voiceCleanupLabel("cleaned")).toBe("cleaned");
+    expect(voiceCleanupLabel("raw")).toBe("as spoken");
+    expect(voiceCleanupLabel("shrunk")).toBe("cleanup refused");
+  });
+
+  it("reads a spoken length as minutes and seconds", () => {
+    expect(spokenDuration(0)).toBe("0s");
+    expect(spokenDuration(4200)).toBe("4s");
+    expect(spokenDuration(59_400)).toBe("59s");
+    expect(spokenDuration(60_000)).toBe("1m 00s");
+    // Twenty minutes is the cap a capture may not exceed.
+    expect(spokenDuration(1_200_000)).toBe("20m 00s");
+    expect(spokenDuration(-1)).toBe("—");
+    expect(spokenDuration(Number.NaN)).toBe("—");
   });
 });

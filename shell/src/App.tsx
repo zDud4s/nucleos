@@ -11,10 +11,11 @@ import Mail from "./Mail";
 import Projects from "./Projects";
 import Runs from "./Runs";
 import System from "./System";
+import Voice from "./Voice";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 
-type Tab = "home" | "autopilot" | "runs" | "projects" | "assistant" | "mail" | "system";
+type Tab = "home" | "autopilot" | "runs" | "projects" | "assistant" | "mail" | "voice" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -23,6 +24,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "projects", label: "Projects" },
   { key: "assistant", label: "Assistant" },
   { key: "mail", label: "Mail" },
+  { key: "voice", label: "Voice" },
   { key: "system", label: "System" },
 ];
 
@@ -291,6 +293,7 @@ function App() {
             />
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}
+          {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
         </main>
       )}

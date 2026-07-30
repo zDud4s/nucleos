@@ -92,6 +92,24 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     run "shell: typecheck" shell npx tsc -b
     run "shell: test"      shell npm test
   fi
+
+  # shell/src-tauri is deliberately excluded from the cargo workspace (see the root Cargo.toml),
+  # which means the root `cargo fmt --all`, `cargo clippy --all-targets` and `cargo test
+  # -p nucleos-core` every one of them miss it. Until these three lines existed its Rust side was
+  # compiled only as a side effect of `npm run tauri build`, and its tests were never run at all --
+  # so a test written there was code nobody executed.
+  #
+  # Guarded on shell/dist because `tauri::generate_context!()` embeds the built frontend at COMPILE
+  # time: without it the crate does not compile, and the gate would report a Rust failure for a
+  # missing frontend. A fresh clone has to build the frontend once before the Rust side will build.
+  if [ ! -d shell/dist ]; then
+    echo "shell/dist missing — run (cd shell && npm run build) first; src-tauri embeds it at compile time" >&2
+    failures="$failures  shell/src-tauri: frontend not built"$'\n'
+  else
+    run "shell/src-tauri: fmt"    shell/src-tauri cargo fmt --all -- --check
+    run "shell/src-tauri: clippy" shell/src-tauri cargo clippy --all-targets -- -D warnings
+    run "shell/src-tauri: test"   shell/src-tauri cargo test
+  fi
 fi
 
 # The stack targets are offline and hermetic; these are neither. `cargo audit` fetches RustSec's

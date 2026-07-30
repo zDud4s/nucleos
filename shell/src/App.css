@@ -813,3 +813,52 @@ details.scoreboard th {
   .tabs { flex-wrap: wrap; min-width: 0; }
   .tab { padding-inline: var(--sp-2); font-size: var(--fs-xs); }
 }
+
+/* Voz. As linhas de um memo são cabeçalho + texto: os metadados numa fila que se pode ler de
+   relance, e o transcrito a ocupar a largura toda, porque é a única coisa ali que se lê a sério. */
+.page-voice { display: flex; flex-direction: column; gap: var(--sp-4); }
+
+.v-kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--sp-1) var(--sp-4);
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-sm);
+}
+.v-kv dt { color: var(--muted); }
+.v-kv dd { margin: 0; }
+
+/* O prompt é longo e o utilizador não o edita aqui — daí <details> e não um bloco sempre aberto.
+   `pre-wrap` porque as proibições são uma por linha e essa forma é o que as torna legíveis. */
+.v-prompt {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-3);
+  background: var(--code-bg);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+.v-memos { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.v-memos > li { padding: var(--sp-3) 0; border-top: var(--hairline); }
+.v-memos > li:first-child { border-top: none; }
+.v-memos header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-2);
+}
+/* Empurra o Delete para a direita, de modo que a ação destrutiva nunca fique encostada aos
+   metadados nem mude de posição entre linhas. */
+.v-memos header > :last-child { margin-left: auto; }
+
+.v-when, .v-len, .v-model { font-size: var(--fs-xs); color: var(--faint); }
+.v-model { font-family: var(--mono); font-size: var(--fs-2xs); }
+.v-count { font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* `pre-wrap`: um transcrito ditado traz os seus próprios parágrafos, e colapsá-los juntaria
+   pensamentos separados numa parede de texto. */
+.v-text { margin: 0; font-size: var(--fs-sm); line-height: 1.55; white-space: pre-wrap; }

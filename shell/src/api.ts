@@ -1358,3 +1358,84 @@ export async function requeueEmail(
     return "failed";
   }
 }
+
+export type VoiceKind = "dictation" | "memo";
+
+/**
+ * How a capture's text came out. `cleaned` is the only one whose `clean_text` is populated;
+ * `raw` means the model was unreachable or unarmed, and `shrunk` means it answered with so much
+ * less text than it was given that the answer was refused and the transcript kept instead.
+ */
+export type VoiceCleanupState = "cleaned" | "raw" | "shrunk";
+
+/**
+ * What `GET /voice/config` reports.
+ *
+ * Every value is the daemon's. The shell displays them and owns none of them — `.ai/voice.yaml` is
+ * a self-governing file (it names a program the daemon will execute), so it is edited by hand and
+ * never through this window.
+ */
+export interface VoiceConfigView {
+  armed: boolean;
+  hints: string[];
+  cleanup_prompt: string;
+  cleanup_model: string | null;
+  retain_dictations_days: number;
+  max_capture_seconds: number;
+  max_body_bytes: number;
+}
+
+/** One stored capture. `clean_text` is null for any `cleanup_state` other than `cleaned`. */
+export interface VoiceCapture {
+  id: number;
+  kind: VoiceKind;
+  created_at: string;
+  duration_ms: number;
+  raw_text: string;
+  clean_text: string | null;
+  cleanup_state: VoiceCleanupState;
+  model: string | null;
+}
+
+export async function getVoiceConfig(token: string): Promise<VoiceConfigView | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/voice/config`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as VoiceConfigView;
+  } catch {
+    return null;
+  }
+}
+
+export async function listVoiceMemos(token: string): Promise<VoiceCapture[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/voice/memos`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as VoiceCapture[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Deletes a memo. `false` covers both "no such memo" and a failed request, because the page's only
+ * response to either is to reload the list and show what is actually there.
+ *
+ * The route is scoped to memos on the daemon's side: a dictation's id here answers 404 rather than
+ * deleting it, even though both kinds draw their ids from one sequence.
+ */
+export async function deleteVoiceMemo(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/voice/memos/${id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

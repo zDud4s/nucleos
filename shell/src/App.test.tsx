@@ -179,7 +179,9 @@ describe("App navigation and presence", () => {
     const nav = screen.getByLabelText("NucleOS views");
     expect(
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
-    ).toEqual(["Home", "Autopilot", "Runs", "Projects", "Assistant", "Mail", "System"]);
+    ).toEqual([
+      "Home", "Autopilot", "Runs", "Projects", "Assistant", "Mail", "Voice", "System",
+    ]);
   });
 
   it("tells the daemon someone is watching, and keeps saying so", async () => {

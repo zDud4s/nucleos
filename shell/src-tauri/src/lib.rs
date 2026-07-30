@@ -1,4 +1,9 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+/// Dictation decisions. `pub` because it is genuinely this crate's surface: the platform layer
+/// calls into it, and a private module of not-yet-wired functions would be dead code under the
+/// `-D warnings` clippy gate that `scripts/gates.sh` now runs over this package.
+pub mod voice;
+
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, WindowEvent};

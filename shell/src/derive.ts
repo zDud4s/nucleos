@@ -504,3 +504,44 @@ export function relativeTime(iso: string, nowMs: number = Date.now()): string {
   if (wk < 5) return `${wk} w ago`;
   return iso.slice(0, 10);
 }
+
+/**
+ * The badge tone for how a capture's cleanup turned out.
+ *
+ * Neither `raw` nor `shrunk` gets a tone that means something is broken, because in both the
+ * transcript is intact — the daemon refuses a cleanup rather than letting it damage what was said.
+ * They mean "the model did not improve this", which is worth seeing while tuning the prompt and not
+ * worth alarming anyone about. Only `cleaned` claims the text was actually edited.
+ */
+export function voiceCleanupTone(state: string): BadgeTone {
+  switch (state) {
+    case "cleaned":
+      return "active";
+    case "shrunk":
+      return "paused";
+    default:
+      return "off";
+  }
+}
+
+/** The same three states in words, because `shrunk` says nothing to anyone who did not write it. */
+export function voiceCleanupLabel(state: string): string {
+  switch (state) {
+    case "cleaned":
+      return "cleaned";
+    case "raw":
+      return "as spoken";
+    case "shrunk":
+      return "cleanup refused";
+    default:
+      return state;
+  }
+}
+
+/** How long someone spoke, from the milliseconds the daemon recorded. */
+export function spokenDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  const total = Math.round(ms / 1000);
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+}
