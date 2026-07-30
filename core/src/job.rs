@@ -470,7 +470,7 @@ pub struct NewJob<'a> {
 /// status could start one mid-queue with no queue.
 ///
 /// Fails when the project already has a live one. That refusal is the unique index
-/// `one_live_job_per_project` (migration 0037) rather than a check here, deliberately: with the
+/// `one_live_job_per_project` (migration 0042) rather than a check here, deliberately: with the
 /// constraint in the storage layer the INSERT itself is the lock, so a scheduler tick and a manual
 /// request racing for the same project cannot both pass a check and then both proceed. It mirrors
 /// what `one_open_worktree_run_per_project` already does for runs.
