@@ -943,6 +943,182 @@ mod tests {
         .expect("write autopilot schedule");
     }
 
+    /// The same rule with a `graph:` block on it, so a test can compare like with like.
+    fn write_graph_schedule(project_root: &FsPath) {
+        std::fs::write(
+            project_root.join(".ai").join("autopilot.yaml"),
+            "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n",
+        )
+        .expect("write autopilot schedule with a graph block");
+    }
+
+    async fn job_count(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn run_count(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Shadow runs are `--permission-mode plan`, so the plan node could not write the `plan.json`
+    /// the queue is read from, and every shadow job would fail at its first node — deterministically,
+    /// on every project in shadow. §6.5 of the design wanted the implement nodes' classifier samples
+    /// and flagged its own dependency on plan-only mode; this is that dependency coming back false.
+    /// A `graph:` rule in shadow therefore behaves exactly as it does today.
+    #[tokio::test]
+    async fn a_graph_rule_in_shadow_still_fires_one_ordinary_run() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+        write_graph_schedule(project.path());
+
+        scheduler_tick(&state, now).await;
+
+        assert_eq!(job_count(&state).await, 0);
+        let mode: String = sqlx::query_scalar("SELECT mode FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "shadow");
+    }
+
+    /// A catch-up is demoted to plan-only precisely because its assumptions are as old as the window
+    /// it missed. A job is the largest thing this daemon can start, so it is the last thing a stale
+    /// window should get.
+    #[tokio::test]
+    async fn a_catch_up_never_starts_a_job() {
+        let project = tempfile::tempdir().expect("create active project");
+        let state = test_state(None).await;
+        // Due at 10:01; the daemon only came back four hours later.
+        let now = timestamp("2026-07-18T14:00:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "active", &old).await;
+        write_graph_schedule(project.path());
+
+        scheduler_tick(&state, now).await;
+
+        assert_eq!(job_count(&state).await, 0);
+        let (mode, prompt): (String, String) = sqlx::query_as("SELECT mode, prompt FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "shadow");
+        assert!(prompt.contains("CATCH-UP"), "got: {prompt}");
+    }
+
+    /// Nothing was started, so the window goes back — the same trade `CreateRunError::Busy` gets,
+    /// and for the same reason: a busy project should retry on the next tick rather than skip its
+    /// schedule for the day.
+    #[tokio::test]
+    async fn a_project_that_already_has_a_live_job_keeps_its_window() {
+        let project = tempfile::tempdir().expect("create active project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "active", &old).await;
+        write_graph_schedule(project.path());
+        crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &project.path().to_string_lossy(),
+                rule_name: "r1",
+                prompt: "go",
+                max_items: 3,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await
+        .expect("a job is already live for this project");
+
+        scheduler_tick(&state, now).await;
+
+        // Refused by `one_live_job_per_project`, not by a check in the tick: the INSERT is the lock.
+        assert_eq!(job_count(&state).await, 1);
+        assert_eq!(run_count(&state).await, 0);
+        let stored: String = sqlx::query_scalar(
+            "SELECT last_fired_at FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'r1'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, old, "the window must go back for the next tick");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_graph_rule_starts_a_job_that_owns_its_worktree() {
+        // Re-executed in a child process, like the other worktree-provisioning scheduler test:
+        // `NUCLEOS_WORKTREE_ROOT` is process-wide, and a real `git worktree add` runs here.
+        if std::env::var_os(ACTIVE_TEST_CHILD_ENV).is_none() {
+            let _lock = env_lock();
+            let repo_container = space_free_tempdir("nucleos-scheduler-job-");
+            let repo = repo_container.path().join("repo");
+            initialize_repo(&repo);
+            let worktree_root = space_free_tempdir("nucleos-wt-test-job-");
+            let status = Command::new(std::env::current_exe().expect("resolve test executable"))
+                .args([
+                    "--exact",
+                    "scheduler::tests::a_graph_rule_starts_a_job_that_owns_its_worktree",
+                    "--nocapture",
+                ])
+                .env(ACTIVE_TEST_CHILD_ENV, "1")
+                .env(ACTIVE_TEST_REPO_ENV, &repo)
+                .env(WORKTREE_ROOT_ENV, worktree_root.path())
+                .status()
+                .expect("start isolated scheduler test process");
+            assert!(status.success(), "isolated scheduler test process failed");
+            return;
+        }
+
+        let repo = PathBuf::from(
+            std::env::var_os(ACTIVE_TEST_REPO_ENV).expect("active test repository is set"),
+        );
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, &repo, "active", &old).await;
+        write_graph_schedule(&repo);
+
+        scheduler_tick(&state, now).await;
+
+        // A job, and no run: the nodes are started by the job tick, not by this one.
+        assert_eq!(run_count(&state).await, 0);
+        let (job_id, status, max_items, prompt): (i64, String, i64, String) =
+            sqlx::query_as("SELECT id, status, max_items, prompt FROM jobs")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "planning");
+        assert_eq!(max_items, 3);
+        // The rule's prompt is copied onto the job, not re-read at the plan node: the file can be
+        // edited between now and then, and a job that changed shape mid-flight would plan something
+        // nobody asked this job to do.
+        assert_eq!(prompt, "go");
+
+        // The worktree belongs to the JOB. A run owning it would let the GC collect the tree the
+        // moment that one node finished, with the rest of the queue still to run in it.
+        let worktree_path: String = sqlx::query_scalar(
+            "SELECT path FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(worktree_path.ends_with(&format!("job-{job_id}")));
+
+        let _ = crate::worktree::remove(&repo, &PathBuf::from(worktree_path), &[]).await;
+    }
+
     async fn seed_project(
         state: &AppState,
         project_root: &FsPath,
