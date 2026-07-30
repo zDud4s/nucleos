@@ -1,3 +1,6 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Deserialize;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub struct Profile {
@@ -248,15 +251,189 @@ pub async fn unmerge(pool: &SqlitePool, address: &str) -> sqlx::Result<()> {
     transaction.commit().await
 }
 
+#[derive(Deserialize)]
+struct ContactMergeInput {
+    keep_id: i64,
+    absorb_id: i64,
+}
+
+fn ordered_contact_pair(first_id: i64, second_id: i64) -> Option<(i64, i64)> {
+    match first_id.cmp(&second_id) {
+        std::cmp::Ordering::Less => Some((first_id, second_id)),
+        std::cmp::Ordering::Greater => Some((second_id, first_id)),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+fn contact_merge_pair(tool_input: &str) -> sqlx::Result<(i64, i64)> {
+    let input: ContactMergeInput =
+        serde_json::from_str(tool_input).map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    ordered_contact_pair(input.keep_id, input.absorb_id).ok_or_else(|| {
+        sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a contact merge must contain two different contact ids",
+        )))
+    })
+}
+
+// Consumed by the contact merge suggestion scheduler.
+#[allow(dead_code)]
+pub async fn propose_merges(pool: &SqlitePool) -> sqlx::Result<Vec<i64>> {
+    let address_rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT contact_id, display_name, outbound_ever
+         FROM contact_addresses
+         WHERE display_name IS NOT NULL
+           AND TRIM(display_name) <> ''
+         ORDER BY contact_id, address",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut people_by_name: BTreeMap<String, BTreeMap<i64, bool>> = BTreeMap::new();
+    for (contact_id, display_name, outbound_ever) in address_rows {
+        let normalized_name = display_name.trim().to_lowercase();
+        let outbound = outbound_ever == 1;
+        people_by_name
+            .entry(normalized_name)
+            .or_default()
+            .entry(contact_id)
+            .and_modify(|known_outbound| *known_outbound |= outbound)
+            .or_insert(outbound);
+    }
+
+    let mut candidates = BTreeMap::new();
+    for (normalized_name, people) in people_by_name {
+        let people: Vec<_> = people.into_iter().collect();
+        for (index, (lower_id, lower_outbound)) in people.iter().enumerate() {
+            for (higher_id, higher_outbound) in &people[index + 1..] {
+                if *lower_outbound || *higher_outbound {
+                    candidates
+                        .entry((*lower_id, *higher_id))
+                        .or_insert_with(|| normalized_name.clone());
+                }
+            }
+        }
+    }
+
+    let rejected_pairs: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT lower_id, higher_id FROM contact_merge_rejections")
+            .fetch_all(pool)
+            .await?;
+    let rejected_pairs: BTreeSet<_> = rejected_pairs
+        .into_iter()
+        .filter_map(|(first_id, second_id)| ordered_contact_pair(first_id, second_id))
+        .collect();
+
+    let pending_inputs: Vec<String> = sqlx::query_scalar(
+        "SELECT tool_input
+         FROM proposals
+         WHERE kind = 'contact-merge'
+           AND status = 'pending'
+           AND tool_input IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut pending_pairs: BTreeSet<_> = pending_inputs
+        .iter()
+        .filter_map(|tool_input| contact_merge_pair(tool_input).ok())
+        .collect();
+
+    let mut proposal_ids = Vec::new();
+    for (pair, normalized_name) in candidates {
+        if rejected_pairs.contains(&pair) || pending_pairs.contains(&pair) {
+            continue;
+        }
+
+        let reasoning = format!(
+            "Contacts share the normalized display name {normalized_name:?}, and at least one has outbound correspondence"
+        );
+        let proposal_id =
+            crate::proposals::create_contact_merge(pool, pair.0, pair.1, &reasoning).await?;
+        proposal_ids.push(proposal_id);
+        pending_pairs.insert(pair);
+    }
+
+    Ok(proposal_ids)
+}
+
+// Consumed by the contact merge decision endpoint.
+#[allow(dead_code)]
+pub async fn reject_merge(pool: &SqlitePool, proposal_id: i64) -> sqlx::Result<()> {
+    let rejected_at = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let tool_input: String = sqlx::query_scalar(
+        "SELECT tool_input
+         FROM proposals
+         WHERE id = ?
+           AND kind = 'contact-merge'
+           AND status = 'pending'
+           AND tool_input IS NOT NULL",
+    )
+    .bind(proposal_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let (lower_id, higher_id) = contact_merge_pair(&tool_input)?;
+
+    if !crate::proposals::transition_in_transaction(
+        &mut transaction,
+        proposal_id,
+        "rejected",
+        "rejected by user",
+        &rejected_at,
+    )
+    .await?
+    {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    sqlx::query(
+        "INSERT INTO contact_merge_rejections (lower_id, higher_id, rejected_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT (lower_id, higher_id)
+         DO UPDATE SET rejected_at = excluded.rejected_at",
+    )
+    .bind(lower_id)
+    .bind(higher_id)
+    .bind(&rejected_at)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
 
+    type ContactAddressRow = (
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    async fn all_contact_address_rows(pool: &SqlitePool) -> Vec<ContactAddressRow> {
+        sqlx::query_as(
+            "SELECT address, contact_id, first_seen, last_seen, messages_in, outbound_ever,
+                    linked_by, linked_at, display_name
+             FROM contact_addresses
+             ORDER BY address",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -883,5 +1060,225 @@ mod tests {
                 .unwrap();
         assert_eq!(linked_by, "human");
         assert!(linked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_heuristica_propoe_e_nao_funde() {
+        let pool = test_pool().await;
+        let first_address = "ana@example.com";
+        let second_address = "ana@work.example";
+        let received_at = "2026-07-20T09:00:00+00:00";
+        let sent_at = "2026-07-21T09:00:00+00:00";
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(
+            &mut transaction,
+            first_address,
+            Some("Ana Silva"),
+            received_at,
+        )
+        .await
+        .unwrap();
+        record_inbound(
+            &mut transaction,
+            second_address,
+            Some(" ana silva "),
+            received_at,
+        )
+        .await
+        .unwrap();
+        record_outbound(&mut transaction, &[first_address], sent_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let before = all_contact_address_rows(&pool).await;
+        assert_eq!(before.len(), 2);
+        let mut original_contact_ids = before.iter().map(|row| row.1).collect::<Vec<_>>();
+        original_contact_ids.sort_unstable();
+        original_contact_ids.dedup();
+        assert_eq!(
+            original_contact_ids.len(),
+            2,
+            "the fixture must begin with two separate people"
+        );
+
+        let created = propose_merges(&pool).await.unwrap();
+
+        assert_eq!(created.len(), 1);
+        let proposal_id = created[0];
+        let (kind, status, reasoning, tool_input): (String, String, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT kind, status, reasoning, tool_input
+                 FROM proposals
+                 WHERE id = ?",
+            )
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kind, "contact-merge");
+        assert_eq!(status, "pending");
+        assert!(!reasoning.trim().is_empty());
+
+        let tool_input: serde_json::Value =
+            serde_json::from_str(tool_input.as_deref().expect("merge ids must be recorded"))
+                .unwrap();
+        let mut proposed_contact_ids = vec![
+            tool_input["keep_id"]
+                .as_i64()
+                .expect("tool_input must carry keep_id"),
+            tool_input["absorb_id"]
+                .as_i64()
+                .expect("tool_input must carry absorb_id"),
+        ];
+        proposed_contact_ids.sort_unstable();
+        assert_eq!(proposed_contact_ids, original_contact_ids);
+
+        let event: (Option<String>, String, String) = sqlx::query_as(
+            "SELECT from_status, to_status, note
+             FROM proposal_events
+             WHERE proposal_id = ?",
+        )
+        .bind(proposal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event.0, None);
+        assert_eq!(event.1, "pending");
+        assert_eq!(event.2, "created");
+
+        let after = all_contact_address_rows(&pool).await;
+        assert_eq!(
+            after, before,
+            "the heuristic must leave every contact-address value unchanged"
+        );
+        let distinct_people: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT contact_id) FROM contact_addresses")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(distinct_people, 2);
+    }
+
+    #[tokio::test]
+    async fn um_par_recusado_nao_volta() {
+        let pool = test_pool().await;
+        let first_address = "duarte@example.com";
+        let second_address = "duarte@work.example";
+        let received_at = "2026-07-20T09:00:00+00:00";
+        let sent_at = "2026-07-21T09:00:00+00:00";
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(
+            &mut transaction,
+            first_address,
+            Some("Duarte Ferreira"),
+            received_at,
+        )
+        .await
+        .unwrap();
+        record_inbound(
+            &mut transaction,
+            second_address,
+            Some("duarte ferreira"),
+            received_at,
+        )
+        .await
+        .unwrap();
+        record_outbound(&mut transaction, &[second_address], sent_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let rows = all_contact_address_rows(&pool).await;
+        let mut pair = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+        pair.sort_unstable();
+        pair.dedup();
+        assert_eq!(pair.len(), 2);
+
+        let first_pass = propose_merges(&pool).await.unwrap();
+        assert_eq!(first_pass.len(), 1);
+        let proposal_id = first_pass[0];
+
+        reject_merge(&pool, proposal_id).await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(status, "pending");
+        assert_eq!(status, "rejected");
+
+        let rejection: (i64, i64, String) = sqlx::query_as(
+            "SELECT lower_id, higher_id, rejected_at
+             FROM contact_merge_rejections
+             WHERE lower_id = ? AND higher_id = ?",
+        )
+        .bind(pair[0])
+        .bind(pair[1])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((rejection.0, rejection.1), (pair[0], pair[1]));
+        assert!(!rejection.2.is_empty());
+
+        let second_pass = propose_merges(&pool).await.unwrap();
+        assert!(
+            second_pass.is_empty(),
+            "a rejected pair must not produce another proposal"
+        );
+        let proposal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'contact-merge'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(proposal_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_heuristica_exige_evidencia_de_conhecimento() {
+        let pool = test_pool().await;
+        let first_address = "info@first.example";
+        let second_address = "info@second.example";
+        let received_at = "2026-07-20T09:00:00+00:00";
+
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(
+            &mut transaction,
+            first_address,
+            Some("Support Team"),
+            received_at,
+        )
+        .await
+        .unwrap();
+        record_inbound(
+            &mut transaction,
+            second_address,
+            Some(" support team "),
+            received_at,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let rows = all_contact_address_rows(&pool).await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.5 == 0));
+        assert_ne!(rows[0].1, rows[1].1);
+
+        let created = propose_merges(&pool).await.unwrap();
+
+        assert!(
+            created.is_empty(),
+            "a shared display name without outbound correspondence is insufficient"
+        );
+        let proposal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'contact-merge'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(proposal_count, 0);
     }
 }
