@@ -341,6 +341,24 @@ pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
     }
 }
 
+/// PURE: the wall clock a run in `mode` gets, given the interactive default `base`.
+///
+/// `shadow` and `worktree` are the modes that check out a tree, edit it, build it and run a gate,
+/// and they are the ones measured dying on the 600-second deadline with work still open (see
+/// `state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER`). `email_triage` is autonomous too and deliberately
+/// stays on the short clock: it classifies one message against a local model, so a triage run still
+/// going after ten minutes is stuck, not busy.
+///
+/// Derived from `base` rather than given a constant of its own, so a test that shortens the clock
+/// still gets a short one, and an operator who tunes the deadline moves both together.
+fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+    if mode == "shadow" || mode == "worktree" {
+        base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER
+    } else {
+        base
+    }
+}
+
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
 /// aborted, including aborted before its first poll, when the task drops its captured state without
 /// running a line of the body.
@@ -689,6 +707,7 @@ async fn spawn_handoff_if_needed(
     gate_config: GateConfig,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
+    run_timeout: std::time::Duration,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -722,6 +741,9 @@ async fn spawn_handoff_if_needed(
         // conversation across a handoff means giving the successor row the flag too, which is a
         // decision to take deliberately rather than inherit.
         false,
+        // Inherited, not re-derived: a successor continues one task, and a handoff that reset the
+        // clock would let a run outlive its deadline by handing itself on.
+        run_timeout,
     );
 }
 
@@ -743,11 +765,11 @@ fn spawn_run(
     tool_policy: crate::runner::ToolPolicy,
     daemon_token: String,
     steerable: bool,
+    run_timeout: std::time::Duration,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
     let progress_timeout = state.progress_timeout;
-    let run_timeout = state.run_timeout;
     let env = run_env(&daemon_token, id);
     let handoff_state = state.clone();
     let run_messages = state.run_messages.clone();
@@ -959,6 +981,7 @@ fn spawn_run(
                             gate_config.clone(),
                             max_attempts,
                             tool_policy,
+                            run_timeout,
                         ))
                         .await;
                     }
@@ -1047,6 +1070,7 @@ fn spawn_run(
                             gate_config.clone(),
                             max_attempts,
                             tool_policy,
+                            run_timeout,
                         ))
                         .await;
                     }
@@ -1269,6 +1293,7 @@ pub async fn create_run_inner(
         tool_policy,
         daemon_token,
         steerable,
+        run_timeout_for_mode(state.run_timeout, mode),
     );
 
     Ok(id)
@@ -1433,6 +1458,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // column's default, and a process listening on a stdin its own row denies could never be
         // told the conversation is over.
         false,
+        // A resume is a worktree run, so it gets the worktree clock — the same one the run it
+        // continues was given.
+        run_timeout_for_mode(state.run_timeout, "worktree"),
     );
 
     Ok(resume_id)
@@ -3678,6 +3706,67 @@ mod tests {
         }
         panic!(
             "silent run did not reach timed_out before its wall clock, last status: {status}"
+        );
+    }
+
+    /// PURE. `email_triage` is the case worth stating: it is autonomous, it spends money, and it
+    /// still must not get the long clock — a triage run classifies one message, so one that is
+    /// still going after ten minutes is stuck rather than busy.
+    #[test]
+    fn only_the_long_running_autonomous_modes_get_the_longer_wall_clock() {
+        let base = Duration::from_secs(600);
+
+        for mode in ["shadow", "worktree"] {
+            assert_eq!(
+                run_timeout_for_mode(base, mode),
+                base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER,
+                "{mode} builds and gates a tree; it is the mode that was measured hitting the wall"
+            );
+        }
+
+        for mode in ["real", "plan", crate::email::TRIAGE_MODE] {
+            assert_eq!(
+                run_timeout_for_mode(base, mode),
+                base,
+                "{mode} keeps the interactive clock"
+            );
+        }
+    }
+
+    /// The wall clock is per mode, and this is the test that notices if it stops being — the pure
+    /// test above would keep passing if nobody called the function.
+    ///
+    /// One state, one clock, two runs. The work takes longer than the interactive deadline and less
+    /// than the autonomous one, so the same runner and the same 300ms setting have to produce two
+    /// different outcomes. Drop the multiplier and the shadow run times out with the real one; apply
+    /// it to everything and the real run completes. Both were run; both fail this.
+    #[tokio::test]
+    async fn an_autonomous_run_outlives_the_deadline_that_kills_an_interactive_one() {
+        // 300ms clock against 520ms of work: 3x that is 900ms, so the margin either way is wider
+        // than the work itself.
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_millis(520)), Duration::from_millis(300))
+                .await;
+        // Far out of the way: this test is about the wall clock, not about silence.
+        state.progress_timeout = Duration::from_secs(30);
+
+        let interactive = create_run_inner(&state, "interactive".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        let autonomous = create_run_inner(&state, "autonomous".into(), None, None, "shadow", false)
+            .await
+            .unwrap();
+
+        let (interactive_status, _) = poll_run(&state, interactive, "timed_out").await;
+        let (autonomous_status, _) = poll_run(&state, autonomous, "completed").await;
+
+        assert_eq!(
+            interactive_status, "timed_out",
+            "520ms of work does not fit in a 300ms interactive clock"
+        );
+        assert_eq!(
+            autonomous_status, "completed",
+            "the same work fits in the autonomous clock, which is what the multiplier is for"
         );
     }
 
