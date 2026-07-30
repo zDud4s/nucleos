@@ -483,8 +483,15 @@ pub trait CommandRunner: Send + Sync {
     /// Runs one `claude -p` invocation. `cwd`, when set, is the run's working directory (spec §3.3).
     /// `session_tx` receives the `session_id` the instant the CLI's `init` message is parsed.
     ///
-    /// Deliberately wide rather than taking an options struct: every parameter is one CLI flag, and
-    /// keeping them positional means adding a flag cannot silently inherit a default nobody chose.
+    /// Mostly one parameter per CLI flag, kept positional so adding a flag cannot silently inherit a
+    /// default nobody chose. The two exceptions are the escape hatches: `session_tx` and
+    /// `transcript`, which exist so a caller can learn something before this future resolves.
+    ///
+    /// `transcript` accumulates stdout as it arrives, and is the ONLY way a caller sees any of it
+    /// when the run does not end normally. `runs.rs` bounds the whole call in a wall-clock timeout;
+    /// when that fires the future is dropped, and everything owned by it — the returned
+    /// `RunOutcome`, its stdout, its usage — is destroyed with it. A run killed by that clock used to
+    /// persist no transcript and no trajectory at all, which is precisely the run worth inspecting.
     #[allow(clippy::too_many_arguments)]
     async fn run_prompt(
         &self,
@@ -497,6 +504,7 @@ pub trait CommandRunner: Send + Sync {
         tool_policy: ToolPolicy,
         progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome>;
 }
 
@@ -568,6 +576,7 @@ impl CommandRunner for OllamaRunner {
         tool_policy: ToolPolicy,
         _progress_timeout: Option<Duration>,
         _session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
         if tool_policy != ToolPolicy::None {
             return Err(std::io::Error::other(
@@ -644,6 +653,12 @@ impl CommandRunner for OllamaRunner {
             })?
             .to_string();
 
+        // One shot, so there is no streaming to mirror — but a caller that reads the transcript
+        // after a timeout must not find it empty just because this runner answered all at once.
+        if let Ok(mut shared) = transcript.lock() {
+            shared.push_str(&answer);
+        }
+
         if let Some(stderr) = unusable_local_answer(&answer) {
             return Ok(RunOutcome {
                 exit_code: 1,
@@ -689,6 +704,7 @@ impl CommandRunner for ClaudeCliRunner {
         tool_policy: ToolPolicy,
         progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
         // npm-installed `claude` is a `.cmd` shim that Rust's `Command` can't spawn by name — the
@@ -778,6 +794,13 @@ impl CommandRunner for ClaudeCliRunner {
             };
             stdout_acc.push_str(&line);
             stdout_acc.push('\n');
+            // Mirrored as it arrives, not at the end: the end is exactly what a wall-clock timeout
+            // never reaches. A poisoned lock would mean another thread panicked mid-write, which
+            // says nothing about this run — keep going rather than take the run down with it.
+            if let Ok(mut shared) = transcript.lock() {
+                shared.push_str(&line);
+                shared.push('\n');
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if session_id.is_none()
                     && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
@@ -921,6 +944,7 @@ impl CommandRunner for FakeCommandRunner {
         tool_policy: ToolPolicy,
         progress_timeout: Option<Duration>,
         session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
         {
             *self.calls.lock().unwrap() += 1;
@@ -960,8 +984,10 @@ impl CommandRunner for FakeCommandRunner {
             let _ = session_tx.send(sid.clone());
         }
         let delay = *self.delay.lock().unwrap();
+        let mut streamed = false;
         match (delay, progress_timeout) {
             (Some(delay), Some(deadline)) => {
+                streamed = true;
                 let mut emitted_stdout = String::new();
                 let stdout_lines = outcome
                     .stdout
@@ -986,10 +1012,19 @@ impl CommandRunner for FakeCommandRunner {
                     }
                     emitted_stdout.push_str(&line);
                     emitted_stdout.push('\n');
+                    // Same contract as the real runner: what has been emitted is visible to the
+                    // caller even if this future never gets to return.
+                    if let Ok(mut shared) = transcript.lock() {
+                        shared.push_str(&line);
+                        shared.push('\n');
+                    }
                 }
             }
             (Some(delay), None) => tokio::time::sleep(delay).await,
             (None, _) => {}
+        }
+        if !streamed && let Ok(mut shared) = transcript.lock() {
+            shared.push_str(&outcome.stdout);
         }
         Ok(outcome)
     }
@@ -998,6 +1033,12 @@ impl CommandRunner for FakeCommandRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript sink for the tests that do not read one. Named rather than inlined so that a
+    /// test which DOES care about the transcript is visibly different at the call site.
+    fn discard_transcript() -> std::sync::Arc<std::sync::Mutex<String>> {
+        std::sync::Arc::new(std::sync::Mutex::new(String::new()))
+    }
 
     #[tokio::test]
     async fn fake_runner_returns_canned_outcome() {
@@ -1028,6 +1069,7 @@ mod tests {
                 ToolPolicy::Unrestricted,
                 None,
                 tx,
+                discard_transcript(),
             )
             .await
             .unwrap();
@@ -1078,6 +1120,7 @@ mod tests {
                 ToolPolicy::Unrestricted,
                 Some(progress_timeout),
                 tx,
+                discard_transcript(),
             ),
         )
         .await
@@ -1107,6 +1150,7 @@ mod tests {
                     ToolPolicy::Unrestricted,
                     None,
                     tx,
+                    discard_transcript(),
                 )
                 .await
         });
@@ -1131,6 +1175,7 @@ mod tests {
                 ToolPolicy::Unrestricted,
                 None,
                 tx,
+                discard_transcript(),
             )
             .await
             .unwrap();
@@ -1155,6 +1200,7 @@ mod tests {
                 ToolPolicy::McpOnly,
                 None,
                 tx,
+                discard_transcript(),
             )
             .await
             .unwrap();
@@ -1427,7 +1473,8 @@ mod tests {
                         None,
                         ToolPolicy::Unrestricted,
                         None,
-                        tx
+                        tx,
+                        discard_transcript()
                     )
                     .await
                     .is_err()
@@ -1445,7 +1492,8 @@ mod tests {
                     None,
                     ToolPolicy::Unrestricted,
                     None,
-                    tx
+                    tx,
+                    discard_transcript()
                 )
                 .await
                 .is_ok()
@@ -1495,6 +1543,7 @@ mod tests {
                 tool_policy,
                 None,
                 session_tx,
+                discard_transcript(),
             )
             .await
     }

@@ -471,6 +471,8 @@ fn spawn_run(
                 });
             }
 
+            // Owned out here so it survives the timeout below dropping the run future.
+            let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let result = tokio::time::timeout(
                 run_timeout,
                 runner.run_prompt(
@@ -483,6 +485,7 @@ fn spawn_run(
                     tool_policy,
                     Some(progress_timeout),
                     session_tx,
+                    std::sync::Arc::clone(&transcript),
                 ),
             )
             .await;
@@ -651,10 +654,21 @@ fn spawn_run(
                     break;
                 }
                 Err(_elapsed) => {
+                    // The wall clock dropped the run future, so there is no `RunOutcome` to read —
+                    // no stdout, no usage, no session id. What the run did emit before the clock ran
+                    // out is in the shared transcript, and it is the whole record of a run that hit
+                    // this branch. Persisting it is not cosmetic: this is the run most worth reading
+                    // afterwards, and until now it was the one that left nothing at all behind.
+                    let seen = transcript
+                        .lock()
+                        .map(|shared| shared.clone())
+                        .unwrap_or_default();
+                    append_run_events(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'timed_out', stdout = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
+                    .bind(&seen)
                     .bind(&completed_at)
                     .bind(attempt as i64)
                     .bind(id)
@@ -2994,6 +3008,77 @@ mod tests {
         }
         panic!(
             "silent run did not reach timed_out before its wall clock, last status: {status}"
+        );
+    }
+
+    /// The wall clock drops the run future, taking the `RunOutcome` and every byte of stdout it
+    /// owned. A run killed that way used to persist nothing at all — no transcript, no trajectory —
+    /// which made the run most worth reading afterwards the one that left no record. The shared
+    /// transcript is the only thing that outlives the drop.
+    #[tokio::test]
+    async fn a_run_killed_by_the_wall_clock_keeps_what_it_had_already_emitted() {
+        // Four events, one every 40ms, against a 150ms wall clock: the run cannot finish, and the
+        // progress deadline is far enough out that it is the WALL clock being tested, not it.
+        let (mut state, runner) =
+            test_state_with_runner(Some(Duration::from_millis(40)), Duration::from_millis(150))
+                .await;
+        state.progress_timeout = Duration::from_secs(30);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"system","subtype":"init"}"#,
+                r#"{"type":"assistant"}"#,
+                r#"{"type":"user"}"#,
+                r#"{"type":"result"}"#,
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.05),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "a run the wall clock will cut short").await;
+
+        let mut status = String::new();
+        for _ in 0..60 {
+            status = get_run_status(&app, created.id).await.status;
+            if status == "timed_out" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, "timed_out", "the wall clock must terminate this run");
+
+        let stdout: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let stdout = stdout.unwrap_or_default();
+        assert!(
+            stdout.contains(r#""subtype":"init""#),
+            "the transcript emitted before the clock ran out must be persisted, got {stdout:?}"
+        );
+
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_events WHERE run_id = ?")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            events > 0,
+            "a timed-out run must still leave a trajectory behind"
+        );
+        // Not all four: the point is that it was cut off mid-stream, so a test asserting the whole
+        // transcript would be asserting that the timeout did not work.
+        assert!(
+            events < 4,
+            "the run should have been cut short, but all {events} events arrived"
         );
     }
 
