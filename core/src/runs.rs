@@ -666,7 +666,13 @@ async fn prepare_handoff_successor(
 #[derive(Clone)]
 enum GateConfig {
     NotConfigured,
-    Command(String),
+    /// The command, and the project root it was read from. They travel together because the gate
+    /// verifies the second before trusting the first: a script the run rewrote inside its worktree
+    /// is compared against the project root's copy, which is the one the operator configured.
+    Command {
+        command: String,
+        project_root: String,
+    },
     Unreadable(String),
 }
 
@@ -840,9 +846,17 @@ fn spawn_run(
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
                     let gate_outcome = match (terminal_status, &gate_config, spawn_cwd.as_deref()) {
-                        ("completed", GateConfig::Command(command), Some(worktree)) => Some(
+                        (
+                            "completed",
+                            GateConfig::Command {
+                                command,
+                                project_root,
+                            },
+                            Some(worktree),
+                        ) => Some(
                             crate::gate::run_gate(
                                 worktree,
+                                std::path::Path::new(project_root),
                                 command,
                                 crate::state::DEFAULT_GATE_TIMEOUT,
                             )
@@ -1148,7 +1162,10 @@ pub async fn create_run_inner(
         gate_config = match crate::config::load_schedule_rules(std::path::Path::new(project_root)) {
             Ok(rules) => rules
                 .gate_command
-                .map_or(GateConfig::NotConfigured, GateConfig::Command),
+                .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                    command,
+                    project_root: project_root.to_string(),
+                }),
             Err(error) => {
                 tracing::warn!(
                     project_id = worktree_project_id,
@@ -1377,7 +1394,10 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     {
         Ok(rules) => rules
             .gate_command
-            .map_or(GateConfig::NotConfigured, GateConfig::Command),
+            .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                command,
+                project_root: project_root.clone(),
+            }),
         Err(error) => {
             tracing::warn!(
                 project_id = %wt_project_id,
