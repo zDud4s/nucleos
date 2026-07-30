@@ -206,9 +206,16 @@ async fn cli_probe() -> SubsystemReadout {
 /// Whether the configured transcriber is a program that exists.
 ///
 /// Reports readiness of configuration only, like every other probe here — it resolves the binary and
-/// does not run it. The whitespace split is load-bearing: `stt_command` is a whole command line, so
-/// handing the string to a path lookup unsplit would look for a program whose name contains its own
-/// arguments and report every configured transcriber as missing.
+/// does not run it. Splitting is load-bearing: `stt_command` is a whole command line, so handing the
+/// string to a path lookup unsplit would look for a program whose name contains its own arguments and
+/// report every configured transcriber as missing.
+///
+/// It splits through `transcribe::split_command`, the same function that spawns the child, and that
+/// sharing is the point rather than a tidiness. This probe used its own `split_whitespace` until a
+/// quoted program path became supported — at which point it started looking for a program whose name
+/// began with a quote character, and reported a transcriber that worked perfectly as missing. A probe
+/// that parses its subject differently from the code under test is worse than no probe: it raises the
+/// alarm on exactly the configuration it was added to bless.
 ///
 /// Absent config is `Ok`, not a failure. Voice being off is a state, not a fault.
 async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
@@ -216,11 +223,10 @@ async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
         if !armed {
             return Ok(HealthState::Ok);
         }
-        let program = command
-            .split_whitespace()
+        let program = crate::transcribe::split_command(&command)
+            .into_iter()
             .next()
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
         tokio::task::spawn_blocking(move || resolve_program(std::ffi::OsStr::new(&program)))
             .await
             .map_err(classify_error)?
@@ -495,5 +501,39 @@ mod tests {
         let encoded = serde_json::to_string(&readout).unwrap();
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("user:password@host"));
+    }
+
+    /// A working transcriber behind a quoted path must not be reported as missing.
+    ///
+    /// The regression this pins: the probe used to split on whitespace while `transcribe.rs` split on
+    /// quotes, so a `stt_command` naming `"C:\Program Files\...\whisper-cli.exe"` made the probe
+    /// look for a program whose name STARTS WITH a quote character. It reported `down` for the exact
+    /// configuration that quoting was added to support — a probe raising the alarm on a working setup,
+    /// which is worse than no probe. Both now go through one function.
+    #[tokio::test]
+    async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote() {
+        // `cmd` exists on every Windows host and needs no arguments to resolve.
+        let readout = voice_probe(true, "\"cmd\" -m model.bin".to_string()).await;
+
+        assert_eq!(
+            readout.status,
+            HealthState::Ok,
+            "a quoted path that resolves must probe Ok, got {:?}",
+            readout.reason
+        );
+    }
+
+    /// And the unquoted form, which every config written before quoting existed uses.
+    #[tokio::test]
+    async fn an_unquoted_transcriber_path_still_probes_its_first_token() {
+        let readout = voice_probe(true, "cmd -m model.bin".to_string()).await;
+        assert_eq!(readout.status, HealthState::Ok);
+
+        let missing = voice_probe(true, "definitely-not-a-program-anywhere -x".to_string()).await;
+        assert_ne!(
+            missing.status,
+            HealthState::Ok,
+            "a transcriber that does not exist has to be reported"
+        );
     }
 }

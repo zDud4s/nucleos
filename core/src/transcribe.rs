@@ -225,7 +225,9 @@ impl Transcriber for CommandTranscriber {
 /// Deliberately not a shell: no escapes, no single quotes, no variable expansion. A double quote
 /// toggles whether whitespace separates, and nothing else. Anything more would be a shell nobody
 /// asked for, in a config field that names one program.
-fn split_command(command: &str) -> Vec<String> {
+/// `pub(crate)` so `health.rs` probes the SAME program this spawns. A second parser for one config
+/// string is how a probe comes to disagree with the thing it is probing.
+pub(crate) fn split_command(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
