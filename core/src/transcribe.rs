@@ -103,14 +103,13 @@ impl CommandTranscriber {
 #[async_trait]
 impl Transcriber for CommandTranscriber {
     async fn transcribe(&self, wav: &[u8], audio: Duration) -> std::io::Result<String> {
-        let mut fields = self.command.split_whitespace();
-        let program = fields.next().ok_or_else(|| {
+        let tokens = split_command(&self.command);
+        let (program, args) = tokens.split_first().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "no transcribe command configured",
             )
         })?;
-        let args = fields.collect::<Vec<_>>();
 
         // Built before anything can await, and owning the file from this line onwards. Constructing it
         // after the spawn would reintroduce exactly the leak it exists to prevent.
@@ -121,7 +120,7 @@ impl Transcriber for CommandTranscriber {
 
         let mut command = Command::new(program);
         command
-            .args(&args)
+            .args(args)
             .arg(&audio_file.path)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -179,6 +178,50 @@ impl Transcriber for CommandTranscriber {
     }
 }
 
+/// PURE: splits the configured command into program and arguments, honouring double quotes.
+///
+/// A bare whitespace split is what `transcribe.go` does, and it is wrong here for a reason this very
+/// machine demonstrates: `C:\Program Files\whisper\whisper-cli.exe -m model.bin` splits into program
+/// `C:\Program`, which does not exist, and the spawn fails naming a path nobody typed. `Program
+/// Files` is where a Windows install goes by default, and this account's own home directory contains
+/// a space too -- it is why the Rust toolchain had to be relocated. So the space is the ordinary case
+/// and not the exotic one. Quotes work for arguments as well, because a model file under the same
+/// directory has the same problem.
+///
+/// Deliberately not a shell: no escapes, no single quotes, no variable expansion. A double quote
+/// toggles whether whitespace separates, and nothing else. Anything more would be a shell nobody
+/// asked for, in a config field that names one program.
+fn split_command(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in command.chars() {
+        match c {
+            // Marking the token started is what lets an explicit "" survive as an empty argument
+            // instead of silently vanishing and shifting every argument after it.
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// What a `FakeTranscriber` will do when asked.
 #[cfg(test)]
 pub enum FakeOutcome {
@@ -193,6 +236,9 @@ pub enum FakeOutcome {
 #[cfg(test)]
 pub struct FakeTranscriber {
     outcome: FakeOutcome,
+    /// How long to take before answering. Real transcription takes seconds, and a test about what
+    /// happens WHILE it runs -- a request abandoned mid-capture -- needs a window to abandon it in.
+    delay: Duration,
     // Qualified rather than imported: the import would be unused in the non-test build.
     calls: std::sync::atomic::AtomicUsize,
 }
@@ -202,13 +248,23 @@ impl FakeTranscriber {
     pub fn returning(text: &str) -> Self {
         Self {
             outcome: FakeOutcome::Text(text.to_string()),
+            delay: Duration::ZERO,
             calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Answers, but not immediately.
+    pub fn returning_slowly(text: &str, delay: Duration) -> Self {
+        Self {
+            delay,
+            ..Self::returning(text)
         }
     }
 
     pub fn failing(kind: std::io::ErrorKind, message: &str) -> Self {
         Self {
             outcome: FakeOutcome::Failure(kind, message.to_string()),
+            delay: Duration::ZERO,
             calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -223,6 +279,9 @@ impl FakeTranscriber {
 impl Transcriber for FakeTranscriber {
     async fn transcribe(&self, _wav: &[u8], _audio: Duration) -> std::io::Result<String> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         match &self.outcome {
             FakeOutcome::Text(text) => Ok(text.clone()),
             FakeOutcome::Failure(kind, message) => Err(std::io::Error::new(*kind, message.clone())),
@@ -360,5 +419,69 @@ mod tests {
             .expect_err("an empty command cannot transcribe");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The failure this fixes: `C:\Program Files\...` is where a Windows install actually goes, and a
+    /// bare whitespace split turns it into the program `C:\Program`.
+    #[test]
+    fn a_quoted_program_path_keeps_its_spaces() {
+        assert_eq!(
+            split_command("\"C:\\Program Files\\whisper\\whisper-cli.exe\" -m model.bin"),
+            vec![
+                "C:\\Program Files\\whisper\\whisper-cli.exe",
+                "-m",
+                "model.bin"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quoted_argument_keeps_its_spaces_too() {
+        // A model file lives next to the program, so it inherits the same directory and the same
+        // problem. Fixing only the program would move the failure one argument to the right.
+        assert_eq!(
+            split_command("whisper-cli -m \"C:\\My Models\\ggml-base.bin\" -bo 1"),
+            vec![
+                "whisper-cli",
+                "-m",
+                "C:\\My Models\\ggml-base.bin",
+                "-bo",
+                "1"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unquoted_command_splits_the_way_it_always_did() {
+        // The existing contract, unchanged: every `.ai/voice.yaml` written before quoting existed
+        // must keep working.
+        assert_eq!(
+            split_command("whisper-cli -m model.bin -bo 1 -bs 1"),
+            vec!["whisper-cli", "-m", "model.bin", "-bo", "1", "-bs", "1"]
+        );
+    }
+
+    #[test]
+    fn runs_of_whitespace_do_not_produce_empty_arguments() {
+        assert_eq!(
+            split_command("  whisper-cli   -m    model.bin  "),
+            vec!["whisper-cli", "-m", "model.bin"]
+        );
+    }
+
+    #[test]
+    fn an_explicitly_empty_quoted_argument_survives() {
+        // Passing "" is how some CLIs are told "this flag, with no value". Dropping it would shift
+        // every later argument one position left, which fails in a way that looks like a config typo.
+        assert_eq!(
+            split_command("prog --prefix \"\" --after"),
+            vec!["prog", "--prefix", "", "--after"]
+        );
+    }
+
+    #[test]
+    fn nothing_but_whitespace_is_no_command_at_all() {
+        assert!(split_command("   ").is_empty());
+        assert!(split_command("").is_empty());
     }
 }

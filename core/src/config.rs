@@ -132,18 +132,28 @@ pub fn load_email_config(path: &Path) -> EmailConfig {
 
 /// What the local model is told to do with a raw transcript.
 ///
-/// The three prohibitions are the load-bearing part, and each answers a measured failure of a small
+/// The four prohibitions are the load-bearing part, and each answers a measured failure of a small
 /// model rather than a hypothetical one. Local triage found a 4B model inventing deadlines nobody
 /// wrote and inverting who was asking whom, which two forbidding sentences fixed. The third is
 /// specific to dictation: a dictated sentence is often a question, and a small model handed a question
 /// ANSWERS it — without that line, saying "will this compile?" pastes an opinion about compilation
 /// instead of the words that were said.
+///
+/// The fourth came out of §14.6, from measurement rather than review: the first three forbid adding,
+/// distorting and answering, and none of them forbids REWRITING. Asked to tidy "prune dictations
+/// after 7 days", the model returned "pruning dictations after seven days" — reproducibly, three
+/// times out of three. It had added nothing and changed no meaning, so every existing rule was
+/// satisfied; it had also restructured the sentence and spelled out the numeral, which for dictation
+/// is the whole failure. Someone dictating a config value, a version, a time or a path needs the
+/// characters they said, not a well-phrased paraphrase of them.
 pub const DEFAULT_CLEANUP_PROMPT: &str =
     "Tidy the transcript below. Fix punctuation, capitalisation, \
 and obvious speech-to-text errors. Remove filler words and false starts.
 Do NOT add any information that is not in the transcript.
 Do NOT change the meaning, the tone, or who is asking whom.
 Do NOT answer, summarise, or comment on the content — you are an editor, not a reader.
+Do NOT rephrase or restructure sentences that are already clear, and keep numbers, dates, \
+versions, units and paths exactly as they were said — digits stay digits.
 Keep the original language. Return only the corrected text.";
 
 /// `.ai/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
@@ -153,9 +163,10 @@ Keep the original language. Return only the corrected text.";
 pub struct VoiceConfig {
     /// Opt-in, like the email pillar: this one opens a microphone.
     pub enabled: bool,
-    /// Whitespace-split into program + args, with the audio path appended last — the contract the
-    /// Telegram sidecar's transcriber already uses. Empty means there is no transcriber, which is
-    /// indistinguishable from the pillar being off and is treated as such.
+    /// Split into program + args, with the audio path appended last — the contract the Telegram
+    /// sidecar's transcriber already uses. Whitespace separates; double quotes protect a path that
+    /// contains spaces, which anything installed under `C:\Program Files` needs. Empty means there is
+    /// no transcriber, which is indistinguishable from the pillar being off and is treated as such.
     pub stt_command: String,
     pub hotkey: String,
     pub memo_hotkey: String,

@@ -179,10 +179,19 @@ pub fn apply_hints(raw: &str, hints: &[String]) -> String {
     if hints.is_empty() {
         return raw.to_string();
     }
+    // Trimmed, because a hint carrying a stray space from the YAML list folds to a form no single
+    // token can ever equal: it would sit in the file looking active and silently match nothing.
+    // Blank entries drop out for the same reason.
     let folded_hints = hints
         .iter()
-        .map(|hint| (fold_for_hint(hint), hint))
+        .filter_map(|hint| {
+            let hint = hint.trim();
+            (!hint.is_empty()).then(|| (fold_for_hint(hint), hint))
+        })
         .collect::<Vec<_>>();
+    if folded_hints.is_empty() {
+        return raw.to_string();
+    }
 
     raw.split_inclusive(|c: char| !c.is_alphanumeric())
         .map(|piece| {
@@ -195,7 +204,7 @@ pub fn apply_hints(raw: &str, hints: &[String]) -> String {
             let folded_word = fold_for_hint(word);
             match folded_hints
                 .iter()
-                .find(|(folded, hint)| *folded == folded_word && hint.as_str() != word)
+                .find(|(folded, hint)| *folded == folded_word && **hint != *word)
             {
                 Some((_, hint)) => format!("{hint}{tail}"),
                 None => piece.to_string(),
@@ -233,25 +242,78 @@ pub fn build_cleanup_prompt(instructions: &str, transcript: &str) -> String {
 
 /// PURE: splits a transcript on sentence boundaries into pieces a small model can hold.
 ///
-/// Falls back to emitting an over-long piece rather than cutting mid-sentence when a single sentence
-/// exceeds the budget: a chunk boundary inside a sentence is what makes a map-reduce cleanup produce
-/// two half-sentences that each look finished.
+/// Sentence-first, because a chunk boundary inside a sentence is what makes a map-reduce cleanup
+/// produce two half-sentences that each look finished.
+///
+/// But sentence-first is not sentence-only, and that distinction is the whole point of this
+/// function. Greedy decoding -- which §14.2 made mandatory for latency -- routinely returns a wall
+/// of words with no full stop anywhere in it, and a transcript with no terminator is ONE sentence:
+/// every character of a twenty-minute memo, handed whole to a `CLEANUP_NUM_CTX` window. Ollama then
+/// truncates the input, the reply covers only the prefix, and `accept_cleanup`'s shrink guard
+/// rejects the result -- so the ENTIRE memo silently falls back to raw, not just the oversized
+/// piece. The budget is therefore a ceiling, not a preference.
+///
+/// Counted in characters throughout, matching `CLEANUP_CHUNK_CHARS`'s name. Bytes would make every
+/// chunk of accented Portuguese smaller than the budget says without anything explaining why.
 pub fn chunk_transcript(text: &str, budget: usize) -> Vec<String> {
+    // A zero budget would make every piece over-long and leave `split_oversized` with no cut it is
+    // allowed to make.
+    let budget = budget.max(1);
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_chars = 0usize;
     for sentence in text.split_inclusive(['.', '!', '?', '\n']) {
-        if !current.is_empty() && current.len() + sentence.len() > budget {
-            chunks.push(std::mem::take(&mut current));
+        for piece in split_oversized(sentence, budget) {
+            let piece_chars = piece.chars().count();
+            if current_chars > 0 && current_chars + piece_chars > budget {
+                chunks.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+            current.push_str(piece);
+            current_chars += piece_chars;
         }
-        current.push_str(sentence);
     }
     if !current.trim().is_empty() {
         chunks.push(current);
     }
-    if chunks.is_empty() && !text.trim().is_empty() {
-        chunks.push(text.to_string());
-    }
     chunks
+}
+
+/// PURE: cuts one over-long sentence into pieces of at most `budget` characters.
+///
+/// Prefers the last space in each piece, so a word survives whole. A run containing no space at all
+/// -- a dictated URL, a path, a string of digits -- is cut at the budget anyway: letting it through
+/// is the failure this exists to prevent, and a cut word costs a seam the cleanup model can repair.
+///
+/// Every index comes from `char_indices`, so a cut can never land inside a multibyte character. A
+/// byte-arithmetic version of this would panic on the first accented word.
+fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
+    if sentence.chars().count() <= budget {
+        return vec![sentence];
+    }
+    let mut pieces = Vec::new();
+    let mut rest = sentence;
+    while rest.chars().count() > budget {
+        let hard = rest
+            .char_indices()
+            .nth(budget)
+            .map_or(rest.len(), |(index, _)| index);
+        let head = &rest[..hard];
+        let cut = head
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(hard, |(index, c)| index + c.len_utf8());
+        // A piece whose only whitespace is its first character would otherwise cut nothing and loop
+        // forever.
+        let cut = if cut == 0 { hard } else { cut };
+        pieces.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    if !rest.is_empty() {
+        pieces.push(rest);
+    }
+    pieces
 }
 
 /// PURE: whether a cleaned transcript is plausible enough to hand back.
@@ -389,19 +451,31 @@ pub async fn list(pool: &sqlx::SqlitePool, kind: Kind) -> Result<Vec<Capture>, s
     .await
 }
 
-pub async fn get(pool: &sqlx::SqlitePool, id: i64) -> Result<Option<Capture>, sqlx::Error> {
+/// Scoped by kind as well as id, and the kind is not redundant.
+///
+/// `voice_captures.id` is ONE sequence shared by both kinds, so without this clause
+/// `GET /voice/memos/{id}` happily serves a dictation and `DELETE /voice/memos/{id}` deletes one --
+/// a route named for the documents you keep, silently reaching into the retention-bound corpus of
+/// everything you have ever dictated. `list` was already kind-scoped; these two were not.
+pub async fn get(
+    pool: &sqlx::SqlitePool,
+    kind: Kind,
+    id: i64,
+) -> Result<Option<Capture>, sqlx::Error> {
     sqlx::query_as(
         "SELECT id, kind, created_at, duration_ms, raw_text, clean_text, cleanup_state, model \
-         FROM voice_captures WHERE id = ?",
+         FROM voice_captures WHERE id = ? AND kind = ?",
     )
     .bind(id)
+    .bind(kind.as_str())
     .fetch_optional(pool)
     .await
 }
 
-pub async fn delete(pool: &sqlx::SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM voice_captures WHERE id = ?")
+pub async fn delete(pool: &sqlx::SqlitePool, kind: Kind, id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM voice_captures WHERE id = ? AND kind = ?")
         .bind(id)
+        .bind(kind.as_str())
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
@@ -528,61 +602,94 @@ pub async fn post_capture(
     wav: Bytes,
 ) -> impl IntoResponse {
     let duration = Duration::from_millis(query.duration_ms);
-    let captured = match capture(&state.voice, &wav, duration).await {
-        Ok(captured) => captured,
-        // Not an error condition — the capability genuinely does not exist on this machine, and saying
-        // so beats a hotkey that silently does nothing.
-        Err(CaptureError::NotConfigured) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no transcriber is configured; voice is off",
-            )
-                .into_response();
-        }
-        Err(CaptureError::TooLong) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("a capture may not exceed {MAX_CAPTURE_SECONDS}s"),
-            )
-                .into_response();
-        }
-        Err(CaptureError::Transcription(error)) => {
-            tracing::warn!(%error, "voice: transcription failed");
-            return (StatusCode::BAD_GATEWAY, "the transcriber failed").into_response();
-        }
-        Err(CaptureError::NothingHeard) => {
-            return (StatusCode::NO_CONTENT, "nothing was heard").into_response();
-        }
+    let work = capture_and_record(
+        state.pool.clone(),
+        state.voice.clone(),
+        query.kind,
+        wav,
+        duration,
+    );
+
+    // Decision 14, and the two kinds genuinely want opposite things here.
+    //
+    // A memo records something that happened once. A client that goes away mid-capture -- the shell
+    // restarting, a laptop sleeping, the Telegram sidecar timing out its turn -- would otherwise drop
+    // this future at its last `.await`, and because decision 6 already deleted the audio there is
+    // nothing left to retry from: the recording is transcribed and then thrown away, with no row and
+    // no reply. So a memo runs in its own task and finishes even if nobody is listening.
+    //
+    // A dictation is the opposite. Nobody wants the transcript of an utterance they walked away from,
+    // and letting it die with its request stops paying a model for an answer with nowhere to go.
+    let outcome = match query.kind {
+        Kind::Memo => match crate::http::uncancellable(work).await {
+            Ok(outcome) => outcome,
+            Err(status) => return status.into_response(),
+        },
+        Kind::Dictation => work.await,
     };
 
-    match record(
-        &state.pool,
-        query.kind,
+    match outcome {
+        Ok(response) => axum::Json(response).into_response(),
+        // Not an error condition — the capability genuinely does not exist on this machine, and saying
+        // so beats a hotkey that silently does nothing.
+        Err(CaptureError::NotConfigured) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no transcriber is configured; voice is off",
+        )
+            .into_response(),
+        Err(CaptureError::TooLong) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a capture may not exceed {MAX_CAPTURE_SECONDS}s"),
+        )
+            .into_response(),
+        Err(CaptureError::Transcription(error)) => {
+            tracing::warn!(%error, "voice: transcription failed");
+            (StatusCode::BAD_GATEWAY, "the transcriber failed").into_response()
+        }
+        Err(CaptureError::NothingHeard) => {
+            (StatusCode::NO_CONTENT, "nothing was heard").into_response()
+        }
+    }
+}
+
+/// One capture from end to end -- transcribe, clean, persist -- as a single OWNED future.
+///
+/// Owned, rather than borrowing `AppState`, because `http::uncancellable` needs `'static`: the future
+/// has to be able to outlive the request that created it. That is also what puts the audio guard in
+/// the right place. `TempAudio` is built inside `transcribe`, so it travels with whatever task holds
+/// this future, which §5.5 asks for in as many words -- the guard lives with the work, not with the
+/// connection.
+async fn capture_and_record(
+    pool: sqlx::SqlitePool,
+    voice: Arc<VoiceRuntime>,
+    kind: Kind,
+    wav: Bytes,
+    duration: Duration,
+) -> Result<CaptureResponse, CaptureError> {
+    let captured = capture(&voice, &wav, duration).await?;
+    let id = match record(
+        &pool,
+        kind,
         duration,
         &captured.raw,
         &captured.cleaned,
-        state.voice.cleanup_model.as_deref(),
+        voice.cleanup_model.as_deref(),
     )
     .await
     {
-        Ok(id) => axum::Json(CaptureResponse {
-            id,
-            text: captured.cleaned.text,
-            state: captured.cleaned.state,
-        })
-        .into_response(),
+        Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "voice: could not record the capture");
             // The text is what the caller actually needs; losing the row is not worth losing the
             // dictation the person just spoke. `id: 0` says no row exists to fetch later.
-            axum::Json(CaptureResponse {
-                id: 0,
-                text: captured.cleaned.text,
-                state: captured.cleaned.state,
-            })
-            .into_response()
+            0
         }
-    }
+    };
+    Ok(CaptureResponse {
+        id,
+        text: captured.cleaned.text,
+        state: captured.cleaned.state,
+    })
 }
 
 pub async fn list_memos(State(state): State<AppState>) -> impl IntoResponse {
@@ -604,17 +711,19 @@ pub async fn list_dictations(State(state): State<AppState>) -> impl IntoResponse
 }
 
 pub async fn get_memo(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    match get(&state.pool, id).await {
+    match get(&state.pool, Kind::Memo, id).await {
         Ok(Some(memo)) => axum::Json(memo).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "no such capture").into_response(),
+        // A dictation's id reaching this route is "no such memo", not a memo. Both kinds draw from
+        // one id sequence, so this is the answer that keeps the two surfaces separate.
+        Ok(None) => (StatusCode::NOT_FOUND, "no such memo").into_response(),
         Err(error) => db_error(error),
     }
 }
 
 pub async fn delete_memo(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    match delete(&state.pool, id).await {
+    match delete(&state.pool, Kind::Memo, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "no such capture").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such memo").into_response(),
         Err(error) => db_error(error),
     }
 }
@@ -752,10 +861,44 @@ mod tests {
                 "cut mid-sentence: {chunk:?}"
             );
         }
+    }
 
-        // One sentence longer than the whole budget survives intact rather than being split.
-        let long = format!("{}.", "x".repeat(50));
-        assert_eq!(chunk_transcript(&long, 10), vec![long]);
+    /// The budget is a ceiling even when the transcript offers nowhere good to cut.
+    ///
+    /// This is what greedy decoding actually returns -- §14.2 made `-bo 1 -bs 1` mandatory for
+    /// latency, and it under-produces punctuation. Before this, a wall of words with no full stop
+    /// was one "sentence" and went to the model whole, so a twenty-minute memo overflowed
+    /// `CLEANUP_NUM_CTX` and lost its cleanup entirely. An earlier version of the test above
+    /// asserted exactly that behaviour and so pinned the bug in place rather than the fix.
+    #[test]
+    fn an_unpunctuated_wall_of_words_is_still_cut_to_the_budget() {
+        let wall = "palavra ".repeat(50);
+        let chunks = chunk_transcript(&wall, 20);
+        assert!(chunks.len() > 1, "an unpunctuated wall must still be split");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 20, "over budget: {chunk:?}");
+        }
+        assert_eq!(chunks.concat(), wall, "cutting lost or duplicated text");
+    }
+
+    #[test]
+    fn a_run_with_no_space_is_cut_without_splitting_a_character() {
+        // A dictated URL or path, in a language where a character is not a byte. Byte arithmetic
+        // here would panic rather than mis-cut, which is why the cut comes from char_indices.
+        let run = "ação".repeat(10);
+        let chunks = chunk_transcript(&run, 7);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 7, "over budget: {chunk:?}");
+        }
+        assert_eq!(chunks.concat(), run);
+    }
+
+    #[test]
+    fn a_zero_budget_terminates_instead_of_hanging() {
+        // Nothing configures this, but a budget of zero has no legal cut and the loop has to be
+        // proven to end anyway.
+        assert_eq!(chunk_transcript("abc", 0).concat(), "abc");
     }
 
     /// An unreachable cleanup model yields the raw transcript, FLAGGED raw.
@@ -807,7 +950,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = get(&pool, id)
+        let stored = get(&pool, Kind::Memo, id)
             .await
             .unwrap()
             .expect("the memo was recorded");
@@ -821,8 +964,8 @@ mod tests {
 
         assert_eq!(list(&pool, Kind::Memo).await.unwrap().len(), 1);
         assert!(list(&pool, Kind::Dictation).await.unwrap().is_empty());
-        assert!(delete(&pool, id).await.unwrap());
-        assert!(!delete(&pool, id).await.unwrap());
+        assert!(delete(&pool, Kind::Memo, id).await.unwrap());
+        assert!(!delete(&pool, Kind::Memo, id).await.unwrap());
     }
 
     /// A raw or shrunk capture stores no cleaned text, so the two can never disagree.
@@ -844,7 +987,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = get(&pool, id).await.unwrap().unwrap();
+        let stored = get(&pool, Kind::Dictation, id).await.unwrap().unwrap();
         assert_eq!(stored.cleanup_state, "raw");
         assert_eq!(stored.clean_text, None);
         assert_eq!(stored.raw_text, "as spoken");
@@ -991,5 +1134,135 @@ mod tests {
             ..crate::config::VoiceConfig::default()
         };
         assert!(transcriber_for(&armed).is_some());
+    }
+
+    /// Decision 14, both halves at once — the pair §10 test 5b names.
+    ///
+    /// Without this, decision 14 was only an intention: the handler awaited both kinds identically, so
+    /// a memo whose client went away mid-transcription was transcribed and then thrown away. No row,
+    /// no reply, and decision 6 had already deleted the audio it came from, so there was nothing left
+    /// to retry with. A dictation must keep dying, though — that half is not an oversight to fix.
+    ///
+    /// Abandonment here is `timeout` dropping the future, which is the same drop a disconnecting
+    /// client causes. For the memo it drops the future that AWAITS the JoinHandle, and dropping a
+    /// JoinHandle only detaches its task; that detachment is exactly the property `uncancellable`
+    /// exists to buy, so the test would fail if the handler stopped using it.
+    #[tokio::test]
+    async fn a_memo_survives_the_client_disconnecting_and_a_dictation_does_not() {
+        let pool = pool().await;
+        let slow = || {
+            Arc::new(crate::transcribe::FakeTranscriber::returning_slowly(
+                "gravado em voz alta",
+                Duration::from_millis(150),
+            )) as Arc<dyn crate::transcribe::Transcriber>
+        };
+        let runtime = |transcriber| {
+            Arc::new(VoiceRuntime {
+                armed: true,
+                transcriber: Some(transcriber),
+                ..VoiceRuntime::default()
+            })
+        };
+        // 20ms against a 150ms transcriber: the drop lands inside transcription, not after it.
+        let abandon = Duration::from_millis(20);
+
+        let memo = capture_and_record(
+            pool.clone(),
+            runtime(slow()),
+            Kind::Memo,
+            Bytes::from_static(b"wav"),
+            Duration::from_secs(3),
+        );
+        assert!(
+            tokio::time::timeout(abandon, crate::http::uncancellable(memo))
+                .await
+                .is_err(),
+            "the request must be gone before transcription could finish"
+        );
+
+        // The task is detached, so there is no handle left to await — poll for the row instead of
+        // sleeping a guessed interval.
+        let mut waited = Duration::ZERO;
+        let step = Duration::from_millis(25);
+        while list(&pool, Kind::Memo).await.unwrap().is_empty() && waited < Duration::from_secs(5) {
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+        let memos = list(&pool, Kind::Memo).await.unwrap();
+        assert_eq!(
+            memos.len(),
+            1,
+            "the memo must persist with nobody listening for the answer"
+        );
+        assert_eq!(memos[0].raw_text, "gravado em voz alta");
+
+        let dictation = capture_and_record(
+            pool.clone(),
+            runtime(slow()),
+            Kind::Dictation,
+            Bytes::from_static(b"wav"),
+            Duration::from_secs(3),
+        );
+        assert!(tokio::time::timeout(abandon, dictation).await.is_err());
+        // Twice the transcriber's delay: long enough that a surviving task would have landed by now.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            list(&pool, Kind::Dictation).await.unwrap().is_empty(),
+            "an abandoned dictation must leave nothing behind"
+        );
+    }
+
+    /// The memos-only routes must not reach a dictation, even by its exact id.
+    ///
+    /// `voice_captures.id` is one sequence shared by both kinds, so an unscoped `WHERE id = ?` let
+    /// `GET /voice/memos/{id}` serve a dictation and `DELETE /voice/memos/{id}` delete one — the
+    /// memos surface silently reaching into the retention-bound corpus of everything ever dictated.
+    #[tokio::test]
+    async fn the_memo_routes_cannot_reach_a_dictation() {
+        let pool = pool().await;
+        let cleaned = Cleaned {
+            text: "texto limpo".to_string(),
+            state: CleanupState::Cleaned,
+        };
+        let id = record(
+            &pool,
+            Kind::Dictation,
+            Duration::from_secs(2),
+            "texto cru",
+            &cleaned,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            get(&pool, Kind::Memo, id).await.unwrap().is_none(),
+            "a dictation must not be readable as a memo"
+        );
+        assert!(
+            !delete(&pool, Kind::Memo, id).await.unwrap(),
+            "the memo route must not delete a dictation"
+        );
+        assert!(
+            get(&pool, Kind::Dictation, id).await.unwrap().is_some(),
+            "and the dictation must still be there afterwards"
+        );
+    }
+
+    /// A hint carrying a stray space from a hand-edited list must still match.
+    #[test]
+    fn a_hint_with_surrounding_whitespace_still_matches() {
+        // Untrimmed, this folds to " nucleo " — a form no single token can ever equal. It sat in the
+        // file looking active and quietly did nothing, which is the worst way for a hint to fail.
+        let hints = vec!["  núcleo  ".to_string()];
+
+        assert_eq!(apply_hints("o nucleo escreve", &hints), "o núcleo escreve");
+    }
+
+    #[test]
+    fn blank_hints_are_dropped_rather_than_matching_everything() {
+        let hints = vec!["   ".to_string(), String::new()];
+
+        assert_eq!(apply_hints("texto intacto", &hints), "texto intacto");
     }
 }
