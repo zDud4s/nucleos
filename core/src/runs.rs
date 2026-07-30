@@ -707,12 +707,63 @@ async fn fail_provisioning(state: &AppState, id: i64, project_id: Option<&str>, 
     .await;
 }
 
+/// One node of a job: which job it belongs to, what part it plays, and the worktree it inherits.
+///
+/// A node carries the worktree rather than provisioning one, which is the whole reason a job can
+/// exceed a single context window — each node starts with a fresh window and picks up the previous
+/// one's work from the disk it shares.
+pub struct JobNode {
+    pub job_id: i64,
+    /// `plan` | `implement` | `review`. Never `gate`: the gate is a subprocess, not a run.
+    pub stage: &'static str,
+    pub worktree_path: String,
+    pub branch: String,
+}
+
 pub async fn create_run_inner(
     state: &AppState,
     prompt: String,
     project_id: Option<String>,
     cwd: Option<String>,
     mode: &str,
+) -> Result<i64, CreateRunError> {
+    create_run_with(state, prompt, project_id, cwd, mode, None).await
+}
+
+/// Starts one node of a job inside that job's existing worktree.
+///
+/// Deliberately `mode = "worktree"` rather than a mode of its own: `plan_only`, the tool policy,
+/// `max_attempts` and migration 0009's exclusivity index all branch on `mode`, and a fourth value
+/// would have to be excluded from each of them. Missing one would be silent.
+///
+/// Unused outside tests until the state machine drives it; the allow comes off with the first
+/// production caller, and if it is still here after that, a node path was built and never wired up.
+#[allow(dead_code)]
+pub async fn create_job_node_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    node: JobNode,
+) -> Result<i64, CreateRunError> {
+    create_run_with(
+        state,
+        prompt,
+        Some(project_id),
+        Some(project_root),
+        "worktree",
+        Some(node),
+    )
+    .await
+}
+
+async fn create_run_with(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    node: Option<JobNode>,
 ) -> Result<i64, CreateRunError> {
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
@@ -782,18 +833,30 @@ pub async fn create_run_inner(
                 GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
             }
         };
-        let owner = crate::worktree::Owner::Run(id);
-        let info = match crate::worktree::create(std::path::Path::new(project_root), owner).await {
-            Ok(info) => info,
-            Err(error) => {
-                fail_provisioning(
-                    state,
-                    id,
-                    project_id.as_deref(),
-                    &format!("worktree provisioning failed: {error}"),
-                )
-                .await;
-                return Err(CreateRunError::Worktree(error));
+        // A job node inherits its job's worktree; only a standalone run provisions one. Skipping
+        // both the `create` and the `record` is what lets a sequence of nodes accumulate work on one
+        // tree — and it is why nothing here writes a `worktrees` row for a node: the job already
+        // owns one, and a second row for the same directory would give the GC two owners to reconcile.
+        let info = match &node {
+            Some(node) => crate::worktree::WorktreeInfo {
+                path: std::path::PathBuf::from(&node.worktree_path),
+                branch: node.branch.clone(),
+            },
+            None => {
+                let owner = crate::worktree::Owner::Run(id);
+                match crate::worktree::create(std::path::Path::new(project_root), owner).await {
+                    Ok(info) => info,
+                    Err(error) => {
+                        fail_provisioning(
+                            state,
+                            id,
+                            project_id.as_deref(),
+                            &format!("worktree provisioning failed: {error}"),
+                        )
+                        .await;
+                        return Err(CreateRunError::Worktree(error));
+                    }
+                }
             }
         };
         // Every exit from here on has to leave a terminal status behind. Past the INSERT the row is
@@ -802,15 +865,16 @@ pub async fn create_run_inner(
         // the project — until a restart, the only thing that reconciles `running`. The `create`
         // branch above compensated; these two propagated with `?` and stranded the run.
         let worktree_path = info.path.to_string_lossy().into_owned();
-        if let Err(error) = crate::worktree::record(
-            &state.pool,
-            owner,
-            worktree_project_id,
-            project_root,
-            &worktree_path,
-            &info.branch,
-        )
-        .await
+        if node.is_none()
+            && let Err(error) = crate::worktree::record(
+                &state.pool,
+                crate::worktree::Owner::Run(id),
+                worktree_project_id,
+                project_root,
+                &worktree_path,
+                &info.branch,
+            )
+            .await
         {
             fail_provisioning(
                 state,
@@ -821,12 +885,19 @@ pub async fn create_run_inner(
             .await;
             return Err(CreateRunError::Db(error));
         }
-        if let Err(error) = sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?")
-            .bind(&worktree_path)
-            .bind(id)
-            .execute(&state.pool)
-            .await
-        {
+        // The node's identity lands in the same write as its cwd so a row can never be `running`
+        // inside a job's worktree while claiming to belong to no job — which would make it invisible
+        // to the chain that has to finalise it.
+        let cwd_update = match &node {
+            Some(node) => {
+                sqlx::query("UPDATE runs SET cwd = ?, job_id = ?, stage = ? WHERE id = ?")
+                    .bind(&worktree_path)
+                    .bind(node.job_id)
+                    .bind(node.stage)
+            }
+            None => sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path),
+        };
+        if let Err(error) = cwd_update.bind(id).execute(&state.pool).await {
             fail_provisioning(
                 state,
                 id,
@@ -1410,6 +1481,79 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_node_adopts_the_jobs_worktree_instead_of_provisioning_one() {
+        // `WorktreeRootEnv` writes a process-wide variable, so every test that sets it must hold
+        // this lock. Without it this test moves the worktree root out from under whichever other
+        // test is mid-provision, and the failure surfaces over there instead of here — which is
+        // exactly how it was found.
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-jobnode-");
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let job_id = crate::job::insert_job(&state.pool, "proj", &project_root, "implementing", 5)
+            .await
+            .expect("start a job");
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("the job provisions its worktree once");
+        crate::worktree::record(
+            &state.pool,
+            owner,
+            "proj",
+            &project_root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+        )
+        .await
+        .expect("record the job worktree");
+
+        let run_id = create_job_node_run(
+            &state,
+            "the second item".into(),
+            "proj".into(),
+            project_root.clone(),
+            JobNode {
+                job_id,
+                stage: "implement",
+                worktree_path: info.path.to_string_lossy().into_owned(),
+                branch: info.branch.clone(),
+            },
+        )
+        .await
+        .expect("a node starts inside the job worktree");
+
+        let (cwd, node_job_id, stage): (String, i64, String) =
+            sqlx::query_as("SELECT cwd, job_id, stage FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(PathBuf::from(&cwd), info.path);
+        assert_eq!(node_job_id, job_id);
+        assert_eq!(stage, "implement");
+
+        // The load-bearing half. A node that recorded a worktree of its own would give the same
+        // directory two owners, and the GC would then be free to collect it out from under the job
+        // the moment this one node reached a terminal status.
+        let own_row: Option<i64> = sqlx::query_scalar(
+            "SELECT owner_id FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            own_row.is_none(),
+            "a job node must not provision or record a worktree of its own"
+        );
     }
 
     async fn create_worktree_run(
