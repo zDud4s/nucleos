@@ -4244,8 +4244,16 @@ mod tests {
         );
     }
 
-    /// The invariant, run rather than asserted: the CLI's permission barrier is stood down ONLY
-    /// where the classifier that replaces it is verified present.
+    /// The invariant, run rather than asserted: the permission DECISION is `true` only where the
+    /// classifier that would replace the barrier is verified present.
+    ///
+    /// The decision, not the command line — those are two different claims and this test can only
+    /// make the first. `shadow` is `plan_only` (see `create_run_inner`), and `plan_only` outranks
+    /// this flag in `cli_args`, so a shadow run carries the decision and still launches with
+    /// `--permission-mode plan`. That is correct and it is why the pure test
+    /// `runner::tests::plan_only_outranks_the_classifier_permission_surface` exists beside this one:
+    /// together they cover decision → flag → argument, and `worktree` is the only mode where all
+    /// three line up. Confirmed against a live daemon on 2026-07-31, both directions.
     ///
     /// Three cases, and the second and third are the ones that matter. The same unattended run in a
     /// tree whose `PreToolUse` entry names somebody else's script gets nothing — "a hook exists" is
@@ -4255,7 +4263,7 @@ mod tests {
     /// Mutation-checked: dropping the `runs_unattended` guard fails the third case, dropping the
     /// hook lookup fails the second.
     #[tokio::test]
-    async fn only_a_verified_classifier_stands_the_cli_permission_barrier_down() {
+    async fn only_a_verified_classifier_earns_the_permission_decision() {
         let (state, runner) = test_state_with_runner(None, Duration::from_secs(30)).await;
 
         let wired = space_free_tempdir("nucleos-wired-");
