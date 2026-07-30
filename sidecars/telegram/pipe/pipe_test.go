@@ -388,7 +388,7 @@ func TestResolveIncomingVoiceWithoutTranscriber(t *testing.T) {
 	dl := fakeDownloader{remotePath: "voice/file.ogg", data: []byte("voice")}
 	msg := &telegram.Message{Voice: &telegram.Voice{FileID: "v1"}}
 
-	if got := resolveIncoming(dl, "", msg); !strings.Contains(got, "unavailable") {
+	if got := resolveIncoming(dl, nil, "", msg); !strings.Contains(got, "unavailable") {
 		t.Errorf("resolveIncoming(voice) = %q, want unavailable note", got)
 	}
 }
@@ -397,7 +397,7 @@ func TestResolveIncomingDocument(t *testing.T) {
 	dl := fakeDownloader{remotePath: "documents/notes.pdf", data: []byte("document")}
 	msg := &telegram.Message{Document: &telegram.Document{FileID: "d1", FileName: "notes.pdf"}}
 
-	got := resolveIncoming(dl, "", msg)
+	got := resolveIncoming(dl, nil, "", msg)
 	if !strings.Contains(got, "File saved at:") || !strings.HasSuffix(got, ".pdf") {
 		t.Errorf("resolveIncoming(document) = %q, want saved .pdf prompt", got)
 	}
@@ -406,7 +406,7 @@ func TestResolveIncomingDocument(t *testing.T) {
 func TestResolveIncomingPlainText(t *testing.T) {
 	msg := &telegram.Message{Text: "hello"}
 
-	if got := resolveIncoming(fakeDownloader{}, "", msg); got != "hello" {
+	if got := resolveIncoming(fakeDownloader{}, nil, "", msg); got != "hello" {
 		t.Errorf("resolveIncoming(text) = %q, want %q", got, "hello")
 	}
 }
@@ -467,7 +467,7 @@ func TestAVoiceRecordingDoesNotOutliveItsTranscription(t *testing.T) {
 	t.Setenv("TEMP", dir)
 
 	dl := fakeDownloader{remotePath: "voice/file.ogg", data: []byte("voice")}
-	resolveIncoming(dl, "", &telegram.Message{Voice: &telegram.Voice{FileID: "v1"}})
+	resolveIncoming(dl, nil, "", &telegram.Message{Voice: &telegram.Voice{FileID: "v1"}})
 
 	left, err := filepath.Glob(filepath.Join(dir, tempFilePattern))
 	if err != nil {
@@ -518,7 +518,7 @@ func TestACaptionOnAnAttachmentReachesTheOrchestrator(t *testing.T) {
 		Caption: "what is the error in this screenshot?",
 	}
 
-	got := resolveIncoming(dl, "", msg)
+	got := resolveIncoming(dl, nil, "", msg)
 	if !strings.Contains(got, "what is the error in this screenshot?") {
 		t.Errorf("resolveIncoming(captioned photo) = %q, want the caption carried through", got)
 	}
@@ -737,4 +737,93 @@ func (d *bootingDaemon) GetFeed() ([]map[string]any, error) {
 		return nil, errors.New("daemon not up yet")
 	}
 	return d.feed, nil
+}
+
+// A daemon whose voice pillar can be scripted, plus the Daemon methods the pipe never reaches on this
+// path. Only `VoiceCapture` is exercised; the rest exist so the value satisfies `Daemon`.
+type voiceDaemon struct {
+	Daemon
+	text       string
+	configured bool
+	err        error
+	gotFormat  string
+	gotMillis  int64
+	gotBytes   int
+}
+
+func (v *voiceDaemon) VoiceCapture(audio []byte, format string, durationMs int64) (string, bool, error) {
+	v.gotFormat = format
+	v.gotMillis = durationMs
+	v.gotBytes = len(audio)
+	return v.text, v.configured, v.err
+}
+
+// The point of the whole change: when the núcleo can transcribe, it does — hints and cleanup included —
+// and this process does not run a transcriber of its own.
+func TestVoiceGoesThroughTheDaemonWhenThePillarIsArmed(t *testing.T) {
+	dl := fakeDownloader{data: []byte("OggS fake opus")}
+	vd := &voiceDaemon{text: "the núcleo owns the DB.", configured: true}
+	msg := &telegram.Message{Voice: &telegram.Voice{FileID: "v1", Duration: 4}}
+
+	// `transcribeCmd` is deliberately a command that would FAIL if it ran, so a passing test proves the
+	// local path was not taken rather than merely that the answer was right.
+	got := resolveIncoming(dl, vd, "definitely-not-a-program", msg)
+
+	if got != "the núcleo owns the DB." {
+		t.Errorf("resolveIncoming(voice) = %q, want the daemon's transcript", got)
+	}
+	if vd.gotFormat != "ogg" {
+		t.Errorf("format = %q, want ogg — Telegram sends Opus and the daemon names its temp file from this", vd.gotFormat)
+	}
+	if vd.gotMillis != 4000 {
+		t.Errorf("durationMs = %d, want 4000 (Telegram reports seconds)", vd.gotMillis)
+	}
+	if vd.gotBytes == 0 {
+		t.Error("no audio reached the daemon")
+	}
+}
+
+// The regression this guards: a voice note must keep arriving for someone who never configured the
+// voice pillar. `configured: false` is the daemon saying 503, or not answering at all.
+func TestVoiceFallsBackToTheLocalCommandWhenThePillarIsOff(t *testing.T) {
+	dl := fakeDownloader{data: []byte("OggS fake opus")}
+	vd := &voiceDaemon{configured: false}
+	msg := &telegram.Message{Voice: &telegram.Voice{FileID: "v1", Duration: 2}}
+
+	// An empty command makes the local transcriber report ErrNoTranscriber, so reaching the
+	// "unavailable" note proves the fallback ran instead of the answer being taken from the daemon.
+	got := resolveIncoming(dl, vd, "", msg)
+
+	if !strings.Contains(got, "unavailable") {
+		t.Errorf("resolveIncoming(voice) = %q, want the local path to have been tried", got)
+	}
+}
+
+// A daemon that CAN transcribe and failed is not a reason to try again locally: it already has the
+// recording's one chance, and a second transcription would be a different answer with no way to tell
+// which was right.
+func TestAFailingDaemonIsReportedRatherThanRetriedLocally(t *testing.T) {
+	dl := fakeDownloader{data: []byte("OggS fake opus")}
+	vd := &voiceDaemon{configured: true, err: errors.New("transcriber exited with 1")}
+	msg := &telegram.Message{Voice: &telegram.Voice{FileID: "v1", Duration: 2}}
+
+	got := resolveIncoming(dl, vd, "", msg)
+
+	if !strings.Contains(got, "unavailable") {
+		t.Errorf("resolveIncoming(voice) = %q, want an unavailable note", got)
+	}
+}
+
+// 204 from the daemon means it ran and heard nothing. Distinct from a failure, because the person
+// should be told their recording was silent rather than that dictation is broken.
+func TestSilenceFromTheDaemonSaysNothingWasHeard(t *testing.T) {
+	dl := fakeDownloader{data: []byte("OggS fake opus")}
+	vd := &voiceDaemon{configured: true, text: "   "}
+	msg := &telegram.Message{Voice: &telegram.Voice{FileID: "v1", Duration: 2}}
+
+	got := resolveIncoming(dl, vd, "", msg)
+
+	if !strings.Contains(got, "nothing was heard") {
+		t.Errorf("resolveIncoming(voice) = %q, want a nothing-was-heard note", got)
+	}
 }

@@ -138,7 +138,7 @@ func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Trac
 	}
 
 	chatID := u.Message.Chat.ID
-	text := resolveIncoming(dl, cfg.TranscribeCmd, u.Message)
+	text := resolveIncoming(dl, dc, cfg.TranscribeCmd, u.Message)
 	if strings.TrimSpace(text) == "" {
 		// A sticker, a location, a poll: none of them carries a prompt, and a turn started on an
 		// empty one spends a run to answer nothing.
@@ -221,7 +221,18 @@ func sweepTempFiles(dir string, maxAge time.Duration) {
 // the orchestrator. Voice → transcript (or a graceful "unavailable" note); document/photo → a
 // "file saved at" prompt; otherwise the plain text. Never returns an error — it degrades to a
 // human-readable note the orchestrator can relay.
-func resolveIncoming(dl Downloader, transcribeCmd string, msg *telegram.Message) string {
+// voiceCapturer is the daemon's voice pillar, asked for by type assertion rather than added to
+// `Daemon`.
+//
+// Optional on purpose, and in two directions: a daemon build that predates the pillar does not have
+// this method, and a daemon that has it may still have voice switched off. Widening `Daemon` would
+// have forced every stub in this package to grow a method most of them do not care about, and would
+// have implied the capability is required when it is not.
+type voiceCapturer interface {
+	VoiceCapture(audio []byte, format string, durationMs int64) (string, bool, error)
+}
+
+func resolveIncoming(dl Downloader, dc Daemon, transcribeCmd string, msg *telegram.Message) string {
 	switch {
 	case msg.Voice != nil:
 		path, err := downloadToTemp(dl, msg.Voice.FileID, ".ogg")
@@ -235,6 +246,32 @@ func resolveIncoming(dl Downloader, transcribeCmd string, msg *telegram.Message)
 				log.Printf("could not remove voice recording %q: %v", path, err)
 			}
 		}()
+		// The núcleo first, when it can. It spawns the transcriber, applies the operator's
+		// misheard-word hints and runs the local cleanup model — none of which this process can do,
+		// and all of which a voice note deserves as much as a dictation does. Asking it here is what
+		// stops this file being a second implementation of the same contract.
+		//
+		// Only "I cannot" sends us to the local command: voice switched off, or a daemon that is not
+		// answering. A voice note is somebody talking to you, and it must not stop arriving because an
+		// optional pillar is unconfigured.
+		if vc, ok := dc.(voiceCapturer); ok {
+			if audio, readErr := os.ReadFile(path); readErr == nil {
+				text, configured, err := vc.VoiceCapture(audio, "ogg", int64(msg.Voice.Duration)*1000)
+				if configured {
+					if err != nil {
+						log.Printf("voice capture via the daemon failed: %v", err)
+						return "[voice message received but transcription is unavailable]"
+					}
+					if strings.TrimSpace(text) == "" {
+						return "[voice message received but nothing was heard]"
+					}
+					return text
+				}
+			} else {
+				log.Printf("could not read the downloaded voice recording: %v", readErr)
+			}
+		}
+
 		text, err := transcribe.Transcribe(transcribeCmd, path)
 		if err != nil || strings.TrimSpace(text) == "" {
 			return "[voice message received but transcription is unavailable]"

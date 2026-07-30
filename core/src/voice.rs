@@ -95,7 +95,13 @@ pub enum CleanupState {
     Cleaned,
     /// Delivered as transcribed. Either no cleanup model is armed, or the model could not be reached.
     Raw,
-    /// A cleanup came back implausibly short and was discarded in favour of the raw transcript.
+    /// A cleanup was REFUSED by a guard and the raw transcript was kept instead.
+    ///
+    /// The name is narrower than the meaning, and deliberately not renamed: this value is written into
+    /// `voice_captures.cleanup_state`, whose CHECK constraint names it, so changing the spelling is a
+    /// migration and a shell change for no gain. It covers a cleanup that came back implausibly short,
+    /// and one that changed a number — see `accept_cleanup` for why the second is a guard rather than a
+    /// line in the prompt.
     Shrunk,
 }
 
@@ -330,11 +336,23 @@ fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
 
 /// PURE: whether a cleaned transcript is plausible enough to hand back.
 ///
+/// Two guards, both of which answer a measured failure rather than a hypothetical one.
+///
 /// Length is a crude proxy, and that is the point: the failure it catches is a chunk silently going
 /// missing, which is precisely a length event. A cleanup that legitimately removes filler loses a
 /// little; one that lost a paragraph loses a lot.
+///
+/// Digits are not a proxy at all. §14.6 measured a 4B model turning "prune dictations after 7 days"
+/// into "pruning dictations after seven days", and the prompt gained a fourth prohibition forbidding
+/// exactly that. Running the real pipeline afterwards showed the prohibition DID NOT WORK -- the model
+/// produced the same rewrite with the rule in front of it. A small model does not reliably obey a
+/// negative instruction of that shape, so this stops being a request and becomes a guard, which is the
+/// same move the length check already represents: what must not happen is enforced, not asked for.
 pub fn accept_cleanup(raw: &str, cleaned: &str) -> bool {
     if cleaned.trim().is_empty() {
+        return false;
+    }
+    if digit_runs(raw) != digit_runs(cleaned) {
         return false;
     }
     let raw_len = raw.trim().chars().count() as f64;
@@ -342,6 +360,27 @@ pub fn accept_cleanup(raw: &str, cleaned: &str) -> bool {
         return true;
     }
     (cleaned.trim().chars().count() as f64 / raw_len) >= MIN_CLEANUP_RATIO
+}
+
+/// PURE: every run of digits in a transcript, in the order it appears.
+///
+/// Compared as an ordered list rather than as a set, which makes one comparison catch three different
+/// ways for a cleanup to corrupt what was said: a number spelled out (`7` → `seven`) loses a run, a
+/// number invented (`version 1` → `version 1 of 2024`) gains one, and a number moved changes the order.
+/// Someone dictating a version, a time, a port or a path needs the characters they said; every one of
+/// those is a digit run, and none of them survives being paraphrased.
+fn digit_runs(text: &str) -> Vec<&str> {
+    let mut runs = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        runs.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    runs
 }
 
 /// A transcript plus what was done to it.
@@ -561,7 +600,8 @@ pub struct Captured {
 
 pub async fn capture(
     voice: &VoiceRuntime,
-    wav: &[u8],
+    audio: &[u8],
+    extension: &str,
     duration: Duration,
 ) -> Result<Captured, CaptureError> {
     let Some(transcriber) = voice.transcriber.as_ref() else {
@@ -572,7 +612,7 @@ pub async fn capture(
     }
 
     let raw = transcriber
-        .transcribe(wav, duration)
+        .transcribe(audio, extension, duration)
         .await
         .map_err(|error| CaptureError::Transcription(error.to_string()))?;
 
@@ -595,6 +635,11 @@ pub async fn capture(
 pub struct CaptureQuery {
     pub kind: Kind,
     pub duration_ms: u64,
+    /// Which container the body is in, as a bare extension. Absent means WAV.
+    ///
+    /// Resolved through `transcribe::extension_for`, which answers from an allowlist rather than
+    /// echoing this string — the value names a file this process creates.
+    pub format: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -614,11 +659,21 @@ pub async fn post_capture(
     wav: Bytes,
 ) -> impl IntoResponse {
     let duration = Duration::from_millis(query.duration_ms);
+    // Resolved before any work starts, and refused loudly rather than silently treated as WAV: a
+    // transcriber handed Opus in a file named `.wav` fails in a way that reads as a broken recording.
+    let Some(extension) = crate::transcribe::extension_for(query.format.as_deref()) else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported audio format; send wav, ogg, oga, opus, mp3, m4a, flac or webm",
+        )
+            .into_response();
+    };
     let work = capture_and_record(
         state.pool.clone(),
         state.voice.clone(),
         query.kind,
         wav,
+        extension,
         duration,
     );
 
@@ -675,10 +730,11 @@ async fn capture_and_record(
     pool: sqlx::SqlitePool,
     voice: Arc<VoiceRuntime>,
     kind: Kind,
-    wav: Bytes,
+    audio: Bytes,
+    extension: &'static str,
     duration: Duration,
 ) -> Result<CaptureResponse, CaptureError> {
-    let captured = capture(&voice, &wav, duration).await?;
+    let captured = capture(&voice, &audio, extension, duration).await?;
     let id = match record(
         &pool,
         kind,
@@ -1080,7 +1136,7 @@ mod tests {
             "the nucleo owns the db",
         ));
 
-        let captured = capture(&voice, b"RIFF", Duration::from_secs(4))
+        let captured = capture(&voice, b"RIFF", "wav", Duration::from_secs(4))
             .await
             .expect("a configured transcriber produces a capture");
 
@@ -1099,7 +1155,7 @@ mod tests {
         let voice = voice_with(crate::transcribe::FakeTranscriber::returning("   \n  "));
 
         assert_eq!(
-            capture(&voice, b"RIFF", Duration::from_secs(4)).await,
+            capture(&voice, b"RIFF", "wav", Duration::from_secs(4)).await,
             Err(CaptureError::NothingHeard)
         );
     }
@@ -1113,13 +1169,19 @@ mod tests {
         ));
 
         assert!(matches!(
-            capture(&voice, b"RIFF", Duration::from_secs(4)).await,
+            capture(&voice, b"RIFF", "wav", Duration::from_secs(4)).await,
             Err(CaptureError::Transcription(_))
         ));
 
         // Unconfigured is NOT a failure: the capability simply does not exist here.
         assert_eq!(
-            capture(&VoiceRuntime::default(), b"RIFF", Duration::from_secs(4)).await,
+            capture(
+                &VoiceRuntime::default(),
+                b"RIFF",
+                "wav",
+                Duration::from_secs(4)
+            )
+            .await,
             Err(CaptureError::NotConfigured)
         );
     }
@@ -1139,7 +1201,7 @@ mod tests {
 
         let too_long = Duration::from_secs(MAX_CAPTURE_SECONDS + 1);
         assert_eq!(
-            capture(&voice, b"RIFF", too_long).await,
+            capture(&voice, b"RIFF", "wav", too_long).await,
             Err(CaptureError::TooLong)
         );
         assert_eq!(transcriber.calls(), 0);
@@ -1193,6 +1255,7 @@ mod tests {
             runtime(slow()),
             Kind::Memo,
             Bytes::from_static(b"wav"),
+            "wav",
             Duration::from_secs(3),
         );
         assert!(
@@ -1223,6 +1286,7 @@ mod tests {
             runtime(slow()),
             Kind::Dictation,
             Bytes::from_static(b"wav"),
+            "wav",
             Duration::from_secs(3),
         );
         assert!(tokio::time::timeout(abandon, dictation).await.is_err());
@@ -1269,6 +1333,137 @@ mod tests {
             get(&pool, Kind::Dictation, id).await.unwrap().is_some(),
             "and the dictation must still be there afterwards"
         );
+    }
+
+    /// Proves the whole pipeline against the REAL transcriber and the REAL cleanup model.
+    ///
+    /// `#[ignore]` because it needs three things a gate cannot assume: a CUDA whisper build, a running
+    /// Ollama, and a recording on disk. Everything else in this file uses a fake transcriber, which
+    /// proves the wiring and proves nothing about whether the configured command actually works —
+    /// and a `stt_command` that does not spawn is the single most likely way for this pillar to be
+    /// broken on a given machine.
+    ///
+    /// Run it deliberately, from the repository root:
+    ///   CARGO_TARGET_DIR=target/gate cargo test -p nucleos-core -- --ignored --nocapture real_pipeline
+    ///
+    /// Paths resolve through `CARGO_MANIFEST_DIR` because cargo runs tests with the working directory
+    /// set to the PACKAGE root (`core/`), while the daemon reads `.ai/voice.yaml` relative to wherever
+    /// it was launched. A bare relative path here would look for `core/.ai/voice.yaml`.
+    #[tokio::test]
+    #[ignore = "needs a CUDA whisper build, a running Ollama, and a probe recording"]
+    async fn real_pipeline_transcribes_and_cleans_an_actual_recording() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("core/ has a parent");
+        let config = crate::config::load_voice_config(&repo.join(".ai/voice.yaml"));
+        assert!(
+            config.armed(),
+            "`.ai/voice.yaml` must set enabled: true and a stt_command for this test to mean anything"
+        );
+        let models = crate::config::load_models_config(&repo.join(".ai/nucleos-models.yaml"))
+            .expect("the daemon's own models config must parse");
+        let cleanup_model = models
+            .voice_cleanup_model
+            .clone()
+            .expect("`voice_cleanup_model` must be set for this test to exercise cleanup");
+        let voice = VoiceRuntime::from_config(&config, Some(cleanup_model));
+
+        // 5.6s of TTS speech. Valid for latency and for "does the command work"; NOT valid for
+        // accuracy, because a synthesised voice is easier than a real one (§14.1).
+        let wav = std::fs::read("C:/Projects/whisper/probe_short.wav")
+            .expect("the step-A probe recording must be on disk");
+
+        let captured = capture(&voice, &wav, "wav", Duration::from_millis(5600))
+            .await
+            .expect("the configured transcriber must produce a transcript");
+
+        println!("raw:     {:?}", captured.raw);
+        println!("cleaned: {:?}", captured.cleaned.text);
+        println!("state:   {:?}", captured.cleaned.state);
+
+        assert!(
+            !captured.raw.trim().is_empty(),
+            "an empty transcript means the command ran and said nothing, which is a config failure"
+        );
+        // The probe says "voice captures table" and "prune dictations after 7 days", so this word is
+        // in the audio and its absence would mean the wrong file was read.
+        assert!(
+            captured.raw.to_lowercase().contains("dictation"),
+            "the transcript does not match the probe recording: {:?}",
+            captured.raw
+        );
+        // `Raw` would mean Ollama was unreachable, which makes the rest of this test vacuous.
+        assert_ne!(
+            captured.cleaned.state,
+            CleanupState::Raw,
+            "the cleanup model was not reached at all, so nothing here was exercised"
+        );
+        // The invariant, asserted instead of the outcome: the numeral survives. It does not matter
+        // whether cleanup was accepted or refused — what must never happen is the digit being
+        // paraphrased into the text a person then pastes into a config file.
+        //
+        // This is the assertion that caught the real defect. The fourth prohibition alone did NOT hold:
+        // the model returned "after seven days" with the rule in front of it, which is why
+        // `accept_cleanup` now enforces digits rather than asking for them.
+        assert!(
+            captured.cleaned.text.contains('7'),
+            "the numeral did not survive cleanup: {:?}",
+            captured.cleaned.text
+        );
+    }
+
+    /// The guard that the prompt could not be trusted to enforce.
+    ///
+    /// Measured, not imagined: with the fourth prohibition in the prompt, `qwen3.5:4b` still turned
+    /// "prune dictations after 7 days" into "pruning dictations after seven days". A cleanup that
+    /// paraphrases a number is worse than no cleanup, because the number is usually the reason the
+    /// sentence was dictated — a version, a port, a time, a path.
+    #[test]
+    fn a_cleanup_that_spells_out_a_number_is_refused() {
+        assert!(!accept_cleanup(
+            "prune dictations after 7 days",
+            "pruning dictations after seven days"
+        ));
+    }
+
+    #[test]
+    fn a_cleanup_that_keeps_the_digits_is_accepted() {
+        // Punctuation, capitalisation and filler removal are what cleanup is FOR. Only the numbers
+        // are protected.
+        assert!(accept_cleanup(
+            "um prune dictations after 7 days",
+            "Prune dictations after 7 days."
+        ));
+    }
+
+    #[test]
+    fn a_cleanup_that_invents_a_number_is_refused() {
+        // The same guard, catching the first prohibition instead of the fourth: a model that adds a
+        // year nobody said has added information, and the ordered comparison sees the extra run.
+        assert!(!accept_cleanup(
+            "release version 1",
+            "release version 1 of 2024"
+        ));
+    }
+
+    #[test]
+    fn a_cleanup_that_reorders_numbers_is_refused() {
+        assert!(!accept_cleanup(
+            "ports 8791 and 11434",
+            "ports 11434 and 8791"
+        ));
+    }
+
+    #[test]
+    fn a_transcript_with_no_numbers_is_judged_on_length_alone() {
+        assert!(accept_cleanup(
+            "olá isto é uma frase",
+            "Olá, isto é uma frase."
+        ));
+        assert!(!accept_cleanup(
+            "uma frase inteira que foi dita em voz alta",
+            "frase"
+        ));
     }
 
     /// The hotkeys have to survive the trip from the config file to the runtime.

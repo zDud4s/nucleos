@@ -53,7 +53,14 @@ pub fn deadline_for(audio: Duration) -> Duration {
 pub trait Transcriber: Send + Sync {
     /// `audio` is the recording's own length, which the caller measured while recording — it sizes the
     /// deadline and is not recoverable from the bytes without trusting a header.
-    async fn transcribe(&self, wav: &[u8], audio: Duration) -> std::io::Result<String>;
+    /// `extension` names the container `audio` is in, and must come from `extension_for` — the temp
+    /// file is created with it, so it may never be a string taken straight from a request.
+    async fn transcribe(
+        &self,
+        audio: &[u8],
+        extension: &str,
+        duration: Duration,
+    ) -> std::io::Result<String>;
 }
 
 /// Deletes the file it names when dropped, whatever the reason.
@@ -76,13 +83,35 @@ impl Drop for TempAudio {
 }
 
 /// Distinct per call within a process, and per process, without a clock or a random source.
-fn temp_wav_path() -> PathBuf {
+fn temp_audio_path(extension: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "nucleos-voice-{}-{ordinal}.wav",
+        "nucleos-voice-{}-{ordinal}.{extension}",
         std::process::id()
     ))
+}
+
+/// PURE: the filename extension for the temp recording, resolved through an allowlist.
+///
+/// The núcleo hands a PATH to a program it did not write, so the extension is how that program is told
+/// what the bytes are: whisper reads a `.wav` as PCM and rejects Opus wearing that name. The shell sends
+/// WAV, but the Telegram sidecar downloads `.ogg` from Telegram — and the point of one pipeline is that
+/// it does not need a second transcriber, so it has to be able to say which container it is sending.
+///
+/// Returns a `&'static str` instead of echoing the request, and that is the whole security property:
+/// no caller-controlled string ever reaches the filesystem. Echoing it would let a request body name
+/// the extension of a file this process creates — `format=exe`, or a `format` full of `../`.
+pub fn extension_for(requested: Option<&str>) -> Option<&'static str> {
+    const ALLOWED: [&str; 8] = ["wav", "ogg", "oga", "opus", "mp3", "m4a", "flac", "webm"];
+    match requested {
+        // Absent means WAV, which is what the shell sends and what every earlier caller assumed.
+        None => Some("wav"),
+        Some(raw) => {
+            let wanted = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+            ALLOWED.into_iter().find(|allowed| *allowed == wanted)
+        }
+    }
 }
 
 /// Transcribes by spawning the command named in `.ai/voice.yaml`.
@@ -102,7 +131,12 @@ impl CommandTranscriber {
 
 #[async_trait]
 impl Transcriber for CommandTranscriber {
-    async fn transcribe(&self, wav: &[u8], audio: Duration) -> std::io::Result<String> {
+    async fn transcribe(
+        &self,
+        audio: &[u8],
+        extension: &str,
+        duration: Duration,
+    ) -> std::io::Result<String> {
         let tokens = split_command(&self.command);
         let (program, args) = tokens.split_first().ok_or_else(|| {
             std::io::Error::new(
@@ -114,9 +148,9 @@ impl Transcriber for CommandTranscriber {
         // Built before anything can await, and owning the file from this line onwards. Constructing it
         // after the spawn would reintroduce exactly the leak it exists to prevent.
         let audio_file = TempAudio {
-            path: temp_wav_path(),
+            path: temp_audio_path(extension),
         };
-        std::fs::write(&audio_file.path, wav)?;
+        std::fs::write(&audio_file.path, audio)?;
 
         let mut command = Command::new(program);
         command
@@ -133,7 +167,7 @@ impl Transcriber for CommandTranscriber {
             .take()
             .expect("stdout was piped when the command was configured");
 
-        let deadline = deadline_for(audio);
+        let deadline = deadline_for(duration);
         let collected = tokio::time::timeout(deadline, async move {
             let mut text = Vec::new();
             // One byte past the ceiling is all it takes to know the ceiling was breached, and reading
@@ -156,7 +190,7 @@ impl Transcriber for CommandTranscriber {
                     format!(
                         "transcriber gave up after {}s for {}s of audio",
                         deadline.as_secs(),
-                        audio.as_secs()
+                        duration.as_secs()
                     ),
                 ));
             }
@@ -277,7 +311,12 @@ impl FakeTranscriber {
 #[cfg(test)]
 #[async_trait]
 impl Transcriber for FakeTranscriber {
-    async fn transcribe(&self, _wav: &[u8], _audio: Duration) -> std::io::Result<String> {
+    async fn transcribe(
+        &self,
+        _audio: &[u8],
+        _extension: &str,
+        _duration: Duration,
+    ) -> std::io::Result<String> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
@@ -322,7 +361,7 @@ mod tests {
         let transcriber = CommandTranscriber::new("echo".to_string());
 
         let spoken = transcriber
-            .transcribe(b"RIFF....WAVE", Duration::from_secs(1))
+            .transcribe(b"RIFF....WAVE", "wav", Duration::from_secs(1))
             .await
             .expect("echo is a working transcriber for this purpose");
 
@@ -342,7 +381,7 @@ mod tests {
         let transcriber = CommandTranscriber::new("echo".to_string());
 
         let path = transcriber
-            .transcribe(b"RIFF....WAVE", Duration::from_secs(1))
+            .transcribe(b"RIFF....WAVE", "wav", Duration::from_secs(1))
             .await
             .expect("echo is a working transcriber for this purpose");
 
@@ -369,7 +408,7 @@ mod tests {
         // Far below `MIN_DEADLINE`, so the future is dropped by this timeout rather than finishing.
         let abandoned = tokio::time::timeout(
             Duration::from_millis(300),
-            transcriber.transcribe(b"RIFF....WAVE", Duration::from_secs(1)),
+            transcriber.transcribe(b"RIFF....WAVE", "wav", Duration::from_secs(1)),
         )
         .await;
         assert!(
@@ -401,7 +440,7 @@ mod tests {
         let transcriber = CommandTranscriber::new("yes".to_string());
 
         let error = transcriber
-            .transcribe(b"RIFF....WAVE", Duration::from_secs(1))
+            .transcribe(b"RIFF....WAVE", "wav", Duration::from_secs(1))
             .await
             .expect_err("an endless transcriber must not look like a successful one");
 
@@ -414,11 +453,53 @@ mod tests {
         let transcriber = CommandTranscriber::new("   ".to_string());
 
         let error = transcriber
-            .transcribe(b"RIFF....WAVE", Duration::from_secs(1))
+            .transcribe(b"RIFF....WAVE", "wav", Duration::from_secs(1))
             .await
             .expect_err("an empty command cannot transcribe");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn an_absent_format_means_wav() {
+        // Every caller that predates this parameter sent WAV, so absence has to keep meaning WAV.
+        assert_eq!(extension_for(None), Some("wav"));
+    }
+
+    #[test]
+    fn the_containers_a_real_caller_sends_are_accepted_however_they_are_written() {
+        // `.ogg` is what the Telegram sidecar downloads; the leading dot and the case are the two
+        // ways someone writes it by hand.
+        assert_eq!(extension_for(Some("ogg")), Some("ogg"));
+        assert_eq!(extension_for(Some(".ogg")), Some("ogg"));
+        assert_eq!(extension_for(Some("OGG")), Some("ogg"));
+        assert_eq!(extension_for(Some("  webm  ")), Some("webm"));
+    }
+
+    /// The security property: the answer is never the caller's string.
+    ///
+    /// This value names a file the daemon CREATES, so echoing the request would let a request body
+    /// choose an extension — `exe` — or walk out of the temp directory. Refusing is also the honest
+    /// answer for a container the transcriber could not read anyway.
+    #[test]
+    fn anything_not_on_the_allowlist_is_refused_rather_than_echoed() {
+        assert_eq!(extension_for(Some("exe")), None);
+        assert_eq!(extension_for(Some("../../evil")), None);
+        assert_eq!(extension_for(Some("wav.exe")), None);
+        assert_eq!(extension_for(Some("")), None);
+        assert_eq!(extension_for(Some("   ")), None);
+    }
+
+    #[test]
+    fn the_extension_reaches_the_temp_file_name() {
+        // The whole reason the parameter exists: whisper decides how to decode by the name it is
+        // handed, so an Opus payload in a file called `.wav` is rejected as a broken recording.
+        let path = temp_audio_path("ogg");
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("ogg"),
+            "path was {path:?}"
+        );
     }
 
     /// The failure this fixes: `C:\Program Files\...` is where a Windows install actually goes, and a

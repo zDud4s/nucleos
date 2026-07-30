@@ -247,3 +247,67 @@ func statusError(operation string, status int, body []byte) error {
 	}
 	return fmt.Errorf("%s: status code %d: %s", operation, status, bytes.TrimSpace(body))
 }
+
+// VoiceTranscriber is the daemon's voice pillar, when it is armed.
+//
+// Split out as an interface so the pipe can be tested against a stub, and so a daemon that predates
+// the pillar (or has it switched off) is a normal, expected answer rather than an error path.
+type VoiceTranscriber interface {
+	VoiceCapture(audio []byte, format string, durationMs int64) (string, bool, error)
+}
+
+// VoiceCapture sends a recording to the núcleo and returns the cleaned transcript.
+//
+// This is what stops the sidecar being a second implementation of the STT contract. The núcleo already
+// spawns a transcriber, applies the operator's misheard-word hints, runs the local cleanup model and
+// keeps the result — none of which this process can do, and all of which a voice note deserves as much
+// as a dictation does.
+//
+// The second return value is "the daemon can do this", NOT "it worked". It is false when the pillar is
+// off (503) or unreachable, which is the case the caller must be able to distinguish: those mean fall
+// back to the local command, while a genuine failure means say so. A voice note is somebody talking to
+// you, and it must not stop arriving because an optional pillar is not configured.
+//
+// Sent as raw bytes with the container named in the query string rather than as base64 in JSON: base64
+// would inflate every recording by a third for nothing, and the daemon names its temp file from the
+// container so the transcriber knows how to decode it.
+func (c *Client) VoiceCapture(audio []byte, format string, durationMs int64) (string, bool, error) {
+	url := fmt.Sprintf(
+		"%s/voice/capture?kind=dictation&duration_ms=%d&format=%s",
+		c.baseURL, durationMs, format,
+	)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(audio))
+	if err != nil {
+		return "", false, fmt.Errorf("create voice request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		// Unreachable is indistinguishable from not-configured for our purposes: either way the local
+		// command is the only thing that can still answer.
+		return "", false, nil
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusServiceUnavailable:
+		// The daemon's own words for "no transcriber is configured; voice is off".
+		return "", false, nil
+	case resp.StatusCode == http.StatusNoContent:
+		// It ran, and heard nothing. A real answer, and not one the local command would improve on.
+		return "", true, nil
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", true, fmt.Errorf("voice capture failed (%d): %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+
+	var answer struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		return "", true, fmt.Errorf("decode voice capture answer: %w", err)
+	}
+	return answer.Text, true, nil
+}
