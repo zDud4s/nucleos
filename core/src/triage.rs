@@ -772,7 +772,7 @@ async fn apply_verdicts(
                                    triage_run_id = NULL, body_text = NULL
                   WHERE id = ?",
             )
-            .bind(triage_class)
+            .bind(triage_class.class)
             .bind(&verdict.summary)
             .bind(&now_str)
             .bind(verdict.id)
@@ -784,7 +784,7 @@ async fn apply_verdicts(
                                    triage_run_id = NULL
                   WHERE id = ?",
             )
-            .bind(triage_class)
+            .bind(triage_class.class)
             .bind(&verdict.summary)
             .bind(&now_str)
             .bind(verdict.id)

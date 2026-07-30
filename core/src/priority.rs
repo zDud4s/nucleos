@@ -1,28 +1,66 @@
+/// What the policy decided, and which rule decided it.
+///
+/// The reason travels with the class because the class alone cannot be audited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decision {
+    pub class: &'static str,
+    /// The rule that decided the class, or `None` when the model's answer stood untouched.
+    ///
+    /// This names the rule that DECIDED, not merely one that changed the value: a human pin is
+    /// reported even when it agrees with the model, because the pin is why the class is what it
+    /// is.
+    pub rule: Option<&'static str>,
+}
+
 pub fn adjust(
     model_class: &str,
     profile: Option<&crate::contacts::Profile>,
     override_verdict: Option<&str>,
-) -> &'static str {
+) -> Decision {
     match override_verdict {
-        Some("pin") => return "urgent",
-        Some("mute") => return "noise",
+        Some("pin") => {
+            return Decision {
+                class: "urgent",
+                rule: Some("human-pin"),
+            };
+        }
+        Some("mute") => {
+            return Decision {
+                class: "noise",
+                rule: Some("human-mute"),
+            };
+        }
         _ => {}
     }
 
-    let model_class = crate::triage::VALID_CLASSES
+    let Some(model_class) = crate::triage::VALID_CLASSES
         .iter()
         .copied()
         .find(|valid_class| *valid_class == model_class)
-        .unwrap_or("noise");
+    else {
+        // Turning an unrecognised model answer into `noise` is the quietest thing this function
+        // does; naming it keeps the classifier's loudest failure from becoming its most invisible
+        // outcome.
+        return Decision {
+            class: "noise",
+            rule: Some("unknown-class"),
+        };
+    };
     let unknown_first_contact = match profile {
         None => true,
         Some(profile) => profile.messages_in <= 1 && !profile.outbound_ever,
     };
 
     if unknown_first_contact && model_class == "urgent" {
-        "action"
+        Decision {
+            class: "action",
+            rule: Some("first-contact"),
+        }
     } else {
-        model_class
+        Decision {
+            class: model_class,
+            rule: None,
+        }
     }
 }
 
@@ -40,7 +78,7 @@ fn rank(class: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjust, rank};
+    use super::{Decision, adjust, rank};
     use crate::contacts::Profile;
 
     fn profile(messages_in: i64, outbound_ever: bool) -> Profile {
@@ -69,8 +107,9 @@ mod tests {
             for &profile in &profiles {
                 let adjusted = adjust(model_class, profile, None);
                 assert!(
-                    rank(adjusted) <= rank(model_class),
-                    "derived policy promoted {model_class} to {adjusted}"
+                    rank(adjusted.class) <= rank(model_class),
+                    "derived policy promoted {model_class} to {}",
+                    adjusted.class
                 );
             }
         }
@@ -105,7 +144,7 @@ mod tests {
 
         for (name, model_class, profile, override_verdict, expected) in cases {
             assert_eq!(
-                adjust(model_class, profile, override_verdict),
+                adjust(model_class, profile, override_verdict).class,
                 expected,
                 "{name}"
             );
@@ -135,11 +174,113 @@ mod tests {
                     model_class
                 };
                 assert_eq!(
-                    adjust(model_class, profile, None),
+                    adjust(model_class, profile, None).class,
                     expected,
                     "{name} with model class {model_class}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_regra_que_decidiu_e_nomeada() {
+        let first_contact = profile(1, false);
+        let has_outbound = profile(1, true);
+        let cases = [
+            (
+                "a pin decides",
+                "urgent",
+                Some(&first_contact),
+                Some("pin"),
+                "urgent",
+                Some("human-pin"),
+            ),
+            (
+                "a mute decides",
+                "urgent",
+                Some(&first_contact),
+                Some("mute"),
+                "noise",
+                Some("human-mute"),
+            ),
+            (
+                "a first contact softens urgency",
+                "urgent",
+                Some(&first_contact),
+                None,
+                "action",
+                Some("first-contact"),
+            ),
+            (
+                "a known contact keeps it",
+                "urgent",
+                Some(&has_outbound),
+                None,
+                "urgent",
+                None,
+            ),
+            (
+                "nothing to decide",
+                "info",
+                Some(&first_contact),
+                None,
+                "info",
+                None,
+            ),
+        ];
+
+        for (name, model_class, profile, override_verdict, expected_class, expected_rule) in cases {
+            assert_eq!(
+                adjust(model_class, profile, override_verdict),
+                Decision {
+                    class: expected_class,
+                    rule: expected_rule,
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn uma_classe_desconhecida_deixa_de_ser_silenciosa() {
+        let established = profile(2, false);
+
+        // This has its own test because turning an unrecognised answer into `noise` is the quietest
+        // thing this function does and the one most worth being able to see afterwards.
+        assert_eq!(
+            adjust("panic", Some(&established), None),
+            Decision {
+                class: "noise",
+                rule: Some("unknown-class"),
+            }
+        );
+    }
+
+    #[test]
+    fn uma_sobreposicao_humana_decide_antes_de_tudo() {
+        let first_contact = profile(1, false);
+        let cases = [
+            (
+                "pin",
+                Decision {
+                    class: "urgent",
+                    rule: Some("human-pin"),
+                },
+            ),
+            (
+                "mute",
+                Decision {
+                    class: "noise",
+                    rule: Some("human-mute"),
+                },
+            ),
+        ];
+
+        for (override_verdict, expected) in cases {
+            assert_eq!(
+                adjust("panic", Some(&first_contact), Some(override_verdict)),
+                expected
+            );
         }
     }
 }
