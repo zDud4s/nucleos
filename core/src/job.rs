@@ -190,6 +190,101 @@ pub fn next_step(job: &JobView) -> Next {
     }
 }
 
+impl Outcome {
+    /// The `jobs.status` this outcome is stored as.
+    pub fn as_status(self) -> &'static str {
+        match self {
+            Outcome::Completed => "completed",
+            Outcome::Failed => "failed",
+            Outcome::GateFailed => "gate_failed",
+            Outcome::GateErrored => "gate_errored",
+        }
+    }
+}
+
+fn item_state_from(status: &str) -> ItemState {
+    match status {
+        "running" => ItemState::Running,
+        "implemented" => ItemState::Implemented,
+        "passed" => ItemState::Passed,
+        "failed" => ItemState::Failed,
+        "gate_failed" => ItemState::GateFailed,
+        "gate_errored" => ItemState::GateErrored,
+        // An unrecognised item status is treated as still to do rather than as done. Erring toward
+        // "not finished" costs a repeated item; erring the other way silently skips work the job
+        // was created to perform and reports it complete.
+        _ => ItemState::Pending,
+    }
+}
+
+/// Assembles what `next_step` needs from the two tables.
+pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> {
+    let (status, review_wanted): (String, i64) =
+        sqlx::query_as("SELECT status, review FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+
+    let items: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+            .bind(job_id)
+            .fetch_all(pool)
+            .await?;
+
+    // A review node is identified by its stage, not by the job's status: the job can be sitting in
+    // `waiting` for budget while its review is the thing that has yet to run.
+    let review_run: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM runs WHERE job_id = ? AND stage = 'review' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let review = match (review_wanted != 0, review_run.as_deref()) {
+        (false, _) => ReviewState::NotWanted,
+        (true, None) => ReviewState::Pending,
+        (true, Some("running")) => ReviewState::Running,
+        (true, Some(_)) => ReviewState::Done,
+    };
+
+    Ok(JobView {
+        // `planning` is the one status that means the queue does not exist yet. Everything else has
+        // been past the plan node, including a job whose planner honestly found nothing to do.
+        planned: status != "planning",
+        items: items.iter().map(|s| item_state_from(s)).collect(),
+        review,
+    })
+}
+
+/// Records how a job ended.
+pub async fn finish(pool: &SqlitePool, job_id: i64, outcome: Outcome) -> sqlx::Result<()> {
+    sqlx::query("UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?")
+        .bind(outcome.as_status())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Parks a job that could not start its next node, so it is retried rather than abandoned.
+///
+/// Decision 15 of the design: the exclusivity slot belongs to a *run*, so nobody holds it in the gap
+/// between two of a job's nodes, and an ordinary scheduler tick can take it. Losing that race is not
+/// a failure of the work — the worktree and everything gated green so far are untouched — so the job
+/// waits rather than reporting a partial. The 4-hour ceiling is what stops waiting forever.
+///
+/// `reason` is stored because `waiting` now means two different things — a budget window that will
+/// reopen, and a slot another run is holding — and they call for opposite responses from a reader.
+pub async fn wait(pool: &SqlitePool, job_id: i64, reason: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE jobs SET status = 'waiting', wait_reason = ? WHERE id = ?")
+        .bind(reason)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Starts a job and returns its id.
 ///
 /// Fails when the project already has a live one. That refusal is the unique index
@@ -383,6 +478,121 @@ mod tests {
         // Reported, never silent: a queue quietly cut from seven to five reads downstream as "the
         // planner found five things", which is a different and wrong statement about the work.
         assert_eq!(plan.dropped, 2);
+    }
+
+    async fn seed_items(pool: &sqlx::SqlitePool, job_id: i64, statuses: &[&str]) {
+        for (ordinal, status) in statuses.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO job_items (job_id, ordinal, description, status)
+                 VALUES (?, ?, 'an item', ?)",
+            )
+            .bind(job_id)
+            .bind(ordinal as i64)
+            .bind(status)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_still_planning_has_no_queue_yet() {
+        let pool = test_pool().await;
+        let job_id = insert_job(&pool, "project-a", "/project/a", "planning", 5)
+            .await
+            .unwrap();
+
+        let view = load_view(&pool, job_id).await.unwrap();
+
+        assert!(!view.planned);
+        assert_eq!(next_step(&view), Next::SpawnPlan);
+    }
+
+    #[tokio::test]
+    async fn a_planner_that_found_nothing_is_not_a_job_still_planning() {
+        let pool = test_pool().await;
+        // Past the plan node with an empty queue: the honest "there was no work" night. Reading
+        // this as still-planning would spawn a second planner every tick, forever.
+        let job_id = insert_job(&pool, "project-a", "/project/a", "implementing", 5)
+            .await
+            .unwrap();
+
+        let view = load_view(&pool, job_id).await.unwrap();
+
+        assert!(view.planned);
+        assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn a_loaded_view_resumes_at_the_first_unfinished_item() {
+        let pool = test_pool().await;
+        let job_id = insert_job(&pool, "project-a", "/project/a", "implementing", 5)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["passed", "passed", "pending"]).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+
+        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_item_status_is_unfinished_rather_than_done() {
+        let pool = test_pool().await;
+        let job_id = insert_job(&pool, "project-a", "/project/a", "implementing", 5)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["passed", "something-new"]).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+
+        // Erring toward "not finished" costs a repeated item. Erring the other way skips work the
+        // job exists to do and reports it complete, which is the failure nobody sees.
+        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 1 });
+    }
+
+    #[tokio::test]
+    async fn losing_the_slot_parks_the_job_instead_of_failing_it() {
+        let pool = test_pool().await;
+        let job_id = insert_job(&pool, "project-a", "/project/a", "implementing", 5)
+            .await
+            .unwrap();
+
+        wait(&pool, job_id, "slot").await.unwrap();
+
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "waiting");
+        // The reason is stored because `waiting` now covers a budget window that will reopen and a
+        // slot another run holds, and those ask opposite things of whoever reads the feed.
+        assert_eq!(reason.as_deref(), Some("slot"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_records_which_kind_of_ending_it_had() {
+        let pool = test_pool().await;
+        let broken = insert_job(&pool, "project-a", "/project/a", "gating", 5)
+            .await
+            .unwrap();
+        finish(&pool, broken, Outcome::GateFailed).await.unwrap();
+        let unmeasured = insert_job(&pool, "project-b", "/project/b", "gating", 5)
+            .await
+            .unwrap();
+        finish(&pool, unmeasured, Outcome::GateErrored)
+            .await
+            .unwrap();
+
+        let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM jobs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        // Distinct in the database, not just in the enum: a reader querying jobs must still be able
+        // to tell broken code from a measurement that never happened.
+        assert_eq!(statuses, vec!["gate_failed", "gate_errored"]);
     }
 
     #[tokio::test]

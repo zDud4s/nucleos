@@ -8,11 +8,20 @@ CREATE TABLE jobs (
     rule_name    TEXT,
     status       TEXT    NOT NULL,
     stage_cursor INTEGER NOT NULL DEFAULT 0,
+    -- The shape the rule asked for, copied onto the job when it starts rather than re-read at each
+    -- step. `.ai/autopilot.yaml` can be edited mid-flight, and a job that changed shape between its
+    -- own nodes would gate some items and not others with nothing recording why.
     max_items    INTEGER NOT NULL,
+    gate_each    INTEGER NOT NULL DEFAULT 1,
+    review       INTEGER NOT NULL DEFAULT 1,
     -- The repository HEAD when the job started. Crash recovery resumes from `stage_cursor` only if
     -- HEAD has not moved since: resuming an old plan against a tree that changed underneath it is
     -- the riskiest execution in the system, and the same rule already governs catch-up runs.
     head_sha     TEXT,
+    -- `waiting` means two different things — a budget window that will reopen, and an exclusivity
+    -- slot another run is holding — and they ask opposite things of a reader. Storing which is what
+    -- keeps the feed from saying only "waiting" and leaving the person to guess.
+    wait_reason  TEXT,
     created_at   TEXT    NOT NULL,
     completed_at TEXT
 );
