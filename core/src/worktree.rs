@@ -910,9 +910,18 @@ mod tests {
     }
 
     async fn set_worktree_created_at(pool: &sqlx::SqlitePool, run_id: i64, created_at: &str) {
-        sqlx::query("UPDATE worktrees SET created_at = ? WHERE owner_kind = 'run' AND owner_id = ?")
+        set_worktree_created_at_for(pool, Owner::Run(run_id), created_at).await;
+    }
+
+    async fn set_worktree_created_at_for(
+        pool: &sqlx::SqlitePool,
+        owner: Owner,
+        created_at: &str,
+    ) {
+        sqlx::query("UPDATE worktrees SET created_at = ? WHERE owner_kind = ? AND owner_id = ?")
             .bind(created_at)
-            .bind(run_id)
+            .bind(owner.kind())
+            .bind(owner.id())
             .execute(pool)
             .await
             .unwrap();
@@ -1826,6 +1835,45 @@ mod tests {
                 .await
                 .expect("count live worktrees");
         assert_eq!(live, 2);
+    }
+
+    #[tokio::test]
+    async fn a_job_worktree_is_not_collected_by_a_run_of_the_same_id() {
+        let pool = test_pool().await;
+        // A terminal run, old enough to be collectable, whose id the job then reuses. Run ids and
+        // job ids come from different sequences, so this collision is ordinary, not contrived — and
+        // the GC joins on the bare id, so only `owner_kind = 'run'` keeps the two apart.
+        let run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            Owner::Job(run_id),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-1",
+            "nucleos/job-1",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at_for(&pool, Owner::Job(run_id), "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            candidates.is_empty(),
+            "a job's worktree must not be collected because a run happens to share its id"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
