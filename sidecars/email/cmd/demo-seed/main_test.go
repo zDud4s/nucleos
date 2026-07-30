@@ -136,6 +136,37 @@ func TestSentFixtureReachesAnInboxSender(t *testing.T) {
 	t.Fatal("sent fixture has no recipient matching an inbox sender")
 }
 
+func TestTheSentFolderIsSeededBeforeTheInbox(t *testing.T) {
+	batches, err := batchesToSeed("INBOX", "Sent")
+	if err != nil {
+		t.Fatalf("build seed batches: %v", err)
+	}
+	if len(batches) != 2 {
+		t.Fatalf("got %d batches, want 2", len(batches))
+	}
+	// Sent mail makes a correspondent known, so it must land before the inbox mail whose judgement
+	// it changes.
+	if batches[0].Direction != "outbound" || batches[0].Mailbox != "Sent" {
+		t.Errorf("first batch = direction %q mailbox %q, want outbound Sent", batches[0].Direction, batches[0].Mailbox)
+	}
+	if batches[1].Direction != "inbound" || batches[1].Mailbox != "INBOX" {
+		t.Errorf("second batch = direction %q mailbox %q, want inbound INBOX", batches[1].Direction, batches[1].Mailbox)
+	}
+}
+
+func TestSeedingWithoutASentMailboxIsJustTheInbox(t *testing.T) {
+	batches, err := batchesToSeed("INBOX", "")
+	if err != nil {
+		t.Fatalf("build seed batches: %v", err)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("got %d batches, want 1", len(batches))
+	}
+	if batches[0].Direction != "inbound" || batches[0].Mailbox != "INBOX" {
+		t.Errorf("batch = direction %q mailbox %q, want inbound INBOX", batches[0].Direction, batches[0].Mailbox)
+	}
+}
+
 func headerValue(headers map[string]string, name string) string {
 	for key, value := range headers {
 		if strings.EqualFold(key, name) {

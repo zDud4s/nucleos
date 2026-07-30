@@ -271,6 +271,11 @@ struct EmailIncomingRequest {
     /// The highest uid the sidecar LOOKED AT, which is what lets the cursor move past a message it
     /// could not read. Not the same as the highest uid delivered.
     max_uid_examined: i64,
+    /// Absent, `null` and `""` all mean inbound — see `absent_or_null_is_empty` above for why the
+    /// empty case has to be spelled out: Go writes an unset string field as `""` rather than
+    /// omitting it, and `daemon.Batch.Direction` has no `omitempty`.
+    #[serde(default)]
+    direction: Option<String>,
     #[serde(default, deserialize_with = "absent_or_null_is_empty")]
     skipped: Vec<crate::email::SkippedMessage>,
     #[serde(default, deserialize_with = "absent_or_null_is_empty")]
@@ -316,6 +321,18 @@ async fn post_email_incoming(
     if body.messages.len() > MAX_MESSAGES_PER_BATCH {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let direction = match body.direction.as_deref().map(str::trim) {
+        None | Some("") => crate::contacts::MessageDirection::Inbound,
+        Some(value) if value.eq_ignore_ascii_case("inbound") => {
+            crate::contacts::MessageDirection::Inbound
+        }
+        Some(value) if value.eq_ignore_ascii_case("outbound") => {
+            crate::contacts::MessageDirection::Outbound
+        }
+        // Defaulting would store the user's sent bodies as inbound; refusal keeps the cursor in
+        // place so the retry makes the mailbox complain instead of quietly mis-filing them.
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
     // Ingestion is one transaction over untrusted content and it moves the cursor. A client that
     // disconnects mid-request must not be able to leave that half-done.
     let pool = state.pool.clone();
@@ -323,7 +340,7 @@ async fn post_email_incoming(
     uncancellable(async move {
         crate::email::ingest_batch(
             &pool,
-            crate::contacts::MessageDirection::Inbound,
+            direction,
             &body.mailbox,
             body.uidvalidity,
             body.max_uid_examined,
@@ -1494,6 +1511,19 @@ mod tests {
         )
     }
 
+    fn email_batch_directed(direction: serde_json::Value, messages: serde_json::Value) -> Body {
+        Body::from(
+            serde_json::json!({
+                "mailbox": "INBOX",
+                "uidvalidity": 1,
+                "max_uid_examined": 10,
+                "direction": direction,
+                "messages": messages,
+            })
+            .to_string(),
+        )
+    }
+
     fn one_message() -> serde_json::Value {
         serde_json::json!([{
             "message_id": "<a@b>",
@@ -1584,6 +1614,119 @@ mod tests {
             post_email(state, Some("test-token"), body).await,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn um_lote_marcado_de_saida_e_gravado_como_saida() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                email_batch_directed(serde_json::json!("outbound"), one_message())
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let stored = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT direction, body_text FROM emails",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("outbound".to_owned(), None));
+    }
+
+    #[tokio::test]
+    async fn um_lote_sem_direccao_continua_a_ser_entrada() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        assert_eq!(
+            post_email(state, Some("test-token"), email_batch(one_message())).await,
+            StatusCode::OK
+        );
+
+        let stored = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT direction, body_text FROM emails",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("inbound".to_owned(), Some("hello".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn uma_direccao_vazia_e_lida_como_entrada() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                email_batch_directed(serde_json::json!(""), one_message())
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let stored = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT direction, body_text FROM emails",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("inbound".to_owned(), Some("hello".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn uma_direccao_nula_e_lida_como_entrada() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                email_batch_directed(serde_json::Value::Null, one_message())
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let stored = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT direction, body_text FROM emails",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("inbound".to_owned(), Some("hello".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn uma_direccao_desconhecida_e_recusada_sem_gravar() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        assert_eq!(
+            post_email(
+                state,
+                Some("test-token"),
+                email_batch_directed(serde_json::json!("sideways"), one_message())
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let stored = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM emails")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
     }
 
     /// Paging is the sidecar's job (C7T3). A batch past the ceiling means it stopped doing it, and
