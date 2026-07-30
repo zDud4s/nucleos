@@ -154,7 +154,7 @@ async fn governance_permits_repo_trigger(
             stop_tick: false,
         });
     }
-    if let crate::budget::BudgetDecision::Pause { reason } =
+    if let crate::budget::BudgetDecision::Pause { reason, .. } =
         crate::budget::budget_permits_new_run(&state.pool, now).await
     {
         return Err(GateRefusal {

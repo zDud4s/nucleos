@@ -510,7 +510,7 @@ async fn gates_permit(
     {
         return Err(GateBlock::ScopedKill);
     }
-    if let crate::budget::BudgetDecision::Pause { reason } =
+    if let crate::budget::BudgetDecision::Pause { reason, .. } =
         crate::budget::budget_permits_new_run(&state.pool, now).await
     {
         return Err(GateBlock::Budget(reason));

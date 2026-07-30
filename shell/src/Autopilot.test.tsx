@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
-import Autopilot, { ApprovalQueuePanel } from "./Autopilot";
-import type { ClassTally, ProjectSummary, Proposal } from "./api";
+import Autopilot, { ApprovalQueuePanel, JobsPanel } from "./Autopilot";
+import type { ClassTally, Job, JobDetail, JobItem, ProjectSummary, Proposal } from "./api";
 
 const DAEMON_URL = "http://127.0.0.1:8791";
 const fetchMock = vi.fn();
@@ -259,5 +259,153 @@ describe("Autopilot project scope", () => {
 
     expect(screen.getByText("Viewing beta")).toBeTruthy();
     expect(screen.queryByText("filesystem.write")).toBeNull();
+  });
+});
+
+/**
+ * The jobs panel is where a night of autonomous work becomes readable, and where the two
+ * cancellation levels stop being a claim in a design document. These pin the parts that are easy
+ * to get subtly, silently wrong.
+ */
+describe("JobsPanel", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fetchMock.mockReset();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fetchMock.mockReset();
+  });
+
+  function job(over: Partial<Job> = {}): Job {
+    return {
+      id: 7,
+      project_id: "alpha",
+      rule_name: "nightly-backlog",
+      status: "implementing",
+      wait_reason: null,
+      max_items: 5,
+      created_at: "2026-07-30T03:00:00Z",
+      completed_at: null,
+      ...over,
+    };
+  }
+
+  function jobItem(over: Partial<JobItem> = {}): JobItem {
+    return { ordinal: 0, description: "an item", status: "pending", run_id: null, gate_status: null, ...over };
+  }
+
+  /** Answers the detail route with a queue, and every other route with a bare ok. */
+  function serveDetail(detail: Partial<JobDetail> & { items: JobItem[] }) {
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === "string" && /\/jobs\/\d+$/.test(url)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ ...job(), branch: "nucleos/job-7", ...detail }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 204, json: async () => ({}) });
+    });
+  }
+
+  function renderPanel(jobs: Job[], refresh = vi.fn(async () => {})) {
+    return {
+      ...render(
+        <JobsPanel jobs={jobs} loading={false} selectedProject={null} token="test-token" refresh={refresh} isKill={false} />,
+      ),
+      refresh,
+    };
+  }
+
+  it("offers to stop a job that is parked, which cancelling a run cannot reach", async () => {
+    // The whole reason the two levels exist as separate buttons. A job waiting for the budget has
+    // no node to cancel; without this its only ending is the four-hour ceiling.
+    renderPanel([job({ status: "waiting", wait_reason: "budget" })]);
+
+    expect(screen.getByText(/the budget is spent/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Stop job" }));
+    advance(300);
+    fireEvent.click(screen.getByRole("button", { name: "Stop the whole job?" }));
+    await settle();
+
+    const calls = fetchMock.mock.calls;
+    const [url, init] = calls[calls.length - 1] ?? [];
+    expect(url).toBe(`${DAEMON_URL}/jobs/7/cancel`);
+    expect(init?.method).toBe("POST");
+  });
+
+  it("does not offer to stop a job that has already ended", () => {
+    renderPanel([job({ status: "completed", completed_at: "2026-07-30T05:00:00Z" })]);
+    expect(screen.queryByRole("button", { name: "Stop job" })).toBeNull();
+  });
+
+  it("reads a 409 as 'it already finished', not as a failure to stop it", async () => {
+    // The job ended between the render and the click. Telling the user it "could not be cancelled"
+    // would send them looking for a fault that is not there.
+    fetchMock.mockResolvedValue({ ok: false, status: 409, json: async () => ({}) });
+    renderPanel([job()]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop job" }));
+    advance(300);
+    fireEvent.click(screen.getByRole("button", { name: "Stop the whole job?" }));
+    await settle();
+
+    expect(screen.getByText(/already finished/)).toBeTruthy();
+  });
+
+  it("never claims a verdict for an item nothing measured", async () => {
+    // `passed` with no gate status is legitimate — no gate command, or an intermediate item under
+    // gate_after_each_item: false — and it is not a verdict. One label for both would invent one.
+    serveDetail({
+      items: [
+        jobItem({ ordinal: 0, description: "guard the cursor", status: "passed" }),
+        jobItem({ ordinal: 1, description: "retry on lock", status: "passed", gate_status: "passed" }),
+      ],
+    });
+    renderPanel([job()]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show list" }));
+    await settle();
+
+    expect(screen.getByText("done, not measured")).toBeTruthy();
+    expect(screen.getByText("passed the tests")).toBeTruthy();
+    expect(screen.getByText("guard the cursor")).toBeTruthy();
+  });
+
+  it("reads an empty queue as a quiet night rather than as a failure", async () => {
+    // A planner that looked and found no work had a successful night. Rendering that as an error
+    // is what teaches somebody to stop reading the panel.
+    serveDetail({ items: [], status: "completed" });
+    renderPanel([job({ status: "completed" })]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show list" }));
+    await settle();
+
+    expect(screen.getByText(/found no work/)).toBeTruthy();
+  });
+
+  it("keeps up with a live job's list and leaves a finished one alone", async () => {
+    // A live job's items move while the reader is looking at them. A finished job never changes
+    // again, so polling it is a request per tick for a row that has said all it has to say.
+    serveDetail({ items: [jobItem({ status: "running" })] });
+    const { unmount } = renderPanel([job({ status: "implementing" })]);
+    fireEvent.click(screen.getByRole("button", { name: "Show list" }));
+    await settle();
+    const afterOpen = fetchMock.mock.calls.length;
+    advance(3000);
+    await settle();
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(afterOpen);
+    unmount();
+
+    fetchMock.mockClear();
+    serveDetail({ items: [jobItem({ status: "passed" })], status: "completed" });
+    renderPanel([job({ status: "completed" })]);
+    fireEvent.click(screen.getByRole("button", { name: "Show list" }));
+    await settle();
+    const once = fetchMock.mock.calls.length;
+    advance(9000);
+    await settle();
+    expect(fetchMock.mock.calls.length).toBe(once);
   });
 });

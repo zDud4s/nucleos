@@ -87,6 +87,12 @@ pub fn build_router(state: AppState) -> Router {
             "/runs/{id}/message",
             post(post_run_message).delete(delete_run_message),
         )
+        .route("/jobs", get(get_jobs))
+        .route("/jobs/{id}", get(get_job))
+        // Distinct from `/runs/{id}/cancel`, which stops one node. Both end the job — a stopped
+        // node leaves the tree holding edits no gate measured — but only this one reaches a job
+        // that has no node in flight: parked for budget, waiting for the slot, or between nodes.
+        .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/assistant/message", post(post_assistant_message))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
@@ -1243,7 +1249,7 @@ async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode>
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (paused, reason) = match budget::budget_permits_new_run(&state.pool, now).await {
         budget::BudgetDecision::Allow => (false, None),
-        budget::BudgetDecision::Pause { reason } => (true, Some(reason)),
+        budget::BudgetDecision::Pause { reason, .. } => (true, Some(reason)),
     };
     Ok(BudgetResponse {
         limit_usd: config.limit_usd,
@@ -1742,6 +1748,55 @@ async fn post_proposal_reject(
             tracing::warn!(proposal_id = id, %error, "rejecting a proposal failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+/// How many jobs one listing returns.
+///
+/// Finished jobs are included, so this is a window rather than a queue: a job that stopped for the
+/// budget or ran out of clock is exactly the one the user needs to see, and filtering to live ones
+/// would make it vanish at the moment it started mattering.
+const JOB_LIST_LIMIT: i64 = 20;
+
+#[derive(serde::Deserialize)]
+struct OptionalProjectQuery {
+    project_id: Option<String>,
+}
+
+async fn get_jobs(
+    State(state): State<AppState>,
+    Query(query): Query<OptionalProjectQuery>,
+) -> Result<Json<Vec<crate::job::JobSummary>>, StatusCode> {
+    crate::job::list(&state.pool, query.project_id.as_deref(), JOB_LIST_LIMIT)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::job::JobDetail>, StatusCode> {
+    match crate::job::detail(&state.pool, id).await {
+        Ok(Some(detail)) => Ok(Json(detail)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    // Uncancellable: this terminates the node in flight and only then retires the job. A request
+    // dropped in between would leave a job nothing drives with a node still running inside it.
+    match uncancellable(async move { crate::job::cancel(&state, id).await }).await? {
+        Ok(crate::job::CancelOutcome::Cancelled) => Ok(StatusCode::NO_CONTENT),
+        // Already over. Not success: "I stopped it" and "it had already finished" are different
+        // answers to the question the user just asked.
+        Ok(crate::job::CancelOutcome::NotLive) => Err(StatusCode::CONFLICT),
+        Ok(crate::job::CancelOutcome::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -3552,6 +3607,74 @@ mod tests {
         );
     }
 
+    /// Two facts the daemon records about a run were invisible to every client reading it back:
+    /// whether the run can be spoken to at all, and which run continued it after a context handoff.
+    /// Both are columns on `runs`; neither was in `RunStatusResponse`, so the only way to learn
+    /// either was to open the database. A steering caller could not tell a refusal it deserved
+    /// (`steerable = 0`) from one caused by something else, and a handoff's successor could be found
+    /// only by guessing at ids.
+    #[tokio::test]
+    async fn a_run_reports_whether_it_is_steerable_and_which_run_succeeded_it() {
+        let state = test_state().await;
+        let run_id = crate::runs::create_run_inner(
+            &state,
+            "a run that may be spoken to".to_string(),
+            None,
+            None,
+            "real",
+            true,
+        )
+        .await
+        .expect("a real-mode run needs neither a project nor a worktree");
+
+        // A real row, because `successor_run_id` carries `REFERENCES runs(id)` (migration 0041) —
+        // an invented id is rejected, which is the constraint doing its job.
+        let successor_id = crate::runs::create_run_inner(
+            &state,
+            "the run that continued the work".to_string(),
+            None,
+            None,
+            "real",
+            false,
+        )
+        .await
+        .expect("a real-mode run needs neither a project nor a worktree");
+
+        sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+            .bind(successor_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .expect("link a successor the way a handoff does");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            parsed["steerable"],
+            serde_json::json!(true),
+            "a run created steerable must say so when read back"
+        );
+        assert_eq!(
+            parsed["successor_run_id"],
+            serde_json::json!(successor_id),
+            "the run that continued this one must be reachable without reading the database"
+        );
+    }
+
     #[tokio::test]
     async fn awaiting_approval_runs_returns_seeded_run_with_bearer_token() {
         let state = test_state().await;
@@ -4625,8 +4748,8 @@ mod tests {
         let original_run_id = result.last_insert_rowid();
         sqlx::query(
             "INSERT INTO worktrees
-             (run_id, project_id, project_root, path, branch, created_at)
-             VALUES (?, 'proj', 'C:/repos/proj', 'C:/worktrees/proj/run-paused', ?, ?)",
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', 'C:/repos/proj', 'C:/worktrees/proj/run-paused', ?, ?)",
         )
         .bind(original_run_id)
         .bind(format!("nucleos/run-{original_run_id}"))

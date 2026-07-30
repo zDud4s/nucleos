@@ -143,6 +143,8 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/runs/awaiting-approval"),
     (Method::GET, "/runs/{id}"),
     (Method::GET, "/assistant/{turn_id}"),
+    (Method::GET, "/jobs"),
+    (Method::GET, "/jobs/{id}"),
     (Method::GET, "/proposals"),
     (Method::GET, "/shadow-decisions"),
     (Method::GET, "/scoreboard"),

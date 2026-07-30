@@ -8,7 +8,29 @@ use tokio::task::AbortHandle;
 
 /// Production default for how long a single run may take before it's marked `"timed_out"` and its
 /// process killed. Tests override `AppState.run_timeout` to something much shorter.
+///
+/// This is the clock for a run somebody is waiting on. Autonomous runs get a longer one — see
+/// [`AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER`].
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How much longer an autonomous run may take than an interactive one.
+///
+/// A wall clock and a progress deadline answer different questions. The progress deadline
+/// ([`DEFAULT_PROGRESS_TIMEOUT`]) is the one that catches a run that has stopped getting anywhere;
+/// the wall clock is a backstop against a run that keeps making progress and never finishes. Set
+/// below the length of an ordinary task, a backstop stops being a backstop and becomes the usual
+/// way runs end.
+///
+/// **Measured, 2026-07-30.** Three `worktree` runs of one real task were killed at the 600-second
+/// wall clock with 400+ streamed events each and sub-tasks still open, while the same task in
+/// `real` mode finished in 20 turns. The failure was the deadline, not the runs: nothing about
+/// them was stuck, and each one spent money the daemon then had to write off. A worktree run does
+/// setup, edits, a build and a gate; 10 minutes does not buy that.
+///
+/// 30 minutes is a bound, not a measurement — nobody has yet run one to completion to find out
+/// what it needs. It is three times the observed floor and still finite, which is the property
+/// that matters: an autonomous run must not be able to run all day.
+pub const AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER: u32 = 3;
 
 /// Production default for how long a run may stay silent between streamed events.
 ///

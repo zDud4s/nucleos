@@ -36,11 +36,26 @@ pub struct BudgetConfig {
     pub time_cost_per_hour_usd: f64,
 }
 
+/// Whether a paused budget will lift on its own, and roughly when.
+///
+/// Carried because a job is a sequence and therefore has a choice a single run never had: park and
+/// resume, or stop and hand back the partial. Getting it from the reason string would work until
+/// somebody reworded the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseKind {
+    /// The trailing-hour brake, or a check that could not be made this time. Both reopen without
+    /// anyone doing anything, so work stopped for this reason is worth coming back to.
+    Transient,
+    /// The budget window's own ceiling. Nothing reopens it before the period rolls over, which for
+    /// the default monthly window can be weeks — far past any deadline a caller is willing to wait.
+    Window,
+}
+
 /// Whether autonomy may start a new proactive run under the current budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetDecision {
     Allow,
-    Pause { reason: String },
+    Pause { reason: String, kind: PauseKind },
 }
 
 /// One run's contribution to the budget, already parsed from the `runs` table.
@@ -288,6 +303,7 @@ async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<
                     "window spend ${spent:.2} + ${:.2} reserve would exceed the ${limit:.2} limit",
                     cfg.per_run_reserve_usd
                 ),
+                kind: PauseKind::Window,
             });
         }
     }
@@ -300,6 +316,7 @@ async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<
                     "hourly spend ${spent:.2} + ${:.2} reserve would exceed the ${hourly_limit:.2} hourly limit",
                     cfg.per_run_reserve_usd
                 ),
+                kind: PauseKind::Transient,
             });
         }
     }
@@ -311,8 +328,12 @@ async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<
 pub async fn budget_permits_new_run(pool: &SqlitePool, now: DateTime<Utc>) -> BudgetDecision {
     match evaluate_budget(pool, now).await {
         Ok(decision) => decision,
+        // Transient, deliberately: a database that would not answer says nothing about how much has
+        // been spent. Calling it a window ceiling would end a job outright over a read that may well
+        // succeed thirty seconds later, and the failure would be indistinguishable from a real one.
         Err(error) => BudgetDecision::Pause {
             reason: format!("budget check failed, pausing to be safe: {error}"),
+            kind: PauseKind::Transient,
         },
     }
 }
@@ -1001,6 +1022,86 @@ mod tests {
         assert!(matches!(
             budget_permits_new_run(&pool, now).await,
             BudgetDecision::Pause { .. }
+        ));
+    }
+
+    /// A caller that can park and come back — a job, as opposed to a single run — needs to know
+    /// which of the two limits stopped it. The hourly brake reopens by itself within the hour; the
+    /// window ceiling does not reopen until the period rolls over, which for the default monthly
+    /// window is weeks away. Waiting out the first is patience; waiting out the second is a hang.
+    #[tokio::test]
+    async fn the_hourly_brake_reopens_by_itself_and_the_window_ceiling_does_not() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: None,
+                period: BudgetPeriod::Monthly,
+                hourly_limit_usd: Some(1.0),
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T12:00:00Z");
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(0.7),
+            "2026-07-20T11:30:00Z",
+            Some("2026-07-20T11:40:00Z"),
+        )
+        .await;
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Pause {
+                kind: PauseKind::Transient,
+                ..
+            }
+        ));
+
+        // Same spend, now measured against a window ceiling instead of the hourly brake.
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: Some(1.0),
+                period: BudgetPeriod::Monthly,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, now).await,
+            BudgetDecision::Pause {
+                kind: PauseKind::Window,
+                ..
+            }
+        ));
+    }
+
+    /// A budget that cannot be read says nothing about how much has been spent. Reporting it as the
+    /// window ceiling would end a job outright over a read that may well succeed on the next tick.
+    #[tokio::test]
+    async fn an_unreadable_budget_is_transient_rather_than_a_spent_window() {
+        let pool = test_pool().await;
+        sqlx::query("DELETE FROM autopilot_global")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            budget_permits_new_run(&pool, ts("2026-07-20T12:00:00Z")).await,
+            BudgetDecision::Pause {
+                kind: PauseKind::Transient,
+                ..
+            }
         ));
     }
 

@@ -197,7 +197,11 @@ impl std::error::Error for CreateRunError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+// `FromRow` rather than a positional tuple: sqlx only implements `FromRow` for tuples up to 16
+// elements, and this row outgrew that. Deriving it also removes the column-order-to-field-order
+// correspondence that a tuple made load-bearing and invisible — adding a column in the middle of
+// the SELECT used to silently shift every field after it.
+#[derive(Serialize, Deserialize, sqlx::FromRow)]
 pub struct RunStatusResponse {
     pub id: i64,
     pub project_id: Option<String>,
@@ -215,6 +219,12 @@ pub struct RunStatusResponse {
     pub cache_read_tokens: Option<i64>,
     pub num_turns: Option<i64>,
     pub context_fill: Option<i64>,
+    /// Whether this run accepts `POST /runs/{id}/message`. Reported because a caller that is
+    /// refused otherwise cannot tell a run that never opted in from one that has already ended.
+    pub steerable: bool,
+    /// The run that continued this one after a context handoff, when there was one. Without it the
+    /// link the handoff records is reachable only by reading the database directly.
+    pub successor_run_id: Option<i64>,
 }
 
 pub async fn create_run(
@@ -278,15 +288,30 @@ const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 /// proposals and disengages the kill switch. Autonomous runs now get their own scoped key
 /// (`auth::mint_run_token`); only orchestrator turns still carry the control token, and only
 /// because `ToolPolicy::McpOnly` leaves them nothing to read it with.
-pub(crate) fn run_env(token: &str, id: i64) -> Vec<(String, String)> {
-    vec![
+///
+/// `artifacts` is the directory a job's nodes hand work to each other through, and is `Some` only
+/// for a node of a job. An ordinary run has no successor to write to, and handing it the variable
+/// anyway would advertise a protocol nothing in its prompt describes.
+pub(crate) fn run_env(
+    token: &str,
+    id: i64,
+    artifacts: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
         (
             "NUCLEOS_DAEMON_URL".to_string(),
             "http://127.0.0.1:8791".to_string(),
         ),
         ("NUCLEOS_DAEMON_TOKEN".to_string(), token.to_string()),
         ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
-    ]
+    ];
+    if let Some(path) = artifacts {
+        env.push((
+            "NUCLEOS_JOB_ARTIFACTS".to_string(),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    env
 }
 
 /// Mints a run's own daemon key and stores its secret, returning what goes in the environment.
@@ -355,6 +380,67 @@ pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
         crate::runner::ToolPolicy::None
     } else {
         crate::runner::ToolPolicy::Unrestricted
+    }
+}
+
+/// PURE: whether a run in `mode` proceeds with nobody there to answer it.
+///
+/// Three policies read this, for the same reason each time — there is no human in the loop: how
+/// many attempts a failure gets, how long the wall clock runs, and whether the classifier replaces
+/// the CLI's permission surface. `email_triage` is unattended too and is deliberately NOT in this
+/// set: it is one toolless classification against a local model, so it has no tools to permit, no
+/// build to outlast, and nothing a retry would fix.
+///
+/// One definition rather than the same `if` at each reader, because the day a fourth unattended
+/// mode appears, three policies have to learn about it together or two of them quietly won't.
+pub(crate) fn runs_unattended(mode: &str) -> bool {
+    mode == "shadow" || mode == "worktree"
+}
+
+/// Whether this run's actions are governed by the classifier rather than by the CLI's allow-list.
+///
+/// Reads the disk, so not pure: the answer depends on what is wired up in `dir`, which for a
+/// worktree run is the worktree the CLI will start in and not the project root.
+///
+/// Every condition is a refusal, and the AND between them is the point:
+///
+///   * unattended only — an interactive run has somebody who can approve, and taking that decision
+///     away from them is not this function's business;
+///   * `Unrestricted` only — a run with no tools has no permissions worth changing;
+///   * classifier verified present — the load-bearing one. Standing the CLI's barrier down is only
+///     safe because another barrier takes over. With no hook there is no second barrier, and the
+///     run would be governed by nothing at all.
+///
+/// The third condition means a project that has not wired the hook keeps today's behaviour, which
+/// is also today's failure: its unattended runs still cannot execute what the interactive list
+/// omits. That is the right trade — the answer for such a project is to wire the classifier, not
+/// to stand the barrier down without one.
+fn classifier_governs_tools(
+    mode: &str,
+    tool_policy: crate::runner::ToolPolicy,
+    dir: Option<&std::path::Path>,
+) -> bool {
+    if !runs_unattended(mode) || tool_policy != crate::runner::ToolPolicy::Unrestricted {
+        return false;
+    }
+    dir.is_some_and(crate::autopilot::classifier_hook_is_wired)
+}
+
+/// PURE: the wall clock a run in `mode` gets, given the interactive default `base`.
+///
+/// `shadow` and `worktree` are the modes that check out a tree, edit it, build it and run a gate,
+/// and they are the ones measured dying on the 600-second deadline with work still open (see
+/// `state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER`). `email_triage` is autonomous too and deliberately
+/// stays on the short clock: it classifies one message against a local model, so a triage run still
+/// going after ten minutes is stuck, not busy.
+///
+/// Derived from `base` rather than given a constant of its own, so a test that shortens the clock
+/// still gets a short one, and an operator who tunes the deadline moves both together.
+fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+    if runs_unattended(mode) {
+        base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER
+    } else {
+        base
     }
 }
 
@@ -581,6 +667,9 @@ const HANDOFF_CONTINUATION_PROMPT: &str =
 struct HandoffSuccessor {
     id: i64,
     session_id: String,
+    /// The job this successor belongs to, carried over from its predecessor. `Some` means the
+    /// successor needs the handoff directory in its environment, like every other node of that job.
+    job_id: Option<i64>,
 }
 
 /// Applies the durable handoff policy to a prepared successor.
@@ -617,8 +706,8 @@ async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
 ) -> sqlx::Result<Option<HandoffSuccessor>> {
-    let (context_fill, existing_successor): (Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT context_fill, successor_run_id FROM runs WHERE id = ?")
+    let (context_fill, existing_successor, job_id): (Option<i64>, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT context_fill, successor_run_id, job_id FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(pool)
             .await?;
@@ -634,11 +723,16 @@ async fn prepare_handoff_successor(
     }
 
     let session_id = crate::auth::generate_uuid_v4();
+    // `job_id` and `stage` are carried across with everything else. A node that runs out of context
+    // is still that node — same item, same tree — and a successor belonging to no job would be
+    // invisible to the chain that has to finalise it: the item would stay `running` until the
+    // four-hour ceiling, with the work already done and nothing saying where it went.
     let inserted = sqlx::query(
         "INSERT INTO runs (
-             project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at
+             project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
+             job_id, stage
          )
-         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?
+         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage
          FROM runs WHERE id = ?",
     )
     .bind(HANDOFF_CONTINUATION_PROMPT)
@@ -651,6 +745,14 @@ async fn prepare_handoff_successor(
         return Err(sqlx::Error::RowNotFound);
     }
     let successor_id = inserted.last_insert_rowid();
+    // The item follows its node, for the same reason it follows an approval resume: left pointing
+    // at the predecessor, the job's next pass reads a terminal node that did not complete and stops
+    // the whole chain — turning a context handoff into a failure.
+    sqlx::query("UPDATE job_items SET run_id = ? WHERE run_id = ?")
+        .bind(successor_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
 
     if !record_handoff_if_needed(pool, run_id, successor_id).await? {
         let _ = sqlx::query(
@@ -665,15 +767,25 @@ async fn prepare_handoff_successor(
 
     // A worktree handoff continues in the same checkout. Moving its ownership keeps approval,
     // cancellation, and GC pointed at the live successor instead of the completed predecessor.
-    sqlx::query("UPDATE worktrees SET run_id = ? WHERE run_id = ? AND removed_at IS NULL")
-        .bind(successor_id)
-        .bind(run_id)
-        .execute(pool)
-        .await?;
+    //
+    // Keyed on `owner_kind = 'run'` since migration 0035 replaced `worktrees.run_id` with an owner
+    // pair — the older spelling was a runtime SQL string, so it compiled fine and would have failed
+    // only when a handoff actually happened. The filter is also load-bearing on its own: a job's
+    // tree must NOT move to the successor, because the job owns it and handing it to one node would
+    // let the GC collect it the moment that node finished, with the rest of the queue still to run.
+    sqlx::query(
+        "UPDATE worktrees SET owner_id = ?
+         WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(successor_id)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
 
     Ok(Some(HandoffSuccessor {
         id: successor_id,
         session_id,
+        job_id,
     }))
 }
 
@@ -706,6 +818,8 @@ async fn spawn_handoff_if_needed(
     gate_config: GateConfig,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
+    run_timeout: std::time::Duration,
+    classifier_governs_tools: bool,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -716,6 +830,12 @@ async fn spawn_handoff_if_needed(
         }
     };
     let daemon_token = mint_run_token(&state.pool, successor.id).await;
+    // A successor of a job node keeps the handoff directory: same node, same tree, same item.
+    // `spawn_cwd` is the job's worktree, which is where `prepare_artifacts` put it.
+    let node_artifacts = successor
+        .job_id
+        .and(spawn_cwd.as_ref())
+        .map(|cwd| cwd.join(crate::worktree::ARTIFACTS_DIR));
     spawn_run(
         &state,
         runner,
@@ -731,7 +851,7 @@ async fn spawn_handoff_if_needed(
         gate_config,
         max_attempts,
         tool_policy,
-        daemon_token,
+        run_env(&daemon_token, successor.id, node_artifacts.as_deref()),
         // A successor is not steerable, whatever its predecessor was. `prepare_handoff_successor`
         // writes its row with the column's default, so a listening successor would contradict its
         // own record: `post_run_message` reads the row, refuses, and nothing would ever close the
@@ -739,6 +859,12 @@ async fn spawn_handoff_if_needed(
         // conversation across a handoff means giving the successor row the flag too, which is a
         // decision to take deliberately rather than inherit.
         false,
+        // Inherited, not re-derived: a successor continues one task, and a handoff that reset the
+        // clock would let a run outlive its deadline by handing itself on.
+        run_timeout,
+        // Inherited for the same reason, and it is the same tree: re-deriving would let a handoff
+        // quietly change what the work is allowed to do halfway through it.
+        classifier_governs_tools,
     );
 }
 
@@ -758,14 +884,16 @@ fn spawn_run(
     gate_config: GateConfig,
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
-    daemon_token: String,
+    // The environment, built by the caller rather than from a token here: a job node needs the
+    // handoff directory alongside the key, and only the caller knows whether this run is one.
+    env: Vec<(String, String)>,
     steerable: bool,
+    run_timeout: std::time::Duration,
+    classifier_governs_tools: bool,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
     let progress_timeout = state.progress_timeout;
-    let run_timeout = state.run_timeout;
-    let env = run_env(&daemon_token, id);
     let handoff_state = state.clone();
     let run_messages = state.run_messages.clone();
 
@@ -809,6 +937,7 @@ fn spawn_run(
                 fork_session,
                 include_partial_messages: false,
                 steerable,
+                classifier_governs_tools,
                 messages: None,
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
@@ -976,6 +1105,8 @@ fn spawn_run(
                             gate_config.clone(),
                             max_attempts,
                             tool_policy,
+                            run_timeout,
+                            classifier_governs_tools,
                         ))
                         .await;
                     }
@@ -1064,6 +1195,8 @@ fn spawn_run(
                             gate_config.clone(),
                             max_attempts,
                             tool_policy,
+                            run_timeout,
+                            classifier_governs_tools,
                         ))
                         .await;
                     }
@@ -1099,6 +1232,19 @@ async fn fail_provisioning(state: &AppState, id: i64, project_id: Option<&str>, 
     .await;
 }
 
+/// One node of a job: which job it belongs to, what part it plays, and the worktree it inherits.
+///
+/// A node carries the worktree rather than provisioning one, which is the whole reason a job can
+/// exceed a single context window — each node starts with a fresh window and picks up the previous
+/// one's work from the disk it shares.
+pub struct JobNode {
+    pub job_id: i64,
+    /// `plan` | `implement` | `review`. Never `gate`: the gate is a subprocess, not a run.
+    pub stage: &'static str,
+    pub worktree_path: String,
+    pub branch: String,
+}
+
 pub async fn create_run_inner(
     state: &AppState,
     prompt: String,
@@ -1106,6 +1252,46 @@ pub async fn create_run_inner(
     cwd: Option<String>,
     mode: &str,
     steerable: bool,
+) -> Result<i64, CreateRunError> {
+    create_run_with(state, prompt, project_id, cwd, mode, steerable, None).await
+}
+
+/// Starts one node of a job inside that job's existing worktree.
+///
+/// Deliberately `mode = "worktree"` rather than a mode of its own: `plan_only`, the tool policy,
+/// `max_attempts` and migration 0009's exclusivity index all branch on `mode`, and a fourth value
+/// would have to be excluded from each of them. Missing one would be silent.
+pub async fn create_job_node_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    node: JobNode,
+) -> Result<i64, CreateRunError> {
+    create_run_with(
+        state,
+        prompt,
+        Some(project_id),
+        Some(project_root),
+        "worktree",
+        // Never steerable. A node is one step of a plan the job is executing, and text typed into it
+        // mid-flight would change what that step does with nothing recording the substitution — the
+        // queue would still claim the item it was given. Steering belongs to a run somebody started
+        // and is watching.
+        false,
+        Some(node),
+    )
+    .await
+}
+
+async fn create_run_with(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    steerable: bool,
+    node: Option<JobNode>,
 ) -> Result<i64, CreateRunError> {
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
@@ -1170,20 +1356,30 @@ pub async fn create_run_inner(
         )
     });
     let mut gate_config = GateConfig::NotConfigured;
+    let mut node_artifacts: Option<std::path::PathBuf> = None;
 
     if mode == "worktree" {
         let project_root = cwd.as_deref().expect("worktree cwd validated above");
         let worktree_project_id = project_id
             .as_deref()
             .expect("worktree project_id validated above");
-        gate_config = match crate::config::load_schedule_rules(std::path::Path::new(project_root)) {
-            Ok(rules) => rules
+        // A job node is not gated here, because the job gates it. Two reasons, either of which is
+        // enough: `gate_after_each_item: false` is a knob the job honours and this path cannot see,
+        // and the plan and review nodes change nothing, so gating them spends a whole suite run to
+        // re-measure the tree the previous gate already measured. The verdict also belongs to the
+        // item it measured, which is a row this path has no access to.
+        gate_config = match (
+            &node,
+            crate::config::load_schedule_rules(std::path::Path::new(project_root)),
+        ) {
+            (Some(_), _) => GateConfig::NotConfigured,
+            (None, Ok(rules)) => rules
                 .gate_command
                 .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
                     command,
                     project_root: project_root.to_string(),
                 }),
-            Err(error) => {
+            (None, Err(error)) => {
                 tracing::warn!(
                     project_id = worktree_project_id,
                     project_root,
@@ -1193,17 +1389,30 @@ pub async fn create_run_inner(
                 GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
             }
         };
-        let info = match crate::worktree::create(std::path::Path::new(project_root), id).await {
-            Ok(info) => info,
-            Err(error) => {
-                fail_provisioning(
-                    state,
-                    id,
-                    project_id.as_deref(),
-                    &format!("worktree provisioning failed: {error}"),
-                )
-                .await;
-                return Err(CreateRunError::Worktree(error));
+        // A job node inherits its job's worktree; only a standalone run provisions one. Skipping
+        // both the `create` and the `record` is what lets a sequence of nodes accumulate work on one
+        // tree — and it is why nothing here writes a `worktrees` row for a node: the job already
+        // owns one, and a second row for the same directory would give the GC two owners to reconcile.
+        let info = match &node {
+            Some(node) => crate::worktree::WorktreeInfo {
+                path: std::path::PathBuf::from(&node.worktree_path),
+                branch: node.branch.clone(),
+            },
+            None => {
+                let owner = crate::worktree::Owner::Run(id);
+                match crate::worktree::create(std::path::Path::new(project_root), owner).await {
+                    Ok(info) => info,
+                    Err(error) => {
+                        fail_provisioning(
+                            state,
+                            id,
+                            project_id.as_deref(),
+                            &format!("worktree provisioning failed: {error}"),
+                        )
+                        .await;
+                        return Err(CreateRunError::Worktree(error));
+                    }
+                }
             }
         };
         // Every exit from here on has to leave a terminal status behind. Past the INSERT the row is
@@ -1212,15 +1421,16 @@ pub async fn create_run_inner(
         // the project — until a restart, the only thing that reconciles `running`. The `create`
         // branch above compensated; these two propagated with `?` and stranded the run.
         let worktree_path = info.path.to_string_lossy().into_owned();
-        if let Err(error) = crate::worktree::record(
-            &state.pool,
-            id,
-            worktree_project_id,
-            project_root,
-            &worktree_path,
-            &info.branch,
-        )
-        .await
+        if node.is_none()
+            && let Err(error) = crate::worktree::record(
+                &state.pool,
+                crate::worktree::Owner::Run(id),
+                worktree_project_id,
+                project_root,
+                &worktree_path,
+                &info.branch,
+            )
+            .await
         {
             fail_provisioning(
                 state,
@@ -1231,12 +1441,19 @@ pub async fn create_run_inner(
             .await;
             return Err(CreateRunError::Db(error));
         }
-        if let Err(error) = sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?")
-            .bind(&worktree_path)
-            .bind(id)
-            .execute(&state.pool)
-            .await
-        {
+        // The node's identity lands in the same write as its cwd so a row can never be `running`
+        // inside a job's worktree while claiming to belong to no job — which would make it invisible
+        // to the chain that has to finalise it.
+        let cwd_update = match &node {
+            Some(node) => {
+                sqlx::query("UPDATE runs SET cwd = ?, job_id = ?, stage = ? WHERE id = ?")
+                    .bind(&worktree_path)
+                    .bind(node.job_id)
+                    .bind(node.stage)
+            }
+            None => sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path),
+        };
+        if let Err(error) = cwd_update.bind(id).execute(&state.pool).await {
             fail_provisioning(
                 state,
                 id,
@@ -1246,6 +1463,26 @@ pub async fn create_run_inner(
             .await;
             return Err(CreateRunError::Db(error));
         }
+        // The handoff directory, and the exclusion that keeps it out of both the preservation commit
+        // and anything a node commits itself. Prepared per node rather than once per job because a
+        // node is the thing that writes there, and a failure here has to stop this node rather than
+        // be discovered later as an empty plan — which §5.2 of the design maps to `failed` with no
+        // way of telling a planner that found nothing from a directory that was never created.
+        if node.is_some() {
+            match crate::worktree::prepare_artifacts(&info.path).await {
+                Ok(path) => node_artifacts = Some(path),
+                Err(error) => {
+                    fail_provisioning(
+                        state,
+                        id,
+                        project_id.as_deref(),
+                        &format!("the job's handoff directory could not be prepared: {error}"),
+                    )
+                    .await;
+                    return Err(CreateRunError::Worktree(error));
+                }
+            }
+        }
         completion_feed = Some((
             "worktree_run_completed".to_owned(),
             format!("worktree run completed on {}", info.branch),
@@ -1253,7 +1490,7 @@ pub async fn create_run_inner(
         spawn_cwd = Some(info.path);
     }
 
-    let max_attempts = if mode == "shadow" || mode == "worktree" {
+    let max_attempts = if runs_unattended(mode) {
         MAX_AUTONOMOUS_ATTEMPTS
     } else {
         1
@@ -1269,6 +1506,11 @@ pub async fn create_run_inner(
     } else {
         state.runner.clone()
     };
+    // Answered before the call, because `spawn_cwd` is moved into it. `spawn_cwd` and not `cwd`:
+    // for a worktree run the CLI starts in the worktree provisioned above, and settings are read
+    // from where the process starts — asking the project root would answer about a directory this
+    // run never enters.
+    let governed_by_classifier = classifier_governs_tools(mode, tool_policy, spawn_cwd.as_deref());
     spawn_run(
         state,
         runner,
@@ -1284,8 +1526,10 @@ pub async fn create_run_inner(
         gate_config,
         max_attempts,
         tool_policy,
-        daemon_token,
+        run_env(&daemon_token, id, node_artifacts.as_deref()),
         steerable,
+        run_timeout_for_mode(state.run_timeout, mode),
+        governed_by_classifier,
     );
 
     Ok(id)
@@ -1311,11 +1555,27 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .clone()
         .ok_or(ResumeError::NotResumable("proposal has no tool_name"))?;
 
+    // A node of a job does not own the tree it is paused in — the job does, and has since before
+    // this node started. Looking it up by run would answer "no live worktree" for every paused job
+    // node, so approving one returned `NotResumable` and the shell offered a button that could not
+    // work. Which owner to ask for is decided by the paused run's own `job_id`.
+    let (job_id, stage): (Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT job_id, stage FROM runs WHERE id = ?")
+            .bind(original_run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or((None, None));
+    let owner = match job_id {
+        Some(job_id) => crate::worktree::Owner::Job(job_id),
+        None => crate::worktree::Owner::Run(original_run_id),
+    };
+
     let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
         "SELECT project_id, project_root, path
-         FROM worktrees WHERE run_id = ? AND removed_at IS NULL",
+         FROM worktrees WHERE owner_kind = ? AND owner_id = ? AND removed_at IS NULL",
     )
-    .bind(original_run_id)
+    .bind(owner.kind())
+    .bind(owner.id())
     .fetch_optional(&state.pool)
     .await?
     .ok_or(ResumeError::NotResumable(
@@ -1339,19 +1599,36 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // The resume carries the node's identity forward. Without it the new run belongs to no job, so
+    // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
+    // sits there until the four-hour ceiling retires it, with the approved work already done.
     let result = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, created_at)
-         VALUES (?, ?, ?, 'running', 'worktree', ?, ?)",
+        "INSERT INTO runs
+           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?)",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
     .bind(&prompt)
     .bind(&session_id)
     .bind(&now)
+    .bind(job_id)
+    .bind(stage.as_deref())
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
-    sqlx::query("UPDATE worktrees SET run_id=? WHERE run_id=?")
+    // The hand-over is a no-op for a job's tree, and must be: the job owns it, and moving ownership
+    // to this one node would let the GC collect it the moment that node finished — with the rest of
+    // the queue still to run in it. Filtering on `owner_kind = 'run'` is what makes that so.
+    sqlx::query("UPDATE worktrees SET owner_id=? WHERE owner_kind='run' AND owner_id=?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
+    // The item follows its node. Left pointing at the run just marked `superseded`, the job's next
+    // pass would read a terminal node that did not complete and stop the whole chain — turning an
+    // approval into a failure, and throwing away the work the user just authorised.
+    sqlx::query("UPDATE job_items SET run_id = ? WHERE run_id = ?")
         .bind(resume_id)
         .bind(original_run_id)
         .execute(&mut *tx)
@@ -1445,11 +1722,32 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // A resume continues an approved worktree run, which is autopilot work: the hook and the
         // classifier govern it, exactly as they governed the run being resumed.
         crate::runner::ToolPolicy::Unrestricted,
-        daemon_token,
+        // A resumed job node keeps its handoff directory: it is the same node, in the same tree,
+        // finishing the same item, and the review node after it still reads `plan.json` from there.
+        // An ordinary resumed run gets nothing, as before.
+        run_env(
+            &daemon_token,
+            resume_id,
+            job_id
+                .map(|_| std::path::PathBuf::from(&wt_path).join(crate::worktree::ARTIFACTS_DIR))
+                .as_deref(),
+        ),
         // Not steerable, for the reason the handoff successor is not: the resume row carries the
         // column's default, and a process listening on a stdin its own row denies could never be
         // told the conversation is over.
         false,
+        // A resume is a worktree run, so it gets the worktree clock — the same one the run it
+        // continues was given.
+        run_timeout_for_mode(state.run_timeout, "worktree"),
+        // Asked again against the worktree being resumed rather than inherited, because it is a
+        // fresh launch into a tree that has since been worked in: the run it continues may have
+        // rewritten the very settings file this reads. Re-checking is the conservative direction —
+        // a tree that no longer wires the hook stops getting the classifier's surface.
+        classifier_governs_tools(
+            "worktree",
+            crate::runner::ToolPolicy::Unrestricted,
+            Some(std::path::Path::new(&wt_path)),
+        ),
     );
 
     Ok(resume_id)
@@ -1459,30 +1757,10 @@ pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<RunStatusResponse>, StatusCode> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            i64,
-            Option<String>,
-            String,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<f64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-        ),
-    >(
+    let run = sqlx::query_as::<_, RunStatusResponse>(
         "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
                 stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns, context_fill
+                num_turns, context_fill, steerable, successor_run_id
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -1491,24 +1769,7 @@ pub async fn get_run(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(RunStatusResponse {
-        id: row.0,
-        project_id: row.1,
-        status: row.2,
-        gate_status: row.3,
-        gate_exit_code: row.4,
-        gate_output: row.5,
-        exit_code: row.6,
-        stdout: row.7,
-        stderr: row.8,
-        session_id: row.9,
-        cost_usd: row.10,
-        input_tokens: row.11,
-        output_tokens: row.12,
-        cache_read_tokens: row.13,
-        num_turns: row.14,
-        context_fill: row.15,
-    }))
+    Ok(Json(run))
 }
 
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
@@ -1783,6 +2044,33 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         (container, repo)
     }
 
+    /// Wires this daemon's classifier hook into `dir`, the way a project that has onboarded has it:
+    /// registered in `.claude/settings.json` AND executable on disk. Both, because
+    /// `autopilot::classifier_hook_is_wired` requires both — a registered command that cannot run
+    /// classifies nothing.
+    fn wire_classifier_hook(dir: &FsPath) {
+        std::fs::create_dir_all(dir.join(".claude/hooks")).expect("create hook directory");
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
+        )
+        .expect("write settings");
+        std::fs::write(dir.join(".claude/hooks/ask_daemon.py"), "# hook").expect("write hook");
+    }
+
+    /// The same project WITHOUT the classifier: settings present and valid, a `PreToolUse` entry
+    /// even, but it names somebody else's script. This is the shape the check exists to reject —
+    /// "some PreToolUse hook exists" was never the property worth having.
+    fn wire_someone_elses_hook(dir: &FsPath) {
+        std::fs::create_dir_all(dir.join(".claude/hooks")).expect("create hook directory");
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"prettier --write"}]}]}}"#,
+        )
+        .expect("write settings");
+        std::fs::write(dir.join(".claude/hooks/ask_daemon.py"), "# hook").expect("write hook");
+    }
+
     fn configure_gate(repo: &FsPath, command: &str) {
         std::fs::create_dir_all(repo.join(".ai")).expect("create project config directory");
         std::fs::write(
@@ -1837,6 +2125,91 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_node_adopts_the_jobs_worktree_instead_of_provisioning_one() {
+        // `WorktreeRootEnv` writes a process-wide variable, so every test that sets it must hold
+        // this lock. Without it this test moves the worktree root out from under whichever other
+        // test is mid-provision, and the failure surfaces over there instead of here — which is
+        // exactly how it was found.
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-jobnode-");
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &project_root,
+                rule_name: "nightly",
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("the job provisions its worktree once");
+        crate::worktree::record(
+            &state.pool,
+            owner,
+            "proj",
+            &project_root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+        )
+        .await
+        .expect("record the job worktree");
+
+        let run_id = create_job_node_run(
+            &state,
+            "the second item".into(),
+            "proj".into(),
+            project_root.clone(),
+            JobNode {
+                job_id,
+                stage: "implement",
+                worktree_path: info.path.to_string_lossy().into_owned(),
+                branch: info.branch.clone(),
+            },
+        )
+        .await
+        .expect("a node starts inside the job worktree");
+
+        let (cwd, node_job_id, stage): (String, i64, String) =
+            sqlx::query_as("SELECT cwd, job_id, stage FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(PathBuf::from(&cwd), info.path);
+        assert_eq!(node_job_id, job_id);
+        assert_eq!(stage, "implement");
+
+        // The load-bearing half. A node that recorded a worktree of its own would give the same
+        // directory two owners, and the GC would then be free to collect it out from under the job
+        // the moment this one node reached a terminal status.
+        let own_row: Option<i64> = sqlx::query_scalar(
+            "SELECT owner_id FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            own_row.is_none(),
+            "a job node must not provision or record a worktree of its own"
+        );
     }
 
     async fn create_worktree_run(
@@ -1930,8 +2303,8 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 
         sqlx::query(
             "INSERT INTO worktrees
-             (run_id, project_id, project_root, path, branch, created_at)
-             VALUES (?, 'proj', ?, ?, ?, ?)",
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', ?, ?, ?, ?)",
         )
         .bind(original_run_id)
         .bind(project_root)
@@ -1955,6 +2328,134 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         .unwrap();
 
         (original_run_id, proposal_id, worktree_path)
+    }
+
+    /// §6.2 of the design, and the one path where the shell offered a button that could not work.
+    ///
+    /// A node of a job does not own the tree it is paused in — the job does — so the resume looked
+    /// the worktree up by run, found none, and answered `NotResumable` for every paused job node.
+    /// Three things have to be true afterwards, and getting any of them wrong turns an approval
+    /// into something worse than the refusal it replaced.
+    #[tokio::test]
+    async fn approving_a_job_node_resumes_it_in_the_jobs_worktree() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let worktree_path = "C:/worktrees/proj/job-1";
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: "C:/repos/proj",
+                rule_name: "nightly",
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await
+        .unwrap();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('job', ?, 'proj', 'C:/repos/proj', ?, 'nucleos/job-1', ?)",
+        )
+        .bind(job_id)
+        .bind(worktree_path)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let paused = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at,
+                               job_id, stage)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', 'sess-j', 'worktree', ?, ?, 'implement')",
+        )
+        .bind(worktree_path)
+        .bind(&created_at)
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
+             VALUES (?, 0, 'an item', 'running', ?)",
+        )
+        .bind(job_id)
+        .bind(paused)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            paused,
+            Some("sess-j"),
+            Some("proj"),
+            "Bash",
+            "push needs approval",
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+        let seeded: (Option<i64>, Option<String>, i64) = sqlx::query_as(
+            "SELECT r.job_id, r.stage,
+                    (SELECT COUNT(*) FROM worktrees w
+                     WHERE w.owner_kind = 'job' AND w.owner_id = r.job_id AND w.removed_at IS NULL)
+             FROM runs r WHERE r.id = ?",
+        )
+        .bind(paused)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        // The seed, checked before the thing under test touches it. sqlx fills a `?` with no bind
+        // behind it as NULL without complaining, so a miscounted bind list produces a run with no
+        // job — which is exactly the state whose handling this test exists to prove, and it would
+        // have passed by testing nothing.
+        assert_eq!(
+            (seeded.0, seeded.1.as_deref(), seeded.2),
+            (Some(job_id), Some("implement"), 1),
+            "the seed itself must be what this test claims to be testing"
+        );
+
+        let resume_id = resume_approved_run(&state, proposal_id)
+            .await
+            .expect("a paused job node is resumable");
+
+        // One: the resume belongs to the same job and plays the same part. A run belonging to no
+        // job is invisible to the chain that has to finalise it, so the item would stay `running`
+        // until the four-hour ceiling — with the approved work already done.
+        let (resumed_job, resumed_stage): (Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT job_id, stage FROM runs WHERE id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(resumed_job, Some(job_id));
+        assert_eq!(resumed_stage.as_deref(), Some("implement"));
+
+        // Two: the item follows its node. Left pointing at the run just marked `superseded`, the
+        // next pass would read a terminal node that did not complete and stop the whole chain —
+        // turning the user's approval into a failure.
+        let item_run: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(item_run, Some(resume_id));
+
+        // Three: the tree still belongs to the job. Handed to this one node, the GC would be free
+        // to collect it the moment the node finished, with the rest of the queue still to run in it.
+        let owner: (String, i64) =
+            sqlx::query_as("SELECT owner_kind, owner_id FROM worktrees WHERE path = ?")
+                .bind(worktree_path)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, ("job".to_owned(), job_id));
     }
 
     #[tokio::test]
@@ -1994,7 +2495,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(resume_run.3, "worktree");
 
         let transferred_run_id =
-            sqlx::query_scalar::<_, i64>("SELECT run_id FROM worktrees WHERE path = ?")
+            sqlx::query_scalar::<_, i64>("SELECT owner_id FROM worktrees WHERE owner_kind = 'run' AND path = ?")
                 .bind(worktree_path.to_string_lossy().as_ref())
                 .fetch_one(&state.pool)
                 .await
@@ -2668,7 +3169,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(PathBuf::from(&run_cwd), spawn_cwd);
 
         let (worktree_path, branch): (String, String) =
-            sqlx::query_as("SELECT path, branch FROM worktrees WHERE run_id = ?")
+            sqlx::query_as("SELECT path, branch FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2731,7 +3232,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(gate_status.as_deref(), Some("passed"));
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2784,8 +3285,9 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(gate_exit_code, Some(7), "the gate's own exit code must reach the row");
         assert!(gate_output.is_some(), "a failing gate must keep its output tail");
 
+        // Keyed on the owner pair since migration 0035; `worktrees.run_id` no longer exists.
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2849,7 +3351,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         );
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2897,7 +3399,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         );
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2946,7 +3448,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(feed_kind, "worktree_gate_failed");
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -2996,7 +3498,7 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         assert_eq!(feed_kind, "worktree_run_completed");
 
         let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
                 .await
@@ -3697,6 +4199,123 @@ voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
         panic!(
             "silent run did not reach timed_out before its wall clock, last status: {status}"
         );
+    }
+
+    /// PURE. `email_triage` is the case worth stating: it is autonomous, it spends money, and it
+    /// still must not get the long clock — a triage run classifies one message, so one that is
+    /// still going after ten minutes is stuck rather than busy.
+    #[test]
+    fn only_the_long_running_autonomous_modes_get_the_longer_wall_clock() {
+        let base = Duration::from_secs(600);
+
+        for mode in ["shadow", "worktree"] {
+            assert_eq!(
+                run_timeout_for_mode(base, mode),
+                base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER,
+                "{mode} builds and gates a tree; it is the mode that was measured hitting the wall"
+            );
+        }
+
+        for mode in ["real", "plan", crate::email::TRIAGE_MODE] {
+            assert_eq!(
+                run_timeout_for_mode(base, mode),
+                base,
+                "{mode} keeps the interactive clock"
+            );
+        }
+    }
+
+    /// The wall clock is per mode, and this is the test that notices if it stops being — the pure
+    /// test above would keep passing if nobody called the function.
+    ///
+    /// One state, one clock, two runs. The work takes longer than the interactive deadline and less
+    /// than the autonomous one, so the same runner and the same 300ms setting have to produce two
+    /// different outcomes. Drop the multiplier and the shadow run times out with the real one; apply
+    /// it to everything and the real run completes. Both were run; both fail this.
+    #[tokio::test]
+    async fn an_autonomous_run_outlives_the_deadline_that_kills_an_interactive_one() {
+        // 300ms clock against 520ms of work: 3x that is 900ms, so the margin either way is wider
+        // than the work itself.
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_millis(520)), Duration::from_millis(300))
+                .await;
+        // Far out of the way: this test is about the wall clock, not about silence.
+        state.progress_timeout = Duration::from_secs(30);
+
+        let interactive = create_run_inner(&state, "interactive".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        let autonomous = create_run_inner(&state, "autonomous".into(), None, None, "shadow", false)
+            .await
+            .unwrap();
+
+        let (interactive_status, _) = poll_run(&state, interactive, "timed_out").await;
+        let (autonomous_status, _) = poll_run(&state, autonomous, "completed").await;
+
+        assert_eq!(
+            interactive_status, "timed_out",
+            "520ms of work does not fit in a 300ms interactive clock"
+        );
+        assert_eq!(
+            autonomous_status, "completed",
+            "the same work fits in the autonomous clock, which is what the multiplier is for"
+        );
+    }
+
+    /// The invariant, run rather than asserted: the CLI's permission barrier is stood down ONLY
+    /// where the classifier that replaces it is verified present.
+    ///
+    /// Three cases, and the second and third are the ones that matter. The same unattended run in a
+    /// tree whose `PreToolUse` entry names somebody else's script gets nothing — "a hook exists" is
+    /// not the property. And an interactive run in the fully wired tree gets nothing either, because
+    /// there is a person there who can approve, and this must not decide for them.
+    ///
+    /// Mutation-checked: dropping the `runs_unattended` guard fails the third case, dropping the
+    /// hook lookup fails the second.
+    #[tokio::test]
+    async fn only_a_verified_classifier_stands_the_cli_permission_barrier_down() {
+        let (state, runner) = test_state_with_runner(None, Duration::from_secs(30)).await;
+
+        let wired = space_free_tempdir("nucleos-wired-");
+        wire_classifier_hook(wired.path());
+        let unwired = space_free_tempdir("nucleos-unwired-");
+        wire_someone_elses_hook(unwired.path());
+
+        for (label, dir, mode, expected) in [
+            ("unattended, classifier wired", wired.path(), "shadow", true),
+            (
+                "unattended, PreToolUse names another script",
+                unwired.path(),
+                "shadow",
+                false,
+            ),
+            (
+                "interactive, classifier wired",
+                wired.path(),
+                "real",
+                false,
+            ),
+        ] {
+            *runner.last_classifier_governs_tools.lock().unwrap() = None;
+            let id = create_run_inner(
+                &state,
+                "work".into(),
+                None,
+                Some(dir.to_string_lossy().into_owned()),
+                mode,
+                false,
+            )
+            .await
+            .unwrap();
+            let (status, _) = poll_run(&state, id, "completed").await;
+            assert_eq!(status, "completed", "{label}: the run must reach the runner");
+
+            assert_eq!(
+                *runner.last_classifier_governs_tools.lock().unwrap(),
+                Some(expected),
+                "{label}"
+            );
+        }
     }
 
     /// The wall clock drops the run future, taking the `RunOutcome` and every byte of stdout it

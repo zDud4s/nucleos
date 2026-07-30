@@ -53,4 +53,20 @@ git -C "$repo" archive --format=tar "$sha" | ( cd "$dest" && tar -xf - )
 status=("${PIPESTATUS[@]}")
 [ "${status[0]}" -eq 0 ] && [ "${status[1]}" -eq 0 ] || die "extracting $sha failed"
 
+# LOAD-BEARING when CARGO_TARGET_DIR is shared, which it has to be here or every
+# tree builds its own ~15 GB copy.
+#
+# Cargo's artifact hash for this package does not include the workspace path, so
+# two trees at two paths write the same `nucleos_core-<hash>` and share one
+# fingerprint. Freshness then rests on mtimes -- and an archive carries the
+# COMMIT's dates, which are older than any build. Cargo calls such a tree fresh
+# and runs the binary built from the other one. (Measured: `scripts/gates.sh
+# core` on 58e4864~1 ran a binary built from 58e4864 and reported green, having
+# executed a test that tree does not contain.)
+#
+# score.sh survives this by touching the one file it grafts. A tree nobody
+# grafts into -- a base being compile-checked, a reference being scored as-is --
+# has no such file, so stamp the whole thing on the way out.
+find "$dest" -type f -exec touch {} + 2>/dev/null
+
 printf '%s\t%s\n' "$sha" "$dest"

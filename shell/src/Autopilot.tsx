@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  approveProposal, getBudget, getFeed, getProjects, getProposals,
+  approveProposal, cancelJob, getBudget, getFeed, getJob, getJobs, getProjects, getProposals,
   getScopedKills, getScoreboard, getShadowDecisions, rejectProposal,
   setProjectMode, setScopedKill, setVerdict,
   type AutopilotMode, type Budget, type ClassTally, type ConnectionState,
-  type FeedEntry, type ProjectSummary, type Proposal,
+  type FeedEntry, type Job, type JobDetail, type ProjectSummary, type Proposal,
   type ScopedKill, type ShadowDecision,
 } from "./api";
 import {
-  agreementRate, autopilotState, budgetStatusLabel, classifierVerdictLabel, formatUsd,
-  groupScoreboardByMode, killSwitchLabel, periodLabel, promotionBlock, promotionReadiness,
+  agreementRate, autopilotState, budgetStatusLabel, classifierVerdictLabel, feedKindLabel,
+  formatUsd, groupScoreboardByMode, jobIsLive, jobItemLabel, jobItemTone, jobProgress,
+  jobStageLabel, killSwitchLabel, periodLabel, promotionBlock, promotionReadiness,
   queueBlock, readinessCriterionLabel,
   readinessGap, relativeTime, REVIEW_ALLOW, REVIEW_BLOCK, scoreboardReadiness,
   SWAMPED_THRESHOLD, totalPending,
@@ -158,9 +159,131 @@ function FeedPanel({ feed, loading, selectedProject }: FeedPanelProps) {
       {feed === null ? !loading && <ErrorNote>Could not load activity from the daemon.</ErrorNote>
         : feed.length === 0 ? <Teach title="The record starts here.">Runs, proposals, verdicts and budget events will leave their paper trail here.</Teach>
         : feed.map((entry) => <article className="feed-item" key={entry.id}>
-            <div className="f-meta"><time dateTime={entry.created_at} title={entry.created_at}>{relativeTime(entry.created_at)}</time><span>{entry.kind}</span></div>
+            <div className="f-meta"><time dateTime={entry.created_at} title={entry.created_at}>{relativeTime(entry.created_at)}</time><span title={entry.kind}>{feedKindLabel(entry.kind)}</span></div>
             <p className="f-body"><b>{entry.project_id ?? "global"}</b> — {entry.summary}</p>
           </article>)}
+    </Panel>
+  );
+}
+
+interface JobsPanelProps {
+  jobs: Job[] | null;
+  loading: boolean;
+  selectedProject: string | null;
+  token: string;
+  refresh: () => Promise<void>;
+  isKill: boolean;
+}
+
+/**
+ * What one job is doing, and what its list looks like.
+ *
+ * The queue is fetched per job and only while it is open. A job's items are the one thing here
+ * that cannot be derived from the listing, and asking for every job's queue on a 3-second tick
+ * would multiply the poll by the number of jobs on screen to show rows nobody has opened.
+ */
+function JobRow({ job, token, refresh, isKill }: { job: Job; token: string; refresh: () => Promise<void>; isKill: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [detail, setDetail] = useState<JobDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const live = jobIsLive(job.status);
+
+  useEffect(() => {
+    if (!open) return;
+    let current = true;
+    void getJob(token, job.id).then((next) => { if (current) setDetail(next); });
+    // A live job's queue moves under the reader — an item goes from running to passed while they
+    // are looking at it — so an open row keeps up. A finished one never changes again, so polling
+    // it would be a request per tick for a row that has already said everything it has to say.
+    if (!live) return () => { current = false; };
+    const id = setInterval(() => {
+      void getJob(token, job.id).then((next) => { if (current) setDetail(next); });
+    }, 3000);
+    return () => { current = false; clearInterval(id); };
+  }, [job.id, live, open, token]);
+
+  async function cancel() {
+    setCancelling(true);
+    const result = await cancelJob(token, job.id);
+    if (result.ok) {
+      setError(null);
+      await refresh();
+    } else {
+      // 409 is not a failure to report as one: the job ended between the render and the click, and
+      // telling the user it "could not be cancelled" would send them looking for a fault.
+      setError(
+        result.status === 409
+          ? "That job had already finished — nothing to stop."
+          : result.fault === "unreachable"
+            ? "Could not reach the daemon, so the job was not stopped."
+            : "The daemon refused to stop this job.",
+      );
+    }
+    setCancelling(false);
+  }
+
+  const progress = detail === null ? null : jobProgress(detail.items);
+
+  return (
+    <article className="job" key={job.id}>
+      <div className="j-meta">
+        <span className="j-id">job {job.id}{job.rule_name !== null && <> · {job.rule_name}</>}</span>
+        <span className="j-proj">{job.project_id}</span>
+        <time dateTime={job.created_at} title={job.created_at}>{relativeTime(job.created_at)}</time>
+      </div>
+      <p className="j-stage">
+        {live ? <Badge tone={job.status === "waiting" ? "paused" : "pending"}>{job.status}</Badge>
+              : <Badge tone={job.status === "completed" ? "active" : "off"}>{job.status}</Badge>}
+        {" "}{jobStageLabel(job.status, job.wait_reason)}
+      </p>
+      <div className="j-act">
+        <Button size="sm" onClick={() => setOpen((current) => !current)}>
+          {open ? "Hide list" : "Show list"}
+        </Button>
+        {/* Only for a live job, and deliberately a different button from cancelling a run:
+            cancelling a run stops one node, and a job parked for the budget or waiting for the
+            slot has no node to stop. Without this its only ending is the four-hour ceiling. */}
+        {live && (
+          <ConfirmButton
+            variant="link"
+            size="sm"
+            confirmLabel="Stop the whole job?"
+            disabled={cancelling || isKill}
+            onConfirm={() => void cancel()}
+          >
+            Stop job
+          </ConfirmButton>
+        )}
+        {progress !== null && <span className="j-count">{progress.done}/{progress.total} done</span>}
+      </div>
+      {error !== null && <ErrorNote>{error}</ErrorNote>}
+      {open && (detail === null
+        ? <p className="j-note">Loading its list…</p>
+        : detail.items.length === 0
+          ? <Teach title="Nothing was on the list.">Its planner looked and found no work — a quiet, successful night, not a failure.</Teach>
+          : <>
+              <ol className="j-items">
+                {detail.items.map((item) => (
+                  <li className="j-item" key={item.ordinal}>
+                    <Badge tone={jobItemTone(item.status)}>{jobItemLabel(item)}</Badge>
+                    <span className="j-desc">{item.description}</span>
+                  </li>
+                ))}
+              </ol>
+              {detail.branch !== null && <p className="j-branch">Its work is on <code>{detail.branch}</code>.</p>}
+            </>)}
+    </article>
+  );
+}
+
+export function JobsPanel({ jobs, loading, selectedProject, token, refresh, isKill }: JobsPanelProps) {
+  return (
+    <Panel dim={isKill} title="Jobs" aside={selectedProject ?? "one trigger, several runs, one worktree"}>
+      {jobs === null ? !loading && <ErrorNote>Could not load jobs from the daemon.</ErrorNote>
+        : jobs.length === 0
+          ? <Teach title="No job has run yet.">A schedule rule with a <code>graph:</code> block turns one trigger into a sequence of runs over a shared worktree, so a night's work is not capped by one context window.</Teach>
+          : jobs.map((job) => <JobRow key={job.id} job={job} token={token} refresh={refresh} isKill={isKill} />)}
     </Panel>
   );
 }
@@ -346,6 +469,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
   const [scoreboard, setScoreboard] = useState<ClassTally[] | null>(null);
   const [shadowDecisions, setShadowDecisions] = useState<ShadowDecision[] | null>(null);
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
+  const [jobs, setJobs] = useState<Job[] | null>(null);
   const [budget, setBudget] = useState<Budget | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -369,11 +493,12 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
     inFlight.current += 1;
     if (!background) setLoading(true);
     try {
-      const [nextProjects, nextFeed, nextProposals, nextBudget, nextScopedKills] =
+      const [nextProjects, nextFeed, nextProposals, nextJobs, nextBudget, nextScopedKills] =
         await Promise.all([
           getProjects(token),
           getFeed(token, project ? { projectId: project } : { scope: "all" }),
           getProposals(token),
+          getJobs(token, project ?? undefined),
           getBudget(token),
           getScopedKills(token),
         ]);
@@ -392,6 +517,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
       setScoreboard(nextScoreboard);
       setShadowDecisions(nextShadowDecisions);
       setProposals(nextProposals);
+      setJobs(nextJobs);
       setBudget(nextBudget);
     } finally {
       inFlight.current -= 1;
@@ -417,6 +543,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
       setScoreboard(null);
       setShadowDecisions(null);
       setProposals(null);
+      setJobs(null);
       setBudget(null);
       setLoading(true);
       return;
@@ -493,6 +620,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
                 : projects?.map((project) => <ProjectCard key={project.project_id} project={project} scopedKills={scopedKills} token={token} refresh={refresh} selected={selectedProject === project.project_id} onSelect={() => setSelectedProject((current) => current === project.project_id ? null : project.project_id)} />)}
             </Panel>
             {selectedProject !== null && <div className="panel-scope"><strong>Viewing {selectedProject}</strong><Button size="sm" onClick={() => setSelectedProject(null)}>Show all</Button></div>}
+            <JobsPanel jobs={jobs} loading={loading} selectedProject={selectedProject} token={token} refresh={refresh} isKill={isKill} />
             {selectedProject !== null && <><ShadowReviewPanel projectId={selectedProject} decisions={shadowDecisions} loading={loading} token={token} refresh={refresh} /><ScoreboardPanel projectId={selectedProject} scoreboard={scoreboard} /></>}
             <ScopedKillPanel scopedKills={scopedKills} token={token} refresh={refresh} />
             <FeedPanel feed={feed} loading={loading} selectedProject={selectedProject} />

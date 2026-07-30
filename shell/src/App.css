@@ -788,11 +788,43 @@ details.scoreboard th {
   user-select: all;
 }
 
+/* ── Jobs ───────────────────────────────────────────────── */
+
+.job { display: grid; gap: var(--sp-1); padding: var(--sp-3) 0; }
+.job + .job { border-top: 1px solid var(--line); }
+.j-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--faint);
+}
+.j-meta .j-id { color: var(--text); }
+.j-stage { font-size: var(--fs-sm); color: var(--muted); }
+.j-act { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.j-count { margin-left: auto; font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
+.j-note { font-size: var(--fs-sm); color: var(--faint); }
+/* The queue reads as a list because it IS one: the items run in order, on one worktree, and item
+   i+1 builds on what i left behind. A grid of cards would lose the only thing that matters. */
+.j-items { display: grid; gap: var(--sp-1); margin: var(--sp-2) 0 0; padding: 0; list-style: none; }
+.j-item {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+.j-desc { font-size: var(--fs-sm); color: var(--muted); }
+.j-branch { margin-top: var(--sp-2); font-size: var(--fs-xs); color: var(--faint); }
+.j-branch code { font-family: var(--mono); color: var(--muted); }
+
 /* ── Responsivo ─────────────────────────────────────────── */
 
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
   .dense-row { grid-template-columns: 1fr; gap: var(--sp-2); }
+  /* The badge stops sharing a line with the description; a two-column grid at this width
+     squeezes the text into a column narrower than the words in it. */
+  .j-item { grid-template-columns: 1fr; gap: 2px; }
   .d-act { margin-top: var(--sp-1); }
   .command { gap: var(--sp-2); padding-inline: var(--sp-3); }
   .command .right { gap: var(--sp-2); }

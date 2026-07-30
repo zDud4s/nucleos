@@ -55,7 +55,54 @@ fn git() -> tokio::process::Command {
     command
 }
 
-pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo> {
+/// Who a worktree belongs to.
+///
+/// A run owns its own tree; a job owns one that outlives each of its nodes, so several runs in
+/// sequence can build on what the previous one left. Modelled as an enum rather than a `&str` so a
+/// caller cannot invent a third kind that the migration's CHECK constraint would then reject at
+/// runtime, in a write nobody is watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Run(i64),
+    Job(i64),
+}
+
+impl Owner {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Owner::Run(_) => "run",
+            Owner::Job(_) => "job",
+        }
+    }
+
+    pub fn id(self) -> i64 {
+        match self {
+            Owner::Run(id) | Owner::Job(id) => id,
+        }
+    }
+
+    /// The directory name for this owner's worktree.
+    ///
+    /// For a run this is byte-identical to what `create` produced before this type existed, which is
+    /// the point: no worktree already on disk becomes unrecognisable to `orphaned_worktrees`, which
+    /// would leave it uncollectable forever.
+    pub fn dir_name(self) -> String {
+        format!("{}-{}", self.kind(), self.id())
+    }
+
+    /// The run a feed row about this worktree should be attributed to, if any.
+    ///
+    /// A job-owned worktree has no single run to blame, and writing a job id into `feed.run_id`
+    /// would mislabel it as one — the ids come from different sequences and would collide silently.
+    pub fn feed_run_id(self) -> Option<i64> {
+        match self {
+            Owner::Run(id) => Some(id),
+            Owner::Job(_) => None,
+        }
+    }
+}
+
+pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInfo> {
     let root = worktree_root(project_root);
     if root.to_string_lossy().contains(' ') {
         return Err(io::Error::new(
@@ -78,8 +125,9 @@ pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo
         ));
     }
 
-    let branch = format!("nucleos/run-{run_id}");
-    let path = root.join(format!("run-{run_id}"));
+    let name = owner.dir_name();
+    let branch = format!("nucleos/{name}");
+    let path = root.join(&name);
     tokio::fs::create_dir_all(&root).await?;
 
     let output = git()
@@ -100,6 +148,82 @@ pub async fn create(project_root: &Path, run_id: i64) -> io::Result<WorktreeInfo
     }
 
     Ok(WorktreeInfo { path, branch })
+}
+
+/// Where a job's nodes hand work to each other, relative to the worktree they share.
+///
+/// Inside the worktree, not beside it. `classifier.rs` denies any write outside the run's cwd — the
+/// class is `outside-workspace`, it is the classifier's first rule, and it is a hard `deny` with no
+/// single-use grant to fall back on — and a node's cwd *is* the worktree. A sibling directory would
+/// make the plan node's only output unwritable, so every job would fail at its first node, always.
+pub const ARTIFACTS_DIR: &str = ".nucleos";
+
+/// Creates a job's artifacts directory and hides it from git, returning its absolute path.
+///
+/// The exclusion goes in `info/exclude`, not the project's `.gitignore`: that file belongs to the
+/// user and the entry would turn up in their diff.
+///
+/// Excluded rather than merely untracked, because `preserve_uncommitted` runs `git add -A`. Left
+/// visible, the handoff files would ride into the preservation commit — and count against
+/// `DEFAULT_PRESERVATION_BYTE_CEILING`, where going over does not truncate the commit, it blocks
+/// removal of the worktree. A node that commits its own work with `git add -A` would sweep them up
+/// the same way.
+///
+/// It lands in the repository's **common** git directory, which is the one place git reads
+/// `info/exclude` from. A linked worktree has a private git directory of its own, and writing there
+/// looks right and excludes nothing — `info/` is on git's common list, so the per-worktree copy is
+/// never consulted. The design called for "the worktree's `info/exclude`"; this is where that file
+/// actually is. The cost is that the entry is visible to every worktree of the repository including
+/// the user's own checkout, and it is accepted: `.nucleos` is this daemon's own directory name, the
+/// file is per-clone and unversioned, and the alternative is a node committing handoff files onto
+/// the user's branch.
+///
+/// The entry is anchored (`/.nucleos/`) so a directory of the same name deeper in the tree keeps
+/// showing up in the user's status.
+pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
+    let artifacts = worktree.join(ARTIFACTS_DIR);
+    tokio::fs::create_dir_all(&artifacts).await?;
+
+    // Asked of git rather than assumed: in a linked worktree `.git` is a file, not a directory, so
+    // `<worktree>/.git/info/exclude` cannot be written to at all.
+    let output = git()
+        .arg("-C")
+        .arg(worktree)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "could not resolve the repository's common git directory: {stderr}"
+        )));
+    }
+    // Older git answers relatively, and relative to the `-C` directory above.
+    let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let git_dir = if reported.is_absolute() {
+        reported
+    } else {
+        worktree.join(reported)
+    };
+
+    let info = git_dir.join("info");
+    tokio::fs::create_dir_all(&info).await?;
+    let exclude = info.join("exclude");
+    let entry = format!("/{ARTIFACTS_DIR}/");
+    let mut contents = tokio::fs::read_to_string(&exclude)
+        .await
+        .unwrap_or_default();
+    if !contents.lines().any(|line| line.trim() == entry) {
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(&entry);
+        contents.push('\n');
+        tokio::fs::write(&exclude, contents).await?;
+    }
+
+    Ok(artifacts)
 }
 
 pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
@@ -558,11 +682,27 @@ where
 
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq)]
 pub struct WorktreeRow {
-    pub run_id: i64,
+    pub owner_kind: String,
+    pub owner_id: i64,
     pub project_id: String,
     pub project_root: String,
     pub path: String,
     pub branch: String,
+}
+
+impl WorktreeRow {
+    /// The typed owner behind the two stored columns.
+    ///
+    /// `None` for a kind the CHECK constraint should have made impossible. Callers treat that as
+    /// "not mine to touch" rather than guessing — the operations downstream of this delete
+    /// directories, so an unrecognised row is left alone instead of being collected on a guess.
+    pub fn owner(&self) -> Option<Owner> {
+        match self.owner_kind.as_str() {
+            "run" => Some(Owner::Run(self.owner_id)),
+            "job" => Some(Owner::Job(self.owner_id)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -574,7 +714,7 @@ pub enum ReleaseOutcome {
 
 pub async fn record(
     pool: &SqlitePool,
-    run_id: i64,
+    owner: Owner,
     project_id: &str,
     project_root: &str,
     path: &str,
@@ -582,10 +722,11 @@ pub async fn record(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO worktrees
-         (run_id, project_id, project_root, path, branch, created_at, removed_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL)",
+         (owner_kind, owner_id, project_id, project_root, path, branch, created_at, removed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
     )
-    .bind(run_id)
+    .bind(owner.kind())
+    .bind(owner.id())
     .bind(project_id)
     .bind(project_root)
     .bind(path)
@@ -596,10 +737,11 @@ pub async fn record(
     Ok(())
 }
 
-pub async fn mark_removed(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
-    sqlx::query("UPDATE worktrees SET removed_at = ? WHERE run_id = ?")
+pub async fn mark_removed(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
+    sqlx::query("UPDATE worktrees SET removed_at = ? WHERE owner_kind = ? AND owner_id = ?")
         .bind(Utc::now().to_rfc3339())
-        .bind(run_id)
+        .bind(owner.kind())
+        .bind(owner.id())
         .execute(pool)
         .await?;
     Ok(())
@@ -635,10 +777,12 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
         });
     }
 
+    // Release stays a *run* concept: it un-pins a run paused for approval, and a run still owns its
+    // own worktree. The `owner_kind` filter keeps it from ever matching a job whose id collides.
     let worktree: Option<WorktreeRow> = sqlx::query_as(
-        "SELECT run_id, project_id, project_root, path, branch
+        "SELECT owner_kind, owner_id, project_id, project_root, path, branch
          FROM worktrees
-         WHERE run_id = ? AND removed_at IS NULL",
+         WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
     )
     .bind(run_id)
     .fetch_optional(pool)
@@ -666,7 +810,7 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
                 "failed to remove released worktree; continuing with discard"
             );
         }
-        mark_removed(pool, run_id).await?;
+        mark_removed(pool, Owner::Run(run_id)).await?;
     }
 
     if let Some(worktree) = worktree {
@@ -728,10 +872,39 @@ async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted:
         Some(&worktree.project_id),
         "worktree_branch_kept",
         &summary,
-        Some(worktree.run_id),
+        worktree.owner().and_then(Owner::feed_run_id),
     )
     .await;
 }
+
+// Two arms rather than one join, because a worktree's owner decides which table says whether it is
+// finished. `owner_kind` is load-bearing in both: the joins match on the bare id, and run ids and
+// job ids come from different sequences, so without the filters a job whose id happened to equal a
+// terminal run's would have its worktree collected mid-use. There is a test on exactly that
+// (`a_job_worktree_is_not_collected_by_a_run_of_the_same_id`).
+//
+// The job arm lists terminal statuses explicitly rather than excluding live ones. A status added
+// later then defaults to *not collected* — a stale directory — instead of to deleting the worktree
+// of a job still using it. That is the safe direction and still a leak, so
+// `every_ending_a_job_can_have_is_an_ending_the_gc_collects` holds this list against `job.rs`.
+pub(crate) const GC_CANDIDATES_SQL: &str =
+    "SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
+         FROM worktrees w
+         JOIN runs r ON r.id = w.owner_id
+         WHERE w.owner_kind = 'run'
+           AND w.removed_at IS NULL
+           AND r.status IN ('completed','failed','cancelled','timed_out','interrupted')
+           AND COALESCE(r.completed_at, w.created_at) <= ?
+         UNION ALL
+         SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
+         FROM worktrees w
+         JOIN jobs j ON j.id = w.owner_id
+         WHERE w.owner_kind = 'job'
+           AND w.removed_at IS NULL
+           AND j.status IN ('completed','failed','gate_failed','gate_errored','expired','stopped',
+                            'cancelled','interrupted')
+           AND COALESCE(j.completed_at, w.created_at) <= ?
+         ORDER BY 1, 2";
 
 pub async fn gc_candidates(
     pool: &SqlitePool,
@@ -739,18 +912,11 @@ pub async fn gc_candidates(
     retention: chrono::Duration,
 ) -> sqlx::Result<Vec<WorktreeRow>> {
     let cutoff = (now - retention).to_rfc3339();
-    sqlx::query_as(
-        "SELECT w.run_id, w.project_id, w.project_root, w.path, w.branch
-         FROM worktrees w
-         JOIN runs r ON r.id = w.run_id
-         WHERE w.removed_at IS NULL
-           AND r.status IN ('completed','failed','cancelled','timed_out','interrupted')
-           AND COALESCE(r.completed_at, w.created_at) <= ?
-         ORDER BY w.run_id",
-    )
-    .bind(cutoff)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as(GC_CANDIDATES_SQL)
+        .bind(&cutoff)
+        .bind(&cutoff)
+        .fetch_all(pool)
+        .await
 }
 
 fn retention() -> chrono::Duration {
@@ -786,6 +952,20 @@ pub(crate) async fn gc_pass(
     }
 
     for worktree in candidates {
+        // A row whose kind this build does not recognise is not ours to delete. `gc_candidates`
+        // filters to `owner_kind = 'run'`, so this cannot fire today; it exists so that a future
+        // kind added to the CHECK constraint but not to `Owner` skips collection rather than
+        // falling through to a branch that removes directories.
+        let Some(owner) = worktree.owner() else {
+            tracing::warn!(
+                owner_kind = %worktree.owner_kind,
+                owner_id = worktree.owner_id,
+                "skipping a worktree row whose owner kind is unrecognised"
+            );
+            continue;
+        };
+        let feed_run_id = owner.feed_run_id();
+
         match remove(
             Path::new(&worktree.project_root),
             Path::new(&worktree.path),
@@ -794,9 +974,9 @@ pub(crate) async fn gc_pass(
         .await
         {
             Ok(()) => {
-                if let Err(error) = mark_removed(pool, worktree.run_id).await {
+                if let Err(error) = mark_removed(pool, owner).await {
                     tracing::warn!(
-                        run_id = worktree.run_id,
+                        owner_id = owner.id(),
                         %error,
                         "failed to mark collected worktree as removed"
                     );
@@ -814,7 +994,7 @@ pub(crate) async fn gc_pass(
                     Some(&worktree.project_id),
                     "worktree_removed",
                     &summary,
-                    Some(worktree.run_id),
+                    feed_run_id,
                 )
                 .await;
                 feed_branch_outcome(pool, &worktree, branch_deleted).await;
@@ -825,15 +1005,15 @@ pub(crate) async fn gc_pass(
             // forgotten, so without this the row stayed a candidate: same backoff, same failure,
             // another feed row, every half hour forever.
             Err(_) if !Path::new(&worktree.path).exists() => {
-                if let Err(error) = mark_removed(pool, worktree.run_id).await {
+                if let Err(error) = mark_removed(pool, owner).await {
                     tracing::warn!(
-                        run_id = worktree.run_id,
+                        owner_id = owner.id(),
                         %error,
                         "failed to retire a worktree row whose directory had already gone"
                     );
                 }
                 tracing::info!(
-                    run_id = worktree.run_id,
+                    owner_id = owner.id(),
                     path = %worktree.path,
                     "worktree directory was already gone; retiring its row"
                 );
@@ -845,7 +1025,7 @@ pub(crate) async fn gc_pass(
                     Some(&worktree.project_id),
                     "worktree_gc_failed",
                     &summary,
-                    Some(worktree.run_id),
+                    feed_run_id,
                 )
                 .await;
             }
@@ -866,14 +1046,32 @@ pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
 /// away leaves a directory the GC now believes is gone. Both leak forever without this.
 ///
 /// Fail-safe: a directory whose age cannot be determined is left alone, and anything not named
-/// `run-<id>` is not ours to touch.
+/// `run-<id>` or `job-<id>` is not ours to touch.
+/// The owner a worktree directory name denotes, or `None` when the name is not ours to touch.
+///
+/// Fail-safe by construction: an unparseable name yields `None` and the sweeper leaves the directory
+/// alone. Nothing here may split on `.` — the operations downstream delete directories, and a looser
+/// parse would let a sibling like `job-5.artifacts` be read as job 5 and taken with it.
+fn owner_from_dir_name(name: &str) -> Option<Owner> {
+    if let Some(rest) = name.strip_prefix("run-") {
+        return rest.parse::<i64>().ok().map(Owner::Run);
+    }
+    if let Some(rest) = name.strip_prefix("job-") {
+        return rest.parse::<i64>().ok().map(Owner::Job);
+    }
+    None
+}
+
 pub async fn orphaned_worktrees(
     pool: &SqlitePool,
     project_root: &Path,
     min_age: Duration,
 ) -> sqlx::Result<Vec<PathBuf>> {
-    let live: std::collections::HashSet<i64> =
-        sqlx::query_scalar("SELECT run_id FROM worktrees WHERE removed_at IS NULL")
+    // Keyed by the full owner pair, not by id alone: run ids and job ids come from different
+    // sequences, so a live `run-7` row would otherwise account for a `job-7` directory and leave it
+    // uncollectable forever.
+    let live: std::collections::HashSet<(String, i64)> =
+        sqlx::query_as("SELECT owner_kind, owner_id FROM worktrees WHERE removed_at IS NULL")
             .fetch_all(pool)
             .await?
             .into_iter()
@@ -887,14 +1085,10 @@ pub async fn orphaned_worktrees(
     let mut orphans = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let file_name = entry.file_name();
-        let Some(run_id) = file_name
-            .to_string_lossy()
-            .strip_prefix("run-")
-            .and_then(|id| id.parse::<i64>().ok())
-        else {
+        let Some(owner) = owner_from_dir_name(&file_name.to_string_lossy()) else {
             continue;
         };
-        if live.contains(&run_id) {
+        if live.contains(&(owner.kind().to_owned(), owner.id())) {
             continue;
         }
 
@@ -1101,19 +1295,27 @@ mod tests {
     }
 
     async fn set_worktree_created_at(pool: &sqlx::SqlitePool, run_id: i64, created_at: &str) {
-        sqlx::query("UPDATE worktrees SET created_at = ? WHERE run_id = ?")
+        set_worktree_created_at_for(pool, Owner::Run(run_id), created_at).await;
+    }
+
+    async fn set_worktree_created_at_for(pool: &sqlx::SqlitePool, owner: Owner, created_at: &str) {
+        sqlx::query("UPDATE worktrees SET created_at = ? WHERE owner_kind = ? AND owner_id = ?")
             .bind(created_at)
-            .bind(run_id)
+            .bind(owner.kind())
+            .bind(owner.id())
             .execute(pool)
             .await
             .unwrap();
     }
 
+    /// Keeps its `run_id: i64` signature deliberately: every caller is exercising a *run's*
+    /// worktree, and widening it to `Owner` would churn ten call sites without testing anything new.
     async fn create_and_record(pool: &sqlx::SqlitePool, repo: &Path, run_id: i64) -> WorktreeInfo {
-        let info = create(repo, run_id).await.expect("create worktree");
+        let owner = Owner::Run(run_id);
+        let info = create(repo, owner).await.expect("create worktree");
         record(
             pool,
-            run_id,
+            owner,
             "project-a",
             repo.to_str().expect("repository path should be UTF-8"),
             info.path.to_str().expect("worktree path should be UTF-8"),
@@ -1317,7 +1519,9 @@ mod tests {
             ],
         ));
 
-        create(repo.path(), 4242).await.expect("create worktree");
+        create(repo.path(), Owner::Run(4242))
+            .await
+            .expect("create worktree");
 
         assert!(
             !canary.exists(),
@@ -1337,7 +1541,9 @@ mod tests {
             &[OsStr::new("status"), OsStr::new("--porcelain")],
         );
 
-        let info = create(repo.path(), 7).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(7))
+            .await
+            .expect("create worktree");
         assert!(info.path.is_dir());
         assert_eq!(info.branch, "nucleos/run-7");
         let branch_listing = git_stdout(
@@ -1386,7 +1592,7 @@ mod tests {
             .expect("resolve current directory")
             .join("root with a space");
         let _env = WorktreeRootEnv::set(Some(&spaced_root));
-        let error = match create(repo.path(), 8).await {
+        let error = match create(repo.path(), Owner::Run(8)).await {
             Ok(_) => panic!("spaced root must be rejected"),
             Err(error) => error,
         };
@@ -1400,7 +1606,7 @@ mod tests {
         let _lock = env_lock();
         let repo = init_repo();
         let _env = WorktreeRootEnv::set(Some(Path::new("relative-worktree-root")));
-        let error = match create(repo.path(), 9).await {
+        let error = match create(repo.path(), Owner::Run(9)).await {
             Ok(_) => panic!("relative root must be rejected"),
             Err(error) => error,
         };
@@ -1413,7 +1619,7 @@ mod tests {
         let not_repo = tempfile::tempdir().expect("create non-repo tempdir");
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        assert!(create(not_repo.path(), 1).await.is_err());
+        assert!(create(not_repo.path(), Owner::Run(1)).await.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1422,7 +1628,9 @@ mod tests {
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), 101).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(101))
+            .await
+            .expect("create worktree");
         let commits_before = commit_count(repo.path(), &info.branch);
 
         std::fs::write(info.path.join("seed.txt"), "modified\n").expect("modify tracked file");
@@ -1494,7 +1702,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let orphan = create(repo.path(), 102).await.expect("create orphan");
+        let orphan = create(repo.path(), Owner::Run(102))
+            .await
+            .expect("create orphan");
         let commits_before = commit_count(repo.path(), &orphan.branch);
         std::fs::write(orphan.path.join("crash-recovery.txt"), "survived startup\n")
             .expect("write orphaned work");
@@ -1526,7 +1736,9 @@ mod tests {
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), 103).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(103))
+            .await
+            .expect("create worktree");
         let commits_before = commit_count(repo.path(), &info.branch);
 
         remove(repo.path(), &info.path, &[])
@@ -1556,7 +1768,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let info = create(repo.path(), 104).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(104))
+            .await
+            .expect("create worktree");
         let commits_before = commit_count(repo.path(), &info.branch);
         std::fs::write(info.path.join("failure.txt"), "must survive\n")
             .expect("write uncommitted work");
@@ -1657,6 +1871,86 @@ mod tests {
         pool.close().await;
     }
 
+    /// The handoff between a job's nodes lives in the worktree, which is the only place the
+    /// classifier lets a node write — and `preserve_uncommitted` runs `git add -A`, so left visible
+    /// it would ride into the preservation commit and count against the byte ceiling, where going
+    /// over blocks removal of the worktree rather than trimming the commit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_jobs_handoff_files_stay_out_of_the_preservation_commit() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(41))
+            .await
+            .expect("create the job's worktree");
+
+        let artifacts = prepare_artifacts(&info.path)
+            .await
+            .expect("prepare the job's artifacts directory");
+        assert!(artifacts.is_dir());
+        std::fs::write(artifacts.join("plan.json"), r#"{"items":[]}"#).expect("write a plan");
+        std::fs::write(info.path.join("seed.txt"), "an item's work\n")
+            .expect("modify tracked file");
+
+        assert!(
+            preserve_uncommitted(&info.path, 1_000_000)
+                .await
+                .expect("preserve the item's work"),
+            "the tracked change alone should still produce a commit"
+        );
+
+        let handoff_object = format!("{}:{ARTIFACTS_DIR}/plan.json", info.branch);
+        assert!(
+            !git_ok(
+                repo.path(),
+                &[
+                    OsStr::new("cat-file"),
+                    OsStr::new("-e"),
+                    OsStr::new(handoff_object.as_str()),
+                ],
+            ),
+            "the handoff must not enter the preservation commit"
+        );
+        // Still on disk: the next node reads it. Excluded means invisible to git, not deleted.
+        assert!(artifacts.join("plan.json").exists());
+        assert_eq!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            ),
+            "",
+            "an excluded handoff leaves the worktree looking clean"
+        );
+    }
+
+    /// Called once per job today, but a resumed job would call it again on a tree that already has
+    /// the entry. Appending it a second time is harmless to git and a lie to anyone reading the
+    /// file, and the same loop that produced two would produce two hundred.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparing_the_handoff_twice_writes_one_exclusion() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(42))
+            .await
+            .expect("create the job's worktree");
+
+        prepare_artifacts(&info.path).await.expect("first call");
+        prepare_artifacts(&info.path).await.expect("second call");
+
+        // Read from the main repository's `.git`, deliberately: that is the common directory, and
+        // the only `info/exclude` git ever reads. A per-worktree copy would be inert.
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude"))
+            .expect("read the repository's exclude file");
+        let entry = format!("/{ARTIFACTS_DIR}/");
+        assert_eq!(
+            exclude.lines().filter(|line| line.trim() == entry).count(),
+            1
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_skips_ignored_paths_and_respects_the_ceiling() {
         let _lock = env_lock();
@@ -1674,7 +1968,9 @@ mod tests {
         ));
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), 105).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(105))
+            .await
+            .expect("create worktree");
         let ceiling = 64_u64;
         let commits_before = commit_count(repo.path(), &info.branch);
 
@@ -1798,7 +2094,7 @@ mod tests {
         let run_id = insert_run(&pool, "completed", None, "2026-07-09T00:00:00+00:00").await;
         record(
             &pool,
-            run_id,
+            Owner::Run(run_id),
             "project-a",
             "/project/a",
             "/worktrees/run-1",
@@ -1819,7 +2115,8 @@ mod tests {
         assert_eq!(
             candidates,
             vec![WorktreeRow {
-                run_id,
+                owner_kind: "run".to_owned(),
+                owner_id: run_id,
                 project_id: "project-a".to_owned(),
                 project_root: "/project/a".to_owned(),
                 path: "/worktrees/run-1".to_owned(),
@@ -1840,7 +2137,7 @@ mod tests {
         .await;
         record(
             &pool,
-            run_id,
+            Owner::Run(run_id),
             "project-a",
             "/project/a",
             "/worktrees/run-2",
@@ -1872,7 +2169,7 @@ mod tests {
         .await;
         record(
             &pool,
-            run_id,
+            Owner::Run(run_id),
             "project-a",
             "/project/a",
             "/worktrees/run-3",
@@ -1905,7 +2202,7 @@ mod tests {
         .await;
         record(
             &pool,
-            run_id,
+            Owner::Run(run_id),
             "project-a",
             "/project/a",
             "/worktrees/run-4",
@@ -1913,7 +2210,7 @@ mod tests {
         )
         .await
         .unwrap();
-        mark_removed(&pool, run_id).await.unwrap();
+        mark_removed(&pool, Owner::Run(run_id)).await.unwrap();
 
         let candidates = gc_candidates(
             &pool,
@@ -1932,7 +2229,7 @@ mod tests {
         let run_id = insert_run(&pool, "running", None, "2026-07-09T00:00:00+00:00").await;
         record(
             &pool,
-            run_id,
+            Owner::Run(run_id),
             "project-a",
             "/project/a",
             "/worktrees/run-5",
@@ -1965,7 +2262,7 @@ mod tests {
         .await;
         record(
             &pool,
-            run_id,
+            Owner::Run(run_id),
             "project-a",
             "/project/a",
             "/worktrees/run-6",
@@ -1983,7 +2280,7 @@ mod tests {
             1
         );
 
-        mark_removed(&pool, run_id).await.unwrap();
+        mark_removed(&pool, Owner::Run(run_id)).await.unwrap();
 
         assert!(
             gc_candidates(&pool, now, chrono::Duration::hours(72))
@@ -1991,6 +2288,165 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_and_a_run_can_each_own_a_worktree_with_the_same_id() {
+        let pool = test_pool().await;
+
+        record(
+            &pool,
+            Owner::Run(1),
+            "project-a",
+            "/project/a",
+            "/worktrees/run-1",
+            "nucleos/run-1",
+        )
+        .await
+        .expect("record run-owned worktree");
+        record(
+            &pool,
+            Owner::Job(1),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-1",
+            "nucleos/job-1",
+        )
+        .await
+        .expect("record job-owned worktree");
+
+        // Same numeric id, different kind. Keying on `owner_id` alone would make the second insert a
+        // constraint violation and the `expect` above would panic, so this count tests the composite
+        // key rather than restating it.
+        let live: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worktrees WHERE removed_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("count live worktrees");
+        assert_eq!(live, 2);
+    }
+
+    #[tokio::test]
+    async fn a_job_worktree_is_not_collected_by_a_run_of_the_same_id() {
+        let pool = test_pool().await;
+        // A terminal run, old enough to be collectable, whose id the job then reuses. Run ids and
+        // job ids come from different sequences, so this collision is ordinary, not contrived — and
+        // the GC joins on the bare id, so only `owner_kind = 'run'` keeps the two apart.
+        let run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            Owner::Job(run_id),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-1",
+            "nucleos/job-1",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at_for(&pool, Owner::Job(run_id), "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            candidates.is_empty(),
+            "a job's worktree must not be collected because a run happens to share its id"
+        );
+    }
+
+    async fn insert_job(
+        pool: &sqlx::SqlitePool,
+        status: &str,
+        completed_at: Option<&str>,
+        created_at: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at, completed_at)
+             VALUES ('project-a', '/project/a', ?, 5, ?, ?)",
+        )
+        .bind(status)
+        .bind(created_at)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn gc_collects_a_finished_jobs_worktree() {
+        let pool = test_pool().await;
+        let job_id = insert_job(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        record(
+            &pool,
+            Owner::Job(job_id),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-9",
+            "nucleos/job-9",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at_for(&pool, Owner::Job(job_id), "2026-07-09T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2026-07-19T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].owner_kind, "job");
+        assert_eq!(candidates[0].owner_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn gc_never_collects_a_live_jobs_worktree_however_old() {
+        let pool = test_pool().await;
+        // `waiting` is the sharpest case: an hourly budget limit can hold a job there for a long
+        // time, so age alone must never make its worktree collectable. The job is coming back to
+        // it, and deleting it would destroy work a gate had already measured as good.
+        let job_id = insert_job(&pool, "waiting", None, "2020-01-01T00:00:00+00:00").await;
+        record(
+            &pool,
+            Owner::Job(job_id),
+            "project-a",
+            "/project/a",
+            "/worktrees/job-10",
+            "nucleos/job-10",
+        )
+        .await
+        .unwrap();
+        set_worktree_created_at_for(&pool, Owner::Job(job_id), "2020-01-01T00:00:00+00:00").await;
+
+        let candidates = gc_candidates(
+            &pool,
+            timestamp("2030-01-01T00:00:00+00:00"),
+            chrono::Duration::hours(72),
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates.is_empty(), "a live job keeps its worktree");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2013,12 +2469,13 @@ mod tests {
         gc_pass(&pool, now, chrono::Duration::hours(72), &[]).await;
 
         assert!(!info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_some());
         assert!(
             gc_candidates(&pool, now, chrono::Duration::hours(72))
@@ -2061,12 +2518,13 @@ mod tests {
         .await;
 
         assert!(info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_none());
     }
 
@@ -2189,12 +2647,13 @@ mod tests {
         )
         .await;
 
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(
             removed_at.is_some(),
             "a vanished directory must retire its row, not be retried forever"
@@ -2244,12 +2703,13 @@ mod tests {
         );
 
         assert!(!info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_some());
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
@@ -2307,12 +2767,13 @@ mod tests {
         );
 
         assert!(info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_none());
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
@@ -2417,7 +2878,9 @@ mod tests {
         let repo = init_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), 9).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(9))
+            .await
+            .expect("create worktree");
         let handle = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2469,11 +2932,13 @@ mod tests {
         let _env = WorktreeRootEnv::set(Some(root.path()));
 
         // A crash between `git worktree add` and the row INSERT: on disk, unknown to the database.
-        let unrecorded = create(repo.path(), 41).await.expect("create worktree");
+        let unrecorded = create(repo.path(), Owner::Run(41))
+            .await
+            .expect("create worktree");
         // A removal that set `removed_at` but whose files never went away.
         let leaked_run = insert_run(&pool, "completed", None, "2026-07-27T00:00:00+00:00").await;
         let leaked = create_and_record(&pool, repo.path(), leaked_run).await;
-        mark_removed(&pool, leaked_run).await.unwrap();
+        mark_removed(&pool, Owner::Run(leaked_run)).await.unwrap();
         // Not ours, whatever its age.
         let stranger = root.path().join("not-a-run");
         std::fs::create_dir_all(&stranger).expect("create unrelated directory");
@@ -2488,13 +2953,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn an_unaccounted_job_directory_is_sweepable() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        // Nothing creates a `job-*` worktree yet. The sweeper has to recognise the name *before*
+        // the first one exists: a directory it does not recognise is one it never collects, so a
+        // name taught later leaves every job worktree made in the meantime leaking forever, with
+        // nothing to report it.
+        let orphan = create(repo.path(), Owner::Job(3))
+            .await
+            .expect("create job worktree");
+
+        let orphans = orphaned_worktrees(&pool, repo.path(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(orphans, vec![orphan.path.clone()]);
+    }
+
+    #[test]
+    fn an_artifacts_directory_is_not_a_worktree() {
+        // The sweeper deletes what this returns, so a looser parse — splitting on `.`, say — would
+        // read a sibling artifacts directory as its job and take it too.
+        assert_eq!(owner_from_dir_name("job-5.artifacts"), None);
+        assert_eq!(owner_from_dir_name("job-5"), Some(Owner::Job(5)));
+        assert_eq!(owner_from_dir_name("run-5"), Some(Owner::Run(5)));
+        assert_eq!(owner_from_dir_name("not-a-run"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_leaves_a_young_directory_alone() {
         let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        create(repo.path(), 42).await.expect("create worktree");
+        create(repo.path(), Owner::Run(42))
+            .await
+            .expect("create worktree");
 
         // Freshly made and unrecorded looks exactly like a run mid-way through starting up, so the
         // age gate is what stops the sweep from deleting a worktree out from under a live run.
@@ -2518,7 +3018,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let orphan = create(repo.path(), 43).await.expect("create worktree");
+        let orphan = create(repo.path(), Owner::Run(43))
+            .await
+            .expect("create worktree");
 
         let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
             .await
@@ -2598,7 +3100,9 @@ mod tests {
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), 78).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(78))
+            .await
+            .expect("create worktree");
         std::fs::write(info.path.join("work.txt"), "real work\n").expect("write work file");
         let before = commit_count(repo.path(), &info.branch);
 
@@ -2756,7 +3260,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let orphan = create(repo.path(), 44).await.expect("create worktree");
+        let orphan = create(repo.path(), Owner::Run(44))
+            .await
+            .expect("create worktree");
         assert!(git_ok(
             repo.path(),
             &[
@@ -2790,7 +3296,9 @@ mod tests {
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), 46).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(46))
+            .await
+            .expect("create worktree");
         assert_eq!(
             registration(repo.path(), &info.path).await.unwrap(),
             Registration::Present

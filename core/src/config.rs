@@ -269,6 +269,46 @@ pub struct ScheduleRule {
     /// summer, and the daily task that quietly starts an hour late for half the year is a worse
     /// failure than one that never runs, because nothing about it looks broken.
     pub timezone: Option<String>,
+    /// Absent means the rule keeps today's behaviour: one run, one gate. Opt-in per rule.
+    pub graph: Option<GraphConfig>,
+}
+
+/// The ceiling the daemon puts on a rule's fan-out, whatever the file asks for.
+///
+/// `.ai/` is gitignored and travels with nobody, so `autopilot.yaml` is per-developer configuration
+/// that no review ever sees. A number in it therefore cannot be the only thing standing between one
+/// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
+pub const MAX_ITEMS_CEILING: usize = 5;
+
+fn default_max_items() -> usize {
+    MAX_ITEMS_CEILING
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a
+/// single run capped by one context window.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GraphConfig {
+    #[serde(default = "default_max_items")]
+    max_items: usize,
+    #[serde(default = "default_true")]
+    pub gate_after_each_item: bool,
+    #[serde(default = "default_true")]
+    pub review: bool,
+}
+
+impl GraphConfig {
+    /// The fan-out actually allowed, after the daemon's own ceiling.
+    ///
+    /// Private field plus this accessor on purpose: a caller that read `max_items` straight off the
+    /// struct would silently honour whatever the file said, and the ceiling would be advisory.
+    pub fn max_items(&self) -> usize {
+        self.max_items.min(MAX_ITEMS_CEILING)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -311,6 +351,64 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rules_from(yaml: &str) -> std::io::Result<AutopilotRules> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), yaml).unwrap();
+        load_schedule_rules(dir.path())
+    }
+
+    #[test]
+    fn a_rule_without_a_graph_block_keeps_todays_behaviour() {
+        let rules =
+            rules_from("schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n")
+                .expect("a rule with no graph block still parses");
+        assert_eq!(rules.schedules[0].graph, None);
+    }
+
+    #[test]
+    fn a_graph_block_defaults_to_gating_each_item_and_reviewing() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph: {}\n",
+        )
+        .expect("an empty graph block is valid and fully defaulted");
+        let graph = rules.schedules[0].graph.as_ref().expect("graph present");
+        assert_eq!(graph.max_items(), MAX_ITEMS_CEILING);
+        assert!(graph.gate_after_each_item);
+        assert!(graph.review);
+    }
+
+    #[test]
+    fn the_daemon_ceiling_wins_over_the_file() {
+        // The file is per-developer and gitignored, so nobody reviews this number. It may lower the
+        // fan-out; it may not raise it past what the daemon is willing to run in one trigger.
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_items: 500\n",
+        )
+        .expect("an oversized max_items parses");
+        assert_eq!(rules.schedules[0].graph.as_ref().unwrap().max_items(), 5);
+    }
+
+    #[test]
+    fn a_lower_max_items_is_honoured() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_items: 2\n",
+        )
+        .expect("a smaller max_items parses");
+        assert_eq!(rules.schedules[0].graph.as_ref().unwrap().max_items(), 2);
+    }
+
+    #[test]
+    fn a_misspelt_graph_key_is_malformed_rather_than_ignored() {
+        // Same fail-closed contract the rest of this module keeps: a typo that parsed cleanly would
+        // silently drop the setting, and the rule would run a shape nobody asked for.
+        let error = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_item: 2\n",
+        )
+        .expect_err("an unknown key inside graph is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     fn email_config_from(yaml: &str) -> EmailConfig {
         let dir = tempfile::tempdir().unwrap();
