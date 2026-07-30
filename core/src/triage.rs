@@ -369,10 +369,14 @@ pub struct LoopState {
 }
 
 /// Messages waiting with no batch holding them.
+///
+/// Mail the user wrote is a source of facts about a correspondent, not something to be judged.
+/// Sending it to the model would spend a run only to learn that the user's own message is not
+/// urgent, while also putting their own subject lines in the prompt.
 async fn pending_rows(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<PendingRow>> {
     let raw: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT id, ingested_at, infra_failures FROM emails
-          WHERE triage_class IS NULL AND triage_run_id IS NULL",
+          WHERE triage_class IS NULL AND triage_run_id IS NULL AND direction = 'inbound'",
     )
     .fetch_all(pool)
     .await?;
@@ -740,28 +744,56 @@ async fn apply_verdicts(
 ) -> sqlx::Result<()> {
     let now_str = now.to_rfc3339();
     for verdict in verdicts {
+        let from_addr: String = sqlx::query_scalar("SELECT from_addr FROM emails WHERE id = ?")
+            .bind(verdict.id)
+            .fetch_one(pool)
+            .await?;
+        let profile = crate::contacts::profile_for(pool, &from_addr).await?;
+        let override_verdict: Option<String> = sqlx::query_scalar(
+            "SELECT overrides.verdict
+               FROM contact_overrides AS overrides
+               JOIN contact_addresses AS addresses
+                 ON addresses.contact_id = overrides.contact_id
+              WHERE addresses.address = ?",
+        )
+        .bind(crate::contacts::normalize_address(&from_addr))
+        .fetch_optional(pool)
+        .await?;
+        let triage_class = crate::priority::adjust(
+            &verdict.class,
+            profile.as_ref(),
+            override_verdict.as_deref(),
+        );
+
+        // A stored class alone cannot be explained; calibration must compare the model's answer
+        // with the rule-adjusted class to ask whether the derived rule was right.
         // The body goes only in the steady state; the default keeps it for the calibration week.
         if retain_bodies_days == 0 {
             sqlx::query(
                 "UPDATE emails SET triage_class = ?, triage_summary = ?, triaged_at = ?,
+                                   model_class = ?, priority_rule = ?,
                                    triage_run_id = NULL, body_text = NULL
                   WHERE id = ?",
             )
-            .bind(&verdict.class)
+            .bind(triage_class.class)
             .bind(&verdict.summary)
             .bind(&now_str)
+            .bind(&verdict.class)
+            .bind(triage_class.rule)
             .bind(verdict.id)
             .execute(pool)
             .await?;
         } else {
             sqlx::query(
                 "UPDATE emails SET triage_class = ?, triage_summary = ?, triaged_at = ?,
-                                   triage_run_id = NULL
+                                   model_class = ?, priority_rule = ?, triage_run_id = NULL
                   WHERE id = ?",
             )
-            .bind(&verdict.class)
+            .bind(triage_class.class)
             .bind(&verdict.summary)
             .bind(&now_str)
+            .bind(&verdict.class)
+            .bind(triage_class.rule)
             .bind(verdict.id)
             .execute(pool)
             .await?;
@@ -1252,12 +1284,17 @@ pub async fn prune(
 
     let row_cutoff = (now - chrono::Duration::days(ROW_RETENTION_DAYS)).to_rfc3339();
     let failed_cutoff = (now - chrono::Duration::days(FAILED_ROW_RETENTION_DAYS)).to_rfc3339();
+    // Expiring an outbound row costs nothing: the facts it produced were accumulated into
+    // `contact_addresses` at ingestion and are not stored here. That is why the design accumulates
+    // them instead of aggregating over retained mail.
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM emails
-          WHERE triage_class IS NOT NULL
-            AND ((triage_class IN {CONTENT_CLASSES} AND COALESCE(triaged_at, ingested_at) < ?)
-              OR (triage_class = 'failed' AND COALESCE(triaged_at, ingested_at) < ?))"
+          WHERE (direction = 'outbound' AND COALESCE(triaged_at, ingested_at) < ?)
+             OR (triage_class IS NOT NULL
+                 AND ((triage_class IN {CONTENT_CLASSES} AND COALESCE(triaged_at, ingested_at) < ?)
+                   OR (triage_class = 'failed' AND COALESCE(triaged_at, ingested_at) < ?)))"
     )))
+    .bind(&row_cutoff)
     .bind(&row_cutoff)
     .bind(&failed_cutoff)
     .execute(pool)
@@ -1465,6 +1502,79 @@ mod tests {
         ids
     }
 
+    #[tokio::test]
+    async fn o_correio_enviado_nao_entra_na_fila_de_triagem() {
+        let state = triage_state().await;
+        let now = chrono::Utc::now();
+        let inbound = crate::email::IncomingMessage {
+            message_id: Some("<inbound-pending@x>".into()),
+            uid: 1,
+            from_addr: "remetente@example.com".into(),
+            from_name: None,
+            subject: Some("Pedido recebido".into()),
+            received_at: now.to_rfc3339(),
+            body_text: Some("Preciso de uma resposta.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        let mut outbound = crate::email::IncomingMessage {
+            message_id: Some("<outbound-pending@x>".into()),
+            uid: 2,
+            from_addr: "utilizador@example.com".into(),
+            from_name: None,
+            subject: Some("Resposta enviada".into()),
+            received_at: now.to_rfc3339(),
+            body_text: Some("Aqui vai a resposta.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        outbound
+            .headers
+            .insert("to".into(), "destinatario@example.com".into());
+
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            inbound.uid,
+            &[],
+            &[inbound],
+            14,
+            now,
+        )
+        .await
+        .unwrap();
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            outbound.uid,
+            &[],
+            &[outbound],
+            14,
+            now,
+        )
+        .await
+        .unwrap();
+
+        let inbound_id: i64 = sqlx::query_scalar("SELECT id FROM emails WHERE mailbox = 'INBOX'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let pending_ids: Vec<i64> = pending_rows(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert_eq!(pending_ids, vec![inbound_id]);
+    }
+
     async fn claimed_by(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
         sqlx::query_scalar("SELECT triage_run_id FROM emails WHERE id = ?")
             .bind(id)
@@ -1566,6 +1676,16 @@ mod tests {
     async fn verdicts_are_filed_without_a_new_request() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 1, 1).await;
+        // Seed established history so this test remains about filing verdicts, not priority policy.
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
         let stdout = transcript(serde_json::json!([
             {"id": ids[0], "class": "urgent", "summary": "server down"},
         ]));
@@ -1640,22 +1760,47 @@ mod tests {
         assert_gate_blocks(&state).await;
     }
 
-    #[tokio::test]
-    async fn an_exhausted_budget_blocks_triage() {
-        let state = triage_state().await;
-        sqlx::query("UPDATE autopilot_global SET budget_limit_usd = 0.01")
+    /// Seeds one completed `email_triage` run costing `cost_usd`, and caps the window at `limit`.
+    ///
+    /// The two numbers have to be chosen together, which is exactly what the earlier version of this
+    /// test got wrong. The gate is `spent + per_run_reserve > limit` (`budget.rs`), and the reserve
+    /// defaults to 0.5 (`0012_budget.sql`), so any limit at or below 0.5 closes the gate on its own
+    /// and whatever spend was seeded is decoration.
+    async fn seed_triage_spend(state: &crate::state::AppState, cost_usd: f64, limit: f64) {
+        sqlx::query("UPDATE autopilot_global SET budget_limit_usd = ?")
+            .bind(limit)
             .execute(&state.pool)
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO runs (prompt, status, mode, created_at, completed_at, cost_usd, session_id)
-             VALUES ('x', 'completed', 'email_triage', ?, ?, 5.0, 'spent')",
+             VALUES ('x', 'completed', 'email_triage', ?, ?, ?, 'spent')",
         )
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(chrono::Utc::now().to_rfc3339())
+        .bind(cost_usd)
         .execute(&state.pool)
         .await
         .unwrap();
+    }
+
+    /// Triage spends money, so it must count against the same window every other autonomous run
+    /// does — which is only true while `budget::autonomous_rows` keeps `email_triage` in its mode
+    /// filter. This is the test that notices if it is dropped.
+    ///
+    /// **The version that shipped could not fail.** It set `budget_limit_usd = 0.01` against a
+    /// default reserve of 0.5, so `0.5 > 0.01` closed the gate with ZERO spend and the 5.0 row it
+    /// seeded never entered the arithmetic. It passed identically with `email_triage` counted and
+    /// with it removed — the one distinction it exists to draw. Found by trying to use it to score
+    /// an ablation task, not by reading it.
+    ///
+    /// The limit now sits above the reserve and below `spend + reserve`, so only the seeded spend
+    /// can close the gate; the control below shows it stays open without that spend.
+    #[tokio::test]
+    async fn an_exhausted_budget_blocks_triage() {
+        let state = triage_state().await;
+        // 5.0 spent + 0.5 reserve = 5.5, over the 3.0 cap. Without the spend it is 0.5, well under.
+        seed_triage_spend(&state, 5.0, 3.0).await;
 
         seed_pending(&state.pool, 5, 1).await;
         let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
@@ -1665,6 +1810,27 @@ mod tests {
         assert!(
             !launched,
             "triage must respect the budget it now counts towards"
+        );
+    }
+
+    /// The control that makes the test above mean something. Same cap, same everything, and the only
+    /// difference is that the seeded run cost almost nothing — so the gate has to open. If this ever
+    /// fails alongside its pair passing, the pair is passing for a reason that has nothing to do with
+    /// spend, which is precisely the state it was in before.
+    #[tokio::test]
+    async fn a_budget_with_room_still_lets_triage_run() {
+        let state = triage_state().await;
+        seed_triage_spend(&state, 0.01, 3.0).await;
+
+        seed_pending(&state.pool, 5, 1).await;
+        let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
+        assert!(
+            launched,
+            "a budget with room left must not block triage — otherwise the blocking test above \
+             proves nothing about spend"
         );
     }
 
@@ -1749,6 +1915,16 @@ mod tests {
     async fn a_completed_run_files_its_verdicts() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 2, 1).await;
+        // Seed established history so this test remains about filing verdicts, not priority policy.
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, "ana@company.com", None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
         let stdout = transcript(serde_json::json!([
             {"id": ids[0], "class": "urgent", "summary": "server down"},
             {"id": ids[1], "class": "noise", "summary": "newsletter"},
@@ -1766,6 +1942,224 @@ mod tests {
         assert_eq!(class.as_deref(), Some("urgent"));
         assert_eq!(summary.as_deref(), Some("server down"));
         assert!(claimed_by(&state.pool, ids[0]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_triagem_aplica_o_ajuste_ao_que_grava() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 2, 1).await;
+        let first_contact = "first.contact@example.com";
+        let established_contact = "established.contact@example.com";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(first_contact)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(established_contact)
+            .bind(ids[1])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, established_contact, None, &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, established_contact, None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let first_profile = crate::contacts::profile_for(&state.pool, first_contact)
+            .await
+            .unwrap();
+        assert!(
+            first_profile.is_none(),
+            "the first sender must have no accumulated history"
+        );
+        let established_profile = crate::contacts::profile_for(&state.pool, established_contact)
+            .await
+            .unwrap()
+            .expect("the established sender must have accumulated history");
+        assert_eq!(established_profile.messages_in, 2);
+
+        let verdicts = vec![
+            Verdict {
+                id: ids[0],
+                class: "urgent".into(),
+                summary: "first contact".into(),
+            },
+            Verdict {
+                id: ids[1],
+                class: "urgent".into(),
+                summary: "known contact".into(),
+            },
+        ];
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let first_class: Option<String> =
+            sqlx::query_scalar("SELECT triage_class FROM emails WHERE id = ?")
+                .bind(ids[0])
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let established_class: Option<String> =
+            sqlx::query_scalar("SELECT triage_class FROM emails WHERE id = ?")
+                .bind(ids[1])
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            first_class.as_deref(),
+            Some("action"),
+            "an urgent verdict for a sender with no history must be demoted"
+        );
+        assert_eq!(
+            established_class.as_deref(),
+            Some("urgent"),
+            "the derived rule must not demote an established sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn o_registo_diz_o_que_o_modelo_disse_e_quem_decidiu() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let sender = "new.sender@example.com";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(sender)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let verdicts = [Verdict {
+            id: ids[0],
+            class: "urgent".into(),
+            summary: "first contact".into(),
+        }];
+
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let stored: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT triage_class, model_class, priority_rule FROM emails WHERE id = ?",
+        )
+        .bind(ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            (
+                Some("action".into()),
+                Some("urgent".into()),
+                Some("first-contact".into())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sem_regra_o_registo_nao_inventa_uma() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let sender = "established.sender@example.com";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(sender)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, sender, None, &received_at)
+            .await
+            .unwrap();
+        crate::contacts::record_inbound(&mut transaction, sender, None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let verdicts = [Verdict {
+            id: ids[0],
+            class: "info".into(),
+            summary: "known contact".into(),
+        }];
+
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let stored: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT triage_class, model_class, priority_rule FROM emails WHERE id = ?",
+        )
+        .bind(ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, (Some("info".into()), Some("info".into()), None));
+    }
+
+    #[tokio::test]
+    async fn uma_sobreposicao_humana_fica_no_registo() {
+        let state = triage_state().await;
+        let ids = seed_pending(&state.pool, 1, 1).await;
+        let sender = "Pinned Person <PINNED@example.com>";
+        sqlx::query("UPDATE emails SET from_addr = ? WHERE id = ?")
+            .bind(sender)
+            .bind(ids[0])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let mut transaction = state.pool.begin().await.unwrap();
+        crate::contacts::record_inbound(&mut transaction, sender, None, &received_at)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let contact_id: i64 =
+            sqlx::query_scalar("SELECT contact_id FROM contact_addresses WHERE address = ?")
+                .bind(crate::contacts::normalize_address(sender))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO contact_overrides (contact_id, verdict, set_at) VALUES (?, 'pin', ?)",
+        )
+        .bind(contact_id)
+        .bind(&received_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let verdicts = [Verdict {
+            id: ids[0],
+            class: "action".into(),
+            summary: "human pin".into(),
+        }];
+
+        apply_verdicts(&state.pool, &ids, &verdicts, 14, &[], chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let stored: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT triage_class, model_class, priority_rule FROM emails WHERE id = ?",
+        )
+        .bind(ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            (
+                Some("urgent".into()),
+                Some("action".into()),
+                Some("human-pin".into())
+            )
+        );
     }
 
     /// The rule that keeps this pillar from destroying mail: ten infrastructure failures in a row
@@ -2193,6 +2587,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, vec!["<oldfailed@x>"]);
+    }
+
+    #[tokio::test]
+    async fn o_correio_enviado_e_apagado_na_mesma_janela() {
+        let state = triage_state().await;
+        let now = chrono::Utc::now();
+        let ingested_at = now - chrono::Duration::days(ROW_RETENTION_DAYS + 1);
+        let mut outbound = crate::email::IncomingMessage {
+            message_id: Some("<old-outbound@x>".into()),
+            uid: 1,
+            from_addr: "utilizador@example.com".into(),
+            from_name: None,
+            subject: Some("Mensagem antiga".into()),
+            received_at: ingested_at.to_rfc3339(),
+            body_text: Some("Conteúdo enviado.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        outbound
+            .headers
+            .insert("to".into(), "destinatario@example.com".into());
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            outbound.uid,
+            &[],
+            &[outbound],
+            14,
+            ingested_at,
+        )
+        .await
+        .unwrap();
+
+        let (_, rows_deleted) = prune(&state.pool, 14, now).await.unwrap();
+        let rows_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!((rows_deleted, rows_left), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn os_factos_do_contacto_sobrevivem_ao_prune_do_enviado() {
+        let state = triage_state().await;
+        let recipient = "contacto@example.com";
+        let now = chrono::Utc::now();
+        let ingested_at = now - chrono::Duration::days(ROW_RETENTION_DAYS + 1);
+        let mut outbound = crate::email::IncomingMessage {
+            message_id: Some("<old-outbound-contact@x>".into()),
+            uid: 1,
+            from_addr: "utilizador@example.com".into(),
+            from_name: None,
+            subject: Some("Mensagem antiga".into()),
+            received_at: ingested_at.to_rfc3339(),
+            body_text: Some("Conteúdo enviado.".into()),
+            has_attachments: false,
+            attachments: Vec::new(),
+            headers: std::collections::HashMap::new(),
+        };
+        outbound.headers.insert("to".into(), recipient.into());
+        crate::email::ingest_batch(
+            &state.pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            outbound.uid,
+            &[],
+            &[outbound],
+            14,
+            ingested_at,
+        )
+        .await
+        .unwrap();
+
+        let (_, rows_deleted) = prune(&state.pool, 14, now).await.unwrap();
+        let rows_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let profile = crate::contacts::profile_for(&state.pool, recipient)
+            .await
+            .unwrap();
+
+        // The mail expires, but the accumulated fact that the user wrote to this person does not.
+        assert_eq!(
+            (
+                rows_deleted,
+                rows_left,
+                profile.map(|profile| profile.outbound_ever)
+            ),
+            (1, 0, Some(true))
+        );
     }
 
     /// The prompt is the one place a mail body reaches a model, so its framing is asserted rather

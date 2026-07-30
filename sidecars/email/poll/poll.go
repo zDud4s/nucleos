@@ -3,6 +3,7 @@
 package poll
 
 import (
+	"fmt"
 	"log"
 	"time"
 
@@ -30,6 +31,48 @@ type Fetcher interface {
 	Fetch(uid imapv2.UID) (imap.Raw, error)
 }
 
+// Extractor turns raw bytes into a delivery record. The inbox and the sent folder use different
+// ones because they are interested in different parties.
+type Extractor func(raw []byte, uid uint32, internalDate time.Time) (daemon.Message, error)
+
+// ExtractorFor picks the reader for a target's direction.
+func ExtractorFor(direction string) Extractor {
+	if direction == "outbound" {
+		return extract.SentMessage
+	}
+	// The inbox reader is the safe default: unknown directions must not expose unchosen recipients.
+	return extract.Message
+}
+
+type Target struct {
+	Mailbox   string
+	Direction string
+}
+
+func Targets(cfg config.Config) []Target {
+	targets := []Target{{
+		Mailbox:   cfg.Mailbox,
+		Direction: "inbound",
+	}}
+	if cfg.SentMailbox != "" {
+		targets = append(targets, Target{
+			Mailbox:   cfg.SentMailbox,
+			Direction: "outbound",
+		})
+	}
+	return targets
+}
+
+func Cycle(targets []Target, poll func(Target) error) []error {
+	var failures []error
+	for _, target := range targets {
+		if err := poll(target); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return failures
+}
+
 // Collect reads messages in uid order and reports how far it actually got.
 //
 // `maxExamined` is the highest uid whose fetch COMPLETED and produced a decision — a delivered
@@ -40,7 +83,7 @@ type Fetcher interface {
 // A message that cannot be parsed is a DECISION, not a failure: it is recorded as skipped, the
 // watermark passes it, and the user is told. Otherwise one corrupt message stalls the mailbox
 // forever.
-func Collect(fetcher Fetcher, uids []imapv2.UID, limit int) (
+func Collect(fetcher Fetcher, uids []imapv2.UID, limit int, extractor Extractor) (
 	messages []daemon.Message,
 	skipped []daemon.Skipped,
 	maxExamined uint32,
@@ -56,7 +99,7 @@ func Collect(fetcher Fetcher, uids []imapv2.UID, limit int) (
 			break
 		}
 
-		message, err := extract.Message(raw.Body, raw.UID, raw.InternalDate)
+		message, err := extractor(raw.Body, raw.UID, raw.InternalDate)
 		if err != nil {
 			skipped = append(skipped, daemon.Skipped{
 				UID:    raw.UID,
@@ -98,8 +141,8 @@ func StrictlyAbove(uids []imapv2.UID, lastUID uint32) []imapv2.UID {
 }
 
 // Once performs a single poll: connect, read what is new, deliver it.
-func Once(cfg config.Config, client *daemon.Client) error {
-	cursor, err := client.GetCursor(cfg.Mailbox)
+func Once(cfg config.Config, client *daemon.Client, target Target) error {
+	cursor, err := client.GetCursor(target.Mailbox)
 	if err != nil {
 		return err
 	}
@@ -110,7 +153,7 @@ func Once(cfg config.Config, client *daemon.Client) error {
 	}
 	defer conn.Close()
 
-	uidValidity, err := conn.Select(cfg.Mailbox)
+	uidValidity, err := conn.Select(target.Mailbox)
 	if err != nil {
 		return err
 	}
@@ -132,12 +175,17 @@ func Once(cfg config.Config, client *daemon.Client) error {
 		// Said out loud, every time. A poll that finds nothing used to be silent, which made
 		// silence mean both "connected, nothing new" and "never connected at all" — and those are
 		// the two things a person setting this up most needs to tell apart.
-		log.Printf("email: %s has nothing new above uid %d", cfg.Mailbox, lastSeen(cursor))
+		log.Printf("email: %s has nothing new above uid %d", target.Mailbox, lastSeen(cursor))
 		return nil
 	}
-	log.Printf("email: %s has %d message(s) to read", cfg.Mailbox, len(uids))
+	log.Printf("email: %s has %d message(s) to read", target.Mailbox, len(uids))
 
-	messages, skipped, maxExamined := Collect(conn, uids, MaxPerBatch)
+	messages, skipped, maxExamined := Collect(
+		conn,
+		uids,
+		MaxPerBatch,
+		ExtractorFor(target.Direction),
+	)
 	if maxExamined == 0 {
 		// Nothing was read all the way through; delivering would move the cursor over mail nobody
 		// examined.
@@ -145,7 +193,8 @@ func Once(cfg config.Config, client *daemon.Client) error {
 	}
 
 	result, err := client.Deliver(daemon.Batch{
-		Mailbox:        cfg.Mailbox,
+		Mailbox:        target.Mailbox,
+		Direction:      target.Direction,
 		UIDValidity:    uidValidity,
 		MaxUIDExamined: maxExamined,
 		Skipped:        skipped,
@@ -158,8 +207,8 @@ func Once(cfg config.Config, client *daemon.Client) error {
 	}
 
 	log.Printf(
-		"email: delivered %d message(s), %d duplicate(s), %d skipped; cursor now %d",
-		result.Ingested, result.Duplicates, len(skipped), result.Cursor,
+		"email: %s delivered %d message(s), %d duplicate(s), %d skipped; cursor now %d",
+		target.Mailbox, result.Ingested, result.Duplicates, len(skipped), result.Cursor,
 	)
 	return nil
 }
@@ -167,8 +216,20 @@ func Once(cfg config.Config, client *daemon.Client) error {
 // Run polls until the process is stopped. Errors are logged and retried on the next tick: the
 // daemon supervises this process, and a mailbox that is briefly unreachable is not an emergency.
 func Run(cfg config.Config, client *daemon.Client) {
+	targets := Targets(cfg)
 	for {
-		if err := Once(cfg, client); err != nil {
+		failures := Cycle(targets, func(target Target) error {
+			if err := Once(cfg, client, target); err != nil {
+				return fmt.Errorf(
+					"%s mailbox %q: %w",
+					target.Direction,
+					target.Mailbox,
+					err,
+				)
+			}
+			return nil
+		})
+		for _, err := range failures {
 			log.Printf("email: poll failed: %v", err)
 		}
 		time.Sleep(cfg.PollInterval)

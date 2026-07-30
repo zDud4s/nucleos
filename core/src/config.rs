@@ -50,6 +50,7 @@ pub struct EmailConfig {
     pub port: u16,
     pub username: String,
     pub mailbox: String,
+    pub sent_mailbox: Option<String>,
     pub poll_interval_secs: u64,
     /// Which triage classes are worth interrupting a person for.
     ///
@@ -75,6 +76,7 @@ impl Default for EmailConfig {
             port: 993,
             username: String::new(),
             mailbox: "INBOX".to_string(),
+            sent_mailbox: None,
             poll_interval_secs: 300,
             notify_classes: vec!["urgent".to_string()],
             digest_hour_utc: 7,
@@ -221,6 +223,17 @@ mod tests {
         assert_eq!(config.mailbox, "INBOX");
         assert_eq!(config.notify_classes, vec!["urgent".to_string()]);
         assert_eq!(config.retain_bodies_days, 14);
+    }
+
+    #[test]
+    fn sem_pasta_de_enviados_o_pilar_arranca() {
+        let config = email_config_from("enabled: true\nhost: imap.example.com\n");
+
+        assert!(
+            config.enabled,
+            "the rest of the email config must still load"
+        );
+        assert_eq!(config.sent_mailbox, None);
     }
 
     /// The distinction the rollout's first week depends on: an EMPTY list means "notify about
