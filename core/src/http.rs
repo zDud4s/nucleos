@@ -83,6 +83,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/jobs", get(get_jobs))
+        .route("/jobs/{id}", get(get_job))
+        // Distinct from `/runs/{id}/cancel`, which stops one node. Both end the job — a stopped
+        // node leaves the tree holding edits no gate measured — but only this one reaches a job
+        // that has no node in flight: parked for budget, waiting for the slot, or between nodes.
+        .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/assistant/message", post(post_assistant_message))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
@@ -1582,6 +1588,55 @@ async fn post_proposal_reject(
             tracing::warn!(proposal_id = id, %error, "rejecting a proposal failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+/// How many jobs one listing returns.
+///
+/// Finished jobs are included, so this is a window rather than a queue: a job that stopped for the
+/// budget or ran out of clock is exactly the one the user needs to see, and filtering to live ones
+/// would make it vanish at the moment it started mattering.
+const JOB_LIST_LIMIT: i64 = 20;
+
+#[derive(serde::Deserialize)]
+struct OptionalProjectQuery {
+    project_id: Option<String>,
+}
+
+async fn get_jobs(
+    State(state): State<AppState>,
+    Query(query): Query<OptionalProjectQuery>,
+) -> Result<Json<Vec<crate::job::JobSummary>>, StatusCode> {
+    crate::job::list(&state.pool, query.project_id.as_deref(), JOB_LIST_LIMIT)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::job::JobDetail>, StatusCode> {
+    match crate::job::detail(&state.pool, id).await {
+        Ok(Some(detail)) => Ok(Json(detail)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    // Uncancellable: this terminates the node in flight and only then retires the job. A request
+    // dropped in between would leave a job nothing drives with a node still running inside it.
+    match uncancellable(async move { crate::job::cancel(&state, id).await }).await? {
+        Ok(crate::job::CancelOutcome::Cancelled) => Ok(StatusCode::NO_CONTENT),
+        // Already over. Not success: "I stopped it" and "it had already finished" are different
+        // answers to the question the user just asked.
+        Ok(crate::job::CancelOutcome::NotLive) => Err(StatusCode::CONFLICT),
+        Ok(crate::job::CancelOutcome::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

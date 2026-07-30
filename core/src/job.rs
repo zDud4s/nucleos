@@ -90,6 +90,9 @@ pub enum ItemState {
     /// Gated green, or no gate is configured for this project.
     Passed,
     Failed,
+    /// Somebody stopped this node. Apart from `Failed` because it is the difference between "the
+    /// work broke" and "you stopped it", and the two read as opposite things in a feed.
+    Cancelled,
     GateFailed,
     GateErrored,
 }
@@ -112,6 +115,11 @@ pub enum ReviewState {
 pub enum Outcome {
     Completed,
     Failed,
+    /// Stopped on purpose, at either level: cancelling a run stops one node, cancelling a job stops
+    /// the sequence. Both end the job — a stopped node leaves the tree holding edits no gate has
+    /// measured, so the next item must not build on them — but neither is a failure of the work,
+    /// and a feed that says `failed` for something the user did themselves teaches them to ignore it.
+    Cancelled,
     GateFailed,
     GateErrored,
 }
@@ -160,6 +168,7 @@ pub fn next_step(job: &JobView) -> Next {
     for item in &job.items {
         match item {
             ItemState::Failed => return Next::Finish(Outcome::Failed),
+            ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
             ItemState::GateFailed => return Next::Finish(Outcome::GateFailed),
             ItemState::GateErrored => return Next::Finish(Outcome::GateErrored),
             _ => {}
@@ -209,6 +218,7 @@ impl Outcome {
         match self {
             Outcome::Completed => "completed",
             Outcome::Failed => "failed",
+            Outcome::Cancelled => STATUS_CANCELLED,
             Outcome::GateFailed => "gate_failed",
             Outcome::GateErrored => "gate_errored",
         }
@@ -221,6 +231,7 @@ fn item_state_from(status: &str) -> ItemState {
         "implemented" => ItemState::Implemented,
         "passed" => ItemState::Passed,
         "failed" => ItemState::Failed,
+        STATUS_CANCELLED => ItemState::Cancelled,
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
         // An unrecognised item status is treated as still to do rather than as done. Erring toward
@@ -313,6 +324,8 @@ pub const STATUS_EXPIRED: &str = "expired";
 pub const STATUS_STOPPED: &str = "stopped";
 /// A job whose daemon died under it, and whose repository has moved on since.
 pub const STATUS_INTERRUPTED: &str = "interrupted";
+/// A job somebody stopped, at either level: one node, or the whole chain.
+pub const STATUS_CANCELLED: &str = "cancelled";
 
 /// Every ending this module can write.
 ///
@@ -321,7 +334,7 @@ pub const STATUS_INTERRUPTED: &str = "interrupted";
 /// invisibly, because as far as the system is concerned that job is finished and its tree is
 /// nobody's. `every_ending_a_job_can_have_is_an_ending_the_gc_collects` holds the two lists
 /// together, and it was written because adding `stopped` had already opened exactly that leak.
-pub const TERMINAL_STATUSES: [&str; 7] = [
+pub const TERMINAL_STATUSES: [&str; 8] = [
     "completed",
     "failed",
     "gate_failed",
@@ -329,6 +342,7 @@ pub const TERMINAL_STATUSES: [&str; 7] = [
     STATUS_EXPIRED,
     STATUS_STOPPED,
     STATUS_INTERRUPTED,
+    STATUS_CANCELLED,
 ];
 
 /// Writes a job's terminal status and stamps it done.
@@ -660,11 +674,17 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     for (ordinal, run_status) in landed {
         // Only `completed` is done. `timed_out`, `cancelled` and `interrupted` all leave a tree
         // holding edits no gate has measured, and calling any of them finished would let the next
-        // item build on top of them.
-        let item_status = if run_status == "completed" {
-            "implemented"
-        } else {
-            "failed"
+        // item build on top of them — so all three stop the chain.
+        //
+        // A cancelled node is kept apart from the other two all the same, because it is the
+        // difference between the work breaking and somebody stopping it. This is what makes
+        // cancelling a run mean something distinct from cancelling a job: one stops a node and ends
+        // the chain honestly, the other stops the chain outright. Collapsing them would report the
+        // user's own decision back to them as a failure.
+        let item_status = match run_status.as_str() {
+            "completed" => "implemented",
+            STATUS_CANCELLED => STATUS_CANCELLED,
+            _ => "failed",
         };
         sqlx::query("UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ?")
             .bind(item_status)
@@ -672,18 +692,34 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
             .bind(ordinal)
             .execute(pool)
             .await?;
-        if item_status == "failed" {
-            say(
-                pool,
-                job,
-                "job_item_failed",
-                &format!(
-                    "job {} stopped at item {}: its node ended `{run_status}`",
-                    job.id,
-                    ordinal + 1
-                ),
-            )
-            .await;
+        match item_status {
+            "failed" => {
+                say(
+                    pool,
+                    job,
+                    "job_item_failed",
+                    &format!(
+                        "job {} stopped at item {}: its node ended `{run_status}`",
+                        job.id,
+                        ordinal + 1
+                    ),
+                )
+                .await;
+            }
+            STATUS_CANCELLED => {
+                say(
+                    pool,
+                    job,
+                    "job_cancelled",
+                    &format!(
+                        "job {} stopped at item {}: its node was cancelled",
+                        job.id,
+                        ordinal + 1
+                    ),
+                )
+                .await;
+            }
+            _ => {}
         }
     }
 
@@ -1319,6 +1355,176 @@ pub async fn run_job_loop(state: AppState) {
 
 const JOB_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// One job, as the shell lists it.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct JobSummary {
+    pub id: i64,
+    pub project_id: String,
+    pub rule_name: Option<String>,
+    pub status: String,
+    /// Why a `waiting` job is waiting. Budget and contention ask opposite things of a reader — one
+    /// is "spend more or wait", the other is "something else is using the project" — so `waiting`
+    /// alone would leave them guessing which.
+    pub wait_reason: Option<String>,
+    pub max_items: i64,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// One item of a job's queue, as the shell shows it.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct JobItemView {
+    pub ordinal: i64,
+    pub description: String,
+    pub status: String,
+    /// The node that did it, so the shell can link to the transcript.
+    pub run_id: Option<i64>,
+    /// Carried separately from `status` because they answer different questions: `status` says
+    /// where the item got to, `gate_status` says whether anything measured it. An item that reads
+    /// `passed` with no gate status was never measured — the project has no gate command, or this
+    /// was an intermediate item under `gate_after_each_item: false`.
+    pub gate_status: Option<String>,
+}
+
+/// A job with its queue.
+#[derive(Debug, serde::Serialize)]
+pub struct JobDetail {
+    #[serde(flatten)]
+    pub job: JobSummary,
+    pub items: Vec<JobItemView>,
+    /// The branch the work is on, so a stopped job's partial can be found. `None` once the GC has
+    /// taken the worktree.
+    pub branch: Option<String>,
+}
+
+const ONE_SUMMARY_SQL: &str =
+    "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at, completed_at
+     FROM jobs WHERE id = ?";
+
+/// The most recent jobs, newest first.
+///
+/// Not filtered to live ones: a job that stopped for the budget or ran out of clock is exactly the
+/// one the user needs to see, and it would vanish the moment it mattered.
+pub async fn list(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<JobSummary>> {
+    match project_id {
+        Some(project_id) => {
+            sqlx::query_as(
+                "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at,
+                    completed_at
+             FROM jobs WHERE project_id = ? ORDER BY id DESC LIMIT ?",
+            )
+            .bind(project_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at,
+                    completed_at
+             FROM jobs ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDetail>> {
+    let Some(job): Option<JobSummary> = sqlx::query_as(ONE_SUMMARY_SQL)
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let items: Vec<JobItemView> = sqlx::query_as(
+        "SELECT ordinal, description, status, run_id, gate_status
+         FROM job_items WHERE job_id = ? ORDER BY ordinal",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    let branch: Option<String> = sqlx::query_scalar(
+        "SELECT branch FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(Some(JobDetail { job, items, branch }))
+}
+
+/// What cancelling a job did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled,
+    /// Already over. Reported rather than treated as success, because "I stopped it" and "it had
+    /// already finished" are different answers to the question the user just asked.
+    NotLive,
+    NotFound,
+}
+
+/// Stops a whole job: the node in flight, and the sequence behind it.
+///
+/// This is the second of the two cancellation levels. Cancelling a *run* stops one node, and the
+/// chain then ends `cancelled` too — a stopped node leaves the tree holding edits no gate measured,
+/// so the next item must not build on them. What this adds is stopping a job that has no node in
+/// flight at all: one parked for budget, waiting for the slot, or between two nodes.
+///
+/// The node is cancelled BEFORE the job is retired, so a daemon that dies in between heals itself:
+/// the next pass sees a cancelled node and reaches the same ending. Retiring first would leave a
+/// live node in a job nothing drives.
+pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome> {
+    let pool = &state.pool;
+    let Some(job): Option<JobSummary> = sqlx::query_as(ONE_SUMMARY_SQL)
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(CancelOutcome::NotFound);
+    };
+    if !LIVE_STATUSES.contains(&job.status.as_str()) {
+        return Ok(CancelOutcome::NotLive);
+    }
+
+    let in_flight: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE job_id = ? AND status IN ('running','awaiting_approval')",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+    for run_id in in_flight {
+        crate::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
+    }
+
+    // Only the item that was in someone's hands. The ones still `pending` were never started, and
+    // marking them cancelled would claim the job got to them and turned back.
+    sqlx::query("UPDATE job_items SET status = ? WHERE job_id = ? AND status = 'running'")
+        .bind(STATUS_CANCELLED)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    retire(pool, job_id, STATUS_CANCELLED).await?;
+
+    let _ = crate::feed::append(
+        pool,
+        Some(&job.project_id),
+        "job_cancelled",
+        &format!("job {job_id} was cancelled; what it finished is on its branch"),
+        None,
+    )
+    .await;
+    Ok(CancelOutcome::Cancelled)
+}
+
 /// Retires jobs a crash left behind, unless the repository is provably where they left it.
 ///
 /// Decision 11. The discriminator is HEAD and cannot be liveness: by the time this runs,
@@ -1851,6 +2057,129 @@ mod tests {
                 "`{status}` both holds the project's slot and is collectable"
             );
         }
+    }
+
+    /// Both levels of cancellation end the job, because a stopped node leaves the tree holding
+    /// edits no gate measured and the next item must not build on them. What must not happen is
+    /// either level reporting the user's own decision back to them as a failure.
+    #[tokio::test]
+    async fn cancelling_a_node_ends_its_job_cancelled_rather_than_failed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["running", "pending"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "cancelled").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["cancelled", "pending"]
+        );
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::Finish(Outcome::Cancelled)
+        );
+    }
+
+    /// The whole reason cancelling a job is a separate thing from cancelling a run: a job parked
+    /// for the budget, or waiting for the slot, has no node to cancel. Without this it could only
+    /// be stopped by waiting out the four-hour ceiling.
+    #[tokio::test]
+    async fn a_parked_job_can_be_cancelled_even_though_it_has_no_node_running() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "pending"]).await;
+        wait(&pool, job_id, "budget").await.unwrap();
+
+        assert_eq!(
+            cancel(&state, job_id).await.unwrap(),
+            CancelOutcome::Cancelled
+        );
+        assert_eq!(job_status(&pool, job_id).await, STATUS_CANCELLED);
+        // The item that was never started is left alone. Marking it cancelled would claim the job
+        // got to it and turned back, and the gated-green one keeps its verdict.
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "pending"]
+        );
+        assert!(
+            feed_kinds(&pool)
+                .await
+                .contains(&"job_cancelled".to_owned())
+        );
+    }
+
+    /// "I stopped it" and "it had already finished" are different answers to the question the user
+    /// just asked, so the second one is not reported as success.
+    #[tokio::test]
+    async fn cancelling_a_job_that_is_already_over_says_so() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let done = seed_job(&pool, "project-a", "completed").await.unwrap();
+
+        assert_eq!(cancel(&state, done).await.unwrap(), CancelOutcome::NotLive);
+        assert_eq!(job_status(&pool, done).await, "completed");
+        assert_eq!(
+            cancel(&state, 9_999).await.unwrap(),
+            CancelOutcome::NotFound
+        );
+    }
+
+    /// A job's queue is what the detail view is for, and two of its columns answer different
+    /// questions: `status` says where an item got to, `gate_status` says whether anything measured
+    /// it. An item reading `passed` with no gate status was never measured.
+    #[tokio::test]
+    async fn a_jobs_detail_carries_its_queue_and_says_which_items_were_measured() {
+        let pool = test_pool().await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["passed", "passed"]).await;
+        sqlx::query("UPDATE job_items SET gate_status = 'passed' WHERE job_id = ? AND ordinal = 1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let detail = detail(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job exists");
+
+        assert_eq!(detail.job.status, "implementing");
+        assert_eq!(detail.items.len(), 2);
+        assert_eq!(detail.items[0].gate_status, None);
+        assert_eq!(detail.items[1].gate_status.as_deref(), Some("passed"));
+        assert_eq!(detail.branch.as_deref(), Some("nucleos/job"));
+        assert!(detail.items[0].ordinal < detail.items[1].ordinal);
+    }
+
+    /// Finished jobs stay in the listing. A job that stopped for the budget or ran out of clock is
+    /// exactly the one worth looking at, and filtering to live ones would make it vanish at the
+    /// moment it started mattering.
+    #[tokio::test]
+    async fn the_listing_keeps_the_jobs_that_already_ended() {
+        let pool = test_pool().await;
+        let old = seed_job(&pool, "project-a", "completed").await.unwrap();
+        let live = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_job(&pool, "project-b", "implementing").await.unwrap();
+
+        let mine = list(&pool, Some("project-a"), 20).await.unwrap();
+        assert_eq!(
+            mine.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![live, old],
+            "newest first, and the finished one is still there"
+        );
+        assert_eq!(list(&pool, None, 20).await.unwrap().len(), 3);
     }
 
     /// The plan node is the one node with no item to mark, so nothing else stops a second planner
