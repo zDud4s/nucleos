@@ -68,6 +68,13 @@ fn escape_like(query: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn fts_query(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<AwaitingRun>> {
     sqlx::query_as::<_, AwaitingRun>(
         "SELECT id, project_id, prompt, cwd, created_at
@@ -97,10 +104,20 @@ pub async fn search(
         query.push(" AND mode = ").push_bind(mode);
     }
     if let Some(q) = &filter.q {
+        let fts = fts_query(q);
         query
-            .push(" AND prompt LIKE ")
+            .push(" AND (prompt LIKE ")
             .push_bind(format!("%{}%", escape_like(q)))
             .push(" ESCAPE '\\'");
+        if fts.is_empty() {
+            query.push(" OR 0");
+        } else {
+            query
+                .push(" OR id IN (SELECT run_id FROM run_events WHERE id IN (SELECT rowid FROM run_events_fts WHERE run_events_fts MATCH ")
+                .push_bind(fts)
+                .push("))");
+        }
+        query.push(")");
     }
     if let Some(since) = &filter.since {
         query
@@ -3496,5 +3513,240 @@ mod tests {
         let json = serde_json::to_value(&entries[0]).unwrap();
         assert!(json.get("stdout").is_none());
         assert!(json.get("stderr").is_none());
+    }
+
+    #[tokio::test]
+    async fn transcript_search_finds_a_run_by_its_trajectory() {
+        let pool = search_test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-trajectory', 'prompt without the needle', 'completed', 'real',
+                     '2026-07-30T10:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+             VALUES (?, 1, 'assistant',
+                     '{\"type\":\"assistant\",\"text\":\"located trajectory-needle in output\"}',
+                     '2026-07-30T10:00:01Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let entries = search(
+            &pool,
+            &SearchFilter {
+                project_id: None,
+                status: None,
+                mode: None,
+                q: Some("trajectory-needle".into()),
+                since: None,
+                until: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, run_id);
+    }
+
+    #[tokio::test]
+    async fn transcript_search_returns_no_transcript_text() {
+        let pool = search_test_pool().await;
+        let transcript_text = "private-transcript-payload";
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-private', 'ordinary prompt', 'completed', 'real',
+                     '2026-07-30T11:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+             VALUES (?, 1, 'assistant', ?, '2026-07-30T11:00:01Z')",
+        )
+        .bind(run_id)
+        .bind(transcript_text)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let entries = search(
+            &pool,
+            &SearchFilter {
+                project_id: None,
+                status: None,
+                mode: None,
+                q: Some(transcript_text.into()),
+                since: None,
+                until: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.id, run_id);
+        assert!(!entry.prompt_excerpt.contains(transcript_text));
+
+        let json = serde_json::to_value(entry).unwrap();
+        let object = json.as_object().unwrap();
+        assert_eq!(object.len(), 8);
+        for field in [
+            "id",
+            "project_id",
+            "status",
+            "mode",
+            "created_at",
+            "completed_at",
+            "cost_usd",
+            "prompt_excerpt",
+        ] {
+            assert!(object.contains_key(field), "missing metadata field {field}");
+        }
+        for forbidden in ["transcript", "payload", "stdout", "stderr"] {
+            assert!(
+                !object.contains_key(forbidden),
+                "search result leaked {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_search_matches_an_fts_operator_literally() {
+        let pool = search_test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-force', 'prepare repository update', 'completed', 'real',
+                     '2026-07-30T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+             VALUES (?, 1, 'tool_result', 'git push --force',
+                     '2026-07-30T12:00:01Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let entries = search(
+            &pool,
+            &SearchFilter {
+                project_id: None,
+                status: None,
+                mode: None,
+                q: Some("--force".into()),
+                since: None,
+                until: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, run_id);
+    }
+
+    #[tokio::test]
+    async fn transcript_search_excludes_a_match_outside_the_project() {
+        let pool = search_test_pool().await;
+        let included_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-included', 'first unrelated prompt', 'completed', 'real',
+                     '2026-07-30T13:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let excluded_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-excluded', 'second unrelated prompt', 'completed', 'real',
+                     '2026-07-30T13:01:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        for run_id in [included_run_id, excluded_run_id] {
+            sqlx::query(
+                "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+                 VALUES (?, 1, 'assistant', 'shared-project-needle',
+                         '2026-07-30T13:02:00Z')",
+            )
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let entries = search(
+            &pool,
+            &SearchFilter {
+                project_id: Some("project-included".into()),
+                status: None,
+                mode: None,
+                q: Some("shared-project-needle".into()),
+                since: None,
+                until: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![included_run_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_search_still_matches_the_prompt() {
+        let pool = search_test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-prompt', 'prompt contains prompt-regression-needle', 'completed',
+                     'real', '2026-07-30T14:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let entries = search(
+            &pool,
+            &SearchFilter {
+                project_id: None,
+                status: None,
+                mode: None,
+                q: Some("prompt-regression-needle".into()),
+                since: None,
+                until: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, run_id);
     }
 }
