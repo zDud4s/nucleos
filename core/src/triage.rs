@@ -1760,22 +1760,47 @@ mod tests {
         assert_gate_blocks(&state).await;
     }
 
-    #[tokio::test]
-    async fn an_exhausted_budget_blocks_triage() {
-        let state = triage_state().await;
-        sqlx::query("UPDATE autopilot_global SET budget_limit_usd = 0.01")
+    /// Seeds one completed `email_triage` run costing `cost_usd`, and caps the window at `limit`.
+    ///
+    /// The two numbers have to be chosen together, which is exactly what the earlier version of this
+    /// test got wrong. The gate is `spent + per_run_reserve > limit` (`budget.rs`), and the reserve
+    /// defaults to 0.5 (`0012_budget.sql`), so any limit at or below 0.5 closes the gate on its own
+    /// and whatever spend was seeded is decoration.
+    async fn seed_triage_spend(state: &crate::state::AppState, cost_usd: f64, limit: f64) {
+        sqlx::query("UPDATE autopilot_global SET budget_limit_usd = ?")
+            .bind(limit)
             .execute(&state.pool)
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO runs (prompt, status, mode, created_at, completed_at, cost_usd, session_id)
-             VALUES ('x', 'completed', 'email_triage', ?, ?, 5.0, 'spent')",
+             VALUES ('x', 'completed', 'email_triage', ?, ?, ?, 'spent')",
         )
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(chrono::Utc::now().to_rfc3339())
+        .bind(cost_usd)
         .execute(&state.pool)
         .await
         .unwrap();
+    }
+
+    /// Triage spends money, so it must count against the same window every other autonomous run
+    /// does — which is only true while `budget::autonomous_rows` keeps `email_triage` in its mode
+    /// filter. This is the test that notices if it is dropped.
+    ///
+    /// **The version that shipped could not fail.** It set `budget_limit_usd = 0.01` against a
+    /// default reserve of 0.5, so `0.5 > 0.01` closed the gate with ZERO spend and the 5.0 row it
+    /// seeded never entered the arithmetic. It passed identically with `email_triage` counted and
+    /// with it removed — the one distinction it exists to draw. Found by trying to use it to score
+    /// an ablation task, not by reading it.
+    ///
+    /// The limit now sits above the reserve and below `spend + reserve`, so only the seeded spend
+    /// can close the gate; the control below shows it stays open without that spend.
+    #[tokio::test]
+    async fn an_exhausted_budget_blocks_triage() {
+        let state = triage_state().await;
+        // 5.0 spent + 0.5 reserve = 5.5, over the 3.0 cap. Without the spend it is 0.5, well under.
+        seed_triage_spend(&state, 5.0, 3.0).await;
 
         seed_pending(&state.pool, 5, 1).await;
         let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
@@ -1785,6 +1810,27 @@ mod tests {
         assert!(
             !launched,
             "triage must respect the budget it now counts towards"
+        );
+    }
+
+    /// The control that makes the test above mean something. Same cap, same everything, and the only
+    /// difference is that the seeded run cost almost nothing — so the gate has to open. If this ever
+    /// fails alongside its pair passing, the pair is passing for a reason that has nothing to do with
+    /// spend, which is precisely the state it was in before.
+    #[tokio::test]
+    async fn a_budget_with_room_still_lets_triage_run() {
+        let state = triage_state().await;
+        seed_triage_spend(&state, 0.01, 3.0).await;
+
+        seed_pending(&state.pool, 5, 1).await;
+        let launched = triage_now(&state, &mut LoopState::default(), chrono::Utc::now())
+            .await
+            .run_id
+            .is_some();
+        assert!(
+            launched,
+            "a budget with room left must not block triage — otherwise the blocking test above \
+             proves nothing about spend"
         );
     }
 
