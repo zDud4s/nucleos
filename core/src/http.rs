@@ -4,12 +4,14 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::require_token;
+use crate::attention::{self, AttentionScope};
+use crate::auth::{ApiTokenLevel, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
+use crate::backup;
 use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::health;
@@ -39,6 +41,9 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/status", get(status))
         .route("/health/readout", get(health_readout))
+        .route("/backup", post(post_backup))
+        .route("/backups", get(get_backups))
+        .route("/backups/{name}/restore", post(post_backup_restore))
         .route(
             "/autopilot/state",
             get(get_autopilot_state).post(post_autopilot_state),
@@ -55,6 +60,7 @@ pub fn build_router(state: AppState) -> Router {
             "/autopilot/budget",
             get(get_autopilot_budget).post(post_autopilot_budget),
         )
+        .route("/autopilot/attention", post(post_attention_heartbeat))
         .route("/projects", get(get_projects))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -62,6 +68,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/diff", get(get_project_diff))
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
+        .route(
+            "/webhooks/push",
+            post(post_webhook_push)
+                .layer(DefaultBodyLimit::max(crate::webhook::WEBHOOK_BODY_LIMIT)),
+        )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -118,6 +129,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mail-files", get(get_mail_files))
         .route("/mail-files/folder", post(post_mail_folder))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        .route("/api-tokens", get(list_api_tokens).post(create_api_token))
+        .route(
+            "/api-tokens/{name}",
+            axum::routing::delete(revoke_api_token),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -138,8 +154,212 @@ async fn health_readout(State(state): State<AppState>) -> Json<health::HealthRea
     Json(health::readout(state).await)
 }
 
+async fn post_webhook_push(
+    State(state): State<AppState>,
+    Json(delivery): Json<crate::webhook::Delivery>,
+) -> Result<(StatusCode, Json<crate::webhook::DeliveryOutcome>), StatusCode> {
+    let outcome = crate::webhook::deliver(&state, delivery, chrono::Utc::now())
+        .await
+        .map_err(|error| match error {
+            crate::webhook::DeliveryError::Invalid => StatusCode::BAD_REQUEST,
+            crate::webhook::DeliveryError::Unconfigured => StatusCode::NOT_FOUND,
+            crate::webhook::DeliveryError::Storage(error) => {
+                tracing::warn!(%error, "webhook delivery storage failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            crate::webhook::DeliveryError::Config(error) => {
+                tracing::warn!(%error, "webhook project configuration could not be read");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    let status = match outcome {
+        crate::webhook::DeliveryOutcome::Fired { .. } => StatusCode::ACCEPTED,
+        crate::webhook::DeliveryOutcome::Duplicate => StatusCode::OK,
+        crate::webhook::DeliveryOutcome::Deferred { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    Ok((status, Json(outcome)))
+}
+
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+#[derive(Deserialize)]
+struct CreateApiTokenRequest {
+    name: String,
+    level: ApiTokenLevel,
+}
+
+#[derive(Serialize)]
+struct CreatedApiToken {
+    name: String,
+    level: ApiTokenLevel,
+    created_at: String,
+    /// The complete bearer credential. It is returned only by creation, never by listing.
+    token: String,
+}
+
+#[derive(Serialize)]
+struct ApiTokenSummary {
+    name: String,
+    level: ApiTokenLevel,
+    created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiTokenRow {
+    name: String,
+    access_level: String,
+    created_at: String,
+}
+
+fn valid_api_token_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+async fn create_api_token(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiTokenRequest>,
+) -> Result<(StatusCode, Json<CreatedApiToken>), StatusCode> {
+    if !valid_api_token_name(&body.name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let (token, secret) = mint_api_token(&body.name);
+    let result = sqlx::query(
+        "INSERT INTO api_tokens (name, token, access_level, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&body.name)
+    .bind(secret)
+    .bind(body.level.as_str())
+    .bind(&created_at)
+    .execute(&state.pool)
+    .await;
+
+    if let Err(error) = result {
+        if error
+            .as_database_error()
+            .is_some_and(|database| database.is_unique_violation())
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedApiToken {
+            name: body.name,
+            level: body.level,
+            created_at,
+            token,
+        }),
+    ))
+}
+
+async fn list_api_tokens(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiTokenSummary>>, StatusCode> {
+    let rows = sqlx::query_as::<_, ApiTokenRow>(
+        "SELECT name, access_level, created_at FROM api_tokens ORDER BY created_at, name",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(ApiTokenSummary {
+                name: row.name,
+                level: ApiTokenLevel::from_str(&row.access_level)
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+                created_at: row.created_at,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn revoke_api_token(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let result = sqlx::query("DELETE FROM api_tokens WHERE name = ?")
+        .bind(name)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if result.rows_affected() == 0 {
+        Err(StatusCode::NOT_FOUND)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+async fn post_backup(
+    State(state): State<AppState>,
+) -> Result<Json<backup::BackupInfo>, StatusCode> {
+    backup::take_backup(&state.pool, backup::DEFAULT_RETENTION)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+async fn get_backups(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<backup::BackupInfo>>, StatusCode> {
+    backup::list_backups(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+async fn post_backup_restore(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<backup::StagedRestore>, StatusCode> {
+    if !plain_filename(&name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    backup::stage_restore(&state.pool, &name)
+        .await
+        .map(Json)
+        .map_err(|error| backup_status(&error))
+}
+
+fn plain_filename(name: &str) -> bool {
+    if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+
+    let mut components = std::path::Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn backup_status(error: &backup::BackupError) -> StatusCode {
+    match error {
+        backup::BackupError::InvalidName | backup::BackupError::InvalidRetention => {
+            StatusCode::BAD_REQUEST
+        }
+        backup::BackupError::NotFound => StatusCode::NOT_FOUND,
+        backup::BackupError::ExistingTarget(_) | backup::BackupError::PendingRestoreExists => {
+            StatusCode::CONFLICT
+        }
+        backup::BackupError::Verification(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        backup::BackupError::Database(_) | backup::BackupError::Io(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -241,6 +461,11 @@ struct BudgetRequest {
     hourly_limit_usd: Option<f64>,
     per_run_reserve_usd: f64,
     time_cost_per_hour_usd: f64,
+}
+
+#[derive(Deserialize)]
+struct AttentionHeartbeatRequest {
+    project_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -969,6 +1194,21 @@ async fn post_autopilot_budget(
     budget_response(&state).await.map(Json)
 }
 
+async fn post_attention_heartbeat(
+    State(state): State<AppState>,
+    Json(body): Json<AttentionHeartbeatRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let scope = match body.project_id {
+        None => AttentionScope::Global,
+        Some(project_id) if project_id.trim().is_empty() => return Err(StatusCode::BAD_REQUEST),
+        Some(project_id) => AttentionScope::Project(project_id),
+    };
+    attention::record_heartbeat(&state.pool, &scope, chrono::Utc::now())
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode> {
     let now = chrono::Utc::now();
     let config = budget::load_budget_config(&state.pool)
@@ -1413,7 +1653,7 @@ async fn post_shadow_verdict(
     let was_promotable = match &project {
         Some(project_id) => shadow::project_readiness(&state.pool, project_id)
             .await
-            .map(|(ready, total)| shadow::promotable(ready, total))
+            .map(|(ready, total, withheld)| shadow::promotable(ready, total, withheld))
             .unwrap_or(false),
         None => false,
     };
@@ -1448,10 +1688,10 @@ async fn announce_promotable(pool: &sqlx::SqlitePool, project_id: &str, was_prom
     if was_promotable {
         return;
     }
-    let Ok((ready, total)) = shadow::project_readiness(pool, project_id).await else {
+    let Ok((ready, total, withheld)) = shadow::project_readiness(pool, project_id).await else {
         return;
     };
-    if !shadow::promotable(ready, total) {
+    if !shadow::promotable(ready, total, withheld) {
         return;
     }
 
@@ -1485,6 +1725,99 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    async fn file_test_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::storage::open(&dir.path().join("nucleos.db"))
+            .await
+            .unwrap();
+        (
+            AppState {
+                token: Token("test-token".into()),
+                pool,
+                runner: Arc::new(FakeCommandRunner::default()),
+                triage_runner: None,
+                local_triage_disabled: None,
+                run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+                run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+                progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            },
+            dir,
+        )
+    }
+
+    async fn backup_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        build_router(state)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_backup_route_requires_the_bearer_token() {
+        for (method, uri) in [
+            ("POST", "/backup"),
+            ("GET", "/backups"),
+            (
+                "POST",
+                "/backups/nucleos-20260729T010203.000000000Z-0000.db/restore",
+            ),
+        ] {
+            let response = backup_request(test_state().await, method, uri, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_route_rejects_traversal_and_path_separators() {
+        for name in ["bad..name.db", "bad%5Cname.db"] {
+            let response = backup_request(
+                test_state().await,
+                "POST",
+                &format!("/backups/{name}/restore"),
+                Some("test-token"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backups_route_lists_newest_first() {
+        let (state, dir) = file_test_state().await;
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let older = "nucleos-20260729T010203.000000000Z-0000.db";
+        let newer = "nucleos-20260729T020203.000000000Z-0000.db";
+        std::fs::write(backup_dir.join(older), b"old").unwrap();
+        std::fs::write(backup_dir.join(newer), b"new").unwrap();
+
+        let response = backup_request(state.clone(), "GET", "/backups", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed[0]["name"], newer);
+        assert_eq!(listed[1]["name"], older);
+
+        state.pool.close().await;
+        drop(dir);
+    }
+
     async fn test_state() -> AppState {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -1504,8 +1837,224 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_webhook_body_is_refused() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/push")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(vec![
+                        b'x';
+                        crate::webhook::WEBHOOK_BODY_LIMIT + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    async fn api_token_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(body) => {
+                request = request.header("Content-Type", "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        build_router(state)
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_api_token_routes_create_list_once_and_revoke() {
+        let state = test_state().await;
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/api-tokens",
+            "test-token",
+            Some(serde_json::json!({
+                "name": "administrator",
+                "level": "admin"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let admin_token = created["token"].as_str().unwrap().to_owned();
+        assert_eq!(created["name"], "administrator");
+        assert_eq!(created["level"], "admin");
+
+        let stored_secret: String =
+            sqlx::query_scalar("SELECT token FROM api_tokens WHERE name = 'administrator'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(admin_token.split_once('.').unwrap().1, stored_secret);
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/api-tokens",
+            &admin_token,
+            Some(serde_json::json!({
+                "name": "reader",
+                "level": "read-only"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reader: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let reader_token = reader["token"].as_str().unwrap().to_owned();
+
+        let response =
+            api_token_request(state.clone(), "GET", "/api-tokens", &reader_token, None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response =
+            api_token_request(state.clone(), "GET", "/api-tokens", &admin_token, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.iter().all(|entry| entry.get("token").is_none()),
+            "listing existing keys must never return their secrets"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry["name"] == "reader" && entry["level"] == "read-only")
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "DELETE",
+            "/api-tokens/reader",
+            &admin_token,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = api_token_request(state, "GET", "/status", &reader_token, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn store_api_token_at_level(
+        state: &AppState,
+        name: &str,
+        level: ApiTokenLevel,
+    ) -> String {
+        let (token, secret) = mint_api_token(name);
+        sqlx::query(
+            "INSERT INTO api_tokens (name, token, access_level, created_at)
+             VALUES (?, ?, ?, '2026-07-29T12:00:00Z')",
+        )
+        .bind(name)
+        .bind(secret)
+        .bind(level.as_str())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        token
+    }
+
+    #[tokio::test]
+    async fn attention_heartbeat_requires_a_bearer_and_records_the_requested_scope() {
+        let state = test_state().await;
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/autopilot/attention")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/autopilot/attention",
+            "test-token",
+            Some(serde_json::json!({ "project_id": "project-a" })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let stored: (String, String) = sqlx::query_as(
+            "SELECT scope, project_id FROM attention_heartbeats WHERE project_id = 'project-a'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("project".to_string(), "project-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn only_control_and_admin_tokens_may_post_attention_heartbeats() {
+        let state = test_state().await;
+        let read_only = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let admin = store_api_token_at_level(&state, "administrator", ApiTokenLevel::Admin).await;
+
+        for token in [&read_only, &run_creating] {
+            let response = api_token_request(
+                state.clone(),
+                "POST",
+                "/autopilot/attention",
+                token,
+                Some(serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let response = api_token_request(
+            state,
+            "POST",
+            "/autopilot/attention",
+            &admin,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     fn email_batch(messages: serde_json::Value) -> Body {
@@ -2386,6 +2935,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };
 
@@ -2692,6 +3242,78 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["id"], serde_json::json!(turn_id));
+    }
+
+    #[tokio::test]
+    async fn a_run_response_exposes_the_gate_verdict_and_its_reason() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, gate_status, gate_exit_code, gate_output, created_at)
+             VALUES ('gate diagnostics', 'completed', 'worktree', 'errored', NULL,
+                     'gate configuration is unreadable', '2026-07-29T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["gate_status"], "errored");
+        assert_eq!(parsed.get("gate_exit_code"), Some(&serde_json::Value::Null));
+        assert_eq!(parsed["gate_output"], "gate configuration is unreadable");
+    }
+
+    #[tokio::test]
+    async fn a_run_response_exposes_its_token_usage() {
+        let state = test_state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, input_tokens, output_tokens, cache_read_tokens, num_turns,
+              created_at)
+             VALUES ('measured run', 'completed', 'real', 1000, 500, 20000, 12,
+                     '2026-07-29T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["input_tokens"], 1000);
+        assert_eq!(parsed["output_tokens"], 500);
+        assert_eq!(parsed["cache_read_tokens"], 20000);
+        assert_eq!(parsed["num_turns"], 12);
     }
 
     #[tokio::test]
@@ -3735,6 +4357,12 @@ mod tests {
 
     /// Seeds one shadow-mode run whose `read-local` class has `reviewed` approved decisions plus one
     /// still-unreviewed decision, and returns that unreviewed decision's id.
+    ///
+    /// Alongside it, a `push-merge-deploy` class that ALREADY clears the bar — because `promotable`
+    /// also requires one ready class the classifier withheld. Without it no project seeded here could
+    /// ever be promotable, and these three tests would all be asserting against a project held back
+    /// by a criterion none of them is about: one would fail, and the other two would pass for a
+    /// reason their names deny.
     async fn seed_shadow_class(pool: &sqlx::SqlitePool, project_id: &str, reviewed: usize) -> i64 {
         sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
@@ -3748,6 +4376,23 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
+
+        // Seeded first and complete, so the `read-local` class below stays the one whose crossing
+        // these tests observe. `reject` agrees with `pending_approval`, so the class is unanimous.
+        for index in 0..shadow::READINESS_MIN_REVIEWED {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, tool_input, decision, reason, action_class,
+                  classifier_version, human_verdict, reviewed_at, created_at)
+                 VALUES (?, 'Bash', ?, 'pending_approval', 'seed', 'push-merge-deploy', 1,
+                         'reject', NULL, '2026-07-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(format!(r#"{{"command":"git push seed-{index}"}}"#))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
 
         let mut last = 0;
         for index in 0..=reviewed {

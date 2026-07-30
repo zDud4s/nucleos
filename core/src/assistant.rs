@@ -250,7 +250,14 @@ fn spawn_assistant_turn(
                 // does not enforce that on its own — an allowlist only grants — so the policy is
                 // what actually keeps a Telegram turn away from the filesystem and the shell.
                 crate::runner::ToolPolicy::McpOnly,
+                None,
                 session_tx,
+                // Unread here, deliberately. An assistant turn's product is the reply that
+                // `extract_reply` pulls out of a completed run; a turn the wall clock killed has no
+                // reply to salvage, and `assistant_sessions` has nowhere to keep a partial one.
+                // `runs.rs` reads its copy because a run's trajectory is worth keeping even when
+                // the run is not — that difference is in the tables, not an oversight here.
+                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             ),
         )
         .await;
@@ -360,6 +367,7 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
     }

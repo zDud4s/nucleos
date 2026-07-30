@@ -21,6 +21,10 @@ pub struct ProjectSummary {
     /// Shadow-exit progress (§8.2): action classes clearing the bar, out of those exercised so far.
     pub classes_ready: i64,
     pub classes_total: i64,
+    /// How many of those ready classes are ones the classifier WITHHELD (`pending_approval`/`deny`).
+    /// Surfaced separately because it is the criterion a project can fail while looking finished:
+    /// every class ready out of every class exercised, and still nothing proving restraint.
+    pub withheld_classes_ready: i64,
     /// Whether the shell should unlock the promote-to-active control. Computed here rather than in
     /// the shell so the displayed gate and the enforced rule are the same arithmetic (`shadow.rs`).
     pub promotable: bool,
@@ -224,8 +228,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                 let mode = Mode::from_db_str(&mode).ok_or_else(|| {
                     sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
                 })?;
-                let (classes_ready, classes_total) =
-                    readiness.get(&project_id).copied().unwrap_or((0, 0));
+                let (classes_ready, classes_total, withheld_classes_ready) =
+                    readiness.get(&project_id).copied().unwrap_or((0, 0, 0));
                 let wip_limit = wip_override.or(global_wip_limit);
                 Ok(ProjectSummary {
                     project_id,
@@ -234,7 +238,12 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                     pending,
                     classes_ready,
                     classes_total,
-                    promotable: crate::shadow::promotable(classes_ready, classes_total),
+                    withheld_classes_ready,
+                    promotable: crate::shadow::promotable(
+                        classes_ready,
+                        classes_total,
+                        withheld_classes_ready,
+                    ),
                     open_proposals,
                     wip_limit,
                     queue_full: crate::wip::queue_full(open_proposals, wip_limit),
@@ -446,6 +455,7 @@ mod tests {
                     pending: 0,
                     classes_ready: 0,
                     classes_total: 0,
+                    withheld_classes_ready: 0,
                     promotable: false,
                     open_proposals: 0,
                     wip_limit: Some(3),
@@ -458,6 +468,7 @@ mod tests {
                     pending: 0,
                     classes_ready: 0,
                     classes_total: 0,
+                    withheld_classes_ready: 0,
                     promotable: false,
                     open_proposals: 0,
                     wip_limit: Some(3),
@@ -470,6 +481,7 @@ mod tests {
                     pending: 0,
                     classes_ready: 0,
                     classes_total: 0,
+                    withheld_classes_ready: 0,
                     promotable: false,
                     open_proposals: 0,
                     wip_limit: Some(3),
@@ -505,6 +517,7 @@ mod tests {
                     pending: 0,
                     classes_ready: 0,
                     classes_total: 0,
+                    withheld_classes_ready: 0,
                     promotable: false,
                     open_proposals: 0,
                     wip_limit: Some(3),
@@ -517,6 +530,7 @@ mod tests {
                     pending: 0,
                     classes_ready: 0,
                     classes_total: 0,
+                    withheld_classes_ready: 0,
                     promotable: false,
                     open_proposals: 0,
                     wip_limit: Some(3),
@@ -593,6 +607,7 @@ mod tests {
                 pending: 3,
                 classes_ready: 0,
                 classes_total: 1,
+                withheld_classes_ready: 0,
                 promotable: false,
                 // The one unreviewed shadow decision seeded above. It counts here as well as in
                 // `pending`, because the WIP brake throttles on everything waiting for a human and
@@ -625,6 +640,7 @@ mod tests {
                 pending: 0,
                 classes_ready: 0,
                 classes_total: 0,
+                withheld_classes_ready: 0,
                 promotable: false,
                 open_proposals: 0,
                 wip_limit: Some(3),

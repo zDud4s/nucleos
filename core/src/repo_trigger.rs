@@ -106,6 +106,155 @@ pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Opti
 /// 30s scheduler tick.
 const REPO_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+#[derive(Debug)]
+struct GateRefusal {
+    reason: String,
+    stop_tick: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum TriggerFireOutcome {
+    Fired(i64),
+    Deferred { reason: String, stop_tick: bool },
+    Busy,
+    Failed(String),
+}
+
+/// The one governance path for every repo trigger, whether its branch movement came from polling
+/// or an authenticated webhook delivery.
+async fn governance_permits_repo_trigger(
+    state: &crate::state::AppState,
+    project_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), GateRefusal> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(GateRefusal {
+            reason: "global kill switch is engaged or unreadable".to_string(),
+            stop_tick: true,
+        });
+    }
+    if crate::autopilot::scoped_kill_engaged(&state.pool, "trigger", "repo")
+        .await
+        .unwrap_or(true)
+    {
+        return Err(GateRefusal {
+            reason: "repo-trigger kill switch is engaged or unreadable".to_string(),
+            stop_tick: true,
+        });
+    }
+    if crate::autopilot::scoped_kill_engaged(&state.pool, "project", project_id)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(GateRefusal {
+            reason: "project kill switch is engaged or unreadable".to_string(),
+            stop_tick: false,
+        });
+    }
+    if let crate::budget::BudgetDecision::Pause { reason } =
+        crate::budget::budget_permits_new_run(&state.pool, now).await
+    {
+        return Err(GateRefusal {
+            reason,
+            stop_tick: true,
+        });
+    }
+    if let crate::wip::WipDecision::Defer { reason } =
+        crate::wip::wip_permits_new_run(&state.pool, project_id).await
+    {
+        return Err(GateRefusal {
+            reason,
+            stop_tick: false,
+        });
+    }
+    if let crate::attention::AttentionDecision::Defer { reason, scope } =
+        crate::attention::attention_permits_new_run(
+            &state.pool,
+            &state.run_handles,
+            project_id,
+            now,
+        )
+        .await
+    {
+        return Err(GateRefusal {
+            reason,
+            stop_tick: matches!(scope, crate::attention::AttentionScope::Global),
+        });
+    }
+    Ok(())
+}
+
+/// Fire one already-resolved configured repo trigger through the shared autonomy brakes.
+pub(crate) async fn fire_configured_trigger(
+    state: &crate::state::AppState,
+    now: chrono::DateTime<chrono::Utc>,
+    project_id: &str,
+    project_root: &str,
+    project_mode: crate::autopilot::Mode,
+    trigger: &RepoTrigger,
+    current_sha: &str,
+) -> TriggerFireOutcome {
+    if let Err(refusal) = governance_permits_repo_trigger(state, project_id, now).await {
+        return TriggerFireOutcome::Deferred {
+            reason: refusal.reason,
+            stop_tick: refusal.stop_tick,
+        };
+    }
+
+    let run_mode = match project_mode {
+        crate::autopilot::Mode::Shadow => "shadow",
+        crate::autopilot::Mode::Active => "worktree",
+        crate::autopilot::Mode::Off => {
+            return TriggerFireOutcome::Deferred {
+                reason: "project autopilot is off".to_string(),
+                stop_tick: false,
+            };
+        }
+    };
+
+    // Re-read the emergency stop immediately before committing because the preceding checks take
+    // time and a switch thrown during them must stop this queued trigger.
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return TriggerFireOutcome::Deferred {
+            reason: "global kill switch engaged before run creation".to_string(),
+            stop_tick: true,
+        };
+    }
+
+    match crate::runs::create_run_inner(
+        state,
+        trigger.prompt.clone(),
+        Some(project_id.to_string()),
+        Some(project_root.to_string()),
+        run_mode,
+    )
+    .await
+    {
+        Ok(run_id) => {
+            if let Err(error) =
+                record_sha(&state.pool, project_id, &trigger.name, current_sha).await
+            {
+                tracing::error!(
+                    project_id,
+                    trigger = %trigger.name,
+                    run_id,
+                    %error,
+                    "repo-trigger run started but its SHA was not recorded — this trigger will fire again"
+                );
+            }
+            TriggerFireOutcome::Fired(run_id)
+        }
+        Err(crate::runs::CreateRunError::Busy) => TriggerFireOutcome::Busy,
+        Err(error) => TriggerFireOutcome::Failed(error.to_string()),
+    }
+}
+
 /// Background loop: polls every managed project's repo triggers on a slow cadence.
 pub async fn run_repo_poller(state: crate::state::AppState) {
     let mut interval = tokio::time::interval(REPO_POLL_INTERVAL);
@@ -119,26 +268,6 @@ pub async fn run_repo_poller(state: crate::state::AppState) {
 /// arm first-seen triggers without firing, and fire a run for any trigger whose branch SHA changed —
 /// gated by the same global/scoped kill switches and budget as the scheduler.
 pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chrono::Utc>) {
-    // Same governance gates as the scheduler, all fail-closed (skip on read error).
-    if crate::autopilot::kill_switch_engaged(&state.pool)
-        .await
-        .unwrap_or(true)
-    {
-        return;
-    }
-    if crate::autopilot::scoped_kill_engaged(&state.pool, "trigger", "repo")
-        .await
-        .unwrap_or(true)
-    {
-        return;
-    }
-    if let crate::budget::BudgetDecision::Pause { reason } =
-        crate::budget::budget_permits_new_run(&state.pool, now).await
-    {
-        tracing::info!(reason = %reason, "budget exhausted; repo poller paused this tick");
-        return;
-    }
-
     let projects = match crate::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {
@@ -148,23 +277,15 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
     };
 
     for (project_id, project_root, project_mode) in projects {
-        if crate::autopilot::scoped_kill_engaged(&state.pool, "project", &project_id)
-            .await
-            .unwrap_or(true)
-        {
-            continue;
-        }
-
-        // Same brake as the scheduler: a full approval queue defers repo-event work too, otherwise
-        // a busy branch would route around the ceiling the cron path respects.
-        if let crate::wip::WipDecision::Defer { reason } =
-            crate::wip::wip_permits_new_run(&state.pool, &project_id).await
-        {
+        if let Err(refusal) = governance_permits_repo_trigger(state, &project_id, now).await {
             tracing::info!(
                 project_id = %project_id,
-                reason = %reason,
-                "approval queue full; deferring this project's repo triggers"
+                reason = %refusal.reason,
+                "repo-trigger governance brake refused this project"
             );
+            if refusal.stop_tick {
+                return;
+            }
             continue;
         }
 
@@ -206,75 +327,49 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
             }
         }
 
-        let run_mode = match project_mode {
-            crate::autopilot::Mode::Shadow => "shadow",
-            crate::autopilot::Mode::Active => "worktree",
-            crate::autopilot::Mode::Off => continue,
-        };
-
         for trigger in due_repo_triggers(&triggers, &last_shas, &current_shas) {
             let Some(current) = current_shas.get(&trigger.name).cloned() else {
                 continue;
             };
 
-            // Re-read the emergency stop immediately before committing. This poller's preamble
-            // checked it once and then ran a `git fetch` per trigger across every project, which is
-            // network time — a switch thrown during that did not stop the triggers still queued
-            // behind it. Fails closed, like the preamble.
-            if crate::autopilot::kill_switch_engaged(&state.pool)
-                .await
-                .unwrap_or(true)
-            {
-                tracing::info!(
-                    project_id = %project_id,
-                    trigger = %trigger.name,
-                    "kill switch engaged mid-poll; not firing"
-                );
-                return;
-            }
-
-            match crate::runs::create_run_inner(
+            match fire_configured_trigger(
                 state,
-                trigger.prompt.clone(),
-                Some(project_id.clone()),
-                Some(project_root.clone()),
-                run_mode,
+                now,
+                &project_id,
+                &project_root,
+                project_mode,
+                trigger,
+                &current,
             )
             .await
             {
-                Ok(run_id) => {
-                    // Recording AFTER the run starts is what keeps a deferred fire due — but the
-                    // error was being discarded outright, and a write that keeps failing while the
-                    // run keeps succeeding re-fires the same prompt every five minutes forever.
-                    // The SHA cannot be recorded and the trigger cannot be trusted, so say so
-                    // loudly rather than letting the loop quietly repeat itself.
-                    if let Err(error) =
-                        record_sha(&state.pool, &project_id, &trigger.name, &current).await
-                    {
-                        tracing::error!(
-                            project_id = %project_id,
-                            trigger = %trigger.name,
-                            run_id,
-                            %error,
-                            "repo-trigger run started but its SHA was not recorded — this trigger will fire again"
-                        );
-                    }
+                TriggerFireOutcome::Fired(run_id) => {
                     tracing::info!(
                         project_id = %project_id,
                         trigger = %trigger.name,
                         run_id,
-                        run_mode,
                         "fired repo-trigger run"
                     );
                 }
-                Err(crate::runs::CreateRunError::Busy) => {
+                TriggerFireOutcome::Busy => {
                     tracing::info!(
                         project_id = %project_id,
                         trigger = %trigger.name,
                         "repo trigger deferred; project busy"
                     );
                 }
-                Err(error) => {
+                TriggerFireOutcome::Deferred { reason, stop_tick } => {
+                    tracing::info!(
+                        project_id = %project_id,
+                        trigger = %trigger.name,
+                        %reason,
+                        "repo-trigger governance brake refused a queued trigger"
+                    );
+                    if stop_tick {
+                        return;
+                    }
+                }
+                TriggerFireOutcome::Failed(error) => {
                     tracing::warn!(
                         project_id = %project_id,
                         trigger = %trigger.name,
@@ -479,8 +574,103 @@ mod tests {
             local_triage_disabled: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    async fn seed_due_repo_project(state: &crate::state::AppState, project_id: &str, repo: &Path) {
+        let branch = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        std::fs::create_dir_all(repo.join(".ai")).unwrap();
+        std::fs::write(
+            repo.join(".ai").join("autopilot.yaml"),
+            format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
+        )
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES (?, 'shadow', ?)",
+        )
+        .bind(project_id)
+        .bind(repo.to_string_lossy().as_ref())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let old_head = git_stdout(repo, &["rev-parse", "HEAD"]);
+        record_sha(&state.pool, project_id, "t1", &old_head)
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join(format!("{project_id}.txt")), "changed\n").unwrap();
+        assert!(git_ok(repo, &["add", "-A"]));
+        assert!(git_ok(repo, &["commit", "-m", "trigger change"]));
+    }
+
+    #[tokio::test]
+    async fn a_project_heartbeat_only_stops_that_projects_repo_trigger() {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let state = test_state().await;
+        seed_due_repo_project(&state, "project-a", repo_a.path()).await;
+        seed_due_repo_project(&state, "project-b", repo_b.path()).await;
+        let now = ts("2026-07-20T10:00:00Z");
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Project("project-a".to_string()),
+            now,
+        )
+        .await
+        .unwrap();
+
+        poll_tick(&state, now).await;
+
+        let fired_projects: Vec<String> =
+            sqlx::query_scalar("SELECT project_id FROM runs ORDER BY project_id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(fired_projects, ["project-b"]);
+    }
+
+    #[tokio::test]
+    async fn a_global_heartbeat_stops_all_repo_triggers() {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let state = test_state().await;
+        seed_due_repo_project(&state, "project-a", repo_a.path()).await;
+        seed_due_repo_project(&state, "project-b", repo_b.path()).await;
+        let now = ts("2026-07-20T10:00:00Z");
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            now,
+        )
+        .await
+        .unwrap();
+
+        poll_tick(&state, now).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn no_heartbeat_leaves_repo_trigger_firing_unchanged() {
+        let repo = init_repo();
+        let state = test_state().await;
+        seed_due_repo_project(&state, "project", repo.path()).await;
+
+        poll_tick(&state, ts("2026-07-20T10:00:00Z")).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 1);
     }
 
     #[tokio::test]

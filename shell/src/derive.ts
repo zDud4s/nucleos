@@ -135,18 +135,54 @@ export function readinessCriterionLabel(): string {
   return `Ready at ${READINESS_MIN_REVIEWED}+ reviews, ≥${Math.round(READINESS_MIN_RATE * 100)}% agreement`;
 }
 
+/** The three numbers the shadow-exit rule is decided on, exactly as `shadow.rs` computes them. */
+export interface PromotionCriteria {
+  classes_ready: number;
+  classes_total: number;
+  withheld_classes_ready: number;
+}
+
+/**
+ * Which promotion criterion is not met yet, or null when they all are.
+ *
+ * Three situations, because each asks for something different to be done about it. Nothing reviewed
+ * yet is a lack of evidence. A class short of the bar is more reviewing. And a corpus of nothing but
+ * ALLOWED actions is a gap that no amount of further reviewing closes: it validates that the
+ * classifier lets through what it should, and says nothing about whether it holds back what it
+ * should — restraint being the only property that matters once the project acts on its own.
+ *
+ * That last one is the case that reads as a bug when it is not named: every exercised class ready,
+ * every count matching, and the button still locked.
+ */
+export function promotionCriterionGap(criteria: PromotionCriteria): string | null {
+  if (criteria.classes_total === 0) return "No reviewed shadow decisions yet";
+  if (criteria.classes_ready < criteria.classes_total) {
+    return `${criteria.classes_ready}/${criteria.classes_total} action classes ready`;
+  }
+  if (criteria.withheld_classes_ready === 0) {
+    return "No withheld action class has cleared the review bar";
+  }
+  return null;
+}
+
 /**
  * Why the promote-to-active control is locked for a project, or null when it may be promoted.
  *
  * The gate exists so shadow mode has a real exit criterion: promotion stays the human's call, but it
  * can't be made on a hunch after three runs. A project already active is never gated (this only
- * guards the way IN to autonomy), and a project with nothing reviewed yet is blocked for lack of
- * evidence rather than for failing the bar — a different message, because it's a different problem.
+ * guards the way IN to autonomy).
+ *
+ * The daemon still owns the verdict — `project.promotable` is what unlocks the control. This only
+ * decides which unmet criterion to NAME, which is why it delegates: the wording of the gap and the
+ * arithmetic behind it stay in one place.
  */
 export function promotionBlock(project: ProjectSummary): string | null {
   if (project.mode === "active" || project.promotable) return null;
-  if (project.classes_total === 0) return "No reviewed shadow decisions yet";
-  return `${project.classes_ready}/${project.classes_total} action classes ready`;
+  return promotionCriterionGap({
+    classes_ready: project.classes_ready,
+    classes_total: project.classes_total,
+    withheld_classes_ready: project.withheld_classes_ready ?? 0,
+  });
 }
 
 /**

@@ -1,7 +1,9 @@
 mod assistant;
+mod attention;
 mod auth;
 mod autopilot;
 mod autostart;
+mod backup;
 mod budget;
 mod classifier;
 mod config;
@@ -9,6 +11,7 @@ mod contacts;
 mod daemon_client;
 mod email;
 mod feed;
+mod gate;
 mod health;
 mod hooks;
 mod http;
@@ -30,6 +33,7 @@ mod sidecar;
 mod state;
 mod storage;
 mod triage;
+mod webhook;
 mod wip;
 mod worktree;
 
@@ -145,6 +149,17 @@ async fn main() {
     }
 
     let db_path = dirs.data_local_dir().join("nucleos.db");
+    match backup::apply_pending_restore(&db_path).await {
+        Ok(Some(applied)) => tracing::warn!(
+            "applied pending database restore from {}; safety backup at {}",
+            applied.restored_from,
+            applied.safety_backup.display()
+        ),
+        Ok(None) => tracing::info!("no pending database restore to apply"),
+        Err(e) => tracing::error!(
+            "failed to apply pending database restore; continuing startup and retrying next start: {e}"
+        ),
+    }
     let pool = storage::open(&db_path)
         .await
         .expect("failed to open local database");
@@ -276,6 +291,7 @@ async fn main() {
             mail_files_root,
         )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
 
