@@ -2163,6 +2163,85 @@ mod tests {
         }
         assert_eq!(feed_kind.as_deref(), Some("worktree_gate_failed"));
 
+        // The feed row was all this asserted, which left the `failed` verdict itself unpinned:
+        // `gate_status` is checked as 'passed', 'errored' and NULL elsewhere but never as 'failed',
+        // and `gate_exit_code` is only ever asserted to be NULL. The column that carries the exit
+        // code was never once checked holding one, so nothing distinguished exit 7 from exit 1 — or
+        // from the gate not having run at all.
+        let (gate_status, gate_exit_code, gate_output): (Option<String>, Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT gate_status, gate_exit_code, gate_output FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(gate_status.as_deref(), Some("failed"));
+        assert_eq!(gate_exit_code, Some(7), "the gate's own exit code must reach the row");
+        assert!(gate_output.is_some(), "a failing gate must keep its output tail");
+
+        let worktree_path: String =
+            sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
+    }
+
+    /// Replaces `budget::a_gate_execution_is_not_an_autonomous_row`, which could not fail: it opened
+    /// a pool that `run_gate` never receives — the function takes no pool and `gate.rs` has no SQL —
+    /// then compared an empty table to itself. It was cited during this series as evidence that the
+    /// property held.
+    ///
+    /// The property worth pinning is the one the spec actually claims: the gate costs the autonomy
+    /// budget nothing. That holds because `completed_at` is captured BEFORE the gate runs, so the
+    /// billed window closes when the agent stopped, not when the measurement finished. Moving that
+    /// capture after the gate would silently start charging a project for verifying its own work.
+    #[tokio::test]
+    async fn a_gate_is_not_billed_to_the_run_it_measures() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-gate-billing-");
+        // A full second of gate, so the margin below cannot be explained by scheduling noise.
+        configure_gate(&repo, r#"sh -c "sleep 1; exit 0""#);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let started = tokio::time::Instant::now();
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let mut row: Option<(String, Option<String>, Option<String>)> = None;
+        for _ in 0..300 {
+            row = sqlx::query_as(
+                "SELECT created_at, completed_at, gate_status FROM runs WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if matches!(&row, Some((_, Some(_), Some(_)))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let observed = started.elapsed();
+        let (created_at, completed_at, gate_status) = row.expect("the run must reach a terminal row");
+        assert_eq!(gate_status.as_deref(), Some("passed"));
+
+        let created = chrono::DateTime::parse_from_rfc3339(&created_at).unwrap();
+        let completed =
+            chrono::DateTime::parse_from_rfc3339(&completed_at.expect("completed_at")).unwrap();
+        let billed = (completed - created).to_std().unwrap_or_default();
+
+        // The gate slept a second AFTER completed_at was captured, so real elapsed time must exceed
+        // the billed window by roughly that second. Half of it is margin.
+        assert!(
+            observed > billed + Duration::from_millis(500),
+            "the gate must fall outside the billed window: billed {billed:?}, observed {observed:?}"
+        );
+
         let worktree_path: String =
             sqlx::query_scalar("SELECT path FROM worktrees WHERE run_id = ?")
                 .bind(id)
