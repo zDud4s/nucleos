@@ -730,7 +730,7 @@ pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
 /// away leaves a directory the GC now believes is gone. Both leak forever without this.
 ///
 /// Fail-safe: a directory whose age cannot be determined is left alone, and anything not named
-/// `run-<id>` is not ours to touch.
+/// `run-<id>` or `job-<id>` is not ours to touch.
 /// The owner a worktree directory name denotes, or `None` when the name is not ours to touch.
 ///
 /// Fail-safe by construction: an unparseable name yields `None` and the sweeper leaves the directory
@@ -739,6 +739,9 @@ pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
 fn owner_from_dir_name(name: &str) -> Option<Owner> {
     if let Some(rest) = name.strip_prefix("run-") {
         return rest.parse::<i64>().ok().map(Owner::Run);
+    }
+    if let Some(rest) = name.strip_prefix("job-") {
+        return rest.parse::<i64>().ok().map(Owner::Job);
     }
     None
 }
@@ -913,11 +916,7 @@ mod tests {
         set_worktree_created_at_for(pool, Owner::Run(run_id), created_at).await;
     }
 
-    async fn set_worktree_created_at_for(
-        pool: &sqlx::SqlitePool,
-        owner: Owner,
-        created_at: &str,
-    ) {
+    async fn set_worktree_created_at_for(pool: &sqlx::SqlitePool, owner: Owner, created_at: &str) {
         sqlx::query("UPDATE worktrees SET created_at = ? WHERE owner_kind = ? AND owner_id = ?")
             .bind(created_at)
             .bind(owner.kind())
@@ -1138,7 +1137,9 @@ mod tests {
             ],
         ));
 
-        create(repo.path(), Owner::Run(4242)).await.expect("create worktree");
+        create(repo.path(), Owner::Run(4242))
+            .await
+            .expect("create worktree");
 
         assert!(
             !canary.exists(),
@@ -1158,7 +1159,9 @@ mod tests {
             &[OsStr::new("status"), OsStr::new("--porcelain")],
         );
 
-        let info = create(repo.path(), Owner::Run(7)).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(7))
+            .await
+            .expect("create worktree");
         assert!(info.path.is_dir());
         assert_eq!(info.branch, "nucleos/run-7");
         let branch_listing = git_stdout(
@@ -1229,7 +1232,9 @@ mod tests {
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), Owner::Run(101)).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(101))
+            .await
+            .expect("create worktree");
         let commits_before = commit_count(repo.path(), &info.branch);
 
         std::fs::write(info.path.join("seed.txt"), "modified\n").expect("modify tracked file");
@@ -1301,7 +1306,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let orphan = create(repo.path(), Owner::Run(102)).await.expect("create orphan");
+        let orphan = create(repo.path(), Owner::Run(102))
+            .await
+            .expect("create orphan");
         let commits_before = commit_count(repo.path(), &orphan.branch);
         std::fs::write(orphan.path.join("crash-recovery.txt"), "survived startup\n")
             .expect("write orphaned work");
@@ -1333,7 +1340,9 @@ mod tests {
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), Owner::Run(103)).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(103))
+            .await
+            .expect("create worktree");
         let commits_before = commit_count(repo.path(), &info.branch);
 
         remove(repo.path(), &info.path, &[])
@@ -1363,7 +1372,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let info = create(repo.path(), Owner::Run(104)).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(104))
+            .await
+            .expect("create worktree");
         let commits_before = commit_count(repo.path(), &info.branch);
         std::fs::write(info.path.join("failure.txt"), "must survive\n")
             .expect("write uncommitted work");
@@ -1481,7 +1492,9 @@ mod tests {
         ));
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), Owner::Run(105)).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(105))
+            .await
+            .expect("create worktree");
         let ceiling = 64_u64;
         let commits_before = commit_count(repo.path(), &info.branch);
 
@@ -1896,12 +1909,13 @@ mod tests {
         gc_pass(&pool, now, chrono::Duration::hours(72), &[]).await;
 
         assert!(!info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_some());
         assert!(
             gc_candidates(&pool, now, chrono::Duration::hours(72))
@@ -1944,12 +1958,13 @@ mod tests {
         .await;
 
         assert!(info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_none());
     }
 
@@ -2072,12 +2087,13 @@ mod tests {
         )
         .await;
 
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(
             removed_at.is_some(),
             "a vanished directory must retire its row, not be retried forever"
@@ -2127,12 +2143,13 @@ mod tests {
         );
 
         assert!(!info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_some());
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
@@ -2190,12 +2207,13 @@ mod tests {
         );
 
         assert!(info.path.exists());
-        let removed_at: Option<String> =
-            sqlx::query_scalar("SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(removed_at.is_none());
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
@@ -2300,7 +2318,9 @@ mod tests {
         let repo = init_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        let info = create(repo.path(), Owner::Run(9)).await.expect("create worktree");
+        let info = create(repo.path(), Owner::Run(9))
+            .await
+            .expect("create worktree");
         let handle = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2352,7 +2372,9 @@ mod tests {
         let _env = WorktreeRootEnv::set(Some(root.path()));
 
         // A crash between `git worktree add` and the row INSERT: on disk, unknown to the database.
-        let unrecorded = create(repo.path(), Owner::Run(41)).await.expect("create worktree");
+        let unrecorded = create(repo.path(), Owner::Run(41))
+            .await
+            .expect("create worktree");
         // A removal that set `removed_at` but whose files never went away.
         let leaked_run = insert_run(&pool, "completed", None, "2026-07-27T00:00:00+00:00").await;
         let leaked = create_and_record(&pool, repo.path(), leaked_run).await;
@@ -2371,13 +2393,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn an_unaccounted_job_directory_is_sweepable() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        // Nothing creates a `job-*` worktree yet. The sweeper has to recognise the name *before*
+        // the first one exists: a directory it does not recognise is one it never collects, so a
+        // name taught later leaves every job worktree made in the meantime leaking forever, with
+        // nothing to report it.
+        let orphan = create(repo.path(), Owner::Job(3))
+            .await
+            .expect("create job worktree");
+
+        let orphans = orphaned_worktrees(&pool, repo.path(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(orphans, vec![orphan.path.clone()]);
+    }
+
+    #[test]
+    fn an_artifacts_directory_is_not_a_worktree() {
+        // The sweeper deletes what this returns, so a looser parse — splitting on `.`, say — would
+        // read a sibling artifacts directory as its job and take it too.
+        assert_eq!(owner_from_dir_name("job-5.artifacts"), None);
+        assert_eq!(owner_from_dir_name("job-5"), Some(Owner::Job(5)));
+        assert_eq!(owner_from_dir_name("run-5"), Some(Owner::Run(5)));
+        assert_eq!(owner_from_dir_name("not-a-run"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_leaves_a_young_directory_alone() {
         let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
-        create(repo.path(), Owner::Run(42)).await.expect("create worktree");
+        create(repo.path(), Owner::Run(42))
+            .await
+            .expect("create worktree");
 
         // Freshly made and unrecorded looks exactly like a run mid-way through starting up, so the
         // age gate is what stops the sweep from deleting a worktree out from under a live run.
@@ -2401,7 +2458,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let orphan = create(repo.path(), Owner::Run(43)).await.expect("create worktree");
+        let orphan = create(repo.path(), Owner::Run(43))
+            .await
+            .expect("create worktree");
 
         let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
             .await

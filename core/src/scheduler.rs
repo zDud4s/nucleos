@@ -1104,12 +1104,13 @@ mod tests {
                 .unwrap();
         assert_eq!(mode, "worktree");
         assert_eq!(project_id.as_deref(), Some("proj"));
-        let worktree_path: String =
-            sqlx::query_scalar("SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?")
-                .bind(run_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let worktree_path: String = sqlx::query_scalar(
+            "SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
         let stored: String = sqlx::query_scalar(
             "SELECT last_fired_at FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'r1'",
         )
