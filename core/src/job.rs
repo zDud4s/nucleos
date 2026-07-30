@@ -77,10 +77,123 @@ pub fn parse_plan(contents: Option<&[u8]>, max_items: usize) -> Result<PlannedIt
     })
 }
 
+/// Where one item of a job's queue has got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemState {
+    Pending,
+    Running,
+    /// The run finished cleanly but the gate has not measured it yet.
+    Implemented,
+    /// Gated green, or no gate is configured for this project.
+    Passed,
+    Failed,
+    GateFailed,
+    GateErrored,
+}
+
+/// Whether the job still owes a review node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    NotWanted,
+    Pending,
+    Running,
+    Done,
+}
+
+/// How a job ended.
+///
+/// `GateFailed` and `GateErrored` stay apart all the way up from `gate::GateOutcome`: a non-zero
+/// exit says the code is broken, a binary that would not start says the measurement never happened.
+/// Collapsing them would report silence as a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Completed,
+    Failed,
+    GateFailed,
+    GateErrored,
+}
+
+/// What the daemon should do next for a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    SpawnPlan,
+    SpawnImplement {
+        ordinal: usize,
+    },
+    RunGate {
+        ordinal: usize,
+    },
+    SpawnReview,
+    /// A node is in flight; nothing to do until it lands.
+    Wait,
+    Finish(Outcome),
+}
+
+/// Everything the decision below needs to see, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobView {
+    /// Whether a plan node has already produced a queue. Distinct from `items` being empty, which
+    /// is a planner that looked and found no work.
+    pub planned: bool,
+    pub items: Vec<ItemState>,
+    pub review: ReviewState,
+}
+
+/// Decides a job's next move from what is observable about it.
+///
+/// Pure, and kept that way on purpose — the same split `classifier.rs` has from `hooks.rs`. Every
+/// interesting question about a job ("does a red gate stop the chain?", "where does a resume pick
+/// up?") becomes a table test with no database, no worktree and no subprocess. The caller owns the
+/// I/O and is free to be dumb.
+pub fn next_step(job: &JobView) -> Next {
+    // Failures first, and before the in-flight check: a chain with a broken item must stop even if
+    // another node is still running, rather than spending budget on work about to be thrown away.
+    for item in &job.items {
+        match item {
+            ItemState::Failed => return Next::Finish(Outcome::Failed),
+            ItemState::GateFailed => return Next::Finish(Outcome::GateFailed),
+            ItemState::GateErrored => return Next::Finish(Outcome::GateErrored),
+            _ => {}
+        }
+    }
+
+    if !job.planned {
+        return Next::SpawnPlan;
+    }
+    if job.items.is_empty() {
+        return Next::Finish(Outcome::Completed);
+    }
+    if job.items.contains(&ItemState::Running) {
+        return Next::Wait;
+    }
+    // Gate before starting the next item: on a shared worktree, letting item i+1 build on unmeasured
+    // work means a later red gate cannot say which item broke it.
+    if let Some(ordinal) = job
+        .items
+        .iter()
+        .position(|item| *item == ItemState::Implemented)
+    {
+        return Next::RunGate { ordinal };
+    }
+    if let Some(ordinal) = job
+        .items
+        .iter()
+        .position(|item| *item == ItemState::Pending)
+    {
+        return Next::SpawnImplement { ordinal };
+    }
+
+    match job.review {
+        ReviewState::Pending => Next::SpawnReview,
+        ReviewState::Running => Next::Wait,
+        ReviewState::NotWanted | ReviewState::Done => Next::Finish(Outcome::Completed),
+    }
+}
+
 /// Starts a job and returns its id.
 ///
 /// Fails when the project already has a live one. That refusal is the unique index
-/// `one_live_job_per_project` (migration 0036) rather than a check here, deliberately: with the
+/// `one_live_job_per_project` (migration 0037) rather than a check here, deliberately: with the
 /// constraint in the storage layer the INSERT itself is the lock, so a scheduler tick and a manual
 /// request racing for the same project cannot both pass a check and then both proceed. It mirrors
 /// what `one_open_worktree_run_per_project` already does for runs.
@@ -122,6 +235,115 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    fn view(planned: bool, items: &[ItemState], review: ReviewState) -> JobView {
+        JobView {
+            planned,
+            items: items.to_vec(),
+            review,
+        }
+    }
+
+    #[test]
+    fn a_job_walks_plan_then_each_item_then_review() {
+        // One walk rather than five isolated assertions: the sequence is the behaviour, and a
+        // transition that is right in isolation can still be reached in the wrong order.
+        let mut items = vec![ItemState::Pending, ItemState::Pending];
+
+        assert_eq!(
+            next_step(&view(false, &[], ReviewState::Pending)),
+            Next::SpawnPlan
+        );
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::SpawnImplement { ordinal: 0 }
+        );
+
+        items[0] = ItemState::Implemented;
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::RunGate { ordinal: 0 }
+        );
+
+        items[0] = ItemState::Passed;
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::SpawnImplement { ordinal: 1 }
+        );
+
+        items[1] = ItemState::Passed;
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::SpawnReview
+        );
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Done)),
+            Next::Finish(Outcome::Completed)
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_completes_without_implementing_anything() {
+        // A planner that found no work had a successful night. Only an absent plan.json is a
+        // failure, and that distinction is made before this function ever sees the job.
+        assert_eq!(
+            next_step(&view(true, &[], ReviewState::Pending)),
+            Next::Finish(Outcome::Completed)
+        );
+    }
+
+    #[test]
+    fn a_failed_item_stops_the_chain_instead_of_moving_on() {
+        let items = [ItemState::Failed, ItemState::Pending];
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::Finish(Outcome::Failed)
+        );
+    }
+
+    #[test]
+    fn a_failed_gate_and_an_errored_gate_end_the_job_differently() {
+        // The distinction gate.rs guards and §7 of the spec insists must survive the trip up to the
+        // job: a non-zero exit says the code is broken, a binary that would not start says the
+        // measurement never happened. One of those is a verdict; the other is silence.
+        assert_eq!(
+            next_step(&view(true, &[ItemState::GateFailed], ReviewState::Pending)),
+            Next::Finish(Outcome::GateFailed)
+        );
+        assert_eq!(
+            next_step(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
+            Next::Finish(Outcome::GateErrored)
+        );
+    }
+
+    #[test]
+    fn work_resumes_at_the_first_unfinished_item_not_the_first_item() {
+        // What `stage_cursor` exists for. Resuming at zero would redo work the gate already passed,
+        // on a worktree that still holds it.
+        let items = [ItemState::Passed, ItemState::Passed, ItemState::Pending];
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::SpawnImplement { ordinal: 2 }
+        );
+    }
+
+    #[test]
+    fn a_running_node_is_waited_for_rather_than_raced() {
+        let items = [ItemState::Running, ItemState::Pending];
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::Pending)),
+            Next::Wait
+        );
+    }
+
+    #[test]
+    fn a_job_without_review_completes_at_the_last_item() {
+        let items = [ItemState::Passed];
+        assert_eq!(
+            next_step(&view(true, &items, ReviewState::NotWanted)),
+            Next::Finish(Outcome::Completed)
+        );
     }
 
     #[test]
