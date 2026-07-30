@@ -32,10 +32,8 @@ pub fn normalize_address(address: &str) -> String {
 }
 
 #[derive(Clone, Copy)]
-enum MessageDirection {
+pub enum MessageDirection {
     Inbound,
-    // Consumed by the Sent-folder ingestion packet (P4).
-    #[allow(dead_code)]
     Outbound,
 }
 
@@ -148,8 +146,6 @@ pub async fn record_inbound(
     Ok(())
 }
 
-// Consumed by the Sent-folder ingestion packet (P4).
-#[allow(dead_code)]
 pub async fn record_outbound(
     transaction: &mut Transaction<'_, Sqlite>,
     to_addrs: &[&str],

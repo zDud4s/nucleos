@@ -323,6 +323,7 @@ async fn post_email_incoming(
     uncancellable(async move {
         crate::email::ingest_batch(
             &pool,
+            crate::contacts::MessageDirection::Inbound,
             &body.mailbox,
             body.uidvalidity,
             body.max_uid_examined,

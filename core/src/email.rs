@@ -332,6 +332,7 @@ impl EntryClass {
 #[allow(clippy::too_many_arguments)]
 pub async fn ingest_batch(
     pool: &sqlx::SqlitePool,
+    direction: crate::contacts::MessageDirection,
     mailbox: &str,
     uidvalidity: i64,
     max_uid_examined: i64,
@@ -341,6 +342,10 @@ pub async fn ingest_batch(
     now: chrono::DateTime<chrono::Utc>,
 ) -> sqlx::Result<IngestOutcome> {
     let now_str = now.to_rfc3339();
+    let direction_value = match direction {
+        crate::contacts::MessageDirection::Inbound => "inbound",
+        crate::contacts::MessageDirection::Outbound => "outbound",
+    };
     let mut tx = pool.begin().await?;
 
     let stored: Option<(i64, i64, String)> = sqlx::query_as(
@@ -386,9 +391,18 @@ pub async fn ingest_batch(
         // calibration week (§9) has a real corpus to judge the classifier against, and dropping
         // them at classification would make that week one-way — a wrong call could never be
         // reviewed. With retention on, periodic pruning is what clears them (§7.2).
-        let body = match entry.triage_class {
-            Some(_) if retain_bodies_days == 0 => None,
-            _ => message.body_text.as_deref().map(truncate_body),
+        let body = match direction {
+            crate::contacts::MessageDirection::Outbound => None,
+            crate::contacts::MessageDirection::Inbound => match entry.triage_class {
+                Some(_) if retain_bodies_days == 0 => None,
+                _ => message.body_text.as_deref().map(truncate_body),
+            },
+        };
+        let to_addrs = match direction {
+            crate::contacts::MessageDirection::Inbound => None,
+            crate::contacts::MessageDirection::Outbound => {
+                message.headers.get("to").map(String::as_str)
+            }
         };
         let triaged_at = entry.triage_class.map(|_| now_str.as_str());
 
@@ -396,8 +410,8 @@ pub async fn ingest_batch(
             "INSERT OR IGNORE INTO emails
                  (message_id, mailbox, uidvalidity, uid, from_addr, from_name, subject, body_text,
                   has_attachments, received_at, ingested_at, triage_class, triage_summary,
-                  triaged_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  triaged_at, direction, to_addrs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&key)
         .bind(mailbox)
@@ -413,17 +427,32 @@ pub async fn ingest_batch(
         .bind(entry.triage_class)
         .bind(entry.summary.as_deref())
         .bind(triaged_at)
+        .bind(direction_value)
+        .bind(to_addrs)
         .execute(tx.as_mut())
         .await?;
 
         if result.rows_affected() == 1 {
-            crate::contacts::record_inbound(
-                &mut tx,
-                &message.from_addr,
-                message.from_name.as_deref(),
-                &message.received_at,
-            )
-            .await?;
+            match direction {
+                crate::contacts::MessageDirection::Inbound => {
+                    crate::contacts::record_inbound(
+                        &mut tx,
+                        &message.from_addr,
+                        message.from_name.as_deref(),
+                        &message.received_at,
+                    )
+                    .await?;
+                }
+                crate::contacts::MessageDirection::Outbound => {
+                    let recipients = to_addrs
+                        .into_iter()
+                        .flat_map(|header| header.split(','))
+                        .filter(|address| !address.trim().is_empty())
+                        .collect::<Vec<_>>();
+                    crate::contacts::record_outbound(&mut tx, &recipients, &message.received_at)
+                        .await?;
+                }
+            }
             ingested += 1;
             // Only for a row this batch actually created. A duplicate already has its attachments,
             // and re-inserting them would either collide on the UNIQUE or silently double a list
@@ -1105,9 +1134,19 @@ mod tests {
         messages: &[IncomingMessage],
         max_uid_examined: i64,
     ) -> IngestOutcome {
-        ingest_batch(pool, "INBOX", 1, max_uid_examined, &[], messages, 14, now())
-            .await
-            .unwrap()
+        ingest_batch(
+            pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            max_uid_examined,
+            &[],
+            messages,
+            14,
+            now(),
+        )
+        .await
+        .unwrap()
     }
 
     async fn class_of(pool: &sqlx::SqlitePool, message_id: &str) -> Option<String> {
@@ -1197,6 +1236,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enviados_nunca_guardam_corpo() {
+        let pool = test_pool().await;
+        let secret = "rascunho confidencial que nunca deve entrar na base";
+        let mut sent = message(22);
+        sent.body_text = Some(secret.into());
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            22,
+            &[],
+            std::slice::from_ref(&sent),
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            22,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let outbound: (String, Option<String>) =
+            sqlx::query_as("SELECT direction, body_text FROM emails WHERE mailbox = 'Sent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let inbound: (String, Option<String>) =
+            sqlx::query_as("SELECT direction, body_text FROM emails WHERE mailbox = 'INBOX'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            (outbound, inbound),
+            (
+                ("outbound".to_string(), None),
+                ("inbound".to_string(), Some(secret.to_string()))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn enviados_marcam_o_trinco_sem_contar() {
+        let pool = test_pool().await;
+        let first = "primeiro.destinatario@example.com";
+        let second = "segundo.destinatario@example.com";
+        let to_header = format!("{first}, {second}");
+        let mut sent = message(23);
+        sent.headers.insert("to".into(), to_header);
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            23,
+            &[],
+            &[sent],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let to_addrs: Option<String> =
+            sqlx::query_scalar("SELECT to_addrs FROM emails WHERE mailbox = 'Sent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let first_profile = crate::contacts::profile_for(&pool, first)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let second_profile = crate::contacts::profile_for(&pool, second)
+            .await
+            .unwrap()
+            .map(|profile| (profile.messages_in, profile.outbound_ever));
+        let stored_both = to_addrs
+            .as_deref()
+            .is_some_and(|stored| stored.contains(first) && stored.contains(second));
+
+        assert_eq!(
+            (stored_both, first_profile, second_profile),
+            (true, Some((0, true)), Some((0, true)))
+        );
+    }
+
+    #[tokio::test]
     async fn a_message_without_an_id_gets_a_synthetic_one() {
         let pool = test_pool().await;
         let mut m = message(77);
@@ -1261,9 +1400,19 @@ mod tests {
         let mut old = message(15);
         old.received_at = ago(72);
 
-        ingest_batch(&pool, "INBOX", 1, 15, &[], &[noisy, old], 0, now())
-            .await
-            .unwrap();
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            15,
+            &[],
+            &[noisy, old],
+            0,
+            now(),
+        )
+        .await
+        .unwrap();
 
         for message_id in ["<m14@x>", "<m15@x>"] {
             let body: Option<String> =
@@ -1328,6 +1477,7 @@ mod tests {
 
         let result = ingest_batch(
             &pool,
+            crate::contacts::MessageDirection::Inbound,
             "INBOX",
             1,
             21,
@@ -1365,6 +1515,7 @@ mod tests {
         let pool = test_pool().await;
         ingest_batch(
             &pool,
+            crate::contacts::MessageDirection::Inbound,
             "INBOX",
             1,
             60,
@@ -1393,9 +1544,19 @@ mod tests {
     async fn a_uidvalidity_change_replaces_the_cursor() {
         let pool = test_pool().await;
         seed_cursor(&pool, 1, 900, 0).await;
-        let outcome = ingest_batch(&pool, "INBOX", 2, 5, &[], &[], 14, now())
-            .await
-            .unwrap();
+        let outcome = ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            2,
+            5,
+            &[],
+            &[],
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.cursor, 5, "a rebuilt uid space is not a rewind");
         let cursor = get_cursor(&pool, "INBOX").await.unwrap().unwrap();
         assert_eq!(cursor.uidvalidity, 2);
