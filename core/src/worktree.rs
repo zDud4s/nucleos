@@ -653,23 +653,18 @@ async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted:
     .await;
 }
 
-pub async fn gc_candidates(
-    pool: &SqlitePool,
-    now: DateTime<Utc>,
-    retention: chrono::Duration,
-) -> sqlx::Result<Vec<WorktreeRow>> {
-    let cutoff = (now - retention).to_rfc3339();
-    sqlx::query_as(
-        // Two arms rather than one join, because a worktree's owner decides which table says whether
-        // it is finished. `owner_kind` is load-bearing in both: the joins match on the bare id, and
-        // run ids and job ids come from different sequences, so without the filters a job whose id
-        // happened to equal a terminal run's would have its worktree collected mid-use. There is a
-        // test on exactly that (`a_job_worktree_is_not_collected_by_a_run_of_the_same_id`).
-        //
-        // The job arm lists terminal statuses explicitly rather than excluding live ones. Adding a
-        // status later then defaults to *not collected* — a stale directory — instead of to deleting
-        // the worktree of a job still using it.
-        "SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
+// Two arms rather than one join, because a worktree's owner decides which table says whether it is
+// finished. `owner_kind` is load-bearing in both: the joins match on the bare id, and run ids and
+// job ids come from different sequences, so without the filters a job whose id happened to equal a
+// terminal run's would have its worktree collected mid-use. There is a test on exactly that
+// (`a_job_worktree_is_not_collected_by_a_run_of_the_same_id`).
+//
+// The job arm lists terminal statuses explicitly rather than excluding live ones. A status added
+// later then defaults to *not collected* — a stale directory — instead of to deleting the worktree
+// of a job still using it. That is the safe direction and still a leak, so
+// `every_ending_a_job_can_have_is_an_ending_the_gc_collects` holds this list against `job.rs`.
+pub(crate) const GC_CANDIDATES_SQL: &str =
+    "SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
          FROM worktrees w
          JOIN runs r ON r.id = w.owner_id
          WHERE w.owner_kind = 'run'
@@ -682,15 +677,22 @@ pub async fn gc_candidates(
          JOIN jobs j ON j.id = w.owner_id
          WHERE w.owner_kind = 'job'
            AND w.removed_at IS NULL
-           AND j.status IN ('completed','failed','gate_failed','gate_errored','expired',
+           AND j.status IN ('completed','failed','gate_failed','gate_errored','expired','stopped',
                             'cancelled','interrupted')
            AND COALESCE(j.completed_at, w.created_at) <= ?
-         ORDER BY 1, 2",
-    )
-    .bind(&cutoff)
-    .bind(&cutoff)
-    .fetch_all(pool)
-    .await
+         ORDER BY 1, 2";
+
+pub async fn gc_candidates(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    retention: chrono::Duration,
+) -> sqlx::Result<Vec<WorktreeRow>> {
+    let cutoff = (now - retention).to_rfc3339();
+    sqlx::query_as(GC_CANDIDATES_SQL)
+        .bind(&cutoff)
+        .bind(&cutoff)
+        .fetch_all(pool)
+        .await
 }
 
 fn retention() -> chrono::Duration {

@@ -314,11 +314,38 @@ pub const STATUS_STOPPED: &str = "stopped";
 /// A job whose daemon died under it, and whose repository has moved on since.
 pub const STATUS_INTERRUPTED: &str = "interrupted";
 
+/// Every ending this module can write.
+///
+/// Named in one place because something else has to agree with it: `gc_candidates` collects a job's
+/// worktree only for a status it lists, so an ending missing from there leaks a directory forever —
+/// invisibly, because as far as the system is concerned that job is finished and its tree is
+/// nobody's. `every_ending_a_job_can_have_is_an_ending_the_gc_collects` holds the two lists
+/// together, and it was written because adding `stopped` had already opened exactly that leak.
+pub const TERMINAL_STATUSES: [&str; 7] = [
+    "completed",
+    "failed",
+    "gate_failed",
+    "gate_errored",
+    STATUS_EXPIRED,
+    STATUS_STOPPED,
+    STATUS_INTERRUPTED,
+];
+
 /// Writes a job's terminal status and stamps it done.
 ///
 /// Clears `wait_reason` on the way out: a finished job is not waiting for anything, and a stale
 /// reason left on the row is the sort of thing a feed renders forever.
 pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<()> {
+    if !TERMINAL_STATUSES.contains(&status) {
+        // Written anyway. A job left live would hold the project's exclusivity slot forever and
+        // take the whole project's autonomy down with it, which is worse than a worktree directory
+        // the GC declines to collect. The warning is what makes the leak findable at all.
+        tracing::warn!(
+            job_id,
+            status,
+            "retiring a job into a status the worktree GC does not collect"
+        );
+    }
     sqlx::query(
         "UPDATE jobs SET status = ?, completed_at = ?, wait_reason = NULL, resume_status = NULL
          WHERE id = ?",
@@ -1807,6 +1834,23 @@ mod tests {
             LIVE_STATUSES.len(),
             "the index covers a status the tick does not drive: {index}"
         );
+    }
+
+    /// A job that ends in a status the GC does not collect keeps its worktree forever, and nothing
+    /// reports it: as far as the system is concerned the job is finished and the tree is nobody's.
+    /// Written after adding `stopped` opened exactly that leak.
+    #[test]
+    fn every_ending_a_job_can_have_is_an_ending_the_gc_collects() {
+        for status in TERMINAL_STATUSES {
+            assert!(
+                crate::worktree::GC_CANDIDATES_SQL.contains(&format!("'{status}'")),
+                "a job can end `{status}` and its worktree would never be collected"
+            );
+            assert!(
+                !LIVE_STATUSES.contains(&status),
+                "`{status}` both holds the project's slot and is collectable"
+            );
+        }
     }
 
     /// The plan node is the one node with no item to mark, so nothing else stops a second planner
