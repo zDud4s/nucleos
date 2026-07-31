@@ -101,13 +101,36 @@ describe("daemon API client", () => {
     await expect(
       api.getFeed(TOKEN, { projectId: "alpha/beta & gamma" }),
     ).resolves.toEqual(feed);
+    // `+` for the space, the way `URLSearchParams` writes it and the way the runs filter has
+    // always written it. Axum decodes a query as form-urlencoded, so this is the same string on
+    // the daemon's side as `%20` — one encoder for every filter, rather than two conventions.
     expectGetCall(
       3,
-      `${DAEMON_URL}/feed?project_id=alpha%2Fbeta%20%26%20gamma`,
+      `${DAEMON_URL}/feed?project_id=alpha%2Fbeta+%26+gamma`,
     );
 
     await expect(api.getFeed(TOKEN)).resolves.toBeNull();
     expectGetCall(4, `${DAEMON_URL}/feed`);
+  });
+
+  it("sends only the search fields that were filled in", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([])).mockResolvedValueOnce(okJson([]));
+
+    // The daemon switches from listing a scope to searching it on the PRESENCE of any search
+    // field, so an empty string is not the same as an absent one — sending `q=` would turn a plain
+    // "show me the feed" into a search for nothing.
+    await api.getFeed(TOKEN, { scope: "all", q: "", kind: "" });
+    expectGetCall(1, `${DAEMON_URL}/feed?scope=all`);
+
+    await api.getFeed(TOKEN, {
+      projectId: "alpha", q: "gate failed", kind: "worktree_gate_failed",
+      since: "2026-07-01T00:00:00Z", limit: 200,
+    });
+    expectGetCall(
+      2,
+      `${DAEMON_URL}/feed?project_id=alpha&q=gate+failed&kind=worktree_gate_failed`
+        + `&since=2026-07-01T00%3A00%3A00Z&limit=200`,
+    );
   });
 
   it("gets an encoded project's scoreboard and returns null when non-ok", async () => {

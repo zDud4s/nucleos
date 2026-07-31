@@ -646,6 +646,17 @@ details.scoreboard th {
 .rd-gate > pre { flex-basis: 100%; }
 .rd-out > summary { color: var(--muted); font-size: var(--fs-xs); cursor: pointer; }
 
+/* Procurar no registo. Fechado por omissão — a página responde "o que precisa de mim agora", e
+   um formulário sempre aberto empurra essa resposta para baixo. */
+.feed-search > summary {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+}
+.feed-search > summary:hover { color: var(--text); }
+.feed-search .filters { margin-bottom: var(--sp-3); }
+
 /* ── Regras de um projeto ───────────────────────────────── */
 
 .rule {

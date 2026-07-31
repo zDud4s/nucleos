@@ -152,13 +152,117 @@ function ProjectCard({ project, scopedKills, token, refresh, selected, onSelect 
   );
 }
 
-interface FeedPanelProps { feed: FeedEntry[] | null; loading: boolean; selectedProject: string | null; }
-function FeedPanel({ feed, loading, selectedProject }: FeedPanelProps) {
+/** How far back a deliberate search reaches. The daemon's own ceiling; the ambient feed shows 50. */
+const FEED_SEARCH_LIMIT = 200;
+
+interface FeedPanelProps { token: string | null; feed: FeedEntry[] | null; loading: boolean; selectedProject: string | null; }
+
+/**
+ * The paper trail, and a way to look through it.
+ *
+ * The search runs on its own rather than through the page's 3-second batch, and its results are NOT
+ * refreshed on that cadence. Two reasons, and they point the same way: rebuilding the batch on every
+ * keystroke would restart six other requests that have nothing to do with this, and a list of
+ * results that silently reorders while it is being read is one you lose your place in. The ambient
+ * feed stays live; a search is a question, asked once.
+ */
+function FeedPanel({ token, feed, loading, selectedProject }: FeedPanelProps) {
+  const [q, setQ] = useState("");
+  const [kind, setKind] = useState("");
+  const [since, setSince] = useState("");
+  const [until, setUntil] = useState("");
+  const [results, setResults] = useState<FeedEntry[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  const asked = q.trim() !== "" || kind.trim() !== "" || since !== "" || until !== "";
+
+  async function search() {
+    if (token === null) return;
+    setSearching(true);
+    setFailed(null);
+    const found = await getFeed(token, {
+      ...(selectedProject === null ? { scope: "all" as const } : { projectId: selectedProject }),
+      q: q.trim() || undefined,
+      kind: kind.trim() || undefined,
+      // The daemon wants RFC 3339 and answers 400 for anything else, so a date box's `YYYY-MM-DD`
+      // is widened here rather than sent as-is. `since` opens the day and `until` closes it, which
+      // is what picking one day in both boxes has to mean.
+      since: since === "" ? undefined : `${since}T00:00:00Z`,
+      until: until === "" ? undefined : `${until}T23:59:59Z`,
+      limit: FEED_SEARCH_LIMIT,
+    });
+    setSearching(false);
+    if (found === null) {
+      setFailed("The daemon could not answer that search.");
+      return;
+    }
+    setResults(found);
+  }
+
+  function clear() {
+    setQ(""); setKind(""); setSince(""); setUntil("");
+    setResults(null);
+    setFailed(null);
+  }
+
+  // What is on screen: the answer to a question if one was asked, otherwise the live feed.
+  const shown = results ?? feed;
+  // Offered as suggestions, drawn from what is actually here. The daemon's set of kinds grows with
+  // the daemon, so a hard-coded list would be wrong the first time a new one is emitted.
+  const kinds = [...new Set((shown ?? []).map((entry) => entry.kind))].sort();
+
   return (
-    <Panel dim title="Feed" aside={selectedProject === null ? "latest across all projects" : selectedProject}>
-      {feed === null ? !loading && <ErrorNote>Could not load activity from the daemon.</ErrorNote>
-        : feed.length === 0 ? <Teach title="The record starts here.">Runs, proposals, verdicts and budget events will leave their paper trail here.</Teach>
-        : feed.map((entry) => <article className="feed-item" key={entry.id}>
+    <Panel
+      dim
+      title="Feed"
+      aside={results !== null ? `${results.length} found` : selectedProject === null ? "latest across all projects" : selectedProject}
+    >
+      <details className="feed-search">
+        <summary>search the record</summary>
+        <form
+          className="filters"
+          onSubmit={(event) => { event.preventDefault(); if (!searching) void search(); }}
+        >
+          <label className="wide">
+            Contains
+            <input value={q} placeholder="anything in the summary" onChange={(event) => setQ(event.target.value)} />
+          </label>
+          <label>
+            Kind
+            <input list="feed-kinds" value={kind} placeholder="any" onChange={(event) => setKind(event.target.value)} />
+            <datalist id="feed-kinds">
+              {kinds.map((option) => <option key={option} value={option} />)}
+            </datalist>
+          </label>
+          <label>
+            From
+            <input type="date" value={since} onChange={(event) => setSince(event.target.value)} />
+          </label>
+          <label>
+            To
+            <input type="date" value={until} onChange={(event) => setUntil(event.target.value)} />
+          </label>
+          <div className="form-actions">
+            <Button type="submit" size="sm" disabled={searching || !asked}>
+              {searching ? "Searching…" : "Search"}
+            </Button>
+            {results !== null && (
+              <Button size="sm" onClick={clear}>Back to live</Button>
+            )}
+            <span className="cta-note">
+              {results === null
+                ? `Searching reaches back ${FEED_SEARCH_LIMIT} entries; the live feed shows the latest 50.`
+                : "These results are frozen — the feed keeps moving underneath them."}
+            </span>
+          </div>
+        </form>
+        {failed !== null && <ErrorNote>{failed}</ErrorNote>}
+      </details>
+      {shown === null ? !loading && <ErrorNote>Could not load activity from the daemon.</ErrorNote>
+        : shown.length === 0 && results !== null ? <Teach title="Nothing matches.">Widen the dates, or drop the kind — the record only goes back as far as the daemon has been running.</Teach>
+        : shown.length === 0 ? <Teach title="The record starts here.">Runs, proposals, verdicts and budget events will leave their paper trail here.</Teach>
+        : shown.map((entry) => <article className="feed-item" key={entry.id}>
             <div className="f-meta"><time dateTime={entry.created_at} title={entry.created_at}>{relativeTime(entry.created_at)}</time><span title={entry.kind}>{feedKindLabel(entry.kind)}</span></div>
             <p className="f-body"><b>{entry.project_id ?? "global"}</b> — {entry.summary}</p>
           </article>)}
@@ -623,7 +727,7 @@ function Autopilot({ token, connection, killEngaged, killBusy, toggleKill }: Aut
             <JobsPanel jobs={jobs} loading={loading} selectedProject={selectedProject} token={token} refresh={refresh} isKill={isKill} />
             {selectedProject !== null && <><ShadowReviewPanel projectId={selectedProject} decisions={shadowDecisions} loading={loading} token={token} refresh={refresh} /><ScoreboardPanel projectId={selectedProject} scoreboard={scoreboard} /></>}
             <ScopedKillPanel scopedKills={scopedKills} token={token} refresh={refresh} />
-            <FeedPanel feed={feed} loading={loading} selectedProject={selectedProject} />
+            <FeedPanel token={token} feed={feed} loading={loading} selectedProject={selectedProject} />
           </div>
         </div>
       </>}

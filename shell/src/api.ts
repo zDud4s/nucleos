@@ -467,19 +467,44 @@ export async function getProjects(
   }
 }
 
+/**
+ * How the feed is narrowed. Every field is optional and an omitted one is not sent.
+ *
+ * The daemon treats the presence of ANY of `q`, `kind`, `since`, `until` or `limit` as the switch
+ * between listing a scope and searching it — so sending an empty string for one of them is not the
+ * same as leaving it out, and this only sends what was actually filled in.
+ */
+export interface FeedFilter {
+  scope?: "all";
+  projectId?: string;
+  /** Matched against the entry's summary. */
+  q?: string;
+  kind?: string;
+  /** RFC 3339. The daemon rejects anything else with a 400. */
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+function feedQuery(filter: FeedFilter): string {
+  const params = new URLSearchParams();
+  if (filter.scope === "all") params.set("scope", "all");
+  else if (filter.projectId) params.set("project_id", filter.projectId);
+  if (filter.q) params.set("q", filter.q);
+  if (filter.kind) params.set("kind", filter.kind);
+  if (filter.since) params.set("since", filter.since);
+  if (filter.until) params.set("until", filter.until);
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  const query = params.toString();
+  return query === "" ? "" : `?${query}`;
+}
+
 export async function getFeed(
   token: string,
-  opts?: { scope?: "all"; projectId?: string },
+  opts: FeedFilter = {},
 ): Promise<FeedEntry[] | null> {
-  let path = "/feed";
-  if (opts?.scope === "all") {
-    path += "?scope=all";
-  } else if (opts?.projectId) {
-    path += `?project_id=${encodeURIComponent(opts.projectId)}`;
-  }
-
   try {
-    const res = await fetch(`${DAEMON_URL}${path}`, {
+    const res = await fetch(`${DAEMON_URL}/feed${feedQuery(opts)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
