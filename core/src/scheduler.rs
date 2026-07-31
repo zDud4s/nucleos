@@ -16,7 +16,7 @@ const TICK: Duration = Duration::from_secs(30);
 /// A rule cannot create more than one run per minute, even if it uses second-level cron syntax.
 const MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(1);
 /// Phase 1 limits each project rule to 24 runs per daemon day.
-const DAILY_CAP: u32 = 24;
+pub const DAILY_CAP: u32 = 24;
 /// How late a due window must be before its run counts as a catch-up. Normal scheduling lands within
 /// one `TICK`; this far behind means the daemon or the machine was genuinely unavailable, not merely
 /// busy — which is the difference between "a bit late" and "running on days-old assumptions".
@@ -71,6 +71,27 @@ pub fn rule_timezone(rule: &ScheduleRule) -> Result<Tz, String> {
             .parse::<Tz>()
             .map_err(|_| format!("'{name}' is not an IANA timezone")),
     }
+}
+
+/// PURE: when a rule fires next after `since`, or why it never will.
+///
+/// The same parse, the same zone handling and the same anchor as `due_rules` — deliberately, because
+/// this exists to be SHOWN, and a screen that computed "next at 08:00" by a second route would
+/// eventually disagree with the tick that actually fires it.
+///
+/// The error side is the point as much as the success side. An invalid cron or an unknown timezone
+/// makes `due_rules` skip the rule and log at debug, which repeats 2,880 times a day and is
+/// therefore invisible: the rule simply never runs, and nothing anywhere says so. Returned here, it
+/// becomes something a person can read.
+pub fn next_fire(rule: &ScheduleRule, since: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    let cron = rule
+        .cron
+        .parse::<Cron>()
+        .map_err(|error| format!("'{}' is not a cron expression: {error}", rule.cron))?;
+    let zone = rule_timezone(rule)?;
+    cron.find_next_occurrence(&since.with_timezone(&zone), false)
+        .map(|next| next.with_timezone(&Utc))
+        .map_err(|error| format!("no next occurrence for '{}': {error}", rule.cron))
 }
 
 /// Returns each due rule paired with the occurrence that made it due, so the caller can tell a run

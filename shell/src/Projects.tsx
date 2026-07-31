@@ -5,8 +5,15 @@ import {
 } from "./api";
 import { breadcrumbs, joinPath, parentPath } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
+import Rules from "./Rules";
 
-type View = "browse" | "search" | "diff";
+/**
+ * The four things this page can show about a project.
+ *
+ * The first three read the tree; `rules` reads what the project does on its own, which is the one
+ * question here that still has an answer when the tree cannot be opened at all.
+ */
+type View = "browse" | "search" | "diff" | "rules";
 
 /**
  * Why a read was refused, in the words that say what to do next.
@@ -367,7 +374,7 @@ function Projects({ token, connection }: ProjectsProps) {
       </h1>
       <div className="statusline">
         <span>{projects?.length ?? 0} projects · {readable} readable</span>
-        <span>read-only · <b>ls, cat, grep, diff</b></span>
+        <span>read-only · <b>ls, cat, grep, diff</b> · <b>rules</b></span>
       </div>
       {loading && projects === null && <p className="a-note">Loading…</p>}
       {!loading && projects === null && (
@@ -398,14 +405,37 @@ function Projects({ token, connection }: ProjectsProps) {
               </button>
             ))}
           </div>
-          {/* A project with no root is a KNOWN state, not a failure, and the roster already says
-              which one it is — so this is decided here rather than by firing four requests that
-              can only come back 404 and then guessing at the reason from the status code. */}
-          {selectedProject !== null && selectedProject.project_root === null ? (
+          {/* Above the root check, not below it. The three inspector views need a readable tree;
+              the rules do not — a project whose root is gone still has an approval-queue ceiling and
+              still has recorded schedule state, and "the rules cannot be read" is itself the answer
+              somebody came here for. Gating all four on the tree would hide the explanation behind
+              the very failure it explains. */}
+          {selected !== null && (
+            <nav className="subnav" aria-label="Project views">
+              {(["browse", "search", "diff", "rules"] as View[]).map((option) => (
+                <button
+                  type="button"
+                  key={option}
+                  className="subtab"
+                  aria-current={view === option ? "page" : undefined}
+                  onClick={() => setView(option)}
+                >
+                  {option}
+                </button>
+              ))}
+            </nav>
+          )}
+          {selected !== null && view === "rules" ? (
+            <Rules key={selected} token={token} projectId={selected} />
+          ) : /* A project with no root is a KNOWN state, not a failure, and the roster already says
+                which one it is — so this is decided here rather than by firing four requests that
+                can only come back 404 and then guessing at the reason from the status code. */
+          selectedProject !== null && selectedProject.project_root === null ? (
             <Teach title={`${selectedProject.project_id} has no root to read.`}>
               A root is recorded when a project is put into shadow or active mode, and cleared when
               it goes back to off — so an off project has no tree for the inspector to open. Put it
-              in shadow mode from Autopilot and it becomes readable here.
+              in shadow mode from Autopilot and it becomes readable here. Its rules and its approval
+              queue are still readable above.
             </Teach>
           ) : reach.state === "gone" ? (
             // A recorded root that is not on disk. Named separately from "not found" because the
@@ -426,19 +456,6 @@ function Projects({ token, connection }: ProjectsProps) {
             <p className="a-note">Checking the project root…</p>
           ) : selected !== null && (
             <>
-              <nav className="subnav" aria-label="Inspector views">
-                {(["browse", "search", "diff"] as View[]).map((option) => (
-                  <button
-                    type="button"
-                    key={option}
-                    className="subtab"
-                    aria-current={view === option ? "page" : undefined}
-                    onClick={() => setView(option)}
-                  >
-                    {option}
-                  </button>
-                ))}
-              </nav>
               {/* Keyed by project so switching projects remounts each view with its own state
                   rather than carrying a path or a search across the boundary. */}
               {view === "browse" && <Browser key={selected} token={token} projectId={selected} />}

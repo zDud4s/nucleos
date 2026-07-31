@@ -63,8 +63,14 @@ describe("the project inspector and a root it cannot read", () => {
 
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Reading beta.");
     expect(screen.getByRole("button", { name: /beta/ }).getAttribute("aria-current")).toBe("true");
-    expect(screen.getByRole("navigation", { name: "Inspector views" })).toBeTruthy();
+    expect(screen.getByRole("navigation", { name: "Project views" })).toBeTruthy();
   });
+
+  /** The tabs that read the tree, as opposed to `rules`, which reads what the project does. */
+  function inspectorTabsAreUsable() {
+    // The crumbs only exist once the browser mounted, which is the thing the root check gates.
+    return screen.queryByRole("navigation", { name: "Path" }) !== null;
+  }
 
   it("explains an off project instead of firing a request that can only 404", async () => {
     roster([project({ project_id: "alpha", mode: "off", project_root: null })]);
@@ -75,9 +81,14 @@ describe("the project inspector and a root it cannot read", () => {
     // The roster already said there is no root, so nothing is asked of the inspect routes.
     expect(inspectCalls()).toHaveLength(0);
     expect(screen.getByText("alpha has no root to read.")).toBeTruthy();
-    // A state, not a failure: no error styling, and no inspector to click into.
+    // A state, not a failure: no error styling, and nothing of the tree to click into.
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.queryByRole("navigation", { name: "Inspector views" })).toBeNull();
+    expect(inspectorTabsAreUsable()).toBe(false);
+    // The nav stays, though. An off project still has an approval-queue ceiling and still has a
+    // rules file to be missing, and those are exactly what someone looking at an idle project came
+    // to find out — hiding the tab behind the same check would hide the explanation behind the
+    // failure it explains.
+    expect(screen.getByRole("navigation", { name: "Project views" })).toBeTruthy();
   });
 
   it("names a recorded root that has vanished, and shows which path it was", async () => {
@@ -93,8 +104,10 @@ describe("the project inspector and a root it cannot read", () => {
     ).toBeTruthy();
     // The path is the only actionable thing on that screen, so it must be on it.
     expect(screen.getByText(root)).toBeTruthy();
-    // And the three views are not offered, because none of them can work.
-    expect(screen.queryByRole("navigation", { name: "Inspector views" })).toBeNull();
+    // The three tree views cannot work, so none of them is drawn — but `rules` still can, and the
+    // nav that reaches it stays.
+    expect(inspectorTabsAreUsable()).toBe(false);
+    expect(screen.getByRole("navigation", { name: "Project views" })).toBeTruthy();
   });
 
   it("does not claim to be reading a project whose root is gone", async () => {

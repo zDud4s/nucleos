@@ -267,6 +267,99 @@ export interface QueuedEmail {
   sender_verdict: string | null;
 }
 
+// ── What a project does on its own ──────────────────────────────────────────
+
+/** One scheduled rule, with what the daemon knows about it having run. */
+export interface ScheduleView {
+  name: string;
+  cron: string;
+  prompt: string;
+  cwd: string | null;
+  /** The IANA zone the cron is read in. null means UTC, which is what an absent field has always meant. */
+  timezone: string | null;
+  /** When it fires next, counted from the last time it did. null when it never will. */
+  next_fire_at: string | null;
+  /** Why it will never fire — a cron that does not parse, or a zone the daemon does not know. */
+  problem: string | null;
+  last_fired_at: string | null;
+  fires_today: number;
+  daily_cap: number;
+}
+
+/** One repo trigger, with the commit it last saw. */
+export interface RepoTriggerView {
+  name: string;
+  branch: string;
+  prompt: string;
+  /** null means armed but with no first commit to compare against yet, which fires nothing. */
+  last_sha: string | null;
+}
+
+/** Everything a project will do unasked, and everything currently holding it back. */
+export interface ProjectRules {
+  project_id: string;
+  project_root: string | null;
+  /** The three states `.ai/autopilot.yaml` can be in. */
+  rules_file: "present" | "absent" | "unreadable";
+  rules_error: string | null;
+  gate_command: string | null;
+  schedules: ScheduleView[];
+  repo_triggers: RepoTriggerView[];
+  /** The effective open-proposal ceiling. null means the brake is off. */
+  wip_limit: number | null;
+  open_proposals: number;
+  queue_full: boolean;
+}
+
+export async function getProjectRules(
+  token: string,
+  projectId: string,
+): Promise<ProjectRules | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/projects/${encodeURIComponent(projectId)}/rules`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as ProjectRules;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sets how much unreviewed work a project may leave waiting before it stops starting more.
+ *
+ * `null` switches the brake off. The daemon refuses a negative ceiling: the comparison is
+ * `open >= limit`, so a negative one means "never start anything again" while reading like a number
+ * somebody chose.
+ */
+export async function setProjectWipLimit(
+  token: string,
+  projectId: string,
+  limit: number | null,
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/projects/${encodeURIComponent(projectId)}/wip-limit`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ limit }),
+      },
+    );
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
 /** The two standing decisions a person can record about a sender. `priority.rs` knows only these. */
 export const SENDER_VERDICTS = ["pin", "mute"] as const;
 export type SenderVerdict = (typeof SENDER_VERDICTS)[number];

@@ -646,6 +646,37 @@ details.scoreboard th {
 .rd-gate > pre { flex-basis: 100%; }
 .rd-out > summary { color: var(--muted); font-size: var(--fs-xs); cursor: pointer; }
 
+/* ── Regras de um projeto ───────────────────────────────── */
+
+.rule {
+  display: grid;
+  gap: var(--sp-1);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.rule:last-child { border-bottom: none; }
+.r-cron {
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--text);
+  background: var(--code-bg);
+  border-radius: var(--r-sm);
+  padding: 1px 6px;
+}
+.r-zone { font: 400 var(--fs-2xs) var(--mono); color: var(--faint); }
+.r-when { font-size: var(--fs-sm); color: var(--text); }
+/* O instante exato fica ao lado do relativo, não em vez dele: "daqui a 6 horas" responde à
+   pergunta, o carimbo responde à seguinte. */
+.r-exact { margin-left: var(--sp-2); font: 400 var(--fs-2xs) var(--mono); color: var(--faint); }
+.r-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--muted);
+}
+.r-cwd { color: var(--faint); }
+.r-prompt { font-size: var(--fs-sm); color: var(--muted); max-width: 62ch; }
+
 /* Pressão de contexto. A marca é a linha do handoff: o número só quer dizer alguma coisa em
    relação a ela, por isso desenha-se na própria barra em vez de se explicar por palavras. */
 .rd-context { display: grid; gap: var(--sp-1); }

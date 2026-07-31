@@ -62,6 +62,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/autopilot/attention", post(post_attention_heartbeat))
         .route("/projects", get(get_projects))
+        .route("/projects/{id}/rules", get(get_project_rules))
+        .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
         .route("/projects/{id}/grep", get(get_project_grep))
@@ -1367,6 +1369,244 @@ async fn resolve_project_root(state: &AppState, id: &str) -> Result<PathBuf, Sta
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// One rule's recorded scheduler state, as the tick writes it.
+///
+/// Named rather than left as a five-element tuple because the fields are read by position in three
+/// places here, and `fires_date` and `fires_today` are the pair whose meaning depends entirely on
+/// being read together — a count carrying yesterday's date is a count of nothing.
+#[derive(sqlx::FromRow)]
+struct RuleRunState {
+    rule_name: String,
+    last_fired_at: String,
+    last_head_sha: Option<String>,
+    fires_date: Option<String>,
+    fires_today: i64,
+}
+
+/// One scheduled rule, with what the daemon knows about it having run.
+#[derive(serde::Serialize)]
+struct ScheduleView {
+    name: String,
+    cron: String,
+    prompt: String,
+    cwd: Option<String>,
+    timezone: Option<String>,
+    /// When this fires next, counted from the last time it did — the same anchor the tick uses.
+    next_fire_at: Option<String>,
+    /// Why it will never fire, when that is the answer instead.
+    ///
+    /// An unparseable cron or an unknown timezone makes the tick skip the rule and log at debug,
+    /// 2,880 times a day. The rule simply never runs and nothing says so; this is where that stops
+    /// being invisible.
+    problem: Option<String>,
+    last_fired_at: Option<String>,
+    /// How many times it has fired today, against the daemon's own per-rule daily cap.
+    fires_today: i64,
+    daily_cap: u32,
+}
+
+/// One repo trigger, with the commit it last saw.
+#[derive(serde::Serialize)]
+struct RepoTriggerView {
+    name: String,
+    branch: String,
+    prompt: String,
+    /// The SHA recorded the last time this trigger was evaluated. `null` means it is armed and has
+    /// not yet seen a first commit to compare against — which fires nothing, by design.
+    last_sha: Option<String>,
+}
+
+/// Everything a project will do without being asked, and everything currently holding it back.
+#[derive(serde::Serialize)]
+struct ProjectRules {
+    project_id: String,
+    project_root: Option<String>,
+    /// `present`, `absent`, or `unreadable` — the three states `.ai/autopilot.yaml` can be in.
+    rules_file: &'static str,
+    /// Why the file could not be read, when it could not be.
+    ///
+    /// `config.rs` uses `deny_unknown_fields` precisely so a typo is an error rather than a silently
+    /// empty ruleset — but that error only reached a log line, so writing `schedule:` for
+    /// `schedules:` stopped all autonomy for the project and looked like nothing had happened.
+    rules_error: Option<String>,
+    gate_command: Option<String>,
+    schedules: Vec<ScheduleView>,
+    repo_triggers: Vec<RepoTriggerView>,
+    /// The effective open-proposal ceiling: the project's own, else the global default. `null` means
+    /// the brake is off.
+    wip_limit: Option<i64>,
+    open_proposals: i64,
+    /// Whether that ceiling is currently refusing new autonomous work.
+    queue_full: bool,
+}
+
+/// What a project does on its own.
+///
+/// The rules live in `.ai/autopilot.yaml` under the project root and were readable only by opening
+/// the file; the WIP ceiling lives in the database and was readable only through the roster's
+/// summary. Both decide whether autonomous work happens at all, so they answer one question and are
+/// served together.
+async fn get_project_rules(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ProjectRules>, StatusCode> {
+    let project_root: Option<String> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .flatten();
+
+    let (rules_file, rules_error, loaded) = match project_root.as_deref() {
+        // A project with no root has no file to read, which is not a failure — it is what an `off`
+        // project looks like, and reporting it as unreadable would name a fault where there is none.
+        None => ("absent", None, crate::config::AutopilotRules::default()),
+        Some(root) => match crate::config::load_schedule_rules(std::path::Path::new(root)) {
+            Ok(rules) => {
+                let path = std::path::Path::new(root)
+                    .join(".ai")
+                    .join("autopilot.yaml");
+                let present = tokio::task::spawn_blocking(move || path.exists())
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                (if present { "present" } else { "absent" }, None, rules)
+            }
+            Err(error) => (
+                "unreadable",
+                Some(error.to_string()),
+                crate::config::AutopilotRules::default(),
+            ),
+        },
+    };
+
+    let state_rows: Vec<RuleRunState> = sqlx::query_as(
+        "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today
+           FROM scheduler_state
+          WHERE project_id = ?",
+    )
+    .bind(&id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let now = chrono::Utc::now();
+    let today = now.date_naive().to_string();
+    // One table holds both kinds of rule, keyed by name, so schedules and repo triggers read their
+    // recorded state out of the same map.
+    let by_rule: std::collections::HashMap<&str, &RuleRunState> = state_rows
+        .iter()
+        .map(|row| (row.rule_name.as_str(), row))
+        .collect();
+
+    let schedules = loaded
+        .schedules
+        .iter()
+        .map(|rule| {
+            let recorded = by_rule.get(rule.name.as_str());
+            let last_fired_at = recorded.map(|row| row.last_fired_at.clone());
+            // Anchored on the last fire when there is one, exactly as the tick anchors it. Counting
+            // from now instead would quietly skip a window that is already overdue, and show the run
+            // due tomorrow when it is due this minute.
+            let since = last_fired_at
+                .as_deref()
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
+            let (next_fire_at, problem) = match crate::scheduler::next_fire(rule, since) {
+                Ok(next) => (Some(next.to_rfc3339()), None),
+                Err(problem) => (None, Some(problem)),
+            };
+            // A count carrying another day's date is a count of nothing — the daemon resets by
+            // comparing rather than by sweeping at midnight, so this reads it the same way.
+            let fires_today = recorded
+                .filter(|row| row.fires_date.as_deref() == Some(today.as_str()))
+                .map_or(0, |row| row.fires_today);
+            ScheduleView {
+                name: rule.name.clone(),
+                cron: rule.cron.clone(),
+                prompt: rule.prompt.clone(),
+                cwd: rule.cwd.clone(),
+                timezone: rule.timezone.clone(),
+                next_fire_at,
+                problem,
+                last_fired_at,
+                fires_today,
+                daily_cap: crate::scheduler::DAILY_CAP,
+            }
+        })
+        .collect();
+
+    let repo_triggers = loaded
+        .repo_triggers
+        .iter()
+        .map(|trigger| RepoTriggerView {
+            name: trigger.name.clone(),
+            branch: trigger.branch.clone(),
+            prompt: trigger.prompt.clone(),
+            last_sha: by_rule
+                .get(trigger.name.as_str())
+                .and_then(|row| row.last_head_sha.clone()),
+        })
+        .collect();
+
+    let wip_limit = crate::wip::wip_limit(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let open_proposals = crate::wip::open_proposals(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ProjectRules {
+        project_id: id,
+        project_root,
+        rules_file,
+        rules_error,
+        gate_command: loaded.gate_command.clone(),
+        schedules,
+        repo_triggers,
+        wip_limit,
+        open_proposals,
+        queue_full: crate::wip::queue_full(open_proposals, wip_limit),
+    }))
+}
+
+#[derive(Deserialize)]
+struct WipLimitRequest {
+    /// `null` switches the brake off for this project.
+    limit: Option<i64>,
+}
+
+/// Sets one project's open-proposal ceiling.
+///
+/// The brake it controls is self-clearing — it releases the moment you review something — so the
+/// number is the answer to "how much unreviewed work am I willing to be holding", and until now it
+/// could only be changed with sqlite3. A negative ceiling is refused rather than stored: `queue_is_full`
+/// compares `open >= limit`, so a negative one would mean "never start anything again" while reading
+/// like a number somebody chose.
+async fn post_project_wip_limit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WipLimitRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if body.limit.is_some_and(|limit| limit < 0) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let updated = sqlx::query("UPDATE autopilot_state SET wip_limit = ? WHERE project_id = ?")
+        .bind(body.limit)
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(project_id = %id, %error, "setting a project WIP limit failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if updated.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_projects(
@@ -3167,6 +3407,183 @@ mod tests {
                 .unwrap();
         assert_eq!(class, None);
         assert_eq!(attempts, 0);
+    }
+
+    /// Registers a project with a root on disk, and writes `.ai/autopilot.yaml` under it.
+    async fn project_with_rules(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), yaml).unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+        )
+        .bind(id)
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        dir
+    }
+
+    async fn read_rules(state: AppState, id: &str) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/projects/{id}/rules"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    /// A rule the tick cannot parse is skipped and logged at debug — 2,880 times a day, which is
+    /// the same as not being logged at all. The rule never runs and nothing anywhere says so, which
+    /// is the failure this endpoint exists to make visible.
+    #[tokio::test]
+    async fn a_schedule_that_can_never_fire_says_why_instead_of_going_quiet() {
+        let state = test_state().await;
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "schedules:\n\
+             \x20 - name: nightly\n\
+             \x20   cron: 'not a cron'\n\
+             \x20   prompt: sweep\n\
+             \x20 - name: lisbon\n\
+             \x20   cron: '0 8 * * *'\n\
+             \x20   prompt: morning\n\
+             \x20   timezone: Mars/Olympus\n\
+             \x20 - name: fine\n\
+             \x20   cron: '0 8 * * *'\n\
+             \x20   prompt: morning\n\
+             \x20   timezone: Europe/Lisbon\n",
+        )
+        .await;
+
+        let (status, body) = read_rules(state, "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rules_file"], "present");
+
+        let schedules = body["schedules"].as_array().unwrap();
+        assert!(
+            schedules[0]["problem"]
+                .as_str()
+                .unwrap()
+                .contains("is not a cron expression"),
+        );
+        assert!(schedules[0]["next_fire_at"].is_null());
+        // An unknown zone is an error rather than a silent fall back to UTC, for the reason
+        // `rule_timezone` gives: reading `Europe/Lisbon` as UTC fires an hour off and looks fine.
+        assert!(
+            schedules[1]["problem"]
+                .as_str()
+                .unwrap()
+                .contains("is not an IANA timezone"),
+        );
+        // The healthy one answers with a time, not a complaint.
+        assert!(schedules[2]["problem"].is_null());
+        assert!(schedules[2]["next_fire_at"].is_string());
+    }
+
+    /// `deny_unknown_fields` exists so a typo is an error instead of an empty ruleset — but the
+    /// error only ever reached a log line, so `schedule:` for `schedules:` stopped every scheduled
+    /// run for that project and looked exactly like having no rules.
+    #[tokio::test]
+    async fn a_misspelt_key_is_reported_rather_than_read_as_no_rules_at_all() {
+        let state = test_state().await;
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "schedule:\n\x20 - name: nightly\n\x20   cron: '0 8 * * *'\n\x20   prompt: sweep\n",
+        )
+        .await;
+
+        let (_, body) = read_rules(state, "alpha").await;
+        assert_eq!(body["rules_file"], "unreadable");
+        assert!(body["rules_error"].as_str().unwrap().contains("schedule"));
+        assert_eq!(body["schedules"].as_array().unwrap().len(), 0);
+    }
+
+    /// A project with no root has no file to read. That is what `off` looks like, not a fault.
+    #[tokio::test]
+    async fn a_project_without_a_root_reports_no_rules_rather_than_an_error() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = read_rules(state, "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rules_file"], "absent");
+        assert!(body["rules_error"].is_null());
+        assert!(body["project_root"].is_null());
+    }
+
+    async fn set_wip_limit(state: AppState, id: &str, body: serde_json::Value) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/wip-limit"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_wip_ceiling_can_be_set_cleared_and_never_made_negative() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            set_wip_limit(state.clone(), "alpha", serde_json::json!({ "limit": 2 })).await,
+            StatusCode::NO_CONTENT,
+        );
+        let (_, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(body["wip_limit"], 2);
+
+        // `queue_full` compares `open >= limit`, so a negative ceiling would mean "never start
+        // anything again" while reading like a number somebody chose.
+        assert_eq!(
+            set_wip_limit(state.clone(), "alpha", serde_json::json!({ "limit": -1 })).await,
+            StatusCode::BAD_REQUEST,
+        );
+        let (_, unchanged) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(unchanged["wip_limit"], 2);
+
+        // Null is the brake switched off, which is a state the table already expresses.
+        assert_eq!(
+            set_wip_limit(state.clone(), "alpha", serde_json::json!({ "limit": null })).await,
+            StatusCode::NO_CONTENT,
+        );
+        let limit: Option<i64> =
+            sqlx::query_scalar("SELECT wip_limit FROM autopilot_state WHERE project_id = 'alpha'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(limit, None);
+
+        assert_eq!(
+            set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
+            StatusCode::NOT_FOUND,
+        );
     }
 
     async fn set_sender_verdict(state: AppState, body: serde_json::Value) -> StatusCode {
