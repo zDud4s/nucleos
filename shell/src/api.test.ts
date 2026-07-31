@@ -470,7 +470,7 @@ describe("runs, presets and the assistant", () => {
       .mockResolvedValueOnce(nonOk(503))
       .mockResolvedValueOnce(nonOk(401));
 
-    const input = { prompt: "go", project_id: null, cwd: null, mode: "real" };
+    const input = { prompt: "go", project_id: null, cwd: null, mode: "real", steerable: false };
     await expect(api.createRun(TOKEN, input)).resolves.toEqual({ ok: true, value: 12 });
     await expect(api.createRun(TOKEN, input)).resolves.toEqual({
       ok: false,
@@ -483,6 +483,56 @@ describe("runs, presets and the assistant", () => {
       fault: "unauthorized",
       status: 401,
     });
+  });
+
+  it("keeps the two steering refusals apart, since they mean different things", async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 202 })
+      .mockResolvedValueOnce(nonOk(409))
+      .mockResolvedValueOnce(nonOk(403));
+
+    await expect(api.steerRun(TOKEN, 7, "try the other branch")).resolves.toEqual({
+      ok: true,
+      value: null,
+    });
+    expectPostCall(1, `${DAEMON_URL}/runs/7/message`, { message: "try the other branch" });
+
+    // 409 is about this moment — it finished, or it never listened. 403 is about this run for as
+    // long as it exists. Collapsing them would let the page offer "try again" for the one where
+    // trying again can never work.
+    await expect(api.steerRun(TOKEN, 7, "hello")).resolves.toMatchObject({ status: 409 });
+    await expect(api.steerRun(TOKEN, 7, "hello")).resolves.toMatchObject({ status: 403 });
+  });
+
+  it("closes a conversation with DELETE and treats an already-closed one as done", async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 204 })
+      .mockResolvedValueOnce(nonOk(404));
+
+    await expect(api.endRunTurns(TOKEN, 7)).resolves.toBe(true);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${DAEMON_URL}/runs/7/message`);
+    expect(init.method).toBe("DELETE");
+
+    // 404 is the only real failure here: no such run. A channel that was already closed answers
+    // 204, because that is the state the caller asked for.
+    await expect(api.endRunTurns(TOKEN, 7)).resolves.toBe(false);
+  });
+
+  it("asks for a listening run only when told to", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({ id: 1 }))
+      .mockResolvedValueOnce(okJson({ id: 2 }));
+
+    const base = { prompt: "go", project_id: null, cwd: null, mode: "real" };
+    await api.createRun(TOKEN, { ...base, steerable: false });
+    await api.createRun(TOKEN, { ...base, steerable: true });
+
+    // Sent explicitly both ways rather than omitted when false: the daemon defaults it to false for
+    // callers that predate the field, and relying on that default would make the shell's request
+    // depend on a compatibility rule instead of on what the person ticked.
+    expectPostCall(1, `${DAEMON_URL}/runs`, { ...base, steerable: false });
+    expectPostCall(2, `${DAEMON_URL}/runs`, { ...base, steerable: true });
   });
 
   it("treats a 404 from cancel as a run that already ended", async () => {

@@ -856,6 +856,22 @@ export interface RunDetail {
   output_tokens: number | null;
   cache_read_tokens: number | null;
   num_turns: number | null;
+  /**
+   * How much of the model's context window the run has filled, in tokens.
+   *
+   * The daemon hands a run off to a successor at four fifths of its window (`handoff.rs`), so this
+   * is the number that says a long run is approaching the point where it splits — the one fact
+   * about a live run that predicts what it is about to do rather than reporting what it did.
+   */
+  context_fill: number | null;
+  /**
+   * Whether this run accepts `POST /runs/{id}/message`.
+   *
+   * Decided when the run was created and never afterwards, so it is a fact about the run rather
+   * than about whether a channel currently happens to exist. A `false` here is why the composer is
+   * absent, not merely disabled: nothing the person can do would make this run listen.
+   */
+  steerable: boolean;
 }
 
 /** Every field the daemon's `/runs` filter accepts. All optional; omitted ones are not sent. */
@@ -874,6 +890,14 @@ export interface CreateRunInput {
   project_id: string | null;
   cwd: string | null;
   mode: string;
+  /**
+   * Ask for a run that can be spoken to after it starts.
+   *
+   * Opt-in, and deliberately so on the daemon's side too: `steerable` defaults to false for every
+   * caller that omits it, so a run only listens because someone asked for one that would. The
+   * daemon refuses the combination outright for a mode that launches without tools.
+   */
+  steerable: boolean;
 }
 
 /**
@@ -973,6 +997,60 @@ export async function cancelRun(token: string, id: number): Promise<boolean> {
   try {
     const res = await fetch(`${DAEMON_URL}/runs/${id}/cancel`, {
       method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Says one more turn to a run that is already working.
+ *
+ * The status is kept because the refusals are not interchangeable and the person can act on the
+ * difference: 409 is "this run isn't listening — either it never opted in, or it has already
+ * finished", 403 is "this run may never be spoken to", and both are ordinary answers rather than
+ * faults. The daemon replies 202, not 200: the text reached the run's channel, and the run reads it
+ * when it next reads stdin.
+ */
+export async function steerRun(
+  token: string,
+  id: number,
+  message: string,
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/${id}/message`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Tells a steerable run that no more turns are coming, which is what lets it finish.
+ *
+ * A run launched to listen reads until its stdin closes, and the daemon holds that stdin open for as
+ * long as it holds the run's channel — so without this a conversation could only end by going quiet
+ * long enough to trip the progress deadline, and would be recorded `timed_out` for having waited.
+ *
+ * `true` for any run that exists, whether or not it was still listening: the daemon treats an
+ * already-closed channel as the state the caller asked for, and so does this.
+ */
+export async function endRunTurns(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/${id}/message`, {
+      method: "DELETE",
       headers: { Authorization: `Bearer ${token}` },
     });
     return res.ok;

@@ -571,6 +571,25 @@ details.scoreboard th {
   flex-wrap: wrap;
 }
 
+/* Uma caixa de confirmação é uma linha, não uma coluna: sobrepõe-se ao `display: grid` que todos
+   os outros campos herdam. O `<em>` diz a consequência e fica por baixo do rótulo, porque é isso
+   que a pessoa precisa de ler antes de marcar — não depois. */
+.form-grid label.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+.form-grid label.check input { width: auto; margin-top: 3px; flex: none; }
+.form-grid label.check em {
+  display: block;
+  margin-top: 2px;
+  color: var(--faint);
+  font: 400 var(--fs-xs) / 1.5 var(--body);
+  font-style: normal;
+}
+
 /* ── Sub-navegação dentro de uma página ─────────────────── */
 
 .subnav {
@@ -621,6 +640,49 @@ details.scoreboard th {
 .rd-gate { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .rd-gate > pre { flex-basis: 100%; }
 .rd-out > summary { color: var(--muted); font-size: var(--fs-xs); cursor: pointer; }
+
+/* Pressão de contexto. A marca é a linha do handoff: o número só quer dizer alguma coisa em
+   relação a ela, por isso desenha-se na própria barra em vez de se explicar por palavras. */
+.rd-context { display: grid; gap: var(--sp-1); }
+.ctx-track {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-raise);
+  overflow: hidden;
+}
+.ctx-fill { height: 100%; background: var(--muted); border-radius: 3px; }
+.ctx-fill.at-limit { background: var(--gold); }
+.ctx-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+.ctx-note { font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
+.ctx-note b { color: var(--muted); }
+
+/* Falar com um run a meio. Fica dentro do detalhe do run, e não numa página à parte, porque a
+   pergunta "o que é que ele está a fazer" e "diz-lhe outra coisa" são a mesma pergunta. */
+.steer {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--bg-raise);
+}
+.steer textarea {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: 400 var(--fs-sm) var(--mono);
+  padding: 6px 8px;
+  resize: vertical;
+}
 
 /* Saída de um modelo e de um subprocesso: texto, com o seu próprio scroll para que uma linha
    comprida não empurre a página inteira para o lado. */

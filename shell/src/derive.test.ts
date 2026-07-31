@@ -12,6 +12,8 @@ import {
 
   feedKindLabel,
   formatBytes,
+  CONTEXT_WINDOW_TOKENS,
+  contextPressure,
   formatTokens,
   formatUsd,
   gateTone,
@@ -755,5 +757,38 @@ describe("jobs", () => {
     // The feed prints kinds verbatim for everything else, and a daemon that starts emitting a new
     // one must still show it rather than showing nothing.
     expect(feedKindLabel("run_retry")).toBe("run_retry");
+  });
+});
+
+describe("context pressure", () => {
+  it("says nothing at all when a run has not reported its context", () => {
+    // Not zero. A run that has said nothing about its context and one that has said "nearly empty"
+    // are different facts, and an empty bar would state the first as if it were the second.
+    expect(contextPressure(null)).toBeNull();
+  });
+
+  it("reads the fill against the window the daemon hands off at", () => {
+    const half = contextPressure(CONTEXT_WINDOW_TOKENS / 2);
+    expect(half).toEqual({ fill: 100_000, fraction: 0.5, handingOff: false });
+  });
+
+  it("flags the handoff line exactly at four fifths, not past it", () => {
+    // The daemon's own comparison is `fill * 5 >= limit * 4`, so the boundary itself counts as
+    // crossed. Drawing it as "not yet" would show a run as safe on the very tick it splits.
+    expect(contextPressure(160_000)?.handingOff).toBe(true);
+    expect(contextPressure(159_999)?.handingOff).toBe(false);
+  });
+
+  it("never reports more than a full bar", () => {
+    // The window is a conservative floor, so a model with a bigger one genuinely reports past it.
+    // That is a real number and worth showing — a bar wider than its own track is not.
+    const over = contextPressure(CONTEXT_WINDOW_TOKENS * 3);
+    expect(over?.fraction).toBe(1);
+    expect(over?.fill).toBe(600_000);
+  });
+
+  it("ignores a fill that cannot be one", () => {
+    expect(contextPressure(-1)).toBeNull();
+    expect(contextPressure(Number.NaN)).toBeNull();
   });
 });

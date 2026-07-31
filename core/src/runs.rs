@@ -1914,6 +1914,22 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    /// The shell draws a run's context pressure as a fraction of this window, and it cannot read a
+    /// Rust constant — `CONTEXT_WINDOW_TOKENS` in `shell/src/derive.ts` is a copy of the number
+    /// below. `GET /runs/{id}` reports the fill and not the window, so nothing at runtime would
+    /// notice the two disagreeing; the bar would simply be drawn against the wrong denominator and
+    /// keep looking plausible.
+    ///
+    /// So this test is the join. Changing the floor is allowed — updating one side only is not, and
+    /// this is what says so.
+    #[test]
+    fn the_handoff_window_matches_the_one_the_shell_mirrors() {
+        assert_eq!(
+            HANDOFF_CONTEXT_LIMIT_FLOOR, 200_000,
+            "update CONTEXT_WINDOW_TOKENS in shell/src/derive.ts to match, then this number here",
+        );
+    }
+
     async fn test_state_with_runner(
         delay: Option<Duration>,
         run_timeout: Duration,

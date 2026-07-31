@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  cancelRun, createRun, getRun, getRuns,
+  cancelRun, createRun, endRunTurns, getRun, getRuns, steerRun,
   RUN_MODES, RUN_MODE_FILTERS, RUN_STATUSES,
   type ConnectionState, type RunDetail, type RunSearchResult, type RunsFilter,
 } from "./api";
 import {
+  CONTEXT_WINDOW_TOKENS, HANDOFF_FRACTION, contextPressure,
   formatTokens, formatUsd, gateTone, relativeTime, runIsLive, runStatusLabel, runTone,
 } from "./derive";
 import { Badge, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
@@ -35,6 +36,7 @@ function NewRun({ token, onStarted }: NewRunProps) {
   const [projectId, setProjectId] = useState("");
   const [cwd, setCwd] = useState("");
   const [mode, setMode] = useState<string>("real");
+  const [steerable, setSteerable] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -48,6 +50,7 @@ function NewRun({ token, onStarted }: NewRunProps) {
       project_id: orNull(projectId),
       cwd: orNull(cwd),
       mode,
+      steerable,
     });
     setBusy(false);
     if (!result.ok) {
@@ -108,6 +111,24 @@ function NewRun({ token, onStarted }: NewRunProps) {
             onChange={(event) => setPrompt(event.target.value)}
           />
         </label>
+        <label className="wide check">
+          <input
+            type="checkbox"
+            checked={steerable}
+            onChange={(event) => setSteerable(event.target.checked)}
+          />
+          <span>
+            Let me talk to it while it works
+            {/* The consequence belongs next to the box, not in a tooltip: a listening run does not
+                end by itself. It reads turns until its input closes, so someone has to say the
+                conversation is over — and a run left listening is recorded as having timed out,
+                which reads afterwards as a failure rather than as a run nobody dismissed. */}
+            <em>
+              A run that listens keeps waiting for your next message. End the conversation from the
+              run itself when you are done, or it will sit there until its deadline.
+            </em>
+          </span>
+        </label>
         <div className="form-actions">
           <Button type="submit" variant="approve" disabled={prompt.trim() === "" || busy}>
             {busy ? "Starting…" : "Start run"}
@@ -124,6 +145,98 @@ function NewRun({ token, onStarted }: NewRunProps) {
       {note !== null && <p className="gate-note">{note}</p>}
       {failed !== null && <ErrorNote>{failed}</ErrorNote>}
     </Panel>
+  );
+}
+
+interface SteeringProps {
+  token: string;
+  runId: number;
+  onEnded: () => void;
+}
+
+/**
+ * Saying something to a run that is already working.
+ *
+ * Only drawn for a run that was created steerable and is still going — the daemon decides that when
+ * the run starts and never revisits it, so an absent composer means this run has no ear rather than
+ * that the moment has passed. A message is queued rather than delivered: the run picks it up when it
+ * next reads its input, so the confirmation says accepted, not answered.
+ */
+function Steering({ token, runId, onEnded }: SteeringProps) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  async function say() {
+    const message = text.trim();
+    setBusy(true);
+    setFailed(null);
+    setNote(null);
+    const result = await steerRun(token, runId, message);
+    setBusy(false);
+    if (!result.ok) {
+      setFailed(
+        // The two refusals are not the same thing and lead somewhere different: one is about this
+        // moment, the other is about this run for as long as it exists.
+        result.status === 409
+          ? "This run is not listening any more — it finished, or it was never started to listen."
+          : result.status === 403
+            ? "This run may never be spoken to. It reads text nobody vouches for, so it takes no second author."
+            : "The daemon did not take the message.",
+      );
+      return;
+    }
+    setText("");
+    setNote("Queued — it reads this when it next comes up for air.");
+  }
+
+  async function end() {
+    setBusy(true);
+    setFailed(null);
+    const closed = await endRunTurns(token, runId);
+    setBusy(false);
+    if (!closed) {
+      setFailed("Could not close the conversation.");
+      return;
+    }
+    setNote("Conversation closed. It finishes the turn it is on, then stops.");
+    onEnded();
+  }
+
+  return (
+    <form
+      className="steer"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (text.trim() === "" || busy) return;
+        void say();
+      }}
+    >
+      <textarea
+        rows={2}
+        value={text}
+        placeholder="Say something to this run…"
+        onChange={(event) => setText(event.target.value)}
+      />
+      <div className="a-actions">
+        <Button type="submit" size="sm" variant="approve" disabled={text.trim() === "" || busy}>
+          {busy ? "Sending…" : "Send"}
+        </Button>
+        {/* Confirmed, because this is the end of the conversation and there is no reopening it:
+            the daemon lets go of the run's input, and a closed channel cannot be given back. */}
+        <ConfirmButton
+          size="sm"
+          confirmLabel="Confirm end?"
+          disabled={busy}
+          onConfirm={() => void end()}
+        >
+          End the conversation
+        </ConfirmButton>
+      </div>
+      {note !== null && <p className="gate-note">{note}</p>}
+      {failed !== null && <ErrorNote>{failed}</ErrorNote>}
+    </form>
   );
 }
 
@@ -183,6 +296,8 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
   if (detail === null) return <ErrorNote>Could not read this run.</ErrorNote>;
 
   const gate = gateTone(detail.gate_status);
+  const pressure = contextPressure(detail.context_fill);
+  const stillRunning = runIsLive(detail.status);
 
   return (
     <div className="run-detail">
@@ -193,8 +308,28 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
         <span>in <b>{formatTokens(detail.input_tokens)}</b></span>
         <span>out <b>{formatTokens(detail.output_tokens)}</b></span>
         <span>cached <b>{formatTokens(detail.cache_read_tokens)}</b></span>
+        {detail.steerable && <Badge tone="active">listening</Badge>}
         {detail.session_id !== null && <span className="rd-session">{detail.session_id}</span>}
       </div>
+      {pressure !== null && (
+        <div className="rd-context">
+          <div className="ctx-track">
+            <div
+              className={pressure.handingOff ? "ctx-fill at-limit" : "ctx-fill"}
+              style={{ width: `${Math.round(pressure.fraction * 100)}%` }}
+            />
+            {/* The threshold is drawn on the track rather than described in words, because what the
+                number means is entirely "how far is it from that line". */}
+            <div className="ctx-mark" style={{ left: `${HANDOFF_FRACTION * 100}%` }} />
+          </div>
+          <span className="ctx-note">
+            context <b>{formatTokens(pressure.fill)}</b> of {formatTokens(CONTEXT_WINDOW_TOKENS)}
+            {pressure.handingOff
+              ? " — past the handoff line, so this run continues in a fresh successor"
+              : " · hands off to a successor at the mark"}
+          </span>
+        </div>
+      )}
       {gate !== null && (
         <div className="rd-gate">
           <Badge tone={gate}>gate {detail.gate_status}</Badge>
@@ -218,7 +353,10 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
           <pre className="rd-stream">{detail.stderr}</pre>
         </details>
       )}
-      {runIsLive(detail.status) && (
+      {stillRunning && detail.steerable && (
+        <Steering token={token} runId={runId} onEnded={onCancelled} />
+      )}
+      {stillRunning && (
         <div className="a-actions">
           <ConfirmButton
             size="sm"

@@ -489,6 +489,40 @@ export function formatTokens(count: number | null): string {
   return `${millions < 10 ? millions.toFixed(1) : Math.round(millions)}M`;
 }
 
+/**
+ * The context window the daemon assumes for every run, in tokens.
+ *
+ * Mirrors `HANDOFF_CONTEXT_LIMIT_FLOOR` in `core/src/runs.rs`, which is a conservative floor rather
+ * than a per-model figure — the runner exposes no reliable window metadata, and a model alias can
+ * change underneath the daemon. Duplicated here because the run detail reports the fill and not the
+ * window; `a_run_reports_context_fill_against_the_window_the_shell_mirrors` in `runs.rs` fails if
+ * the two ever stop agreeing, so the drift is caught rather than silently drawn wrong.
+ */
+export const CONTEXT_WINDOW_TOKENS = 200_000;
+
+/** The fraction of the window at which a run hands off to a successor — `handoff.rs`'s four fifths. */
+export const HANDOFF_FRACTION = 0.8;
+
+/**
+ * How close a run is to splitting itself in two.
+ *
+ * At four fifths of the window the daemon stops the run and starts a successor with a fresh context,
+ * which is a visible change in how the work proceeds rather than an internal detail — so a long run
+ * approaching it is worth seeing coming. `null` when the run has reported no fill yet: a run that has
+ * not said anything about its context is different from one that has said "nearly empty", and drawing
+ * an empty bar for both would state the first as if it were the second.
+ */
+export function contextPressure(
+  fill: number | null,
+): { fill: number; fraction: number; handingOff: boolean } | null {
+  if (fill === null || !Number.isFinite(fill) || fill < 0) return null;
+  // Clamped, because the fill is observed from the CLI's own reporting and the window is a floor:
+  // a model with a larger window genuinely can report past it, and a bar wider than its track is a
+  // rendering bug rather than a fact worth showing.
+  const fraction = Math.min(fill / CONTEXT_WINDOW_TOKENS, 1);
+  return { fill, fraction, handingOff: fraction >= HANDOFF_FRACTION };
+}
+
 export function relativeTime(iso: string, nowMs: number = Date.now()): string {
   const then = Date.parse(iso);
   if (Number.isNaN(then)) return iso;
