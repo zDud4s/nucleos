@@ -147,6 +147,8 @@ pub fn build_router(state: AppState) -> Router {
         // segment, and encoding one into a route only to decode it again buys nothing here.
         .route("/contacts", get(get_contacts))
         .route("/contacts/verdict", post(post_sender_verdict))
+        .route("/contacts/unmerge", post(post_contact_unmerge))
+        .route("/contacts/merges", get(get_contact_merges))
         // A twenty-minute memo is ~38 MB of 16 kHz PCM, and every route not given its own ceiling
         // inherits axum's 2 MB default — which would reject precisely the long recordings that are
         // least repeatable, and reject them the same way every time. The ceiling is derived from
@@ -691,6 +693,62 @@ async fn get_contacts(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "reading the contact roster failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Suggestions that two addresses are one person, waiting on an answer.
+///
+/// Its own route rather than a slice of `/proposals`, because the two kinds share a table and
+/// nothing else — see `contacts::pending_merges`. It also puts the question where the context is:
+/// deciding whether two addresses are the same person is a thing you do while looking at your
+/// correspondents, not while looking at a queue of paused runs.
+async fn get_contact_merges(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::contacts::MergeSuggestion>>, StatusCode> {
+    crate::contacts::pending_merges(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending contact merges failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct UnmergeRequest {
+    address: String,
+}
+
+/// Splits one address back out into a person of its own.
+///
+/// The undo for an approved merge, and the reason approving one is a safe thing to offer: the join
+/// is a pointer move, so undoing it restores exactly what was there — counters included, since a
+/// merge never moved them. Without this route the merge was still exact and still undoable in
+/// principle, and unreachable in practice.
+///
+/// Answers 204 whether or not the address was merged with anything. Splitting an address that is
+/// already alone is the state the caller asked for, and a caller that had to tell those apart would
+/// be handling somebody else's bookkeeping.
+async fn post_contact_unmerge(
+    State(state): State<AppState>,
+    Json(body): Json<UnmergeRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let known: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM contact_addresses WHERE address = ?")
+            .bind(crate::contacts::normalize_address(&body.address))
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if known.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    crate::contacts::unmerge(&state.pool, &body.address)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(%error, "splitting a contact failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -2154,10 +2212,57 @@ async fn get_proposals(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Turns a merge decision's outcome into the answer the caller gets.
+///
+/// The conflict is a 409 with a body, not a bare status: it is the one refusal here that names
+/// something the person can go and change, and a status code cannot say which two instructions
+/// disagree.
+fn merge_decision_response(
+    outcome: Result<crate::contacts::MergeOutcome, crate::contacts::DecisionError>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match outcome {
+        Ok(crate::contacts::MergeOutcome::Merged) => {
+            Ok(Json(serde_json::json!({ "merged": true })))
+        }
+        Ok(crate::contacts::MergeOutcome::RefusedConflictingVerdicts { keep, absorb }) => {
+            tracing::info!(%keep, %absorb, "refused a contact merge with conflicting verdicts");
+            Err(StatusCode::CONFLICT)
+        }
+        Err(crate::contacts::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+        Err(crate::contacts::DecisionError::Db(error)) => {
+            tracing::warn!(%error, "deciding a contact merge failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Two kinds of proposal share this table and this door, and they are decided by entirely
+    // different machinery: an action approval resumes a paused run, a contact merge joins two
+    // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
+    // changes, and both paths below are compare-and-set on `status = 'pending'`, so a second
+    // decision racing this one still loses there rather than here.
+    let kind = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a proposal to approve failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .kind;
+    if kind == "contact-merge" {
+        // Uncancellable for the same reason the resume below is: the decision commits, and a
+        // request dropped mid-flight must not leave the record disagreeing with what happened.
+        let state = state.clone();
+        let outcome =
+            uncancellable(async move { crate::contacts::approve_merge(&state.pool, id).await })
+                .await?;
+        return merge_decision_response(outcome);
+    }
+
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await }).await? {
@@ -2185,6 +2290,35 @@ async fn post_proposal_reject(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
+    let kind = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a proposal to reject failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .kind;
+    if kind == "contact-merge" {
+        // `reject_merge` records the refused pair in the same transaction as the status, which is
+        // what stops the heuristic asking the identical question forever. Wiring the approval
+        // without this would have been worse than wiring neither: the suggestion you refused would
+        // come back on every sweep, and a suggestion that ignores your answer is not a suggestion.
+        let state = state.clone();
+        let rejected =
+            uncancellable(async move { crate::contacts::reject_merge(&state.pool, id).await })
+                .await?;
+        return match rejected {
+            Ok(()) => Ok(StatusCode::NO_CONTENT),
+            // The guarded SELECT and the compare-and-set both report a proposal that is no longer
+            // pending this way; either means another decision got there first.
+            Err(sqlx::Error::RowNotFound) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting a contact merge failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
     // Uncancellable: rejecting flips the proposal first and discards the paused run second, and the
     // first half cannot be replayed — a retry finds the proposal no longer `pending` and answers 409.
     match uncancellable(async move { crate::proposals::reject_proposal(&state.pool, id).await })

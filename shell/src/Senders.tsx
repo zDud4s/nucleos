@@ -1,13 +1,117 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  getContacts, setSenderVerdict,
-  type Correspondent, type SenderVerdict,
+  decideContactMerge, getContactMerges, getContacts, setSenderVerdict, unmergeContact,
+  type Correspondent, type MergeSide, type MergeSuggestion, type SenderVerdict,
 } from "./api";
 import { relativeTime } from "./derive";
-import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
 interface SendersProps {
   token: string;
+}
+
+function verdictLabel(verdict: string | null): string | null {
+  if (verdict === "pin") return "always urgent";
+  if (verdict === "mute") return "always noise";
+  return null;
+}
+
+function Side({ side }: { side: MergeSide }) {
+  const label = verdictLabel(side.verdict);
+  return (
+    <div className="m-side">
+      <b>{side.display_name ?? side.addresses[0]}</b>
+      {/* Every address under this contact, because the question is about identity and an address
+          the person does not recognise is the whole reason to answer no. */}
+      <ul className="m-addrs">
+        {side.addresses.map((address) => <li key={address}>{address}</li>)}
+      </ul>
+      <span className="m-count">
+        {side.messages_in} message{side.messages_in === 1 ? "" : "s"} in
+      </span>
+      {label !== null && <Badge tone={side.verdict === "pin" ? "active" : "off"}>{label}</Badge>}
+    </div>
+  );
+}
+
+interface SuggestionsProps {
+  token: string;
+  suggestions: MergeSuggestion[];
+  onDecided: () => void;
+}
+
+/**
+ * Questions the núcleo has asked about who is who.
+ *
+ * The heuristic files a suggestion and a human answers — it never merges on its own, because a
+ * wrong guess silently fuses two people's histories and you find out months later from the verdict
+ * it caused. This is the answering surface; without it the suggestion was created by a sweep that
+ * nothing ran, hidden by a list that filtered it out, and refused by both decision endpoints.
+ */
+function Suggestions({ token, suggestions, onDecided }: SuggestionsProps) {
+  const [busy, setBusy] = useState<number | null>(null);
+  const [failed, setFailed] = useState<{ id: number; text: string } | null>(null);
+
+  async function decide(proposalId: number, accept: boolean) {
+    setBusy(proposalId);
+    setFailed(null);
+    const result = await decideContactMerge(token, proposalId, accept);
+    setBusy(null);
+    if (!result.ok) {
+      setFailed({
+        id: proposalId,
+        // The daemon refuses to join two people you told it opposite things about, rather than
+        // picking a winner and discarding one of your instructions. Naming the way out is the
+        // whole value of separating this from a generic failure.
+        text: result.status === 409
+          ? "These two carry opposite standing decisions. Withdraw one of them below, then answer again."
+          : result.status === 404
+            ? "That suggestion is gone."
+            : "The daemon did not take that answer.",
+      });
+      return;
+    }
+    onDecided();
+  }
+
+  return (
+    <Panel title="Same person?" aside={`${suggestions.length} to answer`}>
+      {suggestions.map((one) => (
+        <article className="feed-item merge-ask" key={one.proposal_id}>
+          <div className="m-pair">
+            <Side side={one.keep} />
+            <span className="m-join">=</span>
+            <Side side={one.absorb} />
+          </div>
+          <p className="a-note">{one.reasoning}</p>
+          <div className="a-actions">
+            {/* Confirmed on the way in, not on the way out: joining is undoable by splitting them
+                again, but it is still a statement about two real people. */}
+            <ConfirmButton
+              size="sm"
+              variant="approve"
+              confirmLabel="Confirm same person?"
+              disabled={busy !== null}
+              onConfirm={() => void decide(one.proposal_id, true)}
+            >
+              Same person
+            </ConfirmButton>
+            <Button
+              size="sm"
+              disabled={busy !== null}
+              title="The núcleo remembers this answer and stops suggesting this pair."
+              onClick={() => void decide(one.proposal_id, false)}
+            >
+              Different people
+            </Button>
+          </div>
+          {failed !== null && failed.id === one.proposal_id && (
+            <ErrorNote>{failed.text}</ErrorNote>
+          )}
+        </article>
+      ))}
+    </Panel>
+  );
 }
 
 /**
@@ -28,16 +132,41 @@ interface SendersProps {
  */
 function Senders({ token }: SendersProps) {
   const [contacts, setContacts] = useState<Correspondent[] | null>(null);
+  const [suggestions, setSuggestions] = useState<MergeSuggestion[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
   const [deciding, setDeciding] = useState<string | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const next = await getContacts(token);
+    const [next, asked] = await Promise.all([
+      getContacts(token),
+      getContactMerges(token),
+    ]);
     setContacts(next);
+    setSuggestions(asked ?? []);
     setLoading(false);
   }, [token]);
+
+  /**
+   * Splits an address back out into a person of its own.
+   *
+   * Offered only where a human actually joined something (`linked_by === "human"`), because that is
+   * the only case with anything to undo — and it is what makes approving a merge a safe thing to
+   * do. The daemon restores exactly what was there, counters included, since the join never moved
+   * them.
+   */
+  async function split(address: string) {
+    setDeciding(address);
+    setFailed(null);
+    const result = await unmergeContact(token, address);
+    setDeciding(null);
+    if (!result.ok) {
+      setFailed("Could not split that address out.");
+      return;
+    }
+    await refresh();
+  }
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -60,7 +189,21 @@ function Senders({ token }: SendersProps) {
       || (one.display_name ?? "").toLowerCase().includes(needle));
   const decided = (contacts ?? []).filter((one) => one.verdict !== null).length;
 
+  // How many addresses share each contact, so a merged pair can be told apart from a lone address.
+  const sharing = new Map<number, number>();
+  for (const one of contacts ?? []) {
+    sharing.set(one.contact_id, (sharing.get(one.contact_id) ?? 0) + 1);
+  }
+
   return (
+    <>
+      {suggestions.length > 0 && (
+        <Suggestions
+          token={token}
+          suggestions={suggestions}
+          onDecided={() => void refresh()}
+        />
+      )}
     <Panel
       title="Senders"
       aside={contacts === null ? undefined : `${contacts.length} known · ${decided} decided`}
@@ -102,6 +245,11 @@ function Senders({ token }: SendersProps) {
             {/* Someone you have written to is not a stranger, and the classifier treats them
                 differently — a first-contact "urgent" is demoted, theirs is not. */}
             {one.outbound_ever === 1 && <Badge tone="shadow">you write back</Badge>}
+            {/* Only where a human joined something AND something is still joined: the flag alone
+                would keep claiming a merge after the other half was split back out. */}
+            {one.linked_by === "human" && (sharing.get(one.contact_id) ?? 1) > 1 && (
+              <Badge tone="pending">merged</Badge>
+            )}
           </div>
           <p className="f-body">
             {one.display_name !== null && <span className="s-addr">{one.address} — </span>}
@@ -129,11 +277,22 @@ function Senders({ token }: SendersProps) {
                 Always noise
               </Button>
             </span>
+            {one.linked_by === "human" && (sharing.get(one.contact_id) ?? 1) > 1 && (
+              <ConfirmButton
+                size="sm"
+                confirmLabel="Confirm split?"
+                disabled={deciding !== null}
+                onConfirm={() => void split(one.address)}
+              >
+                Not the same person
+              </ConfirmButton>
+            )}
           </div>
         </article>
       ))}
       {failed !== null && <ErrorNote>{failed}</ErrorNote>}
     </Panel>
+    </>
   );
 }
 

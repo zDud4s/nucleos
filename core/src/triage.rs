@@ -366,6 +366,8 @@ pub struct LoopState {
     stall_announced: bool,
     /// When retention last ran, so the prune keeps its own cadence inside the 60s tick.
     last_prune: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the contact-merge heuristic last swept, on its own cadence for the same reason.
+    last_merge_sweep: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Messages waiting with no batch holding them.
@@ -1245,6 +1247,14 @@ const CONTENT_CLASSES: &str = "('urgent','action','info','noise')";
 
 /// How often the prune runs while the daemon is up.
 pub const PRUNE_INTERVAL_HOURS: i64 = 6;
+
+/// How often the contact-merge heuristic looks for two addresses that are one person.
+///
+/// A new candidate can only appear when mail arrives from an address carrying a display name, so
+/// there is nothing to gain from asking often. The sweep is also self-limiting — it skips pairs
+/// already proposed and pairs already refused — so a frequent one would mostly scan and find
+/// nothing. This is about the cost of the scan, not about how fast a question should reach you.
+pub const MERGE_SWEEP_INTERVAL_HOURS: i64 = 6;
 /// Rows are removed entirely after this long, and `failed` rows are kept far longer because they
 /// are the ones a person may still act on.
 pub const ROW_RETENTION_DAYS: i64 = 30;
@@ -1342,6 +1352,28 @@ async fn housekeeping(
                 tracing::info!(bodies, rows, "email retention: pruned")
             }
             Err(error) => tracing::warn!(%error, "email retention: prune failed"),
+        }
+    }
+
+    // Gated on the pillar being ON, unlike the prune above it. Retention is an obligation the
+    // daemon owes for content it already stored, so it runs whether or not mail is being collected.
+    // This is the opposite: it CREATES questions about a mailbox, and a mailbox nobody turned on
+    // should not be generating any.
+    if !state.email.enabled {
+        return;
+    }
+    let sweep_due = loop_state
+        .last_merge_sweep
+        .is_none_or(|last| now - last >= chrono::Duration::hours(MERGE_SWEEP_INTERVAL_HOURS));
+    if sweep_due {
+        loop_state.last_merge_sweep = Some(now);
+        match crate::contacts::propose_merges(&state.pool).await {
+            Ok(proposed) if proposed.is_empty() => {}
+            Ok(proposed) => tracing::info!(
+                count = proposed.len(),
+                "contact merges suggested, waiting on a person"
+            ),
+            Err(error) => tracing::warn!(%error, "contact merge sweep failed"),
         }
     }
 }

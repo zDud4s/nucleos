@@ -227,11 +227,61 @@ pub async fn profile_for(pool: &SqlitePool, address: &str) -> sqlx::Result<Optio
     ))
 }
 
-// Consumed by the merge-proposal packet.
-#[allow(dead_code)]
-pub async fn merge(pool: &SqlitePool, keep_id: i64, absorb_id: i64) -> sqlx::Result<()> {
-    let linked_at = chrono::Utc::now().to_rfc3339();
-    let mut transaction = pool.begin().await?;
+/// What a merge did, or why it would not.
+///
+/// The refusal is a first-class outcome rather than an error, because it is a question for the
+/// person rather than a fault: two people they told the núcleo opposite things about cannot become
+/// one person without one of those instructions being thrown away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged,
+    /// Both contacts carry a standing decision and the two disagree.
+    RefusedConflictingVerdicts {
+        keep: String,
+        absorb: String,
+    },
+}
+
+/// The standing verdict recorded against one contact, read inside a transaction.
+async fn verdict_of(
+    transaction: &mut Transaction<'_, Sqlite>,
+    contact_id: i64,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT verdict FROM contact_overrides WHERE contact_id = ?")
+        .bind(contact_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map(Option::flatten)
+}
+
+/// Joins two contacts into one, carrying the standing decision across.
+///
+/// The addresses move and the counters do not, which is what makes the join a pointer change and
+/// splitting it again exact. What is new here is `contact_overrides`, which the address move alone
+/// does not touch — and a pin lives on the CONTACT, so ignoring it had two failure modes with no
+/// error between them: the absorbed person's decision became an unreadable orphan row, and their
+/// mail silently started obeying the kept person's decision instead.
+///
+/// So the rule is that no merge discards an instruction. One decision moves to the survivor, two
+/// identical ones collapse, and two that disagree refuse the merge outright. Picking a winner there
+/// would be the system deciding something it was told twice and told differently — the same guess
+/// the whole propose-don't-decide design exists to avoid.
+async fn merge_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    keep_id: i64,
+    absorb_id: i64,
+    at: &str,
+) -> sqlx::Result<MergeOutcome> {
+    let keep_verdict = verdict_of(transaction, keep_id).await?;
+    let absorb_verdict = verdict_of(transaction, absorb_id).await?;
+    if let (Some(keep), Some(absorb)) = (&keep_verdict, &absorb_verdict)
+        && keep != absorb
+    {
+        return Ok(MergeOutcome::RefusedConflictingVerdicts {
+            keep: keep.clone(),
+            absorb: absorb.clone(),
+        });
+    }
 
     sqlx::query(
         "UPDATE contact_addresses
@@ -241,24 +291,89 @@ pub async fn merge(pool: &SqlitePool, keep_id: i64, absorb_id: i64) -> sqlx::Res
          WHERE contact_id = ?",
     )
     .bind(keep_id)
-    .bind(linked_at)
+    .bind(at)
     .bind(absorb_id)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
 
-    transaction.commit().await
+    // The absorbed row goes either way: it is unreachable afterwards, since every verdict is looked
+    // up through the addresses that now point at the survivor. When the survivor had no decision of
+    // its own, the instruction moves rather than dying with the row it was written on.
+    if let Some(absorb_verdict) = absorb_verdict {
+        if keep_verdict.is_none() {
+            sqlx::query(
+                "INSERT INTO contact_overrides (contact_id, verdict, set_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT (contact_id) DO UPDATE SET verdict = excluded.verdict,
+                                                        set_at  = excluded.set_at",
+            )
+            .bind(keep_id)
+            .bind(&absorb_verdict)
+            .bind(at)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        sqlx::query("DELETE FROM contact_overrides WHERE contact_id = ?")
+            .bind(absorb_id)
+            .execute(&mut **transaction)
+            .await?;
+    }
+
+    Ok(MergeOutcome::Merged)
 }
 
-// Consumed by the merge-proposal packet.
-#[allow(dead_code)]
+/// Joins two contacts outside any proposal — test fixture only.
+///
+/// Production merges go through `approve_merge`, which does this and the proposal's status in ONE
+/// transaction. A standalone version is a second, non-atomic way to reach the same tables, so
+/// `#[cfg(test)]` keeps it available to the tests that exercise the join directly and unavailable
+/// to anything that would use it to merge without an approval.
+#[cfg(test)]
+pub async fn merge(pool: &SqlitePool, keep_id: i64, absorb_id: i64) -> sqlx::Result<MergeOutcome> {
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let outcome = merge_in_transaction(&mut transaction, keep_id, absorb_id, &at).await?;
+    // A refusal wrote nothing, but rolling back rather than committing is what makes that true no
+    // matter what is added to the function above this line.
+    if outcome != MergeOutcome::Merged {
+        return Ok(outcome);
+    }
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+/// Splits one address back out into a person of its own.
+///
+/// The new contact inherits the standing decision, which is the only reading that leaves mail
+/// behaving the way it did a moment earlier: the address was governed by that verdict right up to
+/// the split, and a split is a statement about identity, not about what should happen to their
+/// mail. Dropping it would silently withdraw an instruction nobody withdrew — and the address the
+/// person would look at to check is precisely the one that lost it.
+///
+/// The original contact keeps its own copy, because the addresses left behind are still governed
+/// by it.
 pub async fn unmerge(pool: &SqlitePool, address: &str) -> sqlx::Result<()> {
     let address = normalize_address(address);
     let created_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
 
+    // Read BEFORE the address is repointed, or it resolves through the new contact and finds
+    // nothing — the verdict would be lost by the very statement meant to preserve it.
+    let inherited: Option<String> = sqlx::query_scalar(
+        "SELECT overrides.verdict
+           FROM contact_overrides AS overrides
+           JOIN contact_addresses AS addresses
+             ON addresses.contact_id = overrides.contact_id
+          WHERE addresses.address = ?",
+    )
+    .bind(&address)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .flatten();
+
     let contact_id =
         sqlx::query("INSERT INTO contacts (display_name, created_at) VALUES (NULL, ?)")
-            .bind(created_at)
+            .bind(&created_at)
             .execute(&mut *transaction)
             .await?
             .last_insert_rowid();
@@ -271,9 +386,18 @@ pub async fn unmerge(pool: &SqlitePool, address: &str) -> sqlx::Result<()> {
          WHERE address = ?",
     )
     .bind(contact_id)
-    .bind(address)
+    .bind(&address)
     .execute(&mut *transaction)
     .await?;
+
+    if let Some(verdict) = inherited {
+        sqlx::query("INSERT INTO contact_overrides (contact_id, verdict, set_at) VALUES (?, ?, ?)")
+            .bind(contact_id)
+            .bind(verdict)
+            .bind(&created_at)
+            .execute(&mut *transaction)
+            .await?;
+    }
 
     transaction.commit().await
 }
@@ -344,6 +468,12 @@ pub async fn set_verdict(
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct Correspondent {
     pub address: String,
+    /// Which person this address currently belongs to. Two rows sharing one id are two addresses a
+    /// human said were the same person, which is the only way this list shows a merge happened.
+    pub contact_id: i64,
+    /// `human` when a person approved joining this address to its contact, `implicit` otherwise.
+    /// It is what decides whether splitting it back out is offered.
+    pub linked_by: String,
     pub display_name: Option<String>,
     pub messages_in: i64,
     /// Whether you have ever written to them. It is what `priority.rs` uses to decide a stranger
@@ -364,6 +494,8 @@ pub struct Correspondent {
 pub async fn roster(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<Correspondent>> {
     sqlx::query_as(
         "SELECT addresses.address,
+                addresses.contact_id,
+                addresses.linked_by,
                 addresses.display_name,
                 addresses.messages_in,
                 addresses.outbound_ever,
@@ -504,8 +636,181 @@ pub async fn propose_merges(pool: &SqlitePool) -> sqlx::Result<Vec<i64>> {
     Ok(proposal_ids)
 }
 
-// Consumed by the contact merge decision endpoint.
-#[allow(dead_code)]
+/// One side of a suggested merge, named the way a person can recognise.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergeSide {
+    pub contact_id: i64,
+    /// Every address currently under this contact.
+    pub addresses: Vec<String>,
+    pub display_name: Option<String>,
+    pub messages_in: i64,
+    /// The standing decision, so the conflict that would refuse the merge is visible BEFORE the
+    /// person presses the button rather than as a 409 afterwards.
+    pub verdict: Option<String>,
+}
+
+/// A pending suggestion that two contacts are one person.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergeSuggestion {
+    pub proposal_id: i64,
+    pub reasoning: String,
+    pub created_at: String,
+    /// The contact that survives — the lower id, which is the order the pair is keyed on.
+    pub keep: MergeSide,
+    pub absorb: MergeSide,
+}
+
+async fn merge_side(pool: &SqlitePool, contact_id: i64) -> sqlx::Result<MergeSide> {
+    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT address, display_name, messages_in
+           FROM contact_addresses
+          WHERE contact_id = ?
+          ORDER BY messages_in DESC, address",
+    )
+    .bind(contact_id)
+    .fetch_all(pool)
+    .await?;
+    let verdict: Option<String> =
+        sqlx::query_scalar("SELECT verdict FROM contact_overrides WHERE contact_id = ?")
+            .bind(contact_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+
+    Ok(MergeSide {
+        contact_id,
+        // Whichever address the person actually writes from carries the name worth showing, which
+        // is why the busiest one is first and its name is the one taken.
+        display_name: rows.iter().find_map(|row| row.1.clone()),
+        messages_in: rows.iter().map(|row| row.2).sum(),
+        addresses: rows.into_iter().map(|row| row.0).collect(),
+        verdict,
+    })
+}
+
+/// Every merge the heuristic has suggested and nobody has answered.
+///
+/// Kept out of `proposals::list_pending`, which stays action approvals only. The two kinds share a
+/// table and share nothing else: an action approval is a paused run waiting for a signature and
+/// carries a run, a session and a worktree; this is a question about a mailbox and carries a pair of
+/// contact ids. One list rendering both would have to draw a card that is mostly absent fields.
+///
+/// The contact ids are resolved to addresses here because a person cannot answer "are 4 and 7 the
+/// same person" — the addresses ARE the question.
+pub async fn pending_merges(pool: &SqlitePool) -> sqlx::Result<Vec<MergeSuggestion>> {
+    let rows: Vec<(i64, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT id, reasoning, tool_input, created_at
+           FROM proposals
+          WHERE kind = 'contact-merge'
+            AND status = 'pending'
+            AND tool_input IS NOT NULL
+          ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut suggestions = Vec::with_capacity(rows.len());
+    for (proposal_id, reasoning, tool_input, created_at) in rows {
+        // A row whose `tool_input` no longer parses is skipped rather than failing the list: it
+        // would otherwise take every other suggestion down with it, and the one thing worse than an
+        // unanswerable question is a screen that cannot show the answerable ones either.
+        let Ok((keep_id, absorb_id)) = contact_merge_pair(&tool_input) else {
+            tracing::warn!(
+                proposal_id,
+                "skipping a contact merge with unreadable input"
+            );
+            continue;
+        };
+        suggestions.push(MergeSuggestion {
+            proposal_id,
+            reasoning: reasoning.unwrap_or_default(),
+            created_at,
+            keep: merge_side(pool, keep_id).await?,
+            absorb: merge_side(pool, absorb_id).await?,
+        });
+    }
+    Ok(suggestions)
+}
+
+/// Why a merge decision could not be taken.
+///
+/// There is deliberately no `NotFound`: the guarded SELECT below matches on "this proposal, of this
+/// kind, still pending", so a missing row and an already-decided one are indistinguishable here and
+/// mean the same thing to the caller. The endpoint separates them by reading the proposal first,
+/// which is where a 404 can honestly be told from a 409.
+#[derive(Debug)]
+pub enum DecisionError {
+    NotPending,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for DecisionError {
+    fn from(error: sqlx::Error) -> Self {
+        // `RowNotFound` reaches here only from the guarded SELECT below, whose WHERE clause is
+        // "this proposal, of this kind, still pending" — so it is the answer to a decision arriving
+        // after another one already landed, not a database fault.
+        match error {
+            sqlx::Error::RowNotFound => Self::NotPending,
+            other => Self::Db(other),
+        }
+    }
+}
+
+/// Carries out a merge a person approved.
+///
+/// One transaction for the join and the proposal's status, the way `reject_merge` already does it
+/// for the rejection and its memory. Split across two, a crash between them leaves either a merge
+/// nobody approved or an approval that merged nothing, and only one of those is visible afterwards.
+///
+/// A refusal commits nothing and leaves the proposal PENDING on purpose: the conflicting decisions
+/// are something the person can resolve — withdraw one of the two pins — and then approve the same
+/// proposal. Marking it decided would make them wait for the heuristic to ask again.
+pub async fn approve_merge(
+    pool: &SqlitePool,
+    proposal_id: i64,
+) -> Result<MergeOutcome, DecisionError> {
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await.map_err(DecisionError::Db)?;
+    let tool_input: String = sqlx::query_scalar(
+        "SELECT tool_input
+         FROM proposals
+         WHERE id = ?
+           AND kind = 'contact-merge'
+           AND status = 'pending'
+           AND tool_input IS NOT NULL",
+    )
+    .bind(proposal_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    // `keep` is the lower id and `absorb` the higher, which is the order `propose_merges` writes and
+    // `contact_merge_rejections` keys on. Which of two contacts survives is arbitrary — they are the
+    // same person — so a stable rule beats a meaningful-looking one.
+    let (keep_id, absorb_id) = contact_merge_pair(&tool_input)?;
+
+    let outcome = merge_in_transaction(&mut transaction, keep_id, absorb_id, &at).await?;
+    if outcome != MergeOutcome::Merged {
+        return Ok(outcome);
+    }
+
+    if !crate::proposals::transition_in_transaction(
+        &mut transaction,
+        proposal_id,
+        "approved",
+        "approved by user",
+        &at,
+    )
+    .await?
+    {
+        // The compare-and-set found the proposal no longer pending, so another decision won the
+        // race. Returning without committing discards this merge rather than applying one the
+        // record will say was never approved.
+        return Err(DecisionError::NotPending);
+    }
+
+    transaction.commit().await.map_err(DecisionError::Db)?;
+    Ok(outcome)
+}
+
 pub async fn reject_merge(pool: &SqlitePool, proposal_id: i64) -> sqlx::Result<()> {
     let rejected_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
@@ -986,6 +1291,214 @@ mod tests {
                 .unwrap();
         assert_eq!(linked_by, "human");
         assert!(linked_at.is_some());
+    }
+
+    async fn contact_id_of(pool: &SqlitePool, address: &str) -> i64 {
+        sqlx::query_scalar("SELECT contact_id FROM contact_addresses WHERE address = ?")
+            .bind(address)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Two addresses, each already its own contact, so a merge has something to join.
+    async fn two_contacts(pool: &SqlitePool) -> (String, i64, String, i64) {
+        let first = "bruno@example.com";
+        let second = "bruna@example.com";
+        let mut transaction = pool.begin().await.unwrap();
+        record_inbound(&mut transaction, first, None, "2026-07-10T08:00:00+00:00")
+            .await
+            .unwrap();
+        record_inbound(&mut transaction, second, None, "2026-07-11T08:00:00+00:00")
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let first_id = contact_id_of(pool, first).await;
+        let second_id = contact_id_of(pool, second).await;
+        assert_ne!(first_id, second_id);
+        (first.to_owned(), first_id, second.to_owned(), second_id)
+    }
+
+    async fn pin(pool: &SqlitePool, address: &str, verdict: &str) {
+        set_verdict(pool, address, Some(verdict)).await.unwrap();
+    }
+
+    /// A pin lives on the CONTACT, and the join only moves addresses. Left alone, the absorbed
+    /// person's instruction became an unreadable orphan row while their mail silently started
+    /// obeying the other person's decision — two failures with no error between them.
+    #[tokio::test]
+    async fn fundir_carrega_a_decisao_de_quem_e_absorvido() {
+        let pool = test_pool().await;
+        let (_keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
+        pin(&pool, &absorbed, "mute").await;
+
+        assert_eq!(
+            merge(&pool, keep_id, absorb_id).await.unwrap(),
+            MergeOutcome::Merged
+        );
+
+        // The instruction moved rather than dying with the row it was written on: the address that
+        // was muted is still muted, now through the surviving contact.
+        assert_eq!(
+            verdict_for(&pool, &absorbed).await.unwrap().as_deref(),
+            Some("mute")
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contact_overrides")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "the absorbed contact must not keep an unreachable override"
+        );
+    }
+
+    #[tokio::test]
+    async fn fundir_recusa_quando_as_duas_decisoes_se_contradizem() {
+        let pool = test_pool().await;
+        let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
+        pin(&pool, &keep, "pin").await;
+        pin(&pool, &absorbed, "mute").await;
+
+        // Picking a winner would be the system deciding something it was told twice and told
+        // differently — the exact guess the propose-don't-decide design exists to avoid.
+        assert_eq!(
+            merge(&pool, keep_id, absorb_id).await.unwrap(),
+            MergeOutcome::RefusedConflictingVerdicts {
+                keep: "pin".into(),
+                absorb: "mute".into(),
+            },
+        );
+        // And it wrote nothing: both people keep their own decision and their own identity.
+        assert_eq!(
+            verdict_for(&pool, &keep).await.unwrap().as_deref(),
+            Some("pin")
+        );
+        assert_eq!(
+            verdict_for(&pool, &absorbed).await.unwrap().as_deref(),
+            Some("mute")
+        );
+        let still_apart: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT contact_id) FROM contact_addresses")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_apart, 2);
+    }
+
+    /// Splitting is a statement about identity, not about what should happen to their mail. The
+    /// address was governed by that verdict right up to the split, and the address someone would
+    /// look at to check is precisely the one that would have lost it.
+    #[tokio::test]
+    async fn desfundir_nao_retira_a_decisao_do_endereco_separado() {
+        let pool = test_pool().await;
+        let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
+        pin(&pool, &keep, "pin").await;
+        merge(&pool, keep_id, absorb_id).await.unwrap();
+        assert_eq!(
+            verdict_for(&pool, &absorbed).await.unwrap().as_deref(),
+            Some("pin")
+        );
+
+        unmerge(&pool, &absorbed).await.unwrap();
+
+        assert_eq!(
+            verdict_for(&pool, &absorbed).await.unwrap().as_deref(),
+            Some("pin"),
+            "the split address must keep behaving the way it did a moment earlier",
+        );
+        assert_eq!(
+            verdict_for(&pool, &keep).await.unwrap().as_deref(),
+            Some("pin"),
+            "and the addresses left behind are still governed by the original",
+        );
+    }
+
+    /// The whole point of wiring the endpoint: approving used to answer 409 and merge nothing.
+    #[tokio::test]
+    async fn aprovar_uma_proposta_funde_e_decide_a_proposta() {
+        let pool = test_pool().await;
+        let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
+        let proposal_id =
+            crate::proposals::create_contact_merge(&pool, keep_id, absorb_id, "same name")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            approve_merge(&pool, proposal_id).await.unwrap(),
+            MergeOutcome::Merged
+        );
+
+        assert_eq!(
+            contact_id_of(&pool, &keep).await,
+            contact_id_of(&pool, &absorbed).await
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "approved");
+
+        // One decision only: a second approval finds nothing pending rather than merging again.
+        assert!(matches!(
+            approve_merge(&pool, proposal_id).await,
+            Err(DecisionError::NotPending)
+        ));
+    }
+
+    /// A refusal leaves the proposal answerable: withdraw one of the two pins and approve the same
+    /// suggestion. Marking it decided would make the person wait for the heuristic to ask again.
+    #[tokio::test]
+    async fn uma_recusa_por_contradicao_deixa_a_proposta_por_responder() {
+        let pool = test_pool().await;
+        let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
+        pin(&pool, &keep, "pin").await;
+        pin(&pool, &absorbed, "mute").await;
+        let proposal_id =
+            crate::proposals::create_contact_merge(&pool, keep_id, absorb_id, "same name")
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            approve_merge(&pool, proposal_id).await.unwrap(),
+            MergeOutcome::RefusedConflictingVerdicts { .. }
+        ));
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+
+        // Withdrawing one of the two is all it takes, and the same suggestion then goes through.
+        set_verdict(&pool, &absorbed, None).await.unwrap();
+        assert_eq!(
+            approve_merge(&pool, proposal_id).await.unwrap(),
+            MergeOutcome::Merged
+        );
+    }
+
+    /// The suggestion has to be answerable by a person, and nobody can answer "are 4 and 7 the
+    /// same person" — the addresses are the question.
+    #[tokio::test]
+    async fn as_sugestoes_pendentes_trazem_os_enderecos_e_as_decisoes() {
+        let pool = test_pool().await;
+        let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
+        pin(&pool, &absorbed, "pin").await;
+        crate::proposals::create_contact_merge(&pool, keep_id, absorb_id, "same name")
+            .await
+            .unwrap();
+
+        let pending = pending_merges(&pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].keep.addresses, vec![keep]);
+        assert_eq!(pending[0].absorb.addresses, vec![absorbed]);
+        // The verdicts travel so the conflict that would refuse the merge is visible BEFORE the
+        // button is pressed, rather than as a 409 afterwards.
+        assert_eq!(pending[0].absorb.verdict.as_deref(), Some("pin"));
+        assert!(pending[0].keep.verdict.is_none());
     }
 
     #[tokio::test]

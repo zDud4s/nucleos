@@ -417,6 +417,10 @@ export async function setProjectWipLimit(
 /** One correspondent, as the daemon has come to know them. */
 export interface Correspondent {
   address: string;
+  /** Which person this address belongs to. Two rows sharing one id were merged by a human. */
+  contact_id: number;
+  /** `"human"` when someone approved joining this address to its contact, `"implicit"` otherwise. */
+  linked_by: string;
   display_name: string | null;
   messages_in: number;
   /** 1 if you have ever written to them — what `priority.rs` uses to tell a stranger apart. */
@@ -443,6 +447,103 @@ export async function getContacts(token: string): Promise<Correspondent[] | null
     return (await res.json()) as Correspondent[];
   } catch {
     return null;
+  }
+}
+
+/** One side of a suggested merge, named the way a person can recognise. */
+export interface MergeSide {
+  contact_id: number;
+  addresses: string[];
+  display_name: string | null;
+  messages_in: number;
+  /** The standing decision, so a conflict is visible before the button is pressed, not after. */
+  verdict: string | null;
+}
+
+/** A pending suggestion that two addresses belong to one person. */
+export interface MergeSuggestion {
+  proposal_id: number;
+  reasoning: string;
+  created_at: string;
+  /** The contact that survives the join. */
+  keep: MergeSide;
+  absorb: MergeSide;
+}
+
+/**
+ * Merges the daemon has suggested and nobody has answered.
+ *
+ * Its own route rather than a slice of `/proposals`: an action approval is a paused run waiting for
+ * a signature, this is a question about a mailbox, and they share nothing but a table.
+ */
+export async function getContactMerges(token: string): Promise<MergeSuggestion[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/contacts/merges`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as MergeSuggestion[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Answers a merge suggestion.
+ *
+ * Separate from `approveProposal`, which returns a resume run id and collapses every failure to
+ * null. Neither fits here: a merge resumes nothing, and the 409 it can answer is the one refusal
+ * that names something the person can go and fix — two contradictory standing decisions — so the
+ * status has to survive.
+ */
+export async function decideContactMerge(
+  token: string,
+  proposalId: number,
+  accept: boolean,
+): Promise<ApiResult<null>> {
+  const verb = accept ? "approve" : "reject";
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/${proposalId}/${verb}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Splits an address back out into a person of its own — the undo for an approved merge.
+ *
+ * The join is a pointer move, so undoing it restores exactly what was there, counters included.
+ * The split address keeps whatever standing decision was governing it a moment earlier.
+ */
+export async function unmergeContact(
+  token: string,
+  address: string,
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/contacts/unmerge`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ address }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
 
