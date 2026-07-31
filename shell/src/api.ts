@@ -267,6 +267,60 @@ export interface QueuedEmail {
   sender_verdict: string | null;
 }
 
+// ── The processes beside the daemon, and how it is configured ───────────────
+
+/** One supervised sidecar, and what has happened to it since the daemon started. */
+export interface SidecarState {
+  name: string;
+  /** `"running"`, or `"down"` while it backs off before the next attempt. */
+  state: string;
+  started_at: string | null;
+  /** The last exit status or spawn error — kept even while it is running again. */
+  last_failure: string | null;
+  last_failure_at: string | null;
+  restarts: number;
+}
+
+export async function getSidecars(token: string): Promise<SidecarState[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/sidecars`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SidecarState[];
+  } catch {
+    return null;
+  }
+}
+
+/** The email pillar's settings. No password: it never leaves Credential Manager and the sidecar. */
+export interface EmailConfig {
+  enabled: boolean;
+  /** True only once the hook barrier was proven at startup. Enabled but unarmed is a real state. */
+  armed: boolean;
+  host: string;
+  username: string;
+  mailbox: string;
+  sent_mailbox: string | null;
+  poll_interval_secs: number;
+  notify_classes: string[];
+  digest_hour_utc: number;
+  retain_bodies_days: number;
+  local_triage_disabled: string | null;
+}
+
+export async function getEmailConfig(token: string): Promise<EmailConfig | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/config/email`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as EmailConfig;
+  } catch {
+    return null;
+  }
+}
+
 // ── What a project does on its own ──────────────────────────────────────────
 
 /** One scheduled rule, with what the daemon knows about it having run. */

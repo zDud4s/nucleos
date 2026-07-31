@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  API_TOKEN_LEVELS, createApiToken, getBackups, getHealthReadout, listApiTokens,
+  API_TOKEN_LEVELS, createApiToken, getBackups, getHealthReadout, getSidecars, listApiTokens,
   restoreBackup, revokeApiToken, takeBackup,
   type ApiTokenLevel, type ApiTokenSummary, type BackupInfo, type ConnectionState,
-  type CreatedApiToken, type HealthReadout, type StagedRestore,
+  type CreatedApiToken, type HealthReadout, type SidecarState, type StagedRestore,
 } from "./api";
 import {
   formatBytes, healthReasonLabel, healthTone, relativeTime, tokenLevelHint,
@@ -68,10 +68,76 @@ function Health({ token }: { token: string }) {
         </ul>
       )}
       <p className="a-note">
-        A sidecar row says what is configured and installed — not whether that process is alive right
-        now. Nothing here reports liveness, because the supervisor that restarts sidecars keeps no
-        status to report.
+        A sidecar row here says what is configured and installed. Whether those processes are
+        actually running is the panel below.
       </p>
+    </Panel>
+  );
+}
+
+/**
+ * The processes beside the daemon, and whether they are up.
+ *
+ * A sidecar that keeps failing to start used to be visible nowhere: the supervisor restarts it on a
+ * backoff and writes one line per attempt to a log nobody reads while using the app. For the email
+ * poller that meant the Mail tab looked like a quiet mailbox — which is exactly what an empty inbox
+ * looks like.
+ *
+ * The last failure is kept on screen even while the sidecar is running again, because "up, and it
+ * has crashed nine times" is a different situation from "up", and only one of them is fine.
+ */
+function Sidecars({ token }: { token: string }) {
+  const [sidecars, setSidecars] = useState<SidecarState[] | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const next = await getSidecars(token);
+      if (cancelled) return;
+      setSidecars(next);
+      setLoading(false);
+    };
+    void load();
+    const id = setInterval(() => void load(), 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [token]);
+
+  const down = (sidecars ?? []).filter((one) => one.state !== "running").length;
+
+  return (
+    <Panel title="Sidecars" aside={sidecars === null ? undefined : down > 0 ? `${down} down` : "all up"}>
+      {loading && sidecars === null && <p className="a-note">Asking…</p>}
+      {!loading && sidecars === null && (
+        <ErrorNote>Could not read the sidecar states from the daemon.</ErrorNote>
+      )}
+      {sidecars !== null && sidecars.length === 0 && (
+        <Teach title="No sidecar has been supervised yet.">
+          The daemon starts one per configured pillar — mail collection, Telegram — as it comes up. A
+          daemon with none configured is a daemon with nothing to list here.
+        </Teach>
+      )}
+      <ul className="subsystems">
+        {(sidecars ?? []).map((one) => (
+          <li key={one.name}>
+            <Badge tone={one.state === "running" ? "active" : "paused"}>{one.state}</Badge>
+            <span className="s-name">{one.name}</span>
+            <span className="s-reason">
+              {one.state === "running" && one.started_at !== null
+                ? `up since ${relativeTime(one.started_at)}`
+                : one.last_failure ?? "never started"}
+              {/* The count is the tell for a sidecar that is technically up and in fact thrashing. */}
+              {one.restarts > 0 && ` · ${one.restarts} restart${one.restarts === 1 ? "" : "s"}`}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {(sidecars ?? []).some((one) => one.state === "running" && one.last_failure !== null) && (
+        <p className="a-note">
+          A sidecar shown as running that also has a last failure has been restarted since the
+          daemon started. It is working now; it has not been working the whole time.
+        </p>
+      )}
     </Panel>
   );
 }
@@ -378,7 +444,12 @@ function System({ token, connection }: SystemProps) {
         ))}
       </nav>
       <div className="stack">
-        {section === "health" && <Health token={token} />}
+        {section === "health" && (
+          <>
+            <Health token={token} />
+            <Sidecars token={token} />
+          </>
+        )}
         {section === "backups" && <Backups token={token} />}
         {section === "tokens" && <Tokens token={token} />}
       </div>

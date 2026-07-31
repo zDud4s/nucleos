@@ -41,6 +41,8 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/status", get(status))
         .route("/health/readout", get(health_readout))
+        .route("/sidecars", get(get_sidecars))
+        .route("/config/email", get(get_email_config))
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
         .route("/backups/{name}/restore", post(post_backup_restore))
@@ -1610,6 +1612,56 @@ async fn post_project_wip_limit(
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every supervised sidecar and what has happened to it.
+///
+/// A sidecar that keeps failing to start was previously invisible: `sidecar.rs` restarts it with a
+/// backoff and writes one warning per attempt to a log nobody reads while using the app. For the
+/// email poller in particular that meant the Mail tab looked like a quiet mailbox — which is what an
+/// empty inbox looks like too.
+async fn get_sidecars() -> Json<Vec<crate::sidecar::SidecarState>> {
+    Json(crate::sidecar::states())
+}
+
+/// The email pillar's settings, minus everything secret.
+///
+/// No password: it comes from Credential Manager, is handed to the sidecar process, and does not
+/// pass through here. The host and account are named because "which mailbox is this" is the question
+/// the rest of the panel's numbers are about.
+#[derive(serde::Serialize)]
+struct EmailConfigView {
+    enabled: bool,
+    /// True only once the hook barrier has been PROVEN at startup. Enabled but unarmed is a real
+    /// state — the pillar owns retention either way — and it is why triage can be stopped while
+    /// mail keeps arriving.
+    armed: bool,
+    host: String,
+    username: String,
+    mailbox: String,
+    sent_mailbox: Option<String>,
+    poll_interval_secs: u64,
+    notify_classes: Vec<String>,
+    digest_hour_utc: u8,
+    retain_bodies_days: u8,
+    /// Why local triage is unavailable when a local model was configured but could not be trusted.
+    local_triage_disabled: Option<String>,
+}
+
+async fn get_email_config(State(state): State<AppState>) -> Json<EmailConfigView> {
+    Json(EmailConfigView {
+        enabled: state.email.enabled,
+        armed: state.email.armed.load(std::sync::atomic::Ordering::Relaxed),
+        host: state.email.host.clone(),
+        username: state.email.username.clone(),
+        mailbox: state.email.mailbox.clone(),
+        sent_mailbox: state.email.sent_mailbox.clone(),
+        poll_interval_secs: state.email.poll_interval_secs,
+        notify_classes: state.email.notify_classes.clone(),
+        digest_hour_utc: state.email.digest_hour_utc,
+        retain_bodies_days: state.email.retain_bodies_days,
+        local_triage_disabled: state.local_triage_disabled.clone(),
+    })
 }
 
 async fn get_projects(
@@ -3641,6 +3693,83 @@ mod tests {
             set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
             StatusCode::NOT_FOUND,
         );
+    }
+
+    /// The mailbox name was hard-coded in the shell because nothing reported it, and a wrong one
+    /// reads as an empty mailbox rather than as an error — the worst shape a wrong answer can take.
+    #[tokio::test]
+    async fn the_email_config_names_the_mailbox_and_never_the_password() {
+        let mut state = test_state().await;
+        state.email = std::sync::Arc::new(crate::state::EmailRuntime::from_config(
+            &crate::config::EmailConfig {
+                enabled: true,
+                host: "imap.example.com".into(),
+                port: 993,
+                username: "me@example.com".into(),
+                mailbox: "Trabalho".into(),
+                poll_interval_secs: 120,
+                ..Default::default()
+            },
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        ));
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/config/email")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(config["mailbox"], "Trabalho");
+        assert_eq!(config["host"], "imap.example.com");
+        assert_eq!(config["poll_interval_secs"], 120);
+        // Enabled is not armed. The barrier is proven at startup, and until it is, the pillar
+        // stores and expires mail without triaging any of it — a state worth being able to see.
+        assert_eq!(config["armed"], false);
+
+        // The IMAP password lives in Credential Manager and is handed to the sidecar process. It
+        // is not in `EmailRuntime` at all, and this is what says the readout must never grow it.
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !body.contains("password"),
+            "the email readout must not carry a credential: {body}"
+        );
+    }
+
+    /// A sidecar that keeps failing to start is invisible without this: the supervisor restarts it
+    /// and logs, and the Mail tab looks like a quiet mailbox rather than a broken poller.
+    #[tokio::test]
+    async fn the_sidecar_readout_answers_even_before_anything_has_been_supervised() {
+        let state = test_state().await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/sidecars")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // An array either way. The registry fills as supervisors start, so "none yet" has to be an
+        // empty list rather than an error — a daemon with no sidecars configured is a normal daemon.
+        assert!(listed.is_array());
     }
 
     /// The shell's transcript lived only in the window that made it, because nothing on a run row

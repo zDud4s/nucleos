@@ -63,6 +63,20 @@ pub struct EmailRuntime {
     pub notify_classes: Vec<String>,
     pub digest_hour_utc: u8,
     pub retain_bodies_days: u8,
+    /// The mailbox the sidecar collects from.
+    ///
+    /// Kept here so something can be ASKED which one it is. The shell reads the collection cursor
+    /// per mailbox and had no route that reported the configured name, so it hard-coded `INBOX` —
+    /// which reads empty, not wrong, for anyone collecting from anywhere else. That is the worst
+    /// shape a wrong answer can take: it looks like nothing has arrived.
+    pub mailbox: String,
+    /// The mailbox the user's own sent mail is read from, when one is configured.
+    pub sent_mailbox: Option<String>,
+    /// The IMAP host and account, for saying WHICH mailbox this is. Never the password: that comes
+    /// from Credential Manager, is handed to the sidecar process, and is not in this struct to leak.
+    pub host: String,
+    pub username: String,
+    pub poll_interval_secs: u64,
     /// The directory a triage run works in, so it never inherits the daemon's (spec §5.5).
     pub sandbox: std::path::PathBuf,
     /// The mail organization folder, canonicalised once so every containment check compares
@@ -87,6 +101,11 @@ impl Default for EmailRuntime {
             notify_classes: vec!["urgent".to_string()],
             digest_hour_utc: 7,
             retain_bodies_days: 14,
+            mailbox: "INBOX".to_string(),
+            sent_mailbox: None,
+            host: String::new(),
+            username: String::new(),
+            poll_interval_secs: 300,
             sandbox: std::path::PathBuf::new(),
             files_root: std::path::PathBuf::new(),
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -105,6 +124,11 @@ impl EmailRuntime {
             notify_classes: config.notify_classes.clone(),
             digest_hour_utc: config.digest_hour_utc,
             retain_bodies_days: config.retain_bodies_days,
+            mailbox: config.mailbox.clone(),
+            sent_mailbox: config.sent_mailbox.clone(),
+            host: config.host.clone(),
+            username: config.username.clone(),
+            poll_interval_secs: config.poll_interval_secs,
             sandbox,
             files_root,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),

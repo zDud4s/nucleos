@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -8,8 +10,59 @@ const RESTART_BASE: Duration = Duration::from_secs(2);
 /// enough that a sidecar which starts working again is back within a minute.
 const RESTART_MAX: Duration = Duration::from_secs(60);
 
+/// What each supervised sidecar is doing, as its own supervisor last saw it.
+///
+/// Process-wide rather than a field on `AppState`, the way `assistant::BUSY_CHATS` is: there is one
+/// set of sidecars per daemon, not per handler state, and the supervisors are spawned as free tasks
+/// that outlive every request.
+///
+/// It exists because a dead sidecar was previously visible nowhere. The supervisor restarts it and
+/// writes one line to a log; if the email poller was failing to start, the Mail tab simply looked
+/// like a quiet mailbox — the same thing an empty inbox looks like.
+static SIDECARS: LazyLock<Mutex<BTreeMap<String, SidecarState>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// One sidecar, and what has happened to it since the daemon started.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SidecarState {
+    pub name: String,
+    /// `running`, or `down` while it is backing off before the next attempt.
+    pub state: &'static str,
+    /// When the current process started. `None` means it is not running right now.
+    pub started_at: Option<String>,
+    /// What went wrong last: an exit status, or the error that stopped it starting at all.
+    ///
+    /// Kept even while the sidecar is running again, because "up, but it has crashed nine times"
+    /// is a different situation from "up", and only one of them is fine.
+    pub last_failure: Option<String>,
+    pub last_failure_at: Option<String>,
+    /// How many times this sidecar has been restarted since the daemon started.
+    pub restarts: u32,
+}
+
+/// Every supervised sidecar, in name order.
+pub fn states() -> Vec<SidecarState> {
+    SIDECARS.lock().unwrap().values().cloned().collect()
+}
+
+fn record(name: &str, update: impl FnOnce(&mut SidecarState)) {
+    let mut sidecars = SIDECARS.lock().unwrap();
+    let entry = sidecars
+        .entry(name.to_owned())
+        .or_insert_with(|| SidecarState {
+            name: name.to_owned(),
+            state: "down",
+            started_at: None,
+            last_failure: None,
+            last_failure_at: None,
+            restarts: 0,
+        });
+    update(entry);
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
+    let mut attempts: u32 = 0;
     loop {
         let mut cmd = Command::new(&binary_path);
         for (k, v) in &env {
@@ -20,8 +73,26 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         cmd.kill_on_drop(true);
         match cmd.spawn() {
             Ok(mut child) => {
+                let started_at = chrono::Utc::now().to_rfc3339();
+                let restarts = attempts;
+                record(&name, |entry| {
+                    entry.state = "running";
+                    entry.started_at = Some(started_at);
+                    entry.restarts = restarts;
+                });
                 let status = child.wait().await;
                 tracing::warn!(sidecar = %name, ?status, "sidecar exited — restarting");
+                let failed_at = chrono::Utc::now().to_rfc3339();
+                let detail = match &status {
+                    Ok(status) => format!("exited: {status}"),
+                    Err(error) => format!("could not be waited on: {error}"),
+                };
+                record(&name, |entry| {
+                    entry.state = "down";
+                    entry.started_at = None;
+                    entry.last_failure = Some(detail);
+                    entry.last_failure_at = Some(failed_at);
+                });
                 // Ran and then died is a different event from cannot start: a rare crash should
                 // restart promptly rather than inherit a backoff earned by something else.
                 delay = RESTART_BASE;
@@ -37,9 +108,18 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                     ?delay,
                     "sidecar failed to spawn — backing off"
                 );
+                let failed_at = chrono::Utc::now().to_rfc3339();
+                let detail = format!("could not start: {error}");
+                record(&name, |entry| {
+                    entry.state = "down";
+                    entry.started_at = None;
+                    entry.last_failure = Some(detail);
+                    entry.last_failure_at = Some(failed_at);
+                });
                 delay = (delay * 2).min(RESTART_MAX);
             }
         }
+        attempts = attempts.saturating_add(1);
         tokio::time::sleep(delay).await;
     }
 }

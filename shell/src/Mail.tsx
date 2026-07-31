@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchAllAttachments, fetchAttachment, getEmail, getEmailCursor, getEmailQueue, listMailFiles,
-  requeueEmail, saveAllAttachments, saveAttachment, setSenderVerdict, triageEmail,
-  type ConnectionState, type EmailAttachment, type EmailCursor, type EmailDetail,
-  type QueuedEmail, type SenderVerdict,
+  getEmailConfig, requeueEmail, saveAllAttachments, saveAttachment, setSenderVerdict, triageEmail,
+  type ConnectionState, type EmailAttachment, type EmailConfig, type EmailCursor,
+  type EmailDetail, type QueuedEmail, type SenderVerdict,
 } from "./api";
 import {
   base64ToBytes, formatBytes, mailLabel, mailTone, relativeTime, requeueFailureMessage,
@@ -12,13 +12,14 @@ import {
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
 
 /**
- * The mailbox the cursor is read for.
+ * The mailbox to read the cursor for until the daemon says which one it collects from.
  *
- * Hard-coded because the daemon exposes no route that reports which mailbox it was configured to
- * collect from, and `INBOX` is the default `config.rs` ships. A different configured mailbox makes
- * this read empty rather than wrong — the cursor line simply says nothing has been collected.
+ * A fallback for the first render only — `/config/email` reports the configured name and this page
+ * asks. It used to be the answer rather than the guess, and a different configured mailbox made the
+ * cursor read empty instead of wrong: it said nothing had ever been collected, which is exactly what
+ * a healthy but idle mailbox says too.
  */
-const MAILBOX = "INBOX";
+const DEFAULT_MAILBOX = "INBOX";
 
 interface SenderStandingProps {
   address: string;
@@ -287,6 +288,9 @@ function Mail({ token, connection }: MailProps) {
    * correspondent has several.
    */
   const [verdictNote, setVerdictNote] = useState<{ address: string; text: string } | null>(null);
+  const [config, setConfig] = useState<EmailConfig | null>(null);
+  // The configured mailbox once the daemon has said which it is, and the default until then.
+  const mailbox = config?.mailbox ?? DEFAULT_MAILBOX;
 
   // Only the top level, and only as suggestions in the folder box. A full browser is a different
   // screen; what this needs is to stop someone retyping "BACMAT" every time.
@@ -296,6 +300,23 @@ function Mail({ token, connection }: MailProps) {
     setFolders((entries ?? []).filter((entry) => entry.is_dir).map((entry) => entry.name));
   }, [token]);
 
+  /**
+   * The daemon's mail settings, read once.
+   *
+   * Which mailbox is collected from decides which cursor to ask for, so it is fetched before the
+   * cursor is meaningful — and it is read once rather than per poll because `state.rs` resolves it
+   * at startup and never changes it: editing `.ai/email.yaml` means restarting the daemon.
+   */
+  useEffect(() => {
+    if (token === null || connection !== "connected") return;
+    let cancelled = false;
+    void (async () => {
+      const next = await getEmailConfig(token);
+      if (!cancelled) setConfig(next);
+    })();
+    return () => { cancelled = true; };
+  }, [connection, token]);
+
   const refresh = useCallback(
     async (background = false) => {
       if (token === null || connection !== "connected") return;
@@ -304,13 +325,13 @@ function Mail({ token, connection }: MailProps) {
       // ever asked while looking at how much is waiting.
       const [next, nextCursor] = await Promise.all([
         getEmailQueue(token),
-        getEmailCursor(token, MAILBOX),
+        getEmailCursor(token, mailbox),
       ]);
       setQueue(next);
       setCursor(nextCursor);
       if (!background) setLoading(false);
     },
-    [connection, token],
+    [connection, mailbox, token],
   );
 
   useEffect(() => {
@@ -455,11 +476,30 @@ function Mail({ token, connection }: MailProps) {
       <div className="statusline">
         <span>{queue?.length ?? 0} in the mailbox</span>
         <span>collection is automatic · <b>reading costs a run</b></span>
-        <span title={`Where collection got to in ${MAILBOX}. The cursor lives in the núcleo, so collection resumes here after a restart.`}>
-          {MAILBOX} cursor{" "}
+        <span title={`Where collection got to in ${mailbox}. The cursor lives in the núcleo, so collection resumes here after a restart.`}>
+          {mailbox} cursor{" "}
           <b>{cursor === null ? "nothing collected yet" : `uid ${cursor.last_uid}`}</b>
         </span>
+        {config !== null && config.username !== "" && (
+          <span title={config.host}>{config.username}</span>
+        )}
       </div>
+      {/* Enabled is not armed. The hook barrier is proven at startup, and until it is, mail is
+          collected and expired but never read — a mailbox that fills up while the button does
+          nothing, which looks like a broken button rather than a refused pillar. */}
+      {config !== null && config.enabled && !config.armed && (
+        <ErrorNote>
+          Collection is on but triage is not armed: the núcleo could not prove, at startup, that a
+          mail body can never reach a tool. Mail is still being collected and still expires on
+          schedule; nothing is being read.
+        </ErrorNote>
+      )}
+      {config?.local_triage_disabled != null && (
+        <ErrorNote>
+          Local triage was asked for and could not be provided, so nothing is being read rather than
+          being sent to a remote model — {config.local_triage_disabled}
+        </ErrorNote>
+      )}
       <Panel
         title="Mailbox"
         aside={waiting.length > 0 ? `${waiting.length} waiting` : "nothing waiting"}
