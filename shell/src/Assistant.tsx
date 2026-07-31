@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  getAssistantTurn, sendAssistantMessage, SHELL_CHAT_ID,
-  type ConnectionState, type RunDetail,
+  getAssistantChat, getAssistantTurn, sendAssistantMessage, SHELL_CHAT_ID,
+  type AssistantTurnRow, type ConnectionState, type RunDetail,
 } from "./api";
 import { formatUsd, runIsLive } from "./derive";
 import { Button, ErrorNote, Panel, Teach } from "./ui";
@@ -31,12 +31,51 @@ export interface Turn {
  * instead. Preferring stdout and falling back to stderr means a failure is shown rather than
  * rendered as an empty bubble, which reads as the assistant ignoring you.
  */
-function replyText(detail: RunDetail): string | null {
-  const out = detail.stdout?.trim();
-  if (out !== undefined && out !== "") return out;
-  const err = detail.stderr?.trim();
-  if (err !== undefined && err !== "") return err;
+function firstNonEmpty(...candidates: (string | null | undefined)[]): string | null {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (trimmed !== undefined && trimmed !== "") return trimmed;
+  }
   return null;
+}
+
+function replyText(detail: RunDetail): string | null {
+  return firstNonEmpty(detail.stdout, detail.stderr);
+}
+
+/**
+ * One remembered exchange, as this page holds it.
+ *
+ * The daemon reports a live turn with no answer yet, so `answer` stays null until the turn settles —
+ * which is also what `pending` reads to decide there is still something to poll. Deriving it here
+ * rather than trusting a non-empty string means a turn that genuinely answered with nothing is not
+ * mistaken for one still thinking.
+ */
+function turnFromRow(row: AssistantTurnRow): Turn {
+  const settled = !runIsLive(row.status);
+  return {
+    id: row.id,
+    asked: row.asked,
+    answer: settled ? firstNonEmpty(row.answer, row.error) : null,
+    status: row.status,
+    cost_usd: row.cost_usd,
+    failed: settled && row.status !== "completed",
+  };
+}
+
+/**
+ * The daemon's transcript, plus any turn on screen it does not know about yet.
+ *
+ * A replace would be simpler and is wrong in one narrow, reachable case: the daemon inserts a turn's
+ * row while the request that created it is still open, so a history read that overtakes that insert
+ * comes back without it — and the message you had just sent would disappear on the way back to the
+ * tab, which is the exact loss this is meant to end. The daemon wins wherever both know a turn;
+ * anything only the page has is kept and sorted back into place by id.
+ */
+function merge(history: Turn[], local: Turn[]): Turn[] {
+  const known = new Set(history.map((turn) => turn.id));
+  const extra = local.filter((turn) => !known.has(turn.id));
+  return [...history, ...extra].sort((a, b) => a.id - b.id);
 }
 
 interface AssistantProps {
@@ -55,17 +94,45 @@ interface AssistantProps {
  * 409 therefore means this chat is still mid-turn, which is why the composer stays disabled until
  * the turn lands rather than queueing a second one.
  *
- * The transcript lives in `App` and survives this page being unmounted, but it is still only in
- * memory: the daemon keeps the turns as runs and exposes no "list my chat" route, so a restart loses
- * the thread. Reconstructing it from `/runs?mode=assistant` is not an option either — that returns
- * every chat's turns, including the Telegram sidecar's, and nothing in a run row says which chat it
- * belonged to.
+ * The transcript is the daemon's. Every turn is a run, and the run row records which chat it
+ * belonged to, so the conversation is READ BACK on arrival rather than remembered — which is what
+ * makes it outlive a restart and not merely a tab switch. The copy in `App` is what this page draws
+ * between renders and what holds a turn the daemon has not caught up with yet.
  */
 function Assistant({ token, connection, turns, setTurns }: AssistantProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
+  /**
+   * Whether the conversation has been read back from the daemon yet.
+   *
+   * Kept apart from `turns.length === 0`, because an empty transcript that has not been loaded and
+   * one that genuinely has no turns look identical — and telling someone "nothing said yet" while
+   * their conversation is still arriving is the same wrong answer this whole change is about.
+   */
+  const [loaded, setLoaded] = useState(false);
   const tail = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * Reads the conversation back out of the núcleo.
+   *
+   * The transcript is no longer this window's memory — the daemon keeps every turn as a run and now
+   * records which chat it belonged to, so reopening the app finds the thread where it was left. The
+   * copy in `App` stays as what this page draws between renders, and this is what fills it.
+   */
+  useEffect(() => {
+    if (token === null || connection !== "connected") return;
+    let cancelled = false;
+    void (async () => {
+      const history = await getAssistantChat(token, SHELL_CHAT_ID);
+      if (cancelled) return;
+      // Only on success. A failed read leaves whatever is on screen alone rather than replacing a
+      // conversation with an empty one, which would look exactly like the loss it is fixing.
+      if (history !== null) setTurns((current) => merge(history.map(turnFromRow), current));
+      setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [connection, setTurns, token]);
 
   /**
    * The turn still in flight, DERIVED from the transcript rather than stored beside it.
@@ -165,11 +232,13 @@ function Assistant({ token, connection, turns, setTurns }: AssistantProps) {
         <span>one turn at a time · <b>a turn costs a run</b></span>
       </div>
       <Panel title="Conversation" aside={busy ? "working" : undefined}>
-        {turns.length === 0 ? (
+        {!loaded && turns.length === 0 ? (
+          <p className="a-note">Reading the conversation…</p>
+        ) : turns.length === 0 ? (
           <Teach title="Nothing said yet.">
             Each message is a run, so it is billed and appears in the run history like any other.
-            This transcript lives only in this window — the núcleo keeps the runs, not the thread, so
-            leaving the tab loses what is on screen.
+            The núcleo keeps the thread as well as the runs, so this conversation is here when you
+            come back to it.
           </Teach>
         ) : (
           <div className="chat">

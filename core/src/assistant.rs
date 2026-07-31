@@ -181,12 +181,17 @@ pub async fn send_message(
     // barrier's blind spot: `get_session` refuses to resume a session any run READ mail in, and a
     // turn killed before its stream reported an id used to leave a row with no session to match on.
     let session_id = resume.clone().unwrap_or_else(crate::auth::generate_uuid_v4);
+    // `chat_id` alongside the session, because they answer different questions and diverge on
+    // purpose. The session is what the NEXT turn resumes, and this module drops it whenever a turn
+    // read third-party text — so a conversation that has read mail once is spread across several
+    // sessions, and no amount of joining on `session_id` reassembles it. The chat is the thread.
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, ?)",
     )
     .bind(text)
     .bind(&session_id)
+    .bind(chat_id)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&state.pool)
     .await

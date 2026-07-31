@@ -269,6 +269,58 @@ describe("the assistant transcript survives a tab switch", () => {
     invokeMock.mockReset();
   });
 
+  /**
+   * The thread is the núcleo's, not this window's.
+   *
+   * Every turn is a run and the run row now records which chat it belonged to, so a conversation is
+   * read back rather than remembered — which is what makes it survive a restart, not merely a tab
+   * switch. `/runs?mode=assistant` could never have stood in for it: that is every chat at once,
+   * the Telegram sidecar's turns included.
+   */
+  it("loads the conversation from the daemon rather than starting empty", async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/assistant/chats/shell")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            { id: 41, asked: "what did I ask before?", answer: "this", error: null,
+              status: "completed", cost_usd: 0.01, created_at: "2026-07-30T10:00:00Z" },
+          ],
+        };
+      }
+      return healthyDaemon()(url);
+    });
+
+    render(<App />);
+    await settle();
+    go("Assistant");
+    await settle();
+
+    expect(screen.getByText("what did I ask before?")).toBeTruthy();
+    expect(screen.getByText("this")).toBeTruthy();
+  });
+
+  it("keeps a turn the daemon has not caught up with yet", async () => {
+    // The row is inserted while the request that created it is still open, so a history read can
+    // overtake it. Replacing wholesale would drop the message just sent — the very loss this is
+    // meant to end — so the page keeps what only it knows about.
+    fetchMock.mockImplementation(assistantDaemon(() => ({ status: "running", stdout: null })));
+
+    render(<App />);
+    await settle();
+    go("Assistant");
+    await settle();
+    await ask("acabei de escrever isto");
+
+    go("Runs");
+    await settle();
+    go("Assistant");
+    await settle();
+
+    expect(screen.getByText("acabei de escrever isto")).toBeTruthy();
+  });
+
   it("still shows the message you just sent after leaving and coming back", async () => {
     fetchMock.mockImplementation(assistantDaemon(() => ({ status: "running", stdout: null })));
 

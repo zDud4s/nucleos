@@ -1358,6 +1358,42 @@ export async function getAssistantTurn(
   }
 }
 
+/** One exchange as the daemon remembers it, which is what makes a conversation outlive the window. */
+export interface AssistantTurnRow {
+  id: number;
+  asked: string;
+  /** The reply, or null while the turn is still running or if it produced nothing. */
+  answer: string | null;
+  /** What it failed with, when it failed. Shown rather than left as an empty bubble. */
+  error: string | null;
+  status: string;
+  cost_usd: number | null;
+  created_at: string;
+}
+
+/**
+ * A chat's turns, oldest first.
+ *
+ * The daemon has always kept these — a turn is a run — but until `chat_id` was recorded on the row
+ * there was no way to ask for one conversation's worth. `/runs?mode=assistant` is not a substitute:
+ * that is every chat at once, the Telegram sidecar's turns included.
+ */
+export async function getAssistantChat(
+  token: string,
+  chatId: string,
+): Promise<AssistantTurnRow[] | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/assistant/chats/${encodeURIComponent(chatId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as AssistantTurnRow[];
+  } catch {
+    return null;
+  }
+}
+
 // ── Project inspection ──────────────────────────────────────────────────────
 
 export interface InspectEntry {

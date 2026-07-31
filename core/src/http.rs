@@ -96,6 +96,9 @@ pub fn build_router(state: AppState) -> Router {
         // that has no node in flight: parked for budget, waiting for the slot, or between nodes.
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/assistant/message", post(post_assistant_message))
+        // Static segment ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
+        // number cannot shadow a turn id.
+        .route("/assistant/chats/{chat_id}", get(get_assistant_chat))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
@@ -2010,6 +2013,60 @@ async fn delete_run_message(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// One exchange in a chat, as it is read back.
+///
+/// The reply is the run's stdout and the failure its stderr, which is what the shell was already
+/// pulling out of the run detail — carried here so reopening a conversation does not mean one
+/// request per turn.
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct AssistantTurn {
+    id: i64,
+    asked: String,
+    answer: Option<String>,
+    error: Option<String>,
+    status: String,
+    cost_usd: Option<f64>,
+    created_at: String,
+}
+
+/// How many turns of a conversation are read back. A chat is read from its recent end.
+const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
+
+/// A chat's turns, oldest first.
+///
+/// The daemon has always kept these — a turn is a run — but nothing on the row said which chat it
+/// belonged to, so the shell's transcript could only live in the window that made it and died with
+/// a reload. Reconstructing it from `/runs?mode=assistant` was never an option: that is every
+/// chat's turns at once, the Telegram sidecar's included.
+///
+/// Ordered by id rather than by `created_at`: two turns of the same conversation can share a
+/// timestamp to the second, and a transcript that reorders itself is one you lose your place in.
+/// The limit takes the LAST turns and then puts them back in order, so a long conversation opens on
+/// its recent end rather than on its beginning.
+async fn get_assistant_chat(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<Json<Vec<AssistantTurn>>, StatusCode> {
+    let mut turns = sqlx::query_as::<_, AssistantTurn>(
+        "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
+                created_at
+           FROM runs
+          WHERE chat_id = ? AND mode = 'assistant'
+          ORDER BY id DESC
+          LIMIT ?",
+    )
+    .bind(&chat_id)
+    .bind(ASSISTANT_TRANSCRIPT_LIMIT)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "reading an assistant chat failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    turns.reverse();
+    Ok(Json(turns))
+}
+
 async fn get_proposals(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
@@ -3584,6 +3641,88 @@ mod tests {
             set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
             StatusCode::NOT_FOUND,
         );
+    }
+
+    /// The shell's transcript lived only in the window that made it, because nothing on a run row
+    /// said which conversation the turn belonged to. `/runs?mode=assistant` could never stand in
+    /// for this: it is every chat at once, the Telegram sidecar's turns included.
+    #[tokio::test]
+    async fn a_chat_reads_back_its_own_turns_and_nobody_else_s() {
+        let state = test_state().await;
+        for (chat, prompt) in [
+            (Some("shell"), "first"),
+            (Some("-100999"), "a telegram message"),
+            (Some("shell"), "second"),
+            (None, "an ordinary run"),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
+                 VALUES (?, 'completed', ?, 's', ?, '2026-07-30T10:00:00+00:00')",
+            )
+            .bind(prompt)
+            .bind(if chat.is_some() { "assistant" } else { "real" })
+            .bind(chat)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/shell")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let asked: Vec<&str> = turns
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|turn| turn["asked"].as_str().unwrap())
+            .collect();
+        // Oldest first, so the conversation reads downwards the way it was had.
+        assert_eq!(asked, vec!["first", "second"]);
+    }
+
+    /// A chat named like a number must not be read as a turn id. Static segments win in matchit,
+    /// which is what keeps the two routes apart — asserted rather than assumed, because the failure
+    /// would be a chat silently answering with one unrelated run.
+    #[tokio::test]
+    async fn a_numeric_chat_id_does_not_collide_with_a_turn_id() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
+             VALUES ('hello', 'completed', 'assistant', 's', '1', '2026-07-30T10:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/1")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // An array, not the single run object `/assistant/{turn_id}` would have answered with.
+        assert_eq!(turns.as_array().unwrap().len(), 1);
     }
 
     async fn set_sender_verdict(state: AppState, body: serde_json::Value) -> StatusCode {
