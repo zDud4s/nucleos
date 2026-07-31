@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchAllAttachments, fetchAttachment, getEmail, getEmailCursor, getEmailQueue, listMailFiles,
-  requeueEmail, saveAllAttachments, saveAttachment, triageEmail,
+  requeueEmail, saveAllAttachments, saveAttachment, setSenderVerdict, triageEmail,
   type ConnectionState, type EmailAttachment, type EmailCursor, type EmailDetail,
-  type QueuedEmail,
+  type QueuedEmail, type SenderVerdict,
 } from "./api";
 import {
   base64ToBytes, formatBytes, mailLabel, mailTone, relativeTime, requeueFailureMessage,
@@ -19,6 +19,55 @@ import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
  * this read empty rather than wrong — the cursor line simply says nothing has been collected.
  */
 const MAILBOX = "INBOX";
+
+interface SenderStandingProps {
+  address: string;
+  /** `"pin"`, `"mute"`, or null — the daemon's current standing decision about this sender. */
+  verdict: string | null;
+  busy: boolean;
+  onDecide: (next: SenderVerdict | null) => void;
+}
+
+/**
+ * The standing decision about whoever sent this message.
+ *
+ * A pin and a mute are the two rules in `priority.rs` that outrank the model outright — a pinned
+ * sender is urgent whatever the classifier thought, a muted one is noise. They have been read on
+ * every message since the table existed and, until now, written by nothing: the only way to set the
+ * highest-authority rule in triage was to open the database by hand.
+ *
+ * Each button is its own toggle, so pressing the active one withdraws the decision rather than
+ * needing a third "clear" control for a state that is already on screen.
+ */
+function SenderStanding({ address, verdict, busy, onDecide }: SenderStandingProps) {
+  const choice = (value: SenderVerdict, label: string, help: string) => (
+    <Button
+      size="sm"
+      variant={verdict === value ? "approve" : undefined}
+      disabled={busy}
+      aria-pressed={verdict === value}
+      title={help}
+      onClick={() => onDecide(verdict === value ? null : value)}
+    >
+      {label}
+    </Button>
+  );
+
+  return (
+    <span className="sender-standing" title={address}>
+      {choice(
+        "pin",
+        "Always urgent",
+        "Every future message from this sender is urgent, whatever the classifier decides.",
+      )}
+      {choice(
+        "mute",
+        "Always noise",
+        "Every future message from this sender is noise, whatever the classifier decides.",
+      )}
+    </span>
+  );
+}
 
 interface OpenMessageProps {
   token: string;
@@ -228,6 +277,16 @@ function Mail({ token, connection }: MailProps) {
   const [cursor, setCursor] = useState<EmailCursor | null>(null);
   const [requeuing, setRequeuing] = useState<number | null>(null);
   const [requeueNote, setRequeueNote] = useState<string | null>(null);
+  /** The sender whose standing decision is being written, so only their buttons go quiet. */
+  const [deciding, setDeciding] = useState<string | null>(null);
+  /**
+   * The outcome of the last standing decision, tied to the sender it was about.
+   *
+   * Held with its address rather than as a bare string, because the same note would otherwise print
+   * under every message from every sender at once — the queue draws one row per message, and a busy
+   * correspondent has several.
+   */
+  const [verdictNote, setVerdictNote] = useState<{ address: string; text: string } | null>(null);
 
   // Only the top level, and only as suggestions in the folder box. A full browser is a different
   // screen; what this needs is to stop someone retyping "BACMAT" every time.
@@ -336,6 +395,43 @@ function Mail({ token, connection }: MailProps) {
     void refresh(true);
   }
 
+  /**
+   * Records — or withdraws — a standing decision about a sender.
+   *
+   * The note says what this did and did NOT do. A pin governs classification from here on; the mail
+   * already on screen keeps the class it was given, and "Read again" is what applies the new
+   * decision to it. Leaving that unsaid is how someone pins a sender, sees the message still marked
+   * noise, and concludes the button is broken.
+   */
+  async function decide(address: string, next: SenderVerdict | null) {
+    if (token === null) return;
+    setDeciding(address);
+    setVerdictNote(null);
+    const result = await setSenderVerdict(token, address, next);
+    setDeciding(null);
+    if (!result.ok) {
+      setVerdictNote({
+        address,
+        // 404 is not a fault here: it is what the daemon says about an address it has no contact
+        // for, which cannot normally happen from this list — the message in front of you IS the
+        // arrival that creates one — so it means the two have gone out of step.
+        text: result.status === 404
+          ? "The núcleo has no contact for this address. Reload the mailbox and try again."
+          : "Could not record that decision.",
+      });
+      return;
+    }
+    setVerdictNote({
+      address,
+      text: next === null
+        ? "Decision withdrawn. New mail from this sender goes back to being classified on its merits."
+        : next === "pin"
+          ? "New mail from this sender will be urgent. Use “Read again” to re-read what is already here."
+          : "New mail from this sender will be noise. Use “Read again” to re-read what is already here.",
+    });
+    void refresh(true);
+  }
+
   const waiting = (queue ?? []).filter((mail) => mail.triage_class === null);
 
   if (unavailable) {
@@ -414,8 +510,8 @@ function Mail({ token, connection }: MailProps) {
                   </button>
                   {/* Outside the row button, not inside it: a button nested in a button is invalid
                       markup, and clicking it would toggle the message open as well. */}
-                  {mail.triage_class !== null && (
-                    <div className="a-actions">
+                  <div className="a-actions">
+                    {mail.triage_class !== null && (
                       <Button
                         size="sm"
                         disabled={requeuing !== null}
@@ -424,7 +520,16 @@ function Mail({ token, connection }: MailProps) {
                       >
                         {requeuing === mail.id ? "Requeuing…" : "Read again"}
                       </Button>
-                    </div>
+                    )}
+                    <SenderStanding
+                      address={mail.from_addr}
+                      verdict={mail.sender_verdict}
+                      busy={deciding === mail.from_addr}
+                      onDecide={(next) => void decide(mail.from_addr, next)}
+                    />
+                  </div>
+                  {verdictNote !== null && verdictNote.address === mail.from_addr && (
+                    <p className="gate-note">{verdictNote.text}</p>
                   )}
                   {openId === mail.id && token !== null && (
                     <OpenMessage

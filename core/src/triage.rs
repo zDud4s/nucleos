@@ -749,16 +749,7 @@ async fn apply_verdicts(
             .fetch_one(pool)
             .await?;
         let profile = crate::contacts::profile_for(pool, &from_addr).await?;
-        let override_verdict: Option<String> = sqlx::query_scalar(
-            "SELECT overrides.verdict
-               FROM contact_overrides AS overrides
-               JOIN contact_addresses AS addresses
-                 ON addresses.contact_id = overrides.contact_id
-              WHERE addresses.address = ?",
-        )
-        .bind(crate::contacts::normalize_address(&from_addr))
-        .fetch_optional(pool)
-        .await?;
+        let override_verdict = crate::contacts::verdict_for(pool, &from_addr).await?;
         let triage_class = crate::priority::adjust(
             &verdict.class,
             profile.as_ref(),

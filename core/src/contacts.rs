@@ -278,6 +278,86 @@ pub async fn unmerge(pool: &SqlitePool, address: &str) -> sqlx::Result<()> {
     transaction.commit().await
 }
 
+/// What setting a sender's standing verdict did.
+///
+/// `UnknownAddress` is not a failure and not a 500: it is what happens when someone pins an address
+/// the núcleo has never received mail from. A contact exists because a message arrived, so there is
+/// nothing to attach the decision to — and inventing a contact here would let a typo in an address
+/// create a permanent, invisible row that never matches anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictOutcome {
+    Applied,
+    UnknownAddress,
+}
+
+/// Records — or clears — the standing decision about a sender.
+///
+/// The override lives on the CONTACT, not on the address, which is what makes it survive the same
+/// person writing from a second address that later gets merged in. `verdict: None` clears it, and
+/// clearing an address that had none is `Applied`: the caller asked for "no standing decision here",
+/// and that is the state afterwards either way.
+///
+/// The verdict string is not validated here on purpose — `priority::is_known_verdict` owns that
+/// question, and the endpoint asks it before this is reached. Splitting it that way keeps the
+/// policy's vocabulary in the policy rather than half here and half there.
+pub async fn set_verdict(
+    pool: &SqlitePool,
+    address: &str,
+    verdict: Option<&str>,
+) -> sqlx::Result<VerdictOutcome> {
+    let address = normalize_address(address);
+    let contact_id: Option<i64> =
+        sqlx::query_scalar("SELECT contact_id FROM contact_addresses WHERE address = ?")
+            .bind(&address)
+            .fetch_optional(pool)
+            .await?;
+    let Some(contact_id) = contact_id else {
+        return Ok(VerdictOutcome::UnknownAddress);
+    };
+
+    match verdict {
+        Some(verdict) => {
+            sqlx::query(
+                "INSERT INTO contact_overrides (contact_id, verdict, set_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT (contact_id) DO UPDATE SET verdict = excluded.verdict,
+                                                        set_at  = excluded.set_at",
+            )
+            .bind(contact_id)
+            .bind(verdict)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM contact_overrides WHERE contact_id = ?")
+                .bind(contact_id)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    Ok(VerdictOutcome::Applied)
+}
+
+/// The standing verdict for whoever writes from this address, if anyone set one.
+///
+/// Resolved through the contact rather than the address for the same reason it is stored there: two
+/// addresses merged into one person share one decision, and reading it per-address would report the
+/// pin only for whichever address happened to be pinned.
+pub async fn verdict_for(pool: &SqlitePool, address: &str) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT overrides.verdict
+           FROM contact_overrides AS overrides
+           JOIN contact_addresses AS addresses
+             ON addresses.contact_id = overrides.contact_id
+          WHERE addresses.address = ?",
+    )
+    .bind(normalize_address(address))
+    .fetch_optional(pool)
+    .await
+}
+
 #[derive(Deserialize)]
 struct ContactMergeInput {
     keep_id: i64,

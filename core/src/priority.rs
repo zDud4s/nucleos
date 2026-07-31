@@ -12,19 +12,34 @@ pub struct Decision {
     pub rule: Option<&'static str>,
 }
 
+/// A standing human decision that this sender's mail is always urgent.
+pub const PIN: &str = "pin";
+/// A standing human decision that this sender's mail is always noise.
+pub const MUTE: &str = "mute";
+
+/// Whether a stored override is one this policy acts on.
+///
+/// The `match` below falls through for anything else, so an unrecognised verdict in
+/// `contact_overrides` is not an error — it is a row that does nothing, silently, forever. That is
+/// the wrong place to discover a typo, so the write endpoint asks this question first and refuses;
+/// this function is what keeps the two ends from drifting apart.
+pub fn is_known_verdict(verdict: &str) -> bool {
+    verdict == PIN || verdict == MUTE
+}
+
 pub fn adjust(
     model_class: &str,
     profile: Option<&crate::contacts::Profile>,
     override_verdict: Option<&str>,
 ) -> Decision {
     match override_verdict {
-        Some("pin") => {
+        Some(PIN) => {
             return Decision {
                 class: "urgent",
                 rule: Some("human-pin"),
             };
         }
-        Some("mute") => {
+        Some(MUTE) => {
             return Decision {
                 class: "noise",
                 rule: Some("human-mute"),

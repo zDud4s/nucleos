@@ -136,6 +136,9 @@ pub fn build_router(state: AppState) -> Router {
             post(post_email_attachment_save),
         )
         .route("/email/{id}/requeue", post(post_email_requeue))
+        // The address travels in the body rather than the path: an email address is not a safe path
+        // segment, and encoding one into a route only to decode it again buys nothing here.
+        .route("/contacts/verdict", post(post_sender_verdict))
         // A twenty-minute memo is ~38 MB of 16 kHz PCM, and every route not given its own ceiling
         // inherits axum's 2 MB default — which would reject precisely the long recordings that are
         // least repeatable, and reject them the same way every time. The ceiling is derived from
@@ -651,6 +654,52 @@ struct QueuedEmail {
     triage_summary: Option<String>,
     triaged_at: Option<String>,
     has_attachments: i64,
+    /// The standing human decision about this sender — `pin`, `mute`, or none.
+    ///
+    /// Carried on the row rather than fetched per sender, because it is what the button in the list
+    /// has to be drawn from: without it every row would have to ask separately, and a list of forty
+    /// messages would open forty requests to render forty small pieces of state.
+    sender_verdict: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SenderVerdictRequest {
+    address: String,
+    /// `pin`, `mute`, or `null` to withdraw the decision entirely.
+    verdict: Option<String>,
+}
+
+/// Records what a person has decided about a sender, once, for all their future mail.
+///
+/// This is the only writer of `contact_overrides` outside a test. The table has been read by
+/// `priority::adjust` since it existed — a pin outranks the model and a mute outranks it the other
+/// way — so until now the highest-authority rule in triage was one nothing could set.
+///
+/// An unknown verdict is refused rather than stored. `priority::adjust` falls through for anything
+/// it does not recognise, which means a typo would be accepted, saved, and then do nothing at all
+/// for as long as it sat there; a 400 now is the only moment that mistake is visible.
+///
+/// An address nobody has written from is a 404 for a related reason: a contact exists because mail
+/// arrived, and inventing one here would let a mistyped address become a permanent row that never
+/// matches anything and never explains why.
+async fn post_sender_verdict(
+    State(state): State<AppState>,
+    Json(body): Json<SenderVerdictRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(verdict) = body.verdict.as_deref()
+        && !crate::priority::is_known_verdict(verdict)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match crate::contacts::set_verdict(&state.pool, &body.address, body.verdict.as_deref()).await {
+        Ok(crate::contacts::VerdictOutcome::Applied) => Ok(StatusCode::NO_CONTENT),
+        Ok(crate::contacts::VerdictOutcome::UnknownAddress) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, "recording a sender verdict failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// One attachment, described. The bytes are not here and are not stored (migration 0021).
@@ -1072,9 +1121,9 @@ async fn get_email_queue(
     //
     // `failed` sorts with the rest rather than being hidden: it is the class most likely to be
     // requeued, so it is the one that must stay findable.
-    sqlx::query_as::<_, QueuedEmail>(
+    let mut queue = sqlx::query_as::<_, QueuedEmail>(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
-                triaged_at, has_attachments
+                triaged_at, has_attachments, NULL AS sender_verdict
            FROM emails
           WHERE direction = 'inbound'
           ORDER BY received_at DESC, id DESC
@@ -1083,8 +1132,33 @@ async fn get_email_queue(
     .bind(EMAIL_QUEUE_LIMIT)
     .fetch_all(&state.pool)
     .await
-    .map(Json)
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Filled in afterwards rather than joined in SQL, because matching `emails.from_addr` to a
+    // contact means applying `contacts::normalize_address` — which strips a display name's angle
+    // brackets as well as lowercasing. Writing that as `LOWER(TRIM(...))` in the query would be a
+    // second, subtly different definition of the same rule, and it would disagree exactly for the
+    // senders whose header carries a name. One definition, applied here.
+    //
+    // The set is every address whose contact carries a standing verdict — only what a human pinned
+    // or muted, so it is small regardless of how much mail there is.
+    let overrides: Vec<(String, String)> = sqlx::query_as(
+        "SELECT addresses.address, overrides.verdict
+           FROM contact_overrides AS overrides
+           JOIN contact_addresses AS addresses
+             ON addresses.contact_id = overrides.contact_id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let by_address: std::collections::HashMap<String, String> = overrides.into_iter().collect();
+    for message in &mut queue {
+        message.sender_verdict = by_address
+            .get(&crate::contacts::normalize_address(&message.from_addr))
+            .cloned();
+    }
+
+    Ok(Json(queue))
 }
 
 async fn post_email_requeue(
@@ -3093,6 +3167,200 @@ mod tests {
                 .unwrap();
         assert_eq!(class, None);
         assert_eq!(attempts, 0);
+    }
+
+    async fn set_sender_verdict(state: AppState, body: serde_json::Value) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/contacts/verdict")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Gives the daemon a contact for `address`, the way receiving mail would.
+    async fn seen_from(state: &AppState, address: &str) -> i64 {
+        let contact_id =
+            sqlx::query("INSERT INTO contacts (display_name, created_at) VALUES (NULL, '2026-07-30T10:00:00+00:00')")
+                .execute(&state.pool)
+                .await
+                .unwrap()
+                .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO contact_addresses (address, contact_id, first_seen, last_seen, messages_in)
+             VALUES (?, ?, '2026-07-30T10:00:00+00:00', '2026-07-30T10:00:00+00:00', 1)",
+        )
+        .bind(crate::contacts::normalize_address(address))
+        .bind(contact_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        contact_id
+    }
+
+    /// The pin is the highest-authority rule in triage, and nothing in the product could set it —
+    /// `contact_overrides` was read by `priority::adjust` and written only by a test. These four
+    /// cover the door that was missing, and the two ways it must refuse.
+    #[tokio::test]
+    async fn pinning_a_sender_records_the_verdict_against_their_contact() {
+        let state = test_state().await;
+        let contact_id = seen_from(&state, "Maria <MARIA@example.com>").await;
+
+        assert_eq!(
+            set_sender_verdict(
+                state.clone(),
+                serde_json::json!({ "address": "maria@example.com", "verdict": "pin" }),
+            )
+            .await,
+            StatusCode::NO_CONTENT,
+        );
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT verdict FROM contact_overrides WHERE contact_id = ?")
+                .bind(contact_id)
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("pin"));
+    }
+
+    #[tokio::test]
+    async fn a_second_verdict_replaces_the_first_rather_than_colliding_with_it() {
+        let state = test_state().await;
+        seen_from(&state, "maria@example.com").await;
+
+        for verdict in ["pin", "mute"] {
+            assert_eq!(
+                set_sender_verdict(
+                    state.clone(),
+                    serde_json::json!({ "address": "maria@example.com", "verdict": verdict }),
+                )
+                .await,
+                StatusCode::NO_CONTENT,
+            );
+        }
+
+        // One row, holding the later decision: `contact_id` is the primary key, so changing your
+        // mind must be an update and not a constraint violation.
+        let rows: Vec<String> = sqlx::query_scalar("SELECT verdict FROM contact_overrides")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec!["mute".to_owned()]);
+
+        assert_eq!(
+            set_sender_verdict(
+                state.clone(),
+                serde_json::json!({ "address": "maria@example.com", "verdict": null }),
+            )
+            .await,
+            StatusCode::NO_CONTENT,
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contact_overrides")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// `priority::adjust` matches `pin` and `mute` and falls through for everything else, so a
+    /// stored typo is not an error — it is a row that quietly does nothing forever. The 400 here is
+    /// the only moment that mistake is ever visible.
+    #[tokio::test]
+    async fn a_verdict_the_policy_does_not_know_is_refused_rather_than_stored() {
+        let state = test_state().await;
+        seen_from(&state, "maria@example.com").await;
+
+        assert_eq!(
+            set_sender_verdict(
+                state.clone(),
+                serde_json::json!({ "address": "maria@example.com", "verdict": "urgent" }),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        );
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contact_overrides")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[tokio::test]
+    async fn pinning_an_address_nobody_has_written_from_is_a_404() {
+        let state = test_state().await;
+
+        // A contact exists because a message arrived. Inventing one here would let a mistyped
+        // address become a permanent row that never matches anything and never explains itself.
+        assert_eq!(
+            set_sender_verdict(
+                state,
+                serde_json::json!({ "address": "nobody@example.com", "verdict": "pin" }),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+    }
+
+    /// The queue carries the sender's standing verdict so the list can draw the button. Matching it
+    /// to a message means normalising `from_addr` — and a header that carries a display name is
+    /// exactly where a SQL `LOWER(TRIM(...))` would have disagreed with `normalize_address`.
+    #[tokio::test]
+    async fn the_queue_reports_a_pin_even_when_the_header_carries_a_display_name() {
+        let state = test_state().await;
+        seen_from(&state, "maria@example.com").await;
+        set_sender_verdict(
+            state.clone(),
+            serde_json::json!({ "address": "maria@example.com", "verdict": "pin" }),
+        )
+        .await;
+
+        for (message_id, from_addr) in [
+            ("<a@x>", "Maria Silva <Maria@Example.com>"),
+            ("<b@x>", "maria@example.com"),
+        ] {
+            sqlx::query(
+                "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr,
+                                     received_at, ingested_at)
+                 VALUES (?, 'INBOX', 1, ABS(RANDOM() % 100000), ?,
+                         '2026-07-30T10:00:00+00:00', '2026-07-30T10:00:00+00:00')",
+            )
+            .bind(message_id)
+            .bind(from_addr)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/email/queue")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queue: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let verdicts: Vec<Option<&str>> = queue
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["sender_verdict"].as_str())
+            .collect();
+        assert_eq!(verdicts, vec![Some("pin"), Some("pin")]);
     }
 
     /// Rejecting a proposal is two commits with a gap between them: the proposal flips to

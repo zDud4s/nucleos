@@ -258,6 +258,50 @@ export interface QueuedEmail {
   triage_summary: string | null;
   triaged_at: string | null;
   has_attachments: number;
+  /**
+   * The standing decision about this sender: `"pin"`, `"mute"`, or null for none.
+   *
+   * It belongs to the contact rather than to this message, so two addresses the daemon has merged
+   * into one person report the same thing. It is what the row's button is drawn from.
+   */
+  sender_verdict: string | null;
+}
+
+/** The two standing decisions a person can record about a sender. `priority.rs` knows only these. */
+export const SENDER_VERDICTS = ["pin", "mute"] as const;
+export type SenderVerdict = (typeof SENDER_VERDICTS)[number];
+
+/**
+ * Records what you have decided about a sender, for all their future mail.
+ *
+ * `null` withdraws the decision. The daemon refuses a verdict its policy does not know — `pin` and
+ * `mute` are the whole vocabulary — and answers 404 for an address it has never received mail from,
+ * because a contact exists only because a message arrived.
+ *
+ * This changes what happens NEXT. Mail already classified keeps the class it was given; re-reading
+ * a message is what applies a new decision to it, which is why the page says so next to the button.
+ */
+export async function setSenderVerdict(
+  token: string,
+  address: string,
+  verdict: SenderVerdict | null,
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/contacts/verdict`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ address, verdict }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
 }
 
 /** One attachment, described. The bytes are not stored; opening one asks the mailbox. */

@@ -242,7 +242,12 @@
   align-items: center;
   gap: var(--sp-3);
   margin-top: var(--sp-1);
+  flex-wrap: wrap;
 }
+
+/* As duas decisões permanentes sobre um remetente andam juntas — encostadas uma à outra, e
+   afastadas do resto — porque são uma escolha só, não dois botões independentes. */
+.sender-standing { display: inline-flex; gap: var(--sp-1); margin-left: auto; }
 
 .a-note {
   font-size: var(--fs-xs);
