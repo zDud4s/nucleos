@@ -248,6 +248,9 @@
 /* As duas decisões permanentes sobre um remetente andam juntas — encostadas uma à outra, e
    afastadas do resto — porque são uma escolha só, não dois botões independentes. */
 .sender-standing { display: inline-flex; gap: var(--sp-1); margin-left: auto; }
+/* O endereço em mono ao lado do nome: é o que a decisão é guardada por, e o nome é só como a
+   pessoa assina. */
+.s-addr { font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
 
 .a-note {
   font-size: var(--fs-xs);

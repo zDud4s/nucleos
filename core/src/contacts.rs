@@ -340,6 +340,47 @@ pub async fn set_verdict(
     Ok(VerdictOutcome::Applied)
 }
 
+/// One correspondent, as the daemon has come to know them.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct Correspondent {
+    pub address: String,
+    pub display_name: Option<String>,
+    pub messages_in: i64,
+    /// Whether you have ever written to them. It is what `priority.rs` uses to decide a stranger
+    /// from someone you know, so it is worth seeing next to the counts.
+    pub outbound_ever: i64,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// The standing decision about them — `pin`, `mute`, or none.
+    pub verdict: Option<String>,
+}
+
+/// Who writes to you, busiest first.
+///
+/// One row per address rather than per contact, deliberately: an address is what a message actually
+/// carries and what a standing decision is looked up by, and merging two addresses into one person
+/// is a thing the daemon proposes rather than does. Reporting the merged view would be reporting a
+/// judgement that has not been made.
+pub async fn roster(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<Correspondent>> {
+    sqlx::query_as(
+        "SELECT addresses.address,
+                addresses.display_name,
+                addresses.messages_in,
+                addresses.outbound_ever,
+                addresses.first_seen,
+                addresses.last_seen,
+                overrides.verdict
+           FROM contact_addresses AS addresses
+           LEFT JOIN contact_overrides AS overrides
+                  ON overrides.contact_id = addresses.contact_id
+          ORDER BY addresses.messages_in DESC, addresses.last_seen DESC, addresses.address
+          LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// The standing verdict for whoever writes from this address, if anyone set one.
 ///
 /// Resolved through the contact rather than the address for the same reason it is stored there: two

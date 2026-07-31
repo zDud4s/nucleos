@@ -10,6 +10,7 @@ import {
   safeDownloadName,
 } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
+import Senders from "./Senders";
 
 /**
  * The mailbox to read the cursor for until the daemon says which one it collects from.
@@ -20,6 +21,9 @@ import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
  * a healthy but idle mailbox says too.
  */
 const DEFAULT_MAILBOX = "INBOX";
+
+/** The mailbox itself, or the people who fill it. */
+type MailView = "mailbox" | "senders";
 
 interface SenderStandingProps {
   address: string;
@@ -289,6 +293,7 @@ function Mail({ token, connection }: MailProps) {
    */
   const [verdictNote, setVerdictNote] = useState<{ address: string; text: string } | null>(null);
   const [config, setConfig] = useState<EmailConfig | null>(null);
+  const [view, setView] = useState<MailView>("mailbox");
   // The configured mailbox once the daemon has said which it is, and the default until then.
   const mailbox = config?.mailbox ?? DEFAULT_MAILBOX;
 
@@ -500,6 +505,23 @@ function Mail({ token, connection }: MailProps) {
           being sent to a remote model — {config.local_triage_disabled}
         </ErrorNote>
       )}
+      <nav className="subnav" aria-label="Mail views">
+        {(["mailbox", "senders"] as MailView[]).map((option) => (
+          <button
+            type="button"
+            key={option}
+            className="subtab"
+            aria-current={view === option ? "page" : undefined}
+            onClick={() => setView(option)}
+          >
+            {option}
+          </button>
+        ))}
+      </nav>
+      {/* The senders list is where a standing decision can be found again. Pinning happens on a
+          message, and once that message leaves the queue the only trace of the pin is its effect. */}
+      {view === "senders" && token !== null && <Senders token={token} />}
+      {view === "mailbox" && (
       <Panel
         title="Mailbox"
         aside={waiting.length > 0 ? `${waiting.length} waiting` : "nothing waiting"}
@@ -583,6 +605,7 @@ function Mail({ token, connection }: MailProps) {
                 </article>
               ))}
       </Panel>
+      )}
     </section>
   );
 }

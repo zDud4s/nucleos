@@ -145,6 +145,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/email/{id}/requeue", post(post_email_requeue))
         // The address travels in the body rather than the path: an email address is not a safe path
         // segment, and encoding one into a route only to decode it again buys nothing here.
+        .route("/contacts", get(get_contacts))
         .route("/contacts/verdict", post(post_sender_verdict))
         // A twenty-minute memo is ~38 MB of 16 kHz PCM, and every route not given its own ceiling
         // inherits axum's 2 MB default — which would reject precisely the long recordings that are
@@ -667,6 +668,31 @@ struct QueuedEmail {
     /// has to be drawn from: without it every row would have to ask separately, and a list of forty
     /// messages would open forty requests to render forty small pieces of state.
     sender_verdict: Option<String>,
+}
+
+/// How many correspondents the roster returns. Enough to find anyone; short enough to draw.
+const CONTACTS_LIMIT: i64 = 200;
+
+/// Who writes to you, busiest first, with each one's standing decision.
+///
+/// `contacts.rs` has recorded this since it existed — every inbound message updates a count and a
+/// last-seen, and `priority.rs` reads it to tell a stranger from someone you know. None of it was
+/// readable: the module still carries `#[allow(dead_code)]` on three fields "consumed by the later
+/// contact display surface", and this is that surface for the part that is actually finished.
+///
+/// Deliberately NOT the merged view. `propose_merges` and `merge` exist and nothing in production
+/// calls either, so two addresses belonging to one person are still two rows — and reporting them
+/// as one would be reporting a judgement nobody has made.
+async fn get_contacts(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::contacts::Correspondent>>, StatusCode> {
+    crate::contacts::roster(&state.pool, CONTACTS_LIMIT)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the contact roster failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 #[derive(Deserialize)]
@@ -3693,6 +3719,55 @@ mod tests {
             set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
             StatusCode::NOT_FOUND,
         );
+    }
+
+    /// `contact_addresses` has been written on every inbound message since it existed and read by
+    /// nothing outside `priority.rs` — three of `Profile`'s fields still carry `#[allow(dead_code)]`
+    /// pointing at a display surface that never arrived.
+    #[tokio::test]
+    async fn the_roster_reports_correspondents_busiest_first_with_their_standing_decision() {
+        let state = test_state().await;
+        for (address, messages_in) in [("quiet@example.com", 1), ("busy@example.com", 40)] {
+            seen_from(&state, address).await;
+            sqlx::query("UPDATE contact_addresses SET messages_in = ? WHERE address = ?")
+                .bind(messages_in)
+                .bind(address)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+        set_sender_verdict(
+            state.clone(),
+            serde_json::json!({ "address": "busy@example.com", "verdict": "mute" }),
+        )
+        .await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/contacts")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let roster: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = roster.as_array().unwrap();
+
+        // Busiest first: the question this answers is "who fills my mailbox", and the answer is
+        // useless in address order.
+        assert_eq!(rows[0]["address"], "busy@example.com");
+        assert_eq!(rows[0]["messages_in"], 40);
+        // The standing decision travels with the row, so the one screen that lists everyone is also
+        // the one place a mute can be found again after the message that prompted it is gone.
+        assert_eq!(rows[0]["verdict"], "mute");
+        assert_eq!(rows[1]["address"], "quiet@example.com");
+        assert!(rows[1]["verdict"].is_null());
     }
 
     /// The mailbox name was hard-coded in the shell because nothing reported it, and a wrong one

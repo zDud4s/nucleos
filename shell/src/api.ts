@@ -414,6 +414,38 @@ export async function setProjectWipLimit(
   }
 }
 
+/** One correspondent, as the daemon has come to know them. */
+export interface Correspondent {
+  address: string;
+  display_name: string | null;
+  messages_in: number;
+  /** 1 if you have ever written to them — what `priority.rs` uses to tell a stranger apart. */
+  outbound_ever: number;
+  first_seen: string;
+  last_seen: string;
+  /** The standing decision: `"pin"`, `"mute"`, or null. */
+  verdict: string | null;
+}
+
+/**
+ * Who writes to you, busiest first.
+ *
+ * One row per ADDRESS, not per person. The daemon can propose merging two addresses into one
+ * contact but nothing in it performs that merge, so reporting a merged view would be reporting a
+ * judgement nobody has made.
+ */
+export async function getContacts(token: string): Promise<Correspondent[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/contacts`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Correspondent[];
+  } catch {
+    return null;
+  }
+}
+
 /** The two standing decisions a person can record about a sender. `priority.rs` knows only these. */
 export const SENDER_VERDICTS = ["pin", "mute"] as const;
 export type SenderVerdict = (typeof SENDER_VERDICTS)[number];
