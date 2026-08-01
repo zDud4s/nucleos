@@ -166,6 +166,27 @@ pub fn build_router(state: AppState) -> Router {
             "/voice/memos/{id}",
             get(crate::voice::get_memo).delete(crate::voice::delete_memo),
         )
+        // The literal `/calendar/busy` and `/calendar/config` coexist with no `{id}` sibling at
+        // that depth, so no shadowing question arises here — unlike `/runs/awaiting-approval`.
+        .route(
+            "/calendar/events",
+            get(crate::calendar::list_events).post(crate::calendar::create_event),
+        )
+        .route(
+            "/calendar/events/{id}",
+            axum::routing::delete(crate::calendar::delete_event),
+        )
+        .route(
+            "/calendar/events/{id}/cancel",
+            post(crate::calendar::cancel_occurrence),
+        )
+        .route(
+            "/calendar/events/{id}/move",
+            post(crate::calendar::move_occurrence),
+        )
+        .route("/calendar/busy", get(crate::calendar::get_busy))
+        .route("/calendar/config", get(crate::calendar::get_config))
+        .route("/notifications/pending", get(crate::notify::list_pending))
         .route("/mail-files", get(get_mail_files))
         .route("/mail-files/folder", post(post_mail_folder))
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
@@ -2262,6 +2283,33 @@ async fn post_proposal_approve(
                 .await?;
         return merge_decision_response(outcome);
     }
+    if kind == "calendar-event" {
+        // Third kind through this door, and the second that starts no run: approving writes the
+        // event and the decision in one transaction. Uncancellable for the same reason as the
+        // other two — a dropped request must not leave the proposal and the calendar disagreeing.
+        let state = state.clone();
+        let created =
+            uncancellable(
+                async move { crate::calendar::approve_proposed_event(&state.pool, id).await },
+            )
+            .await?;
+        return match created {
+            Ok(event_id) => Ok(Json(serde_json::json!({ "event_id": event_id }))),
+            Err(crate::calendar::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::calendar::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::calendar::DecisionError::Malformed) => {
+                tracing::warn!(
+                    proposal_id = id,
+                    "a calendar proposal carried no usable event"
+                );
+                Err(StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            Err(crate::calendar::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "approving a calendar proposal failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
 
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
@@ -2314,6 +2362,27 @@ async fn post_proposal_reject(
             Err(sqlx::Error::RowNotFound) => Err(StatusCode::CONFLICT),
             Err(error) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting a contact merge failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "calendar-event" {
+        // Refusing a suggested block leaves nothing behind: it is a suggestion declined, not a
+        // meeting cancelled, so the calendar never learns it was offered.
+        let state = state.clone();
+        let rejected =
+            uncancellable(
+                async move { crate::calendar::reject_proposed_event(&state.pool, id).await },
+            )
+            .await?;
+        return match rejected {
+            Ok(()) => Ok(StatusCode::NO_CONTENT),
+            Err(crate::calendar::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::calendar::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::calendar::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+            Err(crate::calendar::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting a calendar proposal failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
@@ -2512,6 +2581,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+                calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
                 progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             },
@@ -2612,6 +2682,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -4291,6 +4362,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };

@@ -161,6 +161,12 @@ pub struct AppState {
     /// because `VoiceRuntime::default()` means "off" — which is what keeps every test that does not
     /// care about voice from having to know it exists. Same reasoning as `email` above.
     pub voice: Arc<crate::voice::VoiceRuntime>,
+    /// The calendar's settings — the default zone and the window a proposal may land in.
+    ///
+    /// Same shape and same reasoning as `email` and `voice` above: read together, changed together,
+    /// and a `Default` that means "UTC, ordinary office hours" so no test that ignores calendars
+    /// has to know this field exists.
+    pub calendar: Arc<crate::calendar::CalendarRuntime>,
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns
     /// (`runs::create_run`), removed when it completes/times out/is cancelled.
     pub run_handles: RunHandles,

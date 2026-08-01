@@ -249,6 +249,59 @@ pub fn load_voice_config(path: &Path) -> VoiceConfig {
     }
 }
 
+/// The calendar's settings.
+///
+/// Only two things are configurable, because only two things are policy. The zone is what an event
+/// means when the caller does not say; the working window is where a PROPOSAL may land — and it is
+/// emphatically not when you are busy. Busy comes from real events only, and keeping the two apart
+/// is what stops "I do not work Sundays" from quietly becoming "tell me nothing on Sundays".
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CalendarConfig {
+    /// An IANA name. Empty means "ask the operating system", which is right far more often than
+    /// any name written into a default could be.
+    pub default_tz: String,
+    pub working_hours_start: String,
+    pub working_hours_end: String,
+    /// Lowercase three-letter English day names.
+    pub working_weekdays: Vec<String>,
+    /// Whether an `action`-class message may file a proposal asking for time. Off by default, for
+    /// the reason spelled out on `calendar::CalendarRuntime::propose_for_actions`.
+    pub propose_time_for_actions: bool,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            default_tz: String::new(),
+            working_hours_start: "09:00".to_string(),
+            working_hours_end: "18:00".to_string(),
+            working_weekdays: ["mon", "tue", "wed", "thu", "fri"]
+                .iter()
+                .map(|day| (*day).to_string())
+                .collect(),
+            propose_time_for_actions: false,
+        }
+    }
+}
+
+pub fn load_calendar_config(path: &Path) -> CalendarConfig {
+    if !path.exists() {
+        return CalendarConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<CalendarConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "calendar config: could not be parsed; defaults apply");
+            CalendarConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "calendar config: could not be read; defaults apply");
+            CalendarConfig::default()
+        }
+    }
+}
+
 /// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
 /// `schedule:` for `schedules:` parses cleanly into an empty ruleset, and all autonomy for that
 /// project silently stops. That direction is fail-closed, which is precisely why nobody notices —

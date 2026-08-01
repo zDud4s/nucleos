@@ -808,14 +808,17 @@ async fn apply_verdicts(
     // forwards every new feed entry without looking at its kind: a feed row for a triaged email
     // simply IS a notification. Writing one per message would deliver exactly the notification
     // fatigue the rollout is designed to avoid.
+    //
+    // WHICH class is worth a notification is decided here; WHEN it is delivered is decided by
+    // `notify::deliver_or_defer`, which parks it while the calendar says the person is in
+    // something. The two stay separate deliberately: the calendar may turn a notifiable message
+    // into a later one, never into a silent one.
     for verdict in verdicts {
         if notify_classes.iter().any(|class| class == &verdict.class) {
-            let _ = crate::feed::append(
+            let _ = crate::notify::deliver_or_defer(
                 pool,
-                None,
                 &format!("email_{}", verdict.class),
                 &verdict.summary,
-                None,
             )
             .await;
         }
@@ -1150,6 +1153,29 @@ async fn collect_run(
         tracing::warn!(%error, run_id, "email triage: could not apply the verdicts");
         return;
     }
+    // The `action` class means "needs something, but not today", and until now that was a verdict
+    // with nowhere to go. Proposing a block of time is where it goes — as a proposal a person
+    // approves, never as an event the agent writes. Off unless configured, and a failure here is
+    // logged rather than propagated: mail has already been filed correctly, and a calendar
+    // suggestion that could not be made is not a reason to re-triage the batch.
+    for verdict in verdicts.iter().filter(|verdict| verdict.class == "action") {
+        match crate::calendar::propose_time_for_action(state, verdict.id, Some(&verdict.summary))
+            .await
+        {
+            Ok(Some(proposal_id)) => {
+                tracing::info!(
+                    proposal_id,
+                    email_id = verdict.id,
+                    "calendar: time proposed"
+                )
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, email_id = verdict.id, "calendar: could not propose time")
+            }
+        }
+    }
+
     loop_state.consecutive_infra_failures = 0;
     loop_state.stall_announced = false;
     tracing::info!(
@@ -3172,6 +3198,7 @@ mod tests {
             )),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
