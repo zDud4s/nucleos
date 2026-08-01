@@ -1343,4 +1343,209 @@ mod tests {
             .expect("an unambiguous instant");
         assert_eq!(at.with_timezone(&Utc), utc("2026-08-03T08:00:00Z"));
     }
+
+    // ── the `action` class's destination ─────────────────────────────────────────────────────
+
+    async fn state_with(pool: sqlx::SqlitePool, propose: bool) -> AppState {
+        AppState {
+            token: crate::auth::Token("test-token".into()),
+            pool,
+            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            calendar: std::sync::Arc::new(CalendarRuntime {
+                default_tz: LISBON,
+                working_hours: WorkingHours::default(),
+                propose_for_actions: propose,
+            }),
+            run_handles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    async fn pending_calendar_proposals(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposals WHERE kind = 'calendar-event' AND status = 'pending'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("proposals to be countable")
+    }
+
+    /// The ship-dark default. Everything in this tree that generates work for a person to review
+    /// starts off, and this is the only part of the calendar that does.
+    #[tokio::test]
+    async fn no_time_is_proposed_while_the_feature_is_off() {
+        let state = state_with(test_pool().await, false).await;
+
+        let filed = propose_time_for_action(&state, 1, Some("review the contract"))
+            .await
+            .expect("the call to succeed");
+
+        assert!(filed.is_none());
+        assert_eq!(pending_calendar_proposals(&state.pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_action_message_gets_one_proposal_however_often_it_is_triaged() {
+        let state = state_with(test_pool().await, true).await;
+
+        let first = propose_time_for_action(&state, 7, Some("review the contract"))
+            .await
+            .expect("the call to succeed");
+        let second = propose_time_for_action(&state, 7, Some("review the contract"))
+            .await
+            .expect("the call to succeed");
+
+        assert!(first.is_some());
+        assert!(
+            second.is_none(),
+            "a second pass over the same message must not file a second proposal"
+        );
+        assert_eq!(pending_calendar_proposals(&state.pool).await, 1);
+    }
+
+    /// Two messages are two pieces of work, so the dedupe must key on the message and not merely
+    /// on there being a calendar proposal open.
+    #[tokio::test]
+    async fn a_different_message_still_gets_its_own_proposal() {
+        let state = state_with(test_pool().await, true).await;
+
+        propose_time_for_action(&state, 7, Some("one"))
+            .await
+            .expect("the call to succeed");
+        propose_time_for_action(&state, 8, Some("another"))
+            .await
+            .expect("the call to succeed");
+
+        assert_eq!(pending_calendar_proposals(&state.pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn approving_a_proposal_writes_the_event_and_marks_the_decision() {
+        let state = state_with(test_pool().await, true).await;
+        let proposal_id = propose_time_for_action(&state, 7, Some("review the contract"))
+            .await
+            .expect("the call to succeed")
+            .expect("a proposal");
+
+        let event_id = approve_proposed_event(&state.pool, proposal_id)
+            .await
+            .expect("the approval to succeed");
+
+        let (source, source_ref): (String, Option<i64>) =
+            sqlx::query_as("SELECT source, source_ref FROM calendar_events WHERE id = ?")
+                .bind(event_id)
+                .fetch_one(&state.pool)
+                .await
+                .expect("the event to be readable");
+        assert_eq!(source, "proposal");
+        assert_eq!(
+            source_ref,
+            Some(proposal_id),
+            "the event points back at the decision that created it"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .expect("the proposal to be readable");
+        assert_eq!(status, "approved");
+    }
+
+    /// The compare-and-set inside the transaction is what makes this safe; without it a double
+    /// click would book the same block twice.
+    #[tokio::test]
+    async fn approving_the_same_proposal_twice_books_only_one_event() {
+        let state = state_with(test_pool().await, true).await;
+        let proposal_id = propose_time_for_action(&state, 7, Some("review the contract"))
+            .await
+            .expect("the call to succeed")
+            .expect("a proposal");
+
+        approve_proposed_event(&state.pool, proposal_id)
+            .await
+            .expect("the first approval to succeed");
+        let second = approve_proposed_event(&state.pool, proposal_id).await;
+
+        assert!(matches!(second, Err(DecisionError::NotPending)));
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_events")
+            .fetch_one(&state.pool)
+            .await
+            .expect("events to be countable");
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_proposal_leaves_no_trace_on_the_calendar() {
+        let state = state_with(test_pool().await, true).await;
+        let proposal_id = propose_time_for_action(&state, 7, Some("review the contract"))
+            .await
+            .expect("the call to succeed")
+            .expect("a proposal");
+
+        reject_proposed_event(&state.pool, proposal_id)
+            .await
+            .expect("the rejection to succeed");
+
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_events")
+            .fetch_one(&state.pool)
+            .await
+            .expect("events to be countable");
+        assert_eq!(
+            events, 0,
+            "a declined suggestion is not a cancelled meeting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proposed_block_lands_inside_working_hours() {
+        let state = state_with(test_pool().await, true).await;
+        let proposal_id = propose_time_for_action(&state, 7, Some("review the contract"))
+            .await
+            .expect("the call to succeed")
+            .expect("a proposal");
+
+        let event_id = approve_proposed_event(&state.pool, proposal_id)
+            .await
+            .expect("the approval to succeed");
+        let starts_at_local: String =
+            sqlx::query_scalar("SELECT starts_at_local FROM calendar_events WHERE id = ?")
+                .bind(event_id)
+                .fetch_one(&state.pool)
+                .await
+                .expect("the event to be readable");
+
+        let starts = parse_local(&starts_at_local).expect("a stored local timestamp");
+        let hours = WorkingHours::default();
+        assert!(hours.weekdays.contains(&starts.weekday()));
+        assert!(starts.time() >= hours.start && starts.time() < hours.end);
+    }
+
+    #[tokio::test]
+    async fn a_long_subject_is_cut_rather_than_carried_whole() {
+        let long = "x".repeat(200);
+        let title = title_for_action(Some(&long));
+
+        assert!(
+            title.chars().count() <= MAX_TITLE_CHARS + 1,
+            "plus the ellipsis"
+        );
+        assert!(title.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn a_message_with_no_subject_still_gets_a_readable_title() {
+        assert_eq!(title_for_action(None), "follow up on a message");
+        assert_eq!(title_for_action(Some("   ")), "follow up on a message");
+    }
 }
