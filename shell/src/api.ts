@@ -948,8 +948,8 @@ export async function fetchAttachment(
   }
 }
 
-/** One entry in the mail folder. */
-export interface MailFile {
+/** One entry in the files folder. */
+export interface FileEntry {
   name: string;
   is_dir: boolean;
   /** Zero for a folder — its size is a different question, answered by walking it. */
@@ -957,34 +957,125 @@ export interface MailFile {
   modified: string | null;
 }
 
-/** What is in a folder under the mail root. `path` empty means the root itself. */
-export async function listMailFiles(token: string, path = ""): Promise<MailFile[] | null> {
+/**
+ * What is in a folder under the files root. `path` empty means the root itself.
+ *
+ * Every call in this group reports the status rather than collapsing to null, because the Files tab
+ * is a place where a refusal has to be readable: 409 after a delete means "this folder is not
+ * empty" and 409 after a rename means "that name is taken", and a page that only knew "it failed"
+ * would have to guess which.
+ */
+export async function listFiles(token: string, path = ""): Promise<ApiResult<FileEntry[]>> {
   try {
-    const res = await fetch(`${DAEMON_URL}/mail-files?path=${encodeURIComponent(path)}`, {
+    const res = await fetch(`${DAEMON_URL}/files?path=${encodeURIComponent(path)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: (await res.json()) as FileEntry[] };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function createFolder(token: string, path: string): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/files/folder`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Copies one of the user's own files into the folder, and reports the name it landed under.
+ *
+ * The name is not assumed for the same reason filing an attachment does not assume it: it is made
+ * safe on the way to disk, and a collision is numbered rather than allowed to overwrite.
+ */
+export async function uploadFile(
+  token: string,
+  folder: string,
+  file: File,
+): Promise<ApiResult<string>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/files/upload?folder=${encodeURIComponent(folder)}&filename=${encodeURIComponent(file.name)}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+        body: file,
+      },
+    );
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: ((await res.json()) as { filename: string }).filename };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/** One file's bytes, for handing to the browser's own download. */
+export async function downloadFile(token: string, path: string): Promise<Blob | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/files/download?path=${encodeURIComponent(path)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
-    return (await res.json()) as MailFile[];
+    return await res.blob();
   } catch {
     return null;
   }
 }
 
-export async function createMailFolder(token: string, path: string): Promise<boolean> {
+/** Renames or moves one entry. Both are the same request with a different parent in `to`. */
+export async function moveEntry(
+  token: string,
+  from: string,
+  to: string,
+): Promise<ApiResult<null>> {
   try {
-    const res = await fetch(`${DAEMON_URL}/mail-files/folder`, {
+    const res = await fetch(`${DAEMON_URL}/files/move`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ from, to }),
     });
-    return res.ok;
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: null };
   } catch {
-    return false;
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
 
 /**
- * Files an attachment into the mail folder.
+ * Deletes a file, or a folder.
+ *
+ * `recursive` is the second word the daemon asks for before removing a folder that still has
+ * something in it: without it that call answers 409, which is what lets the page say what is about
+ * to go before asking again.
+ */
+export async function deleteEntry(
+  token: string,
+  path: string,
+  recursive = false,
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/files?path=${encodeURIComponent(path)}&recursive=${recursive}`,
+      { method: "DELETE", headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Files an attachment into the files folder.
  *
  * Returns the name it was ACTUALLY stored under, which can differ from the sender's twice over:
  * once because the name was made safe, once because it collided with something already there.

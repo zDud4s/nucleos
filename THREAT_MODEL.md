@@ -59,6 +59,21 @@ optional: an empty `sent_mailbox` makes `poll.Targets` poll the inbox alone.
 An outbound row expires after `ROW_RETENTION_DAYS` in `core/src/triage.rs`, on the same thirty-day clock as mail in the content triage
 classes. The accumulated fact in `contact_addresses` survives, which is why ingestion accumulates it instead of counting retained mail.
 
+## The files folder
+
+`core/src/files.rs` owns one directory under the daemon's own data directory (`…\data\files`, renamed once from `…\data\mail`). It is the only place on this disk a stranger's bytes are written, and it is now also where the owner uploads files of their own, browses them, renames them and deletes them, from the Files tab.
+
+Every route resolves its path through `files::resolve_within` and nothing else: a whitelist of ordinary named components, each held to `email::safe_filename`, canonicalised against the root so a symlink placed inside it pointing out is caught by the filesystem rather than by string inspection. Adding read, upload, move and delete did not widen that rule — the four new handlers are the same one-line wrapper the two original ones were, which is the property worth keeping when this surface grows again.
+
+What is deliberately not symmetric:
+
+- `GET /files/download` always answers `application/octet-stream` with `Content-Disposition: attachment`, never `inline` and never the type an extension suggests. Half of what is in this folder arrived as mail; a webview asked to render one of those files in place would be executing it.
+- `POST /files/upload` writes through the same `write_file` as filing an attachment: the name is made safe and a collision is numbered, never overwritten. `files::MAX_UPLOAD_BYTES` caps a request at 100 MB, which is a memory ceiling as much as a policy one because the body is buffered whole; a download is streamed and has no matching cap.
+- `POST /files/move` refuses a destination that exists instead of numbering it, refuses a folder moved inside itself, and refuses to create a parent that is not there.
+- `DELETE /files` removes a file or an empty folder outright and answers `409` for a folder that still has something in it, until the caller repeats itself with `recursive=true`. The copy in this folder is the only one once the mail an attachment came from has expired.
+- In `core/src/auth.rs`, reading (`GET /files`, `GET /files/download`) is allowlisted for a read-only key because it discloses what `GET /email/{id}/attachments/{position}` already does. The four routes that change the folder are in no scope table, so only Admin and the control token reach them.
+- The MCP tool `list_files` is the agent's whole reach into this folder: one verb, `ToolEffect::ReadsUntrusted`, with no client method in `core/src/daemon_client.rs` for downloading, writing, moving or deleting. An agent can see the folder and cannot touch it.
+
 ## Existing barriers
 
 - `core/src/classifier.rs` is a pure deterministic lexical classifier. `CLASSIFIER_VERSION = 2`; it returns `allow`, `deny`, or `pending_approval` together with an `action_class`. It performs no I/O, makes no database access, and has no knowledge of run state.

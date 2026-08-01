@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  fetchAllAttachments, fetchAttachment, getEmail, getEmailCursor, getEmailQueue, listMailFiles,
+  fetchAllAttachments, fetchAttachment, getEmail, getEmailCursor, getEmailQueue, listFiles,
   getEmailConfig, requeueEmail, saveAllAttachments, saveAttachment, setSenderVerdict, triageEmail,
   type ConnectionState, type EmailAttachment, type EmailConfig, type EmailCursor,
   type EmailDetail, type QueuedEmail, type SenderVerdict,
@@ -160,7 +160,7 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
       return;
     }
     setFiled(
-      `${stored.length} ficheiro${stored.length === 1 ? "" : "s"} → ${folder === "" ? "mail/" : `mail/${folder}/`}`,
+      `${stored.length} ficheiro${stored.length === 1 ? "" : "s"} → ${folder === "" ? "files/" : `files/${folder}/`}`,
     );
     onFiled();
   }
@@ -180,7 +180,7 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
     }
     // Reporting the stored name rather than the sender's, because they differ whenever the name
     // had to be made safe or collided with something already there.
-    setFiled(`${stored} → ${folder === "" ? "mail/" : `mail/${folder}/`}`);
+    setFiled(`${stored} → ${folder === "" ? "files/" : `files/${folder}/`}`);
     onFiled();
   }
 
@@ -195,7 +195,7 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
       {detail.attachments.length > 0 && (
         <>
           <label className="mf-folder">
-            Arquivar em <span className="mf-root">mail/</span>
+            Arquivar em <span className="mf-root">files/</span>
             <input
               type="text"
               list="mail-folders"
@@ -297,12 +297,13 @@ function Mail({ token, connection }: MailProps) {
   // The configured mailbox once the daemon has said which it is, and the default until then.
   const mailbox = config?.mailbox ?? DEFAULT_MAILBOX;
 
-  // Only the top level, and only as suggestions in the folder box. A full browser is a different
-  // screen; what this needs is to stop someone retyping "BACMAT" every time.
+  // Only the top level, and only as suggestions in the folder box. The full browser is the Files
+  // tab; what this needs is to stop someone retyping "BACMAT" every time.
   const loadFolders = useCallback(async () => {
     if (token === null) return;
-    const entries = await listMailFiles(token);
-    setFolders((entries ?? []).filter((entry) => entry.is_dir).map((entry) => entry.name));
+    const result = await listFiles(token);
+    if (!result.ok) return;
+    setFolders(result.value.filter((entry) => entry.is_dir).map((entry) => entry.name));
   }, [token]);
 
   /**

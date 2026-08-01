@@ -833,6 +833,65 @@ details.scoreboard th {
 .t-dir { color: var(--text); }
 .t-icon { color: var(--faint); width: 1ch; }
 
+/* The Files tab. It reuses .crumbs and .t-entry from the project browser above — same gesture,
+   same look — and adds only what a folder you can change needs: a toolbar, and a row wide enough
+   to carry its own actions. */
+.f-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.f-name {
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font: 400 var(--fs-sm) var(--mono);
+  padding: 2px 0;
+  min-width: 12ch;
+}
+.f-name:focus { outline: none; border-bottom-color: var(--gold-line); }
+/* The real picker is opened by the Upload button, so the file input itself never has to be styled
+   into looking like one. */
+.f-picker { display: none; }
+
+.f-list { list-style: none; margin-top: var(--sp-3); display: grid; gap: 2px; }
+.f-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.f-meta { font: 400 var(--fs-2xs) var(--mono); color: var(--faint); white-space: nowrap; }
+.f-actions { display: flex; gap: var(--sp-1); }
+.f-rename {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 6px;
+  background: var(--wash);
+  border-radius: var(--r-sm);
+}
+.f-rename label {
+  display: grid;
+  gap: 2px;
+  flex: 1 1 24ch;
+  font: 400 var(--fs-2xs) var(--mono);
+  color: var(--muted);
+}
+.f-rename input {
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font: 400 var(--fs-sm) var(--mono);
+  padding: 2px 0;
+}
+.f-rename input:focus { outline: none; border-bottom-color: var(--gold-line); }
+
 .diff-body { max-height: 40rem; }
 
 .matches { list-style: none; display: grid; gap: var(--sp-2); margin-top: var(--sp-3); }

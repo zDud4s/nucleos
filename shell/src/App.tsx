@@ -6,6 +6,7 @@ import {
 } from "./api";
 import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
+import Files from "./Files";
 import Home from "./Home";
 import Mail from "./Mail";
 import Projects from "./Projects";
@@ -15,7 +16,8 @@ import Voice from "./Voice";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 
-type Tab = "home" | "autopilot" | "runs" | "projects" | "assistant" | "mail" | "voice" | "system";
+type Tab =
+  | "home" | "autopilot" | "runs" | "projects" | "assistant" | "mail" | "files" | "voice" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -24,6 +26,9 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "projects", label: "Projects" },
   { key: "assistant", label: "Assistant" },
   { key: "mail", label: "Mail" },
+  // Next to Mail because that is where its contents used to come from, and the two still meet:
+  // filing an attachment writes into the folder this tab browses.
+  { key: "files", label: "Files" },
   { key: "voice", label: "Voice" },
   { key: "system", label: "System" },
 ];
@@ -293,6 +298,7 @@ function App() {
             />
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}
+          {tab === "files" && <Files token={token} connection={connection} />}
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
         </main>

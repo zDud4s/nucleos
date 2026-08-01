@@ -169,8 +169,17 @@ pub fn build_router(state: AppState) -> Router {
             "/voice/memos/{id}",
             get(crate::voice::get_memo).delete(crate::voice::delete_memo),
         )
-        .route("/mail-files", get(get_mail_files))
-        .route("/mail-files/folder", post(post_mail_folder))
+        .route("/files", get(get_files).delete(delete_file))
+        .route("/files/folder", post(post_files_folder))
+        .route("/files/download", get(get_file_download))
+        .route("/files/move", post(post_files_move))
+        // Whole-body limit rather than the 2 MB default, for the same reason `/voice/capture` has
+        // one: the request this route exists for is bigger than the default and would be rejected
+        // identically every time. The ceiling is a memory ceiling too — see `files::MAX_UPLOAD_BYTES`.
+        .route(
+            "/files/upload",
+            post(post_file_upload).layer(DefaultBodyLimit::max(crate::files::MAX_UPLOAD_BYTES)),
+        )
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
         .route("/api-tokens", get(list_api_tokens).post(create_api_token))
         .route(
@@ -1023,14 +1032,14 @@ async fn post_email_attachments_save_all(
         tokio::task::spawn_blocking(move || {
             let mut filenames = Vec::with_capacity(decoded.len());
             for (filename, bytes) in &decoded {
-                filenames.push(crate::mailfiles::write_file(
+                filenames.push(crate::files::write_file(
                     &root,
                     &body.folder,
                     filename,
                     bytes,
                 )?);
             }
-            Ok::<_, crate::mailfiles::PathError>(SaveAllOutcome {
+            Ok::<_, crate::files::PathError>(SaveAllOutcome {
                 folder: body.folder,
                 filenames,
             })
@@ -1102,12 +1111,16 @@ async fn fetch_attachment(
 /// Turns a folder refusal into a status. `Escapes` and `Unsafe` are both 400: the request named
 /// something it may not name, and which of the two rules caught it is not the caller's business —
 /// a distinction here would be a probe for how the guard is built.
-fn folder_status(error: crate::mailfiles::PathError) -> StatusCode {
-    use crate::mailfiles::PathError;
+///
+/// The three 409s are not one answer either, and they do not need to be: a caller knows which of
+/// the four operations it just asked for, so "conflict" reads as one sentence per route — this is
+/// not a folder, this name is taken, this folder still has things in it.
+fn folder_status(error: crate::files::PathError) -> StatusCode {
+    use crate::files::PathError;
     match error {
         PathError::Escapes | PathError::Unsafe => StatusCode::BAD_REQUEST,
         PathError::NotFound => StatusCode::NOT_FOUND,
-        PathError::NotADirectory => StatusCode::CONFLICT,
+        PathError::NotADirectory | PathError::NotEmpty | PathError::Exists => StatusCode::CONFLICT,
         PathError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -1127,12 +1140,12 @@ struct FolderQuery {
     path: String,
 }
 
-async fn get_mail_files(
+async fn get_files(
     State(state): State<AppState>,
     Query(query): Query<FolderQuery>,
-) -> Result<Json<Vec<crate::mailfiles::Entry>>, StatusCode> {
+) -> Result<Json<Vec<crate::files::Entry>>, StatusCode> {
     let root = files_root(&state)?;
-    crate::mailfiles::list(root, &query.path)
+    crate::files::list(root, &query.path)
         .map(Json)
         .map_err(folder_status)
 }
@@ -1142,13 +1155,155 @@ struct CreateFolderRequest {
     path: String,
 }
 
-async fn post_mail_folder(
+async fn post_files_folder(
     State(state): State<AppState>,
     Json(body): Json<CreateFolderRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let root = files_root(&state)?;
-    crate::mailfiles::create_folder(root, &body.path)
+    crate::files::create_folder(root, &body.path)
         .map(|()| StatusCode::CREATED)
+        .map_err(folder_status)
+}
+
+/// Hands back one file's bytes, streamed rather than gathered.
+///
+/// `attachment`, never `inline`, and `application/octet-stream` whatever the extension says — the
+/// same rule the attachment route follows, and for a stronger reason: half of what is in this
+/// folder arrived as mail from a stranger, and a webview asked to render it in place would be
+/// executing a file this system exists to keep at arm's length.
+async fn get_file_download(
+    State(state): State<AppState>,
+    Query(query): Query<FolderQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    let root = files_root(&state)?;
+    let target = crate::files::resolve_file(root, &query.path).map_err(folder_status)?;
+
+    // The name comes off the resolved path, not the query string: `resolve_within` has already
+    // decided the last component is a name a filesystem carries, and `content_disposition` makes it
+    // safe for a header again.
+    let filename = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string();
+
+    let file = tokio::fs::File::open(&target)
+        .await
+        // Gone between resolving and opening: rare, and it is the same answer as never having been
+        // there.
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let length = file.metadata().await.ok().map(|metadata| metadata.len());
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&content_disposition(&filename))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    if let Some(length) = length {
+        headers.insert(axum::http::header::CONTENT_LENGTH, length.into());
+    }
+
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok((headers, axum::body::Body::from_stream(stream)).into_response())
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    /// Which folder under the root. Absent means the root itself.
+    #[serde(default)]
+    folder: String,
+    /// What the browser called the file. Made safe on the way to disk, like a sender's name is.
+    filename: String,
+}
+
+/// The other way bytes enter this folder: a person picking a file of their own.
+///
+/// It goes through the same `write_file` as filing an attachment — same name rule, same numbered
+/// collisions — because the folder's guarantee is about the folder, not about who is writing. The
+/// stored name is reported back for the same reason it is there: it can differ from what was sent.
+async fn post_file_upload(
+    State(state): State<AppState>,
+    Query(query): Query<UploadQuery>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<SavedFile>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+
+    // Blocking file I/O off the async runtime, and uncancellable for the same reason as filing: a
+    // client that disconnects mid-write must not leave half a file under a name that says it is
+    // whole.
+    let saved = uncancellable(async move {
+        tokio::task::spawn_blocking(move || {
+            crate::files::write_file(&root, &query.folder, &query.filename, &bytes).map(|stored| {
+                SavedFile {
+                    filename: stored,
+                    folder: query.folder,
+                }
+            })
+        })
+        .await
+    })
+    .await?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    saved.map(Json).map_err(folder_status)
+}
+
+#[derive(Deserialize)]
+struct MoveRequest {
+    from: String,
+    to: String,
+}
+
+/// Renames or moves one entry. Both ends are resolved against the root, so neither can name a
+/// destination outside it.
+async fn post_files_move(
+    State(state): State<AppState>,
+    Json(body): Json<MoveRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+
+    let moved = uncancellable(async move {
+        tokio::task::spawn_blocking(move || crate::files::move_entry(&root, &body.from, &body.to))
+            .await
+    })
+    .await?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    moved
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(folder_status)
+}
+
+#[derive(Deserialize)]
+struct DeleteQuery {
+    path: String,
+    /// Required to remove a folder that still has something in it — see `files::delete`.
+    #[serde(default)]
+    recursive: bool,
+}
+
+async fn delete_file(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteQuery>,
+) -> Result<StatusCode, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+
+    let deleted = uncancellable(async move {
+        tokio::task::spawn_blocking(move || {
+            crate::files::delete(&root, &query.path, query.recursive)
+        })
+        .await
+    })
+    .await?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    deleted
+        .map(|()| StatusCode::NO_CONTENT)
         .map_err(folder_status)
 }
 
@@ -1160,9 +1315,11 @@ struct SaveAttachmentRequest {
 }
 
 #[derive(serde::Serialize)]
-struct SavedAttachment {
-    /// The name it was ACTUALLY stored under, which can differ from the sender's twice over: once
-    /// because the name was made safe, once because it collided.
+struct SavedFile {
+    /// The name it was ACTUALLY stored under, which can differ from the one it arrived with twice
+    /// over: once because the name was made safe, once because it collided. True of a sender's
+    /// attachment and of a file the user picked themselves — this is the answer to "where did it
+    /// go", and guessing it is how a caller ends up naming a file that is not there.
     filename: String,
     folder: String,
 }
@@ -1173,7 +1330,7 @@ async fn post_email_attachment_save(
     State(state): State<AppState>,
     Path((id, position)): Path<(i64, i64)>,
     Json(body): Json<SaveAttachmentRequest>,
-) -> Result<Json<SavedAttachment>, StatusCode> {
+) -> Result<Json<SavedFile>, StatusCode> {
     let root = files_root(&state)?.to_path_buf();
     let (bytes, filename) = fetch_attachment(&state, id, position).await?;
 
@@ -1181,8 +1338,8 @@ async fn post_email_attachment_save(
     // mid-write must not leave half a file behind under a name that says it is whole.
     let saved = uncancellable(async move {
         tokio::task::spawn_blocking(move || {
-            crate::mailfiles::write_file(&root, &body.folder, &filename, &bytes).map(|stored| {
-                SavedAttachment {
+            crate::files::write_file(&root, &body.folder, &filename, &bytes).map(|stored| {
+                SavedFile {
                     filename: stored,
                     folder: body.folder,
                 }
@@ -3330,7 +3487,34 @@ mod tests {
     async fn the_folder_routes_refuse_when_there_is_no_root() {
         let state = test_state().await;
         assert_eq!(
-            call(state, "GET", "/mail-files", None).await.0,
+            call(state.clone(), "GET", "/files", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // The four that write, or hand bytes back, refuse for the same reason and must not be
+        // reachable in a state where nobody knows where they would be writing.
+        assert_eq!(
+            call(state.clone(), "GET", "/files/download?path=x", None)
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            call(
+                state.clone(),
+                "POST",
+                "/files/move",
+                Some(serde_json::json!({"from": "a", "to": "b"}))
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            call(state.clone(), "DELETE", "/files?path=x", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            upload(state, "", "guia.docx", b"x").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -3365,7 +3549,7 @@ mod tests {
     #[tokio::test]
     async fn the_bulk_route_is_not_shadowed_by_the_position_route() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::mailfiles::ensure_root(temp.path()).unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
         let state = with_files_root(test_state().await, root);
 
         // No such message, so this stops at the database — which is proof enough that it reached
@@ -3386,14 +3570,14 @@ mod tests {
     #[tokio::test]
     async fn a_folder_can_be_created_and_listed_over_http() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::mailfiles::ensure_root(temp.path()).unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
         let state = with_files_root(test_state().await, root);
 
         assert_eq!(
             call(
                 state.clone(),
                 "POST",
-                "/mail-files/folder",
+                "/files/folder",
                 Some(serde_json::json!({"path": "BACMAT/2026"}))
             )
             .await
@@ -3401,25 +3585,179 @@ mod tests {
             StatusCode::CREATED
         );
 
-        let (status, entries) = call(state, "GET", "/mail-files", None).await;
+        let (status, entries) = call(state, "GET", "/files", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(entries[0]["name"], "BACMAT");
         assert_eq!(entries[0]["is_dir"], true);
     }
 
+    /// The round trip the folder was missing: a file goes in, and the same bytes come back out.
+    #[tokio::test]
+    async fn a_file_can_be_uploaded_and_downloaded_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root);
+
+        assert_eq!(
+            call(
+                state.clone(),
+                "POST",
+                "/files/folder",
+                Some(serde_json::json!({"path": "BACMAT"}))
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+
+        let (status, saved) = upload(state.clone(), "BACMAT", "guia.docx", b"conteudo").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["filename"], "guia.docx");
+
+        let response = raw(
+            state,
+            "GET",
+            "/files/download?path=BACMAT%2Fguia.docx",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Never `inline`, and never the type the extension suggests: this folder holds files that
+        // arrived as mail from strangers, and a webview must not be invited to render one.
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment;"),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"conteudo");
+    }
+
+    /// An upload lands under the same rules as a filed attachment: the name is made safe, and a
+    /// collision is numbered rather than allowed to erase what is already there.
+    #[tokio::test]
+    async fn an_upload_cannot_write_outside_the_root_and_never_overwrites() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root.clone());
+
+        let (_, first) = upload(state.clone(), "", "guia.docx", b"primeiro").await;
+        assert_eq!(first["filename"], "guia.docx");
+        let (_, second) = upload(state.clone(), "", "guia.docx", b"segundo").await;
+        assert_eq!(second["filename"], "guia (2).docx");
+        assert_eq!(std::fs::read(root.join("guia.docx")).unwrap(), b"primeiro");
+
+        let (_, escaped) = upload(state, "", "../../.ssh/authorized_keys", b"x").await;
+        assert_eq!(escaped["filename"], "authorized_keys");
+        assert!(root.join("authorized_keys").exists());
+    }
+
+    /// Deleting a folder with things in it takes a second word. The 409 is the whole point: it is
+    /// the answer that lets the shell say what is about to be lost before it asks again.
+    #[tokio::test]
+    async fn a_full_folder_is_not_deleted_by_a_single_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root.clone());
+
+        call(
+            state.clone(),
+            "POST",
+            "/files/folder",
+            Some(serde_json::json!({"path": "BACMAT"})),
+        )
+        .await;
+        upload(state.clone(), "BACMAT", "guia.docx", b"x").await;
+
+        assert_eq!(
+            call(state.clone(), "DELETE", "/files?path=BACMAT", None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert!(root.join("BACMAT").join("guia.docx").exists());
+
+        assert_eq!(
+            call(
+                state.clone(),
+                "DELETE",
+                "/files?path=BACMAT&recursive=true",
+                None
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert!(!root.join("BACMAT").exists());
+    }
+
+    #[tokio::test]
+    async fn a_rename_moves_the_file_and_refuses_a_taken_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root.clone());
+
+        call(
+            state.clone(),
+            "POST",
+            "/files/folder",
+            Some(serde_json::json!({"path": "BACMAT"})),
+        )
+        .await;
+        upload(state.clone(), "", "guia.docx", b"conteudo").await;
+        upload(state.clone(), "", "outro.docx", b"outro").await;
+
+        assert_eq!(
+            call(
+                state.clone(),
+                "POST",
+                "/files/move",
+                Some(serde_json::json!({"from": "guia.docx", "to": "BACMAT/guia final.docx"}))
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            std::fs::read(root.join("BACMAT").join("guia final.docx")).unwrap(),
+            b"conteudo"
+        );
+
+        assert_eq!(
+            call(
+                state,
+                "POST",
+                "/files/move",
+                Some(serde_json::json!({"from": "outro.docx", "to": "BACMAT"}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT,
+            "a taken destination must be refused, not numbered and not overwritten"
+        );
+    }
+
     /// The one guard this whole surface rests on, checked through the routes rather than only in
-    /// the module — a handler that forgets to call it is exactly the mistake worth catching.
+    /// the module — a handler that forgets to call it is exactly the mistake worth catching, and
+    /// there are now six handlers to forget it in.
     #[tokio::test]
     async fn a_path_that_leaves_the_root_is_refused_by_every_route() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::mailfiles::ensure_root(temp.path()).unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
         let state = with_files_root(test_state().await, root);
 
         for escape in ["..", "../outside", "/etc", "C:\\Windows"] {
             let listed = call(
                 state.clone(),
                 "GET",
-                &format!("/mail-files?path={}", urlencode(escape)),
+                &format!("/files?path={}", urlencode(escape)),
                 None,
             )
             .await;
@@ -3428,12 +3766,95 @@ mod tests {
             let created = call(
                 state.clone(),
                 "POST",
-                "/mail-files/folder",
+                "/files/folder",
                 Some(serde_json::json!({ "path": escape })),
             )
             .await;
             assert_eq!(created.0, StatusCode::BAD_REQUEST, "created {escape:?}");
+
+            let downloaded = call(
+                state.clone(),
+                "GET",
+                &format!("/files/download?path={}", urlencode(escape)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                downloaded.0,
+                StatusCode::BAD_REQUEST,
+                "downloaded {escape:?}"
+            );
+
+            let deleted = call(
+                state.clone(),
+                "DELETE",
+                &format!("/files?path={}&recursive=true", urlencode(escape)),
+                None,
+            )
+            .await;
+            assert_eq!(deleted.0, StatusCode::BAD_REQUEST, "deleted {escape:?}");
+
+            for pair in [
+                serde_json::json!({ "from": escape, "to": "destino.docx" }),
+                serde_json::json!({ "from": "origem.docx", "to": escape }),
+            ] {
+                let moved = call(state.clone(), "POST", "/files/move", Some(pair)).await;
+                assert_eq!(moved.0, StatusCode::BAD_REQUEST, "moved {escape:?}");
+            }
+
+            // The upload names its folder, and that name is resolved the same way.
+            let uploaded = upload(state.clone(), escape, "guia.docx", b"x").await;
+            assert_eq!(
+                uploaded.0,
+                StatusCode::BAD_REQUEST,
+                "uploaded into {escape:?}"
+            );
         }
+    }
+
+    /// Sends bytes the way the shell does: the name and folder ride in the query string, the file
+    /// is the whole body.
+    async fn upload(
+        state: AppState,
+        folder: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> (StatusCode, serde_json::Value) {
+        let response = raw(
+            state,
+            "POST",
+            &format!(
+                "/files/upload?folder={}&filename={}",
+                urlencode(folder),
+                urlencode(filename)
+            ),
+            Body::from(bytes.to_vec()),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The response itself, for the two tests that care about headers or raw bytes rather than a
+    /// JSON body.
+    async fn raw(state: AppState, method: &str, uri: &str, body: Body) -> axum::response::Response {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     fn urlencode(value: &str) -> String {

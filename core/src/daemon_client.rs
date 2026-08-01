@@ -158,12 +158,13 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
-    /// What is in the mail organization folder. Reading only — there is deliberately no client
-    /// method here for creating or writing, so an agent cannot reach those even by mistake.
-    pub async fn list_mail_files(&self, path: &str) -> Result<Value, String> {
+    /// What is in the files folder. Reading only — there is deliberately no client method here for
+    /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
+    /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.
+    pub async fn list_files(&self, path: &str) -> Result<Value, String> {
         self.request(
             reqwest::Method::GET,
-            &format!("/mail-files?path={}", urlencoding_encode(path)),
+            &format!("/files?path={}", urlencoding_encode(path)),
         )
         .send()
         .await

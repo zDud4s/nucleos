@@ -11,6 +11,7 @@ mod contacts;
 mod daemon_client;
 mod email;
 mod feed;
+mod files;
 mod gate;
 mod handoff;
 mod health;
@@ -19,7 +20,6 @@ mod http;
 mod inspect;
 mod job;
 mod logging;
-mod mailfiles;
 mod mailsend;
 mod mcp_tools;
 mod presets;
@@ -284,14 +284,15 @@ async fn main() {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
 
-    // The folder a person arranges their mail into. Created whether or not the pillar is enabled,
-    // for the same reason as the sandbox: a directory that always exists is one less thing to go
-    // wrong the day email is switched on. An empty path means every route under it refuses, which
-    // is the right answer when the directory could not be made.
-    let mail_files_root = match mailfiles::ensure_root(dirs.data_local_dir()) {
+    // The folder a person arranges their files in — uploads of their own, and the mail they filed.
+    // Created whether or not the email pillar is enabled, for the same reason as the sandbox: a
+    // directory that always exists is one less thing to go wrong the day email is switched on, and
+    // this one is now reachable from its own tab with the pillar off. An empty path means every
+    // route under it refuses, which is the right answer when the directory could not be made.
+    let files_root = match files::ensure_root(dirs.data_local_dir()) {
         Ok(root) => root,
         Err(error) => {
-            tracing::warn!(%error, "could not create the mail folder — organising mail will be unavailable");
+            tracing::warn!(%error, "could not create the files folder — the Files tab will be unavailable");
             std::path::PathBuf::new()
         }
     };
@@ -399,7 +400,7 @@ async fn main() {
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
-            mail_files_root,
+            files_root,
             email_sidecar_token,
         )),
         voice: Arc::new(voice::VoiceRuntime::from_config(
