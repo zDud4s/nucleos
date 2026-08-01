@@ -55,7 +55,9 @@ pub type RunMessages = Arc<Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender
 /// Grouped into one struct rather than spread across `AppState` because they are read together and
 /// change together: spec §3.4 makes this config startup-time on purpose, so editing `.ai/email.yaml`
 /// means restarting the daemon, never recompiling it.
-#[derive(Debug, Clone)]
+/// `Debug` is written by hand rather than derived, and the test at the bottom of this file is what
+/// keeps it that way — see `sidecar_token` below.
+#[derive(Clone)]
 pub struct EmailRuntime {
     /// False keeps every part of the pillar dormant — no polling, no triage, no digest.
     pub enabled: bool,
@@ -75,6 +77,13 @@ pub struct EmailRuntime {
     /// The IMAP host and account, for saying WHICH mailbox this is. Never the password: that comes
     /// from Credential Manager, is handed to the sidecar process, and is not in this struct to leak.
     pub host: String,
+    /// The submission host, or empty when nobody has configured one.
+    ///
+    /// Read by the send route as the first of its two "this daemon is not in a position to send"
+    /// checks. Empty is the shipped state and must stay a refusal rather than a fallback to `host`:
+    /// the IMAP server is not the submission server often enough that guessing would either fail
+    /// the login or hand the message to somebody else's machine.
+    pub smtp_host: String,
     pub username: String,
     pub poll_interval_secs: u64,
     /// The directory a triage run works in, so it never inherits the daemon's (spec §5.5).
@@ -90,6 +99,49 @@ pub struct EmailRuntime {
     /// loop itself runs regardless, because it also owns retention — bodies already stored do not
     /// stop needing to expire because the barrier failed.
     pub armed: Arc<std::sync::atomic::AtomicBool>,
+    /// The email sidecar's OWN key (`auth::Service::Email`), minted at startup — never the control
+    /// token, and never `None` standing in for one.
+    ///
+    /// It lives here because the send route needs it at request time, and the alternative shapes
+    /// are both worse: re-minting per request would rotate the key out from under a running
+    /// sidecar, and reaching for `AppState::token` would hand the full daemon key to the one
+    /// process this arrangement exists to keep it away from. `None` means minting failed or the
+    /// pillar is off, and the route answers 503 — a deployment a person fixes, not a retry.
+    ///
+    /// Set once at startup and never mutated, like every other field here: this struct is read-only
+    /// after `main.rs` builds it, which is why it can be shared behind an `Arc` without a lock.
+    pub sidecar_token: Option<String>,
+}
+
+/// Describes everything except the one thing that must not be described.
+///
+/// Hand-written because `#[derive(Debug)]` on a struct holding a credential is a leak waiting for
+/// its first `tracing::debug!(?state.email, …)` — and the person who writes that line will be
+/// printing configuration, not a secret. Whether a key EXISTS is worth saying (it is the difference
+/// between the two 503s this pillar can answer); what the key IS never is.
+impl std::fmt::Debug for EmailRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmailRuntime")
+            .field("enabled", &self.enabled)
+            .field("notify_classes", &self.notify_classes)
+            .field("digest_hour_utc", &self.digest_hour_utc)
+            .field("retain_bodies_days", &self.retain_bodies_days)
+            .field("mailbox", &self.mailbox)
+            .field("sent_mailbox", &self.sent_mailbox)
+            .field("host", &self.host)
+            .field("smtp_host", &self.smtp_host)
+            .field("username", &self.username)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("sandbox", &self.sandbox)
+            .field("files_root", &self.files_root)
+            .field("armed", &self.armed)
+            .field(
+                "sidecar_token",
+                &self.sidecar_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for EmailRuntime {
@@ -104,20 +156,26 @@ impl Default for EmailRuntime {
             mailbox: "INBOX".to_string(),
             sent_mailbox: None,
             host: String::new(),
+            smtp_host: String::new(),
             username: String::new(),
             poll_interval_secs: 300,
             sandbox: std::path::PathBuf::new(),
             files_root: std::path::PathBuf::new(),
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sidecar_token: None,
         }
     }
 }
 
 impl EmailRuntime {
+    /// `sidecar_token` is a parameter rather than something this reads from config, because it is
+    /// not configuration: it is minted at startup against the database, and the only caller that
+    /// can produce one is `main.rs`. Passing it in keeps this struct read-only afterwards.
     pub fn from_config(
         config: &crate::config::EmailConfig,
         sandbox: std::path::PathBuf,
         files_root: std::path::PathBuf,
+        sidecar_token: Option<String>,
     ) -> Self {
         Self {
             enabled: config.enabled,
@@ -127,11 +185,13 @@ impl EmailRuntime {
             mailbox: config.mailbox.clone(),
             sent_mailbox: config.sent_mailbox.clone(),
             host: config.host.clone(),
+            smtp_host: config.smtp_host.clone(),
             username: config.username.clone(),
             poll_interval_secs: config.poll_interval_secs,
             sandbox,
             files_root,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sidecar_token,
         }
     }
 }
@@ -182,4 +242,41 @@ pub struct AppState {
     /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
     pub progress_timeout: Duration,
     pub run_timeout: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A credential this struct holds must not be published by the act of describing the struct.
+    ///
+    /// `EmailRuntime` is reached from `AppState`, and `AppState` is what every handler is handed —
+    /// so a single `tracing::debug!(?state.email, ...)` written years from now, by someone printing
+    /// configuration rather than a secret, would put the sidecar's key in a rotating log file on
+    /// disk. The IMAP password is kept out of this struct entirely for exactly that reason (see the
+    /// `host` field's comment); the sidecar's own token cannot be, because the send route needs it
+    /// at request time. So it is stored under a `Debug` that refuses to print it, and this test is
+    /// what stops a later `#[derive(Debug)]` from quietly undoing that.
+    #[test]
+    fn the_debug_of_the_email_runtime_does_not_carry_the_sidecar_token() {
+        const TOKEN: &str = "super-secret-token-xyz";
+
+        let runtime = EmailRuntime {
+            smtp_host: "smtp.example.com".to_string(),
+            sidecar_token: Some(TOKEN.into()),
+            ..EmailRuntime::default()
+        };
+
+        let described = format!("{runtime:?}");
+        assert!(
+            !described.contains(TOKEN),
+            "the sidecar's key is in the debug output: {described}"
+        );
+        // The struct must still be describable — redacting a secret is not an excuse to say nothing,
+        // because a Debug that shows nothing is one nobody uses and everybody works around.
+        assert!(
+            described.contains("smtp.example.com"),
+            "the rest of the configuration must still be readable: {described}"
+        );
+    }
 }

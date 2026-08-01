@@ -59,6 +59,17 @@ pub struct EmailConfig {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
+    /// The submission host, kept apart from `host` above because reading a mailbox and posting a
+    /// message to it are two different servers as often as they are one — `imap.gmail.com` and
+    /// `smtp.gmail.com` being the case most people are in. Empty is the shipped state and means
+    /// sending is unconfigured: the send route answers 503 rather than guessing a host from the
+    /// IMAP one, because a guessed submission server either refuses the login or, far worse,
+    /// belongs to somebody else.
+    pub smtp_host: String,
+    /// 465 (implicit TLS) rather than 587 (STARTTLS): the pillar's premise is that a message the
+    /// mailbox's owner cannot recall does not leave this machine in the clear, and only one of the
+    /// two is encrypted before the first byte of the conversation.
+    pub smtp_port: u16,
     pub username: String,
     pub mailbox: String,
     pub sent_mailbox: Option<String>,
@@ -85,6 +96,8 @@ impl Default for EmailConfig {
             enabled: false,
             host: String::new(),
             port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
             username: String::new(),
             mailbox: "INBOX".to_string(),
             sent_mailbox: None,

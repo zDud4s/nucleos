@@ -26,6 +26,12 @@ type Config struct {
 	PollInterval time.Duration
 	// FetchAddr is the loopback address this sidecar serves attachments on.
 	FetchAddr string
+	// SMTPHost is empty when the person has not configured sending. Reading a mailbox and sending
+	// from it are two separate grants, and the first has always worked without the second — so an
+	// empty value here is a configuration, not a failure: the send route answers 503 and the poll
+	// loop carries on.
+	SMTPHost string
+	SMTPPort int
 }
 
 // Load reads the variables the núcleo injects (see `sidecar::email_env`). A missing
@@ -86,6 +92,17 @@ func Load() (Config, error) {
 		interval = time.Duration(seconds) * time.Second
 	}
 
+	smtpHost := os.Getenv("EMAIL_SMTP_HOST")
+	// Unlike the IMAP port, an unreadable value here is not fatal: mail still arrives without a
+	// submission server, so the whole process is not worth killing over one variable. 465 is the
+	// submission port that is TLS from the first byte, which is the only shape send/ speaks.
+	smtpPort := DefaultSMTPPort
+	if raw := os.Getenv("EMAIL_SMTP_PORT"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			smtpPort = parsed
+		}
+	}
+
 	fetchAddr := os.Getenv("EMAIL_FETCH_ADDR")
 	if fetchAddr == "" {
 		fetchAddr = DefaultFetchAddr
@@ -105,12 +122,18 @@ func Load() (Config, error) {
 		SentMailbox:  sentMailbox,
 		PollInterval: interval,
 		FetchAddr:    fetchAddr,
+		SMTPHost:     smtpHost,
+		SMTPPort:     smtpPort,
 	}, nil
 }
 
 // DefaultFetchAddr is where attachments are served when the núcleo does not say otherwise. 8793
 // follows the daemon (8791) and the echo sidecar (8792).
 const DefaultFetchAddr = "127.0.0.1:8793"
+
+// DefaultSMTPPort is submission over implicit TLS. Not 587: that one starts in plaintext and asks
+// for TLS afterwards, and the credential this process holds is the person's own mail password.
+const DefaultSMTPPort = 465
 
 // requireLoopback refuses to open the attachment listener to anything but this machine.
 //
@@ -135,4 +158,10 @@ func requireLoopback(addr string) error {
 // Addr is the dial target for the IMAP connection.
 func (c Config) Addr() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// SMTPAddr is the dial target for the submission connection. Meaningless while SMTPHost is empty,
+// which is why every caller checks that first.
+func (c Config) SMTPAddr() string {
+	return fmt.Sprintf("%s:%d", c.SMTPHost, c.SMTPPort)
 }

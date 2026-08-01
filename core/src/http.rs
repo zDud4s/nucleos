@@ -112,6 +112,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/email/cursor", get(get_email_cursor))
         .route("/email/triage", post(post_email_triage))
         .route("/email/queue", get(get_email_queue))
+        // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, which is where
+        // the reason is written down.
+        .route("/email/send", post(crate::mailsend::post_email_send))
         // The one route whose legitimate payload outgrows axum's 2 MB default. A full batch is
         // 200 messages of up to 32 KiB of body each (the sidecar's own `MaxPerBatch` and
         // `MaxBodyBytes`), so ~6.4 MB of text before subjects, headers and JSON escaping — the
@@ -3992,6 +3995,7 @@ mod tests {
             },
             std::path::PathBuf::new(),
             std::path::PathBuf::new(),
+            None,
         ));
 
         let response = build_router(state)

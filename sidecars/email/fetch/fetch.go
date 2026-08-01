@@ -5,8 +5,11 @@
 // it. Something has to go and get it at that moment, and IMAP lives on this side — duplicating an
 // IMAP client in Rust would mean two implementations of the read-only invariant instead of one.
 //
-// This is the sidecar's only inbound surface. It binds to loopback, requires the daemon's token,
-// and never writes anything: the mailbox stays read-only exactly as the poll loop leaves it.
+// This is the sidecar's only inbound surface, so the one outbound route — /send — is mounted here
+// too rather than opening a second port. It binds to loopback and requires the daemon's token on
+// every route without exception. The mailbox is still never written: the read-only invariant the
+// poll loop keeps is untouched, and what /send changes is that this listener now also relays a
+// message outbound over SMTP.
 package fetch
 
 import (
@@ -27,6 +30,7 @@ import (
 	"nucleosemail/daemon"
 	"nucleosemail/extract"
 	"nucleosemail/imap"
+	"nucleosemail/send"
 )
 
 // HeaderTimeout bounds how long a client may take to send its headers. Small, because the only
@@ -36,8 +40,9 @@ const HeaderTimeout = 10 * time.Second
 // Serve blocks, serving attachment requests until the process ends.
 func Serve(cfg config.Config) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/attachment", handler(cfg))
-	mux.HandleFunc("/attachments", allHandler(cfg))
+	mux.HandleFunc("/attachment", guarded(cfg, handler(cfg)))
+	mux.HandleFunc("/attachments", guarded(cfg, allHandler(cfg)))
+	mux.HandleFunc("/send", guarded(cfg, send.Handler(cfg)))
 	server := &http.Server{
 		Addr:              cfg.FetchAddr,
 		Handler:           mux,
@@ -49,10 +54,6 @@ func Serve(cfg config.Config) error {
 
 func handler(cfg config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, cfg.DaemonToken) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
 		uid, position, err := request(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -104,10 +105,6 @@ type bulkAttachment struct {
 // eight TLS connections to deliver the same bytes.
 func allHandler(cfg config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, cfg.DaemonToken) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
 		uid, err := requestUID(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -155,6 +152,20 @@ func readAll(cfg config.Config, uid imapv2.UID) ([]daemon.Attachment, map[int][]
 		return nil, nil, err
 	}
 	return extract.AllAttachments(raw.Body)
+}
+
+// guarded refuses anything not carrying the daemon's token before the handler behind it sees the
+// request. One wrapper at the mux rather than a check repeated inside each handler: the repeated
+// version is one route away from being forgotten, and the route that forgets it is the one that
+// reads someone's mail or sends from their address.
+func guarded(cfg config.Config, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, cfg.DaemonToken) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // authorized compares in constant time: a token checked with `==` leaks its prefix to anything that
