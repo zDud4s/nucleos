@@ -155,6 +155,22 @@ fn sent_mailbox_env(config: &crate::config::EmailConfig) -> Option<(String, Stri
         .map(|mailbox| ("EMAIL_SENT_MAILBOX".to_string(), mailbox.clone()))
 }
 
+/// The submission server, passed only once somebody has named one.
+///
+/// Conditional for the same reason `sent_mailbox_env` is, and with a sharper edge: the sidecar
+/// decides whether it can send at all by whether this host reached it. Emitting the pair
+/// unconditionally would hand it an empty host and a port, which reads like a configured server
+/// right up to the point a person is told their message went out.
+fn smtp_env(config: &crate::config::EmailConfig) -> Vec<(String, String)> {
+    if config.smtp_host.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ("EMAIL_SMTP_HOST".to_string(), config.smtp_host.clone()),
+        ("EMAIL_SMTP_PORT".to_string(), config.smtp_port.to_string()),
+    ]
+}
+
 /// The email sidecar's environment (spec §3.4). This list is the contract between the núcleo and
 /// the Go sidecar: it reads nothing from disk and holds no config of its own, so anything it needs
 /// is here or it does not exist. The password comes from Credential Manager and never touches a
@@ -185,6 +201,7 @@ pub fn email_env(
         ),
     ];
     env.extend(sent_mailbox_env(config));
+    env.extend(smtp_env(config));
     env
 }
 
@@ -199,6 +216,8 @@ mod tests {
             enabled: true,
             host: "imap.gmail.com".into(),
             port: 993,
+            smtp_host: "smtp.gmail.com".into(),
+            smtp_port: 465,
             username: "me@x.com".into(),
             mailbox: "INBOX".into(),
             poll_interval_secs: 300,
@@ -209,7 +228,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        assert_eq!(env.len(), 9);
+        assert_eq!(env.len(), 11);
         assert_eq!(env["NUCLEOS_DAEMON_URL"], "http://127.0.0.1:8791");
         assert_eq!(env["NUCLEOS_DAEMON_TOKEN"], "tok");
         // The one address both processes have to agree on. The sidecar defaults to the same value,
@@ -221,6 +240,64 @@ mod tests {
         assert_eq!(env["EMAIL_IMAP_PASSWORD"], "app-password");
         assert_eq!(env["EMAIL_MAILBOX"], "INBOX");
         assert_eq!(env["EMAIL_POLL_INTERVAL_SECS"], "300");
+        // Reading and sending are two servers as often as they are one, so the submission host
+        // travels separately from the IMAP one rather than being derived from it.
+        assert_eq!(env["EMAIL_SMTP_HOST"], "smtp.gmail.com");
+        assert_eq!(env["EMAIL_SMTP_PORT"], "465");
+    }
+
+    /// An unconfigured submission host must reach the sidecar as an ABSENCE, not as an empty string.
+    ///
+    /// The sidecar decides whether it can send at all from whether this variable arrived. A blank
+    /// `EMAIL_SMTP_HOST` alongside a perfectly ordinary `EMAIL_SMTP_PORT` looks like a configured
+    /// server to anything reading the pair, and the failure surfaces only after somebody has been
+    /// told their message went out — which for this pillar is the one failure that cannot be undone.
+    #[test]
+    fn the_submission_host_reaches_the_sidecar_only_once_somebody_has_named_one() {
+        let unconfigured: HashMap<String, String> = email_env(
+            "http://127.0.0.1:8791",
+            "tok",
+            &crate::config::EmailConfig::default(),
+            "password",
+        )
+        .into_iter()
+        .collect();
+        assert!(
+            !unconfigured.contains_key("EMAIL_SMTP_HOST")
+                && !unconfigured.contains_key("EMAIL_SMTP_PORT"),
+            "an unnamed submission host must leave BOTH variables absent, port included"
+        );
+
+        // Whitespace is the same absence wearing a hat: a host of spaces would connect to nothing.
+        let blank = crate::config::EmailConfig {
+            smtp_host: "   ".into(),
+            ..Default::default()
+        };
+        let blank_env: HashMap<String, String> =
+            email_env("http://127.0.0.1:8791", "tok", &blank, "password")
+                .into_iter()
+                .collect();
+        assert!(!blank_env.contains_key("EMAIL_SMTP_HOST"));
+
+        let configured = crate::config::EmailConfig {
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 587,
+            ..Default::default()
+        };
+        let configured_env: HashMap<String, String> =
+            email_env("http://127.0.0.1:8791", "tok", &configured, "password")
+                .into_iter()
+                .collect();
+        assert_eq!(
+            configured_env.get("EMAIL_SMTP_HOST").map(String::as_str),
+            Some("smtp.example.com")
+        );
+        // The port travels with the host and is not assumed on the far side: an operator who moved
+        // off 465 did so because their provider left them no choice.
+        assert_eq!(
+            configured_env.get("EMAIL_SMTP_PORT").map(String::as_str),
+            Some("587")
+        );
     }
 
     #[test]

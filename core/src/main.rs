@@ -20,6 +20,7 @@ mod inspect;
 mod job;
 mod logging;
 mod mailfiles;
+mod mailsend;
 mod mcp_tools;
 mod presets;
 mod priority;
@@ -365,6 +366,30 @@ async fn main() {
         None => Arc::new(claude_runner()),
     };
 
+    // The email sidecar's own key, minted before `AppState` exists rather than beside the spawn.
+    //
+    // It moved here because two things now need it: the sidecar, which is handed it in its
+    // environment, and `POST /email/send`, which must present the SIDECAR's key to the sidecar and
+    // never the control token. Minting it twice would produce two keys and rotate the live one out
+    // from under a running process (`INSERT OR REPLACE`), so it is minted once and read from
+    // `state.email` by both. Gated on `enabled` so a daemon with the pillar off writes no key it
+    // will never use, and a failure here is not fatal: it leaves the sidecar unstarted and the send
+    // route answering 503, which is the same "off rather than half-on" posture as the rest.
+    let email_sidecar_token = if email_config.enabled {
+        match auth::mint_service_token(&pool, auth::Service::Email).await {
+            Ok(token) => Some(token),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "could not mint the email sidecar's token — the sidecar will not start"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = AppState {
         token: Token(token_value),
         pool,
@@ -375,6 +400,7 @@ async fn main() {
             &email_config,
             triage_sandbox,
             mail_files_root,
+            email_sidecar_token,
         )),
         voice: Arc::new(voice::VoiceRuntime::from_config(
             &voice_config,
@@ -481,12 +507,13 @@ async fn main() {
             // rather than half-on.
             match secrets::load_secret(EMAIL_PASSWORD_KEY) {
                 Ok(Some(password)) => {
-                    // Its own key, minted before the spawn. A failure here leaves the sidecar
-                    // unstarted rather than started with the control token: this process parses
-                    // MIME written by strangers, and the fallback that hands it everything is the
-                    // arrangement being removed.
-                    match auth::mint_service_token(&state.pool, auth::Service::Email).await {
-                        Ok(token) => {
+                    // Its own key, minted above before `AppState` was built and read back from it
+                    // here so the sidecar and the send route present the same one. An absent key
+                    // leaves the sidecar unstarted rather than started with the control token: this
+                    // process parses MIME written by strangers, and the fallback that hands it
+                    // everything is the arrangement being removed.
+                    match state.email.sidecar_token.as_deref() {
+                        Some(token) => {
                             let path = std::env::current_exe()
                                 .unwrap()
                                 .parent()
@@ -494,15 +521,14 @@ async fn main() {
                                 .join("email-sidecar.exe");
                             let env = sidecar::email_env(
                                 "http://127.0.0.1:8791",
-                                &token,
+                                token,
                                 &email_config,
                                 &password,
                             );
                             tokio::spawn(sidecar::supervise("email".to_string(), path, env));
                             tracing::info!("email sidecar supervised");
                         }
-                        Err(error) => tracing::error!(
-                            %error,
+                        None => tracing::error!(
                             "could not mint the email sidecar's token — the sidecar will not start"
                         ),
                     }

@@ -164,6 +164,13 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// nobody reviewed reaching a process nothing is about to review again. That is precisely what the
 /// email pillar's design forbids for content nobody vouches for, so speaking into a run stays its own
 /// authorization rather than a consequence of being allowed to start one.
+///
+/// `POST /email/send` is deliberately absent from this table and from `READ_ONLY_ROUTES` both, for
+/// the same shape of reason. A run-creating key buys the prompt it supplies at the moment it
+/// supplies it; a message leaving this machine under the mailbox owner's own address is not
+/// something that key ever bought, and it is the one act in the pillar its owner cannot undo.
+/// `EMAIL_ROUTES` is the sharpest case: the sidecar is the process that parses MIME written by
+/// strangers, so it must not hold the key to the route that replies to them. Sending is Admin's.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     (Method::POST, "/webhooks/push"),
@@ -767,6 +774,54 @@ mod tests {
         }
         assert!(!permits(&scope, &Method::GET, "/future-sensitive-route"));
         assert!(!permits(&scope, &Method::POST, "/status"));
+    }
+
+    /// Sending is Admin-only by construction: `POST /email/send` is in NEITHER table.
+    ///
+    /// The same deliberate omission `POST /runs/{id}/message` is documented for above
+    /// `RUN_CREATING_ROUTES`, and for the same reason. A run-creating key authorises the prompt it
+    /// supplies at the moment it supplies it; a message leaving this machine under the owner's own
+    /// address is not something that key ever bought, and it is the one act in this pillar the
+    /// mailbox's owner cannot undo. The email sidecar is on the list too, and is the sharpest case:
+    /// it is the process that parses MIME written by strangers, so it must not hold the key to the
+    /// route that replies to them.
+    ///
+    /// Asserting the two tables' membership as well as `permits` is the point — the rule here is an
+    /// absence, and an absence is what a later edit adds a line to without noticing.
+    #[test]
+    fn sending_mail_is_out_of_reach_of_every_scope_below_admin() {
+        const SEND_ROUTE: &str = "/email/send";
+
+        for scope in [
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::Service(Service::Email),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, SEND_ROUTE),
+                "{scope:?} must not be able to send mail as the mailbox's owner"
+            );
+        }
+
+        for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+            assert!(
+                permits(&scope, &Method::POST, SEND_ROUTE),
+                "{scope:?} acts for the person, and sending is theirs to do"
+            );
+        }
+
+        assert!(
+            !READ_ONLY_ROUTES
+                .iter()
+                .any(|(_, pattern)| *pattern == SEND_ROUTE),
+            "sending is not a read"
+        );
+        assert!(
+            !RUN_CREATING_ROUTES
+                .iter()
+                .any(|(_, pattern)| *pattern == SEND_ROUTE),
+            "sending must not ride in on the permission to start a run"
+        );
     }
 
     #[tokio::test]
