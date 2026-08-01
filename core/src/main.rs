@@ -5,6 +5,7 @@ mod autopilot;
 mod autostart;
 mod backup;
 mod budget;
+mod calendar;
 mod classifier;
 mod config;
 mod contacts;
@@ -22,9 +23,11 @@ mod job;
 mod logging;
 mod mailsend;
 mod mcp_tools;
+mod notify;
 mod presets;
 mod priority;
 mod proposals;
+mod recurrence;
 mod redact;
 mod repo_trigger;
 mod runner;
@@ -300,6 +303,7 @@ async fn main() {
     // Relative to the working directory like the email pillar's, for the same reason: it matters where
     // the daemon was launched from, so the "off" path has to be discoverable rather than mysterious.
     let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
+    let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -407,6 +411,7 @@ async fn main() {
             &voice_config,
             voice_cleanup_model,
         )),
+        calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
@@ -469,6 +474,17 @@ async fn main() {
     // is the opposite of what switching it off is for — the recordings of what they said would then
     // outlive the feature that made them.
     tokio::spawn(voice::run_retention_loop(state.clone()));
+    // Held notifications are reconciled at startup for the same reason orphaned runs and stranded
+    // approvals are: the daemon may have been down when the meeting ended, and a queue that only
+    // drains on the tick would sit there until the NEXT meeting ended instead.
+    match notify::flush_due(&state.pool).await {
+        Ok(delivered) if delivered > 0 => {
+            tracing::warn!("delivered {delivered} notification(s) held over from a previous run")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not flush held notifications on startup"),
+    }
+    tokio::spawn(notify::run_flush_loop(state.clone()));
 
     // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
     // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a

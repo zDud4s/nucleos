@@ -13,11 +13,13 @@ import Projects from "./Projects";
 import Runs from "./Runs";
 import System from "./System";
 import Voice from "./Voice";
+import Calendar from "./Calendar";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 
 type Tab =
-  | "home" | "autopilot" | "runs" | "projects" | "assistant" | "mail" | "files" | "voice" | "system";
+  | "home" | "autopilot" | "runs" | "projects" | "assistant"
+  | "mail" | "files" | "voice" | "calendar" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -30,6 +32,7 @@ const TABS: { key: Tab; label: string }[] = [
   // filing an attachment writes into the folder this tab browses.
   { key: "files", label: "Files" },
   { key: "voice", label: "Voice" },
+  { key: "calendar", label: "Calendar" },
   { key: "system", label: "System" },
 ];
 
@@ -300,6 +303,7 @@ function App() {
           {tab === "mail" && <Mail token={token} connection={connection} />}
           {tab === "files" && <Files token={token} connection={connection} />}
           {tab === "voice" && <Voice token={token} connection={connection} />}
+          {tab === "calendar" && <Calendar token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
         </main>
       )}
