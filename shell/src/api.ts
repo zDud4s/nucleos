@@ -2062,3 +2062,153 @@ export async function deleteVoiceMemo(token: string, id: number): Promise<boolea
     return false;
   }
 }
+
+// ── Calendar ──────────────────────────────────────────────────────────────────
+//
+// The daemon expands recurrence itself, so the shell asks for a WINDOW and gets
+// flat occurrences back. It never sees a rule, which is deliberate: "the third
+// Thursday" is a question with two daylight-saving answers, and there must be
+// exactly one place in the system that decides it.
+
+export interface CalendarOccurrence {
+  event_id: number;
+  title: string;
+  /** `human` for something you created, `proposal` for something you approved. */
+  source: string;
+  /** The original local start — the handle used to cancel or move this one occurrence. */
+  occurrence_local: string;
+  starts_at: string;
+  ends_at: string;
+}
+
+export interface CalendarConfigView {
+  default_tz: string;
+  working_hours_start: string;
+  working_hours_end: string;
+  working_weekdays: string[];
+}
+
+export interface PendingNotification {
+  id: number;
+  kind: string;
+  summary: string;
+  queued_at: string;
+  /** Null while still held. Delivered rows are kept so "did it ever arrive?" is answerable. */
+  delivered_at: string | null;
+}
+
+export async function getCalendarConfig(token: string): Promise<CalendarConfigView | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/calendar/config`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CalendarConfigView;
+  } catch {
+    return null;
+  }
+}
+
+export async function getCalendarEvents(
+  token: string,
+  from: Date,
+  to: Date,
+): Promise<CalendarOccurrence[]> {
+  try {
+    const query = new URLSearchParams({
+      from: from.toISOString(),
+      to: to.toISOString(),
+    });
+    const res = await fetch(`${DAEMON_URL}/calendar/events?${query}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return [];
+    return (await res.json()) as CalendarOccurrence[];
+  } catch {
+    return [];
+  }
+}
+
+export async function getCalendarBusy(token: string): Promise<boolean | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/calendar/busy`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return ((await res.json()) as { busy: boolean }).busy;
+  } catch {
+    return null;
+  }
+}
+
+export interface NewCalendarEvent {
+  title: string;
+  /** Local wall clock, no offset: `2026-08-03T09:00:00`. */
+  starts_at_local: string;
+  duration_minutes: number;
+  tz?: string;
+  freq?: "daily" | "weekly" | "monthly";
+  interval?: number;
+  byday?: string;
+  count?: number;
+}
+
+/** Returns the reason on refusal, so a 400 can say which field the daemon rejected. */
+export async function createCalendarEvent(
+  token: string,
+  event: NewCalendarEvent,
+): Promise<{ ok: true; id: number } | { ok: false; reason: string }> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/calendar/events`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    });
+    if (!res.ok) return { ok: false, reason: (await res.text()) || `HTTP ${res.status}` };
+    return { ok: true, id: ((await res.json()) as { id: number }).id };
+  } catch {
+    return { ok: false, reason: "the daemon is not reachable" };
+  }
+}
+
+/** Deletes the whole series. One occurrence is `cancelCalendarOccurrence`. */
+export async function deleteCalendarEvent(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/calendar/events/${id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function cancelCalendarOccurrence(
+  token: string,
+  id: number,
+  occurrenceLocal: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/calendar/events/${id}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ occurrence_local: occurrenceLocal }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function listPendingNotifications(token: string): Promise<PendingNotification[]> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/notifications/pending`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return [];
+    return (await res.json()) as PendingNotification[];
+  } catch {
+    return [];
+  }
+}
