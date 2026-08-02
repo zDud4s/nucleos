@@ -177,8 +177,8 @@ impl DaemonClient {
     /// Read one page.
     ///
     /// Reading only. There is deliberately NO client method here that submits a form, posts, logs
-    /// in, or sends anything — the same asymmetry the mail tools have, for a sharper reason: this
-    /// is the tool that fills an agent's context with text a stranger wrote, and any write sitting
+    /// in, or sends anything — the same asymmetry `list_files` has, for a sharper reason: this is
+    /// the method that fills an agent's context with text a stranger wrote, and any write sitting
     /// beside it becomes something those words can try to aim.
     pub async fn web_read(&self, url: &str) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/web/read")
@@ -191,12 +191,13 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
-    /// What is in the mail organization folder. Reading only — there is deliberately no client
-    /// method here for creating or writing, so an agent cannot reach those even by mistake.
-    pub async fn list_mail_files(&self, path: &str) -> Result<Value, String> {
+    /// What is in the files folder. Reading only — there is deliberately no client method here for
+    /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
+    /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.
+    pub async fn list_files(&self, path: &str) -> Result<Value, String> {
         self.request(
             reqwest::Method::GET,
-            &format!("/mail-files?path={}", urlencoding_encode(path)),
+            &format!("/files?path={}", urlencoding_encode(path)),
         )
         .send()
         .await

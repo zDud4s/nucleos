@@ -41,7 +41,8 @@ function mailboxOf(queue: QueuedEmail[], config: Record<string, unknown> = email
       return { ok: true, status: 200, json: async () => null };
     }
     if (target.includes("/contacts/verdict")) return { ok: true, status: 204 };
-    if (target.includes("/mail-files")) return { ok: true, status: 200, json: async () => [] };
+    // The folder suggestions in the filing box, which the Files tab now browses in full.
+    if (target.includes("/files")) return { ok: true, status: 200, json: async () => [] };
     return { ok: true, status: 200, json: async () => [] };
   });
 }

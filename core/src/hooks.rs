@@ -1526,7 +1526,7 @@ mod tests {
 
         orchestrator_tool(&app, run_id, "get_email_queue", serde_json::json!({})).await;
 
-        for tool in ["get_email", "get_email_queue", "list_mail_files"] {
+        for tool in ["get_email", "get_email_queue", "list_files"] {
             let decision =
                 orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
             assert_eq!(decision.decision, "allow", "{tool}");

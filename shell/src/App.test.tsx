@@ -180,8 +180,8 @@ describe("App navigation and presence", () => {
     expect(
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
     ).toEqual([
-      "Home", "Autopilot", "Runs", "Projects", "Assistant", "Mail", "Voice", "Calendar", "Web",
-      "System",
+      "Home", "Autopilot", "Runs", "Projects", "Assistant",
+      "Mail", "Files", "Voice", "Calendar", "Web", "System",
     ]);
   });
 

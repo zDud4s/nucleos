@@ -88,8 +88,12 @@ pub struct EmailRuntime {
     pub poll_interval_secs: u64,
     /// The directory a triage run works in, so it never inherits the daemon's (spec §5.5).
     pub sandbox: std::path::PathBuf,
-    /// The mail organization folder, canonicalised once so every containment check compares
-    /// against a path the filesystem has already resolved.
+    /// The files folder, canonicalised once so every containment check compares against a path the
+    /// filesystem has already resolved.
+    ///
+    /// It lives in this struct for its history — it began as the folder mail was filed into — and
+    /// it is no longer only that: the Files tab writes here without the email pillar being on at
+    /// all. `main.rs` builds it unconditionally for exactly that reason.
     pub files_root: std::path::PathBuf,
     /// Set once the hook barrier has been PROVEN at startup, and read by the triage loop before
     /// every batch.

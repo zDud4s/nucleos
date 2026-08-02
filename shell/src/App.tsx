@@ -6,6 +6,7 @@ import {
 } from "./api";
 import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
+import Files from "./Files";
 import Home from "./Home";
 import Mail from "./Mail";
 import Projects from "./Projects";
@@ -16,10 +17,11 @@ import Calendar from "./Calendar";
 import Web from "./Web";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
+import "./calendar.css";
 
 type Tab =
-  | "home" | "autopilot" | "runs" | "projects"
-  | "assistant" | "mail" | "voice" | "calendar" | "web" | "system";
+  | "home" | "autopilot" | "runs" | "projects" | "assistant"
+  | "mail" | "files" | "voice" | "calendar" | "web" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -28,6 +30,9 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "projects", label: "Projects" },
   { key: "assistant", label: "Assistant" },
   { key: "mail", label: "Mail" },
+  // Next to Mail because that is where its contents used to come from, and the two still meet:
+  // filing an attachment writes into the folder this tab browses.
+  { key: "files", label: "Files" },
   { key: "voice", label: "Voice" },
   { key: "calendar", label: "Calendar" },
   { key: "web", label: "Web" },
@@ -299,6 +304,7 @@ function App() {
             />
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}
+          {tab === "files" && <Files token={token} connection={connection} />}
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "calendar" && <Calendar token={token} connection={connection} />}
           {tab === "web" && <Web token={token} connection={connection} />}

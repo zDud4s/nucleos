@@ -1,0 +1,293 @@
+/* Calendário — grelha de mês e de semana.
+   Ficheiro próprio, e não mais 200 linhas no App.css, pela mesma razão que
+   `calendar.rs` é um módulo e não mais handlers no `http.rs`.
+
+   Regra estrutural herdada do sistema (design/design-system.md): a grelha é
+   camada BASE, portanto sólida e quieta — sem blur, sem sombra. O vidro
+   aparece exatamente duas vezes, no rascunho de evento e no banner de
+   retidas, porque só esses dois flutuam por cima da grelha.
+
+   Cor é informação: numa grelha em repouso a única coisa com croma é a linha
+   do agora. A proveniência de um evento distingue-se por FORMA (preenchido vs
+   contornado), não por cor, porque cor está reservada a estado. */
+
+.cal { display: grid; gap: var(--sp-4); }
+.cal-flat, .cal-quiet { color: var(--faint); font-size: var(--fs-sm); }
+.cal-quiet { margin: calc(-1 * var(--sp-2)) 0 0; }
+
+/* ── Cabeçalho ─────────────────────────────────────────── */
+
+.cal-head {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  align-items: center;
+  gap: var(--sp-4);
+}
+/* A única coisa em display neste ecrã. O resto são dados. */
+.cal-title {
+  margin: 0;
+  font: 500 var(--fs-xl) / 1.1 var(--display);
+  letter-spacing: -0.01em;
+  text-transform: capitalize;
+}
+
+.cal-switch {
+  display: flex; gap: 2px; padding: 2px;
+  border-radius: var(--r-full); background: var(--wash);
+}
+.cal-switch-btn {
+  border: 0; cursor: pointer; border-radius: var(--r-full);
+  padding: 5px var(--sp-3);
+  font: 500 var(--fs-xs) var(--body);
+  text-transform: capitalize;
+  color: var(--faint); background: transparent;
+  transition: color var(--t-fast) var(--ease-out), background var(--t-fast) var(--ease-out);
+}
+.cal-switch-btn:hover { color: var(--text); }
+.cal-switch-btn[aria-pressed="true"] { color: var(--text); background: var(--wash-strong); }
+
+.cal-nav { display: flex; align-items: center; gap: var(--sp-1); }
+.cal-step, .cal-today {
+  border: 1px solid var(--line); background: transparent; cursor: pointer;
+  color: var(--muted); border-radius: var(--r-sm);
+  transition: color var(--t-fast) var(--ease-out), border-color var(--t-fast) var(--ease-out);
+}
+.cal-step { width: 26px; height: 26px; font-size: var(--fs-md); line-height: 1; }
+.cal-today { height: 26px; padding: 0 var(--sp-3); font: 500 var(--fs-xs) var(--body); }
+.cal-step:hover, .cal-today:hover { color: var(--text); border-color: var(--glass-line); }
+
+.cal-now { margin: 0; min-width: 56px; text-align: right; }
+/* "Free" é o estado normal, portanto quase não se vê. Só "busy" usa Badge. */
+.cal-free { font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
+
+/* ── Semana ────────────────────────────────────────────── */
+
+.cal-week-scroll {
+  --cal-head-h: 44px;
+  overflow: auto;
+  max-height: 64vh;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-raise);
+}
+.cal-week {
+  display: grid;
+  grid-template-columns: 42px repeat(7, minmax(78px, 1fr));
+  min-width: 640px;
+}
+
+/* A goteira leva a mesma célula de cabeçalho vazia que as colunas, para as horas
+   começarem à meia-noite em vez de subirem para a faixa dos dias. */
+.cal-gutter { border-right: 1px solid var(--hairline); }
+/* Acima de tudo: é esta tampa que impede a hora do topo de aparecer dentro da
+   faixa dos dias enquanto se rola. */
+.cal-gutter .cal-col-head { z-index: 5; }
+.cal-gutter-body { position: relative; }
+.cal-gutter-body span {
+  position: absolute; right: var(--sp-2);
+  transform: translateY(-50%);
+  font: 400 var(--fs-2xs) var(--mono);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.cal-col { border-right: 1px solid var(--hairline); min-width: 0; }
+.cal-col:last-child { border-right: 0; }
+/* Hoje tem de se ler à distância de um relance, que era o problema de um wash a 2%. */
+.cal-col.is-today { background: oklch(0.82 0.115 85 / 0.045); }
+.cal-col.is-today .cal-col-head { background: oklch(0.24 0.03 85); box-shadow: inset 0 -1px 0 var(--gold-line); }
+/* Um dia que não é de trabalho é esbatido inteiro; a faixa de horário dentro dele
+   seria uma afirmação sobre um dia que não tem nenhum. */
+.cal-col.is-off { background: oklch(0.06 0.015 265 / 0.45); }
+.cal-col.is-off .cal-dow, .cal-col.is-off .cal-dom { color: oklch(0.48 0.015 265); }
+
+.cal-col-head {
+  position: sticky; top: 0; z-index: 2;
+  height: var(--cal-head-h);
+  display: flex; align-items: baseline; justify-content: center; gap: 6px;
+  background: var(--bg-raise);
+  border-bottom: 1px solid var(--hairline);
+}
+.cal-dow {
+  font: 500 var(--fs-2xs) var(--body);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--faint);
+}
+.cal-dom {
+  font: 500 var(--fs-md) var(--mono);
+  color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.cal-col.is-today .cal-dom { color: var(--gold); }
+.cal-col.is-today .cal-dow { color: var(--muted); }
+/* Aparece duas vezes por ano: o dia que não tem 24 horas. */
+.cal-dst {
+  font: 500 var(--fs-2xs) var(--mono);
+  color: var(--gold); background: var(--gold-tint);
+  border-radius: var(--r-full); padding: 1px 5px;
+}
+
+.cal-col-body { position: relative; cursor: copy; }
+.cal-offhours {
+  position: absolute; inset-inline: 0;
+  background: oklch(0.05 0.015 265 / 0.5);
+  pointer-events: none;
+}
+.cal-hourline {
+  position: absolute; inset-inline: 0; height: 1px;
+  background: var(--hairline); pointer-events: none;
+}
+
+/* A única coisa com croma numa grelha em repouso — e tem de ficar por cima dos
+   blocos, senão a hora a que estamos desaparece atrás da reunião a decorrer,
+   que é exatamente quando interessa vê-la. */
+.cal-nowline {
+  position: absolute; inset-inline: 0; height: 1px; z-index: 6;
+  background: var(--gold); pointer-events: none;
+}
+.cal-nowline::before {
+  content: ""; position: absolute; left: -3px; top: -2.5px;
+  width: 6px; height: 6px; border-radius: var(--r-full);
+  background: var(--gold);
+}
+
+/* Proveniência por FORMA: o teu é preenchido, o que veio de uma proposta é
+   contornado a tracejado. */
+.cal-block {
+  position: absolute; overflow: hidden;
+  padding: 3px var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: oklch(0.26 0.024 265);
+  cursor: default;
+  transition: border-color var(--t-fast) var(--ease-out), background var(--t-fast) var(--ease-out);
+}
+.cal-block:hover { border-color: var(--glass-line); background: oklch(0.3 0.026 265); z-index: 4; }
+.cal-block.is-proposed { background: transparent; border-style: dashed; border-color: var(--glass-line); }
+.cal-block b { display: block; font: 500 var(--fs-xs) var(--body); color: var(--text); line-height: 1.25; }
+.cal-block time { font: 400 var(--fs-2xs) var(--mono); color: var(--faint); }
+/* Num bloco de 45 minutos o título e a hora não cabem os dois. A hora é a que se
+   deduz da posição; o título não. */
+.cal-block.is-short { padding-top: 1px; display: flex; align-items: baseline; gap: 5px; }
+.cal-block.is-short time { display: none; }
+.cal-block.is-short b { font-size: var(--fs-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Ações só no hover: em repouso a grelha mostra tempo, não botões. */
+.cal-block-do { display: none; gap: var(--sp-1); margin-top: 2px; }
+.cal-block:hover .cal-block-do { display: flex; }
+
+/* ── Mês ───────────────────────────────────────────────── */
+
+.cal-month {
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  overflow: hidden; background: var(--bg-raise);
+}
+.cal-month-head, .cal-month-row { display: grid; grid-template-columns: repeat(7, 1fr); }
+.cal-month-head span {
+  padding: var(--sp-2) var(--sp-3);
+  font: 500 var(--fs-2xs) var(--body);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--faint);
+  border-bottom: 1px solid var(--hairline);
+}
+.cal-cell {
+  min-height: 96px; padding: var(--sp-2);
+  display: flex; flex-direction: column; gap: 3px;
+  border-top: 1px solid var(--hairline);
+  border-right: 1px solid var(--hairline);
+  cursor: copy; min-width: 0;
+  transition: background var(--t-fast) var(--ease-out);
+}
+.cal-month-row:first-child .cal-cell { border-top: 0; }
+.cal-cell:nth-child(7n) { border-right: 0; }
+.cal-cell:hover { background: oklch(1 0 0 / 0.03); }
+/* Dias do mês vizinho continuam clicáveis; só deixam de reclamar atenção. */
+.cal-cell.is-outside { background: oklch(0 0 0 / 0.12); }
+.cal-cell.is-outside .cal-cell-num { color: oklch(0.45 0.015 265); }
+/* Mesma regra da semana. Duas grelhas em desacordo sobre quais são os teus dias
+   fariam a mais silenciosa parecer um erro de renderização. */
+.cal-cell.is-off { background: oklch(0.06 0.015 265 / 0.4); }
+.cal-cell.is-off .cal-cell-num { color: oklch(0.52 0.015 265); }
+.cal-cell.is-off.is-outside { background: oklch(0 0 0 / 0.3); }
+
+.cal-cell-num {
+  font: 500 var(--fs-sm) var(--mono);
+  color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.cal-cell.is-today .cal-cell-num {
+  align-self: flex-start;
+  color: var(--on-shadow); background: var(--gold);
+  border-radius: var(--r-full); min-width: 20px; text-align: center; padding: 0 5px;
+}
+
+.cal-chip {
+  display: flex; gap: 5px; align-items: baseline;
+  padding: 2px 5px; border-radius: 5px;
+  font: 400 var(--fs-xs) var(--body); color: var(--text);
+  background: oklch(0.26 0.024 265);
+  border: 1px solid transparent;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cal-chip.is-proposed { background: transparent; border-color: var(--glass-line); border-style: dashed; }
+.cal-chip time { font: 400 var(--fs-2xs) var(--mono); color: var(--faint); flex: none; }
+/* Leva o mesmo peso de um chip: é a única pista de que aquele dia tem mais do que
+   se vê, e discreta demais tornava-a uma pista que ninguém segue. */
+.cal-more {
+  align-self: flex-start; border: 0; cursor: pointer;
+  padding: 2px 6px; border-radius: 5px;
+  background: var(--wash);
+  font: 500 var(--fs-2xs) var(--body); color: var(--muted);
+  transition: color var(--t-fast) var(--ease-out), background var(--t-fast) var(--ease-out);
+}
+.cal-more:hover { color: var(--text); background: var(--wash-strong); }
+
+/* ── Camadas elevadas: aqui sim, vidro ─────────────────── */
+
+/* Exceção: só existe enquanto alguma coisa está retida. Em repouso não há
+   banner nenhum, só a linha discreta do .cal-quiet. */
+.cal-held {
+  display: grid; gap: 2px;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-md);
+  background: var(--gold-surface);
+  border: 1px solid var(--gold-line);
+  backdrop-filter: var(--blur);
+  box-shadow: var(--shadow-float);
+}
+.cal-held strong { font: 500 var(--fs-md) var(--body); color: var(--text); }
+.cal-held > span { font-size: var(--fs-sm); color: var(--muted); }
+.cal-held ul { list-style: none; margin: var(--sp-2) 0 0; padding: 0; display: grid; gap: 3px; }
+.cal-held li { display: flex; justify-content: space-between; gap: var(--sp-3); font-size: var(--fs-sm); }
+.cal-held em { font: 400 var(--fs-xs) var(--mono); font-style: normal; color: var(--faint); flex: none; }
+
+/* Não é modal: aparece por cima da grelha sem a tapar, porque escolher um
+   título com o dia que clicaste escondido atrás de um véu é a versão pior
+   do mesmo formulário. */
+.cal-draft {
+  display: flex; flex-wrap: wrap; align-items: end; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-md);
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  backdrop-filter: var(--blur);
+  box-shadow: var(--shadow-card);
+  animation: cal-draft-in var(--t-med) var(--ease-out);
+}
+@keyframes cal-draft-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+.cal-draft-when { flex: 1 1 100%; margin: 0; font: 500 var(--fs-xs) var(--mono); color: var(--gold); }
+/* Limitado: o campo é para um título de reunião, não para um parágrafo, e um
+   input de 900 px convida ao segundo. */
+.cal-draft-title { flex: 1 1 240px; max-width: 380px; }
+.cal-draft label {
+  display: grid; gap: 3px;
+  font-size: var(--fs-2xs); color: var(--faint);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.cal-draft label input, .cal-draft label select { width: 92px; }
+.cal-draft-do { display: flex; gap: var(--sp-2); }
+
+@media (prefers-reduced-motion: reduce) {
+  .cal-draft { animation: none; }
+}

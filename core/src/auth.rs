@@ -126,6 +126,13 @@ const EMAIL_ROUTES: &[(Method, &str)] = &[
 /// read-only key. Kill-switch and budget readouts stay administrative because the packet treats
 /// those control surfaces as a family, and token listing stays administrative because it reveals
 /// durable credential metadata.
+///
+/// `GET /files/download` is here and the four routes that CHANGE that folder — `POST /files/folder`,
+/// `/files/upload`, `/files/move` and `DELETE /files` — are in no table at all, which leaves them to
+/// Admin and the control token. Reading a filed file discloses what `GET /email/{id}/attachments/…`
+/// already does, so refusing it would protect nothing; rearranging or deleting somebody's folder is
+/// a different act, and the folder holds the only copy of an attachment once the mail it came from
+/// has expired.
 const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/status"),
     (Method::GET, "/health/readout"),
@@ -153,7 +160,8 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/email/{id}"),
     (Method::GET, "/email/{id}/attachments/{position}"),
     (Method::GET, "/email/{id}/attachments"),
-    (Method::GET, "/mail-files"),
+    (Method::GET, "/files"),
+    (Method::GET, "/files/download"),
     // Reading the archive of pages this machine has already fetched is a read of local state, like
     // the mail queue beside it. It reaches no network.
     (Method::GET, "/web/pages"),
@@ -487,8 +495,11 @@ mod tests {
             .route("/email/incoming", post(|| async { "" }))
             .route("/email/triage", post(|| async {}))
             .route("/email/{id}/attachments", get(|| async {}))
-            .route("/mail-files", get(|| async {}))
-            .route("/mail-files/folder", post(|| async {}))
+            .route("/files", get(|| async {}).delete(|| async {}))
+            .route("/files/folder", post(|| async {}))
+            .route("/files/download", get(|| async {}))
+            .route("/files/upload", post(|| async {}))
+            .route("/files/move", post(|| async {}))
             .route("/api-tokens", get(|| async {}).post(|| async {}))
             .route("/api-tokens/{name}", axum::routing::delete(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
@@ -565,7 +576,7 @@ mod tests {
         ("GET", "/shadow-decisions"),
         ("GET", "/scoreboard"),
         ("GET", "/email/cursor"),
-        ("GET", "/mail-files"),
+        ("GET", "/files"),
         ("POST", HOOK_ROUTE),
         ("GET", "/api-tokens"),
     ];
@@ -846,7 +857,13 @@ mod tests {
         let token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
         let app = protected_router(state);
 
-        for uri in ["/status", "/runs/7", "/projects/demo/cat", "/mail-files"] {
+        for uri in [
+            "/status",
+            "/runs/7",
+            "/projects/demo/cat",
+            "/files",
+            "/files/download",
+        ] {
             assert_eq!(
                 status_of(&app, "GET", uri, &token).await,
                 StatusCode::OK,
@@ -863,6 +880,12 @@ mod tests {
             ("POST", "/backups/snapshot.db/restore"),
             ("POST", "/api-tokens"),
             ("GET", "/api-tokens"),
+            // Reading the folder is an allowlisted read; changing it is not. A read-only key that
+            // could empty somebody's folder would be misnamed.
+            ("POST", "/files/folder"),
+            ("POST", "/files/upload"),
+            ("POST", "/files/move"),
+            ("DELETE", "/files"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,
@@ -899,6 +922,10 @@ mod tests {
             ("POST", "/backups/snapshot.db/restore"),
             ("POST", "/api-tokens"),
             ("GET", "/api-tokens"),
+            ("POST", "/files/folder"),
+            ("POST", "/files/upload"),
+            ("POST", "/files/move"),
+            ("DELETE", "/files"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,

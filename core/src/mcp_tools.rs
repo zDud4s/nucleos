@@ -35,7 +35,7 @@ struct KillParams {
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct PathParams {
-    /// Relative to the mail folder's root. Absent or empty means the root itself.
+    /// Relative to the files folder's root. Absent or empty means the root itself.
     path: Option<String>,
 }
 
@@ -111,16 +111,14 @@ impl NucleosTools {
     }
 
     #[tool(
-        description = "List what is in the mail organization folder. `path` is relative to the \
-                       folder's root; leave it empty for the root itself. Read-only: this can see \
-                       the folder but cannot create, move or write anything in it — filing a file \
-                       is a person's action, taken in the Mail tab."
+        description = "List what is in the files folder — the user's own uploads and the mail they \
+                       filed. `path` is relative to the folder's root; leave it empty for the root \
+                       itself. Read-only: this can see the folder but cannot download, create, \
+                       move, rename or delete anything in it — arranging it is a person's action, \
+                       taken in the Files tab."
     )]
-    async fn list_mail_files(
-        &self,
-        Parameters(PathParams { path }): Parameters<PathParams>,
-    ) -> String {
-        json_result(self.client.list_mail_files(&path.unwrap_or_default()).await)
+    async fn list_files(&self, Parameters(PathParams { path }): Parameters<PathParams>) -> String {
+        json_result(self.client.list_files(&path.unwrap_or_default()).await)
     }
 
     #[tool(
@@ -209,8 +207,10 @@ pub enum ToolEffect {
 /// The three mail entries are the whole reason the table exists. A body is the obvious carrier of
 /// a stranger's words; the other two are less obvious and no less sender-chosen. `get_email_queue`
 /// carries subjects, which arrive exactly as written and are capped nowhere on this path, next to
-/// the triage summaries — a model's words about a stranger's. `list_mail_files` returns filenames,
-/// and the sender picks the filename.
+/// the triage summaries — a model's words about a stranger's. `list_files` returns filenames, and
+/// for anything filed out of the mail the sender picked the filename. That the user's own uploads
+/// now sit in the same folder does not make the listing trustworthy: one sender-chosen name in it
+/// is enough.
 ///
 /// `triage_email` is an action despite reading nothing back: it spends the budget, and a gate that
 /// let a mail body choose when to spend money would be missing the point narrowly. `get_run` is
@@ -232,7 +232,7 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("get_email_queue", ToolEffect::ReadsUntrusted),
     ("get_kill", ToolEffect::ReadsOwn),
     ("get_run", ToolEffect::ReadsOwn),
-    ("list_mail_files", ToolEffect::ReadsUntrusted),
+    ("list_files", ToolEffect::ReadsUntrusted),
     ("list_projects", ToolEffect::ReadsOwn),
     ("list_proposals", ToolEffect::ReadsOwn),
     ("reject_proposal", ToolEffect::Acts),
@@ -287,7 +287,7 @@ mod tests {
     ///
     /// This is what an agent can reach, and the mail tools make the list load-bearing rather than
     /// tidy: `get_email` hands it untrusted third-party text, and from that moment every write tool
-    /// beside it is something a stranger's words could try to steer. `list_mail_files` reads the
+    /// beside it is something a stranger's words could try to steer. `list_files` reads the
     /// folder; there is deliberately no companion that creates, moves or writes in it, because
     /// filing a file is a person's action taken in the Mail tab.
     #[test]
@@ -309,7 +309,7 @@ mod tests {
                 "get_email_queue",
                 "get_kill",
                 "get_run",
-                "list_mail_files",
+                "list_files",
                 "list_projects",
                 "list_proposals",
                 "reject_proposal",
@@ -389,7 +389,7 @@ mod tests {
     fn the_mail_tools_are_what_brings_third_party_text_into_a_turn() {
         assert_eq!(tool_effect("get_email"), ToolEffect::ReadsUntrusted);
         assert_eq!(tool_effect("get_email_queue"), ToolEffect::ReadsUntrusted);
-        assert_eq!(tool_effect("list_mail_files"), ToolEffect::ReadsUntrusted);
+        assert_eq!(tool_effect("list_files"), ToolEffect::ReadsUntrusted);
 
         assert_eq!(tool_effect("approve_proposal"), ToolEffect::Acts);
         assert_eq!(tool_effect("set_kill"), ToolEffect::Acts);
