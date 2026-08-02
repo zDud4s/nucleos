@@ -16,6 +16,7 @@ import Voice from "./Voice";
 import Calendar from "./Calendar";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
+import "./calendar.css";
 
 type Tab =
   | "home" | "autopilot" | "runs" | "projects" | "assistant"
