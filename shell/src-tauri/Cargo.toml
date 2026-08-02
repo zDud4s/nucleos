@@ -37,3 +37,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Wi
 # so it could never run — yet it shipped in the binary and in the bundle config, advertising
 # an update channel that does not exist. Re-add it together with a real key, a real release
 # feed and the capability, as one change.
+
+[dev-dependencies]
+# For `drop.rs`'s walk tests, which need a real directory tree to walk.
+tempfile = "3.27.0"

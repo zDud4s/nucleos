@@ -977,6 +977,35 @@ export async function listFiles(token: string, path = ""): Promise<ApiResult<Fil
   }
 }
 
+/** One search hit: an entry, plus where it sits relative to the ROOT so a click can act on it. */
+export interface FileHit extends FileEntry {
+  path: string;
+}
+
+export interface FileSearch {
+  hits: FileHit[];
+  /** True when a ceiling cut the walk short. Shown, never swallowed. */
+  truncated: boolean;
+}
+
+/** Finds entries by name in one folder and every folder under it. */
+export async function searchFiles(
+  token: string,
+  path: string,
+  q: string,
+): Promise<ApiResult<FileSearch>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/files/search?path=${encodeURIComponent(path)}&q=${encodeURIComponent(q)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: (await res.json()) as FileSearch };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
 export async function createFolder(token: string, path: string): Promise<ApiResult<null>> {
   try {
     const res = await fetch(`${DAEMON_URL}/files/folder`, {

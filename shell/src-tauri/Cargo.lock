@@ -3390,6 +3390,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-opener",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

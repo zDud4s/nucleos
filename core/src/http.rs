@@ -193,6 +193,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/files", get(get_files).delete(delete_file))
         .route("/files/folder", post(post_files_folder))
         .route("/files/download", get(get_file_download))
+        .route("/files/search", get(get_files_search))
         .route("/files/move", post(post_files_move))
         // Whole-body limit rather than the 2 MB default, for the same reason `/voice/capture` has
         // one: the request this route exists for is bigger than the default and would be rejected
@@ -1184,6 +1185,35 @@ async fn post_files_folder(
     crate::files::create_folder(root, &body.path)
         .map(|()| StatusCode::CREATED)
         .map_err(folder_status)
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    /// Where the walk starts. Absent means the root itself.
+    #[serde(default)]
+    path: String,
+    q: String,
+}
+
+/// Finds entries by name, in one folder and everything under it.
+///
+/// A folder this size is searched by walking it — there is no index, and building one would be a
+/// second copy of the truth to keep honest. The ceilings live in `files::search`, and the answer
+/// says when one of them cut in rather than passing a partial result off as the whole.
+async fn get_files_search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<crate::files::Found>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+
+    // Off the async runtime: a deep tree is a long blocking walk, and holding a runtime thread for
+    // it would stall every other request on that thread.
+    let found =
+        tokio::task::spawn_blocking(move || crate::files::search(&root, &query.path, &query.q))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    found.map(Json).map_err(folder_status)
 }
 
 /// Hands back one file's bytes, streamed rather than gathered.
@@ -3585,6 +3615,12 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
+            call(state.clone(), "GET", "/files/search?q=x", None)
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
             upload(state, "", "guia.docx", b"x").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
@@ -3709,6 +3745,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"conteudo");
+    }
+
+    /// Search is the one route that answers about a folder it was not pointed at, so the path it
+    /// reports has to be usable by every other route.
+    #[tokio::test]
+    async fn a_search_reaches_below_the_folder_and_reports_paths_that_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root);
+
+        call(
+            state.clone(),
+            "POST",
+            "/files/folder",
+            Some(serde_json::json!({"path": "BACMAT/2026"})),
+        )
+        .await;
+        upload(state.clone(), "BACMAT/2026", "guia.docx", b"conteudo").await;
+
+        let (status, found) = call(state.clone(), "GET", "/files/search?q=GUIA", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(found["truncated"], false);
+        assert_eq!(found["hits"][0]["path"], "BACMAT/2026/guia.docx");
+        assert_eq!(found["hits"][0]["name"], "guia.docx");
+
+        // The path it reported is the one the download route takes, which is the point of reporting
+        // it relative to the root rather than to the folder searched.
+        let response = raw(
+            state,
+            "GET",
+            "/files/download?path=BACMAT%2F2026%2Fguia.docx",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// An upload lands under the same rules as a filed attachment: the name is made safe, and a
@@ -3855,6 +3926,15 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "downloaded {escape:?}"
             );
+
+            let searched = call(
+                state.clone(),
+                "GET",
+                &format!("/files/search?path={}&q=x", urlencode(escape)),
+                None,
+            )
+            .await;
+            assert_eq!(searched.0, StatusCode::BAD_REQUEST, "searched {escape:?}");
 
             let deleted = call(
                 state.clone(),

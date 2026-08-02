@@ -833,9 +833,71 @@ details.scoreboard th {
 .t-dir { color: var(--text); }
 .t-icon { color: var(--faint); width: 1ch; }
 
-/* The Files tab. It reuses .crumbs and .t-entry from the project browser above — same gesture,
-   same look — and adds only what a folder you can change needs: a toolbar, and a row wide enough
-   to carry its own actions. */
+/* The Files tab: a tree that stays put and a table that changes under it, which is the shape every
+   file manager settled on because it lets you see where you are and where you could go at once.
+   It reuses .crumbs from the project browser above — same gesture, same look. */
+.f-shell { position: relative; }
+/* While Windows is dragging something over the window. The daemon has not been told anything yet;
+   this is only the page saying it is ready to catch it. */
+.f-shell--over::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px dashed var(--gold-line);
+  border-radius: var(--r-md);
+  pointer-events: none;
+}
+
+.f-panes {
+  display: grid;
+  grid-template-columns: minmax(9rem, 15rem) minmax(0, 1fr);
+  gap: var(--sp-4);
+  align-items: start;
+}
+.f-side { border-right: 1px solid var(--line); padding-right: var(--sp-3); min-height: 12rem; }
+.f-tree { list-style: none; margin: 0; padding-left: 0; }
+.f-tree .f-tree { padding-left: var(--sp-3); }
+.f-node { display: flex; align-items: center; gap: 2px; border-radius: var(--r-sm); }
+.f-node:hover { background: var(--wash); }
+.f-node--here { background: var(--wash-strong); }
+/* The folder a dragged row would land in. Same colour as the row version, so the answer to "where
+   is this going" looks the same in both panes. */
+.f-node--drop { outline: 1px solid var(--gold-line); }
+.f-twist {
+  background: none;
+  border: none;
+  color: var(--faint);
+  padding: 2px;
+  width: 1.5ch;
+  font: 400 var(--fs-xs) var(--mono);
+}
+.f-twist:hover { color: var(--text); }
+.f-branch {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--muted);
+  padding: 3px 4px;
+  font: 400 var(--fs-sm) var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.f-branch:hover, .f-branch[aria-current="location"] { color: var(--text); }
+
+.f-main { min-width: 0; }
+.f-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+.f-find {
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font: 400 var(--fs-sm) var(--mono);
+  padding: 2px 0;
+  min-width: 18ch;
+}
+.f-find:focus { outline: none; border-bottom-color: var(--gold-line); }
 .f-tools {
   display: flex;
   flex-wrap: wrap;
@@ -857,15 +919,78 @@ details.scoreboard th {
    into looking like one. */
 .f-picker { display: none; }
 
-.f-list { list-style: none; margin-top: var(--sp-3); display: grid; gap: 2px; }
-.f-row {
+.f-rows { margin-top: var(--sp-3); display: grid; gap: 1px; }
+.f-rows:focus { outline: none; }
+.f-rows:focus-visible { outline: 1px solid var(--gold-line); outline-offset: 3px; }
+.f-head, .f-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) 7ch 10ch;
   align-items: center;
   gap: var(--sp-2);
+  padding: 3px 6px;
+  border-radius: var(--r-sm);
 }
-.f-meta { font: 400 var(--fs-2xs) var(--mono); color: var(--faint); white-space: nowrap; }
-.f-actions { display: flex; gap: var(--sp-1); }
+.f-head { border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+.f-col {
+  background: none;
+  border: none;
+  color: var(--faint);
+  text-align: left;
+  padding: 0;
+  font: 400 var(--fs-2xs) var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.f-col:hover { color: var(--text); }
+.f-arrow { margin-left: 4px; }
+.f-row { font: 400 var(--fs-sm) var(--mono); color: var(--muted); cursor: default; user-select: none; }
+.f-row:hover { background: var(--wash); }
+.f-row--on { background: var(--wash-strong); color: var(--text); }
+.f-row--drop { outline: 1px solid var(--gold-line); }
+.f-row--lift { opacity: 0.55; }
+.f-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.f-cell--name { display: flex; align-items: center; gap: var(--sp-2); }
+.f-cell--size, .f-cell--when { font-size: var(--fs-2xs); color: var(--faint); text-align: right; }
+/* Where a search hit lives. Only search shows it: in a plain listing the answer is the breadcrumb. */
+.f-where { font-size: var(--fs-2xs); color: var(--faint); }
+.f-status { margin-top: var(--sp-2); font: 400 var(--fs-2xs) var(--mono); color: var(--faint); }
+
+.f-menu {
+  position: fixed;
+  z-index: 20;
+  display: grid;
+  min-width: 12rem;
+  padding: 4px;
+  background: var(--layer);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+}
+.f-menu button {
+  background: none;
+  border: none;
+  text-align: left;
+  color: var(--muted);
+  padding: 5px 8px;
+  border-radius: var(--r-sm);
+  font: 400 var(--fs-sm) var(--sans);
+}
+.f-menu button:hover { background: var(--wash); color: var(--text); }
+.f-menu--danger:hover { color: var(--danger, #e06c75); }
+/* Follows nothing: a label pinned to the corner, not a ghost under the cursor. Tracking the pointer
+   would mean a re-render per mousemove for decoration. */
+.f-ghost {
+  position: fixed;
+  right: var(--sp-4);
+  bottom: var(--sp-4);
+  z-index: 20;
+  padding: 6px 10px;
+  background: var(--layer);
+  border: 1px solid var(--gold-line);
+  border-radius: var(--r-sm);
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--text);
+}
 .f-rename {
   display: flex;
   flex-wrap: wrap;
