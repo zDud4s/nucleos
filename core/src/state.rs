@@ -225,6 +225,9 @@ pub struct AppState {
     /// because `VoiceRuntime::default()` means "off" — which is what keeps every test that does not
     /// care about voice from having to know it exists. Same reasoning as `email` above.
     pub voice: Arc<crate::voice::VoiceRuntime>,
+    /// The web pillar: the trust allowlist, retention, and the client for the sidecar that is the
+    /// only process here allowed to open a connection off this machine.
+    pub web: Arc<crate::web::WebRuntime>,
     /// The calendar's settings — the default zone and the window a proposal may land in.
     ///
     /// Same shape and same reasoning as `email` and `voice` above: read together, changed together,

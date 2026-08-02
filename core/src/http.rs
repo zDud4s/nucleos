@@ -161,6 +161,12 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::voice::post_capture)
                 .layer(DefaultBodyLimit::max(crate::voice::max_body_bytes())),
         )
+        // The web pillar. `/web/read` needs Admin and `/web/search` does not — see `auth.rs` for
+        // why; routing is not where that decision lives, only where these four names appear.
+        .route("/web/search", post(crate::web::post_search))
+        .route("/web/read", post(crate::web::post_read))
+        .route("/web/pages", get(crate::web::list_pages))
+        .route("/web/pages/{id}", get(crate::web::get_page))
         .route("/voice/config", get(crate::voice::get_config))
         .route("/voice/memos", get(crate::voice::list_memos))
         // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
@@ -2741,6 +2747,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+                web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
                 progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -2842,6 +2849,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -4787,6 +4795,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,

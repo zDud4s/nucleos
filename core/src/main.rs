@@ -40,7 +40,10 @@ mod state;
 mod storage;
 mod transcribe;
 mod triage;
+mod trust;
 mod voice;
+mod web;
+mod web_client;
 mod webhook;
 mod wip;
 mod worktree;
@@ -54,6 +57,9 @@ const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
 /// The mailbox password (spec §3.4). An app password, in Credential Manager rather than in
 /// `.ai/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
 const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
+/// The web search provider's API key, in Credential Manager like every other secret — no key on
+/// disk, and in particular not in `.ai/web.yaml`, which is a versioned file.
+const WEB_SEARCH_KEY: &str = "web-search-api-key";
 
 /// Reads a secret from stdin rather than from `argv`.
 ///
@@ -304,6 +310,15 @@ async fn main() {
     // the daemon was launched from, so the "off" path has to be discoverable rather than mysterious.
     let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
+    let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
+    // The web sidecar's own shared secret, minted per boot and never persisted.
+    //
+    // NOT the control token, and not for the reason the email sidecar has its own: this traffic
+    // only ever flows daemon → sidecar, so the sidecar has nothing to authenticate itself FOR. It
+    // needs a secret solely to refuse anything else on the machine that can open a socket. A
+    // per-boot random value is therefore strictly better than a long-lived one — there is nothing
+    // to leak and nothing to rotate.
+    let web_sidecar_token = auth::generate_token();
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -412,6 +427,19 @@ async fn main() {
             voice_cleanup_model,
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
+        web: Arc::new(web::WebRuntime {
+            enabled: web_config.enabled,
+            trusted_hosts: web_config.trusted_hosts.clone(),
+            retain_pages_days: web_config.retain_pages_days,
+            client: web_client::WebClient::new(sidecar::WEB_ADDR, web_sidecar_token.clone()),
+            // The local model that reads quarantined pages. It is the same one the voice pillar
+            // probed at startup — one local model, one place it is pinned — but the consequence of
+            // its absence is the opposite: voice degrades to a raw transcript, and this one
+            // REFUSES. A typing aid may fail soft; a barrier may not.
+            quarantine_model: models_config.voice_cleanup_model.clone(),
+            ollama_base_url: runner::OLLAMA_BASE_URL.to_string(),
+            http: reqwest::Client::new(),
+        }),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
@@ -432,6 +460,60 @@ async fn main() {
         .unwrap()
         .join("echo-sidecar.exe");
     tokio::spawn(sidecar::supervise("echo".to_string(), sidecar_path, vec![]));
+
+    // The web sidecar. Started only when the pillar is on: an unstarted one means `/web/*` answers
+    // 502, which is the honest reading of "there is nothing to ask".
+    if web_config.enabled {
+        // The key is optional and its absence is not fatal — `/fetch` works without a search
+        // provider, so an installation with no API key can still be handed a URL to read.
+        let search_key = match secrets::load_secret(WEB_SEARCH_KEY) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                tracing::info!("no web search key stored; the sidecar will serve reads only");
+                String::new()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read the web search key; serving reads only");
+                String::new()
+            }
+        };
+        let path = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("web-sidecar.exe");
+        let env = sidecar::web_env(
+            "http://127.0.0.1:8791",
+            &web_sidecar_token,
+            &web_config,
+            &search_key,
+        );
+        tokio::spawn(sidecar::supervise("web".to_string(), path, env));
+        tracing::info!(provider = %web_config.provider, "web sidecar supervised");
+
+        // Retention. Hourly rather than on a timer tied to reads: a cache that is never read again
+        // must still empty, or "30 days" means "30 days after the last time anyone looked".
+        let retention_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                ticker.tick().await;
+                match web::prune(
+                    &retention_state.pool,
+                    retention_state.web.retain_pages_days,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(pruned) => tracing::info!(pruned, "web: pages past the retention window"),
+                    // Best-effort, like the activity feed: a failed sweep is a full disk later, not
+                    // a reason to take the daemon down now.
+                    Err(error) => tracing::warn!(%error, "web: retention sweep failed"),
+                }
+            }
+        });
+    }
     match secrets::load_secret(TELEGRAM_TOKEN_KEY) {
         Ok(Some(bot_token)) => {
             let telegram_path = std::env::current_exe()

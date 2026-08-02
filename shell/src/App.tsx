@@ -14,13 +14,14 @@ import Runs from "./Runs";
 import System from "./System";
 import Voice from "./Voice";
 import Calendar from "./Calendar";
+import Web from "./Web";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 import "./calendar.css";
 
 type Tab =
   | "home" | "autopilot" | "runs" | "projects" | "assistant"
-  | "mail" | "files" | "voice" | "calendar" | "system";
+  | "mail" | "files" | "voice" | "calendar" | "web" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -34,6 +35,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "files", label: "Files" },
   { key: "voice", label: "Voice" },
   { key: "calendar", label: "Calendar" },
+  { key: "web", label: "Web" },
   { key: "system", label: "System" },
 ];
 
@@ -305,6 +307,7 @@ function App() {
           {tab === "files" && <Files token={token} connection={connection} />}
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "calendar" && <Calendar token={token} connection={connection} />}
+          {tab === "web" && <Web token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
         </main>
       )}

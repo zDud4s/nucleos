@@ -158,6 +158,39 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Search the web, and what this machine has already read, for one query.
+    ///
+    /// Returns titles, URLs and snippets — never page content. The trust decision (spec §5) is made
+    /// over a URL before anything is fetched, and a search that returned content would make that
+    /// decision arrive too late to mean anything.
+    pub async fn web_search(&self, query: &str, limit: Option<i64>) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/web/search")
+            .json(&serde_json::json!({ "query": query, "limit": limit }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Read one page.
+    ///
+    /// Reading only. There is deliberately NO client method here that submits a form, posts, logs
+    /// in, or sends anything — the same asymmetry `list_files` has, for a sharper reason: this is
+    /// the method that fills an agent's context with text a stranger wrote, and any write sitting
+    /// beside it becomes something those words can try to aim.
+    pub async fn web_read(&self, url: &str) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/web/read")
+            .json(&serde_json::json!({ "url": url }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// What is in the files folder. Reading only — there is deliberately no client method here for
     /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
     /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.
