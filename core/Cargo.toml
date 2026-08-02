@@ -27,6 +27,10 @@ tower-http = { version = "0.7.0", features = ["cors"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Already in the tree via reqwest; declared directly because `trust.rs` must not parse a URL by
+# hand. `https://docs.rs@evil.com/` has host `evil.com`, and every hand-rolled extractor gets that
+# wrong at least once.
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3.27.0"

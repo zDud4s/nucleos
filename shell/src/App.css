@@ -1031,3 +1031,59 @@ details.scoreboard th {
 /* Os dois botões de ditado. Em fila, com o memo a seguir ao ditado, porque é a ação menos frequente
    e a que não escreve em lado nenhum. */
 .v-actions { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); flex-wrap: wrap; }
+
+/* --- Web: o arquivo do que já foi lido ------------------------------------------------------ */
+
+/* A lista é de linhas clicáveis, com o selo de confiança FORA do botão: o selo é informação sobre a
+   linha, não uma segunda coisa para carregar, e metê-lo dentro tornava-o parte do alvo de clique. */
+.web-list { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.web-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.web-list li:first-child { border-top: 0; }
+
+/* Mesmo despojamento que `.mail-row`, pela mesma razão: uma lista de arquivos toda em botões com ar
+   de botão é uma parede. */
+.web-row {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.web-row:hover .web-row__title { color: var(--gold); }
+.web-row:focus-visible { outline: 2px solid var(--gold-line); outline-offset: 2px; }
+
+.web-row__title { display: block; font-size: var(--fs-sm); font-weight: 500; }
+.web-row__meta { display: block; font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
+/* O excerto é cortado a duas linhas: é texto escrito por um estranho e não deve poder empurrar o
+   resto da lista para fora do ecrã só por ser longo. */
+.web-row__snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+}
+
+/* `pre` pela mesma razão que `.mail-body`: o Markdown chega com as quebras de linha que tem, nada
+   as deve re-fluir, e isto nunca pode ser outra coisa senão texto. */
+.web-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  margin: var(--sp-3) 0;
+  max-height: 60vh;
+  overflow-y: auto;
+}

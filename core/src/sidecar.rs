@@ -148,6 +148,58 @@ pub fn telegram_env(
 /// (8792). Loopback is not a default here — the sidecar refuses to bind anything else.
 pub const EMAIL_FETCH_ADDR: &str = "127.0.0.1:8793";
 
+/// Where the web sidecar answers the núcleo.
+///
+/// A constant for the same reason `EMAIL_FETCH_ADDR` is: one fact shared by two processes, and a
+/// fact with two homes eventually has two values. 8794 follows email's attachment listener (8793).
+/// Loopback is not a default — `requireLoopback` on the Go side refuses to bind anything else,
+/// because a process that fetches arbitrary URLs and listens off-machine is an open proxy with the
+/// owner's address on it.
+pub const WEB_ADDR: &str = "127.0.0.1:8794";
+
+/// The web sidecar's environment (spec §3.4).
+///
+/// `search_key` is the provider's API key, from Credential Manager, passed to the child process and
+/// never written to a file — the same handling the mail password gets, for the same reason.
+///
+/// The trust allowlist is deliberately ABSENT from this list. The sidecar fetches; it never decides
+/// what may be believed. Sending it the allowlist would put one security decision in two processes,
+/// and the copy that drifts is always the one nobody is reading.
+pub fn web_env(
+    daemon_url: &str,
+    daemon_token: &str,
+    config: &crate::config::WebConfig,
+    search_key: &str,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
+        ("WEB_ADDR".to_string(), WEB_ADDR.to_string()),
+        ("WEB_SEARCH_PROVIDER".to_string(), config.provider.clone()),
+        (
+            "WEB_FETCH_TIMEOUT_SECS".to_string(),
+            config.fetch_timeout_seconds.to_string(),
+        ),
+        (
+            "WEB_MAX_PAGE_BYTES".to_string(),
+            config.max_page_bytes.to_string(),
+        ),
+    ];
+    // Emitted only when there is one, like `smtp_env`: an empty key would have the sidecar build a
+    // Brave provider that answers 401 to every query, which presents as a broken search rather than
+    // an unconfigured one.
+    if !search_key.trim().is_empty() {
+        env.push(("WEB_BRAVE_KEY".to_string(), search_key.to_string()));
+    }
+    if !config.searxng_url.trim().is_empty() {
+        env.push((
+            "WEB_SEARXNG_URL".to_string(),
+            config.searxng_url.trim().to_string(),
+        ));
+    }
+    env
+}
+
 fn sent_mailbox_env(config: &crate::config::EmailConfig) -> Option<(String, String)> {
     config
         .sent_mailbox

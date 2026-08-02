@@ -315,6 +315,78 @@ pub fn load_calendar_config(path: &Path) -> CalendarConfig {
     }
 }
 
+/// `.ai/web.yaml`. The web pillar's settings, including the one list in this system that decides
+/// what counts as trustworthy.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Opt-in, like every pillar that reaches the network.
+    pub enabled: bool,
+    /// `brave` or `searxng`. Validated by the sidecar, which is what has to build one.
+    pub provider: String,
+    pub searxng_url: String,
+    pub retain_pages_days: i64,
+    pub max_page_bytes: i64,
+    pub fetch_timeout_seconds: u32,
+    /// Hosts whose extracted text may reach an agent as written — and only then when the owner
+    /// asked (`trust.rs`, spec §5.2).
+    ///
+    /// Empty by default, and that is the load-bearing choice in this struct. Every other field's
+    /// default is a convenience; this one's is a refusal. A `.ai/web.yaml` that is missing,
+    /// unreadable, or malformed therefore trusts NOTHING rather than falling back to a list nobody
+    /// can see — the opposite direction from `VoiceConfig`, whose defaults are all benign.
+    pub trusted_hosts: Vec<String>,
+    /// Whether a pillar may search on its own, with nobody watching (spec §10.5).
+    ///
+    /// Separate from `enabled`, and off by default, because the query leaves the machine: enriching
+    /// a correspondent means searching a person's name, and nobody decided to share that.
+    ///
+    /// It lives in the file format and NOT yet on `WebRuntime`, because nothing consumes it: no
+    /// pillar reaches the web in this version. Carrying it into the runtime would be a switch that
+    /// grants nothing, and a switch that grants nothing is one somebody later assumes is working.
+    /// The first pillar to search is what moves it across.
+    pub pillar_search_enabled: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "brave".to_string(),
+            searxng_url: String::new(),
+            retain_pages_days: 30,
+            max_page_bytes: 2_000_000,
+            fetch_timeout_seconds: 20,
+            trusted_hosts: Vec::new(),
+            pillar_search_enabled: false,
+        }
+    }
+}
+
+/// Reads `.ai/web.yaml`. Absent, unreadable or malformed → defaults, with a warning.
+///
+/// The failure mode is deliberately asymmetric with the rest of this module: falling back to
+/// defaults here means falling back to an EMPTY allowlist, so a broken file costs fidelity (more
+/// pages go through the local model) and never costs safety. A loader that errored instead would
+/// stop the daemon over a typo in a convenience list; one that guessed a permissive list would be
+/// the worst of both.
+pub fn load_web_config(path: &Path) -> WebConfig {
+    if !path.exists() {
+        return WebConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<WebConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "web config: could not be parsed; the pillar stays off and nothing is trusted");
+            WebConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "web config: could not be read; the pillar stays off and nothing is trusted");
+            WebConfig::default()
+        }
+    }
+}
+
 /// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
 /// `schedule:` for `schedules:` parses cleanly into an empty ruleset, and all autonomy for that
 /// project silently stops. That direction is fail-closed, which is precisely why nobody notices —

@@ -1355,6 +1355,7 @@ mod tests {
             local_triage_disabled: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(CalendarRuntime {
                 default_tz: LISBON,
                 working_hours: WorkingHours::default(),

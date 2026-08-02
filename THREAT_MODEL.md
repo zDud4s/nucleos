@@ -20,6 +20,8 @@ NucleOS does try to prevent these failures:
 3. The long-lived daemon control token reaching an autonomous run.
 4. An approval that the classifier should have blocked.
 5. Mail the user wrote being sent to a model or shown back to them as though it needed attention.
+6. A web page causing a tool call, and in particular causing one that governs autonomy.
+7. The web sidecar being used to reach this machine's own services or the network it sits on.
 
 ## Tool allowlist by trigger class
 
@@ -59,6 +61,61 @@ optional: an empty `sent_mailbox` makes `poll.Targets` poll the inbox alone.
 An outbound row expires after `ROW_RETENTION_DAYS` in `core/src/triage.rs`, on the same thirty-day clock as mail in the content triage
 classes. The accumulated fact in `contact_addresses` survives, which is why ingestion accumulates it instead of counting retained mail.
 
+## Web content
+
+The web is not a trigger. It is a content origin *inside* triggers that already exist, and it is the first one that
+enters a turn holding tools — which is what makes it different from mail rather than a second copy of it. Email triage
+answers untrusted content by removing every tool (`ToolPolicy::None`); web reading cannot, because the point is to read
+and then act.
+
+**Trust is a property of the origin, and it is a conjunction.** `core/src/trust.rs` returns `Raw` only when the owner is
+present in the foreground (`attention::owner_is_present`) AND both the requested host and the final host are on
+`trusted_hosts` in `.ai/web.yaml`. Everything else is `Quarantined`: a local model reads the page and the agent receives
+a summary. The default is quarantine, reached by omission — there is no denylist, so a host nobody has listed is never
+trusted by accident. An absent, unreadable or malformed `.ai/web.yaml` yields an EMPTY allowlist rather than a
+convenient one, so a broken file costs fidelity and never safety.
+
+**Trust never travels up.** The decision is made over the requested URL and the final URL together. An allowlisted host
+that redirects out of the allowlist loses trust, which stops an open redirect on a trusted domain from laundering any
+destination into `Raw`. An unknown host that redirects INTO the allowlist gains nothing, because the owner chose the
+first URL and not the second.
+
+**A cached page grants nothing.** `web_pages.trust_at_fetch` records what happened once, for the audit trail and the
+shell's badge. `web::deliver` is the single door from a stored row to text a model sees, it takes the decision made for
+the request in hand, and it never reads that column. Without this, a page the owner read from an allowlisted host would
+arrive raw to a cron run months later.
+
+**Reading marks the turn.** `web_read` and `web_search` are `ToolEffect::ReadsUntrusted` in `core/src/mcp_tools.rs`, so
+`hooks.rs` refuses every `Acts` tool for the rest of that turn — `set_kill`, `approve_proposal`, `create_run`,
+`cancel_run`. This is the barrier that matters, because the assistant's tool set was designed for a context whose only
+input was the paired owner. `web_search` is classified `ReadsUntrusted` and not `ReadsOwn` deliberately: a result's title
+and snippet are written by whoever owns the page, and ranking for a query somebody expects an agent to run is a thing
+people already do on purpose.
+
+**The tools are read-only, and the absence is the property.** There is no NucleOS tool that submits a form, logs in,
+posts, or sends — the same asymmetry `get_email` has, for a sharper reason. `no_web_tool_can_write_anywhere` fixes it.
+
+**The daemon opens no connection off this machine.** Every fetch goes through the Go sidecar, whose `safe.Control` hook
+runs on `net.Dialer` after DNS resolution, for every connection, including each redirect hop — so loopback, private
+ranges, link-local (169.254.169.254) and multicast are refused with no window between deciding and dialling, and a name
+that resolves differently the second time it is asked does not get through. `safe.CheckURL` deliberately does NOT judge
+the host, and a test fails if someone adds that.
+
+`.ai/web.yaml` is in `classifier.rs`'s `SELF_GOVERNING_FILES`. Appending to `trusted_hosts` is not a file write, it is
+granting trust, and an autonomous run that could add a host it controls would be writing its own permission slip.
+
+### What this does not solve
+
+A quarantined summary is still text derived from a stranger. The grammar guarantees the SHAPE and never the content —
+measured in the email pillar, recorded in `.ai/memory.md` — so a local model can be talked into writing an instruction
+into its own `summary` field. Quarantine reduces the surface from a whole page to a few hundred structured tokens; it
+does not reach zero. The barrier that does the work is the turn marking above, not the summary.
+
+**When `render: true` stops answering 501, this section has to be rewritten first, not after.** A browser driving real
+sessions is a different threat model, and the University of Washington's July 2026 study found four of seven agentic
+browsers letting attackers bypass the same-origin policy. The seam is in `sidecars/web/serve/serve.go` and
+`web_client::fetch`.
+
 ## Existing barriers
 
 - `core/src/classifier.rs` is a pure deterministic lexical classifier. `CLASSIFIER_VERSION = 2`; it returns `allow`, `deny`, or `pending_approval` together with an `action_class`. It performs no I/O, makes no database access, and has no knowledge of run state.
@@ -75,3 +132,7 @@ classes. The accumulated fact in `contact_addresses` survives, which is why inge
 4. `GET /email/{id}` in `core/src/http.rs` still returns an outbound row to a caller that knows its id. The queue no longer links to one, and the row carries no body, so this is recorded rather than fixed: it is the owner's own mail, on the owner's machine, behind bearer authentication.
 5. The correspondence graph now has direction, and it outlives the mail. A read of the database reveals who the owner writes to, not only who writes to them, and `contact_addresses` is not pruned. That is deliberate: surviving the thirty-day window is why the facts are accumulated at ingestion, but it makes the table long-lived personal data.
 6. `sent_mailbox` is owner configuration and nothing validates what it points at. Aimed at a shared or archive folder, it would latch `outbound_ever` for people the owner never wrote to and silently weaken the one derived rule in `core/src/priority.rs`. This is misconfiguration rather than attack, and it fails quietly.
+7. A `Unrestricted` run has two ways to reach the web with different policies, and only one is audited. `WebFetch`/`WebSearch` remain in `BUILTIN_TOOLS` and are therefore available to cron, repo and manual runs, bypassing `trust.rs`, the cache, the index, the feed and the turn marking. Removing them would unify the path at the cost of a real capability; the measurement that decides it is how many `Unrestricted` runs actually use the CLI's own web tools.
+8. `trusted_hosts` is judged by host and nothing else, so an allowlisted host that serves user-published content grants `Raw` to whoever published it. The shipped list is two curated documentation sites for this reason, and the rule for adding one is written in `.ai/web.yaml`: the allowlist does not say "this site will not attack me", it says "summarising this costs fidelity AND I asked for it". A forum, a wiki or a code-hosting domain is the worst candidate precisely when it is otherwise trustworthy.
+9. The search query leaves the machine. Brave is the shipped provider partly because it does not log API queries, but the query is still data, and a pillar searching on its own would send a correspondent's name to a third party. `pillar_search_enabled` exists in `.ai/web.yaml` for that reason and is off; nothing consumes it yet, so no pillar can search today.
+10. Nothing in the web pillar has been exercised against a real server. There is no provider key on this machine and no test leaves it, deliberately. The first `enabled: true` is the first contact.

@@ -2212,3 +2212,70 @@ export async function listPendingNotifications(token: string): Promise<PendingNo
     return [];
   }
 }
+
+/** One page this machine has already read. */
+export interface WebHit {
+  id: number;
+  final_url: string;
+  host: string;
+  title: string | null;
+  snippet: string;
+  /**
+   * `raw` or `quarantined` — the trust this page was fetched UNDER.
+   *
+   * It is a record and not a permission: the daemon remakes the decision on every read, so a badge
+   * here says what happened once, never what an agent would get now.
+   */
+  trust_at_fetch: string;
+  fetched_at: string;
+}
+
+/**
+ * The archive of what NucleOS has read, or a search of it.
+ *
+ * `q` searches the FTS5 index; absent, it lists newest-first.
+ */
+export async function listWebPages(
+  token: string,
+  q = "",
+  limit = 50,
+): Promise<WebHit[] | null> {
+  const query = q.trim().length > 0 ? `?q=${encodeURIComponent(q)}&limit=${limit}` : `?limit=${limit}`;
+  try {
+    const res = await fetch(`${DAEMON_URL}/web/pages${query}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as WebHit[];
+  } catch {
+    return null;
+  }
+}
+
+/** One stored page, in full. */
+export interface WebPage {
+  id: number;
+  requested_url: string;
+  final_url: string;
+  host: string;
+  title: string | null;
+  byline: string | null;
+  content_md: string;
+  extract_status: string;
+  trust_at_fetch: string;
+  trust_rule: string;
+  bytes: number;
+  fetched_at: string;
+}
+
+export async function getWebPage(token: string, id: number): Promise<WebPage | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/web/pages/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as WebPage;
+  } catch {
+    return null;
+  }
+}

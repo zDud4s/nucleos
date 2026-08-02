@@ -66,6 +66,37 @@ pub fn heartbeat_is_active(
     now.signed_duration_since(last_seen_at) < window
 }
 
+/// Whether a foreground client is beating right now, globally.
+///
+/// The web pillar's trust rule (spec §5.2) is a conjunction, and this answers its first half: is
+/// somebody looking? A page's text reaches an agent as written only when a person asked for it in
+/// the foreground, never when a scheduled run did the asking at three in the morning.
+///
+/// It lives here rather than in `web.rs` because `attention_heartbeats` is this module's table, and
+/// a pillar reaching into another module's SQL is exactly the coupling the module map exists to
+/// prevent. It FAILS CLOSED like everything else in this file: an unreadable or unparseable
+/// heartbeat answers "nobody is there", which costs fidelity and never safety.
+pub async fn owner_is_present(pool: &SqlitePool, now: DateTime<Utc>) -> bool {
+    let row = sqlx::query_as::<_, (String,)>(
+        "SELECT last_seen_at FROM attention_heartbeats WHERE scope = 'global' AND project_id = ''",
+    )
+    .fetch_optional(pool)
+    .await;
+
+    let Ok(Some((last_seen_at,))) = row else {
+        return false;
+    };
+    let Ok(last_seen_at) = DateTime::parse_from_rfc3339(&last_seen_at) else {
+        return false;
+    };
+
+    heartbeat_is_active(
+        last_seen_at.with_timezone(&Utc),
+        now,
+        chrono::Duration::seconds(HEARTBEAT_WINDOW_SECONDS),
+    )
+}
+
 /// Records or refreshes the one heartbeat for `scope`.
 pub async fn record_heartbeat(
     pool: &SqlitePool,

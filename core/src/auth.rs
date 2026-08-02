@@ -154,6 +154,15 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/email/{id}/attachments/{position}"),
     (Method::GET, "/email/{id}/attachments"),
     (Method::GET, "/mail-files"),
+    // Reading the archive of pages this machine has already fetched is a read of local state, like
+    // the mail queue beside it. It reaches no network.
+    (Method::GET, "/web/pages"),
+    (Method::GET, "/web/pages/{id}"),
+    // Searching is listed here because the alternative is worse, not because it is free: it does
+    // send a query off this machine. But it starts no run, holds no tools, and returns titles and
+    // URLs — and a read-only key that cannot search would push every caller to Admin, which is the
+    // scope that CAN start runs. The narrower grant is the safer one.
+    (Method::POST, "/web/search"),
 ];
 
 /// The current HTTP entry points that create a new run.
@@ -171,6 +180,11 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// something that key ever bought, and it is the one act in the pillar its owner cannot undo.
 /// `EMAIL_ROUTES` is the sharpest case: the sidecar is the process that parses MIME written by
 /// strangers, so it must not hold the key to the route that replies to them. Sending is Admin's.
+///
+/// `POST /web/read` is deliberately absent from both tables, so it needs Admin. `POST /web/search`
+/// is not, and the asymmetry is the point: a search returns titles and URLs, while a read pulls a
+/// stranger's prose into this machine's store and index, where later callers will meet it. A
+/// read-only key naming any URL it likes is a way to plant text for somebody else to read.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     (Method::POST, "/webhooks/push"),
@@ -432,6 +446,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,

@@ -13,6 +13,12 @@ const SELF_GOVERNING_FILES: &[&str] = &[
     // `.ai/autopilot.yaml`'s `gate_command`, and it is worse in one respect: the command runs outside
     // any tool call this classifier ever sees, so nothing downstream would get a second look at it.
     ".ai/voice.yaml",
+    // Holds `trusted_hosts`, the list deciding whose text may reach an agent as written
+    // (`trust.rs`). Adding a line to it is not a file write, it is granting trust — an autonomous
+    // run that could append a host it controls would be writing its own permission slip, and the
+    // next page from that host would arrive unmediated. Same shape as `gate_command` and
+    // `stt_command` above: what makes the file dangerous is that its CONTENTS are the policy.
+    ".ai/web.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
 ];
