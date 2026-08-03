@@ -1,3 +1,6 @@
+// Chunk 1 deliberately lands the queue before Chunk 2 wires the worker loop and GitExecutor.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 
 /// What was asked for, as data.
@@ -360,6 +363,151 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
     Ok(reconciled.len() as u64)
 }
 
+/// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
+/// decides *when* an operation may run and records how it ended, and this trait is the only thing
+/// that knows how to actually perform one. Chunk 2 adds the real `GitExecutor` behind it — Chunk 1
+/// has only the test double below, which is why nothing here builds an argv yet.
+#[async_trait::async_trait]
+pub trait VcsExecutor: Send + Sync {
+    /// Performs the claimed operation and reports how it ended.
+    ///
+    /// An `Outcome` rather than a `Result` because a git command that exits non-zero is not an error
+    /// of this call — it is the answer. A conflicted merge is a `Failed` the queue must record
+    /// against the row, not a failure to have asked.
+    async fn execute(&self, request: &ClaimedRequest) -> Outcome;
+}
+
+/// Claims, executes and finalizes exactly one request for one repository, and says whether it found
+/// anything to do — so a caller can drain until this returns `false` and only then wait.
+///
+/// Nothing is propagated, because there is no caller left who could act on a `Result`. A claim that
+/// errored has already dealt with its own row — `claim_next` either records it terminal or rolls the
+/// whole claim back to `queued`, so either way this repository is not left holding it. A terminal
+/// write that failed is past the point where anything can be undone: the git command has run. Both
+/// are logged, which is the only thing that distinguishes them from an idle tick.
+///
+/// `true` means a request was claimed and executed — including when the terminal write then failed,
+/// because the work did happen and a drain loop must not read that as "the queue was empty". It
+/// cannot spin on it either: the row stays `running`, so the next claim finds the repository busy
+/// and returns `false`.
+///
+/// **Cancellation** (`core/AGENTS.md` § "Cancellation safety"). `claim_next` could make its claim and
+/// its compensating release uncancellable by putting them in one transaction; this cannot use the
+/// same answer. The await in the middle is git, running for as long as a merge takes, and SQLite
+/// admits one writer at a time — a transaction held open across it would stall every other writer in
+/// the daemon. Rolling one back would be worse than slow: it would un-claim a row whose git command
+/// had already run, erasing the only record that the repository was touched.
+///
+/// So the window is real and is left open on purpose. A drain dropped between the claim and `finish`
+/// leaves its row `running`, and the partial unique index makes that row hold the repository's only
+/// slot until the next startup's `reconcile_interrupted` releases it — the same jam AGENTS.md
+/// describes for `one_open_worktree_run_per_project`. What keeps it acceptable is who calls this:
+/// Chunk 2's caller is a background loop owned by `main.rs`, whose future is dropped only when the
+/// daemon exits, which is precisely the case `reconcile_interrupted` exists for.
+///
+/// **Do not await this inside an HTTP handler.** A client disconnecting mid-merge would strand the
+/// row and jam that repository until a restart, and unlike a lost reply nobody would see it happen.
+/// A handler that wants a drain goes through `http::uncancellable` (AGENTS.md rule 2) — whose spawn
+/// needs owned `'static` arguments, which is a different signature from this one.
+///
+/// The one thing this call *can* narrow, it does: nothing is awaited between the executor returning
+/// and `finish` writing the outcome, so the exposure is the operation itself and not a line longer.
+/// An await added there — a feed append, a notification — would widen it for nothing; those belong
+/// after the terminal write.
+pub async fn drain_once(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    executor: &dyn VcsExecutor,
+) -> bool {
+    let claimed = match claim_next(pool, project_id).await {
+        Ok(Some(claimed)) => claimed,
+        // Nothing queued, something already running, or only unapproved rows — all "come back
+        // later", and the caller waits the same way for each.
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(
+                project_id = %project_id,
+                %error,
+                "could not claim the next vcs request"
+            );
+            return false;
+        }
+    };
+    let id = claimed.id;
+    let outcome = executor.execute(&claimed).await;
+    if let Err(error) = finish(pool, id, outcome).await {
+        // Not best-effort bookkeeping: this is the write that releases the repository. Losing it
+        // leaves the row `running` and every later request for this repository waiting behind it
+        // until a restart reconciles — so the log line is the only account of why the queue stopped.
+        tracing::error!(
+            vcs_request_id = id,
+            project_id = %project_id,
+            %error,
+            "could not record how a vcs request ended; it stays running until the daemon restarts"
+        );
+    }
+    true
+}
+
+/// The test double for `VcsExecutor`. `#[cfg(test)]` because every user of it is a test — building it
+/// into the daemon would ship an executor that can report a merge it never performed.
+#[cfg(test)]
+struct FakeVcsExecutor {
+    outcome: Outcome,
+    calls: std::sync::atomic::AtomicUsize,
+    /// What each call was actually handed, not merely how many there were. A fake that ignores its
+    /// argument answers identically whether the claim gave it the right row or another repository's.
+    seen: std::sync::Mutex<Vec<(Op, String, String)>>,
+}
+
+#[cfg(test)]
+impl FakeVcsExecutor {
+    fn succeeding_with(sha: &str) -> Self {
+        Self::reporting(Outcome::Succeeded { sha: sha.into() })
+    }
+
+    /// `exit_code` and `output_tail` stand in for what git would have printed. Nothing asserts them
+    /// through the drain: `finish`'s handling of those two columns already has direct coverage in
+    /// `a_failed_request_records_why_and_what_it_printed`.
+    fn failing_with(reason: &str) -> Self {
+        Self::reporting(Outcome::Failed {
+            reason: reason.into(),
+            exit_code: Some(1),
+            output_tail: reason.into(),
+        })
+    }
+
+    fn reporting(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn seen(&self) -> Vec<(Op, String, String)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl VcsExecutor for FakeVcsExecutor {
+    async fn execute(&self, request: &ClaimedRequest) -> Outcome {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen.lock().unwrap().push((
+            request.op.clone(),
+            request.project_id.clone(),
+            request.project_root.clone(),
+        ));
+        self.outcome.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +551,17 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    async fn failure_reason_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT failure_reason FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .unwrap_or_default()
     }
 
     async fn run_id_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
@@ -506,6 +665,27 @@ mod tests {
         let pool = test_pool().await;
         let id = submit(&pool, &request(Origin::Human)).await.unwrap();
         assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// The shell speaks for the human sitting in front of it, so its requests queue on the same
+    /// terms rather than asking a second time.
+    ///
+    /// This is also the only thing that constructs `Origin::Shell` at all, and the `origin` column
+    /// is CHECK-constrained: an `as_str` that spelled this variant any other way would fail every
+    /// real shell submit at runtime, and nothing else here would notice. Reading the column back is
+    /// the half that proves it — the status assertion alone passes for any accepted spelling.
+    #[tokio::test]
+    async fn a_shell_request_carries_the_same_approval_a_human_s_does() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Shell)).await.unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "queued");
+        let origin: String = sqlx::query_scalar("SELECT origin FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(origin, "shell");
     }
 
     /// An autonomous run's request is not a human's order; nothing has consented to it yet, so it
@@ -853,5 +1033,68 @@ mod tests {
             sha, None,
             "the late write must not have left its sha behind"
         );
+    }
+
+    #[tokio::test]
+    async fn the_queue_is_drained_in_order_and_each_outcome_recorded() {
+        let pool = test_pool().await;
+        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        let executor = FakeVcsExecutor::succeeding_with("abc123");
+        drain_once(&pool, "alpha", &executor).await;
+        drain_once(&pool, "alpha", &executor).await;
+
+        assert_eq!(status_of(&pool, first).await, "succeeded");
+        assert_eq!(status_of(&pool, second).await, "succeeded");
+        assert_eq!(executor.calls(), 2);
+
+        // What the executor was handed, not just how often. An executor that ignores its argument
+        // reports the same two calls whether the claim gave it the right row or another
+        // repository's, so counting alone cannot catch a `claim_next` that returns the wrong one.
+        let seen = executor.seen();
+        assert_eq!(seen.len(), 2);
+        for (op, project_id, project_root) in seen {
+            assert_eq!(
+                op,
+                Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                }
+            );
+            assert_eq!(project_id, "alpha");
+            assert_eq!(project_root, "C:/repo");
+        }
+
+        // The outcome has to travel from the executor into the row. `drain_once` is the only thing
+        // that carries it there, and the status assertions above pass just as well if it drops the
+        // sha and writes a canned success of its own.
+        let sha: Option<String> =
+            sqlx::query_scalar("SELECT result_sha FROM vcs_requests WHERE id = ?")
+                .bind(first)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sha.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_operation_is_recorded_and_frees_the_repository() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        drain_once(
+            &pool,
+            "alpha",
+            &FakeVcsExecutor::failing_with("CONFLICT (content)"),
+        )
+        .await;
+
+        assert_eq!(status_of(&pool, id).await, "failed");
+        assert!(failure_reason_of(&pool, id).await.contains("CONFLICT"));
+
+        // The point of this half: a failure must not leave the repository claimed forever.
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+        assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
     }
 }
