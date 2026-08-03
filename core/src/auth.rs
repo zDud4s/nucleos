@@ -169,10 +169,16 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // Reading one queued git operation's state. A ticket says what was asked for and how it ended;
     // it starts nothing, runs nothing and holds no repository.
     //
-    // `GET /vcs/requests/{id}/wait` is deliberately NOT here, though it reads the same row. It
-    // differs only in holding the connection for up to 45 seconds, and anyone who may read a ticket
-    // can poll the route above instead — so listing it would hand the longest-held connection in
-    // this API to the weakest key, buying nothing and costing a cheap way to tie the daemon up.
+    // `GET /vcs/requests/{id}/wait` is deliberately NOT here, though it reads the same row and
+    // returns the same shape. The argument is least privilege and nothing else: anyone who may read
+    // a ticket can poll the route above and learn everything waiting would tell them, so granting
+    // the wait buys the holder no capability it lacks — and an unneeded grant is one more thing to
+    // be wrong about later.
+    //
+    // Deliberately NOT argued as load: a key that can poll `{id}` in a tight loop generates more
+    // work than one blocked in a 45-second wait, so "it ties the daemon up" would be an argument a
+    // disagreeing reader wins. What the exclusion removes is convenience, not capability, and that
+    // is exactly why it costs nothing to keep.
     (Method::GET, "/vcs/requests"),
     (Method::GET, "/vcs/requests/{id}"),
     // Searching is listed here because the alternative is worse, not because it is free: it does
@@ -202,6 +208,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// is not, and the asymmetry is the point: a search returns titles and URLs, while a read pulls a
 /// stranger's prose into this machine's store and index, where later callers will meet it. A
 /// read-only key naming any URL it likes is a way to plant text for somebody else to read.
+///
+/// `POST /vcs/requests` is absent from both tables for the `POST /email/send` reason, not the
+/// `POST /runs` one, and the distinction is the whole of it. A run-creating key buys a run: work in
+/// a disposable worktree that a human reviews before anything of it survives. A queued merge is the
+/// opposite end — it is the act that makes work survive, published to a branch other people build
+/// on, and like a sent message it is the one thing in its pillar its owner cannot undo. That it is
+/// spelled `POST` and mentions a repository makes it look like a sibling of `/runs`; it is a sibling
+/// of `/email/send`. Queueing is Admin's.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     (Method::POST, "/webhooks/push"),
@@ -869,10 +883,15 @@ mod tests {
     /// A queue a read-only key can drive is not a brake.
     ///
     /// Written here rather than beside the handlers because `protected_router` and `status_of` are
-    /// private to this module — and because nothing else would catch the mistake. The exactness test
-    /// above walks `READ_ONLY_ROUTES`, never the axum router, so a route added to `http.rs` and
-    /// forgotten in the table is a silently-privileged route with a green suite. This is the only
-    /// thing standing between that and shipping.
+    /// private to this module — and because nothing else would catch the mistake. Nothing in the
+    /// crate links `build_router` to these tables: the exactness test above walks `READ_ONLY_ROUTES`
+    /// and never the axum router.
+    ///
+    /// Note which direction the danger runs. `permits` is default-deny, so a route added to
+    /// `http.rs` and forgotten here is *over*-protected — reachable only by Control and Admin, which
+    /// is annoying rather than dangerous. The dangerous edit is the opposite one: adding a line to
+    /// the table for a route that should not have been graded a read. That is what these assertions
+    /// pin, and `/wait` below is the one most likely to attract it.
     #[tokio::test]
     async fn a_read_only_api_key_may_read_a_vcs_ticket_but_not_queue_work() {
         let state = test_state("control-token").await;

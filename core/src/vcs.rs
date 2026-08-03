@@ -381,7 +381,10 @@ pub struct Ticket {
 /// `op` is the `op` column verbatim, not a parsed `Op`. Parsing can fail on a row written by an
 /// older version or edited by hand, and one such row must not be able to fail the whole listing —
 /// the listing is exactly where somebody would go to find out that a row is wrong.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `FromRow` rather than a positional tuple, for the reason `runs.rs` states: a tuple makes the
+/// column-order-to-field-order correspondence load-bearing and invisible, and five of these six
+/// fields are `String`, so a swap would compile and pass.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestSummary {
     pub id: i64,
     pub op: String,
@@ -393,9 +396,12 @@ pub struct RequestSummary {
 
 /// How many rows a listing returns at most.
 ///
-/// The queue is meant to be short — one operation runs at a time per repository — so a listing that
-/// needs paging is itself the finding. The cap exists so a queue that somehow grew cannot turn one
-/// HTTP call into an unbounded response.
+/// Note what this table is: nothing prunes `vcs_requests`, so it is the permanent history of every
+/// git operation this daemon has ever queued, not a snapshot of what is pending. A listing that hits
+/// this cap therefore means "the daemon has been running a while" — it is not a finding, and this
+/// cap is not a diagnostic. It exists only so one HTTP call cannot return an unbounded response.
+///
+/// When someone adds retention, or paging, this is where they start.
 const LIST_LIMIT: i64 = 200;
 
 /// Newest first, optionally narrowed to one repository.
@@ -417,34 +423,24 @@ pub async fn list(
     .bind(LIST_LIMIT)
     .fetch_all(pool)
     .await
-    .map(|rows: Vec<(i64, String, String, String, String, String)>| {
-        rows.into_iter()
-            .map(
-                |(id, op, project_id, origin, status, created_at)| RequestSummary {
-                    id,
-                    op,
-                    project_id,
-                    origin,
-                    status,
-                    created_at,
-                },
-            )
-            .collect()
-    })
 }
 
-/// How often `wait_for` re-checks a row that has not reached a terminal status yet.
-///
-/// How long a caller that asked to wait is made to wait before it gets a ticket instead.
+/// The longest a caller that asked to wait is held before it gets a ticket instead.
 ///
 /// Spec decision 3. The common case — an empty queue — answers from the first read and never
 /// approaches this. The bad case is two merges queued behind a slow one, and the number exists so
 /// that case stops killing the caller's run by timeout: the agent gets a ticket back and decides for
-/// itself whether to keep waiting. 45s is under every run timeout in `state.rs` (the shortest is
-/// 600s) with room to spare, which is the property that matters — a wait that outlived the run
-/// waiting on it would be worse than no wait at all.
+/// itself whether to keep waiting.
+///
+/// **The constraint to check this against is `state.rs`'s `DEFAULT_PROGRESS_TIMEOUT` (300s), not the
+/// 600s wall clock.** A CLI blocked on a call for this long streams no events, and the progress
+/// timeout is what kills a run that has gone quiet — so it binds first, and the real margin is
+/// roughly 6.7x rather than the 13x the wall clock would suggest. Anyone tempted to lengthen this
+/// has to answer to 300s. A wait that outlived the run waiting on it would be worse than no wait.
 pub const DEFAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// How often `wait_for` re-checks a row that has not reached a terminal status yet.
+///
 /// 25ms, chosen from two directions that happen to agree.
 ///
 /// In production it bounds how often one waiting caller queries: against the ~45s deadline this
@@ -1215,6 +1211,47 @@ mod tests {
         let pool = test_pool().await;
         submit(&pool, &request(Origin::Run(7))).await.unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_none());
+    }
+
+    /// Both branches of the filter, and the ordering, because neither is visible from one row.
+    ///
+    /// The HTTP test that exercises this route inserts a single request and passes no project, so
+    /// `WHERE ?1 IS NULL OR project_id = ?1` never takes its second path there and `ORDER BY id DESC`
+    /// cannot be told from `ASC`. `job::list` has the same `Option` filter and covers both — this is
+    /// that precedent applied.
+    #[tokio::test]
+    async fn a_listing_narrows_to_one_repository_and_puts_the_newest_first() {
+        let pool = test_pool().await;
+        let first = submit(&pool, &request_for("alpha", Origin::Human))
+            .await
+            .unwrap();
+        let second = submit(&pool, &request_for("beta", Origin::Human))
+            .await
+            .unwrap();
+        let third = submit(&pool, &request_for("alpha", Origin::Human))
+            .await
+            .unwrap();
+
+        let everything = list(&pool, None).await.unwrap();
+        assert_eq!(
+            everything.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![third, second, first],
+            "newest first: a caller reading a truncated list must see the present, not history"
+        );
+
+        let just_alpha = list(&pool, Some("alpha")).await.unwrap();
+        assert_eq!(
+            just_alpha.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![third, first]
+        );
+
+        // The fields that make a listing answer "what is this queue doing" rather than just
+        // "something happened" — and the ones a positional row mapping could silently transpose.
+        assert_eq!(just_alpha[0].op, "merge");
+        assert_eq!(just_alpha[0].project_id, "alpha");
+        assert_eq!(just_alpha[0].origin, "human");
+        assert_eq!(just_alpha[0].status, "queued");
+        assert!(!just_alpha[0].created_at.is_empty());
     }
 
     /// A `running` row at startup means the daemon died mid-operation, and nothing can say whether git

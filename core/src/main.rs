@@ -213,7 +213,7 @@ async fn main() {
     }
 
     // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
-    // below, so it is logged louder than either while still letting the daemon start.
+    // below: louder than the sweep, quieter than the panics.
     //
     // A `vcs_requests` row left `running` holds its repository's only slot — the partial unique
     // index sees to that — so failing to clear it means no git operation for that project until
@@ -229,7 +229,7 @@ async fn main() {
         Ok(_) => {}
         Err(error) => tracing::error!(
             %error,
-            "vcs request reconciliation failed — a repository may stay queue-locked until this succeeds"
+            "vcs request reconciliation failed — a repository may stay queue-locked, and nothing retries before the next startup"
         ),
     }
 

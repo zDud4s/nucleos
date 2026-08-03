@@ -2145,20 +2145,49 @@ struct VcsRequestBody {
 
 /// Who the queue records as having asked, derived from the key that authenticated the call.
 ///
+/// **`Origin` decides whether a human still has to approve**, so the mapping is a security decision,
+/// not bookkeeping. `Human` and `Shell` skip approval; `Run` and `Job` do not.
+///
+/// `Control` → `Human` is the load-bearing arm, and it is also where the *autonomous* path lands —
+/// which is not obvious. An orchestrator turn is handed the control token (`assistant.rs`), and only
+/// orchestrator turns are given an `--mcp-config`, so when the MCP door opens its requests arrive as
+/// `Control`, not as `Run`. That is spec decision 6 working as intended: a turn acting on an order
+/// you just gave carries your approval. It is worth stating plainly because the `Run` arm below
+/// looks like the one that handles agents, and it is not.
+///
+/// `ApiToken(Admin)` → `Human`, deliberately, and **not** `Shell`. In this repo "shell" means the
+/// Tauri desktop app — which holds the *control* token and therefore already maps to `Human` — so
+/// recording `shell` for a durable API key would put a word in the listing that names the one client
+/// that did not make the call. `Human` claims only what is true: a person minted this key on purpose
+/// and it carries their approval. Whether an unattended admin key *should* pre-approve a merge is a
+/// real question, and it belongs with the chunk that defines durable-key provenance rather than
+/// being settled by a name chosen here.
+///
 /// `Run` cannot reach this route today — a run token opens exactly one route, the safety gate — but
-/// mapping it costs nothing and is already correct for the chunk that opens the MCP door, which is
-/// the first thing that will produce an autonomous request. `Service` and the lesser API levels are
-/// refused rather than guessed at: `permits` should already have turned them away, and a scope that
-/// arrives here unaccounted for is a routing bug, not a request to serve under a default.
+/// mapping it costs nothing and is what the MCP tools will need once a run can submit directly.
+/// `Service` and the lesser API levels are refused rather than guessed at: `permits` should already
+/// have turned them away, so a scope arriving here unaccounted for is a routing bug, and defaulting
+/// it would mean guessing about approval.
 fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
     match scope {
-        Scope::Control => Ok(vcs::Origin::Human),
-        Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Shell),
+        Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Human),
         Scope::Run(id) => Ok(vcs::Origin::Run(*id)),
         Scope::Service(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
     }
 }
 
+/// The one handler here that writes, and therefore the one that owes the cancellation question an
+/// answer.
+///
+/// It awaits after inserting, so a client disconnecting mid-call can drop the future once the row
+/// is committed. That is benign **today** and only today: what is left behind is a `queued` row that
+/// will still execute, appears in the listing, and holds no repository — the caller loses its reply,
+/// not its request. So `http::uncancellable` is not needed yet.
+///
+/// It stops being benign the moment submitting becomes two writes — the row plus an approval
+/// proposal, which is what the approval chunk adds. A disconnect between them would leave a request
+/// that can never be approved. Whoever writes that second write moves this through `uncancellable`
+/// at the same time.
 async fn submit_vcs_request(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -2940,6 +2969,7 @@ mod tests {
         // doing", not "how did mine end" — so what it must carry is the operation and the project.
         // A listing that only echoed statuses would pass a status-only assertion and be useless.
         let listed = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/vcs/requests")
@@ -2961,6 +2991,19 @@ mod tests {
         assert_eq!(summaries[0].project_id, "alpha");
         assert_eq!(summaries[0].origin, "human");
         assert_eq!(summaries[0].status, "queued");
+
+        // `wait_for` answering `RowNotFound` is covered in `vcs.rs`; that it becomes a 404 rather
+        // than a 500 is this layer's own translation, and nothing else exercises it.
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/vcs/requests/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     /// A project the daemon does not know is a 404, not a merge in a directory somebody named.
