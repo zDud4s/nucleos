@@ -372,14 +372,25 @@ pub struct Ticket {
 
 /// How often `wait_for` re-checks a row that has not reached a terminal status yet.
 ///
-/// 10ms against this file's 50ms test deadlines leaves several polls of room before the deadline
-/// arrives, rather than betting on one sleep landing exactly on the boundary, while staying far
-/// coarser than a real git operation — so the common case (a request that finishes almost
-/// immediately) never pays for a poll at all; see `a_finished_request_returns_its_outcome_without_waiting`.
+/// 25ms, chosen from two directions that happen to agree.
+///
+/// In production it bounds how often one waiting caller queries: against the ~45s deadline this
+/// pillar is designed around, 10ms would be roughly 4500 reads per waiting agent and 25ms roughly
+/// 1800, while the extra latency it can cost — one interval, for a request that finishes just after
+/// a poll — is nothing beside a merge measured in seconds.
+///
+/// In the tests it is the discrimination margin, and that is the reason it is not smaller.
+/// `a_finished_request_returns_its_outcome_without_waiting` proves the answer came from the read
+/// *before* the first sleep, and elapsed time is the only evidence of that — a loop that slept first
+/// would return the same status, just one interval later. At 10ms the assertion sat exactly on the
+/// boundary with no headroom, so ordinary scheduler jitter on a loaded laptop could fail a correct
+/// implementation. The interval IS the margin; this file's other timing tests are documented as
+/// leaving 10x.
+///
 /// A `Notify` would remove the wait entirely, but nothing here has a real operation duration yet to
 /// make that worth the added machinery — the same tradeoff `drain_once`'s doc comment argues for
 /// `VcsExecutor` staying a plain trait rather than a channel.
-const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
 /// comes first — and returns a `Ticket` either way.
@@ -403,9 +414,14 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 ///
 /// An `id` with no matching row is answered `Err(RowNotFound)` on the very first read, without
 /// spending any of the deadline: every id in circulation came from `submit`, which hands one back
-/// only after its INSERT has committed, and nothing in this module ever deletes a row. So a missing
-/// row is not "hasn't arrived yet" — it cannot ever arrive — and polling it out to the deadline
-/// would just be quietly burning the caller's wait on a request that does not exist.
+/// only after its INSERT has committed, and nothing in this module deletes a row *today*. So a
+/// missing row is not "hasn't arrived yet" — it cannot ever arrive — and polling it out to the
+/// deadline would just be quietly burning the caller's wait on a request that does not exist.
+///
+/// The hedge is deliberate: that is a claim about the whole module, not about this function, and the
+/// first retention or cleanup pass added anywhere in `vcs.rs` invalidates it silently — the failure
+/// would be a caller told "no such request" about one that merely aged out. Whoever adds pruning
+/// owns revisiting this.
 ///
 /// Reads before it ever sleeps, and every subsequent iteration does the same: the terminal check
 /// runs on freshly read data, not on whatever the previous iteration saw, so a row that finishes
