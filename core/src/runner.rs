@@ -196,9 +196,17 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// needs this reviewed. A name the CLI does not know costs one stderr line per run
 /// (`Permission deny rule "X" matches no known tool`) — that warning is the price of the margin,
 /// not a typo to clean up.
+///
+/// "A CLI upgrade" understates when this has to be revisited. `TaskCreate`, `TaskGet`, `TaskList`
+/// and `TaskUpdate` appeared on 2.1.198 — the same version this was measured against — and took
+/// every assistant turn down with them, because a name absent here is not denied, so the CLI
+/// advertises it and `advertised_tools_violate` kills the run at the `init` event. The tool set can
+/// move underneath a version that never changed, which means the version number is not the signal:
+/// the stderr line naming the offending tools is.
 const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
+    "AskUserQuestion",
     "Bash",
     "BashOutput",
     "CronCreate",
@@ -229,8 +237,12 @@ const BUILTIN_TOOLS: &[&str] = &[
     "Skill",
     "SlashCommand",
     "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
     "TaskOutput",
     "TaskStop",
+    "TaskUpdate",
     "TodoWrite",
     "ToolSearch",
     "WebFetch",
@@ -1533,9 +1545,14 @@ impl CommandRunner for FakeCommandRunner {
         // Clone the canned outcome in its own scope so the MutexGuard drops before any `.await`.
         let mut outcome = {
             let guard = self.canned.lock().unwrap();
+            // A `result` event rather than bare text, because callers parse this. `extract_reply`
+            // reads the reply out of a completed run's stream, and a default that was not a stream
+            // meant every test taking this outcome exercised the no-reply path by accident — which
+            // is how "a turn with no result event" stayed indistinguishable from a successful one
+            // long enough to publish a CLI hook payload to a Telegram chat.
             guard.clone().unwrap_or(RunOutcome {
                 exit_code: 0,
-                stdout: "fake output".into(),
+                stdout: r#"{"type":"result","subtype":"success","result":"fake output"}"#.into(),
                 stderr: String::new(),
                 session_id: Some("fake-session-id".into()),
                 cost_usd: Some(0.0),
@@ -2219,6 +2236,35 @@ mod tests {
             assert!(
                 denied.split(',').any(|t| t == tool),
                 "{tool} must be denied under McpOnly"
+            );
+        }
+    }
+
+    /// The regression that took every assistant turn down. The CLI grew a task-management family
+    /// on a version this list had already been measured against; the four names were not denied, so
+    /// they were advertised, so `advertised_tools_violate` killed each turn at its `init` event.
+    ///
+    /// Named one by one rather than by prefix: `Task` was in the list and its relatives were not,
+    /// which is exactly the gap a prefix check would paper over. `AskUserQuestion` rides along for
+    /// the same reason — a built-in that was never on the list, waiting to break the next turn.
+    #[test]
+    fn mcp_only_denies_the_task_family_and_the_question_tool() {
+        let args = args_for(ToolPolicy::McpOnly, None);
+        let denied = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("McpOnly must deny built-ins");
+        for tool in [
+            "TaskCreate",
+            "TaskGet",
+            "TaskList",
+            "TaskUpdate",
+            "AskUserQuestion",
+        ] {
+            assert!(
+                denied.split(',').any(|t| t == tool),
+                "{tool} must be denied under McpOnly, or it is advertised and kills the turn"
             );
         }
     }

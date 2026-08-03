@@ -317,44 +317,79 @@ fn spawn_assistant_turn(
         // write would report a completed turn for a CLI that was killed. First writer wins; no rows
         // means the turn was finalised elsewhere, which is an outcome, not an error.
         match result {
-            Ok(Ok(o)) => {
-                let reply = extract_reply(&o.stdout).unwrap_or_else(|| o.stdout.clone());
-                let completed = sqlx::query(
-                    "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
-                )
-                .bind(o.exit_code)
-                .bind(&reply)
-                .bind(&o.stderr)
-                .bind(&o.session_id)
-                .bind(o.cost_usd)
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await;
-                crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
-                if let Some(session_id) = o.session_id.as_deref() {
-                    // `get_session` would refuse to resume this session anyway, by looking at the
-                    // runs that produced it. Dropping the row here as well closes the one case that
-                    // check cannot see: a session recorded against a run that never took the id has
-                    // nothing pointing at it, so nothing marks it as having read anything.
-                    match crate::runs::read_untrusted_context(&pool, id).await {
-                        Ok(false) => {
-                            let _ = upsert_session(
-                                &pool,
-                                &turn.slot.chat_id,
-                                session_id,
-                                &completed_at,
-                            )
-                            .await;
-                        }
-                        // Including the error: a turn whose record cannot be read is not a turn
-                        // that can be shown to be clean.
-                        _ => {
-                            let _ = forget_session(&pool, &turn.slot.chat_id).await;
+            // A turn's product is the `result` event, and a CLI that exited without one answered
+            // nothing. That is a failed turn, not a completed one — and emphatically not a turn
+            // whose raw stream can stand in for the reply it never wrote. The stream is transport:
+            // `init` events, session ids, and whatever the `SessionStart` hook injected as
+            // `additionalContext`. Handing it to a chat as the answer published the whole hook body
+            // to Telegram — internal context, delivered under `status = 'completed'`, so nothing
+            // downstream had any reason to treat it as the breakage it was.
+            //
+            // The reader gets the stderr instead, which is where the CLI says why it stopped. When
+            // the tool-policy barrier kills a turn that line names the offending tools, so the chat
+            // shows the actual fault rather than a wall of JSON.
+            Ok(Ok(o)) => match extract_reply(&o.stdout) {
+                Some(reply) => {
+                    let completed = sqlx::query(
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(o.exit_code)
+                    .bind(&reply)
+                    .bind(&o.stderr)
+                    .bind(&o.session_id)
+                    .bind(o.cost_usd)
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
+                    if let Some(session_id) = o.session_id.as_deref() {
+                        // `get_session` would refuse to resume this session anyway, by looking at the
+                        // runs that produced it. Dropping the row here as well closes the one case that
+                        // check cannot see: a session recorded against a run that never took the id has
+                        // nothing pointing at it, so nothing marks it as having read anything.
+                        match crate::runs::read_untrusted_context(&pool, id).await {
+                            Ok(false) => {
+                                let _ = upsert_session(
+                                    &pool,
+                                    &turn.slot.chat_id,
+                                    session_id,
+                                    &completed_at,
+                                )
+                                .await;
+                            }
+                            // Including the error: a turn whose record cannot be read is not a turn
+                            // that can be shown to be clean.
+                            _ => {
+                                let _ = forget_session(&pool, &turn.slot.chat_id).await;
+                            }
                         }
                     }
                 }
-            }
+                // `stdout` is left NULL rather than filled with the stream: there is no reply, and a
+                // column that says so is honest.
+                //
+                // Nothing is done about the session here, matching the failure and timeout arms
+                // below. Not an omission — the id was already recorded when the CLI announced it,
+                // by the task above, and it stays recorded on every path that does not complete. A
+                // turn killed at the tool-policy barrier died before it could call anything, so the
+                // session it leaves has read nothing and is safe to resume; the read-side check in
+                // `get_session` is what decides that, and it decides it the same way here.
+                None => {
+                    let failed = sqlx::query(
+                        "UPDATE runs SET status = 'failed', exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(o.exit_code)
+                    .bind(&o.stderr)
+                    .bind(&o.session_id)
+                    .bind(o.cost_usd)
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                }
+            },
             Ok(Err(e)) => {
                 let failed = sqlx::query(
                     "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
@@ -514,6 +549,74 @@ mod tests {
         assert_eq!(
             get_session(&pool, chat_id).await.unwrap(),
             Some("sess-clean".to_string())
+        );
+    }
+
+    /// What a Telegram user actually received when the tool-policy barrier killed a turn: the CLI's
+    /// own stream, `SessionStart` hook payload and all, delivered as though it were the answer.
+    ///
+    /// The shape below is the real one — three `system` events and no `result`, because the run was
+    /// killed at `init`. The assertion that matters is the negative one: whatever the chat is shown,
+    /// it must not be the stream. `status` carries the rest of the fix; the sidecar renders a
+    /// `failed` turn as its stderr, which is where the CLI says which tools it objected to.
+    #[tokio::test]
+    async fn a_turn_with_no_result_event_fails_instead_of_replying_with_its_own_stream() {
+        let mut state = test_state().await;
+        let hook_body = r#"{"type":"system","subtype":"hook_response","hook_name":"SessionStart:resume","output":"You have superpowers. If you think there is even a 1% chance a skill might apply"}"#;
+        let stream = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:resume"}"#,
+            hook_body,
+            r#"{"type":"system","subtype":"init","session_id":"s","tools":["TaskCreate"]}"#,
+        );
+        state.runner = Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: -1,
+                stdout: stream.clone(),
+                stderr: "nucleos: ToolPolicy::McpOnly violated by CLI-advertised tools: TaskCreate"
+                    .to_string(),
+                session_id: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                num_turns: None,
+            })),
+            ..Default::default()
+        });
+        let chat_id = "assistant-no-result-event-chat";
+
+        let id = send_message(&state, chat_id, "Le me o ultimo mail que recebi")
+            .await
+            .unwrap();
+
+        let mut row = None;
+        for _ in 0..500 {
+            let (status, stdout, stderr): (String, Option<String>, Option<String>) =
+                sqlx::query_as("SELECT status, stdout, stderr FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            if status != "running" {
+                row = Some((status, stdout, stderr));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let (status, stdout, stderr) = row.expect("the turn must reach a terminal status");
+
+        assert_eq!(
+            status, "failed",
+            "a turn that answered nothing is not a completed turn"
+        );
+        assert_eq!(
+            stdout, None,
+            "the reply column must stay empty rather than carry the stream: {stdout:?}"
+        );
+        assert!(
+            stderr.is_some_and(|e| e.contains("TaskCreate")),
+            "the reader gets the CLI's reason instead of its transport"
         );
     }
 
