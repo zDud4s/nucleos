@@ -1225,6 +1225,66 @@ mod tests {
         );
     }
 
+    /// A restart's reconcile landing while the operation is still running — the collision that makes
+    /// `finish`'s refusal a real path rather than a defensive one, seen from the drain's side.
+    ///
+    /// `a_reconciled_request_cannot_be_finished_by_a_late_worker` covers `finish` refusing directly.
+    /// What only this can show is what `drain_once` does with the refusal: it must not treat a
+    /// terminal row as a jam, must not lose that the work happened, and must leave the interrupted
+    /// row exactly as the reconcile wrote it. The sha the executor produced survives only in a log
+    /// line from here — the row is entitled to refuse it, and does.
+    ///
+    /// The reconcile runs *during* the operation because that is when it really happens, and it can:
+    /// the drain holds no pooled connection while it awaits the executor, so a single-connection
+    /// pool still answers.
+    #[tokio::test]
+    async fn a_drain_whose_row_was_reconciled_out_from_under_it_does_not_overwrite_the_record() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        // A 10x margin over the reconcile's own wait, so which lands first is not a race: an
+        // in-memory claim takes microseconds, and `reconciled == 1` below fails loudly rather than
+        // passing quietly if that ever stops being true.
+        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        let (drained, reconciled) = tokio::join!(drain_once(&pool, "alpha", &executor), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            reconcile_interrupted(&pool).await.unwrap()
+        });
+
+        assert_eq!(
+            reconciled, 1,
+            "the reconcile must have caught the row mid-operation"
+        );
+        assert_eq!(executor.calls(), 1);
+        assert!(
+            drained,
+            "the merge ran; a refused terminal write must not be reported as an idle tick"
+        );
+
+        let (status, sha, reason): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, result_sha, failure_reason FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "interrupted");
+        assert_eq!(
+            sha, None,
+            "the late write must not have left its sha behind"
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("daemon restarted mid-operation"),
+            "the reconcile's account of why must survive the drain arriving after it"
+        );
+
+        // And the repository is free: a refused write means the row is terminal, so the queue moves
+        // on rather than waiting behind it.
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+        assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
+    }
+
     /// The jam window `drain_once`'s doc comment admits to, composed with the thing that closes it.
     ///
     /// Two functions have to agree for that claim to hold, and inspecting either alone does not show
