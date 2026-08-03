@@ -164,11 +164,25 @@ pub enum Outcome {
 ///
 /// `?2` appears twice but is bound once: SQLite numbers placeholder slots by their highest index,
 /// not by how often each occurs, so this statement has two parameters and takes exactly two binds.
+///
+/// The claim, the parse and the release-on-failure are one transaction because they have to be
+/// uncancellable together (`core/AGENTS.md` § "Cancellation safety", rule 3). A dropped future
+/// stops at its last `.await` and never runs another line, and there are two suspension points
+/// between marking a row `running` and deciding it is unexecutable — so a compensating write
+/// written as a statement after those awaits is not cleanup, it is happy-path-only code. Inside a
+/// transaction the question does not arise: `sqlx`'s `Transaction` rolls back when dropped, so a
+/// claim abandoned at *any* await leaves the row exactly `queued`, untouched and claimable on the
+/// next poll. It also means a row released this way goes `queued` → `failed` without ever being
+/// observably `running`, so no queue view can show a phantom.
+///
+/// Wrapping the statement does not weaken the `NOT EXISTS` guard: SQLite admits one writer at a
+/// time, so a second claimer's UPDATE evaluates the guard against the winner's committed row.
 pub async fn claim_next(
     pool: &sqlx::SqlitePool,
     project_id: &str,
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
     let claimed: Option<(i64, String, String, String, String)> = sqlx::query_as(
         "UPDATE vcs_requests
             SET status = 'running', started_at = ?1
@@ -184,42 +198,37 @@ pub async fn claim_next(
     )
     .bind(started_at)
     .bind(project_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await?;
 
     let Some((id, op, args, project_id, project_root)) = claimed else {
+        // Nothing was changed, so the rollback this drop performs is the same as a commit.
         return Ok(None);
     };
     // A row whose stored operation will not parse is an error, never `Ok(None)`: `None` means "come
-    // back later", and no amount of waiting makes an unexecutable row executable.
-    //
-    // The claim has already committed by the time the payload is read, so returning that error on
-    // its own would leave the row `running` and hold this repository's only slot until the next
-    // daemon restart — the jam `core/AGENTS.md` § "Cancellation safety" describes for
-    // `one_open_worktree_run_per_project`, where a run stranded at `running` "blocks *every* later
-    // worktree run for that project". A queue that can trap the repository it exists to protect is
-    // not doing its job, so this path hands the slot back before it returns.
+    // back later", and no amount of waiting makes an unexecutable row executable. Left claimed, it
+    // would hold this repository's only slot until the next daemon restart — the jam
+    // `core/AGENTS.md` § "Cancellation safety" describes for `one_open_worktree_run_per_project`,
+    // where a run stranded at `running` "blocks *every* later worktree run for that project". A
+    // queue that can trap the repository it exists to protect is not doing its job.
     match Op::from_stored(&op, &args) {
-        Ok(op) => Ok(Some(ClaimedRequest {
-            id,
-            op,
-            project_id,
-            project_root,
-        })),
+        Ok(op) => {
+            transaction.commit().await?;
+            Ok(Some(ClaimedRequest {
+                id,
+                op,
+                project_id,
+                project_root,
+            }))
+        }
         Err(error) => {
             let reason =
                 format!("stored operation for vcs request {id} could not be parsed: {error}");
             // Terminal rather than back to `queued`: re-queueing would hand the same unparseable
             // row out again on the next poll, forever. `exit_code` is `None` and `output_tail`
             // empty because nothing ran — this row never reached an argv.
-            //
-            // Its error is dropped on purpose. The parse failure is what propagates either way: it
-            // is the more informative of the two — naming the defect rather than its symptom — and
-            // a database that cannot accept this write will announce itself on the caller's very
-            // next query anyway. Substituting the write error would hide a corrupt row behind
-            // something that reads as transient.
-            let _ = finish(
-                pool,
+            let released = match finish(
+                &mut *transaction,
                 id,
                 Outcome::Failed {
                     reason: reason.clone(),
@@ -227,7 +236,26 @@ pub async fn claim_next(
                     output_tail: String::new(),
                 },
             )
-            .await;
+            .await
+            {
+                Ok(()) => transaction.commit().await,
+                Err(error) => Err(error),
+            };
+            // A lost terminal write is not best-effort bookkeeping (`runs::warn_on_terminal_write_err`
+            // makes the same argument), and the caller cannot infer it: it receives the *parse*
+            // error and will reasonably read that as "handled, move on". The transaction keeps this
+            // from jamming anything — the whole claim rolls back, so the row is `queued` rather
+            // than stranded — but it does mean the next poll will hand out the same corrupt row
+            // again, and a log line is the only thing that distinguishes that loop from silence.
+            if let Err(error) = released {
+                tracing::warn!(
+                    vcs_request_id = id,
+                    %error,
+                    "could not record an unparseable vcs request as failed; it stays queued and will be claimed again"
+                );
+            }
+            // The parse error is what propagates either way: it names the defect rather than its
+            // symptom, and it is the one that stays true whether or not the release was recorded.
             Err(sqlx::Error::Protocol(reason))
         }
     }
@@ -238,7 +266,21 @@ pub async fn claim_next(
 /// The columns an outcome does not carry are written NULL rather than left alone: one statement
 /// covers both outcomes, and NULL is already what those columns hold for a row that has only ever
 /// been queued and claimed.
-pub async fn finish(pool: &sqlx::SqlitePool, id: i64, outcome: Outcome) -> sqlx::Result<()> {
+///
+/// Scoped to `status = 'running'`, and a zero-row match is `RowNotFound` rather than a silent
+/// `Ok(())` (the convention at `runs.rs:744`). Only the holder of a claim may end it: once Task 5's
+/// restart reconciliation can mark a stranded row `interrupted` with the reason why, an unscoped
+/// write would let a worker whose future outlived that reconcile flip `interrupted` to `succeeded`
+/// and NULL the reason — destroying the only trace of the interruption, and reporting success for
+/// work whose outcome nobody actually observed.
+///
+/// Generic over the executor so the claim can perform its own release inside the transaction that
+/// makes the pair uncancellable; callers holding a pool pass `&pool` unchanged.
+pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
+    executor: E,
+    id: i64,
+    outcome: Outcome,
+) -> sqlx::Result<()> {
     let finished_at = chrono::Utc::now().to_rfc3339();
     let (status, result_sha, failure_reason, exit_code, output_tail) = match outcome {
         Outcome::Succeeded { sha } => ("succeeded", Some(sha), None, None, None),
@@ -248,11 +290,11 @@ pub async fn finish(pool: &sqlx::SqlitePool, id: i64, outcome: Outcome) -> sqlx:
             output_tail,
         } => ("failed", None, Some(reason), exit_code, Some(output_tail)),
     };
-    sqlx::query(
+    let finished = sqlx::query(
         "UPDATE vcs_requests
             SET status = ?, finished_at = ?, result_sha = ?, failure_reason = ?,
                 exit_code = ?, output_tail = ?
-          WHERE id = ?",
+          WHERE id = ? AND status = 'running'",
     )
     .bind(status)
     .bind(finished_at)
@@ -261,8 +303,11 @@ pub async fn finish(pool: &sqlx::SqlitePool, id: i64, outcome: Outcome) -> sqlx:
     .bind(exit_code)
     .bind(output_tail)
     .bind(id)
-    .execute(pool)
+    .execute(executor)
     .await?;
+    if finished.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(())
 }
 
@@ -319,16 +364,28 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert(pool: &sqlx::SqlitePool, project: &str, status: &str) -> sqlx::Result<()> {
+    /// A payload `Op::from_stored` accepts, for rows written straight to the table.
+    const MERGE_ARGS: &str = r#"{"op":"merge","source":"feat/x","target":"master"}"#;
+
+    /// The one place that knows the column list. `args` is a parameter because the rows worth
+    /// writing by hand are exactly the ones `submit` cannot produce — a payload that will not
+    /// parse, or a status no caller can reach yet.
+    async fn insert(
+        pool: &sqlx::SqlitePool,
+        project: &str,
+        status: &str,
+        args: &str,
+    ) -> sqlx::Result<i64> {
         sqlx::query(
             "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at)
-             VALUES ('merge', '{}', ?, 'C:/repo', 'human', ?, '2026-08-02T00:00:00Z')",
+             VALUES ('merge', ?, ?, 'C:/repo', 'human', ?, '2026-08-02T00:00:00Z')",
         )
+        .bind(args)
         .bind(project)
         .bind(status)
         .execute(pool)
         .await
-        .map(|_| ())
+        .map(|inserted| inserted.last_insert_rowid())
     }
 
     /// Exclusivity is the database's job, not a Mutex's: a Mutex does not survive a daemon restart
@@ -339,22 +396,22 @@ mod tests {
     async fn only_one_request_may_run_per_repository() {
         let pool = test_pool().await;
 
-        insert(&pool, "alpha", "running")
+        insert(&pool, "alpha", "running", MERGE_ARGS)
             .await
             .expect("the first running request is allowed");
 
-        let second = insert(&pool, "alpha", "running").await;
+        let second = insert(&pool, "alpha", "running", MERGE_ARGS).await;
         assert!(
             second.is_err(),
             "a second running request for the same repository must be rejected"
         );
 
-        insert(&pool, "beta", "running")
+        insert(&pool, "beta", "running", MERGE_ARGS)
             .await
             .expect("a different repository is not blocked by alpha's running request");
 
         for _ in 0..3 {
-            insert(&pool, "alpha", "queued")
+            insert(&pool, "alpha", "queued", MERGE_ARGS)
                 .await
                 .expect("queued requests are not limited — only running is");
         }
@@ -483,15 +540,10 @@ mod tests {
     async fn a_row_that_cannot_be_parsed_frees_the_repository_instead_of_jamming_it() {
         let pool = test_pool().await;
         // Written directly: `submit` cannot produce this row, which is the point — it comes from a
-        // hand-edited row or a downgrade that no longer knows an operation a newer build wrote.
-        let corrupt = sqlx::query(
-            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at)
-             VALUES ('merge', '{\"op\":\"rm_rf\"}', 'alpha', 'C:/repo', 'human', 'queued', '2026-08-02T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
+        // hand edit, or a downgrade that no longer knows an operation a newer build wrote.
+        let corrupt = insert(&pool, "alpha", "queued", r#"{"op":"rm_rf"}"#)
+            .await
+            .unwrap();
         let behind_it = submit(&pool, &request(Origin::Human)).await.unwrap();
 
         assert!(
@@ -499,12 +551,166 @@ mod tests {
             "an unexecutable row is an error, not a wait"
         );
         assert_eq!(status_of(&pool, corrupt).await, "failed");
+        // The diagnosis has to survive into the row, or the only account of why this request died
+        // is a log line the daemon may have already rotated away.
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT failure_reason FROM vcs_requests WHERE id = ?")
+                .bind(corrupt)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let reason = reason.expect("a failed request records why it failed");
+        assert!(
+            reason.contains(&corrupt.to_string()) && reason.contains("could not be parsed"),
+            "the recorded reason must name the row and say what was wrong: {reason}"
+        );
         assert_eq!(
             claim_next(&pool, "alpha").await.unwrap().unwrap().id,
             behind_it,
             "the queue must move on, not hold alpha until the daemon restarts"
         );
     }
+
+    /// A positional 5-tuple of `(i64, String, String, String, String)` is destructured by position,
+    /// so `project_id` and `project_root` — adjacent in both the `RETURNING` list and the pattern —
+    /// could be swapped and everything else here would still pass. This is also the only coverage
+    /// that `Op` parsing works *through* the claim rather than in isolation.
+    #[tokio::test]
+    async fn a_claim_carries_the_operation_and_the_repository_it_names() {
+        let pool = test_pool().await;
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        let claimed = claim_next(&pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(
+            claimed.op,
+            Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            }
+        );
+        assert_eq!(claimed.project_id, "alpha");
+        assert_eq!(claimed.project_root, "C:/repo");
+    }
+
+    /// Any non-`running` status frees the partial index, so the ordering test would pass even if
+    /// `finish` wrote the wrong status and dropped the sha entirely. What the caller keeps of a
+    /// merge is the commit it produced; nothing else asserts it lands.
+    #[tokio::test]
+    async fn a_succeeded_request_records_the_commit_it_produced() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap().unwrap();
+
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (status, sha, exit_code, output_tail, reason): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, result_sha, exit_code, output_tail, failure_reason
+               FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "succeeded");
+        assert_eq!(sha.as_deref(), Some("abc123"));
+        assert_eq!(exit_code, None, "nothing failed, so there is no exit code");
+        assert_eq!(output_tail, None);
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_records_why_and_what_it_printed() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap().unwrap();
+
+        finish(
+            &pool,
+            id,
+            Outcome::Failed {
+                reason: "merge conflict".into(),
+                exit_code: Some(1),
+                output_tail: "CONFLICT (content): Merge conflict in a.txt".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (status, sha, exit_code, output_tail, reason): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, result_sha, exit_code, output_tail, failure_reason
+               FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "failed");
+        assert_eq!(sha, None, "nothing succeeded, so there is no commit");
+        assert_eq!(exit_code, Some(1));
+        assert_eq!(
+            output_tail.as_deref(),
+            Some("CONFLICT (content): Merge conflict in a.txt")
+        );
+        assert_eq!(reason.as_deref(), Some("merge conflict"));
+    }
+
+    /// Only the holder of a claim may end it.
+    ///
+    /// Task 5's restart reconciliation marks stranded rows `interrupted` and records why. A worker
+    /// whose future outlived that reconcile would otherwise flip the row to `succeeded` and NULL
+    /// the reason — reporting success for work nobody observed finish, and destroying the only
+    /// record that it was ever interrupted.
+    #[tokio::test]
+    async fn a_request_that_is_no_longer_running_cannot_be_finished() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "interrupted", MERGE_ARGS)
+            .await
+            .unwrap();
+
+        let late = finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+            },
+        )
+        .await;
+
+        assert!(matches!(late, Err(sqlx::Error::RowNotFound)));
+        assert_eq!(status_of(&pool, id).await, "interrupted");
+    }
+
+    // NOTE: the rollback-on-drop half of the claim's cancellation safety is deliberately not tested
+    // here. Dropping a partially polled `claim_next` never returns this pool's single connection —
+    // every attempt ends in `PoolTimedOut` after 30s — so the assertion that follows the drop cannot
+    // run at all, and observing the abandoned claim from a second connection is not possible either:
+    // a second `:memory:` connection is a different database, not another view of this one. Testing
+    // it needs a file-backed multi-connection harness this module does not have yet. The guarantee
+    // itself is `sqlx`'s (`sqlx-core-0.9.0/src/transaction.rs:264-279`: `impl Drop for Transaction`
+    // calls `start_rollback`, which runs "on the next asynchronous invocation of the underlying
+    // connection (including if the connection is returned to a pool)"), not this crate's to re-prove.
 
     /// The queue must never hand out work that cannot execute — a head blocked on a sleeping human
     /// blocks every agent behind it. That is the whole reason approval precedes admission.
