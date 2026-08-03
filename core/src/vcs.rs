@@ -33,6 +33,84 @@ impl Op {
     }
 }
 
+/// Who is asking, which decides whether the request needs a human's sign-off before it may queue.
+///
+/// A human's order in an interactive session already is the approval — asking again two seconds
+/// later is friction with no safety gain. An autonomous run or job's request is not: nothing else
+/// in the system has consented to it yet, so it waits. The queue itself never decides consent, only
+/// ordering and mutual exclusion — this is where consent, already decided elsewhere, is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Human,
+    Shell,
+    Run(i64),
+    Job(i64),
+}
+
+impl Origin {
+    /// The exact spelling the `origin` column's CHECK constraint accepts — do not invent others.
+    fn as_str(self) -> &'static str {
+        match self {
+            Origin::Human => "human",
+            Origin::Shell => "shell",
+            Origin::Run(_) => "run",
+            Origin::Job(_) => "job",
+        }
+    }
+
+    /// Human and shell requests carry their own approval; run and job requests are autonomous and
+    /// have not been approved by anything yet.
+    fn needs_approval(self) -> bool {
+        matches!(self, Origin::Run(_) | Origin::Job(_))
+    }
+
+    /// `run_id` is populated only for `Origin::Run`. A job id written into a column named
+    /// `run_id` would silently mislabel it as a run — job ids and run ids come from different
+    /// sequences and would collide (see `worktree::Owner::feed_run_id`'s doc comment for the same
+    /// mistake made once already). A `job_id` column arrives once jobs actually submit requests,
+    /// which is not this chunk.
+    fn run_id(self) -> Option<i64> {
+        match self {
+            Origin::Run(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// What a caller asks the queue to do, before provenance decides whether it may queue yet.
+#[derive(Debug, Clone)]
+pub struct SubmitRequest {
+    pub op: Op,
+    pub project_id: String,
+    pub project_root: String,
+    pub origin: Origin,
+}
+
+/// Admits a request into the queue and returns its row id. Provenance alone decides the initial
+/// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
+/// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
+/// into `queued`, or `rejected` — belongs to Chunk 4 alongside the `proposals.rs` wiring that
+/// grants it; this function only ever writes the initial state.
+pub async fn submit(pool: &sqlx::SqlitePool, request: &SubmitRequest) -> sqlx::Result<i64> {
+    let status = if request.origin.needs_approval() { "awaiting_approval" } else { "queued" };
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, run_id, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(request.op.kind())
+    .bind(request.op.to_args())
+    .bind(&request.project_id)
+    .bind(&request.project_root)
+    .bind(request.origin.as_str())
+    .bind(request.origin.run_id())
+    .bind(status)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +130,27 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    fn request(origin: Origin) -> SubmitRequest {
+        request_for("alpha", origin)
+    }
+
+    fn request_for(project: &str, origin: Origin) -> SubmitRequest {
+        SubmitRequest {
+            op: Op::Merge { source: "feat/x".into(), target: "master".into() },
+            project_id: project.into(),
+            project_root: "C:/repo".into(),
+            origin,
+        }
+    }
+
+    async fn status_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     async fn insert(pool: &sqlx::SqlitePool, project: &str, status: &str) -> sqlx::Result<()> {
@@ -117,5 +216,23 @@ mod tests {
     #[test]
     fn a_payload_that_contradicts_its_column_is_refused() {
         assert!(Op::from_stored("merge", r#"{"op":"rm_rf"}"#).is_err());
+    }
+
+    /// A human's order in an interactive session already is the approval — asking again two
+    /// seconds later is friction with no safety gain.
+    #[tokio::test]
+    async fn a_human_request_needs_no_second_approval() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// An autonomous run's request is not a human's order; nothing has consented to it yet, so it
+    /// must wait for a human before it can queue.
+    #[tokio::test]
+    async fn an_autonomous_request_waits_for_approval_before_it_can_queue() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        assert_eq!(status_of(&pool, id).await, "awaiting_approval");
     }
 }
