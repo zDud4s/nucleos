@@ -162,6 +162,14 @@ mod tests {
             .unwrap()
     }
 
+    async fn run_id_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
+        sqlx::query_scalar("SELECT run_id FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     async fn insert(pool: &sqlx::SqlitePool, project: &str, status: &str) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at)
@@ -252,5 +260,24 @@ mod tests {
         let pool = test_pool().await;
         let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
         assert_eq!(status_of(&pool, id).await, "awaiting_approval");
+    }
+
+    /// A job's id must not land in a column named `run_id`.
+    ///
+    /// The two ids come from different sequences, so a job written there reads as a run that
+    /// happens to share its number — wrong in the way that looks right. Neither admission test
+    /// above would notice: both assert only on `status`, so binding NULL always, or binding the
+    /// job id too, passes them. This test is the only thing holding that decision in place.
+    #[tokio::test]
+    async fn only_a_run_puts_its_id_in_run_id() {
+        let pool = test_pool().await;
+
+        let from_run = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        let from_job = submit(&pool, &request_for("beta", Origin::Job(7)))
+            .await
+            .unwrap();
+
+        assert_eq!(run_id_of(&pool, from_run).await, Some(7));
+        assert_eq!(run_id_of(&pool, from_job).await, None);
     }
 }
