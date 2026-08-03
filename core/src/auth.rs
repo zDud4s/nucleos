@@ -166,6 +166,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // the mail queue beside it. It reaches no network.
     (Method::GET, "/web/pages"),
     (Method::GET, "/web/pages/{id}"),
+    // Reading one queued git operation's state. A ticket says what was asked for and how it ended;
+    // it starts nothing, runs nothing and holds no repository.
+    //
+    // `GET /vcs/requests/{id}/wait` is deliberately NOT here, though it reads the same row. It
+    // differs only in holding the connection for up to 45 seconds, and anyone who may read a ticket
+    // can poll the route above instead — so listing it would hand the longest-held connection in
+    // this API to the weakest key, buying nothing and costing a cheap way to tie the daemon up.
+    (Method::GET, "/vcs/requests/{id}"),
     // Searching is listed here because the alternative is worse, not because it is free: it does
     // send a query off this machine. But it starts no run, holds no tools, and returns titles and
     // URLs — and a read-only key that cannot search would push every caller to Admin, which is the
@@ -488,6 +496,10 @@ mod tests {
             .route(HOOK_ROUTE, post(|| async { "decided" }))
             .route("/proposals/{id}/approve", post(|| async {}))
             .route("/worktrees/{run_id}/release", post(|| async {}))
+            // Both spellings, because the point of the test below is that they are graded
+            // differently: reading a ticket is a read, submitting work to the queue is not.
+            .route("/vcs/requests", post(|| async {}))
+            .route("/vcs/requests/{id}", get(|| async {}))
             .route("/shadow-decisions", get(|| async {}))
             .route("/shadow-decisions/{id}/verdict", post(|| async {}))
             .route("/scoreboard", get(|| async {}))
@@ -848,6 +860,31 @@ mod tests {
                 .iter()
                 .any(|(_, pattern)| *pattern == SEND_ROUTE),
             "sending must not ride in on the permission to start a run"
+        );
+    }
+
+    /// A queue a read-only key can drive is not a brake.
+    ///
+    /// Written here rather than beside the handlers because `protected_router` and `status_of` are
+    /// private to this module — and because nothing else would catch the mistake. The exactness test
+    /// above walks `READ_ONLY_ROUTES`, never the axum router, so a route added to `http.rs` and
+    /// forgotten in the table is a silently-privileged route with a green suite. This is the only
+    /// thing standing between that and shipping.
+    #[tokio::test]
+    async fn a_read_only_api_key_may_read_a_vcs_ticket_but_not_queue_work() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "GET", "/vcs/requests/7", &token).await,
+            StatusCode::OK,
+            "reading a ticket starts nothing and holds no repository"
+        );
+        assert_eq!(
+            status_of(&app, "POST", "/vcs/requests", &token).await,
+            StatusCode::FORBIDDEN,
+            "submitting an operation to the queue is not a read"
         );
     }
 

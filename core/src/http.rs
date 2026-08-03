@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::attention::{self, AttentionScope};
-use crate::auth::{ApiTokenLevel, mint_api_token, require_token};
+use crate::auth::{ApiTokenLevel, Scope, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::backup;
 use crate::budget;
@@ -21,6 +21,7 @@ use crate::presets;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
+use crate::vcs;
 use crate::worktree::{self, ReleaseOutcome};
 
 pub fn build_router(state: AppState) -> Router {
@@ -105,6 +106,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proposals", get(get_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
+        .route("/vcs/requests", post(submit_vcs_request))
+        // Two spellings of one read, separated only by how long the caller is willing to hold the
+        // line. `/wait` blocks up to `vcs::DEFAULT_WAIT`; the bare route is the same read with a
+        // zero deadline, which `wait_for` answers from its first look at the row.
+        .route("/vcs/requests/{id}", get(get_vcs_request))
+        .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -2117,6 +2124,95 @@ async fn get_runs(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// What a caller may say when asking the VCS queue for something.
+///
+/// Two fields the queue needs are deliberately NOT here, and their absence is the security posture:
+///
+/// - **`project_root`** is resolved from `autopilot_state` via `resolve_project_root`. A caller that
+///   could name the repository root could point the daemon's git at any directory the daemon can
+///   reach, which is the same reason `inspect.rs` "never resolves a root itself".
+/// - **`origin`** comes from the bearer token's scope. `hooks.rs` states the rule this follows: a
+///   value in the body is a claim the caller makes about itself, and here that claim decides whether
+///   a human still has to approve the operation — precisely the thing a caller must not choose.
+#[derive(Deserialize)]
+struct VcsRequestBody {
+    project_id: String,
+    operation: vcs::Op,
+}
+
+/// Who the queue records as having asked, derived from the key that authenticated the call.
+///
+/// `Run` cannot reach this route today — a run token opens exactly one route, the safety gate — but
+/// mapping it costs nothing and is already correct for the chunk that opens the MCP door, which is
+/// the first thing that will produce an autonomous request. `Service` and the lesser API levels are
+/// refused rather than guessed at: `permits` should already have turned them away, and a scope that
+/// arrives here unaccounted for is a routing bug, not a request to serve under a default.
+fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
+    match scope {
+        Scope::Control => Ok(vcs::Origin::Human),
+        Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Shell),
+        Scope::Run(id) => Ok(vcs::Origin::Run(*id)),
+        Scope::Service(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+async fn submit_vcs_request(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(body): Json<VcsRequestBody>,
+) -> Result<Json<vcs::Ticket>, StatusCode> {
+    let origin = vcs_origin(&scope)?;
+    let project_root = resolve_project_root(&state, &body.project_id).await?;
+    let request = vcs::SubmitRequest {
+        op: body.operation,
+        project_id: body.project_id,
+        project_root: project_root.to_string_lossy().into_owned(),
+        origin,
+    };
+    let id = vcs::submit(&state.pool, &request).await.map_err(|error| {
+        tracing::warn!(%error, "submitting a vcs request failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    // Answered with a zero deadline rather than a bare id: the caller gets the same shape back from
+    // submitting as from asking later, so nothing has to special-case the first reply.
+    vcs_ticket(&state, id, std::time::Duration::ZERO).await
+}
+
+async fn get_vcs_request(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<vcs::Ticket>, StatusCode> {
+    vcs_ticket(&state, id, std::time::Duration::ZERO).await
+}
+
+/// Blocks up to `vcs::DEFAULT_WAIT`, then hands back whatever the ticket says.
+///
+/// Deliberately NOT wrapped in `uncancellable`: this handler only ever reads, so a client that
+/// disconnects mid-wait costs a dropped `SELECT` loop and nothing else. The rule it must keep
+/// obeying is the other one — `vcs::drain_once` executes git and must never be awaited from a
+/// handler, because a disconnect there would strand a claimed row and jam the repository.
+async fn wait_vcs_request(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<vcs::Ticket>, StatusCode> {
+    vcs_ticket(&state, id, vcs::DEFAULT_WAIT).await
+}
+
+async fn vcs_ticket(
+    state: &AppState,
+    id: i64,
+    deadline: std::time::Duration,
+) -> Result<Json<vcs::Ticket>, StatusCode> {
+    match vcs::wait_for(&state.pool, id, deadline).await {
+        Ok(ticket) => Ok(Json(ticket)),
+        Err(sqlx::Error::RowNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, id, "reading a vcs request failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 fn preset_status(error: &presets::PresetError) -> StatusCode {
     match error {
         presets::PresetError::DuplicateName => StatusCode::CONFLICT,
@@ -2754,6 +2850,91 @@ mod tests {
             },
             dir,
         )
+    }
+
+    /// A request submitted over HTTP comes back as a ticket, and the same ticket is readable after.
+    ///
+    /// The `autopilot_state` row is not scene-setting: it is the whole reason the body carries no
+    /// `project_root`. Without a registered project the submit is a 404, which is the behaviour that
+    /// keeps a caller from naming a directory for the daemon's git to work in.
+    #[tokio::test]
+    async fn a_vcs_request_submitted_over_http_is_readable_as_a_ticket() {
+        let (state, _dir) = file_test_state().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', 'C:/repo')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .route("/vcs/requests/{id}", get(get_vcs_request))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let submitted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"alpha","operation":{"op":"merge","source":"feat/x","target":"master"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submitted.status(), StatusCode::OK);
+        let ticket: vcs::Ticket = serde_json::from_slice(
+            &axum::body::to_bytes(submitted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ticket.status, "queued",
+            "a human's own order carries its approval and queues at once"
+        );
+
+        let fetched = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/vcs/requests/{}", ticket.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+    }
+
+    /// A project the daemon does not know is a 404, not a merge in a directory somebody named.
+    #[tokio::test]
+    async fn a_vcs_request_for_an_unregistered_project_is_refused() {
+        let (state, _dir) = file_test_state().await;
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"nowhere","operation":{"op":"merge","source":"a","target":"b"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn backup_request(

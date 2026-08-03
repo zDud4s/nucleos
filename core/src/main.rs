@@ -212,6 +212,27 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "orphaned-job reconciliation failed"),
     }
 
+    // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
+    // below, so it is logged louder than either while still letting the daemon start.
+    //
+    // A `vcs_requests` row left `running` holds its repository's only slot — the partial unique
+    // index sees to that — so failing to clear it means no git operation for that project until
+    // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
+    // refusing to boot mail, voice, calendar and runs over it would trade a stuck repository for a
+    // stuck machine.
+    match vcs::reconcile_interrupted(&pool).await {
+        Ok(released) if released > 0 => {
+            tracing::warn!(
+                "reconciled {released} vcs request(s) left 'running' by a previous crash -> 'interrupted'"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(
+            %error,
+            "vcs request reconciliation failed — a repository may stay queue-locked until this succeeds"
+        ),
+    }
+
     // After the run reconciliations above, so nothing from a previous life still counts as live.
     match worktree::reconcile_orphaned_worktrees(
         &pool,

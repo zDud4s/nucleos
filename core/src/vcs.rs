@@ -372,6 +372,16 @@ pub struct Ticket {
 
 /// How often `wait_for` re-checks a row that has not reached a terminal status yet.
 ///
+/// How long a caller that asked to wait is made to wait before it gets a ticket instead.
+///
+/// Spec decision 3. The common case — an empty queue — answers from the first read and never
+/// approaches this. The bad case is two merges queued behind a slow one, and the number exists so
+/// that case stops killing the caller's run by timeout: the agent gets a ticket back and decides for
+/// itself whether to keep waiting. 45s is under every run timeout in `state.rs` (the shortest is
+/// 600s) with room to spare, which is the property that matters — a wait that outlived the run
+/// waiting on it would be worse than no wait at all.
+pub const DEFAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// 25ms, chosen from two directions that happen to agree.
 ///
 /// In production it bounds how often one waiting caller queries: against the ~45s deadline this
