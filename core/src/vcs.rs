@@ -190,21 +190,47 @@ pub async fn claim_next(
     let Some((id, op, args, project_id, project_root)) = claimed else {
         return Ok(None);
     };
-    // A row whose stored operation will not parse is an error, never `Ok(None)`. `None` means "come
-    // back later", which is a lie here — the row is unexecutable and no amount of waiting fixes it,
-    // and a caller that polls would silently skip it forever. The row does stay `running`, which
-    // holds the repository until startup reconciliation clears it; that is the conservative half of
-    // the trade, since the daemon has just learned it cannot tell what this row asked for and
-    // guessing is worse than pausing.
-    let op = Op::from_stored(&op, &args).map_err(|error| {
-        sqlx::Error::Protocol(format!("vcs request {id} cannot be executed: {error}"))
-    })?;
-    Ok(Some(ClaimedRequest {
-        id,
-        op,
-        project_id,
-        project_root,
-    }))
+    // A row whose stored operation will not parse is an error, never `Ok(None)`: `None` means "come
+    // back later", and no amount of waiting makes an unexecutable row executable.
+    //
+    // The claim has already committed by the time the payload is read, so returning that error on
+    // its own would leave the row `running` and hold this repository's only slot until the next
+    // daemon restart — the jam `core/AGENTS.md` § "Cancellation safety" describes for
+    // `one_open_worktree_run_per_project`, where a run stranded at `running` "blocks *every* later
+    // worktree run for that project". A queue that can trap the repository it exists to protect is
+    // not doing its job, so this path hands the slot back before it returns.
+    match Op::from_stored(&op, &args) {
+        Ok(op) => Ok(Some(ClaimedRequest {
+            id,
+            op,
+            project_id,
+            project_root,
+        })),
+        Err(error) => {
+            let reason =
+                format!("stored operation for vcs request {id} could not be parsed: {error}");
+            // Terminal rather than back to `queued`: re-queueing would hand the same unparseable
+            // row out again on the next poll, forever. `exit_code` is `None` and `output_tail`
+            // empty because nothing ran — this row never reached an argv.
+            //
+            // Its error is dropped on purpose. The parse failure is what propagates either way: it
+            // is the more informative of the two — naming the defect rather than its symptom — and
+            // a database that cannot accept this write will announce itself on the caller's very
+            // next query anyway. Substituting the write error would hide a corrupt row behind
+            // something that reads as transient.
+            let _ = finish(
+                pool,
+                id,
+                Outcome::Failed {
+                    reason: reason.clone(),
+                    exit_code: None,
+                    output_tail: String::new(),
+                },
+            )
+            .await;
+            Err(sqlx::Error::Protocol(reason))
+        }
+    }
 }
 
 /// Releases the repository by writing the claimed request's terminal status.
@@ -445,6 +471,39 @@ mod tests {
 
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
         assert!(claim_next(&pool, "beta").await.unwrap().is_some());
+    }
+
+    /// A row nobody can execute must not take the repository down with it.
+    ///
+    /// The claim commits before the payload is parsed, so the obvious failure path — return the
+    /// error — leaves the row `running` and holds alpha's only slot until the daemon restarts. The
+    /// status assertion alone would not catch that: what proves the repository was actually freed
+    /// is that the *next* claim returns the following request instead of `None`.
+    #[tokio::test]
+    async fn a_row_that_cannot_be_parsed_frees_the_repository_instead_of_jamming_it() {
+        let pool = test_pool().await;
+        // Written directly: `submit` cannot produce this row, which is the point — it comes from a
+        // hand-edited row or a downgrade that no longer knows an operation a newer build wrote.
+        let corrupt = sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at)
+             VALUES ('merge', '{\"op\":\"rm_rf\"}', 'alpha', 'C:/repo', 'human', 'queued', '2026-08-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let behind_it = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        assert!(
+            claim_next(&pool, "alpha").await.is_err(),
+            "an unexecutable row is an error, not a wait"
+        );
+        assert_eq!(status_of(&pool, corrupt).await, "failed");
+        assert_eq!(
+            claim_next(&pool, "alpha").await.unwrap().unwrap().id,
+            behind_it,
+            "the queue must move on, not hold alpha until the daemon restarts"
+        );
     }
 
     /// The queue must never hand out work that cannot execute — a head blocked on a sleeping human
