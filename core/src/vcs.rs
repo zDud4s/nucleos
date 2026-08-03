@@ -117,6 +117,129 @@ pub async fn submit(pool: &sqlx::SqlitePool, request: &SubmitRequest) -> sqlx::R
     Ok(result.last_insert_rowid())
 }
 
+/// A request the caller now holds: its row is already `running`, so nothing else for the same
+/// repository can be claimed until `finish` writes a terminal status.
+///
+/// It carries everything an execution needs — the operation and where to perform it — because the
+/// claim already read that row, and a worker that went back for `project_root` would be reading it
+/// at a moment when the row it holds could no longer be trusted to be the same.
+#[derive(Debug, Clone)]
+pub struct ClaimedRequest {
+    pub id: i64,
+    pub op: Op,
+    pub project_id: String,
+    pub project_root: String,
+}
+
+/// How a claimed request ended.
+///
+/// There is deliberately no `blocked` variant yet: the `status` CHECK already accepts the string,
+/// but nothing in this chunk can produce that state — it becomes reachable only once publishing
+/// exists — and a variant nothing constructs is dead weight the compiler is right to complain
+/// about. The schema is already ready for it.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    Succeeded {
+        sha: String,
+    },
+    Failed {
+        reason: String,
+        exit_code: Option<i32>,
+        output_tail: String,
+    },
+}
+
+/// Takes the oldest claimable request for one repository and marks it `running`, or returns `None`.
+///
+/// `None` covers all three ordinary reasons there is nothing to do: nothing is queued, something is
+/// already running for this repository, or the only rows are still `awaiting_approval` — a caller
+/// waits the same way in each case, so they are not worth distinguishing.
+///
+/// One conditional `UPDATE`, never a `SELECT` then an `UPDATE`. The gap between those two
+/// statements is exactly the race this module exists to remove: both callers would read the same
+/// queued head and both would believe they own the repository. Here the winner is decided inside a
+/// single statement — `NOT EXISTS` is the arbiter, so a losing caller updates zero rows and simply
+/// waits rather than erroring on the unique index. That index is the backstop that makes a bug in
+/// this guard impossible to ship silently, not the everyday mechanism.
+///
+/// `?2` appears twice but is bound once: SQLite numbers placeholder slots by their highest index,
+/// not by how often each occurs, so this statement has two parameters and takes exactly two binds.
+pub async fn claim_next(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<Option<ClaimedRequest>> {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let claimed: Option<(i64, String, String, String, String)> = sqlx::query_as(
+        "UPDATE vcs_requests
+            SET status = 'running', started_at = ?1
+          WHERE id = (
+              SELECT id FROM vcs_requests
+               WHERE project_id = ?2 AND status = 'queued'
+               ORDER BY id LIMIT 1
+          )
+            AND NOT EXISTS (
+              SELECT 1 FROM vcs_requests WHERE project_id = ?2 AND status = 'running'
+            )
+         RETURNING id, op, args, project_id, project_root",
+    )
+    .bind(started_at)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((id, op, args, project_id, project_root)) = claimed else {
+        return Ok(None);
+    };
+    // A row whose stored operation will not parse is an error, never `Ok(None)`. `None` means "come
+    // back later", which is a lie here — the row is unexecutable and no amount of waiting fixes it,
+    // and a caller that polls would silently skip it forever. The row does stay `running`, which
+    // holds the repository until startup reconciliation clears it; that is the conservative half of
+    // the trade, since the daemon has just learned it cannot tell what this row asked for and
+    // guessing is worse than pausing.
+    let op = Op::from_stored(&op, &args).map_err(|error| {
+        sqlx::Error::Protocol(format!("vcs request {id} cannot be executed: {error}"))
+    })?;
+    Ok(Some(ClaimedRequest {
+        id,
+        op,
+        project_id,
+        project_root,
+    }))
+}
+
+/// Releases the repository by writing the claimed request's terminal status.
+///
+/// The columns an outcome does not carry are written NULL rather than left alone: one statement
+/// covers both outcomes, and NULL is already what those columns hold for a row that has only ever
+/// been queued and claimed.
+pub async fn finish(pool: &sqlx::SqlitePool, id: i64, outcome: Outcome) -> sqlx::Result<()> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let (status, result_sha, failure_reason, exit_code, output_tail) = match outcome {
+        Outcome::Succeeded { sha } => ("succeeded", Some(sha), None, None, None),
+        Outcome::Failed {
+            reason,
+            exit_code,
+            output_tail,
+        } => ("failed", None, Some(reason), exit_code, Some(output_tail)),
+    };
+    sqlx::query(
+        "UPDATE vcs_requests
+            SET status = ?, finished_at = ?, result_sha = ?, failure_reason = ?,
+                exit_code = ?, output_tail = ?
+          WHERE id = ?",
+    )
+    .bind(status)
+    .bind(finished_at)
+    .bind(result_sha)
+    .bind(failure_reason)
+    .bind(exit_code)
+    .bind(output_tail)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +402,57 @@ mod tests {
 
         assert_eq!(run_id_of(&pool, from_run).await, Some(7));
         assert_eq!(run_id_of(&pool, from_job).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_queue_is_served_in_arrival_order() {
+        let pool = test_pool().await;
+        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        assert_eq!(claim_next(&pool, "alpha").await.unwrap().unwrap().id, first);
+        assert!(
+            claim_next(&pool, "alpha").await.unwrap().is_none(),
+            "the second request must wait: alpha already has one running"
+        );
+
+        finish(
+            &pool,
+            first,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_next(&pool, "alpha").await.unwrap().unwrap().id,
+            second
+        );
+    }
+
+    /// Serializing repositories that cannot touch each other would make this a bottleneck rather than
+    /// a brake.
+    #[tokio::test]
+    async fn separate_repositories_do_not_wait_on_each_other() {
+        let pool = test_pool().await;
+        submit(&pool, &request_for("alpha", Origin::Human))
+            .await
+            .unwrap();
+        submit(&pool, &request_for("beta", Origin::Human))
+            .await
+            .unwrap();
+
+        assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
+        assert!(claim_next(&pool, "beta").await.unwrap().is_some());
+    }
+
+    /// The queue must never hand out work that cannot execute — a head blocked on a sleeping human
+    /// blocks every agent behind it. That is the whole reason approval precedes admission.
+    #[tokio::test]
+    async fn nothing_awaiting_approval_is_ever_claimable() {
+        let pool = test_pool().await;
+        submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        assert!(claim_next(&pool, "alpha").await.unwrap().is_none());
     }
 }
