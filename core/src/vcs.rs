@@ -351,6 +351,97 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     Ok(())
 }
 
+/// What `wait_for` hands back: either the row's outcome, if the wait caught it before the deadline,
+/// or its current in-flight status if not.
+///
+/// Serializable because it crosses the boundary Task 8 adds: an agent's blocking merge request gets
+/// exactly this back as its HTTP response body, whether the queue answered inside the deadline or
+/// not.
+///
+/// `status` is the same string the `status` column holds rather than an enum: `blocked`,
+/// `rejected` and `cancelled` are already in that column's CHECK constraint even though nothing in
+/// this module writes them yet (see `Outcome`'s doc comment), and a `Ticket` round-trips whichever
+/// one a row holds without this module needing to know what it means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ticket {
+    pub id: i64,
+    pub status: String,
+    pub result_sha: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+/// How often `wait_for` re-checks a row that has not reached a terminal status yet.
+///
+/// 10ms against this file's 50ms test deadlines leaves several polls of room before the deadline
+/// arrives, rather than betting on one sleep landing exactly on the boundary, while staying far
+/// coarser than a real git operation — so the common case (a request that finishes almost
+/// immediately) never pays for a poll at all; see `a_finished_request_returns_its_outcome_without_waiting`.
+/// A `Notify` would remove the wait entirely, but nothing here has a real operation duration yet to
+/// make that worth the added machinery — the same tradeoff `drain_once`'s doc comment argues for
+/// `VcsExecutor` staying a plain trait rather than a channel.
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
+/// comes first — and returns a `Ticket` either way.
+///
+/// Never an error for "still going": a caller told the wait failed would reasonably retry or give
+/// up, and both are wrong when the request is simply still queued behind another. The common case —
+/// an empty queue — answers from the very first read, before any sleep, so it behaves like an
+/// ordinary blocking call. The bad case — two merges queued behind a slow one — stops costing the
+/// caller a hard timeout: it gets a ticket back instead and decides for itself whether to keep
+/// waiting.
+///
+/// Terminal means `succeeded`, `failed`, or `interrupted` — the three statuses `finish` and
+/// `reconcile_interrupted` actually write today, matching the vocabulary those two already use (see
+/// `finish`'s own doc comment, and the interrupted-is-terminal test above). `queued`, `running` and
+/// `awaiting_approval` are treated identically: all three can still change, so none of them ends the
+/// wait early, and if the deadline passes while a row is in any of them the ticket just reports
+/// whichever one it is. `awaiting_approval` is deliberately not special-cased to end the wait
+/// sooner — a human approving mid-wait is exactly the change this loop is built to catch on its next
+/// poll, and treating "needs a human" as if it were "done" would tell an agent to stop watching a
+/// request that is very much still alive.
+///
+/// An `id` with no matching row is answered `Err(RowNotFound)` on the very first read, without
+/// spending any of the deadline: every id in circulation came from `submit`, which hands one back
+/// only after its INSERT has committed, and nothing in this module ever deletes a row. So a missing
+/// row is not "hasn't arrived yet" — it cannot ever arrive — and polling it out to the deadline
+/// would just be quietly burning the caller's wait on a request that does not exist.
+///
+/// Reads before it ever sleeps, and every subsequent iteration does the same: the terminal check
+/// runs on freshly read data, not on whatever the previous iteration saw, so a row that finishes
+/// between two polls is reported the moment the next read sees it rather than after the deadline.
+pub async fn wait_for(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    deadline: std::time::Duration,
+) -> sqlx::Result<Ticket> {
+    let started = std::time::Instant::now();
+    loop {
+        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT status, result_sha, failure_reason FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some((status, result_sha, failure_reason)) = row else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+
+        let terminal = matches!(status.as_str(), "succeeded" | "failed" | "interrupted");
+        if terminal || started.elapsed() >= deadline {
+            return Ok(Ticket {
+                id,
+                status,
+                result_sha,
+                failure_reason,
+            });
+        }
+
+        tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+    }
+}
+
 /// Marks every request still `running` at startup as `interrupted` — the daemon died mid-operation,
 /// and nothing can say whether git finished. Called once at startup, the same moment
 /// `runs::reconcile_orphaned_runs` runs its counterpart pass over `runs`.
@@ -1389,6 +1480,159 @@ mod tests {
         assert!(
             claim_next(&pool, "alpha").await.unwrap().is_some(),
             "once reconciled, the repository is free again"
+        );
+    }
+
+    /// The empty-queue common case: the request is already `succeeded` before `wait_for` is ever
+    /// called, so the answer must come from the first read — no sleep, no `WAIT_POLL_INTERVAL`
+    /// paid at all.
+    #[tokio::test]
+    async fn a_finished_request_returns_its_outcome_without_waiting() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+
+        let started = std::time::Instant::now();
+        let ticket = wait_for(&pool, id, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(ticket.status, "succeeded");
+        assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
+        // The name's actual claim: without this, a loop that sleeps before its first read would
+        // report the same status and sha 50ms later and still pass every assertion above. A single
+        // in-memory read takes microseconds; one `WAIT_POLL_INTERVAL` sleep alone is 10ms, so this
+        // is not a close margin — it is the difference between "never slept" and "slept at all".
+        assert!(
+            started.elapsed() < WAIT_POLL_INTERVAL,
+            "an already-finished request must answer from the first read, not pay for a poll"
+        );
+    }
+
+    /// The deadline hands back a ticket, never an error: "still queued" is not a failure, and an agent
+    /// told it failed would either give up or retry — both wrong.
+    #[tokio::test]
+    async fn an_unfinished_request_hands_back_a_ticket_rather_than_failing() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        let ticket = wait_for(&pool, id, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(ticket.status, "queued");
+        assert!(ticket.result_sha.is_none());
+    }
+
+    /// The two tests above never read `failure_reason` or `id` — both come out `None`/moot in
+    /// every case they cover, so a `wait_for` that dropped `failure_reason`, or swapped it for
+    /// `output_tail`, would still pass them. A failed request is the only scenario that puts a real
+    /// value in that column, so it is the only thing that can catch that class of bug.
+    #[tokio::test]
+    async fn a_failed_requests_ticket_carries_its_id_and_its_reason() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        drain_once(
+            &pool,
+            "alpha",
+            &FakeVcsExecutor::failing_with("CONFLICT (content)"),
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let ticket = wait_for(&pool, id, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_eq!(ticket.id, id);
+        assert_eq!(ticket.status, "failed");
+        assert!(
+            ticket.result_sha.is_none(),
+            "nothing succeeded, so there is no commit"
+        );
+        assert_eq!(ticket.failure_reason.as_deref(), Some("CONFLICT (content)"));
+        // Without this, a `wait_for` that dropped `failed` from its terminal set would still
+        // report the right content 50ms later once the deadline forced an answer, and every
+        // assertion above would still pass. This is what actually proves `failed` ends the wait as
+        // fast as `succeeded` does, rather than merely agreeing with it once time runs out.
+        assert!(
+            started.elapsed() < WAIT_POLL_INTERVAL,
+            "a failed request must answer from the first read, not pay for a poll"
+        );
+    }
+
+    /// A caller waiting on an id nothing ever inserted must not spend the deadline finding that
+    /// out. Every id in circulation came from `submit`, which hands one back only after its INSERT
+    /// commits, and nothing in this module ever deletes a row — so a missing row can never later
+    /// appear, and treating it like "not finished yet" would silently burn the whole wait on a
+    /// request that does not exist.
+    #[tokio::test]
+    async fn waiting_on_an_unknown_id_fails_immediately_rather_than_waiting_out_the_deadline() {
+        let pool = test_pool().await;
+        let started = std::time::Instant::now();
+
+        let result = wait_for(&pool, 999_999, Duration::from_secs(5)).await;
+
+        assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
+        // Two orders of magnitude under the 5s deadline: not a close race, just proof this
+        // returned from the first read rather than polling until the deadline passed.
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "an id that can never exist must not cost the caller the deadline"
+        );
+    }
+
+    /// `awaiting_approval` is not treated as done: a human still has to act on it, and an agent
+    /// told its request had reached a stable end state would stop watching a request that is very
+    /// much still alive. It is handled exactly like `queued` — reported as-is once the deadline
+    /// passes, never ending the wait early.
+    #[tokio::test]
+    async fn a_request_still_awaiting_approval_hands_back_a_ticket_too() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+
+        let ticket = wait_for(&pool, id, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_eq!(ticket.status, "awaiting_approval");
+        assert!(ticket.result_sha.is_none());
+        assert!(ticket.failure_reason.is_none());
+    }
+
+    /// The actual point of a bounded wait, not just its two edges: a request that is still queued
+    /// when `wait_for` starts but finishes partway through a generous deadline must be reported as
+    /// soon as the next poll sees it — "if its turn comes, it gets the result" — not held until the
+    /// deadline passes regardless. Neither test above exercises this: one starts already finished,
+    /// the other never finishes at all, so a `wait_for` that read the row once and then only ever
+    /// re-checked the clock would pass both.
+    #[tokio::test]
+    async fn a_request_that_finishes_mid_wait_is_reported_before_the_deadline() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        // The deadline is two orders of magnitude past how long the operation actually takes: what
+        // this proves is that `wait_for` returns once the row finishes, not that it merely survives
+        // to a deadline that happens to still be far away.
+        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(5)), async {
+            // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
+            // a lucky initial read, is what has to notice the finish.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drain_once(&pool, "alpha", &executor).await
+        });
+
+        assert!(drained, "the operation ran");
+        let ticket = ticket.unwrap();
+        assert_eq!(ticket.status, "succeeded");
+        assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
+        // A 10x margin under the 5s deadline: the operation itself finishes around 25ms in and a
+        // 10ms poll interval should catch it shortly after, so 500ms is nowhere near a close race
+        // in either direction.
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_for must return once the request finishes, not hold the caller to the full \
+             deadline: took {:?}",
+            started.elapsed()
         );
     }
 }
