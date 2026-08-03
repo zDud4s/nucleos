@@ -810,4 +810,48 @@ mod tests {
             "an interrupted request is terminal and must record when"
         );
     }
+
+    /// The reconcile and a late `finish` have to compose, not merely each be correct.
+    ///
+    /// `finish`'s `AND status = 'running'` guard was written for this exact collision — a worker
+    /// whose future outlived the reconcile — but until now nothing put the two real functions in
+    /// sequence: the guard's own test reaches `interrupted` by writing that status by hand. So the
+    /// claim held by inspection of two SQL statements and by nothing else, which is how a guard
+    /// gets dropped in a refactor that only reads one of them.
+    ///
+    /// What is actually protected is the audit record: if the late write landed, a row a restart
+    /// interrupted would read `succeeded`, and the reason it says so would be gone.
+    #[tokio::test]
+    async fn a_reconciled_request_cannot_be_finished_by_a_late_worker() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        reconcile_interrupted(&pool).await.unwrap();
+
+        let late = finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(late, Err(sqlx::Error::RowNotFound)),
+            "a finish arriving after the reconcile must be refused, not silently applied"
+        );
+        assert_eq!(status_of(&pool, id).await, "interrupted");
+        let (reason, sha): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT failure_reason, result_sha FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("daemon restarted mid-operation"));
+        assert_eq!(
+            sha, None,
+            "the late write must not have left its sha behind"
+        );
+    }
 }
