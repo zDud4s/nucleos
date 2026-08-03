@@ -320,6 +320,46 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     Ok(())
 }
 
+/// Marks every request still `running` at startup as `interrupted` — the daemon died mid-operation,
+/// and nothing can say whether git finished. Called once at startup, the same moment
+/// `runs::reconcile_orphaned_runs` runs its counterpart pass over `runs`.
+///
+/// No auto-retry: a re-run `merge` is harmless, a re-run `tag` is not, and telling the two apart
+/// from a cold start is guessing. The row is left `interrupted` with a reason a human can act on,
+/// not silently re-queued.
+///
+/// One statement, not a `SELECT` then an `UPDATE`: nothing else is racing a fresh startup for these
+/// rows, so the two-step shape `claim_next`'s doc comment warns against is not the risk here — the
+/// single statement is simply the smaller diff to read `RETURNING id, project_id, run_id` off.
+///
+/// The feed write is best-effort per row (this crate's convention — see `runs.rs`, `job.rs`,
+/// `scheduler.rs`): it is observational, so a write it cannot make must not undo the row it is
+/// only reporting on. Contrast `finish`, where the terminal write itself is load-bearing.
+pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let reconciled: Vec<(i64, String, Option<i64>)> = sqlx::query_as(
+        "UPDATE vcs_requests
+            SET status = 'interrupted', finished_at = ?,
+                failure_reason = 'daemon restarted mid-operation'
+          WHERE status = 'running'
+         RETURNING id, project_id, run_id",
+    )
+    .bind(finished_at)
+    .fetch_all(pool)
+    .await?;
+    for (id, project_id, run_id) in &reconciled {
+        let _ = crate::feed::append(
+            pool,
+            Some(project_id.as_str()),
+            "vcs_request_interrupted",
+            &format!("vcs request {id} interrupted: daemon restarted mid-operation"),
+            *run_id,
+        )
+        .await;
+    }
+    Ok(reconciled.len() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +770,44 @@ mod tests {
         let pool = test_pool().await;
         submit(&pool, &request(Origin::Run(7))).await.unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_none());
+    }
+
+    /// A `running` row at startup means the daemon died mid-operation, and nothing can say whether git
+    /// finished. Auto-retry is not an option: a re-run `merge` is harmless, a re-run `tag` is not, and
+    /// telling them apart from a cold start is guessing. It is recorded and left for a human — the
+    /// same call `runs::reconcile_orphaned_runs` makes.
+    #[tokio::test]
+    async fn a_request_running_at_startup_is_marked_interrupted_not_retried() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+
+        let reconciled = reconcile_interrupted(&pool).await.unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "interrupted");
+        assert!(
+            claim_next(&pool, "alpha").await.unwrap().is_none(),
+            "an interrupted request must not re-enter the queue by itself"
+        );
+        // The status and the "does not re-enter the queue" assertions above would both still pass
+        // if `reconcile_interrupted` matched every row but wrote `failure_reason` and `finished_at`
+        // as NULL, or if it reported the wrong row count to its caller (Task 8 relies on the count
+        // to decide whether to log anything). `failure_reason` in particular is the only thing that
+        // will ever tell a human this was a restart rather than an ordinary failure.
+        assert_eq!(reconciled, 1);
+        let (failure_reason, finished_at): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT failure_reason, finished_at FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            failure_reason.as_deref(),
+            Some("daemon restarted mid-operation")
+        );
+        assert!(
+            finished_at.is_some(),
+            "an interrupted request is terminal and must record when"
+        );
     }
 }
