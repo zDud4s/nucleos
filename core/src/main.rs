@@ -41,6 +41,7 @@ mod storage;
 mod transcribe;
 mod triage;
 mod trust;
+mod vcs;
 mod voice;
 mod web;
 mod web_client;
