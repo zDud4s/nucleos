@@ -27,7 +27,9 @@ impl Op {
     pub fn from_stored(kind: &str, args: &str) -> Result<Self, String> {
         let parsed: Self = serde_json::from_str(args).map_err(|error| error.to_string())?;
         if parsed.kind() != kind {
-            return Err(format!("stored op column {kind} disagrees with its payload"));
+            return Err(format!(
+                "stored op column {kind} disagrees with its payload"
+            ));
         }
         Ok(parsed)
     }
@@ -92,7 +94,11 @@ pub struct SubmitRequest {
 /// into `queued`, or `rejected` — belongs to Chunk 4 alongside the `proposals.rs` wiring that
 /// grants it; this function only ever writes the initial state.
 pub async fn submit(pool: &sqlx::SqlitePool, request: &SubmitRequest) -> sqlx::Result<i64> {
-    let status = if request.origin.needs_approval() { "awaiting_approval" } else { "queued" };
+    let status = if request.origin.needs_approval() {
+        "awaiting_approval"
+    } else {
+        "queued"
+    };
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, run_id, status, created_at)
@@ -138,7 +144,10 @@ mod tests {
 
     fn request_for(project: &str, origin: Origin) -> SubmitRequest {
         SubmitRequest {
-            op: Op::Merge { source: "feat/x".into(), target: "master".into() },
+            op: Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
             project_id: project.into(),
             project_root: "C:/repo".into(),
             origin,
@@ -173,10 +182,15 @@ mod tests {
     async fn only_one_request_may_run_per_repository() {
         let pool = test_pool().await;
 
-        insert(&pool, "alpha", "running").await.expect("the first running request is allowed");
+        insert(&pool, "alpha", "running")
+            .await
+            .expect("the first running request is allowed");
 
         let second = insert(&pool, "alpha", "running").await;
-        assert!(second.is_err(), "a second running request for the same repository must be rejected");
+        assert!(
+            second.is_err(),
+            "a second running request for the same repository must be rejected"
+        );
 
         insert(&pool, "beta", "running")
             .await
@@ -193,8 +207,12 @@ mod tests {
     /// submitting process and the worker, which may be a daemon restart apart.
     #[test]
     fn an_operation_round_trips_through_its_stored_form() {
-        let op = Op::Merge { source: "feat/x".into(), target: "master".into() };
-        let back = Op::from_stored(op.kind(), &op.to_args()).expect("a stored operation must parse back");
+        let op = Op::Merge {
+            source: "feat/x".into(),
+            target: "master".into(),
+        };
+        let back =
+            Op::from_stored(op.kind(), &op.to_args()).expect("a stored operation must parse back");
         assert_eq!(back, op);
     }
 
