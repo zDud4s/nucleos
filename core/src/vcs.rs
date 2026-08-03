@@ -1,4 +1,32 @@
-// Chunk 1 deliberately lands the queue before Chunk 2 wires the worker loop and GitExecutor.
+//! The shared-state git/`gh` queue: at most one operation per repository, ever.
+//!
+//! Two agents deciding to merge at the same moment is the problem this exists for. Git's index and
+//! refs are shared state with no lock a second process can wait on politely, so the serialization
+//! has to happen before anything reaches an argv: both requests are admitted, and they run one after
+//! the other instead of colliding.
+//!
+//! Exclusivity is the database's job, not a mutex's. A partial unique index over `status = 'running'`
+//! holds it, so it survives the daemon restart a mutex would not — and `reconcile_interrupted` is
+//! what releases a slot that restart found still held.
+//!
+//! Requests are typed (`Op`), never command strings: parsing shell is the surface `classifier.rs`
+//! exists to keep closed, so the daemon builds every argv itself. This module decides WHEN an
+//! operation runs and records how it ended. It never decides whether the actor was allowed to ask
+//! (`autopilot.rs`, `budget.rs`, `wip.rs`, `proposals.rs`), and never what a merge should contain.
+
+// Chunk 1 lands the queue before Chunk 2 wires the worker loop and `GitExecutor`, so every item here
+// has a test caller and no production one.
+//
+// **Chunk 2 must delete this attribute** in the same commit that adds the worker loop, then fix what
+// the compiler reports rather than putting it back: anything still dead once a caller exists is dead
+// for a reason worth reading. If one item genuinely has no caller yet, narrow it to an
+// `#[allow(dead_code)]` on that item carrying the reason — do not keep the blanket.
+//
+// That instruction is the whole defence, because the descriptive version of this comment does not
+// get removed. `attention.rs:12-13` is this same line, and its "part 2" shipped long ago
+// (`scheduler.rs`, `repo_trigger.rs`, `job.rs` and `http.rs` all call `attention::` today) — the
+// attribute is still there, silencing a module nobody means to silence any more. `http.rs:721` and
+// `http.rs:4362` describe the same rot in `contacts.rs`.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
@@ -365,8 +393,15 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
 
 /// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
 /// decides *when* an operation may run and records how it ended, and this trait is the only thing
-/// that knows how to actually perform one. Chunk 2 adds the real `GitExecutor` behind it — Chunk 1
-/// has only the test double below, which is why nothing here builds an argv yet.
+/// that knows how to actually perform one. Chunk 1 has only the test double below, which is why
+/// nothing here builds an argv yet.
+///
+/// Chunk 2's real `GitExecutor` belongs in **its own module** (`git_exec.rs`), not in this file.
+/// Everything it needs — argv construction, a deadline, an output ceiling, capturing what the
+/// subprocess printed — is process transport, and the two comparable concerns in this crate,
+/// `gate.rs` and `transcribe.rs`, are each their own module for exactly that reason. Putting it here
+/// would make one file both the queue domain and the process transport, which is the coupling
+/// `core/AGENTS.md`'s module map exists to prevent.
 #[async_trait::async_trait]
 pub trait VcsExecutor: Send + Sync {
     /// Performs the claimed operation and reports how it ended.
@@ -380,15 +415,16 @@ pub trait VcsExecutor: Send + Sync {
 /// Claims, executes and finalizes exactly one request for one repository, and says whether it found
 /// anything to do — so a caller can drain until this returns `false` and only then wait.
 ///
-/// Nothing is propagated, because there is no caller left who could act on a `Result`. A claim that
-/// errored has already dealt with its own row — `claim_next` either records it terminal or rolls the
-/// whole claim back to `queued`, so either way this repository is not left holding it. A terminal
-/// write that failed is past the point where anything can be undone: the git command has run. Both
-/// are logged, which is the only thing that distinguishes them from an idle tick.
+/// Nothing is propagated, because there is no caller left who could act on a `Result`: this is the
+/// step a polling loop repeats. A claim that errored has already dealt with its own row —
+/// `claim_next` either records it terminal or rolls the whole claim back to `queued`, so either way
+/// this repository is not left holding it. What a failed *terminal* write costs is argued at the
+/// call site, where it gets read.
 ///
 /// `true` means a request was claimed and executed — including when the terminal write then failed,
-/// because the work did happen and a drain loop must not read that as "the queue was empty". It
-/// cannot spin on it either: the row stays `running`, so the next claim finds the repository busy
+/// because the work did happen and a drain loop must not read that as "the queue was empty". Neither
+/// failure path spins: a *refused* write leaves the row terminal, so the next claim moves on to the
+/// next request, and a *lost* one leaves it `running`, so the next claim finds the repository busy
 /// and returns `false`.
 ///
 /// **Cancellation** (`core/AGENTS.md` § "Cancellation safety"). `claim_next` could make its claim and
@@ -404,6 +440,10 @@ pub trait VcsExecutor: Send + Sync {
 /// describes for `one_open_worktree_run_per_project`. What keeps it acceptable is who calls this:
 /// Chunk 2's caller is a background loop owned by `main.rs`, whose future is dropped only when the
 /// daemon exits, which is precisely the case `reconcile_interrupted` exists for.
+///
+/// Both halves of that are run rather than argued —
+/// `a_drain_abandoned_mid_operation_jams_the_repository_until_a_restart_reconciles` drops a drain
+/// inside the operation, shows the repository jammed, and then shows the reconcile releasing it.
 ///
 /// **Do not await this inside an HTTP handler.** A client disconnecting mid-merge would strand the
 /// row and jam that repository until a restart, and unlike a lost reply nobody would see it happen.
@@ -435,16 +475,35 @@ pub async fn drain_once(
     };
     let id = claimed.id;
     let outcome = executor.execute(&claimed).await;
-    if let Err(error) = finish(pool, id, outcome).await {
-        // Not best-effort bookkeeping: this is the write that releases the repository. Losing it
-        // leaves the row `running` and every later request for this repository waiting behind it
-        // until a restart reconciles — so the log line is the only account of why the queue stopped.
-        tracing::error!(
-            vcs_request_id = id,
-            project_id = %project_id,
-            %error,
-            "could not record how a vcs request ended; it stays running until the daemon restarts"
-        );
+    // Cloned rather than moved so the failure paths below can still name it. `finish` consumes the
+    // outcome, and a refused write would otherwise drop the only copy of a sha that git really
+    // produced — leaving a commit the daemon caused recorded nowhere in the system at all.
+    if let Err(error) = finish(pool, id, outcome.clone()).await {
+        match error {
+            // Not a lost write: `finish` is scoped to `status = 'running'`, so this is the row being
+            // taken out from under the operation — a restart's `reconcile_interrupted` already marked
+            // it `interrupted`, the collision `a_reconciled_request_cannot_be_finished_by_a_late_worker`
+            // covers. The repository is NOT jammed; the row is terminal and the queue moves on. What
+            // is lost is the outcome, which the row is now refusing, so this log line is the only
+            // place it survives.
+            sqlx::Error::RowNotFound => tracing::warn!(
+                vcs_request_id = id,
+                project_id = %project_id,
+                ?outcome,
+                "a vcs request stopped running before its outcome arrived; the row refused it, so it is recorded here"
+            ),
+            // Anything else is the write itself failing, and that one does jam. This is the write
+            // that releases the repository: without it the row stays `running` and every later
+            // request for this repository waits behind it until a restart reconciles, so the log
+            // line is the only account of why the queue stopped.
+            error => tracing::error!(
+                vcs_request_id = id,
+                project_id = %project_id,
+                ?outcome,
+                %error,
+                "could not record how a vcs request ended; it stays running until the daemon restarts"
+            ),
+        }
     }
     true
 }
@@ -454,10 +513,19 @@ pub async fn drain_once(
 #[cfg(test)]
 struct FakeVcsExecutor {
     outcome: Outcome,
-    calls: std::sync::atomic::AtomicUsize,
-    /// What each call was actually handed, not merely how many there were. A fake that ignores its
-    /// argument answers identically whether the claim gave it the right row or another repository's.
-    seen: std::sync::Mutex<Vec<(Op, String, String)>>,
+    /// How long to take before answering. A real merge takes seconds, and a test about what happens
+    /// WHILE one runs — a drain abandoned mid-operation — needs a window to abandon it in. The same
+    /// reason `FakeTranscriber` carries one.
+    // Qualified rather than imported: the import would be unused in the non-test build.
+    delay: std::time::Duration,
+    /// Every request this was handed, in the order it was handed them.
+    ///
+    /// Recorded rather than counted, because a fake that ignores its argument answers identically
+    /// whether the claim gave it the right row or another repository's — and the order is what makes
+    /// the drain's FIFO promise checkable at all. Whole `ClaimedRequest`s rather than a tuple of
+    /// fields: two adjacent `String`s destructured positionally can be swapped with every assertion
+    /// still passing, which is the hazard `claim_next`'s own 5-tuple carries a warning about.
+    seen: std::sync::Mutex<Vec<ClaimedRequest>>,
 }
 
 #[cfg(test)]
@@ -466,30 +534,45 @@ impl FakeVcsExecutor {
         Self::reporting(Outcome::Succeeded { sha: sha.into() })
     }
 
-    /// `exit_code` and `output_tail` stand in for what git would have printed. Nothing asserts them
-    /// through the drain: `finish`'s handling of those two columns already has direct coverage in
-    /// `a_failed_request_records_why_and_what_it_printed`.
+    /// Answers, but not immediately.
+    fn succeeding_slowly(sha: &str, delay: std::time::Duration) -> Self {
+        Self {
+            delay,
+            ..Self::succeeding_with(sha)
+        }
+    }
+
+    /// `reason` and `output_tail` are deliberately different strings, so a test using this fake
+    /// cannot be blind to those two columns being swapped —
+    /// `a_failed_request_records_why_and_what_it_printed` uses distinct ones for the same reason.
+    ///
+    /// Neither is asserted *through* the drain. What that leaves untested is not whether `finish`
+    /// writes the columns, which has direct coverage, but whether `drain_once` forwards the
+    /// executor's outcome **whole** rather than rebuilding one of its own — and the drain test's
+    /// `result_sha` assertion stands for that, one field deep.
     fn failing_with(reason: &str) -> Self {
         Self::reporting(Outcome::Failed {
             reason: reason.into(),
             exit_code: Some(1),
-            output_tail: reason.into(),
+            output_tail: format!("git printed this while failing: {reason}"),
         })
     }
 
     fn reporting(outcome: Outcome) -> Self {
         Self {
             outcome,
-            calls: std::sync::atomic::AtomicUsize::new(0),
+            delay: std::time::Duration::ZERO,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    /// Derived from `seen` rather than kept beside it: a separate counter can drift from the list it
+    /// is supposed to describe, and then nothing says which of the two is right.
     fn calls(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        self.seen.lock().unwrap().len()
     }
 
-    fn seen(&self) -> Vec<(Op, String, String)> {
+    fn seen(&self) -> Vec<ClaimedRequest> {
         self.seen.lock().unwrap().clone()
     }
 }
@@ -498,12 +581,12 @@ impl FakeVcsExecutor {
 #[async_trait::async_trait]
 impl VcsExecutor for FakeVcsExecutor {
     async fn execute(&self, request: &ClaimedRequest) -> Outcome {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.seen.lock().unwrap().push((
-            request.op.clone(),
-            request.project_id.clone(),
-            request.project_root.clone(),
-        ));
+        // Recorded before the delay, not after: a drain abandoned mid-operation never reaches the
+        // line after the await, and a test of that case still needs to see the executor was entered.
+        // The guard is a temporary so it is dropped at the end of this statement — held across the
+        // await it would make this future non-`Send`, which `async_trait` requires.
+        self.seen.lock().unwrap().push(request.clone());
+        tokio::time::sleep(self.delay).await;
         self.outcome.clone()
     }
 }
@@ -512,8 +595,7 @@ impl VcsExecutor for FakeVcsExecutor {
 mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    // Task 7 adds `use std::time::Duration;` when it first needs it — adding it now would warn as
-    // an unused import on every run from here to Task 6.
+    use std::time::Duration;
 
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -553,6 +635,9 @@ mod tests {
             .unwrap()
     }
 
+    /// `expect` rather than defaulting a NULL to `""`: a regression that wrote no reason at all is
+    /// exactly what this is for, and collapsing it into an empty string turns that into a bare
+    /// `assertion failed` at the call site with no value to read.
     async fn failure_reason_of(pool: &sqlx::SqlitePool, id: i64) -> String {
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT failure_reason FROM vcs_requests WHERE id = ?",
@@ -561,7 +646,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
-        .unwrap_or_default()
+        .expect("a failed request records why it failed")
     }
 
     async fn run_id_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
@@ -1053,17 +1138,24 @@ mod tests {
         // reports the same two calls whether the claim gave it the right row or another
         // repository's, so counting alone cannot catch a `claim_next` that returns the wrong one.
         let seen = executor.seen();
-        assert_eq!(seen.len(), 2);
-        for (op, project_id, project_root) in seen {
+        // The order half of this test's name. Both rows end `succeeded` and every per-call
+        // assertion below is byte-identical for the two, so without the ids a `claim_next` serving
+        // newest-first would pass here unchanged.
+        assert_eq!(
+            seen.iter().map(|claimed| claimed.id).collect::<Vec<_>>(),
+            vec![first, second],
+            "the drain must serve the queue in arrival order"
+        );
+        for claimed in seen {
             assert_eq!(
-                op,
+                claimed.op,
                 Op::Merge {
                     source: "feat/x".into(),
                     target: "master".into(),
                 }
             );
-            assert_eq!(project_id, "alpha");
-            assert_eq!(project_root, "C:/repo");
+            assert_eq!(claimed.project_id, "alpha");
+            assert_eq!(claimed.project_root, "C:/repo");
         }
 
         // The outcome has to travel from the executor into the row. `drain_once` is the only thing
@@ -1091,10 +1183,91 @@ mod tests {
         .await;
 
         assert_eq!(status_of(&pool, id).await, "failed");
-        assert!(failure_reason_of(&pool, id).await.contains("CONFLICT"));
+        let reason = failure_reason_of(&pool, id).await;
+        assert!(
+            reason.contains("CONFLICT"),
+            "the recorded reason must be the executor's own: {reason}"
+        );
 
         // The point of this half: a failure must not leave the repository claimed forever.
         submit(&pool, &request(Origin::Human)).await.unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
+    }
+
+    /// The return value is the only thing Chunk 2's loop can terminate on, and both tests above
+    /// discard it — so `true` unconditionally and `false` unconditionally each pass them.
+    ///
+    /// Neither is harmless. `true` always spins a `while drain_once(..).await {}` at 100% CPU;
+    /// `false` always drains one request per poll interval forever, which looks like a slow queue
+    /// rather than a bug. `#[must_use]` cannot stand in for this: on an `async fn` it marks the
+    /// future, which every caller already awaits.
+    #[tokio::test]
+    async fn a_drain_says_whether_it_found_anything_to_do() {
+        let pool = test_pool().await;
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        let busy = FakeVcsExecutor::succeeding_with("abc123");
+        assert!(
+            drain_once(&pool, "alpha", &busy).await,
+            "a drain that claimed and executed a request has done something"
+        );
+
+        // A second executor, so the count below is exact rather than merely unchanged.
+        let idle = FakeVcsExecutor::succeeding_with("def456");
+        assert!(
+            !drain_once(&pool, "alpha", &idle).await,
+            "there is nothing left to claim, so the caller should wait rather than drain again"
+        );
+        assert_eq!(
+            idle.calls(),
+            0,
+            "an idle drain must not reach the executor at all"
+        );
+    }
+
+    /// The jam window `drain_once`'s doc comment admits to, composed with the thing that closes it.
+    ///
+    /// Two functions have to agree for that claim to hold, and inspecting either alone does not show
+    /// it — the same gap `a_reconciled_request_cannot_be_finished_by_a_late_worker` was written for.
+    ///
+    /// The NOTE above explains why the *claim's* rollback-on-drop cannot be tested here: an
+    /// abandoned claim never returns the single connection a `:memory:` pool has, so every attempt
+    /// ends in `PoolTimedOut`. That does not transfer to this case. `claim_next` commits and drops
+    /// its `Transaction` before returning, so while the drain is awaiting the executor it holds no
+    /// pooled connection at all — dropping it there leaves the pool free to answer the assertions.
+    #[tokio::test]
+    async fn a_drain_abandoned_mid_operation_jams_the_repository_until_a_restart_reconciles() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        // Far longer than the timeout, so which of the two fires is not a race.
+        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
+        let drain = drain_once(&pool, "alpha", &executor);
+        tokio::time::timeout(Duration::from_millis(50), drain)
+            .await
+            .expect_err("the executor is still working, so the drain cannot have finished");
+
+        assert_eq!(
+            executor.calls(),
+            1,
+            "the drain was abandoned inside the operation, not before it"
+        );
+        // Dropped at the executor's await, so `finish` never ran. This is the documented cost, not a
+        // defect: the row is stranded exactly as the doc comment says it is.
+        assert_eq!(status_of(&pool, id).await, "running");
+        assert!(
+            claim_next(&pool, "alpha").await.unwrap().is_none(),
+            "the stranded row holds this repository's only slot — nothing else may claim it"
+        );
+
+        // And the compensator is what releases it, which is the half that makes the window
+        // acceptable rather than merely admitted.
+        assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, id).await, "interrupted");
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+        assert!(
+            claim_next(&pool, "alpha").await.unwrap().is_some(),
+            "once reconciled, the repository is free again"
+        );
     }
 }
