@@ -177,6 +177,15 @@ pub enum Outcome {
 ///
 /// Wrapping the statement does not weaken the `NOT EXISTS` guard: SQLite admits one writer at a
 /// time, so a second claimer's UPDATE evaluates the guard against the winner's committed row.
+///
+/// That holds because the claim is this transaction's **first** statement. `begin()` is deferred, so
+/// no lock is taken until the UPDATE takes the write lock outright — there is no read-then-upgrade,
+/// and so no `SQLITE_BUSY_SNAPSHOT`. Put a `SELECT` ahead of the claim in here and the argument
+/// stops holding: the transaction becomes a reader that must upgrade, and an upgrade can fail
+/// outright rather than losing cleanly. A loser that instead exhausts `busy_timeout`
+/// (`storage.rs:69`) returns `Err(SQLITE_BUSY)` rather than `Ok(None)` — safe, since it claims
+/// nothing, but it is a return shape the pre-transaction code could not produce, and the critical
+/// section it waits on is one `serde_json::from_str` plus a commit.
 pub async fn claim_next(
     pool: &sqlx::SqlitePool,
     project_id: &str,
@@ -703,14 +712,16 @@ mod tests {
     }
 
     // NOTE: the rollback-on-drop half of the claim's cancellation safety is deliberately not tested
-    // here. Dropping a partially polled `claim_next` never returns this pool's single connection —
-    // every attempt ends in `PoolTimedOut` after 30s — so the assertion that follows the drop cannot
-    // run at all, and observing the abandoned claim from a second connection is not possible either:
-    // a second `:memory:` connection is a different database, not another view of this one. Testing
-    // it needs a file-backed multi-connection harness this module does not have yet. The guarantee
-    // itself is `sqlx`'s (`sqlx-core-0.9.0/src/transaction.rs:264-279`: `impl Drop for Transaction`
-    // calls `start_rollback`, which runs "on the next asynchronous invocation of the underlying
-    // connection (including if the connection is returned to a pool)"), not this crate's to re-prove.
+    // here, and the reason is narrower than "we lack a harness" — the crate has one. `TempDb`
+    // (`storage.rs`, `#[cfg(test)]`) is file-backed with `max_connections(5)`, and its own doc
+    // comment advertises this very shape: "a handler parked on a pool while another connection
+    // watches it". What is actually missing is a way to stop a future at a *chosen* await:
+    // `Waker::noop()` does not give that deterministically, and against `test_pool`'s `:memory:`
+    // single connection every attempt ends in `PoolTimedOut` after 30s, because an abandoned claim
+    // never returns the one connection there is. So the test would be asserting `sqlx`'s documented
+    // guarantee rather than this module's logic: `sqlx-core-0.9.0/src/transaction.rs:265-280`,
+    // `impl Drop for Transaction` calls `start_rollback`, which runs "on the next asynchronous
+    // invocation of the underlying connection (including if the connection is returned to a pool)".
 
     /// The queue must never hand out work that cannot execute — a head blocked on a sleeping human
     /// blocks every agent behind it. That is the whole reason approval precedes admission.
