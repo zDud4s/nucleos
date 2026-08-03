@@ -173,6 +173,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // differs only in holding the connection for up to 45 seconds, and anyone who may read a ticket
     // can poll the route above instead — so listing it would hand the longest-held connection in
     // this API to the weakest key, buying nothing and costing a cheap way to tie the daemon up.
+    (Method::GET, "/vcs/requests"),
     (Method::GET, "/vcs/requests/{id}"),
     // Searching is listed here because the alternative is worse, not because it is free: it does
     // send a query off this machine. But it starts no run, holds no tools, and returns titles and
@@ -496,10 +497,12 @@ mod tests {
             .route(HOOK_ROUTE, post(|| async { "decided" }))
             .route("/proposals/{id}/approve", post(|| async {}))
             .route("/worktrees/{run_id}/release", post(|| async {}))
-            // Both spellings, because the point of the test below is that they are graded
-            // differently: reading a ticket is a read, submitting work to the queue is not.
-            .route("/vcs/requests", post(|| async {}))
+            // All three, because the point of the test below is that they are graded differently:
+            // reading a ticket or the queue is a read, submitting work is not, and waiting is a read
+            // that is refused anyway for holding the connection.
+            .route("/vcs/requests", get(|| async {}).post(|| async {}))
             .route("/vcs/requests/{id}", get(|| async {}))
+            .route("/vcs/requests/{id}/wait", get(|| async {}))
             .route("/shadow-decisions", get(|| async {}))
             .route("/shadow-decisions/{id}/verdict", post(|| async {}))
             .route("/scoreboard", get(|| async {}))
@@ -877,14 +880,29 @@ mod tests {
         let app = protected_router(state);
 
         assert_eq!(
+            status_of(&app, "GET", "/vcs/requests", &token).await,
+            StatusCode::OK,
+            "listing the queue starts nothing and holds no repository"
+        );
+        assert_eq!(
             status_of(&app, "GET", "/vcs/requests/7", &token).await,
             StatusCode::OK,
-            "reading a ticket starts nothing and holds no repository"
+            "reading one ticket, likewise"
         );
         assert_eq!(
             status_of(&app, "POST", "/vcs/requests", &token).await,
             StatusCode::FORBIDDEN,
             "submitting an operation to the queue is not a read"
+        );
+        // The route the table's comment spends six lines justifying, and the only one whose
+        // exclusion is a judgement rather than a category: it reads the same row as `{id}`, so
+        // nothing about *what* it returns argues for refusing it. What argues is that it holds the
+        // connection for up to 45 seconds. Without this assertion, adding it to READ_ONLY_ROUTES
+        // some later afternoon would be a green-suite change.
+        assert_eq!(
+            status_of(&app, "GET", "/vcs/requests/7/wait", &token).await,
+            StatusCode::FORBIDDEN,
+            "waiting is a read, but not one worth handing the weakest key a 45s connection for"
         );
     }
 

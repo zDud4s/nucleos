@@ -106,7 +106,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proposals", get(get_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
-        .route("/vcs/requests", post(submit_vcs_request))
+        .route(
+            "/vcs/requests",
+            post(submit_vcs_request).get(list_vcs_requests),
+        )
         // Two spellings of one read, separated only by how long the caller is willing to hold the
         // line. `/wait` blocks up to `vcs::DEFAULT_WAIT`; the bare route is the same read with a
         // zero deadline, which `wait_for` answers from its first look at the row.
@@ -2185,6 +2188,24 @@ async fn get_vcs_request(
     vcs_ticket(&state, id, std::time::Duration::ZERO).await
 }
 
+#[derive(Deserialize)]
+struct VcsListQuery {
+    project_id: Option<String>,
+}
+
+async fn list_vcs_requests(
+    State(state): State<AppState>,
+    Query(query): Query<VcsListQuery>,
+) -> Result<Json<Vec<vcs::RequestSummary>>, StatusCode> {
+    vcs::list(&state.pool, query.project_id.as_deref())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing vcs requests failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 /// Blocks up to `vcs::DEFAULT_WAIT`, then hands back whatever the ticket says.
 ///
 /// Deliberately NOT wrapped in `uncancellable`: this handler only ever reads, so a client that
@@ -2869,7 +2890,10 @@ mod tests {
         .unwrap();
 
         let app = Router::new()
-            .route("/vcs/requests", post(submit_vcs_request))
+            .route(
+                "/vcs/requests",
+                post(submit_vcs_request).get(list_vcs_requests),
+            )
             .route("/vcs/requests/{id}", get(get_vcs_request))
             .layer(Extension(Scope::Control))
             .with_state(state);
@@ -2901,6 +2925,7 @@ mod tests {
         );
 
         let fetched = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/vcs/requests/{}", ticket.id))
@@ -2910,6 +2935,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
+
+        // The listing exists to answer a different question from the ticket — "what is this queue
+        // doing", not "how did mine end" — so what it must carry is the operation and the project.
+        // A listing that only echoed statuses would pass a status-only assertion and be useless.
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/vcs/requests")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let summaries: Vec<vcs::RequestSummary> = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, ticket.id);
+        assert_eq!(summaries[0].op, "merge");
+        assert_eq!(summaries[0].project_id, "alpha");
+        assert_eq!(summaries[0].origin, "human");
+        assert_eq!(summaries[0].status, "queued");
     }
 
     /// A project the daemon does not know is a 404, not a merge in a directory somebody named.

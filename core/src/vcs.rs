@@ -370,6 +370,69 @@ pub struct Ticket {
     pub failure_reason: Option<String>,
 }
 
+/// One row as a queue listing shows it: what was asked, for which repository, by whom, and where it
+/// got to.
+///
+/// A separate type from `Ticket` rather than a reuse of it, because the two answer different
+/// questions. A ticket answers "how did MY request end" and needs the result; a listing answers
+/// "what is this queue doing" and needs the operation and the project, which a ticket does not
+/// carry — reusing it would produce a column of statuses attached to nothing.
+///
+/// `op` is the `op` column verbatim, not a parsed `Op`. Parsing can fail on a row written by an
+/// older version or edited by hand, and one such row must not be able to fail the whole listing —
+/// the listing is exactly where somebody would go to find out that a row is wrong.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestSummary {
+    pub id: i64,
+    pub op: String,
+    pub project_id: String,
+    pub origin: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+/// How many rows a listing returns at most.
+///
+/// The queue is meant to be short — one operation runs at a time per repository — so a listing that
+/// needs paging is itself the finding. The cap exists so a queue that somehow grew cannot turn one
+/// HTTP call into an unbounded response.
+const LIST_LIMIT: i64 = 200;
+
+/// Newest first, optionally narrowed to one repository.
+///
+/// Newest first because the question a listing answers is almost always "what just happened", and a
+/// caller reading a truncated oldest-first list would be reading history while missing the present.
+pub async fn list(
+    pool: &sqlx::SqlitePool,
+    project_id: Option<&str>,
+) -> sqlx::Result<Vec<RequestSummary>> {
+    sqlx::query_as(
+        "SELECT id, op, project_id, origin, status, created_at
+           FROM vcs_requests
+          WHERE ?1 IS NULL OR project_id = ?1
+          ORDER BY id DESC
+          LIMIT ?2",
+    )
+    .bind(project_id)
+    .bind(LIST_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map(|rows: Vec<(i64, String, String, String, String, String)>| {
+        rows.into_iter()
+            .map(
+                |(id, op, project_id, origin, status, created_at)| RequestSummary {
+                    id,
+                    op,
+                    project_id,
+                    origin,
+                    status,
+                    created_at,
+                },
+            )
+            .collect()
+    })
+}
+
 /// How often `wait_for` re-checks a row that has not reached a terminal status yet.
 ///
 /// How long a caller that asked to wait is made to wait before it gets a ticket instead.
