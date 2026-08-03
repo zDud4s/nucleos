@@ -1225,6 +1225,67 @@ mod tests {
         );
     }
 
+    /// Everything the daemon logged while `body` ran.
+    ///
+    /// Follows `logging.rs`'s own test rather than `init()`, which installs a *global* subscriber and
+    /// would panic the moment a second test did the same; `set_default` is scoped and thread-local,
+    /// which is sound here because `#[tokio::test]`'s default runtime polls on the thread that set
+    /// it. The writer is the non-blocking one, so the guard has to be dropped before reading back.
+    ///
+    /// Worth the machinery for exactly one reason: on the refused-write path the log line is not
+    /// commentary, it is the only place the outcome still exists.
+    async fn logged_during<F: std::future::Future>(body: F) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, flush_on_drop) = tracing_appender::non_blocking(
+            tracing_appender::rolling::daily(dir.path(), "test.log"),
+        );
+        {
+            let subscriber = tracing_subscriber::fmt().with_writer(writer).finish();
+            let _scope = tracing::subscriber::set_default(subscriber);
+            body.await;
+        }
+        drop(flush_on_drop);
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect()
+    }
+
+    /// The outcome of a merge the row refuses has nowhere else to go.
+    ///
+    /// `finish` consumed the outcome before this branch existed, so a real `abc123` was dropped on
+    /// the floor: the row read `interrupted`, and a commit the daemon caused was recorded nowhere in
+    /// the system. The log line is the whole remedy, which makes it load-bearing rather than
+    /// commentary — and the previous version of it announced a jam that does not happen on this
+    /// path, sending a reader hunting a stuck queue that is actually fine.
+    ///
+    /// Asserting on log text is not this crate's habit and should stay rare. It is justified here
+    /// because both halves — that the sha survives, and that the message does not misdescribe the
+    /// state — are invisible to every other assertion available.
+    #[tokio::test]
+    async fn an_outcome_the_row_refuses_survives_in_the_log_and_is_not_called_a_jam() {
+        let pool = test_pool().await;
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+
+        let logged = logged_during(async {
+            tokio::join!(drain_once(&pool, "alpha", &executor), async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                reconcile_interrupted(&pool).await.unwrap()
+            })
+        })
+        .await;
+
+        assert!(
+            logged.contains("abc123"),
+            "the sha the row refused must survive somewhere: {logged}"
+        );
+        assert!(
+            !logged.contains("stays running"),
+            "the row is terminal, so the queue is not jammed and must not be reported as one: {logged}"
+        );
+    }
+
     /// A restart's reconcile landing while the operation is still running — the collision that makes
     /// `finish`'s refusal a real path rather than a defensive one, seen from the drain's side.
     ///
