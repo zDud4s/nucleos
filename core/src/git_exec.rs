@@ -1034,6 +1034,100 @@ pub(crate) mod tests {
         assert!(error.contains("timed out"), "got: {error}");
     }
 
+    /// **The test above is about the transport; this one is about the budget, and only this one can
+    /// see the difference.** `run_git` takes a `Duration` and is told how long to wait; everything
+    /// production runs goes through `git` or `add_worktree`, which take a *deadline* and compute what
+    /// is left of it here. Replacing this function's body with `let budget = OPERATION_TIMEOUT;` —
+    /// handing every command a fresh full 300s — left the suite byte-identical at 1064 passed before
+    /// this test existed, and what it ships is precisely the failure `OPERATION_TIMEOUT` is written
+    /// to prevent: a stalled merge (a `post-merge` hook in a repository the daemon does not control,
+    /// an antivirus scan, an auto-`gc`) holding the repository's only slot for 300s *per command*
+    /// across the dozen this operation runs, which is the better part of an hour.
+    ///
+    /// Five seconds rather than a tight bound: the question is which quantity is being returned, not
+    /// scheduler jitter, and any ceiling below `OPERATION_TIMEOUT` tells the two apart.
+    #[test]
+    fn a_command_is_given_what_is_left_of_the_operation_s_budget_and_never_a_fresh_one() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        let budget = remaining(deadline, "merge feat/x").expect("a live deadline still has budget");
+
+        assert!(
+            budget <= Duration::from_secs(5),
+            "the budget is what is left of the operation, not a fresh {OPERATION_TIMEOUT:?} for each command; got {budget:?}"
+        );
+    }
+
+    /// The other half of the same property, and the one `git`'s doc comment is about: a spent budget
+    /// is refused *before* a child is spawned, because `Command::output()` spawns eagerly and a
+    /// `merge` or an `update-ref` killed mid-flight is a worse thing to do to a repository than
+    /// declining to start.
+    ///
+    /// `Instant::now()` as the deadline rather than `now() - 1s`: the clock is monotonic, so by the
+    /// time `remaining` reads it again the budget is exactly zero — and subtracting from an `Instant`
+    /// is what panics on a platform whose epoch is boot.
+    #[test]
+    fn a_spent_operation_budget_refuses_the_next_command_rather_than_starting_it() {
+        let spent = std::time::Instant::now();
+
+        let outcome = remaining(spent, "merge --no-ff feat/x")
+            .expect_err("a budget that is gone must not start another command");
+
+        match outcome {
+            Outcome::Failed {
+                reason,
+                exit_code,
+                output_tail,
+            } => {
+                assert!(reason.contains("ran out of time before"), "got: {reason}");
+                assert!(
+                    reason.contains("merge --no-ff feat/x"),
+                    "the reason names the command that never started: {reason}"
+                );
+                assert_eq!(exit_code, None, "nothing ran, so nothing exited");
+                assert!(
+                    output_tail.is_empty(),
+                    "no command printed anything: {output_tail}"
+                );
+            }
+            other => panic!("a spent budget reports a Failed, got {other:?}"),
+        }
+    }
+
+    /// And the same property through a caller, because a call site that *bypasses* `remaining` is
+    /// invisible to both unit tests above — the function they exercise is still correct. Measured
+    /// with the one call site that can hide it: replacing `add_worktree`'s `remaining(deadline,
+    /// "worktree add")?` with `OPERATION_TIMEOUT` leaves the whole suite green except this test,
+    /// which then reports the same `ran out of time before` (the *next* command refuses) while a
+    /// worktree has already been added. So it is the second assertion, not the reason, that carries
+    /// this one.
+    ///
+    /// The repository is real and mergeable on purpose — what this pins is that an operation whose
+    /// budget is already gone stops before its FIRST command rather than starting work nobody is
+    /// waiting for any more.
+    #[tokio::test]
+    async fn an_operation_whose_budget_is_gone_computes_nothing() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-spent-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        let outcome = compute_merge(&repo, "feat/x", "master", std::time::Instant::now())
+            .await
+            .expect_err("an operation out of time must not start a merge");
+
+        match outcome {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("ran out of time before"), "got: {reason}")
+            }
+            other => panic!("a spent budget reports a Failed, got {other:?}"),
+        }
+        assert!(
+            !integration_worktree(&repo).exists(),
+            "the first command never ran, so no worktree was added"
+        );
+    }
+
     /// The case the ordering exists for, and the one a hand-measurement caught rather than a test:
     /// a diagnostic one line long behind an stdout large enough to force the truncation. `clean -fd`
     /// prints a line per file and a large merge a diffstat, so the size is reachable from argv this
