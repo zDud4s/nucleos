@@ -502,9 +502,9 @@ pub async fn publish(
 
     match holder {
         None => publish_by_update_ref(project_root, target, computed, deadline).await,
-        // Task 5 renames this binding to `worktree` and replaces the `todo!` — leave it prefixed
-        // with an underscore until then, or this task does not compile warning-free.
-        Some(_worktree) => todo!("Task 5"),
+        Some(worktree) => {
+            publish_by_fast_forward(project_root, &worktree, target, computed, deadline).await
+        }
     }
 }
 
@@ -539,6 +539,112 @@ async fn publish_by_update_ref(
     Outcome::Succeeded {
         sha: computed.new,
         output_tail: computed.output_tail,
+    }
+}
+
+/// Fast-forwards the worktree that has `target` open, so HEAD, the index and the files move
+/// together.
+///
+/// It is always *possible* to fast-forward here, and that is not luck: the merge commit's first
+/// parent is `computed.old` by construction (Task 3's `--no-ff`), so the branch tip is an ancestor of
+/// the new commit. The ref is re-read first for exactly that reason — if it moved, that guarantee is
+/// gone: a commit landing on the target makes the fast-forward impossible, and a target rewound to
+/// somewhere behind `old` would make publishing discard whatever moved it. Either way the operation
+/// raced, which is a `Failed`.
+///
+/// **The refusal is then classified by asking a second question, not by reading git's message.**
+/// `Blocked` is terminal and its advice is "commit or stash", so it must mean the user's own work is
+/// in the way and nothing else. It would be wrong for a file another process has locked open — the
+/// ordinary Windows case, `unable to unlink old 'target/app.exe': Permission denied` — for a worktree
+/// git lists but whose directory is gone, for `dubious ownership`, or for a full disk. None of those
+/// is fixed by committing, and telling a human to stash would be actively misleading advice on a
+/// state that is terminal.
+///
+/// So: `status --porcelain` in that worktree. Non-empty means the user has work there and `Blocked`
+/// is the honest answer; empty, or a status that will not even run, means the fast-forward was
+/// possible and something else refused — `Failed`, with git's own output as the diagnostic. It never
+/// parses git's prose: `worktree.rs:321-327` is explicit that stderr is localised and
+/// version-dependent and must not be classified on. The message is *carried*, so the human reading
+/// the row sees which files git named, and never consulted.
+///
+/// **This is a one-directional guard, not an exact mapping, and it should not be read as one.** It
+/// reliably keeps a *clean* worktree out of `Blocked` — which is the case that mattered, since a
+/// clean worktree's refusal is never something committing would fix. It does not help when the
+/// worktree is dirty for an unrelated reason *and* refuses for another: a locked file in a checkout
+/// that also has ordinary uncommitted work still comes back `Blocked` with advice — "commit, stash
+/// or move it" — that will not help. That gap is narrow, and it is not silent, because the output
+/// tail carries what git actually said.
+///
+/// The mirror-image gap is *not* here, and that was measured rather than assumed: an **ignored** file
+/// in the way would be invisible to `status --porcelain` and would land in `Failed`, but it never
+/// reaches the classification — git overwrites an ignored file instead of refusing (checked on git
+/// 2.50.1, with `merge.overwriteIgnore` both true and false). The publish therefore replaces such a
+/// file silently, which is what a fast-forward does anywhere and not something this route adds.
+///
+/// `Failed` rather than `Blocked` is also the right way to be wrong: `Blocked` is terminal by
+/// design, so a transient problem misfiled there would need a human to notice it and resubmit.
+async fn publish_by_fast_forward(
+    project_root: &Path,
+    worktree: &Path,
+    target: &str,
+    computed: Computed,
+    deadline: std::time::Instant,
+) -> Outcome {
+    let current = match revision(project_root, &format!("refs/heads/{target}"), deadline).await {
+        Ok(current) => current,
+        Err(outcome) => return outcome,
+    };
+    if current != computed.old {
+        return Outcome::Failed {
+            reason: format!(
+                "{target} moved while the merge was being computed, so it was not published; resubmit"
+            ),
+            exit_code: None,
+            output_tail: String::new(),
+        };
+    }
+
+    let merged = match git(worktree, &["merge", "--ff-only", &computed.new], deadline).await {
+        Ok(merged) => merged,
+        Err(outcome) => return outcome,
+    };
+    if merged.succeeded() {
+        return Outcome::Succeeded {
+            sha: computed.new,
+            output_tail: computed.output_tail,
+        };
+    }
+
+    let status = git(worktree, &["status", "--porcelain"], deadline).await;
+    // A status that could not run leaves the question unanswered, and unanswered must fall to
+    // `Failed`: claiming the user's files are in the way when that was never established is the one
+    // wrong answer here.
+    let user_work_in_the_way = matches!(
+        &status,
+        Ok(status) if status.succeeded() && !status.stdout.trim().is_empty()
+    );
+
+    if user_work_in_the_way {
+        Outcome::Blocked {
+            reason: format!(
+                // "or move it", because the blocked case this chunk actually tests is an UNTRACKED
+                // file, and `git stash` without `-u` does not move one — git's own message for it
+                // says "please move or remove them". Advice that does not work on the case in the
+                // test is advice that does not work.
+                "{target} is checked out in {} with uncommitted work in the way; commit, stash or move it and resubmit",
+                worktree.display()
+            ),
+            output_tail: merged.output_tail,
+        }
+    } else {
+        Outcome::Failed {
+            reason: format!(
+                "{target} is checked out in {} and could not be fast-forwarded; git's output says why",
+                worktree.display()
+            ),
+            exit_code: merged.exit_code,
+            output_tail: merged.output_tail,
+        }
     }
 }
 
@@ -1243,6 +1349,153 @@ mod tests {
             sha_of(&repo, "release"),
             elsewhere,
             "the other party's commit is still there — nothing was overwritten"
+        );
+    }
+
+    /// The ordinary case, and the one §6.1 is about: HEAD, the index and the files move together, so
+    /// `git status` tells the truth immediately afterwards.
+    #[tokio::test]
+    async fn a_branch_somebody_has_open_is_fast_forwarded_in_place() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-ff-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        let computed = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute");
+        let new = computed.new.clone();
+
+        let outcome = publish(&repo, "master", computed, deadline()).await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "HEAD"), new, "HEAD moved");
+        assert_eq!(sha_of(&repo, "master"), new, "and so did the branch");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("feature.txt")).expect("read"),
+            "from the branch\n",
+            "and so did the files — this is what publishing separately buys"
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git");
+        assert!(
+            status.stdout.is_empty(),
+            "nothing shows as uncommitted: the repository is not lying about what happened"
+        );
+    }
+
+    /// The whole design in one assertion. The user was in the middle of editing a file the merge
+    /// touches; the merge does not happen to them, and their bytes are exactly where they left them.
+    #[tokio::test]
+    async fn a_user_s_uncommitted_file_blocks_the_publish_and_survives_it_untouched() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-blocked-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // The user is mid-edit on the file `feat/x` also changed.
+        std::fs::write(repo.join("feature.txt"), "half-finished thought\n").expect("write");
+
+        let before = sha_of(&repo, "master");
+        let computed = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute");
+        let new = computed.new.clone();
+
+        let outcome = publish(&repo, "master", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Blocked { output_tail, .. } => assert!(
+                output_tail.contains("feature.txt"),
+                "git names the files itself; we pass them through: {output_tail}"
+            ),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.join("feature.txt")).expect("read"),
+            "half-finished thought\n",
+            "byte-for-byte what the user left"
+        );
+        assert_eq!(sha_of(&repo, "master"), before, "the branch did not move");
+
+        // Nothing was lost: the merge commit exists as an object, so resubmitting after committing or
+        // stashing publishes it instantly instead of recomputing it.
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("cat-file"), OsStr::new("-e"), OsStr::new(&new)]
+        ));
+    }
+
+    /// The invariant `worktree_holding`'s doc comment relies on: the daemon's own worktree is detached,
+    /// so it never answers "I have the target open" and can never be fast-forwarded into.
+    #[tokio::test]
+    async fn an_integration_worktree_never_holds_the_branch_it_merges_into() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-detached-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute");
+
+        let holder = worktree_holding(&repo, "master", deadline())
+            .await
+            .expect("list")
+            .expect("some worktree has master open — the user's checkout");
+        // Compared by what the directory *is* rather than by its path string: a temp path can arrive
+        // symlinked or 8.3-shortened, and `Path` equality is case-sensitive for non-prefix components.
+        // The integration worktree is detached at the merge commit, so this sha tells the two apart.
+        assert_eq!(
+            sha_of(&holder, "HEAD"),
+            sha_of(&repo, "master"),
+            "the user's checkout holds master; the integration worktree is detached and holds nothing"
+        );
+    }
+
+    /// The counterexample that keeps `Blocked` honest, and the reason the classification asks a second
+    /// question instead of treating every refusal as the user's fault.
+    ///
+    /// `Blocked` is terminal and tells a human to commit, stash or move something. Here the worktree
+    /// holding the branch has had its directory deleted — git still lists it, the fast-forward still
+    /// fails, and none of those three would change that. It must come back `Failed`.
+    #[tokio::test]
+    async fn a_refusal_the_user_cannot_fix_by_committing_is_not_reported_as_blocked() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-notblocked-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // A second worktree holds `release`; then its directory goes away. Git keeps the registration
+        // until something prunes it, so `worktree list` still names a path that is not there.
+        let gone = roots.path().join("gone");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("release"),
+                gone.as_os_str()
+            ]
+        ));
+        std::fs::remove_dir_all(&gone).expect("remove the worktree directory");
+
+        let computed = compute_merge(&repo, "feat/x", "release", deadline())
+            .await
+            .expect("compute");
+        let outcome = publish(&repo, "release", computed, deadline()).await;
+
+        assert!(
+            matches!(outcome, Outcome::Failed { .. }),
+            "a worktree that is not there is not something a human fixes by stashing: {outcome:?}"
         );
     }
 }
