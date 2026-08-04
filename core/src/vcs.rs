@@ -20,6 +20,19 @@ use serde::{Deserialize, Serialize};
 ///
 /// Typed rather than a command string on purpose: a string would have to be parsed, and parsing
 /// shell is the surface `classifier.rs` exists to keep closed. The daemon builds every argv.
+///
+/// **Whoever adds the next variant here owes two things that `Merge` did not.**
+///
+/// 1. `git_exec::run_git` justifies having no process-tree kill with "nothing here hands git a
+///    shell". That is true of `merge`, and it stops being true the day `Fetch` or `Push` lands and
+///    git starts spawning ssh and credential helpers — which is the exact case spec §7's hung-command
+///    row was written about, a fetch against a dead network. That comment will become wrong without
+///    anybody editing it, so the obligation is recorded here, where the change has to be made.
+/// 2. `Merge`'s `source`/`target` reach argv without a `--end-of-options`, and get away with it by
+///    accident rather than design: a dashed string can set an option but cannot also name a commit,
+///    HEAD in the integration worktree is always detached so `merge`'s upstream fallback dies, and
+///    `update-ref` rejects a dashed ref name. A variant with a different argv shape does not inherit
+///    any of that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -661,8 +674,16 @@ pub trait VcsExecutor: Send + Sync {
 /// leaves its row `running`, and the partial unique index makes that row hold the repository's only
 /// slot until the next startup's `reconcile_interrupted` releases it — the same jam AGENTS.md
 /// describes for `one_open_worktree_run_per_project`. What keeps it acceptable is who calls this:
-/// Chunk 2's caller is a background loop owned by `main.rs`, whose future is dropped only when the
-/// daemon exits, which is precisely the case `reconcile_interrupted` exists for.
+/// the only production caller is the **detached task** `run_queue_worker` spawns per repository, and
+/// a detached task's future is dropped only at runtime shutdown, which is precisely the case
+/// `reconcile_interrupted` exists for — `main.rs` runs that reconcile before it spawns the worker.
+///
+/// Two consequences of it being *detached* that are easy to get wrong, and one of them is a trap
+/// waiting for whoever adds graceful shutdown. **Aborting `run_queue_worker` does not stop a drain
+/// already in flight**: the loop owns no handle to the tasks it spawns, so an abort drops the poller
+/// and leaves every running merge running — which is what the worker tests do at teardown, and why
+/// they are not evidence of a clean stop. And the exposure is now one open window *per repository*
+/// rather than one for the daemon, since each repository's drain is its own task.
 ///
 /// Both halves of that are run rather than argued —
 /// `a_drain_abandoned_mid_operation_jams_the_repository_until_a_restart_reconciles` drops a drain
