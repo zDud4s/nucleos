@@ -1408,14 +1408,27 @@ mod tests {
             .await
             .expect("compute");
         let new = computed.new.clone();
+        let computed_tail = computed.output_tail.clone();
 
         let outcome = publish(&repo, "master", computed, deadline()).await;
 
         match outcome {
-            Outcome::Blocked { output_tail, .. } => assert!(
-                output_tail.contains("feature.txt"),
-                "git names the files itself; we pass them through: {output_tail}"
-            ),
+            Outcome::Blocked { output_tail, .. } => {
+                assert!(
+                    output_tail.contains("feature.txt"),
+                    "git names the files itself; we pass them through: {output_tail}"
+                );
+                // Not enough on its own, and that was measured rather than assumed: the COMPUTE's
+                // own diffstat names `feature.txt` too — it is the file the merge adds — so the
+                // assertion above stays green when the row is wired to `computed.output_tail`
+                // instead of the refusal's. What spec §6.3 promises a blocked row is the output
+                // that says which file stopped the publish, which is the fast-forward's, and only
+                // this comparison tells the two apart.
+                assert_ne!(
+                    output_tail, computed_tail,
+                    "the row carries git's refusal, not the merge's own diffstat"
+                );
+            }
             other => panic!("expected Blocked, got {other:?}"),
         }
         assert_eq!(
@@ -1457,6 +1470,67 @@ mod tests {
             sha_of(&holder, "HEAD"),
             sha_of(&repo, "master"),
             "the user's checkout holds master; the integration worktree is detached and holds nothing"
+        );
+    }
+
+    /// The re-read of the target ref before the fast-forward, and the one case where it does work
+    /// git would not have done for us anyway.
+    ///
+    /// A target moved *forward* is the obvious test to write and proves nothing: the merge commit is
+    /// not a descendant of the new tip, so `merge --ff-only` refuses on its own and the operation
+    /// fails with or without the check — only the reason differs. A target moved *backwards* is the
+    /// case that needs it. `old~1` is still an ancestor of the merge commit, so the fast-forward is
+    /// perfectly possible: without the re-read the publish silently undoes the user's reset, moves
+    /// the branch and the files back, and reports success. Deleting the check turns this test from
+    /// `Failed` into exactly that — measured, not assumed.
+    #[tokio::test]
+    async fn a_target_rewound_while_the_merge_computed_is_not_fast_forwarded_back_over() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rewound-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // A second commit on `master`, so that there is something to rewind past.
+        std::fs::write(repo.join("work.txt"), "work\n").expect("write");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("work")]
+        ));
+
+        let computed = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute");
+
+        // The user throws that commit away while the merge is being computed — in the very worktree
+        // the publish is about to fast-forward.
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("reset"),
+                OsStr::new("--hard"),
+                OsStr::new("HEAD~1")
+            ]
+        ));
+        let rewound = sha_of(&repo, "master");
+
+        let outcome = publish(&repo, "master", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("moved"),
+                "the reason must say what to do about it: {reason}"
+            ),
+            other => panic!("a raced publish is a Failed, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "master"),
+            rewound,
+            "the branch is where the user left it — the publish did not undo their reset"
+        );
+        assert!(
+            !repo.join("work.txt").exists(),
+            "and their working copy did not get the discarded file back either"
         );
     }
 
