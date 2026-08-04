@@ -197,6 +197,23 @@ pub enum Outcome {
     Unexecutable { reason: String },
 }
 
+impl Outcome {
+    /// The `status` column this outcome writes. `Unexecutable` shares `failed` with `Failed`; what
+    /// tells them apart in the row is `output_tail IS NULL`, not this.
+    ///
+    /// One function rather than a string in each of `finish`'s match arms, because `drain_once` now
+    /// needs the same answer for the feed: two places deciding what an outcome is called would
+    /// drift, and the row and the feed disagreeing is exactly the contradiction the feed exists to
+    /// avoid.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Outcome::Succeeded { .. } => "succeeded",
+            Outcome::Blocked { .. } => "blocked",
+            Outcome::Failed { .. } | Outcome::Unexecutable { .. } => "failed",
+        }
+    }
+}
+
 /// Takes the oldest claimable request for one repository and marks it `running`, or returns `None`.
 ///
 /// `None` covers all three ordinary reasons there is nothing to do: nothing is queued, something is
@@ -339,20 +356,21 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     outcome: Outcome,
 ) -> sqlx::Result<()> {
     let finished_at = chrono::Utc::now().to_rfc3339();
-    let (status, result_sha, failure_reason, exit_code, output_tail) = match outcome {
-        Outcome::Succeeded { sha, output_tail } => {
-            ("succeeded", Some(sha), None, None, Some(output_tail))
-        }
+    // Read before the match below consumes the outcome, and from `status()` rather than restated in
+    // each arm — see its doc comment for why there is only one place that names a status.
+    let status = outcome.status();
+    let (result_sha, failure_reason, exit_code, output_tail) = match outcome {
+        Outcome::Succeeded { sha, output_tail } => (Some(sha), None, None, Some(output_tail)),
         Outcome::Blocked {
             reason,
             output_tail,
-        } => ("blocked", None, Some(reason), None, Some(output_tail)),
+        } => (None, Some(reason), None, Some(output_tail)),
         Outcome::Failed {
             reason,
             exit_code,
             output_tail,
-        } => ("failed", None, Some(reason), exit_code, Some(output_tail)),
-        Outcome::Unexecutable { reason } => ("failed", None, Some(reason), None, None),
+        } => (None, Some(reason), exit_code, Some(output_tail)),
+        Outcome::Unexecutable { reason } => (None, Some(reason), None, None),
     };
     let finished = sqlx::query(
         "UPDATE vcs_requests
@@ -683,32 +701,63 @@ pub async fn drain_once(
     // Cloned rather than moved so the failure paths below can still name it. `finish` consumes the
     // outcome, and a refused write would otherwise drop the only copy of a sha that git really
     // produced — leaving a commit the daemon caused recorded nowhere in the system at all.
-    if let Err(error) = finish(pool, id, outcome.clone()).await {
-        match error {
-            // Not a lost write: `finish` is scoped to `status = 'running'`, so this is the row being
-            // taken out from under the operation — a restart's `reconcile_interrupted` already marked
-            // it `interrupted`, the collision `a_reconciled_request_cannot_be_finished_by_a_late_worker`
-            // covers. The repository is NOT jammed; the row is terminal and the queue moves on. What
-            // is lost is the outcome, which the row is now refusing, so this log line is the only
-            // place it survives.
-            sqlx::Error::RowNotFound => tracing::warn!(
-                vcs_request_id = id,
-                project_id = %project_id,
-                ?outcome,
-                "a vcs request stopped running before its outcome arrived; the row refused it, so it is recorded here"
-            ),
-            // Anything else is the write itself failing, and that one does jam. This is the write
-            // that releases the repository: without it the row stays `running` and every later
-            // request for this repository waits behind it until a restart reconciles, so the log
-            // line is the only account of why the queue stopped.
-            error => tracing::error!(
-                vcs_request_id = id,
-                project_id = %project_id,
-                ?outcome,
-                %error,
-                "could not record how a vcs request ended; it stays running until the daemon restarts"
-            ),
+    match finish(pool, id, outcome.clone()).await {
+        // Spec §6.4's fifth step, and spec §2.1's whole argument for this pillar having no view of
+        // its own: every transition writes to `feed.rs`, which the shell already shows. Without this
+        // row, a merge the daemon performed is invisible to the person who asked for it.
+        //
+        // Best-effort with `let _`, this crate's convention for observational writes
+        // (`reconcile_interrupted` above, and `runs.rs`, `job.rs`, `scheduler.rs`): a feed row that
+        // cannot be written must not undo the terminal write it is only reporting on.
+        //
+        // **Only on `Ok`, and that is not decoration.** `finish` is scoped to `status = 'running'`,
+        // so it returns `RowNotFound` when a restart's `reconcile_interrupted` took the row first.
+        // An unconditional append would then announce "vcs request 7 succeeded" in the one surface
+        // spec §2.1 says the user looks at, while the row itself reads `interrupted`.
+        //
+        // The status comes from the outcome this function already holds, never from re-reading the
+        // row — the row is what the feed is reporting on, and reading it back would report whatever
+        // won a race rather than what this operation did.
+        //
+        // `None` for `run_id`: `ClaimedRequest` does not carry one and `claim_next` does not return
+        // one, and widening its `RETURNING` to supply it would buy nothing today. A `run` request
+        // starts `awaiting_approval` and nothing moves it to `queued` until Chunk 4 wires
+        // `proposals.rs`, so every claimable request in this chunk is `Human` or `Shell` and that
+        // column is NULL regardless. Chunk 4 is where threading it earns its keep.
+        // (`reconcile_interrupted` does attach one, because it reads whole rows rather than a claim.)
+        Ok(()) => {
+            let _ = crate::feed::append(
+                pool,
+                Some(project_id),
+                "vcs_request_finished",
+                &format!("vcs request {id} {}", outcome.status()),
+                None,
+            )
+            .await;
         }
+        // Not a lost write: `finish` is scoped to `status = 'running'`, so this is the row being
+        // taken out from under the operation — a restart's `reconcile_interrupted` already marked
+        // it `interrupted`, the collision `a_reconciled_request_cannot_be_finished_by_a_late_worker`
+        // covers. The repository is NOT jammed; the row is terminal and the queue moves on. What
+        // is lost is the outcome, which the row is now refusing, so this log line is the only
+        // place it survives.
+        Err(sqlx::Error::RowNotFound) => tracing::warn!(
+            vcs_request_id = id,
+            project_id = %project_id,
+            ?outcome,
+            "a vcs request stopped running before its outcome arrived; the row refused it, so it is recorded here"
+        ),
+        // Anything else is the write itself failing, and that one does jam. This is the write
+        // that releases the repository: without it the row stays `running` and every later
+        // request for this repository waits behind it until a restart reconciles, so the log
+        // line is the only account of why the queue stopped.
+        Err(error) => tracing::error!(
+            vcs_request_id = id,
+            project_id = %project_id,
+            ?outcome,
+            %error,
+            "could not record how a vcs request ended; it stays running until the daemon restarts"
+        ),
     }
     true
 }
@@ -804,6 +853,14 @@ impl VcsExecutor for FakeVcsExecutor {
 
 #[cfg(test)]
 mod tests {
+    // `a_real_merge_lands_through_the_queue` holds `worktree::test_env_lock()`'s `MutexGuard` across
+    // every await in it, and that is the point rather than an oversight: the NUCLEOS_WORKTREE_ROOT
+    // override it serialises is process-wide, so it has to be held for the whole test. These are
+    // `current_thread` tests with no multi-thread runtime to starve, so `await_holding_lock` is a
+    // false positive — the same one `job.rs`, `runs.rs`, `worktree.rs` and `git_exec.rs` each carry.
+    // An inner attribute, so it must precede every item in the module.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::time::Duration;
@@ -1566,6 +1623,26 @@ mod tests {
         );
     }
 
+    /// Spec §6.4 step 5 ends "escreve `result_sha`, `succeeded`, **feed**", and spec §2.1 is why:
+    /// this pillar has no view of its own precisely because every transition writes to `feed.rs`,
+    /// which the shell already shows. Without this row a merge the daemon performed is invisible to
+    /// the person who asked for it.
+    #[tokio::test]
+    async fn a_finished_request_is_reported_in_the_feed() {
+        let pool = test_pool().await;
+        submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+
+        let summaries: Vec<String> =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'vcs_request_finished'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("succeeded"), "got: {}", summaries[0]);
+    }
+
     /// Everything the daemon logged while `body` ran.
     ///
     /// Follows `logging.rs`'s own test rather than `init()`, which installs a *global* subscriber and
@@ -1679,6 +1756,21 @@ mod tests {
             reason.as_deref(),
             Some("daemon restarted mid-operation"),
             "the reconcile's account of why must survive the drain arriving after it"
+        );
+
+        // The feed append is conditional on the terminal write having succeeded, and this is the
+        // only assertion in the module that says so. The row reads `interrupted`; an unconditional
+        // append would sit "vcs request 1 succeeded" beside it, in the one surface spec §2.1 says
+        // the user actually looks at — a contradiction, and one no status assertion can see because
+        // the row is already correct.
+        let announced: Vec<String> =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'vcs_request_finished'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            announced.is_empty(),
+            "a terminal write the row refused must not be announced as a finish: {announced:?}"
         );
 
         // And the repository is free: a refused write means the row is terminal, so the queue moves
@@ -1919,6 +2011,42 @@ mod tests {
             "wait_for must return once the request finishes, not hold the caller to the full \
              deadline: took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Everything, once: a request submitted through the queue, drained by the real executor, against a
+    /// real repository — and the sha in the row is the commit git actually created.
+    #[tokio::test]
+    async fn a_real_merge_lands_through_the_queue() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-vcs-e2e-");
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-vcs-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+
+        let id = submit(
+            &pool,
+            &SubmitRequest {
+                op: Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".into(),
+                project_root: repo.to_string_lossy().into_owned(),
+                origin: Origin::Human,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await);
+
+        assert_eq!(status_of(&pool, id).await, "succeeded");
+        let ticket = wait_for(&pool, id, Duration::ZERO).await.unwrap();
+        assert_eq!(
+            ticket.result_sha.unwrap(),
+            crate::git_exec::tests::sha_of(&repo, "master")
         );
     }
 }

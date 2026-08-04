@@ -722,8 +722,60 @@ async fn worktree_holding(
     Ok(None)
 }
 
+/// The `VcsExecutor` the daemon actually runs.
+///
+/// The whole type is a deadline: everything else it needs comes from the claimed request, which is
+/// the only thing that knows which repository and which operation.
+pub struct GitExecutor {
+    pub timeout: Duration,
+}
+
+impl Default for GitExecutor {
+    fn default() -> Self {
+        Self {
+            timeout: OPERATION_TIMEOUT,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::vcs::VcsExecutor for GitExecutor {
+    async fn execute(&self, request: &crate::vcs::ClaimedRequest) -> Outcome {
+        let project_root = Path::new(&request.project_root);
+        // The budget starts here, once. Every git command inside the operation spends from it.
+        let deadline = std::time::Instant::now() + self.timeout;
+        // Also the only production reader of `ClaimedRequest::project_id` — see Task 7 Step 4, which
+        // is where its absence would otherwise surface as a dead-code error. It earns its place
+        // regardless: a merge in the daemon log without the repository it ran against is unreadable
+        // the moment two projects are busy.
+        tracing::info!(
+            vcs_request_id = request.id,
+            project_id = %request.project_id,
+            op = request.op.kind(),
+            "vcs: executing"
+        );
+        // Deliberately exhaustive with no `_` arm: Chunk 4 adds variants, and a wildcard here would
+        // let one ship with no executor and no compile error — a request that queues, claims the
+        // repository, and reports success having done nothing.
+        match &request.op {
+            crate::vcs::Op::Merge { source, target } => {
+                match compute_merge(project_root, source, target, deadline).await {
+                    Ok(computed) => publish(project_root, target, computed, deadline).await,
+                    // Computing failed, which IS how this request ended.
+                    Err(outcome) => outcome,
+                }
+            }
+        }
+    }
+}
+
+// `pub(crate)` on the TEST module only, so nothing about this module's production surface widens.
+// `vcs.rs`'s end-to-end test needs a real repository with a branch to merge, and the alternative is a
+// fifth copy of `init_contained_repo` — four already exist in this crate. Sharing the four helpers
+// `vcs.rs` reaches for (`repo_with_a_branch_to_merge`, `space_free_tempdir`, `WorktreeRootEnv`,
+// `sha_of`) is the smaller cost, and it keeps one definition of what a test repository looks like.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // A process-wide guard held across awaits on purpose: it serialises mutation of the shared
     // NUCLEOS_WORKTREE_ROOT override, and there is no multi-thread runtime here to starve.
     #![allow(clippy::await_holding_lock)]
@@ -735,12 +787,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    struct WorktreeRootEnv {
+    pub(crate) struct WorktreeRootEnv {
         previous: Option<OsString>,
     }
 
     impl WorktreeRootEnv {
-        fn set(path: &Path) -> Self {
+        // `pub(crate)` on the associated function as well as the struct: the struct alone gives
+        // `error[E0624]: associated function 'set' is private` at `vcs.rs`'s call site.
+        pub(crate) fn set(path: &Path) -> Self {
             let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
             unsafe {
                 std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
@@ -773,7 +827,7 @@ mod tests {
     /// Cargo cannot link under a path containing a space, and the daemon refuses such a worktree
     /// root for the same reason (`worktree.rs:107-111`) — so a tempdir under the checkout, not the
     /// system temp directory, which on Windows is routinely under `C:\Users\Some Name\`.
-    fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
+    pub(crate) fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
         let base = std::env::current_dir().expect("resolve current directory");
         assert!(
             !base.to_string_lossy().contains(' '),
@@ -834,7 +888,7 @@ mod tests {
 
     /// `master` with a `feat/x` that touched one file, and back on `master`. Every test in this task
     /// starts here.
-    fn repo_with_a_branch_to_merge(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn repo_with_a_branch_to_merge(prefix: &str) -> (tempfile::TempDir, PathBuf) {
         let (container, repo) = init_contained_repo(prefix);
         assert!(git_ok(
             &repo,
@@ -865,7 +919,7 @@ mod tests {
         (container, repo)
     }
 
-    fn sha_of(repo: &Path, revision: &str) -> String {
+    pub(crate) fn sha_of(repo: &Path, revision: &str) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo)
