@@ -2985,6 +2985,36 @@ mod tests {
         assert_eq!(owner_from_dir_name("not-a-run"), None);
     }
 
+    /// The integration worktree is the daemon's own, and nothing in `vcs.rs` protects it from the
+    /// sweeper — only this module's naming rule does. The `run-99` directory is the control: without
+    /// it a sweeper that returned nothing at all would pass this test while collecting everything.
+    #[tokio::test]
+    async fn the_integration_worktree_is_not_an_orphan() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let container = space_free_tempdir();
+        let project_root = container.path().join("repo");
+        let roots = container.path().join("worktrees");
+        let _env = WorktreeRootEnv::set(Some(roots.as_path()));
+
+        let integration = crate::git_exec::integration_worktree(&project_root);
+        std::fs::create_dir_all(&integration).expect("create the integration worktree directory");
+        std::fs::create_dir_all(roots.join("run-99")).expect("create the control directory");
+
+        let orphans = orphaned_worktrees(&pool, &project_root, Duration::ZERO)
+            .await
+            .expect("sweep");
+
+        assert!(
+            orphans.contains(&roots.join("run-99")),
+            "the control must be collected, or this test proves nothing"
+        );
+        assert!(
+            !orphans.contains(&integration),
+            "the daemon's own worktree must never be swept"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_leaves_a_young_directory_alone() {
         let _lock = env_lock();
