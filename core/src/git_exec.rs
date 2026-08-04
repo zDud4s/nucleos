@@ -197,19 +197,9 @@ pub struct Computed {
     /// value: publishing is only safe if the branch is still here.
     pub old: String,
     pub new: String,
-    /// What the merge printed, for the row to record.
-    ///
-    /// The module header's blanket allow is `cfg(not(test))`, and no test reads this field: the only
-    /// thing there is to assert about it is git's English ("Merge made by the 'ort' strategy."),
-    /// which pins a locale rather than a contract. So the **test** build is the one that needs a
-    /// narrow allow here — the reverse of the header's axis, hence the mirrored `cfg_attr`.
-    ///
-    /// `expect` rather than `allow`, and only under `cfg(test)`, because both halves have to be true
-    /// at once: an unnecessary `expect` is itself a warning, so this line deletes itself at the task
-    /// that writes the tail into the queue row rather than outliving its reason; and under
-    /// `not(test)` the whole struct is dead, so no field-level lint is emitted there and an
-    /// unconditional `expect` would be unfulfilled.
-    #[cfg_attr(test, expect(dead_code))]
+    /// What the merge printed, for the row to record. `publish` moves it into the `Outcome`, which
+    /// is the reader Task 3 wrote a `cfg_attr(test, expect(dead_code))` here to wait for — the
+    /// `expect` was written to delete itself at exactly this task, and did.
     pub output_tail: String,
 }
 
@@ -485,6 +475,111 @@ async fn add_worktree(
         exit_code: None,
         output_tail: String::new(),
     })
+}
+
+/// Publishes a computed merge onto `target`, by whichever of spec §6.3's routes applies.
+///
+/// Takes the `Computed` by value: it is consumed exactly once, and a publish that could be attempted
+/// twice against the same `old` is a shape worth making impossible rather than documenting.
+pub async fn publish(
+    project_root: &Path,
+    target: &str,
+    computed: Computed,
+    deadline: std::time::Instant,
+) -> Outcome {
+    // Nothing to publish: the merge found the target already contained the source.
+    if computed.new == computed.old {
+        return Outcome::Succeeded {
+            sha: computed.new,
+            output_tail: computed.output_tail,
+        };
+    }
+
+    let holder = match worktree_holding(project_root, target, deadline).await {
+        Ok(holder) => holder,
+        Err(outcome) => return outcome,
+    };
+
+    match holder {
+        None => publish_by_update_ref(project_root, target, computed, deadline).await,
+        // Task 5 renames this binding to `worktree` and replaces the `todo!` — leave it prefixed
+        // with an underscore until then, or this task does not compile warning-free.
+        Some(_worktree) => todo!("Task 5"),
+    }
+}
+
+async fn publish_by_update_ref(
+    project_root: &Path,
+    target: &str,
+    computed: Computed,
+    deadline: std::time::Instant,
+) -> Outcome {
+    let reference = format!("refs/heads/{target}");
+    // The third argument is git's own compare-and-swap. It is checked and applied inside git, so no
+    // gap exists between reading the ref and moving it — which is the whole reason not to do this as
+    // a rev-parse followed by an update.
+    let updated = match git(
+        project_root,
+        &["update-ref", &reference, &computed.new, &computed.old],
+        deadline,
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(outcome) => return outcome,
+    };
+    if !updated.succeeded() {
+        return failed(
+            format!(
+                "{target} moved while the merge was being computed, so it was not published; resubmit"
+            ),
+            &updated,
+        );
+    }
+    Outcome::Succeeded {
+        sha: computed.new,
+        output_tail: computed.output_tail,
+    }
+}
+
+/// The worktree that has `target` checked out, if any.
+///
+/// Read out of `git worktree list --porcelain`, whose blocks are `worktree <path>` / `HEAD <sha>` /
+/// then either `branch refs/heads/<name>` or `detached`. The main checkout is in that list too,
+/// which is the point — "the user has master open" is the ordinary answer.
+///
+/// The daemon's own integration worktree can never be the answer, and not because it is filtered
+/// out: it is always detached, so it has no `branch` line to match. Task 3's `--detach` is what makes
+/// that true, and `an_integration_worktree_never_holds_the_branch_it_merges_into` — written later in
+/// this chunk, and deliberately named here before it exists — is what pins it.
+///
+/// An error here is `Outcome::Failed` and never `Ok(None)`: "we could not find out" must not read as
+/// "nobody has it", which would send the publish down the compare-and-swap route and move a ref out
+/// from under somebody. `worktree.rs:321-327` makes the identical argument about the identical
+/// command.
+async fn worktree_holding(
+    project_root: &Path,
+    target: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<std::path::PathBuf>, Outcome> {
+    let listed = git(project_root, &["worktree", "list", "--porcelain"], deadline).await?;
+    if !listed.succeeded() {
+        return Err(failed(
+            "could not find out which worktree has the target branch open".to_owned(),
+            &listed,
+        ));
+    }
+
+    let wanted = format!("branch refs/heads/{target}");
+    let mut current: Option<std::path::PathBuf> = None;
+    for line in listed.stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(std::path::PathBuf::from(path));
+        } else if line == wanted {
+            return Ok(current);
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1062,6 +1157,82 @@ mod tests {
         assert!(
             integration.exists(),
             "the guard reports the directory and never removes it — a wrong removal is the thing it exists to avoid"
+        );
+    }
+
+    /// The target is a branch nobody has checked out — `release`, not `master`. That is the case this
+    /// row of §6.3 is for, and it is common: an agent merging into a branch no human is standing on.
+    #[tokio::test]
+    async fn a_branch_nobody_has_open_is_moved_by_compare_and_swap() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-cas-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("branch"), OsStr::new("release")]
+        ));
+
+        let computed = compute_merge(&repo, "feat/x", "release", deadline())
+            .await
+            .expect("compute");
+        let new = computed.new.clone();
+
+        let outcome = publish(&repo, "release", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Succeeded { sha, .. } => assert_eq!(sha, new),
+            other => panic!("expected a published merge, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "release"), new, "the branch moved");
+        assert_eq!(
+            sha_of(&repo, "master"),
+            sha_of(&repo, "HEAD"),
+            "the user's checked-out branch was not touched"
+        );
+    }
+
+    /// The second lock doing its job. Between computing and publishing, something else moved the ref —
+    /// another daemon, a human in a terminal. Overwriting would silently discard their commit.
+    #[tokio::test]
+    async fn a_target_that_moved_between_computing_and_publishing_is_refused() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-raced-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("branch"), OsStr::new("release")]
+        ));
+
+        let computed = compute_merge(&repo, "feat/x", "release", deadline())
+            .await
+            .expect("compute");
+
+        // Somebody else moves `release` while the merge was being computed.
+        let elsewhere = sha_of(&repo, "feat/x");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/release"),
+                OsStr::new(&elsewhere)
+            ]
+        ));
+
+        let outcome = publish(&repo, "release", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("moved"),
+                "the reason must say what to do about it: {reason}"
+            ),
+            other => panic!("a raced publish is a Failed, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "release"),
+            elsewhere,
+            "the other party's commit is still there — nothing was overwritten"
         );
     }
 }
