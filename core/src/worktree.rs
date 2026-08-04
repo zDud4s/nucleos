@@ -49,7 +49,7 @@ fn git_bin() -> String {
 /// The diff-side command strings `inspect.rs` disables (`diff.external`, a `textconv` filter) are
 /// deliberately absent: nothing here produces a diff, and carrying flags that cannot apply would
 /// advertise a protection that was never at issue in this module.
-fn git() -> tokio::process::Command {
+pub(crate) fn git() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(git_bin());
     command.arg("-c").arg("core.fsmonitor=");
     command

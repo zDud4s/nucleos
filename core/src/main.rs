@@ -14,6 +14,7 @@ mod email;
 mod feed;
 mod files;
 mod gate;
+mod git_exec;
 mod handoff;
 mod health;
 mod hooks;
