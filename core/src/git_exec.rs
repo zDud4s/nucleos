@@ -1464,6 +1464,65 @@ pub(crate) mod tests {
         );
     }
 
+    /// The other half of that guard, and the half `is_file()` is the whole point of.
+    ///
+    /// The test above builds a directory with no `.git` at all, so it cannot tell an existence check
+    /// from `is_file()` — weakening the guard to mere existence leaves it green (measured: `git_exec`
+    /// 19 passed, `vcs` 40 passed). A `.git` DIRECTORY here is a different animal: not a broken
+    /// worktree but a standalone repository somebody put where the daemon wants to work, which under
+    /// `NUCLEOS_WORKTREE_ROOT` is a directory a human picked and so not far-fetched. It passes an
+    /// existence check, and the three commands behind the guard then land inside it — `reset --hard`
+    /// reverting their uncommitted work and `clean -fd` removing their untracked files, in a
+    /// repository nobody named.
+    ///
+    /// **No sacrificial enclosure here, unlike the test above, and the difference is the point.**
+    /// There the directory was not a repository at all, so every `git -C` walked UP and had to be
+    /// stopped at something we are allowed to lose. Here the directory IS a repository, so the walk
+    /// stops inside it by construction — the damage a weakened guard does is to this repository, and
+    /// that is exactly what the assertions below read.
+    #[tokio::test]
+    async fn a_standalone_repository_where_the_integration_worktree_goes_is_refused_rather_than_reset()
+     {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-standalone-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // Somebody's own repository, exactly where the integration worktree belongs, holding the two
+        // things `reset --hard` and `clean -fd` would each take.
+        let integration = integration_worktree(&repo);
+        initialize_repo(&integration);
+        assert!(
+            integration.join(".git").is_dir(),
+            "a standalone repository has a `.git` DIRECTORY — a linked worktree has a `.git` file, and telling the two apart is what this guard does"
+        );
+        std::fs::write(integration.join("seed.txt"), "somebody's work\n").expect("write");
+        std::fs::write(integration.join("untracked.txt"), "not in the index\n").expect("write");
+
+        let outcome = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect_err("a repository that is not our worktree must be refused, not reset");
+
+        match outcome {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("is not a git worktree"), "got: {reason}")
+            }
+            other => panic!("the guard reports a Failed, got {other:?}"),
+        }
+
+        // The two that carry the property, and the two that survive the guard merely being MOVED
+        // below the commands it stands in front of — where the reason above still reads correctly.
+        assert_eq!(
+            std::fs::read_to_string(integration.join("seed.txt")).expect("read"),
+            "somebody's work\n",
+            "`reset --hard` reverted uncommitted work in a repository the daemon does not own"
+        );
+        assert!(
+            integration.join("untracked.txt").exists(),
+            "`clean -fd` removed a file from a repository the daemon does not own"
+        );
+    }
+
     /// The target is a branch nobody has checked out — `release`, not `master`. That is the case this
     /// row of §6.3 is for, and it is common: an agent merging into a branch no human is standing on.
     #[tokio::test]
