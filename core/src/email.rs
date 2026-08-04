@@ -329,6 +329,20 @@ impl EntryClass {
 /// Wide rather than taking a struct, deliberately: every parameter is a distinct field of the
 /// sidecar's wire envelope, and bundling them would let a caller inherit a default for one of them
 /// — including `retain_bodies_days`, which decides whether a body survives.
+/// PURE: whether this message was written by the account whose mailbox is being read.
+///
+/// Compared through `contacts::normalize_address` so both sides are reduced the same way a stored
+/// correspondent is — `Duarte <D@Example.COM>` and `d@example.com` are one person, and a comparison
+/// that said otherwise would withhold the owner's own sent mail rather than a stranger's.
+///
+/// An empty `owner` answers `false`, not `true`. With no address to compare against there is no
+/// evidence the owner wrote anything, and this guards a brake: every brake in this tree fails
+/// closed, `calendar.rs` being the one documented exception and for the opposite reason.
+fn written_by_owner(owner: &str, from_addr: &str) -> bool {
+    let owner = crate::contacts::normalize_address(owner);
+    !owner.is_empty() && owner == crate::contacts::normalize_address(from_addr)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn ingest_batch(
     pool: &sqlx::SqlitePool,
@@ -338,6 +352,7 @@ pub async fn ingest_batch(
     max_uid_examined: i64,
     skipped: &[SkippedMessage],
     messages: &[IncomingMessage],
+    owner_address: &str,
     retain_bodies_days: u8,
     now: chrono::DateTime<chrono::Utc>,
 ) -> sqlx::Result<IngestOutcome> {
@@ -364,6 +379,7 @@ pub async fn ingest_batch(
     let mut ingested = 0i64;
     let mut duplicates = 0i64;
     let mut highest_delivered = 0i64;
+    let mut foreign_in_sent = 0i64;
 
     for message in messages {
         highest_delivered = highest_delivered.max(message.uid);
@@ -457,13 +473,34 @@ pub async fn ingest_batch(
                     .await?;
                 }
                 crate::contacts::MessageDirection::Outbound => {
-                    let recipients = to_addrs
-                        .into_iter()
-                        .flat_map(crate::contacts::split_address_list)
-                        .filter(|address| !address.trim().is_empty())
-                        .collect::<Vec<_>>();
-                    crate::contacts::record_outbound(&mut tx, &recipients, &message.received_at)
+                    // Only this account's OWN sent mail is evidence that this account has written
+                    // to somebody. `sent_mailbox` is owner configuration and nothing validates what
+                    // it points at (THREAT_MODEL, known gap 6): aimed at a shared or archive
+                    // folder, every message in it would latch `outbound_ever` for recipients this
+                    // account never wrote to.
+                    //
+                    // That is not a cosmetic error in a contact list. `priority.rs`'s
+                    // `first-contact` rule reads exactly this field to decide whether an `urgent`
+                    // from a stranger may keep its class, so a wrongly latched row retires a brake
+                    // — silently, and for precisely the senders the brake exists to hold back.
+                    if written_by_owner(owner_address, &message.from_addr) {
+                        let recipients = to_addrs
+                            .into_iter()
+                            .flat_map(crate::contacts::split_address_list)
+                            .filter(|address| !address.trim().is_empty())
+                            .collect::<Vec<_>>();
+                        crate::contacts::record_outbound(
+                            &mut tx,
+                            &recipients,
+                            &message.received_at,
+                        )
                         .await?;
+                    } else {
+                        // The message itself is still stored — it IS in the mailbox being read, and
+                        // dropping it would lose mail. What is withheld is the CLAIM about who
+                        // corresponds with whom.
+                        foreign_in_sent += 1;
+                    }
                 }
             }
             ingested += 1;
@@ -507,6 +544,29 @@ pub async fn ingest_batch(
                 skip.uid,
                 mailbox,
                 skip.reason.trim()
+            ),
+            None,
+        )
+        .await?;
+    }
+
+    // A `sent_mailbox` pointing somewhere it should not is the one email misconfiguration that
+    // cannot be seen from its effects: the mail still arrives, the queue still fills, and the only
+    // symptom is a brake in `priority.rs` that stops engaging. So it is reported the same way an
+    // unreadable message is — a feed row, in the same transaction as the cursor that moved past it.
+    // Once per batch rather than once per message: a first sync of a shared folder is one mistake,
+    // not four hundred.
+    if foreign_in_sent > 0 {
+        crate::feed::append_on(
+            tx.as_mut(),
+            None,
+            "email_sent_mailbox_foreign",
+            &format!(
+                "{foreign_in_sent} message{} in {mailbox} {} not written by this account, so \
+                 the recipients were not recorded as people you have written to — check \
+                 `sent_mailbox` in .ai/email.yaml",
+                if foreign_in_sent == 1 { "" } else { "s" },
+                if foreign_in_sent == 1 { "was" } else { "were" },
             ),
             None,
         )
@@ -634,6 +694,13 @@ pub async fn get_cursor(pool: &sqlx::SqlitePool, mailbox: &str) -> sqlx::Result<
 
 #[cfg(test)]
 mod tests {
+    /// The account whose mailbox these tests read: the address every fixture message is from, so a `Sent` folder holding them is this account's own.
+    ///
+    /// `ingest_batch` compares it against each sent message's `From`, so a value that did not
+    /// match would stop the outbound fixtures recording anything and quietly hollow out every
+    /// assertion about `outbound_ever` below.
+    const OWNER: &str = "ana@company.com";
+
     use super::*;
     use sqlx::Row;
 
@@ -1157,6 +1224,7 @@ mod tests {
             max_uid_examined,
             &[],
             messages,
+            OWNER,
             14,
             now(),
         )
@@ -1265,6 +1333,7 @@ mod tests {
             22,
             &[],
             std::slice::from_ref(&sent),
+            OWNER,
             14,
             now(),
         )
@@ -1278,6 +1347,7 @@ mod tests {
             22,
             &[],
             &[sent],
+            OWNER,
             14,
             now(),
         )
@@ -1321,6 +1391,7 @@ mod tests {
             23,
             &[],
             &[sent],
+            OWNER,
             14,
             now(),
         )
@@ -1366,6 +1437,7 @@ mod tests {
             24,
             &[],
             &[sent],
+            OWNER,
             14,
             now(),
         )
@@ -1391,6 +1463,116 @@ mod tests {
         );
     }
 
+    /// A `sent_mailbox` aimed somewhere it should not be must not invent correspondents.
+    ///
+    /// THREAT_MODEL known gap 6: nothing validates what `sent_mailbox` points at, and pointed at a
+    /// shared or archive folder every message in it would latch `outbound_ever` for people this
+    /// account never wrote to. That is not a cosmetic error — `priority.rs`'s `first-contact` rule
+    /// reads that field to decide whether an `urgent` from a stranger keeps its class, so the
+    /// misconfiguration retires a brake for exactly the senders the brake exists to hold back.
+    ///
+    /// The message is still STORED: it is in the mailbox being read, and dropping it would lose
+    /// mail. What is withheld is the claim about who corresponds with whom.
+    #[tokio::test]
+    async fn uma_mensagem_de_outra_pessoa_na_pasta_de_enviados_nao_inventa_correspondentes() {
+        let pool = test_pool().await;
+        let recipient = "estranho@example.com";
+        let mut sent = message(30);
+        // Somebody else's sent mail, sitting in the folder `sent_mailbox` names.
+        sent.from_addr = "outra.pessoa@company.com".into();
+        sent.headers.insert("to".into(), recipient.into());
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            30,
+            &[],
+            &[sent],
+            OWNER,
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emails WHERE mailbox = 'Sent'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, 1,
+            "the message itself is mail and must still be kept"
+        );
+
+        let profile = crate::contacts::profile_for(&pool, recipient)
+            .await
+            .unwrap();
+        assert!(
+            profile.is_none_or(|profile| !profile.outbound_ever),
+            "a message this account did not write must not record that it wrote to the recipient"
+        );
+
+        // And it must not be silent, which is the whole complaint in known gap 6: the mail arrives,
+        // the queue fills, and the only symptom is a brake that stops engaging.
+        let told: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM feed WHERE kind = 'email_sent_mailbox_foreign'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(told, 1, "a misconfigured sent_mailbox has to be visible");
+    }
+
+    /// The other half, without which the test above passes by breaking the feature.
+    ///
+    /// A guard comparing raw strings would refuse the owner's own mail the moment the header
+    /// carried a display name or different casing — and every `outbound_ever` assertion in this
+    /// module would still pass, because they would all be asserting on a code path that no longer
+    /// runs. Both sides go through `normalize_address` for that reason.
+    #[tokio::test]
+    async fn o_proprio_envio_conta_mesmo_com_nome_e_capitalizacao_diferentes() {
+        let pool = test_pool().await;
+        let recipient = "destinatario@example.com";
+        let mut sent = message(31);
+        sent.from_addr = "Ana Pereira <Ana@Company.COM>".into();
+        sent.headers.insert("to".into(), recipient.into());
+
+        ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Outbound,
+            "Sent",
+            1,
+            31,
+            &[],
+            &[sent],
+            OWNER,
+            14,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let outbound_ever = crate::contacts::profile_for(&pool, recipient)
+            .await
+            .unwrap()
+            .map(|profile| profile.outbound_ever);
+        assert_eq!(
+            outbound_ever,
+            Some(true),
+            "the owner's own sent mail still records a correspondent"
+        );
+
+        let told: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM feed WHERE kind = 'email_sent_mailbox_foreign'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(told, 0, "nothing is wrong here, so nothing is reported");
+    }
+
     // The noise gate above looks headers up case-insensitively because a casing bug on the Go side
     // should not be able to switch that gate off silently. Recipients need the same protection,
     // especially because a hand-written demo fixture leaves casing to a human.
@@ -1411,6 +1593,7 @@ mod tests {
             24,
             &[],
             &[sent],
+            OWNER,
             14,
             now(),
         )
@@ -1455,6 +1638,7 @@ mod tests {
             25,
             &[],
             &[sent],
+            OWNER,
             14,
             now(),
         )
@@ -1546,6 +1730,7 @@ mod tests {
             15,
             &[],
             &[noisy, old],
+            OWNER,
             0,
             now(),
         )
@@ -1621,6 +1806,7 @@ mod tests {
             21,
             &[],
             &[message(20), poisoned],
+            OWNER,
             14,
             now(),
         )
@@ -1662,6 +1848,7 @@ mod tests {
                 reason: "malformed MIME".into(),
             }],
             &[],
+            OWNER,
             14,
             now(),
         )
@@ -1690,6 +1877,7 @@ mod tests {
             5,
             &[],
             &[],
+            OWNER,
             14,
             now(),
         )
