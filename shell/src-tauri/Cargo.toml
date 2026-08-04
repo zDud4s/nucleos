@@ -19,6 +19,12 @@ name = "shell_lib"
 # (and expect to need MSVC or an export filter for the cdylib on Windows).
 crate-type = ["rlib"]
 
+[profile.dev]
+# Repeated from the workspace root rather than inherited: this package is excluded
+# from that workspace (see the root manifest), so it carries its own profiles too.
+# Same reason — full DWARF cost ~17 GB here and only file:line is ever read.
+debug = "line-tables-only"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

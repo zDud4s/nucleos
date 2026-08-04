@@ -7,3 +7,10 @@ members = ["core"]
 # also lets `npm run tauri dev` build it without the "package believes it's in a
 # workspace" error.
 exclude = ["shell/src-tauri"]
+
+[profile.dev]
+# Full DWARF is what made `target/` grow past 20 GB on this machine, and nothing
+# here reads it: backtraces only need file:line, which `line-tables-only` keeps.
+# Restore `debug = true` if you ever need to inspect variables in a debugger.
+# `profile.test` inherits this, so `cargo test` gets the same saving.
+debug = "line-tables-only"
