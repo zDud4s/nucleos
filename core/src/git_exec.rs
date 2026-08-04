@@ -1178,6 +1178,12 @@ mod tests {
             .expect("compute");
         let new = computed.new.clone();
 
+        // Captured before the publish and compared against itself afterwards. Comparing `master` to
+        // `HEAD` instead — the shape this assertion started as — cannot fail: in the main checkout
+        // `HEAD` is a symref to `refs/heads/master`, so the two resolve to the same object however
+        // far a publish strayed. It proved a symref is a symref.
+        let master_before = sha_of(&repo, "master");
+
         let outcome = publish(&repo, "release", computed, deadline()).await;
 
         match outcome {
@@ -1187,8 +1193,8 @@ mod tests {
         assert_eq!(sha_of(&repo, "release"), new, "the branch moved");
         assert_eq!(
             sha_of(&repo, "master"),
-            sha_of(&repo, "HEAD"),
-            "the user's checked-out branch was not touched"
+            master_before,
+            "publishing into `release` must not move the branch the user is standing on"
         );
     }
 
