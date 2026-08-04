@@ -2049,4 +2049,70 @@ mod tests {
             crate::git_exec::tests::sha_of(&repo, "master")
         );
     }
+
+    /// The other half of that wiring, and the half a happy path structurally cannot see: `execute`
+    /// has to report what `publish` *answered*, not merely that it called it.
+    ///
+    /// Measured, not assumed. Rewriting the merge arm to run `publish`, discard its `Outcome` and
+    /// return `Succeeded { sha: computed.new }` passes all 1059 other tests in this crate — the e2e
+    /// test above included, because on its happy path the publish does land and the two shas agree.
+    /// What that would ship is the worst row this pillar can write: `succeeded`, naming a sha that
+    /// is on no branch, announced in the feed to the person who asked for it. Only a publish that
+    /// refuses tells the two apart, so this drives one — the user is mid-edit on the very file the
+    /// merge brings in, which is `a_user_s_uncommitted_file_blocks_the_publish_and_survives_it_untouched`
+    /// seen from the queue's side rather than from `publish`'s.
+    ///
+    /// It also pins the feed's status as *derived* rather than canned, which is the whole reason
+    /// `Outcome::status()` exists as one function: the summary here reads `blocked`, so a hardcoded
+    /// "succeeded" cannot survive both this and `a_finished_request_is_reported_in_the_feed`.
+    #[tokio::test]
+    async fn a_merge_the_queue_could_not_publish_is_not_recorded_as_succeeded() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-vcs-e2e-blocked-");
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-vcs-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+
+        // `feature.txt` is what `feat/x` adds, so the fast-forward has to write it — and it cannot,
+        // because the user has an uncommitted copy of it sitting there.
+        std::fs::write(repo.join("feature.txt"), "half-finished thought\n").expect("write");
+        let before = crate::git_exec::tests::sha_of(&repo, "master");
+
+        let id = submit(
+            &pool,
+            &SubmitRequest {
+                op: Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".into(),
+                project_root: repo.to_string_lossy().into_owned(),
+                origin: Origin::Human,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await);
+
+        assert_eq!(status_of(&pool, id).await, "blocked");
+        assert_eq!(
+            crate::git_exec::tests::sha_of(&repo, "master"),
+            before,
+            "nothing was published, so the row must not claim anything was"
+        );
+        let ticket = wait_for(&pool, id, Duration::ZERO).await.unwrap();
+        assert!(
+            ticket.result_sha.is_none(),
+            "nothing landed, so there is no commit to name: {ticket:?}"
+        );
+
+        let summaries: Vec<String> =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'vcs_request_finished'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(summaries, vec![format!("vcs request {id} blocked")]);
+    }
 }
