@@ -1935,8 +1935,83 @@ mod tests {
         );
     }
 
+    /// The loop keeps looping — the property the daemon's whole use of this worker rests on, and the
+    /// one both tests around it are structurally blind to.
+    ///
+    /// They submit everything *before* the spawn, so a worker that polls exactly once and returns
+    /// passes them both. In production that worker drains nothing, ever: at startup the queue is
+    /// empty, and every request arrives afterwards. The failure would not be "wrong at an edge", it
+    /// would be "the pillar does nothing", with the suite green.
+    ///
+    /// **No timing assertion, and no sleep to let a poll go by.** The first request is what proves
+    /// the worker's first pass already happened — it cannot have succeeded otherwise — so the second
+    /// is submitted into a worker that is provably past that pass. The only wait is for the second to
+    /// finish, inside a budget 10x `WORKER_POLL_INTERVAL`, which is this file's documented margin.
+    ///
+    /// The second request goes to a **different repository** deliberately. A one-pass worker's
+    /// spawned task loops on the repository it was given, so a second request for `alpha` could be
+    /// swept up by a task that happened to still be draining — the test would then pass for a reason
+    /// that is not the property. `beta` was in no pass that worker ever made, so only another poll
+    /// can reach it.
+    #[tokio::test]
+    async fn a_request_submitted_after_the_worker_started_is_still_drained() {
+        let pool = test_pool().await;
+        let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
+        let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
+
+        let first = submit(&pool, &request_for("alpha", Origin::Human))
+            .await
+            .unwrap();
+        let drained_once = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if status_of(&pool, first).await == "succeeded" {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Not the property under test — it is the precondition for it. Asserted separately so a
+        // worker that never started at all is told apart from one that started and stopped.
+        drained_once.expect("the worker's first pass should drain what was queued for it");
+
+        // Submitted only now: the pass above is over, so nothing but a later poll can find this.
+        let second = submit(&pool, &request_for("beta", Origin::Human))
+            .await
+            .unwrap();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if status_of(&pool, second).await == "succeeded" {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        worker.abort();
+        settled.expect(
+            "the worker must keep polling; one that stops after its first pass would drain nothing \
+             the daemon is ever actually asked to do",
+        );
+    }
+
     /// And the other half, which the rendezvous cannot show: one repository's requests still run one at
     /// a time, in order.
+    ///
+    /// **What this holds, exactly, now that mutation has measured it.** Its ordering assertion is
+    /// redundant against `the_queue_is_served_in_arrival_order` and
+    /// `the_queue_is_drained_in_order_and_each_outcome_recorded` — reversing `claim_next`'s `ORDER BY`
+    /// reddens all three. It is kept because those two call `drain_once` by hand, twice, and this is
+    /// the only test where the *worker* is what reaches the second request: it pins that a spawned
+    /// task drains a repository rather than one request of it.
+    ///
+    /// It does not pin *when*. Draining one request per tick instead of until empty passes this
+    /// unchanged, because the tick is 500ms and the budget below is 5s. Closing that would take an
+    /// elapsed-time assertion against `WORKER_POLL_INTERVAL` with roughly 2x of margin, which is
+    /// under this file's convention and is the flaky bet
+    /// `separate_repositories_are_drained_concurrently` was written to avoid. The gap is named here
+    /// rather than papered over.
     #[tokio::test]
     async fn one_repository_is_still_drained_in_order_one_at_a_time() {
         let pool = test_pool().await;
