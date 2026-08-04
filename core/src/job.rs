@@ -499,6 +499,72 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     Ok(result.last_insert_rowid())
 }
 
+/// Why a job cannot be started for a project.
+///
+/// Three refusals rather than one error string, because a caller answers them differently: an
+/// unknown project is a 404, and the other two are a 422 about a machine configured differently
+/// from what the request assumed rather than a request that is malformed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartRefusal {
+    UnknownProject,
+    NotActive(crate::autopilot::Mode),
+    NoRoot,
+}
+
+impl StartRefusal {
+    /// The sentence handed back to whoever asked. It says which state the project is in, because a
+    /// 422 that will not say what is wrong is a 422 somebody retries unchanged.
+    pub fn reason(&self, project_id: &str) -> String {
+        match self {
+            Self::UnknownProject => format!("unknown project: {project_id}"),
+            Self::NotActive(crate::autopilot::Mode::Shadow) => format!(
+                "project {project_id} is in shadow mode, which is plan-only; a job writes to a \
+                 worktree and needs active"
+            ),
+            Self::NotActive(_) => format!("project {project_id} has autopilot off"),
+            Self::NoRoot => format!("project {project_id} is active but has no root recorded"),
+        }
+    }
+}
+
+/// What a start resolved to.
+///
+/// One field today. It is a value rather than a bare `String` because Chunk 4 adds the claimed slot
+/// number beside it, and a caller that had unwrapped a `String` would have to be rewritten then.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedStart {
+    pub project_root: String,
+}
+
+/// PURE: what a job request resolves to, or why it does not.
+///
+/// Neither the mode nor the root is ever chosen by whoever asks — both are read off the project's
+/// own autopilot state, exactly as `resolve_run_request` does for runs.
+///
+/// **A job REQUIRES `Mode::Active`, and that is where this deliberately differs from that
+/// function.** `resolve_run_request` maps `Shadow` onto the `shadow` run mode, which is right for a
+/// run because a run can be plan-only. A job cannot: its plan node has to write the `plan.json`
+/// that the queue is taken from, and a plan-only node writes nothing — so a job quietly demoted to
+/// shadow would do nothing whatsoever while reporting that it was working all night. `Shadow` and
+/// `Off` are refusals with reasons of their own, never fallbacks. Copying that table across without
+/// noticing is the natural mistake here, which is why it has a test of its own.
+pub fn resolve_start(
+    roster: &[crate::autopilot::ProjectSummary],
+    project_id: &str,
+) -> Result<ResolvedStart, StartRefusal> {
+    let project = roster
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or(StartRefusal::UnknownProject)?;
+    if project.mode != crate::autopilot::Mode::Active {
+        return Err(StartRefusal::NotActive(project.mode));
+    }
+    // Active with no root is a real state rather than an impossible one: the root is recorded when
+    // a project is pointed at a directory, and the mode can be set without that having happened.
+    let project_root = project.project_root.clone().ok_or(StartRefusal::NoRoot)?;
+    Ok(ResolvedStart { project_root })
+}
+
 /// How a start attempt ended.
 ///
 /// `AlreadyLive` is not a check that failed here — it is `one_live_job_per_project` (migration
@@ -2468,6 +2534,87 @@ mod tests {
             "newest first, and the finished one is still there"
         );
         assert_eq!(list(&pool, None, 20).await.unwrap().len(), 3);
+    }
+
+    // ---- resolving a request into a start ------------------------------------------------------
+
+    fn summary(
+        project_id: &str,
+        mode: crate::autopilot::Mode,
+        root: Option<&str>,
+    ) -> crate::autopilot::ProjectSummary {
+        crate::autopilot::ProjectSummary {
+            project_id: project_id.to_string(),
+            mode,
+            project_root: root.map(str::to_string),
+            pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            withheld_classes_ready: 0,
+            promotable: false,
+            open_proposals: 0,
+            wip_limit: None,
+            queue_full: false,
+        }
+    }
+
+    /// The whole refusal table, with no database in sight.
+    ///
+    /// The `Shadow` row is the one that matters. `resolve_run_request` maps shadow onto a real run
+    /// mode, and copying that table across is the natural mistake — but a job's plan node has to
+    /// WRITE `plan.json`, and a plan-only node writes nothing. A job demoted to shadow would do
+    /// nothing at all while reporting that it was working, which is the failure a person only
+    /// discovers in the morning.
+    #[test]
+    fn um_pedido_de_job_resolve_ou_recusa_com_motivo_proprio() {
+        use crate::autopilot::Mode;
+        let roster = vec![
+            summary("off", Mode::Off, Some("/repos/off")),
+            summary("shadow", Mode::Shadow, Some("/repos/shadow")),
+            summary("rootless", Mode::Active, None),
+            summary("live", Mode::Active, Some("/repos/live")),
+        ];
+
+        assert_eq!(
+            resolve_start(&roster, "nao-existe"),
+            Err(StartRefusal::UnknownProject)
+        );
+        assert_eq!(
+            resolve_start(&roster, "off"),
+            Err(StartRefusal::NotActive(Mode::Off))
+        );
+        assert_eq!(
+            resolve_start(&roster, "shadow"),
+            Err(StartRefusal::NotActive(Mode::Shadow)),
+            "shadow is plan-only, so it is a refusal and never a mode a job falls back to"
+        );
+        assert_eq!(
+            resolve_start(&roster, "rootless"),
+            Err(StartRefusal::NoRoot)
+        );
+        assert_eq!(
+            resolve_start(&roster, "live"),
+            Ok(ResolvedStart {
+                project_root: "/repos/live".to_string()
+            })
+        );
+
+        // The two refusals that share a status code still have to be told apart by the person
+        // reading them, or "422" is all the answer they get.
+        assert!(
+            StartRefusal::NotActive(Mode::Shadow)
+                .reason("live")
+                .contains("shadow")
+        );
+        assert!(
+            StartRefusal::NotActive(Mode::Off)
+                .reason("live")
+                .contains("off")
+        );
+        assert_ne!(
+            StartRefusal::NotActive(Mode::Shadow).reason("live"),
+            StartRefusal::NotActive(Mode::Off).reason("live")
+        );
     }
 
     // ---- the whole walk ------------------------------------------------------------------------
