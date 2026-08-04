@@ -1695,8 +1695,18 @@ pub(crate) mod tests {
         );
         assert_eq!(sha_of(&repo, "master"), before, "the branch did not move");
 
-        // Nothing was lost: the merge commit exists as an object, so resubmitting after committing or
-        // stashing publishes it instantly instead of recomputing it.
+        // Nothing was lost: a refused publish rolls nothing back, so the tree, the blobs and both
+        // parents are still in this repository and a resubmission after committing or stashing costs
+        // one merge and no network.
+        //
+        // **Not a cached commit waiting to be published, and reading it as one is the mistake this
+        // comment is this long to prevent.** A blocked row records no `result_sha` (`vcs.rs`'s
+        // `finish` writes `None`) and nothing looks one up, so resubmitting goes through
+        // `compute_merge` again and lands its own commit rather than this one — a merge commit
+        // embeds its committer timestamp, and the human had to commit or stash in between, so it is
+        // not even the same sha. This one is left unreferenced for `gc`. What the assertion pins is
+        // therefore the OBJECTS, not the commit: the user's bytes stayed put and their repository
+        // kept everything a recompute needs.
         assert!(git_ok(
             &repo,
             &[OsStr::new("cat-file"), OsStr::new("-e"), OsStr::new(&new)]

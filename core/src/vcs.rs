@@ -158,8 +158,19 @@ pub enum Outcome {
     Succeeded { sha: String, output_tail: String },
     /// Ran and produced its result, which could not be published because the target worktree's
     /// uncommitted files are in the way. Terminal and never retried in a loop (spec §7): a working
-    /// copy left dirty over an afternoon would otherwise hold the whole repository's queue, and
-    /// resubmitting is instant because the merge commit already exists as an object.
+    /// copy left dirty over an afternoon would otherwise hold the whole repository's queue.
+    ///
+    /// **The computed merge is not kept, and nothing here should be read as though it were.** A
+    /// blocked row records no `result_sha` — `finish` writes `None` — and nothing ever looks one up,
+    /// so a resubmission goes through `compute_merge` again and lands its own commit rather than
+    /// publishing that one: a merge commit embeds its committer timestamp, and the clock has moved
+    /// (the human had to commit or stash first), so it is not even the same sha. The first is left
+    /// unreferenced and is `gc` fodder.
+    ///
+    /// That is the intended shape rather than a leak, and it is what makes the row terminal
+    /// affordable: every object the recompute needs is already in this repository, so redoing it
+    /// costs one merge in a worktree nobody is standing in — while the alternative, a terminal row
+    /// holding a sha that is on no branch, is something somebody would eventually try to publish.
     Blocked { reason: String, output_tail: String },
     /// Ran and failed. A conflicted merge is this, and so is a raced publish.
     Failed {
