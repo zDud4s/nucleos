@@ -14,21 +14,6 @@
 //! operation runs and records how it ended. It never decides whether the actor was allowed to ask
 //! (`autopilot.rs`, `budget.rs`, `wip.rs`, `proposals.rs`), and never what a merge should contain.
 
-// Chunk 1 lands the queue before Chunk 2 wires the worker loop and `GitExecutor`, so every item here
-// has a test caller and no production one.
-//
-// **Chunk 2 must delete this attribute** in the same commit that adds the worker loop, then fix what
-// the compiler reports rather than putting it back: anything still dead once a caller exists is dead
-// for a reason worth reading. If one item genuinely has no caller yet, narrow it to an
-// `#[allow(dead_code)]` on that item carrying the reason — do not keep the blanket.
-//
-// That instruction is the whole defence, because the descriptive version of this comment does not
-// get removed. `attention.rs:12-13` is this same line, and its "part 2" shipped long ago
-// (`scheduler.rs`, `repo_trigger.rs`, `job.rs` and `http.rs` all call `attention::` today) — the
-// attribute is still there, silencing a module nobody means to silence any more. `http.rs:721` and
-// `http.rs:4362` describe the same rot in `contacts.rs`.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 
 /// What was asked for, as data.
@@ -75,8 +60,12 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Human,
+    // Constructed by Chunk 3, when the MCP tools give an external session its own provenance.
+    #[allow(dead_code)]
     Shell,
     Run(i64),
+    // Constructed by Chunk 4, when jobs submit requests of their own.
+    #[allow(dead_code)]
     Job(i64),
 }
 
@@ -762,6 +751,72 @@ pub async fn drain_once(
     true
 }
 
+/// How often the worker looks for repositories with queued work.
+///
+/// Much shorter than this daemon's other background loops (`scheduler.rs` 30s, `repo_trigger.rs`
+/// 5min, `worktree::run_gc` 30min) because this is the only one a human is actively waiting on: they
+/// asked for a merge and are watching for it. The cost of the interval is one query that the
+/// `vcs_requests_queued` partial index covers exactly, over an index that is *empty* whenever
+/// nothing is queued — which is almost always.
+///
+/// A `tokio::sync::Notify` would remove the interval entirely and is the obvious next step if this
+/// ever shows up in a profile. It is not here yet because it has to be signalled from `submit`, which
+/// would give the queue a second way to be woken and a second way to be missed — worth it for real
+/// latency, not for 500ms.
+const WORKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Drains every repository with queued work, forever. Spawned once by `main.rs`.
+///
+/// One task per repository per tick, rather than a loop over repositories: draining them in sequence
+/// would make a ten-minute fetch in one project the reason another project's merge is late, and
+/// "separate repositories do not wait on each other" is the promise the whole per-repository locking
+/// design exists to keep.
+///
+/// **No bookkeeping of which repositories are already draining, deliberately.** A redundant task for
+/// a repository that is already busy is not a hazard: its `claim_next` finds a `running` row, returns
+/// `None`, and the task exits — the database is the arbiter, exactly as it is for everything else
+/// here. The cost is one index-covered query per tick per busy repository, and what it buys is that
+/// there is no in-memory set that can disagree with the database about who holds what.
+///
+/// One consequence worth naming before somebody reads it as a defect: a redundant claim can also
+/// exhaust `busy_timeout` (10s, `storage.rs:69`) against another writer and come back
+/// `Err(SQLITE_BUSY)` rather than `Ok(None)` — `claim_next`'s own doc comment describes this. It is
+/// still safe, because nothing was claimed and `drain_once` returning `false` ends the loop rather
+/// than spinning, but it surfaces as a `could not claim the next vcs request` warning that is
+/// expected under contention.
+///
+/// Each spawned task drains until its repository is empty rather than taking one request, so the
+/// second of two queued merges does not wait a tick for no reason.
+pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<dyn VcsExecutor>) {
+    let mut interval = tokio::time::interval(WORKER_POLL_INTERVAL);
+    loop {
+        interval.tick().await;
+
+        let projects: Vec<String> = match sqlx::query_scalar(
+            "SELECT DISTINCT project_id FROM vcs_requests WHERE status = 'queued'",
+        )
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(projects) => projects,
+            // Best-effort, like every other polling loop in this crate: a failed poll is the next
+            // tick's problem, not a reason to stop draining every repository for ever.
+            Err(error) => {
+                tracing::warn!(%error, "vcs: could not look for repositories with queued work");
+                continue;
+            }
+        };
+
+        for project_id in projects {
+            let pool = pool.clone();
+            let executor = std::sync::Arc::clone(&executor);
+            tokio::spawn(async move {
+                while drain_once(&pool, &project_id, executor.as_ref()).await {}
+            });
+        }
+    }
+}
+
 /// The test double for `VcsExecutor`. `#[cfg(test)]` because every user of it is a test — building it
 /// into the daemon would ship an executor that can report a merge it never performed.
 #[cfg(test)]
@@ -772,6 +827,13 @@ struct FakeVcsExecutor {
     /// reason `FakeTranscriber` carries one.
     // Qualified rather than imported: the import would be unused in the non-test build.
     delay: std::time::Duration,
+    /// A rendezvous every execution must reach before any of them may answer.
+    ///
+    /// The only way to assert concurrency without betting on a scheduler: `n` executions in flight
+    /// at once release each other, and `n - 1` or fewer never return at all. A test that instead
+    /// measured elapsed time would be asserting that two things overlapped by looking at how long
+    /// they took, which is a guess on a loaded machine; this is the property itself.
+    barrier: Option<tokio::sync::Barrier>,
     /// Every request this was handed, in the order it was handed them.
     ///
     /// Recorded rather than counted, because a fake that ignores its argument answers identically
@@ -802,6 +864,15 @@ impl FakeVcsExecutor {
         }
     }
 
+    /// Answers only once `n` executions are in flight at the same moment — so a caller that runs
+    /// them one after the other never gets an answer at all.
+    fn rendezvous_of(n: usize, sha: &str) -> Self {
+        Self {
+            barrier: Some(tokio::sync::Barrier::new(n)),
+            ..Self::succeeding_with(sha)
+        }
+    }
+
     /// `reason` and `output_tail` are deliberately different strings, so a test using this fake
     /// cannot be blind to those two columns being swapped —
     /// `a_failed_request_records_why_and_what_it_printed` uses distinct ones for the same reason.
@@ -822,6 +893,7 @@ impl FakeVcsExecutor {
         Self {
             outcome,
             delay: std::time::Duration::ZERO,
+            barrier: None,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -847,6 +919,11 @@ impl VcsExecutor for FakeVcsExecutor {
         // await it would make this future non-`Send`, which `async_trait` requires.
         self.seen.lock().unwrap().push(request.clone());
         tokio::time::sleep(self.delay).await;
+        // Held here rather than before the delay so it is the last thing between being entered and
+        // answering: whatever else an execution does, it does not finish until its peers arrive.
+        if let Some(barrier) = &self.barrier {
+            barrier.wait().await;
+        }
         self.outcome.clone()
     }
 }
@@ -1822,6 +1899,74 @@ mod tests {
         assert!(
             claim_next(&pool, "alpha").await.unwrap().is_some(),
             "once reconciled, the repository is free again"
+        );
+    }
+
+    /// Two repositories, one worker. If it drains them one after the other, neither of these executions
+    /// can complete: the fake will not answer until both have arrived.
+    #[tokio::test]
+    async fn separate_repositories_are_drained_concurrently() {
+        let pool = test_pool().await;
+        let first = submit(&pool, &request_for("alpha", Origin::Human))
+            .await
+            .unwrap();
+        let second = submit(&pool, &request_for("beta", Origin::Human))
+            .await
+            .unwrap();
+
+        let executor = std::sync::Arc::new(FakeVcsExecutor::rendezvous_of(2, "abc123"));
+        let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if status_of(&pool, first).await == "succeeded"
+                    && status_of(&pool, second).await == "succeeded"
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        worker.abort();
+        settled.expect(
+            "both repositories must be in flight at once; a worker that serialises projects deadlocks here",
+        );
+    }
+
+    /// And the other half, which the rendezvous cannot show: one repository's requests still run one at
+    /// a time, in order.
+    #[tokio::test]
+    async fn one_repository_is_still_drained_in_order_one_at_a_time() {
+        let pool = test_pool().await;
+        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+
+        let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
+        let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if status_of(&pool, second).await == "succeeded" {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        worker.abort();
+        settled.expect("the worker should drain the queue");
+        assert_eq!(status_of(&pool, first).await, "succeeded");
+        assert_eq!(
+            executor
+                .seen()
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            vec![first, second],
+            "arrival order, and each one only after the last finished"
         );
     }
 

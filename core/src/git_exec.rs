@@ -4,20 +4,6 @@
 //! `gate.rs` and `transcribe.rs` are each their own module for the same reason. Nothing here knows
 //! what a request is or when it may run; it takes a repository, an argv and a deadline.
 
-// Task 2 lands the process boundary before Tasks 3-7 build compute, publish and the worker loop on
-// top of it, so every item here has a test caller and no production one — and `scripts/gates.sh`
-// runs `cargo clippy --all-targets -- -D warnings` over this crate, which compiles the bin target
-// without `cfg(test)` and so turns each of those into an error.
-//
-// **Task 7 must delete this attribute** — it spawns the worker, which is what gives this module its
-// first production caller — then fix what the compiler reports rather than putting it back: anything
-// still dead once a caller exists is dead for a reason worth reading. Naming the task rather than
-// the condition is deliberate: a condition is not greppable and nobody is watching for it. If one
-// item genuinely has no caller yet, narrow it to an
-// `#[allow(dead_code)]` on that item carrying the reason — do not keep the blanket. `vcs.rs:17-30`
-// is this same instruction, and says at length why the descriptive version of it rots.
-#![cfg_attr(not(test), allow(dead_code))]
-
 // `Outcome` comes from `vcs.rs`, and that is the right direction of dependency: `git_exec` produces
 // outcomes for the queue to record, and knows nothing about rows, claims or ordering.
 use crate::vcs::Outcome;

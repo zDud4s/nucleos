@@ -569,6 +569,10 @@ async fn main() {
     tokio::spawn(job::run_job_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
+    tokio::spawn(vcs::run_queue_worker(
+        state.pool.clone(),
+        std::sync::Arc::new(git_exec::GitExecutor::default()),
+    ));
 
     // Spawned whether or not the pillar is enabled: the loop also owns retention, and bodies
     // already stored do not stop needing to expire because polling was switched off.
