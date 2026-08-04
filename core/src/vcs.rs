@@ -163,21 +163,35 @@ pub struct ClaimedRequest {
 }
 
 /// How a claimed request ended.
-///
-/// There is deliberately no `blocked` variant yet: the `status` CHECK already accepts the string,
-/// but nothing in this chunk can produce that state — it becomes reachable only once publishing
-/// exists — and a variant nothing constructs is dead weight the compiler is right to complain
-/// about. The schema is already ready for it.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    Succeeded {
-        sha: String,
-    },
+    /// Ran, and did what was asked.
+    Succeeded { sha: String, output_tail: String },
+    /// Ran and produced its result, which could not be published because the target worktree's
+    /// uncommitted files are in the way. Terminal and never retried in a loop (spec §7): a working
+    /// copy left dirty over an afternoon would otherwise hold the whole repository's queue, and
+    /// resubmitting is instant because the merge commit already exists as an object.
+    Blocked { reason: String, output_tail: String },
+    /// Ran and failed. A conflicted merge is this, and so is a raced publish.
     Failed {
         reason: String,
         exit_code: Option<i32>,
         output_tail: String,
     },
+    /// Never reached an argv — the row itself was unexecutable, which is a defect in the row and not
+    /// a result of the operation.
+    ///
+    /// Recorded as `failed`, because there is no other honest status for it and adding one would
+    /// mean a migration for a case that only a corrupt row can produce. It is told apart in the row
+    /// **structurally**, not by reading the prose: every other variant writes an `output_tail`
+    /// (possibly empty), and this one writes NULL. `output_tail IS NULL` is therefore exactly "this
+    /// row could not be executed", and it is queryable.
+    ///
+    /// It does *not* mean "no subprocess ran". An operation can fail before reaching one — the
+    /// integration worktree turning out not to be a worktree — and that writes an empty tail rather
+    /// than NULL, because the row was executable and the environment was not. The two are different
+    /// defects and belong to different people.
+    Unexecutable { reason: String },
 }
 
 /// Takes the oldest claimable request for one repository and marks it `running`, or returns `None`.
@@ -265,15 +279,15 @@ pub async fn claim_next(
             let reason =
                 format!("stored operation for vcs request {id} could not be parsed: {error}");
             // Terminal rather than back to `queued`: re-queueing would hand the same unparseable
-            // row out again on the next poll, forever. `exit_code` is `None` and `output_tail`
-            // empty because nothing ran — this row never reached an argv.
+            // row out again on the next poll, forever. `Unexecutable` rather than `Failed` because
+            // this row never reached an argv, and that is what leaves `output_tail` NULL — the
+            // structural discriminator `Outcome::Unexecutable`'s doc comment describes. This arm is
+            // its only producer.
             let released = match finish(
                 &mut *transaction,
                 id,
-                Outcome::Failed {
+                Outcome::Unexecutable {
                     reason: reason.clone(),
-                    exit_code: None,
-                    output_tail: String::new(),
                 },
             )
             .await
@@ -304,7 +318,7 @@ pub async fn claim_next(
 /// Releases the repository by writing the claimed request's terminal status.
 ///
 /// The columns an outcome does not carry are written NULL rather than left alone: one statement
-/// covers both outcomes, and NULL is already what those columns hold for a row that has only ever
+/// covers every outcome, and NULL is already what those columns hold for a row that has only ever
 /// been queued and claimed.
 ///
 /// Scoped to `status = 'running'`, and a zero-row match is `RowNotFound` rather than a silent
@@ -323,12 +337,19 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
 ) -> sqlx::Result<()> {
     let finished_at = chrono::Utc::now().to_rfc3339();
     let (status, result_sha, failure_reason, exit_code, output_tail) = match outcome {
-        Outcome::Succeeded { sha } => ("succeeded", Some(sha), None, None, None),
+        Outcome::Succeeded { sha, output_tail } => {
+            ("succeeded", Some(sha), None, None, Some(output_tail))
+        }
+        Outcome::Blocked {
+            reason,
+            output_tail,
+        } => ("blocked", None, Some(reason), None, Some(output_tail)),
         Outcome::Failed {
             reason,
             exit_code,
             output_tail,
         } => ("failed", None, Some(reason), exit_code, Some(output_tail)),
+        Outcome::Unexecutable { reason } => ("failed", None, Some(reason), None, None),
     };
     let finished = sqlx::query(
         "UPDATE vcs_requests
@@ -358,10 +379,10 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
 /// exactly this back as its HTTP response body, whether the queue answered inside the deadline or
 /// not.
 ///
-/// `status` is the same string the `status` column holds rather than an enum: `blocked`,
-/// `rejected` and `cancelled` are already in that column's CHECK constraint even though nothing in
-/// this module writes them yet (see `Outcome`'s doc comment), and a `Ticket` round-trips whichever
-/// one a row holds without this module needing to know what it means.
+/// `status` is the same string the `status` column holds rather than an enum: `rejected` and
+/// `cancelled` are already in that column's CHECK constraint even though nothing in this module
+/// writes them yet, and a `Ticket` round-trips whichever one a row holds without this module
+/// needing to know what it means.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticket {
     pub id: i64,
@@ -471,15 +492,17 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// caller a hard timeout: it gets a ticket back instead and decides for itself whether to keep
 /// waiting.
 ///
-/// Terminal means `succeeded`, `failed`, or `interrupted` — the three statuses `finish` and
-/// `reconcile_interrupted` actually write today, matching the vocabulary those two already use (see
-/// `finish`'s own doc comment, and the interrupted-is-terminal test above). `queued`, `running` and
-/// `awaiting_approval` are treated identically: all three can still change, so none of them ends the
-/// wait early, and if the deadline passes while a row is in any of them the ticket just reports
-/// whichever one it is. `awaiting_approval` is deliberately not special-cased to end the wait
-/// sooner — a human approving mid-wait is exactly the change this loop is built to catch on its next
-/// poll, and treating "needs a human" as if it were "done" would tell an agent to stop watching a
-/// request that is very much still alive.
+/// Terminal means `succeeded`, `failed`, `blocked`, or `interrupted` — the four statuses `finish`
+/// and `reconcile_interrupted` actually write today, matching the vocabulary those two already use
+/// (see `finish`'s own doc comment, and the interrupted-is-terminal test above). `blocked` is as
+/// terminal as the other three: the queue never retries it, so a caller held to the deadline would
+/// be waiting on a row that can no longer change — and it is the outcome that most needs a human to
+/// see it promptly. `queued`, `running` and `awaiting_approval` are treated identically: all three
+/// can still change, so none of them ends the wait early, and if the deadline passes while a row is
+/// in any of them the ticket just reports whichever one it is. `awaiting_approval` is deliberately
+/// not special-cased to end the wait sooner — a human approving mid-wait is exactly the change this
+/// loop is built to catch on its next poll, and treating "needs a human" as if it were "done" would
+/// tell an agent to stop watching a request that is very much still alive.
 ///
 /// An `id` with no matching row is answered `Err(RowNotFound)` on the very first read, without
 /// spending any of the deadline: every id in circulation came from `submit`, which hands one back
@@ -513,7 +536,10 @@ pub async fn wait_for(
             return Err(sqlx::Error::RowNotFound);
         };
 
-        let terminal = matches!(status.as_str(), "succeeded" | "failed" | "interrupted");
+        let terminal = matches!(
+            status.as_str(),
+            "succeeded" | "failed" | "blocked" | "interrupted"
+        );
         if terminal || started.elapsed() >= deadline {
             return Ok(Ticket {
                 id,
@@ -706,8 +732,14 @@ struct FakeVcsExecutor {
 
 #[cfg(test)]
 impl FakeVcsExecutor {
+    /// `output_tail` is non-empty and deliberately unlike the sha, for the reason
+    /// `failing_with`'s doc comment gives about its own two strings: a fake whose two columns
+    /// carried the same text could not tell a test that they had been swapped.
     fn succeeding_with(sha: &str) -> Self {
-        Self::reporting(Outcome::Succeeded { sha: sha.into() })
+        Self::reporting(Outcome::Succeeded {
+            sha: sha.into(),
+            output_tail: format!("git printed this while succeeding at {sha}"),
+        })
     }
 
     /// Answers, but not immediately.
@@ -823,6 +855,17 @@ mod tests {
         .await
         .unwrap()
         .expect("a failed request records why it failed")
+    }
+
+    /// Returns the `Option` rather than `unwrap_or_default()`ing it: NULL and `""` are different
+    /// things in this column — NULL means the row never reached an argv — and collapsing them would
+    /// erase exactly the distinction its callers are checking.
+    async fn output_tail_of(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT output_tail FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     async fn run_id_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
@@ -994,6 +1037,7 @@ mod tests {
             first,
             Outcome::Succeeded {
                 sha: "abc123".into(),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
         .await
@@ -1096,6 +1140,7 @@ mod tests {
             id,
             Outcome::Succeeded {
                 sha: "abc123".into(),
+                output_tail: "Fast-forward".into(),
             },
         )
         .await
@@ -1119,8 +1164,34 @@ mod tests {
         assert_eq!(status, "succeeded");
         assert_eq!(sha.as_deref(), Some("abc123"));
         assert_eq!(exit_code, None, "nothing failed, so there is no exit code");
-        assert_eq!(output_tail, None);
+        // Not NULL: a success keeps what it printed, and NULL in this column now means something
+        // else entirely — that the row never reached an argv (`Outcome::Unexecutable`).
+        assert_eq!(output_tail.as_deref(), Some("Fast-forward"));
         assert_eq!(reason, None);
+    }
+
+    /// A successful command's output has somewhere to go. Chunk 1 could not record it: a merge that
+    /// succeeded with warnings — a renamed file resolved, a hook's advice — printed them into nothing.
+    #[tokio::test]
+    async fn a_successful_operation_keeps_what_it_printed() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output_tail_of(&pool, id).await.as_deref(),
+            Some("Merge made by the 'ort' strategy.")
+        );
     }
 
     #[tokio::test]
@@ -1166,6 +1237,46 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("merge conflict"));
     }
 
+    /// The deferred decision, settled in the row rather than in prose: `output_tail IS NULL` means the
+    /// request never reached an argv. Both of these rows read `failed`, so without a structural
+    /// discriminator anyone querying failures for execution diagnostics finds entries with no exit code
+    /// and no output and no way to tell why.
+    #[tokio::test]
+    async fn a_request_that_never_ran_is_distinguishable_from_one_that_ran_and_failed() {
+        let pool = test_pool().await;
+
+        let never_ran = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            never_ran,
+            Outcome::Unexecutable {
+                reason: "stored operation could not be parsed".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let ran = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            ran,
+            Outcome::Failed {
+                reason: "CONFLICT (content)".into(),
+                exit_code: Some(1),
+                output_tail: "Automatic merge failed".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status_of(&pool, never_ran).await, "failed");
+        assert_eq!(status_of(&pool, ran).await, "failed");
+        assert!(output_tail_of(&pool, never_ran).await.is_none());
+        assert!(output_tail_of(&pool, ran).await.is_some());
+    }
+
     /// Only the holder of a claim may end it.
     ///
     /// Task 5's restart reconciliation marks stranded rows `interrupted` and records why. A worker
@@ -1184,6 +1295,7 @@ mod tests {
             id,
             Outcome::Succeeded {
                 sha: "abc123".into(),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
         .await;
@@ -1315,6 +1427,7 @@ mod tests {
             id,
             Outcome::Succeeded {
                 sha: "abc123".into(),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
         .await;
@@ -1682,6 +1795,42 @@ mod tests {
         assert!(
             started.elapsed() < WAIT_POLL_INTERVAL,
             "a failed request must answer from the first read, not pay for a poll"
+        );
+    }
+
+    /// Terminal, and terminal in the way that matters: a caller waiting on a blocked request must be
+    /// told now, not at the deadline. The elapsed assertion is the whole test — a wait that ran to its
+    /// deadline would return the identical ticket.
+    #[tokio::test]
+    async fn a_blocked_request_ends_the_wait_rather_than_running_it_out() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Blocked {
+                reason: "uncommitted changes in the target worktree are in the way".into(),
+                output_tail:
+                    "error: Your local changes to the following files would be overwritten by merge:\n\tnotes.txt"
+                        .into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "blocked");
+
+        let started = std::time::Instant::now();
+        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        assert_eq!(ticket.status, "blocked");
+        assert!(
+            ticket.failure_reason.unwrap().contains("in the way"),
+            "the ticket must carry why it is blocked, or the agent cannot act on it"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked is terminal: the wait must not run to its deadline"
         );
     }
 
