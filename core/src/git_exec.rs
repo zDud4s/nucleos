@@ -740,6 +740,36 @@ impl crate::vcs::VcsExecutor for GitExecutor {
             op = request.op.kind(),
             "vcs: executing"
         );
+        // **The third `.git` guard, on the one directory this module neither creates nor reads out
+        // of git.** `prepare_integration_worktree` guards the directory it makes and
+        // `publish_by_fast_forward` guards the one `worktree list` named; `project_root` arrives on
+        // the queue row, and `worktree add`, `worktree list` and `update-ref` all run with `-C`
+        // pointed at it. `git -C <dir>` walks UP, so a root that exists and is not a repository does
+        // not fail — the whole operation runs against whatever repository ENCLOSES it. Measured: the
+        // merge computed, the enclosing repository's `master` moved, and the row came back
+        // `Succeeded` naming a sha from a repository nobody named.
+        //
+        // Nothing constructs a `SubmitRequest` in production yet, so this is not reachable today.
+        // Resolving a project from an agent's cwd is what opens it, and there a stale root or a cwd
+        // one level off the project is enough.
+        //
+        // **Existence, not `is_file()`** — a project root is a main checkout, whose `.git` is a
+        // DIRECTORY. `publish_by_fast_forward`'s guard states that distinction at length and this is
+        // the same case for the same reason; it is not repeated here so there is one place to fix if
+        // it is ever wrong.
+        if tokio::fs::metadata(project_root.join(".git"))
+            .await
+            .is_err()
+        {
+            return Outcome::Failed {
+                reason: format!(
+                    "{} is not a git repository; check the project's root and resubmit",
+                    project_root.display()
+                ),
+                exit_code: None,
+                output_tail: String::new(),
+            };
+        }
         // Deliberately exhaustive with no `_` arm: Chunk 4 adds variants, and a wildcard here would
         // let one ship with no executor and no compile error — a request that queues, claims the
         // repository, and reports success having done nothing.
@@ -1713,6 +1743,96 @@ pub(crate) mod tests {
             sha_of(&enclosing, "HEAD"),
             enclosing_before,
             "and nothing was fast-forwarded into a repository nobody named"
+        );
+    }
+
+    /// The third guard, on the directory the queue row supplies rather than one this module made.
+    ///
+    /// The two guards above protect directories git or this module produced; `project_root` is
+    /// handed over, and it is where `worktree add`, `worktree list` and `update-ref` all point. So
+    /// the walk-up costs more here than anywhere else: a root that exists and is not a repository
+    /// does not fail, it runs the ENTIRE operation — compute and publish both — against whatever
+    /// encloses it. Measured before the guard existed: `Succeeded`, with the enclosing repository's
+    /// `master` moved and the sha of a merge commit nobody asked for.
+    ///
+    /// So the enclosing repository here is not a bystander to be kept safe, it is the thing the
+    /// unguarded run would have merged into — it gets `master` and `feat/x` on purpose, so that the
+    /// operation is one that *would* have completely succeeded.
+    #[tokio::test]
+    async fn a_project_root_that_is_not_a_repository_is_refused_before_git_is_pointed_at_it() {
+        use crate::vcs::VcsExecutor;
+
+        let _lock = crate::worktree::test_env_lock();
+        // The sacrificial repository, mergeable exactly as the real project would be.
+        let (_enclosure, enclosing) = repo_with_a_branch_to_merge("nucleos-gitexec-rootencl-");
+        let enclosing_before = sha_of(&enclosing, "master");
+        // Its own uncommitted work, in a file `feat/x` does not touch — so a publish that reached
+        // it would have fast-forwarded straight past this rather than being blocked by it.
+        std::fs::write(enclosing.join("seed.txt"), "uncommitted work\n").expect("write");
+
+        // What the row names: a directory that exists, is not a repository, and sits INSIDE one.
+        // Chunk 3 resolves this string from an agent's cwd, where a stale root or a cwd one level
+        // off the project produces exactly this.
+        let project_root = enclosing.join("project");
+        std::fs::create_dir_all(&project_root).expect("a directory that is not a repository");
+        let roots = enclosing.join("roots");
+        let _env = WorktreeRootEnv::set(&roots);
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Merge {
+                    source: "feat/x".to_owned(),
+                    target: "master".to_owned(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: project_root.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match outcome {
+            // The same shape the other two guards report, and for the same reason: the row was
+            // executable and the environment was not, so an empty tail rather than the NULL that
+            // means the row itself could not be executed.
+            Outcome::Failed {
+                reason,
+                exit_code,
+                output_tail,
+            } => {
+                assert!(reason.contains("is not a git repository"), "got: {reason}");
+                assert!(
+                    reason.contains(&project_root.display().to_string()),
+                    "the reason names the directory, or nobody can tell which root was wrong: {reason}"
+                );
+                assert_eq!(exit_code, None, "nothing ran, so nothing exited");
+                assert!(
+                    output_tail.is_empty(),
+                    "no command printed anything: {output_tail}"
+                );
+            }
+            other => panic!("the guard reports a Failed, got {other:?}"),
+        }
+
+        // The one that carries the property: this is what moved when the guard was not there.
+        assert_eq!(
+            sha_of(&enclosing, "master"),
+            enclosing_before,
+            "the operation ran against the enclosing repository and published into it"
+        );
+        // The guard runs before ANY git command, not merely before the publish — `worktree add` is
+        // the first thing the compute reaches, and it would have registered a worktree in the
+        // enclosing repository and created this directory to hold it.
+        assert!(
+            !roots.exists(),
+            "the guard runs BEFORE `worktree add`, which would otherwise have added a worktree to a repository nobody named"
+        );
+        // Weaker than those two and kept for what it states rather than what it catches: a
+        // fast-forward leaves a dirty file it does not need alone, so this survives the unguarded
+        // run as well. It pins the promise the pillar makes about the user's bytes.
+        assert_eq!(
+            std::fs::read_to_string(enclosing.join("seed.txt")).expect("read"),
+            "uncommitted work\n",
+            "the enclosing repository's uncommitted work is untouched"
         );
     }
 }
