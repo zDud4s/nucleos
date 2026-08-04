@@ -184,8 +184,11 @@ pub enum Outcome {
     /// Recorded as `failed`, because there is no other honest status for it and adding one would
     /// mean a migration for a case that only a corrupt row can produce. It is told apart in the row
     /// **structurally**, not by reading the prose: every other variant writes an `output_tail`
-    /// (possibly empty), and this one writes NULL. `output_tail IS NULL` is therefore exactly "this
-    /// row could not be executed", and it is queryable.
+    /// (possibly empty), and this one writes NULL. `status = 'failed' AND output_tail IS NULL` is
+    /// therefore exactly "this row could not be executed", and it is queryable. The status half is
+    /// not decoration — `reconcile_interrupted` writes a terminal status without touching this
+    /// column, so it leaves NULL on rows where git may well have run, and so does every row still
+    /// queued, running or awaiting approval.
     ///
     /// It does *not* mean "no subprocess ran". An operation can fail before reaching one — the
     /// integration worktree turning out not to be a worktree — and that writes an empty tail rather
@@ -1097,6 +1100,14 @@ mod tests {
         assert!(
             reason.contains(&corrupt.to_string()) && reason.contains("could not be parsed"),
             "the recorded reason must name the row and say what was wrong: {reason}"
+        );
+        // The only production producer of `Outcome::Unexecutable`, and the only place its NULL
+        // `output_tail` can be caught being written: revert this arm to a `Failed` with an empty
+        // tail and every other assertion here still passes.
+        assert!(
+            output_tail_of(&pool, corrupt).await.is_none(),
+            "a row that never reached an argv writes no output tail; that NULL is what tells it \
+             apart from an operation that ran and failed"
         );
         assert_eq!(
             claim_next(&pool, "alpha").await.unwrap().unwrap().id,
