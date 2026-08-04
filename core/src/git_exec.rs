@@ -69,6 +69,14 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
+/// **`git` and `add_worktree` are the only sanctioned production entries**, and a new caller belongs
+/// behind one of them rather than here: they are where whatever is left of the operation's budget is
+/// computed and an already-spent one is refused *before* a child is spawned, which `output()` would
+/// otherwise do eagerly. Tasks 4-7 add call sites; one that reaches past those two takes its
+/// `Duration` from somewhere else and quietly loses that gate. Naming them makes the gate greppable
+/// rather than conventional. The tests below call this directly on purpose — they are testing the
+/// transport itself.
+///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
 /// `TailBuffer`. That is not an oversight: a gate runs a test suite, which can print without bound
 /// for as long as it likes, while a git command's output is bounded by the size of the change. The
@@ -352,15 +360,24 @@ async fn prepare_integration_worktree(
     // **This check runs before any git command is pointed at that directory, and it is load-bearing.**
     // `git -C <dir>` walks UP until it finds a repository. So a directory that exists but is not a
     // worktree does not make `reset --hard` fail — it makes it *succeed* against whatever ancestor
-    // repository encloses it, hard-resetting someone else's working tree and then `clean -fd`-ing
-    // it. That is precisely the runtime recursive delete this function is written to avoid, reached
-    // by a command that reports success. It is not hypothetical in the tests either:
-    // `space_free_tempdir` places the worktree root inside this very checkout.
+    // repository encloses it — reverting every uncommitted tracked change in that repository, by way
+    // of a command that reports success. That is precisely the runtime destruction this function is
+    // written to avoid. The two commands below are not equally dangerous, and saying so exactly
+    // matters: `reset --hard` is repository-wide, while the `clean -fd` is *cwd-relative* and would
+    // remove only this directory's own contents. The reset is the half that destroys work. None of
+    // this is hypothetical in the tests either: `space_free_tempdir` places the worktree root inside
+    // this very checkout, which is why the test for this guard builds a sacrificial repository
+    // between the two rather than letting the walk-up reach the real one.
     //
-    // A linked worktree always has a `.git` file naming its admin directory. Its absence means the
-    // directory is not one, in every state that reaches here — an interrupted `worktree add`, a
-    // hand-deleted `.git`, a directory somebody created by mistake.
-    if tokio::fs::metadata(integration.join(".git")).await.is_err() {
+    // A linked worktree always has a `.git` FILE naming its admin directory, and `is_file` rather
+    // than mere existence is deliberate: a `.git` *directory* at that path is a standalone
+    // repository somebody put there, which would pass an existence check and then be reset and
+    // cleaned. Every other state that reaches here is not a worktree either — an interrupted
+    // `worktree add`, a hand-deleted `.git`, a directory somebody created by mistake.
+    if !tokio::fs::metadata(integration.join(".git"))
+        .await
+        .is_ok_and(|entry| entry.is_file())
+    {
         return Err(Outcome::Failed {
             reason: format!(
                 "{} exists but is not a git worktree; remove that directory and resubmit",
@@ -391,6 +408,13 @@ async fn prepare_integration_worktree(
     }
     // `-fd`, not `-fdx`: ignored files are build output that costs nothing to keep and minutes to
     // rebuild, and nothing git ignores can affect a merge.
+    //
+    // Discarded like the abort above, but not for the same reason and not for free: a failing
+    // `clean` is abnormal rather than ordinary — a file held open by an indexer or an editor is the
+    // usual Windows cause — and what it then leaves behind resurfaces as the next command's "could
+    // not check out <target> to merge into", which does not look related to it. Accepted anyway,
+    // because the checkout is the step that actually knows whether the litter is in the way, and
+    // refusing here would fail operations it would have completed.
     let _ = git(&integration, &["clean", "-fd"], deadline).await;
     Ok(integration)
 }
@@ -436,8 +460,9 @@ async fn create_integration_worktree(
     Ok(integration.to_path_buf())
 }
 
-/// The only argv in this module with a path in it, and therefore the only caller of `run_git` that
-/// is not `git`.
+/// The only argv in this module with a path in it, and therefore the only *production* caller of
+/// `run_git` that is not `git`. The test module below calls it directly three more times, testing
+/// the transport rather than going through this module's budget gate.
 async fn add_worktree(
     project_root: &Path,
     integration: &Path,
@@ -917,6 +942,126 @@ mod tests {
         assert!(
             !integration.join("litter.txt").exists(),
             "untracked litter is cleaned too, or it accumulates for the life of the project"
+        );
+    }
+
+    /// The `.git` guard, and the reason it must run before any git command is pointed at that
+    /// directory. `git -C <dir>` walks UP until it finds a repository, so a directory that is not a
+    /// worktree does not make `reset --hard` fail — it makes it succeed against whatever repository
+    /// encloses it, reverting every uncommitted tracked change there and exiting 0.
+    ///
+    /// **The enclosure is built on purpose, never borrowed from the ambient checkout.**
+    /// `space_free_tempdir` puts these directories inside this very repository, so a regression that
+    /// removed the guard would otherwise revert the developer's own uncommitted work instead of
+    /// reporting a failure. A repository of our own, between the plain directory and the real one,
+    /// stops the walk-up at something we are allowed to lose.
+    #[tokio::test]
+    async fn a_directory_that_is_not_a_worktree_is_refused_before_git_is_pointed_at_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-guard-");
+
+        // The sacrificial repository, left in the three states the commands behind the guard would
+        // each destroy: mid-conflict (what `merge --abort` clears), one tracked file modified (what
+        // `reset --hard` reverts) and one untracked file (what a `clean` given a wider scope would
+        // remove). `work.txt` is committed before the conflict exists, so neither the merge nor its
+        // abort has any business touching it — it moves only if `reset --hard` walked up.
+        let (_enclosure, enclosing) = init_contained_repo("nucleos-gitexec-enclosing-");
+        std::fs::write(enclosing.join("work.txt"), "committed\n").expect("write");
+        assert!(git_ok(&enclosing, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &enclosing,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("work")]
+        ));
+        assert!(git_ok(
+            &enclosing,
+            &[OsStr::new("branch"), OsStr::new("-M"), OsStr::new("master")]
+        ));
+        assert!(git_ok(
+            &enclosing,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        std::fs::write(enclosing.join("seed.txt"), "theirs\n").expect("write");
+        assert!(git_ok(
+            &enclosing,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("theirs")
+            ]
+        ));
+        assert!(git_ok(
+            &enclosing,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(enclosing.join("seed.txt"), "ours\n").expect("write");
+        assert!(git_ok(
+            &enclosing,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+        assert!(
+            !git_ok(&enclosing, &[OsStr::new("merge"), OsStr::new("feat/x")]),
+            "the setup needs the conflict, so that there is a merge left to abort"
+        );
+        let merge_head = enclosing.join(".git").join("MERGE_HEAD");
+        assert!(merge_head.exists(), "the enclosing repository is mid-merge");
+        std::fs::write(enclosing.join("work.txt"), "uncommitted work\n").expect("write");
+        std::fs::write(enclosing.join("untracked.txt"), "not in the index\n").expect("write");
+
+        // The worktree root, and so the integration directory, INSIDE that repository.
+        let roots = enclosing.join("roots");
+        let _env = WorktreeRootEnv::set(&roots);
+        let integration = integration_worktree(&repo);
+        std::fs::create_dir_all(&integration).expect("a directory that is not a worktree");
+
+        let outcome = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect_err("a directory that is not a worktree must be refused, not used");
+
+        match outcome {
+            // The shape `vcs.rs`'s `Outcome::Unexecutable` doc already predicts for exactly this
+            // case: the row was executable and the environment was not, so an EMPTY tail — `failed`
+            // with `output_tail IS NOT NULL` — rather than the NULL that means the row itself could
+            // not be executed.
+            Outcome::Failed {
+                reason,
+                exit_code,
+                output_tail,
+            } => {
+                assert!(reason.contains("is not a git worktree"), "got: {reason}");
+                assert_eq!(exit_code, None, "nothing ran, so nothing exited");
+                assert!(
+                    output_tail.is_empty(),
+                    "no command printed anything: {output_tail}"
+                );
+            }
+            other => panic!("the guard reports a Failed, got {other:?}"),
+        }
+
+        // The two that carry the property: each goes red if the guard is deleted, or moved below the
+        // command it stands in front of.
+        assert!(
+            merge_head.exists(),
+            "the guard runs BEFORE `merge --abort`, which would otherwise have cleared this"
+        );
+        assert_eq!(
+            std::fs::read_to_string(enclosing.join("work.txt")).expect("read"),
+            "uncommitted work\n",
+            "`reset --hard` walked up and reverted the enclosing repository's uncommitted work"
+        );
+        // Weaker than those two, and kept for what it pins rather than what it catches today:
+        // `clean -fd` is cwd-relative, so it could only ever reach this file if the argv gained a
+        // path or the command were pointed somewhere wider.
+        assert!(
+            enclosing.join("untracked.txt").exists(),
+            "`clean` reached beyond the directory it was pointed at"
+        );
+        assert!(
+            integration.exists(),
+            "the guard reports the directory and never removes it — a wrong removal is the thing it exists to avoid"
         );
     }
 }
