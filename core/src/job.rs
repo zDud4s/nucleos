@@ -499,6 +499,34 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     Ok(result.last_insert_rowid())
 }
 
+/// What `POST /jobs` accepts.
+///
+/// Neither the mode nor the root appears here, and neither ever will: both are resolved from the
+/// project's own autopilot state (`resolve_start`), because a caller that could name its own root
+/// would be naming a directory this daemon then creates a worktree in and writes to.
+#[derive(Deserialize)]
+pub struct CreateJobRequest {
+    pub project_id: String,
+    pub prompt: String,
+    /// Reserved for Chunk 3. Accepted and **ignored** here rather than rejected: a field the client
+    /// sends and the server refuses is a client that has to be rewritten the day the server learns
+    /// it, and the client is a tool description a model reads.
+    ///
+    /// `expect` rather than `allow`, on purpose. The day Chunk 3 reads either field the lint stops
+    /// firing and this attribute becomes an error, which is the compiler asking for it back. An
+    /// `allow` would sit here silently covering whatever went dead next.
+    #[expect(
+        dead_code,
+        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
+    )]
+    pub budget_usd: Option<f64>,
+    #[expect(
+        dead_code,
+        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
+    )]
+    pub max_rounds: Option<i64>,
+}
+
 /// Why a job cannot be started for a project.
 ///
 /// Three refusals rather than one error string, because a caller answers them differently: an

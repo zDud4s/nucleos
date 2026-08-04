@@ -91,7 +91,7 @@ pub fn build_router(state: AppState) -> Router {
             "/runs/{id}/message",
             post(post_run_message).delete(delete_run_message),
         )
-        .route("/jobs", get(get_jobs))
+        .route("/jobs", get(get_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job))
         // Distinct from `/runs/{id}/cancel`, which stops one node. Both end the job — a stopped
         // node leaves the tree holding edits no gate measured — but only this one reaches a job
@@ -2591,6 +2591,117 @@ async fn get_jobs(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[derive(serde::Serialize)]
+struct CreateJobResponse {
+    job_id: i64,
+}
+
+/// `POST /jobs` — asks for a job the way `POST /runs` asks for a run.
+///
+/// Follows `create_run` step for step, and the order of those steps is the interesting part.
+///
+/// The **global** kill switch is checked first and alone. The scoped kills, the budget and the WIP
+/// limit pace proactive autonomy, and a person asking for a job through the shell or the Telegram
+/// assistant is not that; the global switch is the emergency stop, and an emergency stop with
+/// exemptions is not one. It fails closed — a switch that cannot be read refuses.
+///
+/// The whole creation is **uncancellable**. The job row is INSERTed `planning` before its worktree
+/// exists, and `git worktree add` holds that window open for as long as git takes. A request
+/// dropped inside it would strand a live job with no worktree, which the tick then drives forever
+/// while holding `one_live_job_per_project` — taking the project's whole autonomy down with it.
+/// Same window `create_run` documents, and wider here, because provisioning a job's worktree is
+/// the slowest thing this route does.
+///
+/// A second job for a project that already has one is a 409, from the unique index rather than from
+/// a check here. That stays the right answer until Chunk 4 replaces the index with numbered slots.
+async fn create_job(
+    State(state): State<AppState>,
+    Json(request): Json<crate::job::CreateJobRequest>,
+) -> Result<(StatusCode, Json<CreateJobResponse>), (StatusCode, String)> {
+    match crate::autopilot::kill_switch_engaged(&state.pool).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "the kill switch is engaged; nothing autonomous starts".to_string(),
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(%error, "create_job: could not read the kill switch — refusing");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the kill switch could not be read".to_string(),
+            ));
+        }
+    }
+
+    let roster = crate::autopilot::project_roster(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "create_job: could not read the project roster");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the project roster could not be read".to_string(),
+            )
+        })?;
+    let resolved = crate::job::resolve_start(&roster, &request.project_id).map_err(|refusal| {
+        let status = match refusal {
+            crate::job::StartRefusal::UnknownProject => StatusCode::NOT_FOUND,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        (status, refusal.reason(&request.project_id))
+    })?;
+
+    // Read the same way the scheduler reads it. `None` when git will not answer, which crash
+    // recovery reads as "cannot prove the tree stayed put" — the correct meaning rather than the
+    // convenient one.
+    let head_sha = crate::repo_trigger::current_branch_sha(
+        std::path::Path::new(&resolved.project_root),
+        "HEAD",
+        false,
+    )
+    .await;
+
+    let outcome = uncancellable(async move {
+        crate::job::start(
+            &state,
+            &crate::job::StartRequest {
+                project_id: &request.project_id,
+                project_root: &resolved.project_root,
+                // Nobody scheduled this one.
+                rule_name: None,
+                prompt: &request.prompt,
+                // The daemon's ceiling, never a number the caller chose — which is why the request
+                // has no field for it. `.ai/autopilot.yaml` may only lower the fan-out, and an HTTP
+                // body filled in by a model is reviewed even less than that file is.
+                max_items: crate::config::MAX_ITEMS_CEILING as i64,
+                gate_each: true,
+                review: true,
+                head_sha: head_sha.as_deref(),
+            },
+        )
+        .await
+    })
+    .await
+    .map_err(|status| (status, "the job could not be started".to_string()))?;
+
+    match outcome {
+        crate::job::JobStart::Started(job_id) => {
+            Ok((StatusCode::CREATED, Json(CreateJobResponse { job_id })))
+        }
+        crate::job::JobStart::AlreadyLive => Err((
+            StatusCode::CONFLICT,
+            "this project already has a live job".to_string(),
+        )),
+        // Past the INSERT: the row existed and `fail_early` retired it and said so in the feed. 500
+        // rather than 409, because nothing the caller could change would have helped.
+        crate::job::JobStart::Failed => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the job was created and could not be provisioned; it has been retired".to_string(),
+        )),
+    }
+}
+
 async fn get_job(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -5002,6 +5113,259 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- POST /jobs ------------------------------------------------------------------------
+
+    /// A real repository, because `job::start` provisions a real `git worktree` in it.
+    fn seeded_repo(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let base = std::env::current_dir().expect("resolve current directory");
+        assert!(
+            !base.to_string_lossy().contains(' '),
+            "test checkout must have a space-free path"
+        );
+        let container = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(base)
+            .expect("create space-free tempdir");
+        let repo = container.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repository directory");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .output()
+                    .expect("run git")
+                    .status
+                    .success()
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@x"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("seed.txt"), "seed\n").expect("seed the repository");
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        (container, repo)
+    }
+
+    /// `NUCLEOS_WORKTREE_ROOT` is process-wide, so every test that provisions one holds
+    /// `worktree::test_env_lock()` and restores what it found.
+    struct WorktreeRootEnv(Option<std::ffi::OsString>);
+    impl WorktreeRootEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            unsafe { std::env::set_var("NUCLEOS_WORKTREE_ROOT", path) };
+            Self(previous)
+        }
+    }
+    impl Drop for WorktreeRootEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => unsafe { std::env::set_var("NUCLEOS_WORKTREE_ROOT", previous) },
+                None => unsafe { std::env::remove_var("NUCLEOS_WORKTREE_ROOT") },
+            }
+        }
+    }
+
+    async fn project_in(pool: &sqlx::SqlitePool, project_id: &str, mode: &str, root: &str) {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(mode)
+        .bind(root)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn create_job_request(project_id: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("Authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "project_id": project_id,
+                    "prompt": "build the thing",
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    async fn job_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The route's happy path, end to end: a row, a worktree on disk, and a branch named after the
+    /// job. The branch name is asserted because it is what the startup orphan sweeper recognises —
+    /// a worktree it cannot name is one it can never collect.
+    #[tokio::test(flavor = "current_thread")]
+    async fn um_post_valido_cria_um_job_a_planear_com_a_sua_worktree() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["job_id"]
+            .as_i64()
+            .expect("the response carries the job id");
+
+        let (status, rule_name): (String, Option<String>) =
+            sqlx::query_as("SELECT status, rule_name FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "planning", "a job's first act is to plan");
+        assert_eq!(rule_name, None, "no rule asked for this one; a person did");
+
+        // Read through `owner_kind`/`owner_id` because that is how the row is written — and it is
+        // what the startup orphan sweeper matches on. A worktree it cannot name is one it can never
+        // collect, so the branch name is part of the contract rather than cosmetic.
+        let branch: String = sqlx::query_scalar(
+            "SELECT branch FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(branch, format!("nucleos/job-{job_id}"));
+    }
+
+    /// The emergency stop is checked before anything is written, and it fails closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn com_o_kill_switch_engatado_nenhum_job_e_criado() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-kill-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+        crate::autopilot::set_kill_switch(&pool, true)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // Nothing written, not merely nothing driven. A row created and then refused would hold
+        // `one_live_job_per_project` against a project that has no job.
+        assert_eq!(job_count(&pool).await, 0);
+    }
+
+    /// Shadow is plan-only, so a job in shadow would do nothing and say it was working.
+    #[tokio::test(flavor = "current_thread")]
+    async fn um_projeto_em_shadow_e_recusado_e_a_recusa_diz_porque() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-shadow-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "shadow", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reason = String::from_utf8_lossy(&body);
+        assert!(
+            reason.contains("shadow"),
+            "a 422 that will not say what is wrong is one somebody retries unchanged: {reason}"
+        );
+        assert_eq!(job_count(&pool).await, 0);
+    }
+
+    /// The second request loses to the unique index, not to a check in the handler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn um_segundo_job_no_mesmo_projeto_e_recusado_pelo_indice() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-second-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let first = build_router(state.clone())
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let second = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert_eq!(job_count(&pool).await, 1);
+    }
+
+    /// A job from this route is driven by the same tick, down the same path.
+    ///
+    /// The point is that there is no second path: `job_tick` reads the row and knows nothing about
+    /// who wrote it. If the route had to be special-cased anywhere downstream, this is where that
+    /// would show — the tick would leave the job in `planning` with no node.
+    #[tokio::test(flavor = "current_thread")]
+    async fn um_job_desta_rota_e_conduzido_pelo_tick_como_qualquer_outro() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-tick-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state.clone())
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        crate::job::job_tick(&state, chrono::Utc::now()).await;
+
+        let stage: Option<String> = sqlx::query_scalar(
+            "SELECT stage FROM runs WHERE job_id IS NOT NULL ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stage.as_deref(),
+            Some("plan"),
+            "the tick has to pick this job up and start its plan node, exactly as for a scheduled one"
+        );
     }
 
     #[tokio::test]
