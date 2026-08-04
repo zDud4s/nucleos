@@ -33,8 +33,11 @@ import {
   mailTone,
   parentPath,
   periodLabel,
+  quotedReply,
+  replySubject,
   requeueFailureMessage,
   runIsLive,
+  sendFailureMessage,
   runStatusLabel,
   runTone,
   spokenDuration,
@@ -576,6 +579,57 @@ describe("run, health and key derivations", () => {
     expect(requeueFailureMessage("unknown")).toContain("no longer in the mailbox");
     expect(requeueFailureMessage("conflict")).toContain("retention");
     expect(requeueFailureMessage("failed")).toContain("refused");
+  });
+
+  it("prefixes a reply subject once, however many hops it has already made", () => {
+    expect(replySubject("the roof")).toBe("Re: the roof");
+    // The case this exists for: a thread that already carries the prefix must not collect another.
+    expect(replySubject("Re: the roof")).toBe("Re: the roof");
+    expect(replySubject("RE: the roof")).toBe("RE: the roof");
+    expect(replySubject("re: the roof")).toBe("re: the roof");
+    // Surrounding whitespace is the sender's, not a difference in subject.
+    expect(replySubject("  the roof  ")).toBe("Re: the roof");
+    expect(replySubject("  Re: the roof")).toBe("Re: the roof");
+    // No subject is a state, and "Re:" says more about what this is than an empty line does.
+    expect(replySubject(null)).toBe("Re:");
+    expect(replySubject("")).toBe("Re:");
+    expect(replySubject("   ")).toBe("Re:");
+  });
+
+  it("quotes the message being answered, and quotes nothing when there is nothing left", () => {
+    expect(quotedReply("Maria", "first\nsecond")).toBe(
+      "\n\nMaria wrote:\n> first\n> second\n",
+    );
+    // A blank line inside the quote stays a blank quoted line, not a line with a trailing space.
+    expect(quotedReply("Maria", "first\n\nsecond")).toBe(
+      "\n\nMaria wrote:\n> first\n>\n> second\n",
+    );
+    // CRLF arrives from real mailboxes and must not leave a stray \r inside a quoted line.
+    expect(quotedReply("Maria", "first\r\nsecond")).toBe(
+      "\n\nMaria wrote:\n> first\n> second\n",
+    );
+    // Retention pruned the body: quoting an empty block would assert the sender wrote nothing.
+    expect(quotedReply("Maria", null)).toBe("");
+    expect(quotedReply("Maria", "")).toBe("");
+    expect(quotedReply("Maria", "  \n  ")).toBe("");
+  });
+
+  it("says whether a message that did not go was ever attempted", () => {
+    // The three that never left this process say so, because that is a fact and it is the one the
+    // person needs before deciding whether to press send again.
+    expect(sendFailureMessage({ kind: "invalid", reason: "a recipient must not contain a line break" }))
+      .toContain("Not sent");
+    expect(sendFailureMessage({ kind: "unconfigured", reason: "no submission host is configured" }))
+      .toContain("not attempted");
+    expect(sendFailureMessage({ kind: "unreachable", reason: "the daemon is not reachable" }))
+      .toContain("not attempted");
+    // The one that did leave must NOT claim it did not, and must say where to look.
+    const undelivered = sendFailureMessage({ kind: "undelivered", reason: "the email sidecar could not send the message" });
+    expect(undelivered).not.toContain("not attempted");
+    expect(undelivered).toContain("sent mailbox");
+    // Each keeps the daemon's own sentence, which is the half naming the field or the file.
+    expect(sendFailureMessage({ kind: "unconfigured", reason: "set smtp_host in .ai/email.yaml" }))
+      .toContain("smtp_host");
   });
 
   it("builds a breadcrumb trail that always starts at the root", () => {

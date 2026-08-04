@@ -1,4 +1,4 @@
-import type { Budget, ClassTally, JobItem, ProjectSummary } from "./api";
+import type { Budget, ClassTally, JobItem, ProjectSummary, SendFailure } from "./api";
 import type { BadgeTone } from "./ui/Badge";
 
 /**
@@ -445,6 +445,65 @@ export function requeueFailureMessage(failure: string): string {
       return "Cannot requeue: either a run currently holds this message, or retention already pruned its body — there is nothing left to read.";
     default:
       return "The daemon refused the requeue.";
+  }
+}
+
+/**
+ * The subject a reply carries.
+ *
+ * Idempotent on purpose. Real threads arrive already carrying `Re:`, and a prefix added per hop is
+ * exactly how a subject line becomes `Re: Re: Re: the roof`. Only the plain English prefix is
+ * recognised: `Sv:`, `Aw:` and the rest are a localisation table this app has no other use for, and
+ * failing to recognise one costs a duplicated prefix rather than a wrong recipient.
+ *
+ * A message with no subject still gets `Re:`, because that tells the recipient what they are
+ * looking at and an empty subject tells them nothing. The daemon accepts either — `mailsend.rs`
+ * `validate` refuses a line break, never a terse subject.
+ */
+export function replySubject(subject: string | null): string {
+  const trimmed = (subject ?? "").trim();
+  if (trimmed.toLowerCase().startsWith("re:")) return trimmed;
+  return trimmed === "" ? "Re:" : `Re: ${trimmed}`;
+}
+
+/**
+ * The message being answered, quoted under an attribution line — or nothing at all.
+ *
+ * Nothing at all is the answer once retention has pruned the body: quoting an empty block would
+ * have the reply assert that the sender wrote nothing, which is a different claim from "this text
+ * is no longer kept". The same goes for a body that is only whitespace.
+ *
+ * Lines are prefixed rather than fenced, so the result is still plain text — the same reason the
+ * body is rendered as text and never as markup. The leading blank lines are where the answer goes:
+ * the cursor lands at the top of the box, above the quote.
+ */
+export function quotedReply(author: string, body: string | null): string {
+  if (body === null || body.trim() === "") return "";
+  const quoted = body
+    .split(/\r?\n/)
+    .map((line) => (line === "" ? ">" : `> ${line}`))
+    .join("\n");
+  return `\n\n${author} wrote:\n${quoted}\n`;
+}
+
+/**
+ * Why a message did not go, phrased as the thing to do about it.
+ *
+ * The daemon's own sentence is carried through rather than replaced: it is the half that names the
+ * field, or the file to edit, and this side knows neither. What this adds is the half the daemon
+ * cannot say — whether the bytes were attempted, which is the only part a person needs before
+ * deciding to press send a second time.
+ */
+export function sendFailureMessage(failure: SendFailure): string {
+  switch (failure.kind) {
+    case "invalid":
+      return `Not sent — ${failure.reason}.`;
+    case "unconfigured":
+      return `Not sent, and not attempted: ${failure.reason}.`;
+    case "unreachable":
+      return "Not sent, and not attempted: the daemon could not be reached.";
+    default:
+      return `The sidecar was asked and reported a failure — ${failure.reason}. Check the sent mailbox before sending this again.`;
   }
 }
 

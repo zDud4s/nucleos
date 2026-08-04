@@ -751,6 +751,48 @@ describe("mail cursor, requeue and the attention heartbeat", () => {
     await expect(api.requeueEmail(TOKEN, 1)).resolves.toBe("failed");
   });
 
+  it("tells a send that was never attempted from one that was", async () => {
+    const message = { to: "maria@example.com", subject: "Re: the roof", body: "on Tuesday" };
+    const refused = (status: number, reason: string) => ({
+      ok: false, status, text: async () => reason,
+    });
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 204, text: async () => "" })
+      .mockResolvedValueOnce(refused(400, "a recipient must not contain a line break"))
+      .mockResolvedValueOnce(refused(503, "no submission host is configured"))
+      .mockResolvedValueOnce(refused(502, "the email sidecar could not send the message"))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    await expect(api.sendEmail(TOKEN, message)).resolves.toBe(true);
+    expectPostCall(1, `${DAEMON_URL}/email/send`, message);
+
+    // 400 and 503 both mean nothing left this process, and each carries the daemon's own sentence
+    // because it is the half that names the field, or the file to edit.
+    await expect(api.sendEmail(TOKEN, message)).resolves.toEqual({
+      kind: "invalid", reason: "a recipient must not contain a line break",
+    });
+    await expect(api.sendEmail(TOKEN, message)).resolves.toEqual({
+      kind: "unconfigured", reason: "no submission host is configured",
+    });
+    // The one that must never be reported as "not sent": the sidecar was asked.
+    await expect(api.sendEmail(TOKEN, message)).resolves.toEqual({
+      kind: "undelivered", reason: "the email sidecar could not send the message",
+    });
+    // No response at all is a stronger statement than a 502, not a weaker one — the request never
+    // reached the daemon, so nothing was attempted.
+    await expect(api.sendEmail(TOKEN, message)).resolves.toEqual({
+      kind: "unreachable", reason: "the daemon is not reachable",
+    });
+  });
+
+  it("falls back to the status when a refusal carries no sentence", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 502, text: async () => "" });
+
+    await expect(
+      api.sendEmail(TOKEN, { to: "a@b.com", subject: "s", body: "b" }),
+    ).resolves.toEqual({ kind: "undelivered", reason: "HTTP 502" });
+  });
+
   it("beats globally by default and scopes to a project when asked", async () => {
     fetchMock
       .mockResolvedValueOnce({ ok: true, status: 204 })

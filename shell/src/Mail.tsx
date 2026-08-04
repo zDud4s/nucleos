@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchAllAttachments, fetchAttachment, getEmail, getEmailCursor, getEmailQueue, listFiles,
-  getEmailConfig, requeueEmail, saveAllAttachments, saveAttachment, setSenderVerdict, triageEmail,
+  getEmailConfig, requeueEmail, saveAllAttachments, saveAttachment, sendEmail, setSenderVerdict,
+  triageEmail,
   type ConnectionState, type EmailAttachment, type EmailConfig, type EmailCursor,
-  type EmailDetail, type QueuedEmail, type SenderVerdict,
+  type EmailDetail, type QueuedEmail, type SendFailure, type SenderVerdict,
 } from "./api";
 import {
-  base64ToBytes, formatBytes, mailLabel, mailTone, relativeTime, requeueFailureMessage,
-  safeDownloadName,
+  base64ToBytes, formatBytes, mailLabel, mailTone, quotedReply, relativeTime,
+  requeueFailureMessage, replySubject, safeDownloadName, sendFailureMessage,
 } from "./derive";
-import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 import Senders from "./Senders";
 
 /**
@@ -74,12 +75,145 @@ function SenderStanding({ address, verdict, busy, onDecide }: SenderStandingProp
   );
 }
 
+interface ReplyBoxProps {
+  token: string;
+  detail: EmailDetail;
+  /** The address this would go out under, or null while the daemon has not said. */
+  sendFrom: string | null;
+}
+
+/**
+ * Answering the message on screen.
+ *
+ * This is the only control in the app behind which something leaves the machine and cannot be
+ * called back, so three things are deliberate. The form starts closed, because a reply box that is
+ * always open is a reply box that can be typed into by accident. Sending is a `ConfirmButton`, the
+ * same two-press gesture the app already uses for discarding a worktree and for disengaging the
+ * kill switch — this belongs in that company. And discarding asks only once something has been
+ * typed: confirming the disposal of an untouched draft is friction that teaches people to click
+ * through confirmations.
+ *
+ * The recipient is editable rather than fixed. `from_addr` is the right default and the wrong
+ * certainty — a message from a no-reply address, or one where the person signs off with a different
+ * address, both need correcting, and a form that will not let you is a form you work around by not
+ * using it.
+ */
+function ReplyBox({ token, detail, sendFrom }: ReplyBoxProps) {
+  const [open, setOpen] = useState(false);
+  const [to, setTo] = useState("");
+  const [subject, setSubject] = useState("");
+  const [body, setBody] = useState("");
+  const [touched, setTouched] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [failure, setFailure] = useState<SendFailure | null>(null);
+  const [sent, setSent] = useState<string | null>(null);
+
+  function begin() {
+    setTo(detail.from_addr);
+    setSubject(replySubject(detail.subject));
+    setBody(quotedReply(detail.from_name ?? detail.from_addr, detail.body_text));
+    setTouched(false);
+    setFailure(null);
+    setSent(null);
+    setOpen(true);
+  }
+
+  async function send() {
+    setSending(true);
+    setFailure(null);
+    const result = await sendEmail(token, { to, subject, body });
+    setSending(false);
+    if (result !== true) {
+      // The form stays open and keeps every character. Three of the four failures are fixed from
+      // right here, and the fourth is the one where the text is the only copy that exists.
+      setFailure(result);
+      return;
+    }
+    setSent(to);
+    setOpen(false);
+  }
+
+  if (!open) {
+    return (
+      <div className="mail-reply">
+        <Button size="sm" onClick={begin}>
+          {sent === null ? "Reply" : "Reply again"}
+        </Button>
+        {sent !== null && <p className="gate-note">Sent to {sent}.</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mail-reply">
+      <label className="mr-field">
+        <span>To</span>
+        <input
+          type="text"
+          value={to}
+          onChange={(event) => { setTo(event.target.value); setTouched(true); }}
+        />
+      </label>
+      <label className="mr-field">
+        <span>Subject</span>
+        <input
+          type="text"
+          value={subject}
+          onChange={(event) => { setSubject(event.target.value); setTouched(true); }}
+        />
+      </label>
+      <label className="mr-field mr-field--body">
+        <span>Message</span>
+        <textarea
+          className="mr-body"
+          rows={10}
+          value={body}
+          onChange={(event) => { setBody(event.target.value); setTouched(true); }}
+        />
+      </label>
+      <p className="a-note">
+        {sendFrom === null
+          ? "This leaves the machine under the mailbox owner's own address."
+          : `This leaves the machine as ${sendFrom}, and cannot be recalled.`}
+      </p>
+      <div className="mr-actions">
+        <ConfirmButton
+          size="sm"
+          variant="approve"
+          confirmLabel="Send it?"
+          disabled={sending}
+          onConfirm={() => void send()}
+        >
+          {sending ? "Sending…" : "Send"}
+        </ConfirmButton>
+        {touched ? (
+          <ConfirmButton
+            size="sm"
+            confirmLabel="Discard this draft?"
+            disabled={sending}
+            onConfirm={() => setOpen(false)}
+          >
+            Discard
+          </ConfirmButton>
+        ) : (
+          <Button size="sm" disabled={sending} onClick={() => setOpen(false)}>
+            Discard
+          </Button>
+        )}
+      </div>
+      {failure !== null && <ErrorNote>{sendFailureMessage(failure)}</ErrorNote>}
+    </div>
+  );
+}
+
 interface OpenMessageProps {
   token: string;
   detail: EmailDetail | null;
   loading: boolean;
   /** Folders that already exist at the root, offered as suggestions rather than as the only choices. */
   folders: string[];
+  /** The address a reply would go out under, or null while the daemon has not said. */
+  sendFrom: string | null;
   onFiled: () => void;
 }
 /**
@@ -89,7 +223,7 @@ interface OpenMessageProps {
  * someone outside this machine, and the sidecar already reduced any HTML to plain text — putting it
  * back into the DOM as HTML would undo that and hand a stranger a script tag and a tracking pixel.
  */
-function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessageProps) {
+function OpenMessage({ token, detail, loading, folders, sendFrom, onFiled }: OpenMessageProps) {
   const [saving, setSaving] = useState<number | null>(null);
   const [filing, setFiling] = useState<number | null>(null);
   const [bulk, setBulk] = useState<"saving" | "filing" | null>(null);
@@ -248,6 +382,7 @@ function OpenMessage({ token, detail, loading, folders, onFiled }: OpenMessagePr
       )}
       {filed !== null && <p className="gate-note">Arquivado como {filed}</p>}
       {failed !== null && <ErrorNote>{failed}</ErrorNote>}
+      <ReplyBox token={token} detail={detail} sendFrom={sendFrom} />
     </div>
   );
 }
@@ -600,6 +735,7 @@ function Mail({ token, connection }: MailProps) {
                       detail={detail}
                       loading={opening}
                       folders={folders}
+                      sendFrom={config?.username ?? null}
                       onFiled={() => void loadFolders()}
                     />
                   )}
