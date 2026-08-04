@@ -258,6 +258,25 @@ mod tests {
             !result.output_tail.is_empty(),
             "what git said is the only diagnostic the row will carry"
         );
+        // Pins the WIRING, not just `tail`'s own contract: the streams have to reach it in the
+        // order that keeps the diagnostic when a noisier command overruns the ceiling. Swapping the
+        // two arguments at the call site restores the original defect and leaves every other
+        // assertion in this module green — measured, not assumed.
+        // `rev-parse` prints the unresolved argument on stdout and `fatal:` on stderr, so comparing
+        // first occurrences is enough to tell the two orderings apart.
+        let printed = result
+            .output_tail
+            .find("no-such-ref")
+            .expect("what git printed belongs in the tail");
+        let diagnostic = result
+            .output_tail
+            .find("fatal:")
+            .expect("git's diagnostic belongs in the tail");
+        assert!(
+            printed < diagnostic,
+            "stderr goes last, so a truncation drops stdout first; got: {}",
+            result.output_tail
+        );
     }
 
     /// `Duration::ZERO` takes the deadline branch without needing a slow git command to exist.
