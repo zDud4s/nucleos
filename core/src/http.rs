@@ -5208,6 +5208,12 @@ mod tests {
     /// The route's happy path, end to end: a row, a worktree on disk, and a branch named after the
     /// job. The branch name is asserted because it is what the startup orphan sweeper recognises —
     /// a worktree it cannot name is one it can never collect.
+    // Holds `worktree::test_env_lock()` across its awaits on purpose: serialising the
+    // process-wide NUCLEOS_WORKTREE_ROOT override is the whole reason that lock exists. A
+    // `std::sync::Mutex` because sync tests share it, and these are current_thread tests with
+    // no multi-thread runtime to starve — the same false positive job.rs and worktree.rs
+    // already carry this allow for.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn um_post_valido_cria_um_job_a_planear_com_a_sua_worktree() {
         let _lock = crate::worktree::test_env_lock();
@@ -5254,6 +5260,12 @@ mod tests {
     }
 
     /// The emergency stop is checked before anything is written, and it fails closed.
+    // Holds `worktree::test_env_lock()` across its awaits on purpose: serialising the
+    // process-wide NUCLEOS_WORKTREE_ROOT override is the whole reason that lock exists. A
+    // `std::sync::Mutex` because sync tests share it, and these are current_thread tests with
+    // no multi-thread runtime to starve — the same false positive job.rs and worktree.rs
+    // already carry this allow for.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn com_o_kill_switch_engatado_nenhum_job_e_criado() {
         let _lock = crate::worktree::test_env_lock();
@@ -5279,6 +5291,12 @@ mod tests {
     }
 
     /// Shadow is plan-only, so a job in shadow would do nothing and say it was working.
+    // Holds `worktree::test_env_lock()` across its awaits on purpose: serialising the
+    // process-wide NUCLEOS_WORKTREE_ROOT override is the whole reason that lock exists. A
+    // `std::sync::Mutex` because sync tests share it, and these are current_thread tests with
+    // no multi-thread runtime to starve — the same false positive job.rs and worktree.rs
+    // already carry this allow for.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn um_projeto_em_shadow_e_recusado_e_a_recusa_diz_porque() {
         let _lock = crate::worktree::test_env_lock();
@@ -5307,6 +5325,12 @@ mod tests {
     }
 
     /// The second request loses to the unique index, not to a check in the handler.
+    // Holds `worktree::test_env_lock()` across its awaits on purpose: serialising the
+    // process-wide NUCLEOS_WORKTREE_ROOT override is the whole reason that lock exists. A
+    // `std::sync::Mutex` because sync tests share it, and these are current_thread tests with
+    // no multi-thread runtime to starve — the same false positive job.rs and worktree.rs
+    // already carry this allow for.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn um_segundo_job_no_mesmo_projeto_e_recusado_pelo_indice() {
         let _lock = crate::worktree::test_env_lock();
@@ -5337,6 +5361,12 @@ mod tests {
     /// The point is that there is no second path: `job_tick` reads the row and knows nothing about
     /// who wrote it. If the route had to be special-cased anywhere downstream, this is where that
     /// would show — the tick would leave the job in `planning` with no node.
+    // Holds `worktree::test_env_lock()` across its awaits on purpose: serialising the
+    // process-wide NUCLEOS_WORKTREE_ROOT override is the whole reason that lock exists. A
+    // `std::sync::Mutex` because sync tests share it, and these are current_thread tests with
+    // no multi-thread runtime to starve — the same false positive job.rs and worktree.rs
+    // already carry this allow for.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn um_job_desta_rota_e_conduzido_pelo_tick_como_qualquer_outro() {
         let _lock = crate::worktree::test_env_lock();
