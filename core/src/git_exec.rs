@@ -1173,16 +1173,20 @@ mod tests {
             &[OsStr::new("branch"), OsStr::new("release")]
         ));
 
+        // Captured before the *compute*, not merely before the publish: `compute_merge` checks
+        // `release` out in the integration worktree, and taking the reading here pins that it does
+        // so without disturbing the branch the user is standing on either.
+        //
+        // Compared against itself afterwards. Comparing `master` to `HEAD` instead — the shape this
+        // assertion started as — cannot fail: in the main checkout `HEAD` is a symref to
+        // `refs/heads/master`, so the two resolve to the same object however far a publish strayed.
+        // It proved a symref is a symref.
+        let master_before = sha_of(&repo, "master");
+
         let computed = compute_merge(&repo, "feat/x", "release", deadline())
             .await
             .expect("compute");
         let new = computed.new.clone();
-
-        // Captured before the publish and compared against itself afterwards. Comparing `master` to
-        // `HEAD` instead — the shape this assertion started as — cannot fail: in the main checkout
-        // `HEAD` is a symref to `refs/heads/master`, so the two resolve to the same object however
-        // far a publish strayed. It proved a symref is a symref.
-        let master_before = sha_of(&repo, "master");
 
         let outcome = publish(&repo, "release", computed, deadline()).await;
 
