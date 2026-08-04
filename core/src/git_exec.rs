@@ -547,10 +547,16 @@ async fn publish_by_update_ref(
 ///
 /// It is always *possible* to fast-forward here, and that is not luck: the merge commit's first
 /// parent is `computed.old` by construction (Task 3's `--no-ff`), so the branch tip is an ancestor of
-/// the new commit. The ref is re-read first for exactly that reason — if it moved, that guarantee is
-/// gone: a commit landing on the target makes the fast-forward impossible, and a target rewound to
-/// somewhere behind `old` would make publishing discard whatever moved it. Either way the operation
-/// raced, which is a `Failed`.
+/// the new commit. The ref is re-read first because it may no longer be there — and the re-read
+/// matters in **both** directions, which is easy to get wrong:
+///
+/// - The target moved **forward**: the fast-forward is genuinely impossible and git would refuse
+///   anyway, so the check only improves the message.
+/// - The target was **rewound** — somebody ran `reset --hard` and discarded work: `old~1` is still
+///   an ancestor of the merge commit, so the fast-forward is entirely *possible*, and without this
+///   check the publish rolls straight over the rewind, restores what they threw away, and reports
+///   success. This is the direction the check exists for, and the only one a test can distinguish
+///   it by.
 ///
 /// **The refusal is then classified by asking a second question, not by reading git's message.**
 /// `Blocked` is terminal and its advice is "commit or stash", so it must mean the user's own work is
@@ -590,6 +596,34 @@ async fn publish_by_fast_forward(
     computed: Computed,
     deadline: std::time::Instant,
 ) -> Outcome {
+    // The mirror of `prepare_integration_worktree`'s guard, and it runs before any git command is
+    // pointed at this directory for the same reason: `git -C <dir>` walks UP until it finds a
+    // repository. A worktree git still has a row for, whose directory survives but whose `.git` is
+    // gone, therefore answers for whatever repository *encloses* it — measured: `worktree list`
+    // still emits its `branch refs/heads/<target>` line (with a `prunable` line this module does not
+    // read), and `status --porcelain` there exits 0 carrying the enclosing repository's dirt. That
+    // lands the row in `Blocked`, terminal, telling a human to commit files in a repository nobody
+    // named. `merge --ff-only` walks up too, so where the enclosing repository is the one that owns
+    // the merge object, the fast-forward can land somewhere nobody asked us to touch.
+    //
+    // **Existence only, deliberately — NOT `is_file()`, which is what the integration guard uses.**
+    // The two look like they should agree and must not: that guard only ever inspects the daemon's
+    // own worktree, which is always linked and so always has a `.git` FILE. This one is handed
+    // whatever holds the branch, and the commonest holder in the whole design is the user's main
+    // checkout, whose `.git` is a DIRECTORY. `is_file()` here would reject the ordinary case on
+    // every merge — `a_branch_somebody_has_open_is_fast_forwarded_in_place` is what goes red if
+    // somebody ever "fixes" this into agreeing with the other one.
+    if tokio::fs::metadata(worktree.join(".git")).await.is_err() {
+        return Outcome::Failed {
+            reason: format!(
+                "{target} is checked out in {}, which is no longer a git worktree; run `git worktree prune` and resubmit",
+                worktree.display()
+            ),
+            exit_code: None,
+            output_tail: String::new(),
+        };
+    }
+
     let current = match revision(project_root, &format!("refs/heads/{target}"), deadline).await {
         Ok(current) => current,
         Err(outcome) => return outcome,
@@ -1570,6 +1604,75 @@ mod tests {
         assert!(
             matches!(outcome, Outcome::Failed { .. }),
             "a worktree that is not there is not something a human fixes by stashing: {outcome:?}"
+        );
+    }
+
+    /// The mirror of the test above, and the worse half of it. There the holder's directory was gone
+    /// and git could not answer at all. Here the directory is still standing and only its `.git` has
+    /// gone — so every `git -C` pointed at it walks **up** and the *enclosing* repository answers in
+    /// its place, exit 0 and all. `status --porcelain` then reports a stranger's uncommitted files,
+    /// and the row comes back `Blocked`: terminal, and telling a human to commit work in a repository
+    /// nobody named. Measured before it was guarded — `worktree list` keeps emitting the holder's
+    /// `branch refs/heads/release` line (plus a `prunable` line this module does not read).
+    ///
+    /// **The enclosure is built on purpose, never borrowed from the ambient checkout**, for the
+    /// reason `a_directory_that_is_not_a_worktree_is_refused_before_git_is_pointed_at_it` states at
+    /// length: `space_free_tempdir` places these directories inside this very repository, so the
+    /// walk-up has to be stopped at a repository we are allowed to lose.
+    #[tokio::test]
+    async fn a_holder_worktree_whose_git_file_is_gone_is_refused_rather_than_blamed_on_the_user() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-holdergone-");
+
+        // The sacrificial repository the walk-up will reach.
+        let (_enclosure, enclosing) = init_contained_repo("nucleos-gitexec-holderencl-");
+        let enclosing_before = sha_of(&enclosing, "HEAD");
+
+        // The worktree root, and so the holder, INSIDE that repository.
+        let roots = enclosing.join("roots");
+        let _env = WorktreeRootEnv::set(&roots);
+        let holder = roots.join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("release"),
+                holder.as_os_str()
+            ]
+        ));
+        // The directory survives; only the file naming its admin directory goes. This is what an
+        // interrupted move or a half-finished cleanup leaves behind.
+        std::fs::remove_file(holder.join(".git")).expect("remove the worktree's .git file");
+        assert!(holder.is_dir(), "the directory itself is still standing");
+
+        // The enclosing repository's own uncommitted work — what `status` would report in its place.
+        std::fs::write(enclosing.join("seed.txt"), "uncommitted work\n").expect("write");
+
+        let computed = compute_merge(&repo, "feat/x", "release", deadline())
+            .await
+            .expect("compute");
+        let outcome = publish(&repo, "release", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("no longer a git worktree"),
+                "the reason must name the directory and what to do: {reason}"
+            ),
+            other => panic!(
+                "a stranger's dirty files are not this user's to commit — expected Failed, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            std::fs::read_to_string(enclosing.join("seed.txt")).expect("read"),
+            "uncommitted work\n",
+            "the enclosing repository's work is untouched"
+        );
+        assert_eq!(
+            sha_of(&enclosing, "HEAD"),
+            enclosing_before,
+            "and nothing was fast-forwarded into a repository nobody named"
         );
     }
 }
