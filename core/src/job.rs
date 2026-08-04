@@ -446,7 +446,7 @@ pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// What a rule asks for when it starts a job.
+/// What a caller asks for when it starts a job.
 ///
 /// The shape is copied onto the row rather than re-read per node: `.ai/autopilot.yaml` can be
 /// edited mid-flight, and a job that changed shape between its own nodes would gate some items and
@@ -454,7 +454,11 @@ pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
 pub struct NewJob<'a> {
     pub project_id: &'a str,
     pub project_root: &'a str,
-    pub rule_name: &'a str,
+    /// `None` when no rule asked for this job — a person did, through the shell or through the
+    /// Telegram assistant. The column has been nullable since migration 0042, so this is the type
+    /// catching up with the schema rather than a widening: a sentinel name would invent a rule that
+    /// does not exist and that nothing could ever look up.
+    pub rule_name: Option<&'a str>,
     pub prompt: &'a str,
     pub max_items: i64,
     pub gate_each: bool,
@@ -493,6 +497,155 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+/// How a start attempt ended.
+///
+/// `AlreadyLive` is not a check that failed here — it is `one_live_job_per_project` (migration
+/// 0042) refusing the INSERT. With the constraint in the storage layer the INSERT *is* the lock, so
+/// a scheduler tick and a manual request racing for the same project cannot both pass a check and
+/// then both proceed. It mirrors what `one_open_worktree_run_per_project` does for runs.
+pub enum JobStart {
+    Started(i64),
+    AlreadyLive,
+    Failed,
+}
+
+/// Everything `start` needs, with no trace of who is asking.
+///
+/// Deliberately plain values rather than the `&ScheduleRule` + `&GraphConfig` this used to take.
+/// Those types made the scheduler the only caller that could exist — a rule and a graph config are
+/// what a *rule* has — and the request now arrives from `POST /jobs` as well. Whatever ceiling the
+/// caller applies to `max_items` is applied before it gets here, so this function has one job.
+pub struct StartRequest<'a> {
+    pub project_id: &'a str,
+    pub project_root: &'a str,
+    /// `None` for a job nobody scheduled. See `NewJob::rule_name`.
+    pub rule_name: Option<&'a str>,
+    pub prompt: &'a str,
+    pub max_items: i64,
+    pub gate_each: bool,
+    pub review: bool,
+    pub head_sha: Option<&'a str>,
+}
+
+/// Creates a job and provisions the worktree it will live in.
+///
+/// The worktree belongs to the JOB, not to any of its nodes — that is the whole reason a job can
+/// outlive one context window, and it is why this provisions it here rather than letting the first
+/// node do it.
+///
+/// This lives in `job.rs` rather than in `scheduler.rs` because creating jobs is what this module
+/// is for; the module map describes the scheduler as firing runs "through `runs::create_run_inner`;
+/// never defining them", and the same applies to jobs. It moved here when a second caller appeared:
+/// two copies of this sequence would mean one of them learning a fix the other never learns.
+pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
+    let job_id = match insert_job(
+        &state.pool,
+        &NewJob {
+            project_id: request.project_id,
+            project_root: request.project_root,
+            rule_name: request.rule_name,
+            prompt: request.prompt,
+            max_items: request.max_items,
+            gate_each: request.gate_each,
+            review: request.review,
+            head_sha: request.head_sha,
+        },
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation()) =>
+        {
+            return JobStart::AlreadyLive;
+        }
+        Err(error) => {
+            tracing::warn!(
+                project_id = request.project_id,
+                rule_name = request.rule_name.unwrap_or("(none)"),
+                %error,
+                "could not start a job"
+            );
+            return JobStart::Failed;
+        }
+    };
+
+    let owner = crate::worktree::Owner::Job(job_id);
+    let info = match crate::worktree::create(Path::new(request.project_root), owner).await {
+        Ok(info) => info,
+        Err(error) => {
+            return fail_early(state, request.project_id, job_id, &format!("{error}")).await;
+        }
+    };
+    let path = info.path.to_string_lossy().into_owned();
+    if let Err(error) = crate::worktree::record(
+        &state.pool,
+        owner,
+        request.project_id,
+        request.project_root,
+        &path,
+        &info.branch,
+    )
+    .await
+    {
+        // The directory exists and nothing in the database knows it does. Left alone it would be
+        // invisible to the GC forever; the startup orphan sweeper recognises `job-<id>` and is what
+        // eventually collects it.
+        return fail_early(
+            state,
+            request.project_id,
+            job_id,
+            &format!("its worktree was created but could not be recorded: {error}"),
+        )
+        .await;
+    }
+
+    // Two sentences rather than one with a hole in it. A job nobody scheduled has no rule, and
+    // `for rule 'None'` would be a line a person reads as a bug in the scheduler.
+    let started = match request.rule_name {
+        Some(rule_name) => format!(
+            "job {job_id} started for rule '{rule_name}' on {}",
+            info.branch
+        ),
+        None => format!("job {job_id} started on {}", info.branch),
+    };
+    let _ = crate::feed::append(
+        &state.pool,
+        Some(request.project_id),
+        "job_started",
+        &started,
+        None,
+    )
+    .await;
+    JobStart::Started(job_id)
+}
+
+/// Retires a job that never got as far as its first node, and says so where a person will see it.
+///
+/// A job left live with no worktree would be ticked forever and hold `one_live_job_per_project`,
+/// which would take the whole project's autonomy down with it — silently, since nothing else logs.
+async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) -> JobStart {
+    if let Err(error) = retire(&state.pool, job_id, Outcome::Failed.as_status()).await {
+        tracing::error!(
+            project_id,
+            job_id,
+            %error,
+            "a job could not be provisioned AND could not be retired; it holds the project's job slot"
+        );
+    }
+    let _ = crate::feed::append(
+        &state.pool,
+        Some(project_id),
+        "job_failed",
+        &format!("job {job_id} could not start: {why}"),
+        None,
+    )
+    .await;
+    JobStart::Failed
 }
 
 /// The statuses `one_live_job_per_project` covers, and therefore the ones a tick has to drive.
@@ -1790,7 +1943,7 @@ mod tests {
             &NewJob {
                 project_id,
                 project_root,
-                rule_name: "nightly-backlog",
+                rule_name: Some("nightly-backlog"),
                 prompt: "pull from the todo list and advance what you can",
                 max_items: 5,
                 gate_each: true,
@@ -2365,6 +2518,69 @@ mod tests {
             .success()
     }
 
+    /// A job nobody scheduled: no rule on the row, and no rule in the line a person reads.
+    ///
+    /// `rule_name` was `&'a str` until a second caller appeared that has no rule to name. The
+    /// column has accepted NULL since migration 0042, so this pins the type to the schema rather
+    /// than widening anything — and it pins the feed line, which is the half a person actually
+    /// sees. `job 7 started for rule 'None'` is the shape this exists to prevent: a line that reads
+    /// like a bug in the scheduler for a job the scheduler never touched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn um_job_sem_regra_nao_inventa_uma_no_registo_nem_no_feed() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-norule-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+
+        let started = start(
+            &state,
+            &StartRequest {
+                project_id: "nucleos",
+                project_root: &repo.to_string_lossy(),
+                rule_name: None,
+                prompt: "build the thing",
+                max_items: 3,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await;
+
+        let JobStart::Started(job_id) = started else {
+            panic!("a job with no rule must still start");
+        };
+
+        let rule_name: Option<String> =
+            sqlx::query_scalar("SELECT rule_name FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rule_name, None,
+            "no rule asked for this job, so the column has to say so rather than carry a sentinel"
+        );
+
+        let line: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'job_started' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !line.contains("rule"),
+            "a job with no rule must not name one: {line}"
+        );
+        // The positive half, without which the assertion above would pass on an empty line.
+        assert!(
+            line.starts_with(&format!("job {job_id} started on ")),
+            "the line still has to say what started and where: {line}"
+        );
+    }
+
     struct WorktreeRootEnv(Option<std::ffi::OsString>);
     impl WorktreeRootEnv {
         fn set(path: &std::path::Path) -> Self {
@@ -2435,7 +2651,7 @@ mod tests {
             &NewJob {
                 project_id: "project-a",
                 project_root: &root,
-                rule_name: "nightly",
+                rule_name: Some("nightly"),
                 prompt: "advance the backlog",
                 max_items: 5,
                 gate_each: true,
