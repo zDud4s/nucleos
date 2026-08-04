@@ -9,9 +9,11 @@
 // runs `cargo clippy --all-targets -- -D warnings` over this crate, which compiles the bin target
 // without `cfg(test)` and so turns each of those into an error.
 //
-// **Delete this attribute in the same commit that gives these a production caller**, then fix what
-// the compiler reports rather than putting it back: anything still dead once a caller exists is dead
-// for a reason worth reading. If one item genuinely has no caller yet, narrow it to an
+// **Task 7 must delete this attribute** — it spawns the worker, which is what gives this module its
+// first production caller — then fix what the compiler reports rather than putting it back: anything
+// still dead once a caller exists is dead for a reason worth reading. Naming the task rather than
+// the condition is deliberate: a condition is not greppable and nobody is watching for it. If one
+// item genuinely has no caller yet, narrow it to an
 // `#[allow(dead_code)]` on that item carrying the reason — do not keep the blanket. `vcs.rs:17-30`
 // is this same instruction, and says at length why the descriptive version of it rots.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -48,7 +50,8 @@ pub struct CommandResult {
     pub exit_code: Option<i32>,
     /// Standard output only, untruncated — callers parse object ids and porcelain out of this.
     pub stdout: String,
-    /// stderr then stdout, truncated to the last `OUTPUT_TAIL_BYTES`. What the row records.
+    /// stdout then stderr, kept to the last `OUTPUT_TAIL_BYTES` and marked when that clipped it.
+    /// What the row records — see `tail` for why the diagnostic goes last.
     pub output_tail: String,
 }
 
@@ -96,7 +99,7 @@ pub async fn run_git(
     Ok(CommandResult {
         exit_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        output_tail: tail(&output.stderr, &output.stdout),
+        output_tail: tail(&output.stdout, &output.stderr),
     })
 }
 
@@ -109,14 +112,20 @@ fn rendered(args: &[&OsStr]) -> String {
         .join(" ")
 }
 
-/// stderr first: git says what went wrong there, and a truncation that ate the diagnostic to keep
-/// the progress output would be the wrong half.
-fn tail(stderr: &[u8], stdout: &[u8]) -> String {
-    let mut combined = String::from_utf8_lossy(stderr).into_owned();
-    if !combined.is_empty() && !stdout.is_empty() {
+/// stderr **last**, because this keeps a tail and a tail drops what comes first.
+///
+/// git says what went wrong on stderr — `CONFLICT`, `fatal:` — and that line is the only diagnostic
+/// the row carries. Putting it first would guarantee it is the first thing dropped, which is exactly
+/// backwards: `clean -fd` prints a line per file and a large merge a diffstat, in repositories the
+/// daemon does not control, so stdout alone can be the size that forces the truncation. Last, it
+/// survives; and when stderr alone overruns the ceiling, what is kept is the END of stderr, which is
+/// where git puts its `fatal:` line.
+fn tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut combined = String::from_utf8_lossy(stdout).into_owned();
+    if !combined.is_empty() && !stderr.is_empty() {
         combined.push('\n');
     }
-    combined.push_str(&String::from_utf8_lossy(stdout));
+    combined.push_str(&String::from_utf8_lossy(stderr));
     if combined.len() <= OUTPUT_TAIL_BYTES {
         return combined;
     }
@@ -126,7 +135,10 @@ fn tail(stderr: &[u8], stdout: &[u8]) -> String {
     let start = (wanted..combined.len())
         .find(|index| combined.is_char_boundary(*index))
         .unwrap_or(combined.len());
-    combined[start..].to_owned()
+    // The same marker `gate.rs`'s `TailBuffer::render` prepends, spelled identically on purpose: a
+    // bare 8 KiB cannot be told apart from the tail of a 2 MB one, and two spellings of the same
+    // notice would make the row harder to read than one.
+    format!("…[output truncated; showing tail]\n{}", &combined[start..])
 }
 
 #[cfg(test)]
@@ -268,5 +280,37 @@ mod tests {
         .expect_err("a deadline that has already passed must not be waited through");
 
         assert!(error.contains("timed out"), "got: {error}");
+    }
+
+    /// The case the ordering exists for, and the one a hand-measurement caught rather than a test:
+    /// a diagnostic one line long behind an stdout large enough to force the truncation. `clean -fd`
+    /// prints a line per file and a large merge a diffstat, so the size is reachable from argv this
+    /// chunk plans, in repositories the daemon does not control.
+    #[test]
+    fn a_diagnostic_survives_an_stdout_large_enough_to_truncate_it() {
+        let noisy = "Removing some/long/path/to/a/file.txt\n".repeat(1024);
+        assert!(noisy.len() > OUTPUT_TAIL_BYTES, "must force a truncation");
+
+        let kept = tail(
+            noisy.as_bytes(),
+            b"CONFLICT (content): Merge conflict in seed.txt\n",
+        );
+
+        assert!(
+            kept.contains("CONFLICT"),
+            "the only diagnostic the row carries must not be the first thing dropped"
+        );
+        assert!(
+            kept.starts_with("…[output truncated; showing tail]\n"),
+            "a bare tail cannot be told apart from a complete output; got: {kept:.80}"
+        );
+    }
+
+    /// Nothing is marked when nothing was dropped — the marker has to mean something.
+    #[test]
+    fn output_that_fits_is_returned_whole_and_unmarked() {
+        let kept = tail(b"stdout line\n", b"stderr line\n");
+
+        assert_eq!(kept, "stdout line\n\nstderr line\n");
     }
 }
