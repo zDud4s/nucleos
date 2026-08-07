@@ -122,9 +122,9 @@
 }
 .grid > section > h2 { margin-inline: var(--sp-5); }
 
-/* Mail is a single column, so nothing else gives it a bottom edge and the last message would
-   otherwise sit flush against the window. */
-.mail { padding-bottom: var(--sp-6); }
+/* Mail and Contacts are single columns, so nothing else gives them a bottom edge and the last row
+   would otherwise sit flush against the window. */
+.mail, .contacts { padding-bottom: var(--sp-6); }
 
 /* The whole row opens the message, so it is a button — stripped back to looking like the text it
    contains, since a mailbox of 34 buttons that look like buttons is a wall. */

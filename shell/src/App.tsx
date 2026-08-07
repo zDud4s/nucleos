@@ -6,6 +6,7 @@ import {
 } from "./api";
 import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
+import Contacts from "./Contacts";
 import Files from "./Files";
 import Home from "./Home";
 import Mail from "./Mail";
@@ -21,7 +22,7 @@ import "./calendar.css";
 
 type Tab =
   | "home" | "autopilot" | "runs" | "projects" | "assistant"
-  | "mail" | "files" | "voice" | "calendar" | "web" | "system";
+  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -33,6 +34,9 @@ const TABS: { key: Tab; label: string }[] = [
   // Next to Mail because that is where its contents used to come from, and the two still meet:
   // filing an attachment writes into the folder this tab browses.
   { key: "files", label: "Files" },
+  // Beside the channels rather than inside one. Mail fills this list today; Slack and whatever
+  // follows will fill the same one, and who someone is should be answered in one place.
+  { key: "contacts", label: "Contacts" },
   { key: "voice", label: "Voice" },
   { key: "calendar", label: "Calendar" },
   { key: "web", label: "Web" },
@@ -305,6 +309,7 @@ function App() {
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}
           {tab === "files" && <Files token={token} connection={connection} />}
+          {tab === "contacts" && <Contacts token={token} connection={connection} />}
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "calendar" && <Calendar token={token} connection={connection} />}
           {tab === "web" && <Web token={token} connection={connection} />}

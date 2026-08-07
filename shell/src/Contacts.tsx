@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   decideContactMerge, getContactMerges, getContacts, setSenderVerdict, unmergeContact,
-  type Correspondent, type MergeSide, type MergeSuggestion, type SenderVerdict,
+  type ConnectionState, type Correspondent, type MergeSide, type MergeSuggestion,
+  type SenderVerdict,
 } from "./api";
 import { relativeTime } from "./derive";
 import { Badge, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
-interface SendersProps {
-  token: string;
+interface ContactsProps {
+  token: string | null;
+  connection: ConnectionState;
 }
 
 function verdictLabel(verdict: string | null): string | null {
@@ -130,7 +132,7 @@ function Suggestions({ token, suggestions, onDecided }: SuggestionsProps) {
  * addresses into one contact, but nothing in it performs the merge, so a merged view would report a
  * judgement nobody has made.
  */
-function Senders({ token }: SendersProps) {
+function Roster({ token }: { token: string }) {
   const [contacts, setContacts] = useState<Correspondent[] | null>(null);
   const [suggestions, setSuggestions] = useState<MergeSuggestion[]>([]);
   const [loading, setLoading] = useState(true);
@@ -197,6 +199,24 @@ function Senders({ token }: SendersProps) {
 
   return (
     <>
+      <h1 className="headline">
+        {/* Silent until the roster is in hand: "nobody yet" is a real answer about a real mailbox,
+            and printing it while the request is still out states it about one nobody has read. */}
+        {contacts === null
+          ? <>Who the núcleo knows.</>
+          : contacts.length === 0
+            ? <>Nobody yet.</>
+            : <><em>{contacts.length}</em> {contacts.length === 1 ? "address" : "addresses"} write to you.</>}
+      </h1>
+      <div className="statusline">
+        <span>{decided} with a standing decision</span>
+        {/* Said plainly because it is the only channel wired in: a name here means a mail address,
+            and a person you only ever hear from elsewhere is not yet in this list. */}
+        <span>everyone here arrived through <b>mail</b></span>
+        {suggestions.length > 0 && (
+          <span>{suggestions.length} identity question{suggestions.length === 1 ? "" : "s"} waiting</span>
+        )}
+      </div>
       {suggestions.length > 0 && (
         <Suggestions
           token={token}
@@ -205,7 +225,7 @@ function Senders({ token }: SendersProps) {
         />
       )}
     <Panel
-      title="Senders"
+      title="People"
       aside={contacts === null ? undefined : `${contacts.length} known · ${decided} decided`}
     >
       {loading && contacts === null && <p className="a-note">Loading…</p>}
@@ -296,4 +316,34 @@ function Senders({ token }: SendersProps) {
   );
 }
 
-export default Senders;
+/**
+ * Who the núcleo knows, and what has been decided about them.
+ *
+ * Its own tab rather than a view inside Mail, because a contact is not a mail object. Mail is
+ * simply the only channel wired in today; Slack and whatever follows will pour into this same
+ * list, and a roster that lived under the mailbox would mean deciding twice who someone is — once
+ * per channel — with two places to look for the pin that explains a verdict.
+ *
+ * The daemon's side is already built that way: a contact owns its addresses, and the address is
+ * what a channel contributes.
+ */
+function Contacts({ token, connection }: ContactsProps) {
+  if (token === null || connection !== "connected") {
+    return (
+      <section className="contacts">
+        <Teach title="Contacts are waiting for the daemon.">
+          The roster lives in the núcleo, not here. Connect to it and everyone it knows — with the
+          standing decisions you have made about them — comes back exactly as you left it.
+        </Teach>
+      </section>
+    );
+  }
+
+  return (
+    <section className="contacts">
+      <Roster token={token} />
+    </section>
+  );
+}
+
+export default Contacts;

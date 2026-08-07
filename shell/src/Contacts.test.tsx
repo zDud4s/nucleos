@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
-import Senders from "./Senders";
+import Contacts from "./Contacts";
 import type { Correspondent, MergeSide, MergeSuggestion } from "./api";
 
 const fetchMock = vi.fn();
@@ -56,13 +56,34 @@ describe("who writes to you", () => {
   beforeEach(() => fetchMock.mockReset());
   afterEach(() => fetchMock.mockReset());
 
+  it("stands on its own without the mailbox", async () => {
+    rosterOf([]);
+    render(<Contacts token={null} connection="disconnected" />);
+    await settle();
+
+    // It used to be a view inside Mail, reachable only by going through the mailbox. A tab of its
+    // own answers for itself — including for the daemon being away, which it says without asking.
+    expect(screen.getByText("Contacts are waiting for the daemon.")).toBeTruthy();
+    expect(fetchMock.mock.calls.length).toBe(0);
+  });
+
+  it("says which channel these people came in through", async () => {
+    rosterOf([who()]);
+    render(<Contacts token="t" connection="connected" />);
+    await settle();
+
+    // Mail is the only channel wired in, and this list is where Slack and the rest will land too.
+    // Saying so is what stops "nobody here" reading as a bug once a second channel exists.
+    expect(screen.getByText(/everyone here arrived through/)).toBeTruthy();
+  });
+
   it("shows a standing decision that the message which prompted it no longer can", async () => {
     rosterOf([
       who({ address: "noisy@example.com", display_name: null, verdict: "mute" }),
       who({ address: "maria@example.com", verdict: null }),
     ]);
 
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     // Pinning happens on a message. Once that message scrolls out of the queue, the only trace of
@@ -73,7 +94,7 @@ describe("who writes to you", () => {
 
   it("marks the people you have written back to", async () => {
     rosterOf([who({ outbound_ever: 1 })]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     // Not decoration: `priority.rs` demotes a first-contact "urgent" and leaves a correspondent's
@@ -83,7 +104,7 @@ describe("who writes to you", () => {
 
   it("toggles a decision straight from the list", async () => {
     rosterOf([who({ verdict: null })]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     fireEvent.click(screen.getByRole("button", { name: "Always noise" }));
@@ -103,7 +124,7 @@ describe("who writes to you", () => {
       who({ address: "maria@example.com", display_name: "Maria" }),
       who({ address: "joao@example.com", display_name: "João" }),
     ]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     const before = fetchMock.mock.calls.length;
@@ -140,7 +161,7 @@ describe("answering whether two addresses are one person", () => {
 
   it("puts both sides' addresses on screen, because that is the question", async () => {
     rosterOf([who()], [suggestion()]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     // Nobody can answer "are contacts 1 and 2 the same person". An address you do not recognise is
@@ -151,7 +172,7 @@ describe("answering whether two addresses are one person", () => {
 
   it("approves through the proposal it came from", async () => {
     rosterOf([who()], [suggestion({ proposal_id: 9 })]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     await confirm("Same person", "Confirm same person?");
@@ -162,7 +183,7 @@ describe("answering whether two addresses are one person", () => {
 
   it("names the way out when two standing decisions contradict", async () => {
     rosterOf([who()], [suggestion({ keep: side({ verdict: "pin" }), absorb: side({ contact_id: 2, verdict: "mute" }) })]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
     fetchMock.mockImplementationOnce(async () => ({ ok: false, status: 409 }));
 
@@ -175,7 +196,7 @@ describe("answering whether two addresses are one person", () => {
 
   it("remembers a refusal instead of asking again", async () => {
     rosterOf([who()], [suggestion({ proposal_id: 9 })]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     fireEvent.click(screen.getByRole("button", { name: "Different people" }));
@@ -193,7 +214,7 @@ describe("answering whether two addresses are one person", () => {
       who({ address: "b@example.com", contact_id: 5, linked_by: "human" }),
       who({ address: "alone@example.com", contact_id: 6, linked_by: "implicit" }),
     ]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     // Two rows share contact 5, so both can be split back out. The lone address has nothing to
@@ -207,7 +228,7 @@ describe("answering whether two addresses are one person", () => {
       who({ address: "a@example.com", contact_id: 5, linked_by: "human" }),
       who({ address: "b@example.com", contact_id: 5, linked_by: "human" }),
     ]);
-    render(<Senders token="t" />);
+    render(<Contacts token="t" connection="connected" />);
     await settle();
 
     fireEvent.click(screen.getAllByRole("button", { name: "Not the same person" })[1]!);
