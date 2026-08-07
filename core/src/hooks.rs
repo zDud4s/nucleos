@@ -530,11 +530,30 @@ async fn pause_for_approval(
         .flatten()
         .unwrap_or((None, None, None));
 
-    // A node of a job takes the other road entirely. Read HERE and not before the termination
-    // above, deliberately: `job_id` does not change when a run ends, and moving the read earlier
-    // would put an extra query on the hot path of every ordinary run's hook, which is nearly all of
-    // them.
-    if let Some(job_id) = job_id {
+    // A node of a job takes the other road entirely — but only if it owns an item to put down.
+    //
+    // Not every node does. A **plan** node runs before the queue exists and a **review** node runs
+    // after every item in it; neither is an item, and neither can be skipped, because a job with no
+    // queue has nothing to carry on to. Those two park and ask, exactly as an ordinary run does —
+    // so this change does NOT stop the night parking on the plan node, which is where the dogfood
+    // of 2026-08-07 parked first. Deliberate, and the cheaper half of the problem: a plan that
+    // asked once and was answered produces a queue that then runs unattended.
+    //
+    // The mark is what decides, and it is also step (2) of the skip — see `skip_the_item`. Doing it
+    // here rather than inside keeps "did this run own an item?" and "put it down" as one write:
+    // asking first and marking after would be a race with the same cancel/reconcile the mark is
+    // already guarded against.
+    //
+    // Read HERE and not before the termination above, deliberately: `job_id` does not change when a
+    // run ends, and moving the read earlier would put an extra query on the hot path of every
+    // ordinary run's hook, which is nearly all of them.
+    let skippable = match job_id {
+        Some(job_id) => put_the_item_down(&state.pool, job_id, run_id)
+            .await
+            .then_some(job_id),
+        None => None,
+    };
+    if let Some(job_id) = skippable {
         skip_the_item(
             state,
             SkippedItem {
@@ -621,10 +640,11 @@ async fn pause_for_approval(
 /// 1. The run is already terminated by the caller. That `.await` is the one `core/AGENTS.md` names
 ///    as biting hardest: it kills the CLI whose hook script owns the connection being answered, so
 ///    everything after it runs on borrowed time.
-/// 2. **Mark the item.** First, and before anything that can fail or block. An item left `running`
-///    in a job nobody is driving is a job that answers `Wait` for ever — `next_step` sees a live
-///    node, there is no live node, and no later pass rescues it. Every other loss here is
-///    recoverable; that one is not.
+/// 2. **Mark the item.** First, and before anything that can fail or block — done by the caller in
+///    `put_the_item_down`, because whether the mark landed is also what decides that this road is
+///    the right one at all. An item left `running` in a job nobody is driving is a job that answers
+///    `Wait` for ever — `next_step` sees a live node, there is no live node, and no later pass
+///    rescues it. Every other loss here is recoverable; that one is not.
 /// 3. Revert the tree, then record the proposal. Both may fail, and neither failure is allowed to
 ///    take the mark with it: an item skipped without a proposal is work nobody will be reminded of,
 ///    which is bad and survivable, where an item stuck `running` is a dead job.
@@ -638,6 +658,51 @@ struct SkippedItem {
     reason: String,
 }
 
+/// Step (2) of the skip, and the question that decides whether there is a skip at all: mark this
+/// run's item `skipped`, and say whether there was one.
+///
+/// Scoped to the item this run owns, so a job whose other items are in flight is untouched. A
+/// `false` answer has two shapes and the caller treats them alike, because the right move is the
+/// same for both — park and ask:
+///
+/// - **No item exists.** A plan or review node. There is nothing to put down, and skipping a job's
+///   plan would leave it with no queue to carry on with.
+/// - **The item is no longer `running`.** A cancel or a reconcile got there first and its verdict is
+///   the newer one; overwriting it would be this handler talking over a decision already made.
+///
+/// A database error also answers `false`, which parks the run rather than skipping an item that may
+/// still be `running`. Loud, and recoverable by hand — where a job stalled on a live item is not.
+async fn put_the_item_down(pool: &sqlx::SqlitePool, job_id: i64, run_id: i64) -> bool {
+    let marked = sqlx::query(
+        "UPDATE job_items SET status = ? WHERE job_id = ? AND run_id = ? AND status = 'running'",
+    )
+    .bind(crate::job::STATUS_SKIPPED)
+    .bind(job_id)
+    .bind(run_id)
+    .execute(pool)
+    .await;
+    match marked {
+        Ok(result) if result.rows_affected() == 1 => true,
+        Ok(_) => {
+            tracing::info!(
+                run_id,
+                job_id,
+                "pretooluse-decision: no running job item for this run — parking it instead"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(
+                run_id,
+                job_id,
+                %error,
+                "pretooluse-decision: could not mark a job item skipped — parking the run instead"
+            );
+            false
+        }
+    }
+}
+
 async fn skip_the_item(state: AppState, item: SkippedItem) {
     let SkippedItem {
         run_id,
@@ -648,38 +713,6 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
         tool_input,
         reason,
     } = item;
-    // (2) The mark. Scoped to the item this run owns, so a job whose other items are in flight is
-    // untouched.
-    let marked = sqlx::query(
-        "UPDATE job_items SET status = ? WHERE job_id = ? AND run_id = ? AND status = 'running'",
-    )
-    .bind(crate::job::STATUS_SKIPPED)
-    .bind(job_id)
-    .bind(run_id)
-    .execute(&state.pool)
-    .await;
-    match marked {
-        Ok(result) if result.rows_affected() == 1 => {}
-        Ok(_) => {
-            // No row matched: the item is not `running` any more. Something else — a cancel, a
-            // reconcile — got to it first and its verdict is the newer one. Nothing to skip.
-            tracing::warn!(
-                run_id,
-                job_id,
-                "pretooluse-decision: no running job item to skip for this run"
-            );
-            return;
-        }
-        Err(error) => {
-            tracing::error!(
-                run_id,
-                job_id,
-                %error,
-                "pretooluse-decision: could not mark a job item skipped — the job may stall on it"
-            );
-            return;
-        }
-    }
 
     // (3a) Put the tree back. The item wrote whatever it wrote before it asked, and the next item
     // must not build on a half-done change nobody approved.
@@ -1725,6 +1758,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kinds, vec!["action-approval"]);
+    }
+
+    /// The node of a job that owns no item: the plan, which runs before the queue exists.
+    ///
+    /// Found by dogfooding the change above on 2026-08-07 — the plan node asked to run `find`, took
+    /// the job road because its run has a `job_id`, matched no item, and returned before writing any
+    /// proposal. The run sat in `awaiting_approval` with nothing to approve, which is precisely the
+    /// state `pause_for_approval`'s rollback exists to prevent and which
+    /// `one_open_worktree_run_per_project` turns into a permanent block on the project.
+    ///
+    /// The queue is what the plan produces, so there is nothing to skip and nothing to carry on to.
+    /// It parks and asks, like any other run. A review node — which runs after every item — is the
+    /// same shape and takes the same road.
+    #[tokio::test]
+    async fn a_jobs_plan_node_owns_no_item_so_it_parks_and_asks() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        // What makes it a plan node: the queue does not exist yet.
+        sqlx::query("DELETE FROM job_items WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'plan' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a parked node with no proposal can be neither approved nor rejected, and blocks the \
+             project until the daemon restarts"
+        );
+        assert_eq!(pending[0].kind, "action-approval");
+        assert_eq!(pending[0].run_id, Some(run_id));
     }
 
     /// The write that must not be lost: an item left `running` in a job nobody drives makes
