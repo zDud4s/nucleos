@@ -1,6 +1,8 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 /// The OS calls that carry those decisions out, and nothing else. Holds no rules.
 pub mod dictation;
+/// What a drop onto the window means, and the only paths this process will read because of one.
+pub mod drop;
 /// Dictation decisions. `pub` because it is genuinely this crate's surface: the platform layer
 /// calls into it, and a private module of not-yet-wired functions would be dead code under the
 /// `-D warnings` clippy gate that `scripts/gates.sh` now runs over this package.
@@ -8,7 +10,7 @@ pub mod voice;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 /// Marker for "autostart has been decided once". Its EXISTENCE is the whole
@@ -42,6 +44,7 @@ pub fn run() {
         // read `GET /voice/config` — and a daemon that is not up yet simply means no hotkey yet.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(dictation::Dictation::default())
+        .manage(drop::Allowed::default())
         .setup(|app| {
             // Shell-GUI autostart convenience only — the daemon owns its OWN persistence via a
             // Windows Scheduled Task (Part A), independent of this.
@@ -79,12 +82,33 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                // Hide instead of quit — the app stays alive in the tray. "Quit" here is the shell's
-                // own process exit; there is NO child daemon process to kill (the daemon's lifecycle
-                // is entirely independent now — Part A).
-                api.prevent_close();
-                let _ = window.hide();
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    // Hide instead of quit — the app stays alive in the tray. "Quit" here is the
+                    // shell's own process exit; there is NO child daemon process to kill (the
+                    // daemon's lifecycle is entirely independent now — Part A).
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // The OS drop is handled HERE rather than in the page, because the page never sees
+                // it: Tauri takes the drop so it can hand over real paths, which is also what makes
+                // this side the only honest place to decide which paths are readable afterwards.
+                WindowEvent::DragDrop(drag) => match drag {
+                    tauri::DragDropEvent::Enter { .. } => {
+                        let _ = window.emit("files://drag-enter", ());
+                    }
+                    tauri::DragDropEvent::Leave => {
+                        let _ = window.emit("files://drag-leave", ());
+                    }
+                    tauri::DragDropEvent::Drop { paths, .. } => {
+                        let dropped = drop::accept(&window.state::<drop::Allowed>(), paths);
+                        let _ = window.emit("files://dropped", dropped);
+                    }
+                    // `Over` fires continuously while the cursor moves; the page only needs to know
+                    // it is being dragged over, which `Enter` already said.
+                    _ => {}
+                },
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -94,6 +118,7 @@ pub fn run() {
             dictation::voice_paste,
             dictation::voice_abandon,
             dictation::voice_register_hotkeys,
+            drop::read_dropped,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

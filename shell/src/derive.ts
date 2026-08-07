@@ -535,6 +535,59 @@ export function parentPath(path: string): string {
   return cut === -1 ? "" : path.slice(0, cut);
 }
 
+/** Which column a file listing is ordered by. */
+export type FileSortKey = "name" | "size" | "modified";
+
+interface Sortable {
+  name: string;
+  is_dir: boolean;
+  size_bytes: number;
+  modified: string | null;
+}
+
+/**
+ * Orders a listing the way a file manager does.
+ *
+ * Folders come first WHATEVER the column and whatever the direction — reversing the sort in Explorer
+ * reverses the files, it does not push the folders to the bottom, because the folders are how you
+ * move and the files are what you were looking at.
+ *
+ * Name is always the tie-break, so a column where most rows are equal (a folder's size is zero, a
+ * bulk copy shares a timestamp) still lands in a stable, readable order instead of whatever the
+ * filesystem happened to say.
+ */
+export function sortFiles<T extends Sortable>(entries: T[], key: FileSortKey, ascending: boolean): T[] {
+  const byName = (a: T, b: T) => a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  const direction = ascending ? 1 : -1;
+  return [...entries].sort((a, b) => {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    if (key === "size") return direction * (a.size_bytes - b.size_bytes) || byName(a, b);
+    if (key === "modified") {
+      // A row the platform would not date sorts last in both directions: it is missing information,
+      // not the oldest file in the folder.
+      if (a.modified === null || b.modified === null) {
+        if (a.modified === b.modified) return byName(a, b);
+        return a.modified === null ? 1 : -1;
+      }
+      return direction * a.modified.localeCompare(b.modified) || byName(a, b);
+    }
+    return direction * byName(a, b);
+  });
+}
+
+/**
+ * The names between two rows, inclusive — what a shift-click selects.
+ *
+ * Order-independent on purpose: shift-clicking upwards selects the same rows as shift-clicking
+ * downwards, which is what every file manager does and what nobody notices until it is wrong.
+ */
+export function namesBetween(names: string[], from: string, to: string): string[] {
+  const start = names.indexOf(from);
+  const end = names.indexOf(to);
+  if (start === -1 || end === -1) return to === "" ? [] : [to];
+  return names.slice(Math.min(start, end), Math.max(start, end) + 1);
+}
+
 /**
  * A token count, abbreviated. Runs routinely report hundreds of thousands of cached tokens, and the
  * exact digit is never the question being asked of that number.

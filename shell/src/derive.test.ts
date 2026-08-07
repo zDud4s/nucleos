@@ -6,6 +6,8 @@ import {
   autopilotState,
   base64ToBytes,
   breadcrumbs,
+  namesBetween,
+  sortFiles,
   budgetStatusLabel,
   classifierVerdictLabel,
   concatSamples,
@@ -844,5 +846,64 @@ describe("context pressure", () => {
   it("ignores a fill that cannot be one", () => {
     expect(contextPressure(-1)).toBeNull();
     expect(contextPressure(Number.NaN)).toBeNull();
+  });
+});
+
+describe("a file listing, ordered", () => {
+  const rows = [
+    { name: "beta.txt", is_dir: false, size_bytes: 900, modified: "2026-08-01T10:00:00Z" },
+    { name: "Alpha", is_dir: true, size_bytes: 0, modified: "2026-07-01T10:00:00Z" },
+    { name: "aaa.bin", is_dir: false, size_bytes: 5, modified: null },
+  ];
+
+  /**
+   * Folders lead in BOTH directions.
+   *
+   * Reversing the sort in a file manager reverses the files; it does not push the folders to the
+   * bottom, because the folders are how you move and the files are what you were looking at.
+   */
+  it("keeps folders at the top whichever way the column runs", () => {
+    expect(sortFiles(rows, "name", true).map((row) => row.name)).toEqual([
+      "Alpha", "aaa.bin", "beta.txt",
+    ]);
+    expect(sortFiles(rows, "name", false).map((row) => row.name)).toEqual([
+      "Alpha", "beta.txt", "aaa.bin",
+    ]);
+    expect(sortFiles(rows, "size", true).map((row) => row.name)).toEqual([
+      "Alpha", "aaa.bin", "beta.txt",
+    ]);
+  });
+
+  /** A row the platform would not date is missing information, not the oldest file in the folder. */
+  it("sorts an undated row last in both directions", () => {
+    expect(sortFiles(rows, "modified", true).map((row) => row.name)).toEqual([
+      "Alpha", "beta.txt", "aaa.bin",
+    ]);
+    expect(sortFiles(rows, "modified", false).map((row) => row.name)).toEqual([
+      "Alpha", "beta.txt", "aaa.bin",
+    ]);
+  });
+
+  it("does not reorder the array it was given", () => {
+    const before = rows.map((row) => row.name);
+    sortFiles(rows, "size", false);
+    expect(rows.map((row) => row.name)).toEqual(before);
+  });
+});
+
+describe("a shift-click range", () => {
+  const names = ["a", "b", "c", "d"];
+
+  /** Shift-clicking upwards selects the same rows as shift-clicking downwards. */
+  it("reads the same in either direction", () => {
+    expect(namesBetween(names, "b", "d")).toEqual(["b", "c", "d"]);
+    expect(namesBetween(names, "d", "b")).toEqual(["b", "c", "d"]);
+    expect(namesBetween(names, "c", "c")).toEqual(["c"]);
+  });
+
+  /** An anchor on a row that is no longer there (renamed, deleted, filtered out) selects the click. */
+  it("falls back to the row that was clicked when the anchor is gone", () => {
+    expect(namesBetween(names, "gone", "c")).toEqual(["c"]);
+    expect(namesBetween(names, "gone", "")).toEqual([]);
   });
 });

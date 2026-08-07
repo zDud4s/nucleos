@@ -189,6 +189,122 @@ pub fn list(root: &Path, relative: &str) -> Result<Vec<Entry>, PathError> {
     Ok(entries)
 }
 
+/// One search hit: an entry, plus where it is relative to the ROOT so a click can go straight there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Hit {
+    pub path: String,
+    #[serde(flatten)]
+    pub entry: Entry,
+}
+
+/// What a search found, and whether it stopped early.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Found {
+    pub hits: Vec<Hit>,
+    /// True when a ceiling cut the walk short. Said out loud rather than left to look like an
+    /// exhaustive answer — a search that quietly returns half the matches is worse than one that
+    /// admits it.
+    pub truncated: bool,
+}
+
+/// The most hits one search returns, and the most entries it will look at to find them.
+///
+/// Two ceilings rather than one because they fail differently: a folder with 400 matching files
+/// answers instantly and needs the first, and a deep tree with two matches walks everything and
+/// needs the second.
+const SEARCH_HITS: usize = 500;
+const SEARCH_VISITS: usize = 20_000;
+
+/// Finds entries whose name contains `query`, in this folder and every folder under it.
+///
+/// Case-insensitive and substring, because that is what a person typing three letters into a search
+/// box means — not a glob they have to get right, and not a regex a filename would fight with.
+///
+/// Symlinked directories are matched but never descended into. `resolve_within` already refuses a
+/// link that points outside the root, so this is about the other half: a link pointing back INSIDE
+/// it would be a cycle, and a walk that follows one never ends.
+pub fn search(root: &Path, relative: &str, query: &str) -> Result<Found, PathError> {
+    let start = resolve_within(root, relative)?;
+    if !start.is_dir() {
+        return Err(PathError::NotADirectory);
+    }
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        // An empty query matches everything, which is the listing — and answering it here would
+        // walk the whole tree to say what `list` says about one folder.
+        return Ok(Found {
+            hits: Vec::new(),
+            truncated: false,
+        });
+    }
+
+    let mut hits = Vec::new();
+    let mut visits = 0usize;
+    let mut truncated = false;
+    let mut pending = vec![start];
+
+    while let Some(directory) = pending.pop() {
+        let reader = match std::fs::read_dir(&directory) {
+            Ok(reader) => reader,
+            // A folder that vanished or refuses to open mid-walk is skipped, not fatal: the rest of
+            // the tree is still a useful answer.
+            Err(_) => continue,
+        };
+        for item in reader.flatten() {
+            visits += 1;
+            if visits > SEARCH_VISITS || hits.len() >= SEARCH_HITS {
+                truncated = true;
+                return Ok(Found { hits, truncated });
+            }
+            let Some(name) = item.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(metadata) = item.metadata() else {
+                continue;
+            };
+            let full = item.path();
+            let is_link = std::fs::symlink_metadata(&full)
+                .map(|link| link.is_symlink())
+                .unwrap_or(false);
+
+            if metadata.is_dir() && !is_link {
+                pending.push(full.clone());
+            }
+            if !name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            // Relative to the root, which is the only path the shell can send back to any route.
+            let Ok(under_root) = full.strip_prefix(root) else {
+                continue;
+            };
+            hits.push(Hit {
+                path: under_root.to_string_lossy().replace('\\', "/"),
+                entry: Entry {
+                    name,
+                    is_dir: metadata.is_dir(),
+                    size_bytes: if metadata.is_dir() {
+                        0
+                    } else {
+                        metadata.len() as i64
+                    },
+                    modified: metadata
+                        .modified()
+                        .ok()
+                        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
+                },
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| {
+        b.entry
+            .is_dir
+            .cmp(&a.entry.is_dir)
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
+    Ok(Found { hits, truncated })
+}
+
 /// Creates a folder, and every folder above it that is missing.
 pub fn create_folder(root: &Path, relative: &str) -> Result<(), PathError> {
     let target = resolve_within(root, relative)?;
@@ -516,6 +632,46 @@ mod tests {
             "the second root swallowed a sibling"
         );
         assert!(dir.path().join("mail").join("outro.txt").exists());
+    }
+
+    /// Search descends, which is the whole difference between it and filtering a listing.
+    #[test]
+    fn a_search_finds_matches_below_the_folder_it_starts_in() {
+        let (_guard, root) = temp_root();
+        create_folder(&root, "BACMAT/2026").unwrap();
+        create_folder(&root, "Recibos").unwrap();
+        write_file(&root, "BACMAT/2026", "guia de transporte.docx", b"x").unwrap();
+        write_file(&root, "Recibos", "guia.pdf", b"x").unwrap();
+        write_file(&root, "", "outro.txt", b"x").unwrap();
+
+        let found = search(&root, "", "GUIA").unwrap();
+
+        assert!(!found.truncated);
+        let paths: Vec<_> = found.hits.iter().map(|hit| hit.path.as_str()).collect();
+        // Case-insensitive, and the path is relative to the ROOT so the shell can act on it.
+        assert_eq!(
+            paths,
+            vec!["BACMAT/2026/guia de transporte.docx", "Recibos/guia.pdf"]
+        );
+
+        // Starting deeper searches only that subtree.
+        let narrower = search(&root, "Recibos", "guia").unwrap();
+        assert_eq!(narrower.hits.len(), 1);
+        assert_eq!(narrower.hits[0].path, "Recibos/guia.pdf");
+    }
+
+    #[test]
+    fn a_search_matches_folders_too_and_refuses_to_leave_the_root() {
+        let (_guard, root) = temp_root();
+        create_folder(&root, "Faturas").unwrap();
+
+        let found = search(&root, "", "fatur").unwrap();
+        assert_eq!(found.hits.len(), 1);
+        assert!(found.hits[0].entry.is_dir);
+
+        assert_eq!(search(&root, "../outside", "x"), Err(PathError::Escapes));
+        // An empty query is the listing's job, and walking the tree to answer it would be waste.
+        assert!(search(&root, "", "").unwrap().hits.is_empty());
     }
 
     #[test]

@@ -162,6 +162,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/email/{id}/attachments"),
     (Method::GET, "/files"),
     (Method::GET, "/files/download"),
+    (Method::GET, "/files/search"),
     // Reading the archive of pages this machine has already fetched is a read of local state, like
     // the mail queue beside it. It reaches no network.
     (Method::GET, "/web/pages"),
@@ -535,6 +536,7 @@ mod tests {
             .route("/files", get(|| async {}).delete(|| async {}))
             .route("/files/folder", post(|| async {}))
             .route("/files/download", get(|| async {}))
+            .route("/files/search", get(|| async {}))
             .route("/files/upload", post(|| async {}))
             .route("/files/move", post(|| async {}))
             .route("/api-tokens", get(|| async {}).post(|| async {}))
@@ -997,6 +999,7 @@ mod tests {
             "/projects/demo/cat",
             "/files",
             "/files/download",
+            "/files/search",
         ] {
             assert_eq!(
                 status_of(&app, "GET", uri, &token).await,

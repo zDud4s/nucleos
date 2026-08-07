@@ -73,8 +73,17 @@ What is deliberately not symmetric:
 - `POST /files/upload` writes through the same `write_file` as filing an attachment: the name is made safe and a collision is numbered, never overwritten. `files::MAX_UPLOAD_BYTES` caps a request at 100 MB, which is a memory ceiling as much as a policy one because the body is buffered whole; a download is streamed and has no matching cap.
 - `POST /files/move` refuses a destination that exists instead of numbering it, refuses a folder moved inside itself, and refuses to create a parent that is not there.
 - `DELETE /files` removes a file or an empty folder outright and answers `409` for a folder that still has something in it, until the caller repeats itself with `recursive=true`. The copy in this folder is the only one once the mail an attachment came from has expired.
-- In `core/src/auth.rs`, reading (`GET /files`, `GET /files/download`) is allowlisted for a read-only key because it discloses what `GET /email/{id}/attachments/{position}` already does. The four routes that change the folder are in no scope table, so only Admin and the control token reach them.
+- `GET /files/search` walks the tree rather than consulting an index, under two ceilings (`SEARCH_HITS`, `SEARCH_VISITS`) and reporting `truncated` when one of them cuts in. It never descends a symlinked directory: `resolve_within` already refuses a link pointing out of the root, and a link pointing back inside it is a cycle a walk would not survive.
+- In `core/src/auth.rs`, reading (`GET /files`, `GET /files/download`, `GET /files/search`) is allowlisted for a read-only key because it discloses what `GET /email/{id}/attachments/{position}` already does. The four routes that change the folder are in no scope table, so only Admin and the control token reach them.
 - The MCP tool `list_files` is the agent's whole reach into this folder: one verb, `ToolEffect::ReadsUntrusted`, with no client method in `core/src/daemon_client.rs` for downloading, writing, moving or deleting. An agent can see the folder and cannot touch it.
+
+### Files dragged in from Windows
+
+The webview never receives an HTML drop: Tauri intercepts the OS drop so it can hand over real paths, and a path is not something JavaScript can open. `shell/src-tauri/src/drop.rs` therefore resolves a drop into a manifest, and the page asks it for one file's bytes at a time before uploading them through `POST /files/upload` like any other upload.
+
+That gives the frontend a command that reads an absolute path, which is the part worth stating plainly: **a path is readable only after the OS told the Rust side it was dropped on our window.** The allowed set is written by the drag-drop event handler in `shell/src-tauri/src/lib.rs` and consulted by `read_dropped`; nothing the page sends can add to it, and each drop REPLACES the set rather than extending it, so the window in which this process would open a file is as short as the gesture that opened it. A path outside the set is refused with the same message as a file that is not there, because distinguishing them would answer whether a path exists.
+
+The shell already holds the daemon's control token, so this does not widen who can act as the owner on this machine; it narrows what the webview can name. `drop.rs` also caps a drop at 500 files and refuses to read one larger than the daemon would accept, so a dropped folder cannot spend the daemon's memory before being told no.
 
 ## Web content
 
