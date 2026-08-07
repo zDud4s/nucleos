@@ -2131,9 +2131,10 @@ async fn get_runs(
 ///
 /// Two fields the queue needs are deliberately NOT here, and their absence is the security posture:
 ///
-/// - **`project_root`** is resolved from `autopilot_state` via `resolve_project_root`. A caller that
-///   could name the repository root could point the daemon's git at any directory the daemon can
-///   reach, which is the same reason `inspect.rs` "never resolves a root itself".
+/// - **`project_root`** is resolved by `vcs::resolve_repo`, together with the key the queue locks
+///   on, and the two can no longer be set apart from each other. A caller that could name the
+///   repository root could point the daemon's git at any directory the daemon can reach, which is
+///   the same reason `inspect.rs` "never resolves a root itself".
 /// - **`origin`** comes from the bearer token's scope. `hooks.rs` states the rule this follows: a
 ///   value in the body is a claim the caller makes about itself, and here that claim decides whether
 ///   a human still has to approve the operation — precisely the thing a caller must not choose.
@@ -2194,17 +2195,28 @@ async fn submit_vcs_request(
     Json(body): Json<VcsRequestBody>,
 ) -> Result<Json<vcs::Ticket>, StatusCode> {
     let origin = vcs_origin(&scope)?;
-    let project_root = resolve_project_root(&state, &body.project_id).await?;
-    let request = vcs::SubmitRequest {
-        op: body.operation,
-        project_id: body.project_id,
-        project_root: project_root.to_string_lossy().into_owned(),
-        origin,
-    };
-    let id = vcs::submit(&state.pool, &request).await.map_err(|error| {
-        tracing::warn!(%error, "submitting a vcs request failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let repo = vcs::resolve_repo(&state.pool, &body.project_id)
+        .await
+        .map_err(|error| match error {
+            vcs::ResolveError::UnknownProject => StatusCode::NOT_FOUND,
+            // The caller named a project that exists; what is wrong is the root this daemon has
+            // recorded for it. 422 rather than 400 or 500: the request was well-formed and the
+            // daemon is working, but the state it would act on is not a repository.
+            vcs::ResolveError::NotARepository(reason) => {
+                tracing::warn!(project_id = %body.project_id, %reason, "vcs: project root is not a repository");
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            vcs::ResolveError::Database(error) => {
+                tracing::warn!(%error, "vcs: could not resolve a project");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    let id = vcs::submit(&state.pool, &repo, &body.operation, origin)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "submitting a vcs request failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     // Answered with a zero deadline rather than a bare id: the caller gets the same shape back from
     // submitting as from asking later, so nothing has to special-case the first reply.
     vcs_ticket(&state, id, std::time::Duration::ZERO).await
@@ -2907,13 +2919,20 @@ mod tests {
     /// The `autopilot_state` row is not scene-setting: it is the whole reason the body carries no
     /// `project_root`. Without a registered project the submit is a 404, which is the behaviour that
     /// keeps a caller from naming a directory for the daemon's git to work in.
+    ///
+    /// And the root it names has to be a real repository, because `vcs::resolve_repo` asks git for
+    /// the key the queue locks on before anything is inserted — a directory that merely exists in
+    /// the row gets a 422 here rather than a ticket.
     #[tokio::test]
     async fn a_vcs_request_submitted_over_http_is_readable_as_a_ticket() {
         let (state, _dir) = file_test_state().await;
+        let (_container, repo) =
+            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-");
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
-             VALUES ('alpha', 'active', 'C:/repo')",
+             VALUES ('alpha', 'active', ?)",
         )
+        .bind(repo.to_string_lossy().into_owned())
         .execute(&state.pool)
         .await
         .unwrap();

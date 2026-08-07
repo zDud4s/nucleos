@@ -112,13 +112,91 @@ impl Origin {
     }
 }
 
-/// What a caller asks the queue to do, before provenance decides whether it may queue yet.
+/// A project resolved to the repository it names, with the key the queue locks on.
+///
+/// Private fields with one production constructor, because the defect this type exists to kill was
+/// two fields allowed to disagree: a caller that could set `key` and `root` independently could take
+/// the lock on one repository and run git in another, and the row would look entirely ordinary.
 #[derive(Debug, Clone)]
-pub struct SubmitRequest {
-    pub op: Op,
-    pub project_id: String,
-    pub project_root: String,
-    pub origin: Origin,
+pub struct ResolvedRepo {
+    project_id: String,
+    root: String,
+    key: String,
+}
+
+impl ResolvedRepo {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Tests build repositories that do not exist on disk: what most of them exercise is the SQL,
+    /// and making each one create a real git repository would test git twice and slow the suite.
+    /// `resolve_repo` is the only constructor compiled into the daemon.
+    #[cfg(test)]
+    pub fn synthetic(project_id: &str, root: &str, key: &str) -> Self {
+        Self {
+            project_id: project_id.to_owned(),
+            root: root.to_owned(),
+            key: key.to_owned(),
+        }
+    }
+}
+
+/// Why a project could not be resolved to a repository.
+///
+/// Two failure arms rather than one string because the HTTP layer answers them differently and a
+/// caller deserves to know which happened: an unknown project is the caller naming something that is
+/// not there, and a bad root is the daemon's own recorded state being wrong.
+#[derive(Debug)]
+pub enum ResolveError {
+    UnknownProject,
+    NotARepository(String),
+    Database(sqlx::Error),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownProject => {
+                write!(formatter, "no such project, or it has no recorded root")
+            }
+            Self::NotARepository(reason) => write!(formatter, "{reason}"),
+            Self::Database(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// The single production path from a project id to a repository the queue may lock.
+///
+/// Both halves are needed: `autopilot_state` is the only place a root is recorded, and git is what
+/// makes two projects sharing a repository share a lock. It runs a subprocess, so it is neither free
+/// nor infallible — that is the trade against keying on a label, which is what it replaces.
+pub async fn resolve_repo(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> Result<ResolvedRepo, ResolveError> {
+    let root = crate::inspect::project_root(pool, project_id)
+        .await
+        .map_err(ResolveError::Database)?
+        .ok_or(ResolveError::UnknownProject)?;
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let key = crate::git_exec::repo_key(std::path::Path::new(&root), deadline)
+        .await
+        .map_err(ResolveError::NotARepository)?;
+
+    Ok(ResolvedRepo {
+        project_id: project_id.to_owned(),
+        root,
+        key,
+    })
 }
 
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
@@ -126,23 +204,31 @@ pub struct SubmitRequest {
 /// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
 /// into `queued`, or `rejected` — belongs to Chunk 4 alongside the `proposals.rs` wiring that
 /// grants it; this function only ever writes the initial state.
-pub async fn submit(pool: &sqlx::SqlitePool, request: &SubmitRequest) -> sqlx::Result<i64> {
-    let status = if request.origin.needs_approval() {
+///
+/// The repository arrives resolved rather than as fields to be trusted — see `ResolvedRepo`.
+pub async fn submit(
+    pool: &sqlx::SqlitePool,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64> {
+    let status = if origin.needs_approval() {
         "awaiting_approval"
     } else {
         "queued"
     };
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, run_id, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(request.op.kind())
-    .bind(request.op.to_args())
-    .bind(&request.project_id)
-    .bind(&request.project_root)
-    .bind(request.origin.as_str())
-    .bind(request.origin.run_id())
+    .bind(op.kind())
+    .bind(op.to_args())
+    .bind(repo.project_id())
+    .bind(repo.root())
+    .bind(repo.key())
+    .bind(origin.as_str())
+    .bind(origin.run_id())
     .bind(status)
     .bind(created_at)
     .execute(pool)
@@ -266,7 +352,7 @@ impl Outcome {
 /// section it waits on is one `serde_json::from_str` plus a commit.
 pub async fn claim_next(
     pool: &sqlx::SqlitePool,
-    project_id: &str,
+    repo_key: &str,
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
@@ -275,16 +361,16 @@ pub async fn claim_next(
             SET status = 'running', started_at = ?1
           WHERE id = (
               SELECT id FROM vcs_requests
-               WHERE project_id = ?2 AND status = 'queued'
+               WHERE repo_key = ?2 AND status = 'queued'
                ORDER BY id LIMIT 1
           )
             AND NOT EXISTS (
-              SELECT 1 FROM vcs_requests WHERE project_id = ?2 AND status = 'running'
+              SELECT 1 FROM vcs_requests WHERE repo_key = ?2 AND status = 'running'
             )
          RETURNING id, op, args, project_id, project_root",
     )
     .bind(started_at)
-    .bind(project_id)
+    .bind(repo_key)
     .fetch_optional(&mut *transaction)
     .await?;
 
@@ -700,17 +786,17 @@ pub trait VcsExecutor: Send + Sync {
 /// after the terminal write.
 pub async fn drain_once(
     pool: &sqlx::SqlitePool,
-    project_id: &str,
+    repo_key: &str,
     executor: &dyn VcsExecutor,
 ) -> bool {
-    let claimed = match claim_next(pool, project_id).await {
+    let claimed = match claim_next(pool, repo_key).await {
         Ok(Some(claimed)) => claimed,
         // Nothing queued, something already running, or only unapproved rows — all "come back
         // later", and the caller waits the same way for each.
         Ok(None) => return false,
         Err(error) => {
             tracing::warn!(
-                project_id = %project_id,
+                repo_key = %repo_key,
                 %error,
                 "could not claim the next vcs request"
             );
@@ -749,7 +835,7 @@ pub async fn drain_once(
         Ok(()) => {
             let _ = crate::feed::append(
                 pool,
-                Some(project_id),
+                Some(claimed.project_id.as_str()),
                 "vcs_request_finished",
                 &format!("vcs request {id} {}", outcome.status()),
                 None,
@@ -764,7 +850,7 @@ pub async fn drain_once(
         // place it survives.
         Err(sqlx::Error::RowNotFound) => tracing::warn!(
             vcs_request_id = id,
-            project_id = %project_id,
+            repo_key = %repo_key,
             ?outcome,
             "a vcs request stopped running before its outcome arrived; the row refused it, so it is recorded here"
         ),
@@ -774,7 +860,7 @@ pub async fn drain_once(
         // line is the only account of why the queue stopped.
         Err(error) => tracing::error!(
             vcs_request_id = id,
-            project_id = %project_id,
+            repo_key = %repo_key,
             ?outcome,
             %error,
             "could not record how a vcs request ended; it stays running until the daemon restarts"
@@ -824,13 +910,13 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
     loop {
         interval.tick().await;
 
-        let projects: Vec<String> = match sqlx::query_scalar(
-            "SELECT DISTINCT project_id FROM vcs_requests WHERE status = 'queued'",
+        let repositories: Vec<String> = match sqlx::query_scalar(
+            "SELECT DISTINCT repo_key FROM vcs_requests WHERE status = 'queued'",
         )
         .fetch_all(&pool)
         .await
         {
-            Ok(projects) => projects,
+            Ok(repositories) => repositories,
             // Best-effort, like every other polling loop in this crate: a failed poll is the next
             // tick's problem, not a reason to stop draining every repository for ever.
             Err(error) => {
@@ -839,12 +925,12 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
             }
         };
 
-        for project_id in projects {
+        for repo_key in repositories {
             let pool = pool.clone();
             let executor = std::sync::Arc::clone(&executor);
-            tokio::spawn(async move {
-                while drain_once(&pool, &project_id, executor.as_ref()).await {}
-            });
+            tokio::spawn(
+                async move { while drain_once(&pool, &repo_key, executor.as_ref()).await {} },
+            );
         }
     }
 }
@@ -988,19 +1074,22 @@ mod tests {
         pool
     }
 
-    fn request(origin: Origin) -> SubmitRequest {
-        request_for("alpha", origin)
+    fn repo() -> ResolvedRepo {
+        repo_for("alpha")
     }
 
-    fn request_for(project: &str, origin: Origin) -> SubmitRequest {
-        SubmitRequest {
-            op: Op::Merge {
-                source: "feat/x".into(),
-                target: "master".into(),
-            },
-            project_id: project.into(),
-            project_root: "C:/repo".into(),
-            origin,
+    /// In tests the repository key is the project name. That keeps every existing `claim_next(&pool,
+    /// "alpha")` meaning what it meant, so the rewrite cannot silently swap a key for a label — and it
+    /// leaves `two_projects_naming_one_repository_cannot_both_be_running` as the one place where the two
+    /// deliberately differ.
+    fn repo_for(project: &str) -> ResolvedRepo {
+        ResolvedRepo::synthetic(project, "C:/repo", project)
+    }
+
+    fn merge_op() -> Op {
+        Op::Merge {
+            source: "feat/x".into(),
+            target: "master".into(),
         }
     }
 
@@ -1057,11 +1146,16 @@ mod tests {
         status: &str,
         args: &str,
     ) -> sqlx::Result<i64> {
+        // `repo_key` is bound to the same project this is given, for the reason `repo_for` states:
+        // in tests the repository key is the project name. Left to the column's `''` default these
+        // rows would be invisible to every `claim_next` and would collide with each other on the
+        // partial unique index — two failures with nothing to do with what any caller is testing.
         sqlx::query(
-            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at)
-             VALUES ('merge', ?, ?, 'C:/repo', 'human', ?, '2026-08-02T00:00:00Z')",
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, status, created_at)
+             VALUES ('merge', ?, ?, 'C:/repo', ?, 'human', ?, '2026-08-02T00:00:00Z')",
         )
         .bind(args)
+        .bind(project)
         .bind(project)
         .bind(status)
         .execute(pool)
@@ -1136,7 +1230,9 @@ mod tests {
     #[tokio::test]
     async fn a_human_request_needs_no_second_approval() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert_eq!(status_of(&pool, id).await, "queued");
     }
 
@@ -1150,7 +1246,9 @@ mod tests {
     #[tokio::test]
     async fn a_shell_request_carries_the_same_approval_a_human_s_does() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Shell)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Shell)
+            .await
+            .unwrap();
 
         assert_eq!(status_of(&pool, id).await, "queued");
         let origin: String = sqlx::query_scalar("SELECT origin FROM vcs_requests WHERE id = ?")
@@ -1166,7 +1264,9 @@ mod tests {
     #[tokio::test]
     async fn an_autonomous_request_waits_for_approval_before_it_can_queue() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
         assert_eq!(status_of(&pool, id).await, "awaiting_approval");
     }
 
@@ -1180,8 +1280,10 @@ mod tests {
     async fn only_a_run_puts_its_id_in_run_id() {
         let pool = test_pool().await;
 
-        let from_run = submit(&pool, &request(Origin::Run(7))).await.unwrap();
-        let from_job = submit(&pool, &request_for("beta", Origin::Job(7)))
+        let from_run = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        let from_job = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Job(7))
             .await
             .unwrap();
 
@@ -1192,8 +1294,12 @@ mod tests {
     #[tokio::test]
     async fn the_queue_is_served_in_arrival_order() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
-        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         assert_eq!(claim_next(&pool, "alpha").await.unwrap().unwrap().id, first);
         assert!(
@@ -1222,15 +1328,40 @@ mod tests {
     #[tokio::test]
     async fn separate_repositories_do_not_wait_on_each_other() {
         let pool = test_pool().await;
-        submit(&pool, &request_for("alpha", Origin::Human))
+        submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        submit(&pool, &request_for("beta", Origin::Human))
+        submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
         assert!(claim_next(&pool, "beta").await.unwrap().is_some());
+    }
+
+    /// Two project ids, one repository. The queue's promise is per REPOSITORY, so the second waits.
+    ///
+    /// Before this chunk both were claimable at once: the unique index and the claim both filtered on
+    /// `project_id` while the git that would run used `project_root`. Inert only because nothing in
+    /// production built a request.
+    #[tokio::test]
+    async fn two_projects_naming_one_repository_cannot_both_be_running() {
+        let pool = test_pool().await;
+        let alpha = ResolvedRepo::synthetic("alpha", "C:/repo", "SHARED");
+        let beta = ResolvedRepo::synthetic("beta", "C:/repo", "SHARED");
+
+        submit(&pool, &alpha, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        submit(&pool, &beta, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        assert!(claim_next(&pool, "SHARED").await.unwrap().is_some());
+        assert!(
+            claim_next(&pool, "SHARED").await.unwrap().is_none(),
+            "the second project claimed the repository the first is holding"
+        );
     }
 
     /// A row nobody can execute must not take the repository down with it.
@@ -1247,7 +1378,9 @@ mod tests {
         let corrupt = insert(&pool, "alpha", "queued", r#"{"op":"rm_rf"}"#)
             .await
             .unwrap();
-        let behind_it = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let behind_it = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         assert!(
             claim_next(&pool, "alpha").await.is_err(),
@@ -1289,7 +1422,9 @@ mod tests {
     #[tokio::test]
     async fn a_claim_carries_the_operation_and_the_repository_it_names() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let claimed = claim_next(&pool, "alpha").await.unwrap().unwrap();
         assert_eq!(
@@ -1309,7 +1444,9 @@ mod tests {
     #[tokio::test]
     async fn a_succeeded_request_records_the_commit_it_produced() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap().unwrap();
 
         finish(
@@ -1352,7 +1489,9 @@ mod tests {
     #[tokio::test]
     async fn a_successful_operation_keeps_what_it_printed() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -1374,7 +1513,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_request_records_why_and_what_it_printed() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap().unwrap();
 
         finish(
@@ -1422,7 +1563,9 @@ mod tests {
     async fn a_request_that_never_ran_is_distinguishable_from_one_that_ran_and_failed() {
         let pool = test_pool().await;
 
-        let never_ran = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let never_ran = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -1434,7 +1577,9 @@ mod tests {
         .await
         .unwrap();
 
-        let ran = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let ran = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -1498,7 +1643,9 @@ mod tests {
     #[tokio::test]
     async fn nothing_awaiting_approval_is_ever_claimable() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_none());
     }
 
@@ -1511,13 +1658,13 @@ mod tests {
     #[tokio::test]
     async fn a_listing_narrows_to_one_repository_and_puts_the_newest_first() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request_for("alpha", Origin::Human))
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let second = submit(&pool, &request_for("beta", Origin::Human))
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let third = submit(&pool, &request_for("alpha", Origin::Human))
+        let third = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
@@ -1550,7 +1697,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_running_at_startup_is_marked_interrupted_not_retried() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
 
         let reconciled = reconcile_interrupted(&pool).await.unwrap();
@@ -1595,7 +1744,9 @@ mod tests {
     #[tokio::test]
     async fn a_reconciled_request_cannot_be_finished_by_a_late_worker() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         reconcile_interrupted(&pool).await.unwrap();
 
@@ -1630,8 +1781,12 @@ mod tests {
     #[tokio::test]
     async fn the_queue_is_drained_in_order_and_each_outcome_recorded() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
-        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let executor = FakeVcsExecutor::succeeding_with("abc123");
         drain_once(&pool, "alpha", &executor).await;
@@ -1680,7 +1835,9 @@ mod tests {
     #[tokio::test]
     async fn a_failing_operation_is_recorded_and_frees_the_repository() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         drain_once(
             &pool,
@@ -1697,7 +1854,9 @@ mod tests {
         );
 
         // The point of this half: a failure must not leave the repository claimed forever.
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
     }
 
@@ -1711,7 +1870,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_says_whether_it_found_anything_to_do() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let busy = FakeVcsExecutor::succeeding_with("abc123");
         assert!(
@@ -1739,7 +1900,9 @@ mod tests {
     #[tokio::test]
     async fn a_finished_request_is_reported_in_the_feed() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
@@ -1792,7 +1955,9 @@ mod tests {
     #[tokio::test]
     async fn an_outcome_the_row_refuses_survives_in_the_log_and_is_not_called_a_jam() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
 
         let logged = logged_during(async {
@@ -1828,7 +1993,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_whose_row_was_reconciled_out_from_under_it_does_not_overwrite_the_record() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         // A 10x margin over the reconcile's own wait, so which lands first is not a race: an
         // in-memory claim takes microseconds, and `reconciled == 1` below fails loudly rather than
@@ -1884,7 +2051,9 @@ mod tests {
 
         // And the repository is free: a refused write means the row is terminal, so the queue moves
         // on rather than waiting behind it.
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
     }
 
@@ -1901,7 +2070,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_abandoned_mid_operation_jams_the_repository_until_a_restart_reconciles() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         // Far longer than the timeout, so which of the two fires is not a race.
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
@@ -1927,7 +2098,9 @@ mod tests {
         // acceptable rather than merely admitted.
         assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
         assert_eq!(status_of(&pool, id).await, "interrupted");
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert!(
             claim_next(&pool, "alpha").await.unwrap().is_some(),
             "once reconciled, the repository is free again"
@@ -1939,10 +2112,10 @@ mod tests {
     #[tokio::test]
     async fn separate_repositories_are_drained_concurrently() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request_for("alpha", Origin::Human))
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let second = submit(&pool, &request_for("beta", Origin::Human))
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
@@ -1991,7 +2164,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let first = submit(&pool, &request_for("alpha", Origin::Human))
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
         let drained_once = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2008,7 +2181,7 @@ mod tests {
         drained_once.expect("the worker's first pass should drain what was queued for it");
 
         // Submitted only now: the pass above is over, so nothing but a later poll can find this.
-        let second = submit(&pool, &request_for("beta", Origin::Human))
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
         let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2047,8 +2220,12 @@ mod tests {
     #[tokio::test]
     async fn one_repository_is_still_drained_in_order_one_at_a_time() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
-        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
@@ -2083,7 +2260,9 @@ mod tests {
     #[tokio::test]
     async fn a_finished_request_returns_its_outcome_without_waiting() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
         let started = std::time::Instant::now();
@@ -2107,7 +2286,9 @@ mod tests {
     #[tokio::test]
     async fn an_unfinished_request_hands_back_a_ticket_rather_than_failing() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let ticket = wait_for(&pool, id, Duration::from_millis(50))
             .await
@@ -2123,7 +2304,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_requests_ticket_carries_its_id_and_its_reason() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         drain_once(
             &pool,
             "alpha",
@@ -2159,7 +2342,9 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_request_ends_the_wait_rather_than_running_it_out() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -2217,7 +2402,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_still_awaiting_approval_hands_back_a_ticket_too() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
 
         let ticket = wait_for(&pool, id, Duration::from_millis(50))
             .await
@@ -2237,7 +2424,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_finishes_mid_wait_is_reported_before_the_deadline() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(20));
         let started = std::time::Instant::now();
@@ -2277,17 +2466,14 @@ mod tests {
         let roots = crate::git_exec::tests::space_free_tempdir("nucleos-vcs-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
 
+        // Real root, synthetic key: what this test exercises is the executor against a repository
+        // that is really there, and `repo_for`'s "the key is the project name" is what keeps
+        // `drain_once(&pool, "alpha", ..)` below meaning what it meant.
         let id = submit(
             &pool,
-            &SubmitRequest {
-                op: Op::Merge {
-                    source: "feat/x".into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".into(),
-                project_root: repo.to_string_lossy().into_owned(),
-                origin: Origin::Human,
-            },
+            &ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha"),
+            &merge_op(),
+            Origin::Human,
         )
         .await
         .unwrap();
@@ -2331,17 +2517,12 @@ mod tests {
         std::fs::write(repo.join("feature.txt"), "half-finished thought\n").expect("write");
         let before = crate::git_exec::tests::sha_of(&repo, "master");
 
+        // Real root, synthetic key, for the reason the test above states.
         let id = submit(
             &pool,
-            &SubmitRequest {
-                op: Op::Merge {
-                    source: "feat/x".into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".into(),
-                project_root: repo.to_string_lossy().into_owned(),
-                origin: Origin::Human,
-            },
+            &ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha"),
+            &merge_op(),
+            Origin::Human,
         )
         .await
         .unwrap();

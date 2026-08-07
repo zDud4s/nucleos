@@ -321,13 +321,6 @@ fn remaining(deadline: std::time::Instant, what: &str) -> Result<Duration, Outco
 /// A third sanctioned entry to `run_git` (see its doc comment, which names the other two): it
 /// computes what is left of the budget and refuses before spawning, which is the property that
 /// comment exists to protect.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the next task's resolve_repo is the production caller"
-    )
-)]
 pub async fn repo_key(path: &Path, deadline: std::time::Instant) -> Result<String, String> {
     let budget = deadline.saturating_duration_since(std::time::Instant::now());
     if budget.is_zero() {
