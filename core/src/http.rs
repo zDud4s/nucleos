@@ -641,6 +641,10 @@ async fn post_email_incoming(
     // disconnects mid-request must not be able to leave that half-done.
     let pool = state.pool.clone();
     let retain_bodies_days = state.email.retain_bodies_days;
+    // Resolved here and never accepted from the body, for the same reason the direction is not: a
+    // sidecar that could name the owner could tell the núcleo that a stranger's message was the
+    // owner's own, and `outbound_ever` is what `priority.rs` reads to lower a brake.
+    let owner_address = state.email.username.clone();
     uncancellable(async move {
         crate::email::ingest_batch(
             &pool,
@@ -650,6 +654,7 @@ async fn post_email_incoming(
             body.max_uid_examined,
             &body.skipped,
             &body.messages,
+            &owner_address,
             retain_bodies_days,
             chrono::Utc::now(),
         )

@@ -1406,6 +1406,13 @@ async fn housekeeping(
 
 #[cfg(test)]
 mod tests {
+    /// The account whose mailbox these tests read: the address the outbound fixtures are sent from — the account whose mailbox these tests read.
+    ///
+    /// `ingest_batch` compares it against each sent message's `From`, so a value that did not
+    /// match would stop the outbound fixtures recording anything and quietly hollow out every
+    /// assertion about `outbound_ever` below.
+    const OWNER: &str = "utilizador@example.com";
+
     use super::*;
 
     fn at(minutes_ago: i64, infra_failures: i64, id: i64) -> PendingRow {
@@ -1592,6 +1599,7 @@ mod tests {
             inbound.uid,
             &[],
             &[inbound],
+            OWNER,
             14,
             now,
         )
@@ -1605,6 +1613,7 @@ mod tests {
             outbound.uid,
             &[],
             &[outbound],
+            OWNER,
             14,
             now,
         )
@@ -2667,6 +2676,7 @@ mod tests {
             outbound.uid,
             &[],
             &[outbound],
+            OWNER,
             14,
             ingested_at,
         )
@@ -2709,6 +2719,7 @@ mod tests {
             outbound.uid,
             &[],
             &[outbound],
+            OWNER,
             14,
             ingested_at,
         )

@@ -2231,6 +2231,7 @@ mod tests {
             "Edit",
             "Task",
             "WebFetch",
+            "WebSearch",
             "PowerShell",
         ] {
             assert!(
@@ -2238,6 +2239,49 @@ mod tests {
                 "{tool} must be denied under McpOnly"
             );
         }
+    }
+
+    /// `BUILTIN_TOOLS` is a DENYLIST, and the direction is the whole point of this test.
+    ///
+    /// THREAT_MODEL known gap 7 describes the CLI's own web tools as reachable by cron, repo and
+    /// manual runs, and says removing them from this list would "unify the path". Read literally
+    /// that is backwards in both halves, and acting on it would be a security regression:
+    ///
+    /// - Those runs reach the web because `ToolPolicy::Unrestricted` pushes **no restriction flag
+    ///   at all** — asserted next door in `unrestricted_adds_no_tool_restriction_flags`. Their
+    ///   presence in this list has nothing to do with it.
+    /// - What this list actually does is DENY them to `McpOnly`, which is what every assistant turn
+    ///   runs under. Removing a name from here GRANTS that tool to the surface that reads
+    ///   summaries of mail written by strangers.
+    ///
+    /// Closing the real gap means adding `--disallowedTools WebFetch,WebSearch` to the
+    /// `Unrestricted` arm, which is a different edit in a different place. This test exists so that
+    /// somebody who reaches for the sentence in the threat model instead meets a red test first.
+    #[test]
+    fn removing_a_web_tool_from_the_denylist_widens_the_assistant_rather_than_narrowing_a_run() {
+        // What the denylist governs: the assistant's surface, and nothing else.
+        let mcp_only = args_for(ToolPolicy::McpOnly, None);
+        let denied = mcp_only
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("McpOnly must deny built-ins");
+        for tool in ["WebFetch", "WebSearch"] {
+            assert!(
+                denied.split(',').any(|t| t == tool),
+                "{tool} must stay denied to assistant turns; deleting it from BUILTIN_TOOLS grants \
+                 it to the one surface that reads a stranger's words"
+            );
+        }
+
+        // And what it does NOT govern: an autonomous run's web access, which no flag here touches.
+        // If this ever stops holding, the gap closed somewhere else and the threat model's known
+        // gap 7 needs rewriting rather than this test relaxing.
+        let unrestricted = args_for(ToolPolicy::Unrestricted, None);
+        assert!(
+            !unrestricted.iter().any(|a| a == "--disallowedTools"),
+            "an Unrestricted run carries no denial, so BUILTIN_TOOLS cannot be what governs it"
+        );
     }
 
     /// The regression that took every assistant turn down. The CLI grew a task-management family

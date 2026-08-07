@@ -9,9 +9,6 @@
 //! treating that valid empty answer as an error would disable every autonomous start on release.
 //! An actual read or parse error is different and still fails closed.
 
-// Part 1 deliberately lands the gate before part 2 wires scheduler/repo-trigger callers.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 

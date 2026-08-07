@@ -332,7 +332,32 @@ impl Transcriber for FakeTranscriber {
 
 #[cfg(test)]
 mod tests {
+    // The recording tests hold `recording_lock()` across their awaits on purpose: serialising
+    // writes to the process-wide temp directory is the whole reason it exists. A `std::sync::Mutex`
+    // because these are `#[tokio::test]` (current-thread) and there is no multi-thread runtime here
+    // to starve — the same false positive `worktree.rs` and `job.rs` already carry this allow for.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
+
+    /// Serialises every test here that writes a recording into the process-wide temp directory.
+    ///
+    /// `an_abandoned_transcription_still_deletes_the_recording` asserts that NO file carrying this
+    /// PROCESS's recording prefix survives — and five tests in this module create one. Without this
+    /// lock that assertion reads another test's in-flight recording and fails for a reason that has
+    /// nothing to do with abandonment.
+    ///
+    /// It is a rare failure, which is the bad kind: it surfaces once in a full-suite run, points at
+    /// voice, and gets blamed on whatever change happened to be in the tree. Observed doing exactly
+    /// that on 2026-08-04, against a change that touched neither voice nor transcription.
+    ///
+    /// Same shape and same reason as `worktree::test_env_lock`, down to the poison recovery: a test
+    /// that panicked while holding this left the temp directory no worse than it found it, so the
+    /// next one may proceed.
+    fn recording_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// The failure this guards is deterministic destruction of long recordings.
     ///
@@ -360,6 +385,7 @@ mod tests {
     /// transcript equal to the temp path proves both the append order and that stdout is what is read.
     #[tokio::test]
     async fn the_audio_path_is_appended_last() {
+        let _lock = recording_lock();
         let transcriber = CommandTranscriber::new("echo".to_string());
 
         let spoken = transcriber
@@ -380,6 +406,7 @@ mod tests {
     /// file is not there. Without this the deletion is only an intention written in a comment.
     #[tokio::test]
     async fn the_recording_is_deleted_once_transcribed() {
+        let _lock = recording_lock();
         let transcriber = CommandTranscriber::new("echo".to_string());
 
         let path = transcriber
@@ -405,6 +432,7 @@ mod tests {
     /// client would leave it.
     #[tokio::test]
     async fn an_abandoned_transcription_still_deletes_the_recording() {
+        let _lock = recording_lock();
         let transcriber = CommandTranscriber::new("tail -f".to_string());
 
         // Far below `MIN_DEADLINE`, so the future is dropped by this timeout rather than finishing.
@@ -439,6 +467,7 @@ mod tests {
     /// against, so the same event has to be loud on this side of the boundary.
     #[tokio::test]
     async fn output_ceiling_errors_not_clips() {
+        let _lock = recording_lock();
         let transcriber = CommandTranscriber::new("yes".to_string());
 
         let error = transcriber
@@ -452,6 +481,7 @@ mod tests {
     /// An empty command is "no transcriber", not a spawn of the empty string.
     #[tokio::test]
     async fn an_empty_command_is_refused() {
+        let _lock = recording_lock();
         let transcriber = CommandTranscriber::new("   ".to_string());
 
         let error = transcriber

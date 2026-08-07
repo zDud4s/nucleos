@@ -186,6 +186,56 @@
 /* The two all-at-once actions, above the per-file rows they summarise. */
 .mf-bulk { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); }
 
+/* Answering a message. Ruled off from the message above rather than merely spaced away from it:
+   everything higher up this panel reads, and everything below this line writes to a stranger. */
+.mail-reply {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+.mr-field {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+/* A fixed label column, so `To` and `Subject` start their values at the same x. */
+.mr-field > span { min-width: 4.5rem; }
+.mr-field input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 0;
+  color: var(--text);
+  font: inherit;
+}
+.mr-field input:focus { outline: none; border-bottom-color: var(--gold-line); }
+
+/* The body is the one field that is not a single line, so its label sits above rather than beside. */
+.mr-field--body { display: block; }
+.mr-body {
+  display: block;
+  width: 100%;
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  /* Vertical only: a horizontally resizable box invites lines longer than the quote it contains. */
+  resize: vertical;
+}
+.mr-body:focus { outline: none; border-color: var(--gold-line); }
+
+.mr-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); }
+
 .flat + .flat,
 .stack > * + * { margin-top: var(--sp-4); }
 

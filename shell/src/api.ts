@@ -2020,6 +2020,64 @@ export async function requeueEmail(
   }
 }
 
+/** One outgoing message. Three fields, because the daemon accepts three — see `mailsend.rs`. */
+export interface SendEmailInput {
+  to: string;
+  subject: string;
+  body: string;
+}
+
+/**
+ * Why a message did not go.
+ *
+ * Four answers rather than one `false`, and the split that matters most is not between the fixable
+ * ones — it is **whether anything was attempted**. `invalid` and `unconfigured` and `unreachable`
+ * all mean the bytes never left this process, so "it was not sent" is a fact. `undelivered` means
+ * the sidecar was asked, and this side cannot honestly promise anything about what happened next.
+ * For the one act in this daemon that cannot be undone, collapsing those two would be telling the
+ * person a thing we do not know.
+ *
+ * `mailsend.rs` draws the same line, in the same place, for the same reason.
+ */
+export type SendFailure = {
+  kind: "invalid" | "unconfigured" | "unreachable" | "undelivered";
+  /** The daemon's own sentence, which names the field or the file. Never invented here. */
+  reason: string;
+};
+
+/**
+ * Sends one message under the mailbox owner's own address.
+ *
+ * The only call in this client that cannot be undone, and the shape of its failures is copied
+ * deliberately from `mailsend.rs` rather than collapsed: a 503 means the bytes never left this
+ * process, while a 502 means the sidecar was asked and something went wrong there. Telling the
+ * caller "it did not go" in both cases would be a guess in the second one.
+ */
+export async function sendEmail(
+  token: string,
+  message: SendEmailInput,
+): Promise<true | SendFailure> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/email/send`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    });
+    if (res.ok) return true;
+    const reason = (await res.text()) || `HTTP ${res.status}`;
+    if (res.status === 400) return { kind: "invalid", reason };
+    if (res.status === 503) return { kind: "unconfigured", reason };
+    // Everything else is reported as attempted, including a 500 that in fact means the daemon never
+    // built a client. Erring towards "this may have gone" is the safe direction for a send and the
+    // unsafe one for nothing else here.
+    return { kind: "undelivered", reason };
+  } catch {
+    // No response at all, so the request never reached the daemon: nothing was attempted, and that
+    // is a stronger and more useful statement than the 502 above.
+    return { kind: "unreachable", reason: "the daemon is not reachable" };
+  }
+}
+
 export type VoiceKind = "dictation" | "memo";
 
 /**

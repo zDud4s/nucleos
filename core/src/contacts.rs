@@ -3,16 +3,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
+/// What a correspondent looks like to `priority.rs`, which reads two of these five fields.
+///
+/// The other three carried `#[allow(dead_code)]` and the note "consumed by the later contact
+/// display surface". That surface arrived — the Contacts tab, `GET /contacts` — and consumes none
+/// of them: it has its own query (`list`) over the same tables. The note had stopped being true
+/// while still reading like a plan, which is exactly the failure mode of a suppression that
+/// describes instead of instructing.
+///
+/// They are not dead, though. Each is read by this module's own tests, and each pins a property of
+/// `profile_for`'s SQL that nothing else reaches:
+///
+/// - `display_name` — the accumulated name survives the pruning of the message it came from, and a
+///   human-set `contacts.display_name` beats the observed one.
+/// - `first_seen` / `last_seen` — `MIN`/`MAX` widen the window from BOTH ends, so a message that
+///   arrives out of order moves `first_seen` backwards without disturbing `last_seen`.
+///
+/// `emails` is a rolling thirty-day window, so "survives the prune" is the whole reason these facts
+/// are accumulated at ingestion rather than read back off the mail. The suppression is therefore
+/// scoped to the non-test build: under `cfg(test)` there is none, so a field that stopped being
+/// read THERE — losing the coverage above — warns rather than going quiet.
 pub struct Profile {
-    // Consumed by the later contact display surface.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub display_name: Option<String>,
     pub messages_in: i64,
-    // Consumed by the later contact display surface.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub first_seen: String,
-    // Consumed by the later contact display surface.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub last_seen: String,
     pub outbound_ever: bool,
 }
@@ -556,8 +573,6 @@ fn contact_merge_pair(tool_input: &str) -> sqlx::Result<(i64, i64)> {
     })
 }
 
-// Consumed by the contact merge suggestion scheduler.
-#[allow(dead_code)]
 pub async fn propose_merges(pool: &SqlitePool) -> sqlx::Result<Vec<i64>> {
     let address_rows: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT contact_id, display_name, outbound_ever
