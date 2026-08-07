@@ -683,7 +683,7 @@ describe("inspection, backups, health and keys", () => {
       status: "degraded",
       subsystems: [
         { name: "database", status: "ok" },
-        { name: "email_sidecar_binary", status: "down", reason: "missing" },
+        { name: "email_sidecar", status: "down", reason: "not-running" },
       ],
     };
     fetchMock.mockResolvedValueOnce(okJson(readout));

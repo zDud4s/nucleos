@@ -1,8 +1,24 @@
 use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
+
+/// The supervisor's key for each sidecar, named once.
+///
+/// `main.rs` writes these when it spawns a supervisor and `health.rs` reads them when it reports a
+/// row, and the two files agreeing is load-bearing: a drifted literal would leave a sidecar row
+/// reading `not running` forever with nothing actually wrong. A shared constant is a cheaper
+/// guarantee than a test that watches for the drift.
+pub const ECHO: &str = "echo";
+pub const TELEGRAM: &str = "telegram";
+pub const EMAIL: &str = "email";
+pub const WEB: &str = "web";
+
+/// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
+const RUNNING: &str = "running";
+const DOWN: &str = "down";
 
 /// First delay after a sidecar dies. A single crash should cost about as much as a restart.
 const RESTART_BASE: Duration = Duration::from_secs(2);
@@ -22,6 +38,21 @@ const RESTART_MAX: Duration = Duration::from_secs(60);
 static SIDECARS: LazyLock<Mutex<BTreeMap<String, SidecarState>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// What the supervisor last observed, reduced to what a readiness row needs to grade it.
+///
+/// Carries `io::ErrorKind` rather than a `health::FailureCategory` deliberately: this module reports
+/// what the operating system said, and the vocabulary a user reads is `health.rs`'s to choose.
+/// Keeping that translation in one place is what stops one spawn failure being described two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// `spawn` returned `Ok`, and the child has not been observed to exit.
+    Running,
+    /// Ran and died. The supervisor is waiting out its backoff before trying again.
+    Restarting,
+    /// Never started at all — usually a binary that was never built.
+    FailedToSpawn(io::ErrorKind),
+}
+
 /// One sidecar, and what has happened to it since the daemon started.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SidecarState {
@@ -38,11 +69,48 @@ pub struct SidecarState {
     pub last_failure_at: Option<String>,
     /// How many times this sidecar has been restarted since the daemon started.
     pub restarts: u32,
+    /// The kind of the error that stopped it STARTING, when that is what went wrong.
+    ///
+    /// `last_failure` above is for a person and carries the message; this is for `health.rs`, which
+    /// has to map a failure to a category without parsing prose. Not serialized, because the panel
+    /// already shows the sentence and an `ErrorKind` is not one.
+    ///
+    /// Cleared on every successful spawn and on every exit, so it only ever describes the failure
+    /// the sidecar is sitting in right now. Left uncleared, a sidecar that once could not start,
+    /// then ran, then crashed would be reported as a missing binary forever after.
+    #[serde(skip)]
+    pub spawn_error: Option<io::ErrorKind>,
+}
+
+impl SidecarState {
+    /// What `health.rs` needs in order to grade this row.
+    ///
+    /// `state` and `spawn_error` are the fields the supervisor writes; this is the one reading of
+    /// them, so the two never drift into disagreeing about the same child.
+    pub fn liveness(&self) -> Liveness {
+        match (self.state, self.spawn_error) {
+            (RUNNING, _) => Liveness::Running,
+            (_, Some(kind)) => Liveness::FailedToSpawn(kind),
+            _ => Liveness::Restarting,
+        }
+    }
 }
 
 /// Every supervised sidecar, in name order.
 pub fn states() -> Vec<SidecarState> {
     SIDECARS.lock().unwrap().values().cloned().collect()
+}
+
+/// What the supervisor last saw of `name`, or `None` when nothing ever supervised it.
+///
+/// `None` is load-bearing and must not be collapsed into a state here. A configured sidecar with no
+/// entry is one that nobody ever started — the email pillar whose hook barrier failed, say — and
+/// surfacing that is half the reason this registry exists.
+///
+/// A poisoned lock answers `None` rather than panicking: the readout degrades to "nobody started
+/// this", which is the same conservative answer it gives before the first spawn.
+pub fn liveness_of(name: &str) -> Option<Liveness> {
+    Some(SIDECARS.lock().ok()?.get(name)?.liveness())
 }
 
 fn record(name: &str, update: impl FnOnce(&mut SidecarState)) {
@@ -51,11 +119,12 @@ fn record(name: &str, update: impl FnOnce(&mut SidecarState)) {
         .entry(name.to_owned())
         .or_insert_with(|| SidecarState {
             name: name.to_owned(),
-            state: "down",
+            state: DOWN,
             started_at: None,
             last_failure: None,
             last_failure_at: None,
             restarts: 0,
+            spawn_error: None,
         });
     update(entry);
 }
@@ -76,9 +145,10 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let restarts = attempts;
                 record(&name, |entry| {
-                    entry.state = "running";
+                    entry.state = RUNNING;
                     entry.started_at = Some(started_at);
                     entry.restarts = restarts;
+                    entry.spawn_error = None;
                 });
                 let status = child.wait().await;
                 tracing::warn!(sidecar = %name, ?status, "sidecar exited — restarting");
@@ -88,10 +158,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                     Err(error) => format!("could not be waited on: {error}"),
                 };
                 record(&name, |entry| {
-                    entry.state = "down";
+                    entry.state = DOWN;
                     entry.started_at = None;
                     entry.last_failure = Some(detail);
                     entry.last_failure_at = Some(failed_at);
+                    entry.spawn_error = None;
                 });
                 // Ran and then died is a different event from cannot start: a rare crash should
                 // restart promptly rather than inherit a backoff earned by something else.
@@ -110,11 +181,13 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                 );
                 let failed_at = chrono::Utc::now().to_rfc3339();
                 let detail = format!("could not start: {error}");
+                let kind = error.kind();
                 record(&name, |entry| {
-                    entry.state = "down";
+                    entry.state = DOWN;
                     entry.started_at = None;
                     entry.last_failure = Some(detail);
                     entry.last_failure_at = Some(failed_at);
+                    entry.spawn_error = Some(kind);
                 });
                 delay = (delay * 2).min(RESTART_MAX);
             }

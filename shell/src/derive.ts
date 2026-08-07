@@ -415,6 +415,8 @@ export function healthReasonLabel(reason: string | undefined): string | null {
       return "permission denied";
     case "missing":
       return "missing";
+    case "not-running":
+      return "not running";
     case "low-disk-space":
       return "low disk space";
     default:

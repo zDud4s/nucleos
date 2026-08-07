@@ -482,7 +482,11 @@ async fn main() {
         .parent()
         .unwrap()
         .join("echo-sidecar.exe");
-    tokio::spawn(sidecar::supervise("echo".to_string(), sidecar_path, vec![]));
+    tokio::spawn(sidecar::supervise(
+        sidecar::ECHO.to_string(),
+        sidecar_path,
+        vec![],
+    ));
 
     // The web sidecar. Started only when the pillar is on: an unstarted one means `/web/*` answers
     // 502, which is the honest reading of "there is nothing to ask".
@@ -511,7 +515,7 @@ async fn main() {
             &web_config,
             &search_key,
         );
-        tokio::spawn(sidecar::supervise("web".to_string(), path, env));
+        tokio::spawn(sidecar::supervise(sidecar::WEB.to_string(), path, env));
         tracing::info!(provider = %web_config.provider, "web sidecar supervised");
 
         // Retention. Hourly rather than on a timer tied to reads: a cache that is never read again
@@ -547,7 +551,7 @@ async fn main() {
             let telegram_env =
                 sidecar::telegram_env("http://127.0.0.1:8791", &state.token.0, &bot_token);
             tokio::spawn(sidecar::supervise(
-                "telegram".to_string(),
+                sidecar::TELEGRAM.to_string(),
                 telegram_path,
                 telegram_env,
             ));
@@ -651,7 +655,7 @@ async fn main() {
                                 &email_config,
                                 &password,
                             );
-                            tokio::spawn(sidecar::supervise("email".to_string(), path, env));
+                            tokio::spawn(sidecar::supervise(sidecar::EMAIL.to_string(), path, env));
                             tracing::info!("email sidecar supervised");
                         }
                         None => tracing::error!(

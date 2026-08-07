@@ -567,6 +567,9 @@ describe("run, health and key derivations", () => {
   it("spells out a diagnostic slug, and shows an unknown one rather than hiding it", () => {
     expect(healthReasonLabel(undefined)).toBeNull();
     expect(healthReasonLabel("not-configured")).toBe("not configured");
+    // The two that read alike and mean opposite things: nobody asked for this pillar, versus
+    // somebody did and the process is not up.
+    expect(healthReasonLabel("not-running")).toBe("not running");
     expect(healthReasonLabel("low-disk-space")).toBe("low disk space");
     expect(healthReasonLabel("something-new")).toBe("something-new");
   });

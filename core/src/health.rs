@@ -1,19 +1,28 @@
 //! Bounded, credential-safe readiness readout for the protected HTTP API.
 //!
-//! Sidecar entries describe configuration and binary presence only. The supervisor is a
-//! fire-and-forget restart loop with no process-status surface, so this module must not imply that
-//! a configured binary is currently running. The `*_sidecar_binary` names make that limit explicit.
+//! Sidecar entries report liveness: the supervisor publishes whether it started each child and
+//! whether it has since seen it exit, and these rows read that. One limit remains, and it is worth
+//! stating precisely because the previous one was overstated in the other direction — a child that
+//! is running but wedged reads `ok`, because the supervisor watches processes, not progress.
+//!
+//! `cli_binary` and `voice_transcriber` name no resident process, so for them "alive" can only mean
+//! the program runs on this machine. They execute it, behind a cache: the shell polls this endpoint
+//! every three seconds and the whole readout is budgeted at one second, so running a CLI on the
+//! request path would flap `down` on an install that works. See [`exec_probe`].
 //!
 //! A disabled subsystem never drags the aggregate down. An unconfigured optional pillar is not a
 //! fault, and treating it as one teaches readers to ignore the readout when it matters.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
+use crate::sidecar::Liveness;
 use crate::state::AppState;
 use crate::worktree;
 
@@ -23,6 +32,11 @@ const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DAEMON_TOKEN_KEY: &str = "daemon-token";
 const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
+/// How long an exec verdict is trusted before a refresh is kicked off behind the readout.
+const EXEC_CACHE_TTL: Duration = Duration::from_secs(60);
+/// A generous ceiling for the background exec. Nobody waits on it, so it can afford to be patient
+/// with a CLI that takes its time starting — which is exactly what the readout itself cannot do.
+const EXEC_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A small, stable verdict vocabulary shared by the aggregate and every subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -44,6 +58,9 @@ pub enum FailureCategory {
     Unreachable,
     PermissionDenied,
     Missing,
+    /// Configured, and the process is not up. Distinct from `Missing`, which is about a file that
+    /// is not there, and from `NotConfigured`, which is about a pillar nobody asked for.
+    NotRunning,
     LowDiskSpace,
     Unknown,
 }
@@ -118,25 +135,40 @@ pub async fn readout(state: AppState) -> HealthReadout {
 
 async fn collect_readout(state: AppState) -> HealthReadout {
     let email_enabled = state.email.enabled;
+    let web_enabled = state.web.enabled;
     let voice_armed = state.voice.armed;
     let stt_command = state.voice.stt_command.clone();
-    let (pool, cli, credentials, disk, echo, telegram, email, voice) = tokio::join!(
+    let (pool, cli, credentials, disk, echo, telegram, email, web, voice) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
         run_subsystem("worktree_disk", disk_probe()),
         run_subsystem(
-            "echo_sidecar_binary",
-            sidecar_binary_probe("echo_sidecar_binary", true),
+            "echo_sidecar",
+            sidecar_probe("echo_sidecar", crate::sidecar::ECHO, true),
         ),
-        run_subsystem("telegram_sidecar_binary", telegram_sidecar_probe()),
+        run_subsystem("telegram_sidecar", telegram_sidecar_probe()),
         run_subsystem(
-            "email_sidecar_binary",
-            sidecar_binary_probe("email_sidecar_binary", email_enabled),
+            "email_sidecar",
+            sidecar_probe("email_sidecar", crate::sidecar::EMAIL, email_enabled),
+        ),
+        run_subsystem(
+            "web_sidecar",
+            sidecar_probe("web_sidecar", crate::sidecar::WEB, web_enabled),
         ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
     );
-    let subsystems = vec![pool, cli, credentials, disk, echo, telegram, email, voice];
+    let subsystems = vec![
+        pool,
+        cli,
+        credentials,
+        disk,
+        echo,
+        telegram,
+        email,
+        web,
+        voice,
+    ];
 
     HealthReadout {
         status: aggregate_state(&subsystems),
@@ -194,21 +226,22 @@ async fn pool_probe(pool: SqlitePool) -> SubsystemReadout {
 
 async fn cli_probe() -> SubsystemReadout {
     run_probe("cli_binary", async {
-        tokio::task::spawn_blocking(resolve_cli_binary)
+        let resolved = tokio::task::spawn_blocking(resolve_cli_binary)
             .await
             .map_err(classify_error)?
-            .map(|_| HealthState::Ok)
-            .ok_or(FailureCategory::Missing)
+            .ok_or(FailureCategory::Missing)?;
+        // The resolved path, not the configured name: the lookup has already decided which file on
+        // PATH this is, and re-deriving it in another process would be a second chance to disagree.
+        exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
     })
     .await
 }
 
-/// Whether the configured transcriber is a program that exists.
+/// Whether the configured transcriber is a program that runs here.
 ///
-/// Reports readiness of configuration only, like every other probe here — it resolves the binary and
-/// does not run it. Splitting is load-bearing: `stt_command` is a whole command line, so handing the
-/// string to a path lookup unsplit would look for a program whose name contains its own arguments and
-/// report every configured transcriber as missing.
+/// Splitting is load-bearing: `stt_command` is a whole command line, so handing the string to a path
+/// lookup unsplit would look for a program whose name contains its own arguments and report every
+/// configured transcriber as missing.
 ///
 /// It splits through `transcribe::split_command`, the same function that spawns the child, and that
 /// sharing is the point rather than a tidiness. This probe used its own `split_whitespace` until a
@@ -227,11 +260,12 @@ async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
             .into_iter()
             .next()
             .unwrap_or_default();
-        tokio::task::spawn_blocking(move || resolve_program(std::ffi::OsStr::new(&program)))
-            .await
-            .map_err(classify_error)?
-            .map(|_| HealthState::Ok)
-            .ok_or(FailureCategory::Missing)
+        let resolved =
+            tokio::task::spawn_blocking(move || resolve_program(std::ffi::OsStr::new(&program)))
+                .await
+                .map_err(classify_error)?
+                .ok_or(FailureCategory::Missing)?;
+        exec_probe(resolved.to_string_lossy().into_owned(), "--help").await
     })
     .await
 }
@@ -272,7 +306,7 @@ async fn disk_probe() -> SubsystemReadout {
 }
 
 async fn telegram_sidecar_probe() -> SubsystemReadout {
-    let configured = run_probe("telegram_sidecar_binary", async {
+    let configured = run_probe("telegram_sidecar", async {
         tokio::task::spawn_blocking(|| crate::secrets::load_secret(TELEGRAM_TOKEN_KEY))
             .await
             .map_err(classify_error)?
@@ -290,25 +324,45 @@ async fn telegram_sidecar_probe() -> SubsystemReadout {
     if configured.status == HealthState::Disabled || configured.status == HealthState::Down {
         return configured;
     }
-    sidecar_binary_probe("telegram_sidecar_binary", true).await
+    sidecar_probe("telegram_sidecar", crate::sidecar::TELEGRAM, true).await
 }
 
-async fn sidecar_binary_probe(name: &'static str, configured: bool) -> SubsystemReadout {
+/// PURE: what the supervisor's last observation of a sidecar means for its row.
+///
+/// The `configured` gate runs first and is never reached past: a pillar nobody turned on is a state,
+/// not a fault, and must not be dragged into `down` by having no registry entry.
+///
+/// `None` shares an arm with `Restarting` on purpose. Nothing ever supervised this name — either the
+/// daemon is still starting, which is honest for the seconds it lasts, or something refused to start
+/// it. The email sidecar is the case that matters: `main.rs` returns before `supervise` when the
+/// hook barrier cannot be proven, and this row used to stay green on the strength of an `.exe`
+/// sitting on disk while the pillar was silently off.
+fn sidecar_row(
+    name: &'static str,
+    configured: bool,
+    liveness: Option<Liveness>,
+) -> SubsystemReadout {
     if !configured {
         return SubsystemReadout::disabled(name, FailureCategory::NotConfigured);
     }
+    match liveness {
+        Some(Liveness::Running) => SubsystemReadout::ok(name),
+        Some(Liveness::Restarting) | None => {
+            SubsystemReadout::down(name, FailureCategory::NotRunning)
+        }
+        Some(Liveness::FailedToSpawn(kind)) => {
+            SubsystemReadout::down(name, category_from_spawn(kind))
+        }
+    }
+}
 
-    run_probe(name, async move {
-        tokio::task::spawn_blocking(move || sidecar_binary_path(name).is_some())
-            .await
-            .map_err(classify_error)
-            .and_then(|present| {
-                present
-                    .then_some(HealthState::Ok)
-                    .ok_or(FailureCategory::Missing)
-            })
-    })
-    .await
+/// The row name and the supervisor's key are different things, so the call site passes both.
+async fn sidecar_probe(
+    name: &'static str,
+    supervised_as: &'static str,
+    configured: bool,
+) -> SubsystemReadout {
+    sidecar_row(name, configured, crate::sidecar::liveness_of(supervised_as))
 }
 
 fn aggregate_state(subsystems: &[SubsystemReadout]) -> HealthState {
@@ -365,12 +419,112 @@ fn binary_candidate(path: &Path) -> Option<PathBuf> {
     })
 }
 
-fn sidecar_binary_path(name: &str) -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let directory = executable.parent()?;
-    let stem = name.strip_suffix("_binary")?.replace('_', "-");
-    let path = directory.join(format!("{stem}.exe"));
-    path.is_file().then_some(path)
+type ExecVerdict = Result<HealthState, FailureCategory>;
+
+/// Keyed by the program itself, not by the row: the verdict is a fact about a specific binary, so
+/// re-pointing `stt_command` at a different transcriber must not inherit the old one's answer.
+static EXEC_CACHE: LazyLock<Mutex<HashMap<String, (Instant, ExecVerdict)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What actually happened when the probe tried to run the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecOutcome {
+    Exited { success: bool },
+    TimedOut,
+    SpawnFailed(io::ErrorKind),
+}
+
+/// PURE: what an attempt to run the program means for the row.
+fn exec_verdict(outcome: ExecOutcome) -> ExecVerdict {
+    match outcome {
+        ExecOutcome::Exited { success: true } => Ok(HealthState::Ok),
+        // Deliberately not `down`. `--help` and `--version` conventions differ between CLIs, and a
+        // probe that raises the alarm on a working install is worse than no probe — the lesson this
+        // module already learned from the quoted-path bug in its tests.
+        ExecOutcome::Exited { success: false } | ExecOutcome::TimedOut => Ok(HealthState::Degraded),
+        ExecOutcome::SpawnFailed(kind) => Err(category_from_spawn(kind)),
+    }
+}
+
+/// PURE: a cached verdict, but only while it is fresh.
+fn cached_verdict(entry: Option<(Instant, ExecVerdict)>, now: Instant) -> Option<ExecVerdict> {
+    entry
+        .filter(|(stamped, _)| now.duration_since(*stamped) < EXEC_CACHE_TTL)
+        .map(|(_, verdict)| verdict)
+}
+
+/// A cached verdict on whether `program` runs here, refreshed behind the readout rather than during
+/// it.
+///
+/// The readout never waits for the program. The shell polls `/health` every three seconds and
+/// [`AGGREGATE_TIMEOUT`] is one second, so executing on the request path would spawn two processes
+/// every three seconds and report `down: timeout` for any CLI that takes longer than a second to
+/// answer — which a Node CLI routinely does.
+///
+/// A cold read answers `Ok`, because the caller only gets here once the path has resolved: that is
+/// precisely the check this probe used to do on its own, and it is honest about being a config
+/// check. The executed verdict replaces it one poll later.
+async fn exec_probe(program: String, flag: &'static str) -> ExecVerdict {
+    let entry = EXEC_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&program).cloned());
+    if let Some(verdict) = cached_verdict(entry, Instant::now()) {
+        return verdict;
+    }
+
+    // Claim the slot before spawning, or every poll until the refresh lands starts another one.
+    if let Ok(mut cache) = EXEC_CACHE.lock() {
+        cache.insert(program.clone(), (Instant::now(), Ok(HealthState::Ok)));
+    }
+    tokio::spawn(refresh_exec_cache(program, flag));
+    Ok(HealthState::Ok)
+}
+
+async fn refresh_exec_cache(program: String, flag: &'static str) {
+    let verdict = exec_verdict(run_program_once(&program, flag).await);
+    if let Ok(mut cache) = EXEC_CACHE.lock() {
+        cache.insert(program, (Instant::now(), verdict));
+    }
+}
+
+/// Runs the program with a harmless flag, purely to see whether it runs at all.
+///
+/// This is what execution buys over resolving a path: wrong architecture, a missing DLL, a corrupt
+/// file, permission bits, an `.exe` that is really text — all of them resolve fine and fail here.
+///
+/// stdio is closed and `kill_on_drop` set so a transcriber that ignores `--help` and sits waiting
+/// for audio is killed at the timeout instead of accumulating orphans.
+async fn run_program_once(program: &str, flag: &'static str) -> ExecOutcome {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .arg(flag)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    match command.spawn() {
+        Err(error) => ExecOutcome::SpawnFailed(error.kind()),
+        Ok(mut child) => match tokio::time::timeout(EXEC_PROBE_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => ExecOutcome::Exited {
+                success: status.success(),
+            },
+            Ok(Err(error)) => ExecOutcome::SpawnFailed(error.kind()),
+            Err(_) => ExecOutcome::TimedOut,
+        },
+    }
+}
+
+/// A spawn failure's `NotFound` means the program is absent, so it is `Missing` — where
+/// [`category_from_io`] maps the same `ErrorKind` to `NotConfigured` for the disk probe, which is
+/// asking a different question of the same error.
+fn category_from_spawn(kind: io::ErrorKind) -> FailureCategory {
+    match kind {
+        io::ErrorKind::NotFound => FailureCategory::Missing,
+        io::ErrorKind::PermissionDenied => FailureCategory::PermissionDenied,
+        _ => FailureCategory::Unknown,
+    }
 }
 
 fn worktree_available_space() -> io::Result<u64> {
@@ -510,16 +664,22 @@ mod tests {
     /// look for a program whose name STARTS WITH a quote character. It reported `down` for the exact
     /// configuration that quoting was added to support — a probe raising the alarm on a working setup,
     /// which is worse than no probe. Both now go through one function.
+    ///
+    /// The assertion is `not Missing` rather than `== Ok` since the probe started executing the
+    /// program: a resolvable program can now answer `ok` or `degraded` depending on what IT does
+    /// with `--help`, which is the program's business and not this regression's. Pinning `== Ok`
+    /// would make a test about SPLITTING fail over an exit code — the same category of misdirected
+    /// alarm the bug itself was.
     #[tokio::test]
     async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote() {
         // `cmd` exists on every Windows host and needs no arguments to resolve.
         let readout = voice_probe(true, "\"cmd\" -m model.bin".to_string()).await;
 
-        assert_eq!(
-            readout.status,
-            HealthState::Ok,
-            "a quoted path that resolves must probe Ok, got {:?}",
-            readout.reason
+        assert_ne!(
+            readout.reason,
+            Some(FailureCategory::Missing),
+            "a quoted path that resolves must not be reported missing, got {:?}",
+            readout.status
         );
     }
 
@@ -527,13 +687,150 @@ mod tests {
     #[tokio::test]
     async fn an_unquoted_transcriber_path_still_probes_its_first_token() {
         let readout = voice_probe(true, "cmd -m model.bin".to_string()).await;
-        assert_eq!(readout.status, HealthState::Ok);
+        assert_ne!(readout.reason, Some(FailureCategory::Missing));
 
         let missing = voice_probe(true, "definitely-not-a-program-anywhere -x".to_string()).await;
-        assert_ne!(
+        assert_eq!(
             missing.status,
-            HealthState::Ok,
+            HealthState::Down,
             "a transcriber that does not exist has to be reported"
+        );
+        assert_eq!(missing.reason, Some(FailureCategory::Missing));
+    }
+
+    /// A row now reports what the supervisor saw, not what is sitting on disk.
+    #[test]
+    fn a_sidecar_row_reports_what_the_supervisor_saw() {
+        let running = sidecar_row("echo_sidecar", true, Some(Liveness::Running));
+        assert_eq!(running.status, HealthState::Ok);
+        assert_eq!(running.reason, None);
+
+        let restarting = sidecar_row("echo_sidecar", true, Some(Liveness::Restarting));
+        assert_eq!(restarting.status, HealthState::Down);
+        assert_eq!(restarting.reason, Some(FailureCategory::NotRunning));
+
+        // A failed spawn proves the binary's absence better than an `is_file()` ever did: it proves
+        // it at the moment it mattered, by the mechanism that mattered.
+        let never_built = sidecar_row(
+            "echo_sidecar",
+            true,
+            Some(Liveness::FailedToSpawn(io::ErrorKind::NotFound)),
+        );
+        assert_eq!(never_built.status, HealthState::Down);
+        assert_eq!(never_built.reason, Some(FailureCategory::Missing));
+
+        let refused = sidecar_row(
+            "echo_sidecar",
+            true,
+            Some(Liveness::FailedToSpawn(io::ErrorKind::PermissionDenied)),
+        );
+        assert_eq!(refused.reason, Some(FailureCategory::PermissionDenied));
+    }
+
+    /// The case that motivated the work. When the email hook barrier fails, `main.rs` returns before
+    /// `supervise` is ever called — so there is no registry entry at all. The row used to stay green
+    /// because the `.exe` was on disk, which is the readout being green precisely when it should
+    /// not be.
+    #[test]
+    fn a_configured_sidecar_nobody_started_is_down_rather_than_green() {
+        let row = sidecar_row("email_sidecar", true, None);
+        assert_eq!(row.status, HealthState::Down);
+        assert_eq!(row.reason, Some(FailureCategory::NotRunning));
+    }
+
+    /// The counterpart that must NOT change: a pillar nobody turned on is a state, not a fault.
+    #[test]
+    fn a_pillar_nobody_turned_on_stays_disabled() {
+        let row = sidecar_row("email_sidecar", false, None);
+        assert_eq!(row.status, HealthState::Disabled);
+        assert_eq!(row.reason, Some(FailureCategory::NotConfigured));
+    }
+
+    /// The supervisor writes two fields; `liveness` is the single reading of them. This pins the
+    /// pairing that is easy to get wrong: `down` means two different things depending on whether a
+    /// spawn error is sitting beside it.
+    #[test]
+    fn the_supervisors_two_fields_read_as_one_verdict() {
+        let mut entry = crate::sidecar::SidecarState {
+            name: "echo".to_string(),
+            state: "running",
+            started_at: Some("now".to_string()),
+            last_failure: None,
+            last_failure_at: None,
+            restarts: 0,
+            spawn_error: None,
+        };
+        assert_eq!(entry.liveness(), Liveness::Running);
+
+        entry.state = "down";
+        entry.last_failure = Some("exited: exit code: 1".to_string());
+        assert_eq!(entry.liveness(), Liveness::Restarting);
+
+        entry.spawn_error = Some(io::ErrorKind::NotFound);
+        assert_eq!(
+            entry.liveness(),
+            Liveness::FailedToSpawn(io::ErrorKind::NotFound)
+        );
+
+        // And the clearing matters as much as the setting: a sidecar that could not start, then
+        // started, must stop being reported as a missing binary.
+        entry.state = "running";
+        entry.spawn_error = None;
+        assert_eq!(entry.liveness(), Liveness::Running);
+    }
+
+    /// Non-zero exit is `degraded`, never `down`. `--help` and `--version` conventions differ across
+    /// CLIs, and the one unacceptable outcome for this probe is crying wolf over a working install.
+    #[test]
+    fn an_exec_probe_is_only_down_when_the_program_will_not_start() {
+        assert_eq!(
+            exec_verdict(ExecOutcome::Exited { success: true }),
+            Ok(HealthState::Ok)
+        );
+        assert_eq!(
+            exec_verdict(ExecOutcome::Exited { success: false }),
+            Ok(HealthState::Degraded)
+        );
+        assert_eq!(
+            exec_verdict(ExecOutcome::TimedOut),
+            Ok(HealthState::Degraded)
+        );
+        assert_eq!(
+            exec_verdict(ExecOutcome::SpawnFailed(io::ErrorKind::NotFound)),
+            Err(FailureCategory::Missing)
+        );
+    }
+
+    /// The cache is what keeps a five-second program off a one-second readout, so its expiry is
+    /// worth a test of its own rather than being trusted to a comparison written once.
+    #[test]
+    fn a_stale_exec_verdict_is_not_reused() {
+        let now = Instant::now();
+        let fresh = now.checked_sub(EXEC_CACHE_TTL / 2).unwrap();
+        let stale = now.checked_sub(EXEC_CACHE_TTL * 2).unwrap();
+
+        assert_eq!(
+            cached_verdict(Some((fresh, Ok(HealthState::Degraded))), now),
+            Some(Ok(HealthState::Degraded))
+        );
+        assert_eq!(
+            cached_verdict(Some((stale, Ok(HealthState::Ok))), now),
+            None
+        );
+        assert_eq!(cached_verdict(None, now), None);
+    }
+
+    /// A spawn failure and a disk error carry the same `ErrorKind` and mean different things, which
+    /// is exactly the kind of shared vocabulary that gets collapsed by a later tidy-up.
+    #[test]
+    fn a_missing_program_and_a_missing_directory_are_not_the_same_answer() {
+        assert_eq!(
+            category_from_spawn(io::ErrorKind::NotFound),
+            FailureCategory::Missing
+        );
+        assert_eq!(
+            category_from_io(io::Error::from(io::ErrorKind::NotFound)),
+            FailureCategory::NotConfigured
         );
     }
 }

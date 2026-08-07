@@ -21,11 +21,12 @@ const SECTIONS: { key: Section; label: string }[] = [
 /**
  * The readiness readout, subsystem by subsystem.
  *
- * Two things it deliberately does not claim. A sidecar row describes configuration and binary
- * presence, not whether that process is running right now — the supervisor is a fire-and-forget
- * restart loop with no status surface, and the `*_sidecar_binary` names carry that limit. And a
- * `disabled` subsystem is not a fault: an optional pillar nobody turned on drags nothing down, which
- * is why it recedes here instead of colouring the aggregate.
+ * A sidecar row says whether that process is up, as its own supervisor last saw it. The one thing it
+ * still does not claim is that the process is doing anything: a child that is running but wedged
+ * reads ok, because the supervisor watches processes and not progress.
+ *
+ * A `disabled` subsystem is not a fault: an optional pillar nobody turned on drags nothing down,
+ * which is why it recedes here instead of colouring the aggregate.
  */
 function Health({ token }: { token: string }) {
   const [readout, setReadout] = useState<HealthReadout | null>(null);
@@ -68,8 +69,8 @@ function Health({ token }: { token: string }) {
         </ul>
       )}
       <p className="a-note">
-        A sidecar row here says what is configured and installed. Whether those processes are
-        actually running is the panel below.
+        A sidecar row here says whether that process is up. Why it is not, and how often it has had
+        to be restarted, is the panel below.
       </p>
     </Panel>
   );
