@@ -646,13 +646,20 @@ pub struct Ticket {
 /// older version or edited by hand, and one such row must not be able to fail the whole listing —
 /// the listing is exactly where somebody would go to find out that a row is wrong.
 /// `FromRow` rather than a positional tuple, for the reason `runs.rs` states: a tuple makes the
-/// column-order-to-field-order correspondence load-bearing and invisible, and five of these six
+/// column-order-to-field-order correspondence load-bearing and invisible, and six of these seven
 /// fields are `String`, so a swap would compile and pass.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestSummary {
     pub id: i64,
     pub op: String,
     pub project_id: String,
+    /// What the queue locked on for this row, and therefore what the listing is grouped by.
+    ///
+    /// Carried ALONGSIDE `project_id` rather than instead of it. The project is the label a reader
+    /// recognises; the key is the only thing that says whether two differently-labelled rows were
+    /// competing for the same refs. Without it, a listing that contains another project's work
+    /// reads as a bug in the listing rather than as the fact it is reporting.
+    pub repo_key: String,
     pub origin: String,
     pub status: String,
     pub created_at: String,
@@ -672,14 +679,37 @@ const LIST_LIMIT: i64 = 200;
 ///
 /// Newest first because the question a listing answers is almost always "what just happened", and a
 /// caller reading a truncated oldest-first list would be reading history while missing the present.
+///
+/// **Narrowed by REPOSITORY, though the caller names a project.** The lock this queue takes is on
+/// the repository, so two projects pointing at one checkout share a queue and compete for the same
+/// refs. A listing that filtered on `project_id` would hand each of them a view with the other's
+/// operations missing — which is the single fact about this queue a listing must not hide, and it
+/// was the abbreviation this function shipped with while `project_id` and the key were still the
+/// same thing.
+///
+/// The key is read from the TABLE, not from `resolve_repo`, and that is deliberate twice over.
+/// A listing must not need a git subprocess: it is where somebody goes when something is already
+/// wrong, and a project whose directory has moved or gone would then have no listing at all rather
+/// than a listing of what it did. And the row's own `repo_key` is the better authority anyway — it
+/// is what the queue actually locked on at the time, which is not necessarily what the disk would
+/// say now.
+///
+/// A project with nothing queued yet makes the subquery NULL, so the comparison is NULL and the
+/// listing is empty. That is the right answer and not an accident of SQL: nothing has been queued
+/// for it, so there is no repository to widen to.
 pub async fn list(
     pool: &sqlx::SqlitePool,
     project_id: Option<&str>,
 ) -> sqlx::Result<Vec<RequestSummary>> {
     sqlx::query_as(
-        "SELECT id, op, project_id, origin, status, created_at
+        "SELECT id, op, project_id, repo_key, origin, status, created_at
            FROM vcs_requests
-          WHERE ?1 IS NULL OR project_id = ?1
+          WHERE ?1 IS NULL
+             OR repo_key = (
+                  SELECT repo_key FROM vcs_requests
+                   WHERE project_id = ?1
+                   ORDER BY id DESC LIMIT 1
+                )
           ORDER BY id DESC
           LIMIT ?2",
     )
@@ -1724,6 +1754,69 @@ mod tests {
         assert!(
             claim_next(&pool, "SHARED").await.unwrap().is_none(),
             "the second project claimed the repository the first is holding"
+        );
+    }
+
+    /// A listing narrowed to a project shows the whole repository that project shares.
+    ///
+    /// The thing being pinned is that a reader asking "what is queued for alpha" is not shown a
+    /// view in which beta's merge into the same branch is invisible. They are in one queue, waiting
+    /// on one lock, competing for one set of refs — a listing that split them by label would be
+    /// most misleading exactly when it matters, which is when the two are about to collide.
+    #[tokio::test]
+    async fn a_listing_shows_the_whole_repository_and_not_just_the_project_named() {
+        let pool = test_pool().await;
+        let alpha = ResolvedRepo::synthetic("alpha", "C:/repo", "SHARED");
+        let beta = ResolvedRepo::synthetic("beta", "C:/repo", "SHARED");
+        let elsewhere = ResolvedRepo::synthetic("gamma", "C:/other", "OTHER");
+
+        submit(&pool, &alpha, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        submit(&pool, &beta, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        submit(&pool, &elsewhere, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        let listed = list(&pool, Some("alpha")).await.unwrap();
+        let projects: Vec<&str> = listed
+            .iter()
+            .map(|row| row.project_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            projects.contains(&"alpha") && projects.contains(&"beta"),
+            "both projects share one repository and one queue: {projects:?}"
+        );
+        assert!(
+            !projects.contains(&"gamma"),
+            "widening to the repository must not widen to every repository: {projects:?}"
+        );
+        assert!(
+            listed.iter().all(|row| row.repo_key == "SHARED"),
+            "a listing that groups by repository has to say which one"
+        );
+    }
+
+    /// A project nothing has been queued for lists nothing — not everything.
+    ///
+    /// The subquery that finds the repository answers NULL for such a project, and `= NULL` is NULL
+    /// rather than true, so the row is not returned. Written down as a test because the failure
+    /// mode of getting that wrong is not an error: it is a listing that quietly shows every
+    /// repository on the machine to a caller who asked about one.
+    #[tokio::test]
+    async fn a_project_with_nothing_queued_lists_nothing_rather_than_everything() {
+        let pool = test_pool().await;
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        assert!(list(&pool, Some("never-used")).await.unwrap().is_empty());
+        assert_eq!(
+            list(&pool, None).await.unwrap().len(),
+            1,
+            "asking for no project at all still means the whole table"
         );
     }
 
