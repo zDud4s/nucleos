@@ -89,7 +89,12 @@ impl Branch {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
         {
-            return Err(format!("a branch name may not contain whitespace: {value}"));
+            // Both halves are named, because the message is what a caller reads: told only
+            // "whitespace" about a name carrying an ESC it would go looking for a space that is
+            // not there.
+            return Err(format!(
+                "a branch name may not contain whitespace or control characters: {value}"
+            ));
         }
         Ok(Self(value.to_owned()))
     }
@@ -288,17 +293,9 @@ pub enum ResolveError {
     Database(sqlx::Error),
 }
 
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownProject => {
-                write!(formatter, "no such project, or it has no recorded root")
-            }
-            Self::NotARepository(reason) => write!(formatter, "{reason}"),
-            Self::Database(error) => write!(formatter, "{error}"),
-        }
-    }
-}
+// No `Display`: the one consumer, `http.rs`, destructures every arm and formats the inner value
+// itself, so a `Display` here would be dead code that clippy cannot see — trait impls are exempt
+// from dead-code analysis. Whoever gains a caller that wants to print one whole writes it then.
 
 /// The single production path from a project id to a repository the queue may lock.
 ///
@@ -893,8 +890,8 @@ pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Resul
     Ok(cancelled.len() as u64)
 }
 
-/// Retires every request in this repository whose submitting run has already ended, and returns how
-/// many. Called by `drain_once` before it claims.
+/// Retires every request in this repository whose submitting run is no longer alive — it ended, or
+/// its row is gone — and returns how many. Called by `drain_once` before it claims.
 ///
 /// **This is the pull half of spec §7's "the agent that submitted dies", and it exists because the
 /// push half cannot be complete.** `runs::finalize_termination` sweeps the paths that go through it,
@@ -911,6 +908,23 @@ pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Resul
 /// `cancel_for_run` is kept alongside it and is not redundant: it makes a cancelled run's requests
 /// disappear *immediately*, rather than at the next poll of a repository that may have nothing else
 /// queued for hours.
+///
+/// **The three cases, decided here rather than left to be reassembled by a reader.**
+///
+/// 1. *The run is alive* — including paused at `awaiting_approval`, which resumes — and its request
+///    is **kept**. This is the case the whole shape exists to protect: a merge cancelled out from
+///    under a run that was only waiting on a human is work destroyed for no reason.
+/// 2. *The run has ended* and its request is **reaped**, because nothing will ever come back for it.
+/// 3. *The run's row is gone* and its request is **reaped too** — a row that is not there cannot be
+///    running. Nothing ties `run_id` to `runs` (`0048_vcs_requests.sql` writes no foreign key) and
+///    rows really are deleted from `runs`, so this is an ordinary state and not a corrupt one. Kept,
+///    such a request would eventually be claimed and **executed**: a merge performed against the
+///    repository on behalf of a run that no longer exists.
+///
+/// Case 3 is the only reason the predicate is `NOT EXISTS (… still alive …)` rather than the
+/// `EXISTS (… already ended …)` it reads as the obvious spelling of. The two agree on every row
+/// whose run row exists, and differ only when it does not — where this direction is the one spec §7
+/// asks for.
 ///
 /// The status list comes from `runs::ENDED_RUN_STATUSES` rather than being spelled here. Note what
 /// is NOT in it: a run at `awaiting_approval` is paused for a human and will resume, so its merge
@@ -930,18 +944,25 @@ pub async fn reap_requests_of_ended_runs(
     repo_key: &str,
 ) -> sqlx::Result<u64> {
     let placeholders = vec!["?"; crate::runs::ENDED_RUN_STATUSES.len()].join(", ");
-    // `run_id IS NOT NULL` is redundant against the `EXISTS` below — a NULL joins nothing — and is
-    // written anyway because it is the sentence the reaper means: a request no run owns is not a
-    // request a run can have abandoned.
+    // `run_id IS NOT NULL` is **load-bearing**, and it is the `NOT EXISTS` shape that makes it so.
+    // A NULL joins nothing, so for a request no run owns the subquery is empty and `NOT EXISTS` is
+    // TRUE — without this line every human's request in the repository would be reaped as though
+    // its run had vanished, which is the very case 3 below is about. It reads like the sentence the
+    // reaper means (a request no run owns is not one a run can have abandoned) and it is also the
+    // guard; `a_humans_request_is_never_reaped` is what holds it.
+    //
+    // `NOT EXISTS (… alive …)` rather than `EXISTS (… ended …)`: see this function's doc comment.
+    // The two differ on exactly one row shape — a `run_id` naming a run row that is gone — and this
+    // is the direction that retires it instead of queueing a merge for it for ever.
     let sql = format!(
         "UPDATE vcs_requests
             SET status = 'cancelled', finished_at = ?,
                 failure_reason = 'the run that asked for this had already ended when the queue reached it'
           WHERE repo_key = ? AND status IN ('queued', 'awaiting_approval')
             AND run_id IS NOT NULL
-            AND EXISTS (SELECT 1 FROM runs
-                         WHERE runs.id = vcs_requests.run_id
-                           AND runs.status IN ({placeholders}))
+            AND NOT EXISTS (SELECT 1 FROM runs
+                             WHERE runs.id = vcs_requests.run_id
+                               AND runs.status NOT IN ({placeholders}))
          RETURNING id, project_id, run_id"
     );
 
@@ -1050,8 +1071,8 @@ pub async fn drain_once(
     repo_key: &str,
     executor: &dyn VcsExecutor,
 ) -> bool {
-    // Spec §7's pull half, and the reason the four other writers of a run's terminal status do not
-    // each need a sweep of their own — `reap_requests_of_ended_runs` argues the whole case. It goes
+    // Spec §7's pull half, and the reason the other writers of a run's terminal status do not each
+    // need a sweep of their own — `reap_requests_of_ended_runs` argues the whole case. It goes
     // before the claim because after it the row would already be `running`, which the reap leaves
     // alone by design.
     //
@@ -1105,17 +1126,23 @@ pub async fn drain_once(
         // `None` for `run_id`: `ClaimedRequest` does not carry one and `claim_next` does not return
         // one, and widening its `RETURNING` to supply it would buy nothing today.
         //
-        // **What that rests on is the approval transition not existing yet, and nothing weaker than
-        // that.** Rows carrying a `run_id` are ordinary now — `hooks.rs` submits as `Origin::Run`,
-        // and `reap_requests_of_ended_runs` a few functions up writes feed rows that attach one — so
-        // the premise is not "no request in play has a run". It is that a `Run` request starts
-        // `awaiting_approval` and nothing moves it to `queued` until Chunk 4 wires `proposals.rs`,
-        // so nothing carrying a `run_id` is claimable, and this column is NULL for everything that
-        // reaches here. The day that transition lands, this line stops being true and nothing breaks:
-        // a merge a run asked for appears in the feed with no run attached, which costs the person
+        // **What that rests on is that nothing in production builds a `Run` request at all today.**
+        // The only mapping from a caller to `Origin::Run` is `http.rs`'s `vcs_origin`, and a run
+        // token opens exactly one route — `POST /hooks/pretooluse-decision` (`auth.rs`) — which is
+        // not the one that reaches `submit`; `vcs_origin`'s own doc comment says as much seven lines
+        // above that arm. Every `submit(.., Origin::Run(..))` in the tree is inside a
+        // `#[cfg(test)] mod tests`. So `run_id` is NULL on every row this table holds, claimable or
+        // not, and this `None` throws nothing away.
+        //
+        // Two separate things have to land before that stops being true, and Chunk 4 brings both:
+        // the route opening to a run scope, and the `awaiting_approval` → `queued` transition
+        // `proposals.rs` grants — without the second a `Run` request would still never be claimable,
+        // since that is the status `submit` gives it. When they do land, nothing here breaks: a
+        // merge a run asked for appears in the feed with no run attached, which costs the person
         // reading it the link back and costs the queue nothing. Chunk 4 is where threading it earns
         // its keep.
-        // (`reconcile_interrupted` does attach one, because it reads whole rows rather than a claim.)
+        // (`reconcile_interrupted` and `reap_requests_of_ended_runs` do attach one, because they
+        // read whole rows rather than a claim.)
         Ok(()) => {
             let _ = crate::feed::append(
                 pool,
@@ -2904,6 +2931,42 @@ mod tests {
                 "{status}: a dead run's merge must never reach git"
             );
         }
+    }
+
+    /// The run's row is gone, and the request has to go with it.
+    ///
+    /// No foreign key ties `vcs_requests.run_id` to `runs` (`0048_vcs_requests.sql`) and rows really
+    /// are deleted from `runs`, so this is an ordinary state rather than a corrupt one. It is also
+    /// the *only* state that tells the reaper's predicate apart from its inverse — `EXISTS(ended)`
+    /// and `NOT EXISTS(alive)` agree on every row whose run still exists. The version that kept such
+    /// a request would leave `drain_once` to claim it and execute a merge on behalf of a run that is
+    /// certainly not running, because it is not there.
+    ///
+    /// The run is inserted and then deleted rather than never written, so the row under test is the
+    /// one production produces — a request that named a real run whose record was later removed —
+    /// and not a request that named a number nothing ever used.
+    #[tokio::test]
+    async fn a_request_whose_run_row_is_gone_is_reaped_rather_than_kept_for_ever() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "running").await;
+        let id = queued_request_for_run(&pool, 7).await;
+        sqlx::query("DELETE FROM runs WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let executor = FakeVcsExecutor::succeeding_with("abc123");
+        assert!(
+            !drain_once(&pool, "alpha", &executor).await,
+            "the reap leaves nothing claimable, so the drain must report the queue empty"
+        );
+
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+        assert_eq!(
+            executor.calls(),
+            0,
+            "a merge for a run that no longer exists must never reach git"
+        );
     }
 
     /// The trap, again and one level deeper: a run paused for a human resumes, and its merge must
