@@ -1434,13 +1434,27 @@ mod tests {
         // in tests the repository key is the project name. Left to the column's `''` default these
         // rows would be invisible to every `claim_next` and would collide with each other on the
         // partial unique index — two failures with nothing to do with what any caller is testing.
+        insert_keyed(pool, project, project, status, args).await
+    }
+
+    /// `insert` with its two identifying columns pulled apart.
+    ///
+    /// Every other caller wants them equal, which is why `insert` binds one string to both — and
+    /// which is exactly why a test about *which* of them the queue is keyed on cannot go through it.
+    async fn insert_keyed(
+        pool: &sqlx::SqlitePool,
+        project: &str,
+        repo_key: &str,
+        status: &str,
+        args: &str,
+    ) -> sqlx::Result<i64> {
         sqlx::query(
             "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, status, created_at)
              VALUES ('merge', ?, ?, 'C:/repo', ?, 'human', ?, '2026-08-02T00:00:00Z')",
         )
         .bind(args)
         .bind(project)
-        .bind(project)
+        .bind(repo_key)
         .bind(status)
         .execute(pool)
         .await
@@ -1474,6 +1488,44 @@ mod tests {
                 .await
                 .expect("queued requests are not limited — only running is");
         }
+    }
+
+    /// **What the backstop is keyed on**, which is the half the test above structurally cannot see.
+    ///
+    /// It goes through `insert`, which binds `project_id` and `repo_key` to one string by design —
+    /// so it pins that the index is unique and never that it is unique *on the repository*.
+    /// Re-pointing the index at `project_id`, the column `0048` had it on and `0049` deliberately
+    /// moved it off, leaves it green. That is not a small drift: the whole of this module's promise
+    /// is that a project is a label somebody chose and a repository is what a merge actually
+    /// touches, so two labels naming one repository must not both run. Only two rows where those
+    /// two columns disagree can hold it.
+    ///
+    /// The assertion is on the *constraint*, not on `is_err()`. An insert that failed for any other
+    /// reason — a CHECK on `status`, a column list gone stale — satisfies a bare `is_err()` and
+    /// proves nothing about the index it claims to be about.
+    #[tokio::test]
+    async fn the_backstop_locks_on_the_repository_and_not_on_the_project() {
+        let pool = test_pool().await;
+
+        insert_keyed(&pool, "alpha", "SHARED", "running", MERGE_ARGS)
+            .await
+            .expect("the first running request is allowed");
+
+        let rejected = insert_keyed(&pool, "beta", "SHARED", "running", MERGE_ARGS)
+            .await
+            .expect_err("a second project running against the same repository must be rejected");
+
+        let database_error = rejected
+            .as_database_error()
+            .expect("the rejection must come from the database, not from sqlx's own plumbing");
+        assert!(
+            database_error.is_unique_violation(),
+            "the rejection must be the unique index and not some other constraint: {database_error}"
+        );
+        assert!(
+            database_error.to_string().contains("repo_key"),
+            "the index that rejected this must be the one keyed on repo_key: {database_error}"
+        );
     }
 
     /// Round-tripping through the stored form is the point: the row is the contract between the
@@ -2774,6 +2826,21 @@ mod tests {
         .unwrap();
     }
 
+    /// Every run status the schema names — `0002_runs.sql`'s own comment, as data.
+    ///
+    /// Which of them are *ended* is not decided here: `runs::ENDED_RUN_STATUSES` decides, and the two
+    /// reaper tables partition this list by it. Kept separate so the reaper's two halves are provably
+    /// exhaustive over the vocabulary rather than over whichever cases somebody thought of.
+    const EVERY_RUN_STATUS: &[&str] = &[
+        "running",
+        "completed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "awaiting_approval",
+        "interrupted",
+    ];
+
     /// A request a run asked for that is past approval and waiting its turn — the state every one of
     /// these tests is about, and the one `submit` cannot produce directly, since a `Run` request
     /// starts `awaiting_approval`.
@@ -2789,31 +2856,54 @@ mod tests {
         id
     }
 
-    /// The push half cannot be complete — four writers set a run's terminal status without going through
-    /// `finalize_termination`. This is the half that does not depend on anybody remembering.
+    /// The push half cannot be complete — a run's terminal status is written elsewhere without going
+    /// through `finalize_termination`. This is the half that does not depend on anybody remembering.
+    ///
+    /// **Driven by `runs::ENDED_RUN_STATUSES` itself, never by the statuses written out again here.**
+    /// That constant's doc comment names a second copy drifting from it as the precise failure it
+    /// exists to prevent, and a list retyped in this test would BE that second copy. It was one:
+    /// replacing the reaper's bind loop with four hard-coded strings, two of them nonsense, passed
+    /// the whole suite — because `timed_out` was the only status this SQL was ever handed, while
+    /// `cancelled`, `failed` and `interrupted` were covered on `ends_the_run`'s side only, and that
+    /// is the side the reaper exists because of. Iterating the constant is what stops the coverage
+    /// falling behind it again.
     #[tokio::test]
     async fn a_request_whose_run_died_by_some_other_door_is_reaped_before_the_next_claim() {
-        let pool = test_pool().await;
-        // `timed_out` is written by a direct UPDATE in `runs.rs`'s progress-deadline arm, which does
-        // not sweep. Nothing told the queue this run was over; the queue has to ask.
-        insert_run(&pool, 7, "timed_out").await;
-        let id = queued_request_for_run(&pool, 7).await;
-
-        let executor = FakeVcsExecutor::succeeding_with("abc123");
         assert!(
-            !drain_once(&pool, "alpha", &executor).await,
-            "the reap leaves nothing claimable, so the drain must report the queue empty"
+            !crate::runs::ENDED_RUN_STATUSES.is_empty(),
+            "an empty status list would make this test pass by iterating nothing, while the reaper \
+             it drives reaped nothing either"
         );
+        for status in crate::runs::ENDED_RUN_STATUSES {
+            // A database per status rather than one holding them all, so each iteration is exactly
+            // the single-status case: one queued request, one drain. Sharing a pool would put every
+            // request in one repository's FIFO, where a reaper that swept only the head would be
+            // indistinguishable from one that swept them all.
+            let pool = test_pool().await;
+            insert_run(&pool, 7, status).await;
+            let id = queued_request_for_run(&pool, 7).await;
 
-        assert_eq!(status_of(&pool, id).await, "cancelled");
-        // The half that a status assertion alone cannot make: a merge that ran and was then
-        // overwritten with `cancelled` would satisfy the line above and still have touched the
-        // repository on behalf of a run that no longer exists.
-        assert_eq!(
-            executor.calls(),
-            0,
-            "a dead run's merge must never reach git"
-        );
+            let executor = FakeVcsExecutor::succeeding_with("abc123");
+            assert!(
+                !drain_once(&pool, "alpha", &executor).await,
+                "{status}: the reap leaves nothing claimable, so the drain must report the queue \
+                 empty"
+            );
+
+            assert_eq!(
+                status_of(&pool, id).await,
+                "cancelled",
+                "a request whose run is {status} must be reaped"
+            );
+            // The half that a status assertion alone cannot make: a merge that ran and was then
+            // overwritten with `cancelled` would satisfy the line above and still have touched the
+            // repository on behalf of a run that no longer exists.
+            assert_eq!(
+                executor.calls(),
+                0,
+                "{status}: a dead run's merge must never reach git"
+            );
+        }
     }
 
     /// The trap, again and one level deeper: a run paused for a human resumes, and its merge must
@@ -2849,21 +2939,47 @@ mod tests {
         assert_eq!(status_of(&pool, human).await, "queued");
     }
 
-    /// A run that finished its work asked for the merge and should have it. `completed` is what
-    /// `runs.rs` writes for an exit code of zero (`runs.rs`'s terminal-status match, and the status
-    /// comment at the top of `0002_runs.sql`), and it is deliberately absent from
-    /// `runs::ENDED_RUN_STATUSES`.
+    /// The complement of the reaping table, derived rather than retyped, so the two are exhaustive
+    /// between them and neither can quietly stop covering a status.
+    ///
+    /// What must survive is everything `runs::ENDED_RUN_STATUSES` does not name, and spelling those
+    /// out here would be a third copy of the list the constant exists to be the only one of. So the
+    /// schema's vocabulary is filtered *by* the constant: `running` is a run still working;
+    /// `completed` is a run that finished normally and asked for this merge, which is why
+    /// `runs.rs`'s exit-code-zero status is deliberately absent from the constant; and
+    /// `awaiting_approval` is the trap one level deeper — the case a filter written as
+    /// `status != 'running'` would lose. That one keeps its own named test above as well, because it
+    /// is the first thing to fail if the reaper's predicate is ever inverted the wrong way, and a
+    /// canary is worth having by name.
     #[tokio::test]
-    async fn a_request_whose_run_completed_normally_is_not_reaped() {
-        let pool = test_pool().await;
-        insert_run(&pool, 7, "completed").await;
-        let id = queued_request_for_run(&pool, 7).await;
-
-        assert_eq!(
-            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
-            0
+    async fn a_request_whose_run_is_still_alive_is_not_reaped() {
+        let alive: Vec<&str> = EVERY_RUN_STATUS
+            .iter()
+            .copied()
+            .filter(|status| !crate::runs::ENDED_RUN_STATUSES.contains(status))
+            .collect();
+        assert!(
+            !alive.is_empty(),
+            "every status the schema names is now an ended one, so this test would pass by \
+             iterating nothing"
         );
-        assert_eq!(status_of(&pool, id).await, "queued");
+
+        for status in alive {
+            let pool = test_pool().await;
+            insert_run(&pool, 7, status).await;
+            let id = queued_request_for_run(&pool, 7).await;
+
+            assert_eq!(
+                reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+                0,
+                "a run at {status} has not ended, so its request must survive"
+            );
+            assert_eq!(
+                status_of(&pool, id).await,
+                "queued",
+                "a run at {status} has not ended, so its request must survive"
+            );
+        }
     }
 
     /// A cancelled request is terminal, so a caller waiting on one must be answered rather than held to
@@ -3072,10 +3188,26 @@ mod tests {
 
     /// Whitespace and control characters go the same way; surrounding whitespace is trimmed rather
     /// than rejected, because a model that sends " master" meant `master`.
+    ///
+    /// **The two loops are separate because one of the two rules had no coverage at all.** `"a b"`,
+    /// `"a\tb"` and `"a\nb"` are each whitespace *and* control-or-not, so the whitespace half of the
+    /// predicate catches all three — deleting `|| character.is_control()` left the whole suite
+    /// green. The second loop is chosen so it cannot: NUL, BEL, ESC, DEL and the file separator are
+    /// `is_control()` and are not `is_whitespace()`, which the guard inside the loop asserts rather
+    /// than assumes, so a Unicode table that ever disagreed would say so instead of quietly turning
+    /// this back into a duplicate of the first loop. `Branch`'s doc comment calls its four rules
+    /// "the whole list"; this is the third of them being held.
     #[test]
     fn a_branch_name_is_trimmed_and_then_must_be_one_word() {
         assert_eq!(Branch::new("  feature  ").unwrap().as_str(), "feature");
         for bad in ["a b", "a\tb", "a\nb"] {
+            assert!(Branch::new(bad).is_err(), "{bad:?} was accepted");
+        }
+        for bad in ["a\u{0}b", "a\u{7}b", "a\u{1b}b", "a\u{7f}b", "a\u{1c}b"] {
+            assert!(
+                !bad.chars().any(char::is_whitespace),
+                "{bad:?} must exercise the control-character rule, and this one is whitespace too"
+            );
             assert!(Branch::new(bad).is_err(), "{bad:?} was accepted");
         }
     }
