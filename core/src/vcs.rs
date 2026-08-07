@@ -32,17 +32,116 @@ use serde::{Deserialize, Serialize};
 ///    accident rather than design: a dashed string can set an option but cannot also name a commit,
 ///    HEAD in the integration worktree is always detached so `merge`'s upstream fallback dies, and
 ///    `update-ref` rejects a dashed ref name. A variant with a different argv shape does not inherit
-///    any of that.
+///    any of that. `Branch` is that accident turned into a rule for the two fields `Merge` has; a
+///    variant carrying a name of some other kind owes its own type.
+/// 3. The operation names in `from_request` are matched as `&str`, so adding a variant here does NOT
+///    fail to compile there. Whoever adds one must also take its name out of the "not yet" arm by
+///    hand, or the queue will go on refusing an operation it has learned to perform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    Merge { source: String, target: String },
+    Merge { source: Branch, target: Branch },
+}
+
+/// A branch name the daemon is willing to put on a git command line.
+///
+/// A newtype rather than a validating constructor on `Op`, because the validation has to hold on
+/// every route into the queue and there are three: the flat parameters an MCP tool call carries, a
+/// raw `POST /vcs/requests` body that deserializes an `Op` directly (`http.rs`), and `Op::from_stored`
+/// reading a row back. A `Deserialize` that validates covers all three; a checked constructor covers
+/// the first only, which is how `{"op":"merge","source":"--upload-pack=x"}` would have got through.
+///
+/// The leading-dash rule is the load-bearing one. `Op`'s own doc comment records that `Merge`'s
+/// arguments survive today by accident — a dashed string can set an option but cannot also name a
+/// commit, and the integration worktree's HEAD is always detached so `merge`'s upstream fallback
+/// dies. This is that accident replaced by a rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Branch(String);
+
+impl Branch {
+    pub fn new(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("a branch name may not be empty".to_owned());
+        }
+        if value.starts_with('-') {
+            return Err(format!("a branch name may not start with '-': {value}"));
+        }
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(format!("a branch name may not contain whitespace: {value}"));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Branch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Branch::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Tests build branches from literals everywhere. Panicking is right for a literal a developer
+/// wrote; production has only the fallible path, and this impl does not exist there.
+#[cfg(test)]
+impl From<&str> for Branch {
+    fn from(value: &str) -> Self {
+        Branch::new(value).expect("a test used an invalid branch name literal")
+    }
+}
+
+/// PURE: a caller-supplied branch name for one named role, or why it is not usable as one.
+fn named_branch(value: Option<&str>, which: &str) -> Result<Branch, String> {
+    let Some(value) = value else {
+        return Err(format!("a merge needs a {which} branch"));
+    };
+    Branch::new(value).map_err(|reason| format!("{which}: {reason}"))
 }
 
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::Merge { .. } => "merge",
+        }
+    }
+
+    /// Builds an operation from the flat parameters a tool call carries.
+    ///
+    /// Flat rather than the tagged union `Op` serialises to, because the caller on the other side is
+    /// a language model reading a tool description: the union is the right wire shape and the wrong
+    /// prompt. It is a convenience over `Branch`, not a boundary — the boundary is the type.
+    ///
+    /// Every rejection names what is wrong, and the rejection for an operation the SPEC lists but
+    /// the executor cannot perform yet is deliberately different from the one for a word that is not
+    /// an operation at all. A caller told "unknown operation: push" would go looking for a typo in
+    /// its own request; a caller told "push is not queued yet" knows to wait or do something else.
+    // Called by the tests below, and by Chunk 4's MCP tool — the flat shape exists for that caller
+    // and has no production one yet. Same waiver, and the same reason, as `Origin::Shell` above.
+    #[allow(dead_code)]
+    pub fn from_request(
+        operation: &str,
+        source: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<Self, String> {
+        match operation.trim().to_ascii_lowercase().as_str() {
+            "merge" => Ok(Op::Merge {
+                source: named_branch(source, "source")?,
+                target: named_branch(target, "target")?,
+            }),
+            other @ ("rebase" | "push" | "pull" | "fetch" | "tag" | "branch-delete"
+            | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
+                "{other} is not yet queued by this daemon — merge is the only operation the queue \
+                 can execute today"
+            )),
+            other => Err(format!(
+                "unknown operation: {other} — the queue understands merge"
+            )),
         }
     }
 
@@ -2584,5 +2683,93 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(summaries, vec![format!("vcs request {id} blocked")]);
+    }
+
+    /// A branch name that could be read as an option must not exist, let alone reach argv.
+    #[test]
+    fn a_branch_name_cannot_be_an_option() {
+        for bad in ["-f", "--no-verify", "--upload-pack=x", "--", "", "  "] {
+            assert!(
+                Branch::new(bad).is_err(),
+                "{bad:?} was accepted as a branch name"
+            );
+        }
+    }
+
+    /// Whitespace and control characters go the same way; surrounding whitespace is trimmed rather
+    /// than rejected, because a model that sends " master" meant `master`.
+    #[test]
+    fn a_branch_name_is_trimmed_and_then_must_be_one_word() {
+        assert_eq!(Branch::new("  feature  ").unwrap().as_str(), "feature");
+        for bad in ["a b", "a\tb", "a\nb"] {
+            assert!(Branch::new(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// The route the flat builder does NOT cover, and the reason validation lives in the type rather
+    /// than in a constructor: `http.rs` deserializes an `Op` straight from the request body.
+    #[test]
+    fn a_dashed_branch_cannot_arrive_as_json_either() {
+        let raw = r#"{"op":"merge","source":"--upload-pack=touch x","target":"master"}"#;
+
+        assert!(serde_json::from_str::<Op>(raw).is_err());
+    }
+
+    /// A stored row is not trusted either: `from_stored` parses the same JSON.
+    #[test]
+    fn a_hand_edited_row_with_a_dashed_branch_will_not_parse() {
+        assert!(
+            Op::from_stored("merge", r#"{"op":"merge","source":"-f","target":"master"}"#).is_err()
+        );
+    }
+
+    /// A valid operation still round-trips through the column-plus-payload storage `from_stored`
+    /// reads.
+    #[test]
+    fn a_valid_operation_still_round_trips_through_storage() {
+        let op = Op::Merge {
+            source: "feat/x".into(),
+            target: "master".into(),
+        };
+
+        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
+    }
+
+    /// The door's whole vocabulary, stated as a table.
+    #[test]
+    fn the_queue_speaks_merge_and_says_so_about_everything_else() {
+        assert_eq!(
+            Op::from_request("merge", Some("feature"), Some("master")).unwrap(),
+            Op::Merge {
+                source: "feature".into(),
+                target: "master".into()
+            }
+        );
+
+        // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
+        // missing — "unknown operation: push" would send a caller looking for a typo.
+        let error = Op::from_request("push", Some("origin"), Some("master")).unwrap_err();
+        assert!(error.contains("not yet"), "unexpected error: {error}");
+        assert!(
+            error.contains("merge"),
+            "the error must name what the queue CAN do: {error}"
+        );
+
+        assert!(
+            Op::from_request("frobnicate", None, None)
+                .unwrap_err()
+                .contains("frobnicate")
+        );
+        assert!(
+            Op::from_request("merge", Some("feature"), None)
+                .unwrap_err()
+                .contains("target")
+        );
+        assert!(
+            Op::from_request("merge", None, Some("master"))
+                .unwrap_err()
+                .contains("source")
+        );
+        assert!(Op::from_request(" Merge ", Some("feature"), Some("master")).is_ok());
     }
 }

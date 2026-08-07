@@ -3050,6 +3050,111 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The sibling of the 404 above, and the other half of what keeps a caller from pointing the
+    /// daemon's git somewhere it should not go: the project IS registered, and the root recorded for
+    /// it is an ordinary directory rather than a repository.
+    ///
+    /// 422 rather than 404 or 500 because the caller did nothing wrong and the daemon is working —
+    /// what is unusable is the state the request would be acted on. Nothing exercised that arm
+    /// before this: `resolve_repo`'s two failures are told apart precisely so this layer can answer
+    /// them differently, and an arm nothing reads could have been collapsed into the 404 unnoticed.
+    #[tokio::test]
+    async fn a_vcs_request_for_a_project_whose_root_is_not_a_repository_is_refused() {
+        let (state, dir) = file_test_state().await;
+        // A directory that exists and is not a repository, and — because it lives under the system
+        // temp directory rather than under this checkout — is not INSIDE one either. Both refusals
+        // are `NotARepository`; this is the plainer of the two.
+        let not_a_repository = dir.path().join("not-a-repository");
+        std::fs::create_dir_all(&not_a_repository).expect("a directory that is not a repository");
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(not_a_repository.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"alpha","operation":{"op":"merge","source":"feat/x","target":"master"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A branch name that could be read as a git option cannot get in through the raw body either —
+    /// which is the route a validating constructor would have missed, because this handler
+    /// deserializes a `vcs::Op` straight out of the JSON.
+    ///
+    /// The project is registered and its root is a real repository, so the ONLY thing standing
+    /// between this body and a queued row is `Branch`. Both halves are asserted, and the second is
+    /// the one that matters: a status code alone cannot tell "refused" from "queued and never
+    /// executed", and the second is what a caller would eventually find had merged.
+    ///
+    /// NOTE, recorded rather than fixed: axum answers a `Json` extractor rejection with **422**, the
+    /// same status the arm above gives `NotARepository`, so a client cannot tell a malformed body
+    /// from a project whose root is not a repository. That is a wart and not a defect — both mean
+    /// "the request cannot be acted on" — and changing either is a wire-contract decision, which is
+    /// not worth making while no client branches on the difference.
+    #[tokio::test]
+    async fn a_dashed_branch_in_the_request_body_is_refused_and_queues_nothing() {
+        let (state, _dir) = file_test_state().await;
+        let (_container, repo) =
+            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-dashed-");
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let pool = state.pool.clone();
+
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"alpha","operation":{"op":"merge","source":"--upload-pack=x","target":"master"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "a branch name that is an option must not be accepted: {}",
+            response.status()
+        );
+
+        assert!(
+            vcs::list(&pool, None).await.unwrap().is_empty(),
+            "the request was refused, so there must be no row for anything to execute later"
+        );
+    }
+
     async fn backup_request(
         state: AppState,
         method: &str,

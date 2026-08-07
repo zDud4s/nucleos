@@ -868,8 +868,11 @@ impl crate::vcs::VcsExecutor for GitExecutor {
         // repository, and reports success having done nothing.
         match &request.op {
             crate::vcs::Op::Merge { source, target } => {
-                match compute_merge(project_root, source, target, deadline).await {
-                    Ok(computed) => publish(project_root, target, computed, deadline).await,
+                match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
+                {
+                    Ok(computed) => {
+                        publish(project_root, target.as_str(), computed, deadline).await
+                    }
                     // Computing failed, which IS how this request ended.
                     Err(outcome) => outcome,
                 }
@@ -2038,8 +2041,8 @@ pub(crate) mod tests {
             .execute(&crate::vcs::ClaimedRequest {
                 id: 1,
                 op: crate::vcs::Op::Merge {
-                    source: "feat/x".to_owned(),
-                    target: "master".to_owned(),
+                    source: "feat/x".into(),
+                    target: "master".into(),
                 },
                 project_id: "alpha".to_owned(),
                 project_root: project_root.to_string_lossy().into_owned(),
