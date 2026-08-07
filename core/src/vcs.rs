@@ -595,10 +595,10 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
 /// exactly this back as its HTTP response body, whether the queue answered inside the deadline or
 /// not.
 ///
-/// `status` is the same string the `status` column holds rather than an enum: `rejected` and
-/// `cancelled` are already in that column's CHECK constraint even though nothing in this module
-/// writes them yet, and a `Ticket` round-trips whichever one a row holds without this module
-/// needing to know what it means.
+/// `status` is the same string the `status` column holds rather than an enum: `rejected` is in that
+/// column's CHECK constraint even though nothing in this module writes it yet — `cancelled` was too
+/// until `cancel_for_run` arrived — and a `Ticket` round-trips whichever one a row holds without this
+/// module needing to know what it means.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticket {
     pub id: i64,
@@ -708,10 +708,13 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// caller a hard timeout: it gets a ticket back instead and decides for itself whether to keep
 /// waiting.
 ///
-/// Terminal means `succeeded`, `failed`, `blocked`, or `interrupted` — the four statuses `finish`
-/// and `reconcile_interrupted` actually write today, matching the vocabulary those two already use
-/// (see `finish`'s own doc comment, and the interrupted-is-terminal test above). `blocked` is as
-/// terminal as the other three: the queue never retries it, so a caller held to the deadline would
+/// Terminal means `succeeded`, `failed`, `blocked`, `interrupted`, or `cancelled` — the five statuses
+/// `finish`, `reconcile_interrupted` and `cancel_for_run` actually write today, matching the
+/// vocabulary those three already use (see `finish`'s own doc comment, and the
+/// interrupted-is-terminal test above). `cancelled` is the one this list gained last: the run that
+/// asked for the request ended before it started, so the row can no longer change and a caller
+/// waiting on it must be told now rather than at the deadline. `blocked` is as
+/// terminal as the other four: the queue never retries it, so a caller held to the deadline would
 /// be waiting on a row that can no longer change — and it is the outcome that most needs a human to
 /// see it promptly. `queued`, `running` and `awaiting_approval` are treated identically: all three
 /// can still change, so none of them ends the wait early, and if the deadline passes while a row is
@@ -754,7 +757,7 @@ pub async fn wait_for(
 
         let terminal = matches!(
             status.as_str(),
-            "succeeded" | "failed" | "blocked" | "interrupted"
+            "succeeded" | "failed" | "blocked" | "interrupted" | "cancelled"
         );
         if terminal || started.elapsed() >= deadline {
             return Ok(Ticket {
@@ -807,6 +810,55 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
         .await;
     }
     Ok(reconciled.len() as u64)
+}
+
+/// Cancels every request run `run_id` asked for that has not started, and returns how many.
+///
+/// **`running` is deliberately excluded.** Spec §7: an operation already in flight finishes. A merge
+/// abandoned half-way is worse than one nobody is waiting for any more, and the queue could not stop
+/// it in any case — the git it spawned belongs to the daemon, not to the run whose context ran out.
+/// What this reclaims is the place a dead run would otherwise hold in the FIFO.
+///
+/// `awaiting_approval` is swept alongside `queued`, and that is the arm that matters most: a request
+/// nobody has approved yet, belonging to a run that no longer exists, would otherwise sit there until
+/// a human approved work for an agent that is gone.
+///
+/// **Why this cannot race the claim**, which is worth writing down because it is conditional on
+/// something a future edit could break: `claim_next` opens a transaction whose FIRST statement is its
+/// conditional UPDATE, so it takes SQLite's single write lock outright. Either the claim commits
+/// first — the row is `running`, and the filter below excludes it — or this commits first and the
+/// claim's subquery finds no `queued` row. There is no window in which a row goes `cancelled` while
+/// git is running against it. And even if there were, `finish` is scoped to `status = 'running'`, so
+/// a lost race lands in `drain_once`'s existing warn arm rather than overwriting a terminal status.
+///
+/// The feed write is best-effort per row, this crate's convention for observational writes: a feed
+/// row that cannot be written must not undo the cancellation it is only reporting on.
+pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<u64> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let cancelled: Vec<(i64, String)> = sqlx::query_as(
+        "UPDATE vcs_requests
+            SET status = 'cancelled', finished_at = ?,
+                failure_reason = 'the run that asked for this ended before it started'
+          WHERE run_id = ? AND status IN ('queued', 'awaiting_approval')
+         RETURNING id, project_id",
+    )
+    .bind(finished_at)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+
+    for (id, project_id) in &cancelled {
+        let _ = crate::feed::append(
+            pool,
+            Some(project_id.as_str()),
+            "vcs_request_cancelled",
+            &format!("vcs request {id} cancelled with run {run_id}"),
+            Some(run_id),
+        )
+        .await;
+    }
+
+    Ok(cancelled.len() as u64)
 }
 
 /// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
@@ -2505,6 +2557,84 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "blocked is terminal: the wait must not run to its deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_cancels_the_requests_it_had_not_started() {
+        let pool = test_pool().await;
+        let queued = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+
+        assert_eq!(cancel_for_run(&pool, 7).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, queued).await, "cancelled");
+    }
+
+    /// Spec §7 is explicit: an operation already in flight finishes. The queue could not stop it in any
+    /// case — the git it spawned belongs to the daemon, not to the run whose context ran out.
+    #[tokio::test]
+    async fn cancelling_a_run_does_not_touch_an_operation_already_in_flight() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        // Approved, then claimed — the shape Chunk 4 will produce.
+        sqlx::query("UPDATE vcs_requests SET status = 'queued' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap().unwrap();
+
+        assert_eq!(cancel_for_run(&pool, 7).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, id).await, "running");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_leaves_another_runs_requests_alone() {
+        let pool = test_pool().await;
+        let mine = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        let theirs = submit(&pool, &repo(), &merge_op(), Origin::Run(8))
+            .await
+            .unwrap();
+
+        cancel_for_run(&pool, 7).await.unwrap();
+
+        assert_eq!(status_of(&pool, mine).await, "cancelled");
+        assert_eq!(status_of(&pool, theirs).await, "awaiting_approval");
+    }
+
+    /// A human's request is not a run's request, even when a run is what happens to be ending.
+    #[tokio::test]
+    async fn a_humans_request_survives_a_run_ending() {
+        let pool = test_pool().await;
+        let human = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        cancel_for_run(&pool, 7).await.unwrap();
+
+        assert_eq!(status_of(&pool, human).await, "queued");
+    }
+
+    /// A cancelled request is terminal, so a caller waiting on one must be answered rather than held to
+    /// the deadline. This is the argument `a_blocked_request_ends_the_wait_rather_than_running_it_out`
+    /// already makes for `blocked`, and it becomes true for `cancelled` in this task.
+    #[tokio::test]
+    async fn a_cancelled_request_ends_the_wait_rather_than_running_it_out() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        cancel_for_run(&pool, 7).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let ticket = wait_for(&pool, id, Duration::from_secs(5)).await.unwrap();
+
+        assert_eq!(ticket.status, "cancelled");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     /// A caller waiting on an id nothing ever inserted must not spend the deadline finding that

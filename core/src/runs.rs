@@ -1183,6 +1183,27 @@ fn spawn_run(
                     .await;
                     warn_on_terminal_write_err(&timed_out, id, "timed_out");
                     if matches!(&timed_out, Ok(result) if result.rows_affected() == 1) {
+                        // The run is over; anything it queued and never started goes with it (spec
+                        // §7). A run its wall clock killed is that spec's "the agent that submitted
+                        // dies" as much as one a human cancelled — it will never come back to
+                        // collect the merge — and nothing routes this path through
+                        // `finalize_termination`, so the sweep is called here directly.
+                        //
+                        // Inside the won-the-race guard, for the reason the launch-failure feed row
+                        // above states and one more that is specific to this: a lost race means
+                        // another terminator already chose the status, and one of those —
+                        // `pause_for_approval`'s `awaiting_approval` — is a run that RESUMES.
+                        // Sweeping for it would cancel the very merge it paused to have approved.
+                        //
+                        // Best-effort, because the run IS terminated either way and a queue row that
+                        // outlives its run is a stale request a human can cancel, not a broken run.
+                        if let Err(error) = crate::vcs::cancel_for_run(&pool, id).await {
+                            tracing::warn!(
+                                run_id = id,
+                                %error,
+                                "could not cancel the timed-out run's queued vcs requests"
+                            );
+                        }
                         Box::pin(spawn_handoff_if_needed(
                             handoff_state.clone(),
                             runner.clone(),
@@ -1772,6 +1793,21 @@ pub async fn get_run(
     Ok(Json(run))
 }
 
+/// PURE: whether a run status means the run is over for good.
+///
+/// `finalize_termination` is called with three distinct statuses by five callers, and one of them —
+/// `hooks.rs`'s `pause_for_approval` — passes `awaiting_approval` for a run that is *pausing so a
+/// human can approve something*. That run resumes. Treating it as ended would cancel the merge it
+/// asked for, and the human would then approve a request that no longer exists.
+///
+/// `interrupted` and `timed_out` never arrive through `finalize_termination` — both are written by
+/// direct UPDATEs — so listing them here is about the predicate being true rather than about that
+/// call site: `timed_out` has its own call in `spawn_run`'s wall-clock arm, and `interrupted` is
+/// inert today and would be obviously right if startup recovery ever routed through here.
+fn ends_the_run(status: &str) -> bool {
+    matches!(status, "cancelled" | "failed" | "interrupted" | "timed_out")
+}
+
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
@@ -1801,6 +1837,15 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             .execute(&state.pool)
             .await;
             warn_on_terminal_write_err(&result, id, status);
+            // The run is over; anything it queued and never started goes with it (spec §7). After
+            // the status write, because this is a consequence of the run ending — and best-effort,
+            // because the run IS terminated either way and a queue row that outlives its run is a
+            // stale request a human can cancel, not a broken run.
+            if ends_the_run(status)
+                && let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await
+            {
+                tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+            }
             true
         }
         None => false,
@@ -3778,6 +3823,60 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         assert_eq!(exit_code, Some(0));
     }
 
+    /// A run pausing for approval is not a run that ended, and the queue must not treat it as one.
+    #[test]
+    fn a_pause_for_approval_does_not_end_the_run() {
+        assert!(!ends_the_run("awaiting_approval"));
+
+        assert!(ends_the_run("cancelled"));
+        assert!(ends_the_run("failed"));
+        assert!(ends_the_run("interrupted"));
+        assert!(ends_the_run("timed_out"));
+    }
+
+    /// Spec §7's first half, end to end rather than through `cancel_for_run`: a unit test of the
+    /// predicate cannot see a wrong argument at the call site, and the call site is what this adds.
+    /// A live registration is what makes `finalize_termination` take its `Some(h)` arm at all.
+    #[tokio::test]
+    async fn a_cancelled_run_loses_the_merge_it_had_not_started() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let request = crate::vcs::submit(
+            &state.pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj-1", "C:/repo", "proj-1"),
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Run(id),
+        )
+        .await
+        .unwrap();
+
+        spawn_registered(&state, id, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(request)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "cancelled",
+            "a merge nobody is left to collect must not stay in the queue"
+        );
+    }
+
     /// The same race from the other side. `abort()` only takes effect where the future is dropped,
     /// so a cancel that wins the status write can be followed by the run body waking up one last
     /// time and running its completion write — turning a run whose CLI was killed mid-flight into a
@@ -4412,6 +4511,80 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         assert!(
             events < 4,
             "the run should have been cut short, but all {events} events arrived"
+        );
+    }
+
+    /// The other half of spec §7's "the agent that submitted dies", and the one nothing routes
+    /// through `finalize_termination`: a run its wall clock killed is as gone as one a human
+    /// cancelled, and it will never come back to collect the merge it asked for.
+    ///
+    /// Four events 200ms apart against a 600ms wall clock, rather than this file's usual tighter
+    /// numbers, because the request has to be submitted while the run is still alive — the assert
+    /// on `running` below is what turns a lost race into a legible failure instead of a confusing
+    /// `awaiting_approval`.
+    #[tokio::test]
+    async fn a_run_the_wall_clock_kills_loses_the_merge_it_had_queued() {
+        let (mut state, runner) =
+            test_state_with_runner(Some(Duration::from_millis(200)), Duration::from_millis(600))
+                .await;
+        state.progress_timeout = Duration::from_secs(30);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"system","subtype":"init"}"#,
+                r#"{"type":"assistant"}"#,
+                r#"{"type":"user"}"#,
+                r#"{"type":"result"}"#,
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.05),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "a run the wall clock will cut short").await;
+
+        let request = crate::vcs::submit(
+            &pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj-1", "C:/repo", "proj-1"),
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Run(created.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_run_status(&app, created.id).await.status,
+            "running",
+            "the request must be queued while the run is still alive, or this proves nothing"
+        );
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = get_run_status(&app, created.id).await.status;
+            if status == "timed_out" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, "timed_out", "the wall clock must terminate this run");
+
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            request_status, "cancelled",
+            "a run killed by its wall clock leaves nobody to collect the merge it queued"
         );
     }
 
