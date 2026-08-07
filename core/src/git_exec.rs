@@ -1744,6 +1744,124 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The founding scenario of the whole pillar, end to end: somebody is standing on the target
+    /// branch in a worktree of their own, and the queue lands the merge underneath them — HEAD, the
+    /// index and the files together — without their working copy ever telling a lie about it.**
+    ///
+    /// Nothing else in this module covers it, and the gap is not obvious from the names. The test
+    /// above holds `master` in the MAIN checkout, so it never stands up a linked worktree at all;
+    /// the only two tests that do — `a_refusal_the_user_cannot_fix_by_committing_is_not_reported_as_blocked`
+    /// and `a_holder_worktree_whose_git_file_is_gone_is_refused_rather_than_blamed_on_the_user` —
+    /// hand the publish a deliberately BROKEN holder, because their subject is the guards that
+    /// refuse one. Every piece of the composition was tested; that the pieces fit was not.
+    ///
+    /// So this runs through `GitExecutor::execute` with a `ClaimedRequest`, the way the daemon does,
+    /// rather than calling `publish` directly. Entering below the executor would skip everything
+    /// that decides WHICH publish runs — `project_root`'s guard, `compute_merge`'s detached HEAD,
+    /// and `worktree_holding`'s answer — and the composition is the whole point.
+    ///
+    /// **`status --porcelain` is the assertion that carries this test**, and it is not a tidiness
+    /// check. Moving the ref out from under a holder — what the compare-and-swap route would do
+    /// here — leaves HEAD at the new commit while the index and the files stay at the old one, and
+    /// `git status` in that worktree then reports the merge BACKWARDS: every file the merge brought
+    /// in shows as a staged deletion, waiting for a human to "restore" it. Neither sha assertion can
+    /// see that state, because the ref really did move. Spec §6.1 exists to prevent exactly it.
+    #[tokio::test]
+    async fn a_merge_into_a_branch_somebody_has_open_moves_their_whole_worktree() {
+        use crate::vcs::VcsExecutor;
+
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-holderff-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // The holder: somebody's own linked worktree with `release` checked out and a clean working
+        // copy. `release` rather than `master`, because `master` is held by the main checkout and a
+        // LINKED worktree is precisely what the test above cannot reach. Placed beside the
+        // repository rather than under `NUCLEOS_WORKTREE_ROOT`: this worktree belongs to the user,
+        // and that root is where the daemon's own directories go.
+        let holder = container.path().join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("release"),
+                holder.as_os_str()
+            ]
+        ));
+        let before = sha_of(&repo, "release");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Merge {
+                    source: "feat/x".into(),
+                    target: "release".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        let sha = match outcome {
+            Outcome::Succeeded { sha, .. } => sha,
+            other => panic!("expected a published merge, got {other:?}"),
+        };
+        // The sha the row reports IS the merge commit, established from its parents rather than by
+        // taking the row's word for it: first parent the old target, second the source.
+        assert_eq!(
+            sha_of(&repo, &format!("{sha}^1")),
+            before,
+            "the reported sha is a merge whose first parent is where `release` was"
+        );
+        assert_eq!(
+            sha_of(&repo, &format!("{sha}^2")),
+            sha_of(&repo, "feat/x"),
+            "and whose second parent is what was merged in"
+        );
+
+        assert_eq!(
+            sha_of(&repo, "refs/heads/release"),
+            sha,
+            "the target branch ref moved"
+        );
+        // Stated because the property is "the holder moved", and kept knowing what it can and cannot
+        // catch: the holder's `HEAD` is a SYMREF to `refs/heads/release`, so it follows the ref and
+        // cannot go red while the assertion above is green — the same trap the compare-and-swap test
+        // documents at `master`/`HEAD`. What it would catch is a publish that ever left the holder
+        // DETACHED rather than moving its branch. The two assertions below are the ones that see the
+        // difference between a ref that moved and a worktree that moved.
+        assert_eq!(
+            sha_of(&holder, "HEAD"),
+            sha,
+            "and the holder's HEAD is at it"
+        );
+
+        // **The one that separates "the ref moved" from "the user's worktree moved."**
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&holder)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git should start");
+        assert!(
+            status.stdout.is_empty(),
+            "the holder's index and files agree with its HEAD — a ref moved out from under it would show the merge backwards here; got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        // And the merge is on disk where the human will look for it. Byte-exact rather than merely
+        // present, which `initialize_repo`'s `core.autocrlf false` is what makes possible on Windows.
+        assert_eq!(
+            std::fs::read_to_string(holder.join("feature.txt"))
+                .expect("the file the merged branch introduced is in the holder's working copy"),
+            "from the branch\n",
+            "with the bytes the branch had"
+        );
+    }
+
     /// The whole design in one assertion. The user was in the middle of editing a file the merge
     /// touches; the merge does not happen to them, and their bytes are exactly where they left them.
     #[tokio::test]
