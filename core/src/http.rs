@@ -2180,10 +2180,15 @@ fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
 /// The one handler here that writes, and therefore the one that owes the cancellation question an
 /// answer.
 ///
-/// It awaits after inserting, so a client disconnecting mid-call can drop the future once the row
-/// is committed. That is benign **today** and only today: what is left behind is a `queued` row that
-/// will still execute, appears in the listing, and holds no repository — the caller loses its reply,
-/// not its request. So `http::uncancellable` is not needed yet.
+/// It awaits on both sides of its one write, and the two sides fail differently. **Before** the
+/// insert it awaits git: `resolve_repo` runs a `rev-parse` under `git_exec::OPERATION_TIMEOUT`
+/// (300s), and a disconnect during it leaves nothing written at all — the safest of the outcomes
+/// here, and worth knowing for the other reason, that a pathological repository can hold this
+/// handler for five minutes rather than the moment an INSERT takes. **After** the insert it awaits
+/// the read that builds the ticket, so a client disconnecting there drops the future with the row
+/// already committed. That half is benign **today** and only today: what is left behind is a
+/// `queued` row that will still execute, appears in the listing, and holds no repository — the
+/// caller loses its reply, not its request. So `http::uncancellable` is not needed yet.
 ///
 /// It stops being benign the moment submitting becomes two writes — the row plus an approval
 /// proposal, which is what the approval chunk adds. A disconnect between them would leave a request

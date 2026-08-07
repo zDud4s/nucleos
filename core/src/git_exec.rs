@@ -55,13 +55,15 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git` and `add_worktree` are the only sanctioned production entries**, and a new caller belongs
-/// behind one of them rather than here: they are where whatever is left of the operation's budget is
-/// computed and an already-spent one is refused *before* a child is spawned, which `output()` would
-/// otherwise do eagerly. Tasks 4-7 add call sites; one that reaches past those two takes its
-/// `Duration` from somewhere else and quietly loses that gate. Naming them makes the gate greppable
-/// rather than conventional. The tests below call this directly on purpose — they are testing the
-/// transport itself.
+/// **`git`, `add_worktree` and `repo_key` are the only sanctioned production entries**, and a new
+/// caller belongs behind one of them rather than here: each is a place where whatever is left of the
+/// operation's budget is computed and an already-spent one is refused *before* a child is spawned,
+/// which `output()` would otherwise do eagerly. `repo_key` is the third, and it is on the list
+/// because it passes that same test rather than because it arrived later — it computes its own
+/// remaining budget and returns without spawning when there is none. A caller that reaches past the
+/// three takes its `Duration` from somewhere else and quietly loses that gate. Naming them makes the
+/// gate greppable rather than conventional. The tests below call this directly on purpose — they are
+/// testing the transport itself.
 ///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
 /// `TailBuffer`. That is not an oversight: a gate runs a test suite, which can print without bound
@@ -692,6 +694,14 @@ async fn publish_by_fast_forward(
     // checkout, whose `.git` is a DIRECTORY. `is_file()` here would reject the ordinary case on
     // every merge — `a_branch_somebody_has_open_is_fast_forwarded_in_place` is what goes red if
     // somebody ever "fixes" this into agreeing with the other one.
+    //
+    // **Both holder tests are needed and neither subsumes the other**, which is worth saying before
+    // somebody consolidates them on the grounds that they look alike. Only the one named above can
+    // catch that tightening: its holder is the MAIN checkout, so its `.git` is a directory and
+    // `is_file()` turns it red. `a_merge_into_a_branch_somebody_has_open_moves_their_whole_worktree`
+    // holds the branch in a LINKED worktree, whose `.git` is a file — it would sail through the same
+    // change untouched, which is precisely why its subject is the composition end to end and not
+    // this guard.
     if tokio::fs::metadata(worktree.join(".git")).await.is_err() {
         return Outcome::Failed {
             reason: format!(
@@ -842,9 +852,15 @@ impl crate::vcs::VcsExecutor for GitExecutor {
         // merge computed, the enclosing repository's `master` moved, and the row came back
         // `Succeeded` naming a sha from a repository nobody named.
         //
-        // Nothing constructs a `SubmitRequest` in production yet, so this is not reachable today.
-        // Resolving a project from an agent's cwd is what opens it, and there a stale root or a cwd
-        // one level off the project is enough.
+        // **A backstop now, and no longer the first line of defence.** `vcs::resolve_repo` puts the
+        // root through `repo_key` before a row can be inserted at all, and that check is strictly
+        // stronger than this one: it requires the root to BE the repository's top level, where this
+        // only requires it to contain a `.git`. What is left for this guard is the window between
+        // the two — a root that stopped being a repository between submitting and running, which a
+        // request queued behind two slow merges has plenty of time to do — and any future caller
+        // that reaches `execute` without having gone through `resolve_repo`. Both are real, and
+        // naming them is the point: a guard nobody can say what it still catches is a guard somebody
+        // eventually deletes.
         //
         // **Existence, not `is_file()`** — a project root is a main checkout, whose `.git` is a
         // DIRECTORY. `publish_by_fast_forward`'s guard states that distinction at length and this is

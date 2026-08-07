@@ -55,6 +55,17 @@ pub enum Op {
 /// arguments survive today by accident — a dashed string can set an option but cannot also name a
 /// commit, and the integration worktree's HEAD is always detached so `merge`'s upstream fallback
 /// dies. This is that accident replaced by a rule.
+///
+/// **This is an argv guard and not a ref validator, and the difference has to be said out loud
+/// because the name does not say it.** Empty, a leading `-`, whitespace, control characters — that
+/// is the whole list. `feat/x;rm -rf`, `..`, `@{u}`, `HEAD`, a name carrying `~ ^ : ? * [`, a name
+/// ending in `.lock`: every one of them passes here, and `git check-ref-format` rejects several. That
+/// is fine, and it is fine for a reason rather than by luck. `git_exec::run_git` builds an argv and
+/// spawns it with no shell anywhere in the path, so a `;` is not a separator — it is one more
+/// character in a ref name, git looks for a branch spelled that way, finds none, and the row records
+/// what it said. Git stays the authority on which names resolve; this type only decides which ones
+/// may be handed to it. Whoever wants the other guarantee wants `git check-ref-format --branch` or a
+/// character allowlist, and owes it its own check rather than a quiet widening of this one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Branch(String);
 
@@ -169,7 +180,19 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Human,
-    // Constructed by Chunk 3, when the MCP tools give an external session its own provenance.
+    // **Nothing maps to this, and that is a decision rather than an omission.** `http.rs`'s
+    // `vcs_origin` argues the whole case: in this repo "shell" means the Tauri desktop app, which
+    // holds the *control* token and therefore already arrives as `Human`, and an admin API token is
+    // deliberately NOT recorded as `shell` because that would name the one client that did not make
+    // the call. An arm here would need a scope that means something no scope means today — a
+    // credential belonging to an external session in its own right, distinct from both the desktop
+    // app's control token and a run's.
+    //
+    // It survives anyway, because the schema outranks the mapping: the `origin` column's CHECK
+    // constraint accepts `'shell'`, and `Ticket` and `RequestSummary` hand a row's columns back
+    // verbatim rather than parsing them, so such a row can exist and be listed whether or not this
+    // variant does. Deleting it would leave the one enum that is meant to be the authority on that
+    // column unable to name a value the column permits, which is the wrong way round.
     #[allow(dead_code)]
     Shell,
     Run(i64),
@@ -1066,10 +1089,18 @@ pub async fn drain_once(
         // won a race rather than what this operation did.
         //
         // `None` for `run_id`: `ClaimedRequest` does not carry one and `claim_next` does not return
-        // one, and widening its `RETURNING` to supply it would buy nothing today. A `run` request
-        // starts `awaiting_approval` and nothing moves it to `queued` until Chunk 4 wires
-        // `proposals.rs`, so every claimable request in this chunk is `Human` or `Shell` and that
-        // column is NULL regardless. Chunk 4 is where threading it earns its keep.
+        // one, and widening its `RETURNING` to supply it would buy nothing today.
+        //
+        // **What that rests on is the approval transition not existing yet, and nothing weaker than
+        // that.** Rows carrying a `run_id` are ordinary now — `hooks.rs` submits as `Origin::Run`,
+        // and `reap_requests_of_ended_runs` a few functions up writes feed rows that attach one — so
+        // the premise is not "no request in play has a run". It is that a `Run` request starts
+        // `awaiting_approval` and nothing moves it to `queued` until Chunk 4 wires `proposals.rs`,
+        // so nothing carrying a `run_id` is claimable, and this column is NULL for everything that
+        // reaches here. The day that transition lands, this line stops being true and nothing breaks:
+        // a merge a run asked for appears in the feed with no run attached, which costs the person
+        // reading it the link back and costs the queue nothing. Chunk 4 is where threading it earns
+        // its keep.
         // (`reconcile_interrupted` does attach one, because it reads whole rows rather than a claim.)
         Ok(()) => {
             let _ = crate::feed::append(
