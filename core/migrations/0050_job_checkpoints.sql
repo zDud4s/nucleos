@@ -1,0 +1,14 @@
+-- The commit a job's item was measured green at, so the item after it has somewhere to fall back to.
+--
+-- NULLABLE, and the nullability is the information rather than an omission: an item with no
+-- checkpoint is an item no gate has passed yet, and its fallback is `jobs.head_sha`, written at
+-- creation by migration 0042. Between the two there is NO CASE WITHOUT A FOOTING, which is the
+-- invariant every revert in `job.rs` and `hooks.rs` leans on — a revert that cannot name a commit
+-- would have to choose between leaving a broken tree for the next item and stopping the job, and
+-- both are the failure this column exists to remove.
+--
+-- Written here rather than derived from `runs` because the two answer different questions. A run
+-- says which CLI invocation produced the work; this says which commit the tree was in when the gate
+-- last agreed with it. Nodes are re-run — an approval supersedes one and starts another — so an
+-- item can own several runs and exactly one green commit.
+ALTER TABLE job_items ADD COLUMN checkpoint_sha TEXT;

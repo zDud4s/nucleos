@@ -69,6 +69,59 @@ pub async fn create_action_approval(
     Ok(proposal_id)
 }
 
+/// A job put an item down because it asked for a decision, and this is the record of it.
+///
+/// The fourth `kind` this table carries, and the one that means the OPPOSITE of `action-approval`
+/// despite arriving through the same door in `hooks.rs`. An action approval is work stopped
+/// mid-stride, waiting to be let through; this is work that was never started, in a job that has
+/// already moved on. Nothing resumes when it is approved, which is why it is not `action-approval`
+/// with a flag: `approve` would have to mean two different things.
+///
+/// `tool_input` carries what the item was about to do when it asked, so a person reading this in the
+/// morning can tell an item worth picking up from one worth dropping. **Resuming from it is
+/// deliberately out of scope for v1** — the tree has moved under it by then, which is the same class
+/// of risk as a catch-up run and deserves the same deliberate decision, taken with a real case in
+/// hand rather than now.
+pub async fn create_skipped_item(
+    pool: &SqlitePool,
+    run_id: i64,
+    session_id: Option<&str>,
+    project_id: Option<&str>,
+    tool_name: &str,
+    reasoning: &str,
+    tool_input: Option<&str>,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('skipped-item', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(session_id)
+    .bind(project_id)
+    .bind(tool_name)
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
 pub async fn create_contact_merge(
     pool: &SqlitePool,
     keep_id: i64,
