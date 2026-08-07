@@ -1041,6 +1041,56 @@ mod tests {
         assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
     }
 
+    /// The trap in spec §7's cancellation sweep, made a test rather than a comment. `pause_for_approval`
+    /// drives the run through the same `finalize_termination` a cancel uses, but the run it produces
+    /// **resumes**: sweeping its queued requests would cancel the very merge it paused to have approved,
+    /// and the human would then approve a request that no longer exists.
+    ///
+    /// It has to be driven through the handler rather than asserted on the predicate, because a
+    /// predicate test cannot see a wrong argument at the call site — which is the only place this can
+    /// actually go wrong.
+    #[tokio::test]
+    async fn a_run_paused_for_approval_keeps_the_merge_it_asked_for() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "real", None, None, None).await;
+        let request = crate::vcs::submit(
+            &state.pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj-1", "C:/repo", "proj-1"),
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Run(run_id),
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(state.clone());
+        let body = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"git push origin main"}}}}"#
+        );
+        let decision = decide(&app, &body).await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            request_status, "awaiting_approval",
+            "the run resumes, so the merge it is pausing to have approved must still be there"
+        );
+    }
+
     #[tokio::test]
     async fn edit_to_autopilot_config_pends_approval_and_terminates_the_run() {
         let state = test_state().await;

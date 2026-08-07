@@ -2166,9 +2166,10 @@ async fn get_runs(
 ///
 /// Two fields the queue needs are deliberately NOT here, and their absence is the security posture:
 ///
-/// - **`project_root`** is resolved from `autopilot_state` via `resolve_project_root`. A caller that
-///   could name the repository root could point the daemon's git at any directory the daemon can
-///   reach, which is the same reason `inspect.rs` "never resolves a root itself".
+/// - **`project_root`** is resolved by `vcs::resolve_repo`, together with the key the queue locks
+///   on, and the two can no longer be set apart from each other. A caller that could name the
+///   repository root could point the daemon's git at any directory the daemon can reach, which is
+///   the same reason `inspect.rs` "never resolves a root itself".
 /// - **`origin`** comes from the bearer token's scope. `hooks.rs` states the rule this follows: a
 ///   value in the body is a claim the caller makes about itself, and here that claim decides whether
 ///   a human still has to approve the operation — precisely the thing a caller must not choose.
@@ -2214,10 +2215,15 @@ fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
 /// The one handler here that writes, and therefore the one that owes the cancellation question an
 /// answer.
 ///
-/// It awaits after inserting, so a client disconnecting mid-call can drop the future once the row
-/// is committed. That is benign **today** and only today: what is left behind is a `queued` row that
-/// will still execute, appears in the listing, and holds no repository — the caller loses its reply,
-/// not its request. So `http::uncancellable` is not needed yet.
+/// It awaits on both sides of its one write, and the two sides fail differently. **Before** the
+/// insert it awaits git: `resolve_repo` runs a `rev-parse` under `git_exec::OPERATION_TIMEOUT`
+/// (300s), and a disconnect during it leaves nothing written at all — the safest of the outcomes
+/// here, and worth knowing for the other reason, that a pathological repository can hold this
+/// handler for five minutes rather than the moment an INSERT takes. **After** the insert it awaits
+/// the read that builds the ticket, so a client disconnecting there drops the future with the row
+/// already committed. That half is benign **today** and only today: what is left behind is a
+/// `queued` row that will still execute, appears in the listing, and holds no repository — the
+/// caller loses its reply, not its request. So `http::uncancellable` is not needed yet.
 ///
 /// It stops being benign the moment submitting becomes two writes — the row plus an approval
 /// proposal, which is what the approval chunk adds. A disconnect between them would leave a request
@@ -2229,17 +2235,28 @@ async fn submit_vcs_request(
     Json(body): Json<VcsRequestBody>,
 ) -> Result<Json<vcs::Ticket>, StatusCode> {
     let origin = vcs_origin(&scope)?;
-    let project_root = resolve_project_root(&state, &body.project_id).await?;
-    let request = vcs::SubmitRequest {
-        op: body.operation,
-        project_id: body.project_id,
-        project_root: project_root.to_string_lossy().into_owned(),
-        origin,
-    };
-    let id = vcs::submit(&state.pool, &request).await.map_err(|error| {
-        tracing::warn!(%error, "submitting a vcs request failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let repo = vcs::resolve_repo(&state.pool, &body.project_id)
+        .await
+        .map_err(|error| match error {
+            vcs::ResolveError::UnknownProject => StatusCode::NOT_FOUND,
+            // The caller named a project that exists; what is wrong is the root this daemon has
+            // recorded for it. 422 rather than 400 or 500: the request was well-formed and the
+            // daemon is working, but the state it would act on is not a repository.
+            vcs::ResolveError::NotARepository(reason) => {
+                tracing::warn!(project_id = %body.project_id, %reason, "vcs: project root is not a repository");
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            vcs::ResolveError::Database(error) => {
+                tracing::warn!(%error, "vcs: could not resolve a project");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    let id = vcs::submit(&state.pool, &repo, &body.operation, origin)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "submitting a vcs request failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     // Answered with a zero deadline rather than a bare id: the caller gets the same shape back from
     // submitting as from asking later, so nothing has to special-case the first reply.
     vcs_ticket(&state, id, std::time::Duration::ZERO).await
@@ -3053,13 +3070,20 @@ mod tests {
     /// The `autopilot_state` row is not scene-setting: it is the whole reason the body carries no
     /// `project_root`. Without a registered project the submit is a 404, which is the behaviour that
     /// keeps a caller from naming a directory for the daemon's git to work in.
+    ///
+    /// And the root it names has to be a real repository, because `vcs::resolve_repo` asks git for
+    /// the key the queue locks on before anything is inserted — a directory that merely exists in
+    /// the row gets a 422 here rather than a ticket.
     #[tokio::test]
     async fn a_vcs_request_submitted_over_http_is_readable_as_a_ticket() {
         let (state, _dir) = file_test_state().await;
+        let (_container, repo) =
+            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-");
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
-             VALUES ('alpha', 'active', 'C:/repo')",
+             VALUES ('alpha', 'active', ?)",
         )
+        .bind(repo.to_string_lossy().into_owned())
         .execute(&state.pool)
         .await
         .unwrap();
@@ -3175,6 +3199,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The sibling of the 404 above, and the other half of what keeps a caller from pointing the
+    /// daemon's git somewhere it should not go: the project IS registered, and the root recorded for
+    /// it is an ordinary directory rather than a repository.
+    ///
+    /// 422 rather than 404 or 500 because the caller did nothing wrong and the daemon is working —
+    /// what is unusable is the state the request would be acted on. Nothing exercised that arm
+    /// before this: `resolve_repo`'s two failures are told apart precisely so this layer can answer
+    /// them differently, and an arm nothing reads could have been collapsed into the 404 unnoticed.
+    #[tokio::test]
+    async fn a_vcs_request_for_a_project_whose_root_is_not_a_repository_is_refused() {
+        let (state, dir) = file_test_state().await;
+        // A directory that exists and is not a repository, and — because it lives under the system
+        // temp directory rather than under this checkout — is not INSIDE one either. Both refusals
+        // are `NotARepository`; this is the plainer of the two.
+        let not_a_repository = dir.path().join("not-a-repository");
+        std::fs::create_dir_all(&not_a_repository).expect("a directory that is not a repository");
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(not_a_repository.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"alpha","operation":{"op":"merge","source":"feat/x","target":"master"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A branch name that could be read as a git option cannot get in through the raw body either —
+    /// which is the route a validating constructor would have missed, because this handler
+    /// deserializes a `vcs::Op` straight out of the JSON.
+    ///
+    /// The project is registered and its root is a real repository, so the ONLY thing standing
+    /// between this body and a queued row is `Branch`. Both halves are asserted, and the second is
+    /// the one that matters: a status code alone cannot tell "refused" from "queued and never
+    /// executed", and the second is what a caller would eventually find had merged.
+    ///
+    /// NOTE, recorded rather than fixed: axum answers a `Json` extractor rejection with **422**, the
+    /// same status the arm above gives `NotARepository`, so a client cannot tell a malformed body
+    /// from a project whose root is not a repository. That is a wart and not a defect — both mean
+    /// "the request cannot be acted on" — and changing either is a wire-contract decision, which is
+    /// not worth making while no client branches on the difference.
+    #[tokio::test]
+    async fn a_dashed_branch_in_the_request_body_is_refused_and_queues_nothing() {
+        let (state, _dir) = file_test_state().await;
+        let (_container, repo) =
+            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-dashed-");
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let pool = state.pool.clone();
+
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"alpha","operation":{"op":"merge","source":"--upload-pack=x","target":"master"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "a branch name that is an option must not be accepted: {}",
+            response.status()
+        );
+
+        assert!(
+            vcs::list(&pool, None).await.unwrap().is_empty(),
+            "the request was refused, so there must be no row for anything to execute later"
+        );
     }
 
     async fn backup_request(

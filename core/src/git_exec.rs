@@ -55,13 +55,15 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git` and `add_worktree` are the only sanctioned production entries**, and a new caller belongs
-/// behind one of them rather than here: they are where whatever is left of the operation's budget is
-/// computed and an already-spent one is refused *before* a child is spawned, which `output()` would
-/// otherwise do eagerly. Tasks 4-7 add call sites; one that reaches past those two takes its
-/// `Duration` from somewhere else and quietly loses that gate. Naming them makes the gate greppable
-/// rather than conventional. The tests below call this directly on purpose — they are testing the
-/// transport itself.
+/// **`git`, `add_worktree` and `repo_key` are the only sanctioned production entries**, and a new
+/// caller belongs behind one of them rather than here: each is a place where whatever is left of the
+/// operation's budget is computed and an already-spent one is refused *before* a child is spawned,
+/// which `output()` would otherwise do eagerly. `repo_key` is the third, and it is on the list
+/// because it passes that same test rather than because it arrived later — it computes its own
+/// remaining budget and returns without spawning when there is none. A caller that reaches past the
+/// three takes its `Duration` from somewhere else and quietly loses that gate. Naming them makes the
+/// gate greppable rather than conventional. The tests below call this directly on purpose — they are
+/// testing the transport itself.
 ///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
 /// `TailBuffer`. That is not an oversight: a gate runs a test suite, which can print without bound
@@ -291,6 +293,99 @@ fn remaining(deadline: std::time::Instant, what: &str) -> Result<Duration, Outco
         });
     }
     Ok(budget)
+}
+
+/// The canonical identity of the repository at `path`, for the queue to take its lock on.
+///
+/// `--git-common-dir` rather than `--git-dir`: a linked worktree's `--git-dir` is its own private
+/// `.git/worktrees/<name>`, so keying on it would give every worktree of one repository a key of its
+/// own, and the queue would run two merges against the same refs at once — the single thing it
+/// exists to prevent. `--git-common-dir` is one value for all of them.
+///
+/// **`--show-toplevel` is checked as well, and it is the guard rather than decoration.** `git -C
+/// <dir>` walks UP until it finds a repository, so `rev-parse` inside an ordinary subdirectory
+/// succeeds and answers about the enclosing one. Requiring the caller's own path to BE the top level
+/// turns "found a repository" into "found this repository".
+///
+/// **What that guard costs, stated because it is a restriction and not a free check:** the queue
+/// serves projects whose recorded root is the root of a working-tree repository. A project rooted at
+/// a package inside a monorepo is refused, and so is a bare repository — `--show-toplevel` exits 128
+/// there ("this operation must be run in a work tree"). Both are correct refusals today, because
+/// this module computes merges in a worktree it adds under that root; both are also the first thing
+/// to revisit if a project ever needs to be rooted deeper.
+///
+/// Both paths are canonicalised before being compared, and that comparison is where canonicalisation
+/// is load-bearing: git answers with forward slashes and the caller holds a Windows path, so a raw
+/// comparison would reject every valid root. Canonicalising the RETURNED key buys less than it looks
+/// — git already normalises drive-letter case and `.`/`..` itself (measured) — and is kept for
+/// junctions and symlinks, where two spellings genuinely reach one directory.
+///
+/// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it
+/// computes what is left of the budget and refuses before spawning, which is the property that
+/// comment exists to protect.
+pub async fn repo_key(path: &Path, deadline: std::time::Instant) -> Result<String, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(
+            "the operation ran out of time before the repository could be identified".to_owned(),
+        );
+    }
+
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--show-toplevel"),
+            OsStr::new("--git-common-dir"),
+        ],
+        budget,
+    )
+    .await?;
+    // Two refusals, deliberately worded apart. This one is "git found no repository from here at
+    // all"; the one below the parse is "git found one, and it is not this directory". They shared a
+    // sentence until a mutation pass showed what that cost: with one wording, a test naming either
+    // case passed through whichever branch happened to run, and deleting this block outright left
+    // the whole suite green. A message is a test's only way to say WHICH guard answered.
+    if !result.succeeded() {
+        return Err(format!(
+            "{} is not inside a git repository: {}",
+            path.display(),
+            result.output_tail.trim()
+        ));
+    }
+
+    // Order matters and is fixed by the argv above: `--show-toplevel` first, `--git-common-dir`
+    // second. `rev-parse` prints its answers in the order it was asked for them.
+    let mut lines = result.stdout.lines();
+    let (Some(toplevel), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return Err(format!(
+            "git did not report both a top level and a common directory for {}",
+            path.display()
+        ));
+    };
+
+    let toplevel = canonical(Path::new(toplevel.trim())).await?;
+    if canonical(path).await? != toplevel {
+        return Err(format!(
+            "{} is not the root of a repository — it sits inside {toplevel}",
+            path.display()
+        ));
+    }
+
+    canonical(Path::new(common_dir.trim())).await
+}
+
+/// A path in the one spelling the filesystem itself uses.
+///
+/// On Windows this returns a verbatim path (`\\?\C:\…`). That is fine for a key, whose only job is
+/// to compare equal to itself, and it is worth knowing before anyone compares a stored repository
+/// key against a stored `project_root` — they are in different spellings on purpose.
+async fn canonical(path: &Path) -> Result<String, String> {
+    tokio::fs::canonicalize(path)
+        .await
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| format!("could not canonicalise {}: {error}", path.display()))
 }
 
 /// The object id `rev` names, or the outcome to record when git will not resolve it.
@@ -599,6 +694,14 @@ async fn publish_by_fast_forward(
     // checkout, whose `.git` is a DIRECTORY. `is_file()` here would reject the ordinary case on
     // every merge — `a_branch_somebody_has_open_is_fast_forwarded_in_place` is what goes red if
     // somebody ever "fixes" this into agreeing with the other one.
+    //
+    // **Both holder tests are needed and neither subsumes the other**, which is worth saying before
+    // somebody consolidates them on the grounds that they look alike. Only the one named above can
+    // catch that tightening: its holder is the MAIN checkout, so its `.git` is a directory and
+    // `is_file()` turns it red. `a_merge_into_a_branch_somebody_has_open_moves_their_whole_worktree`
+    // holds the branch in a LINKED worktree, whose `.git` is a file — it would sail through the same
+    // change untouched, which is precisely why its subject is the composition end to end and not
+    // this guard.
     if tokio::fs::metadata(worktree.join(".git")).await.is_err() {
         return Outcome::Failed {
             reason: format!(
@@ -749,9 +852,15 @@ impl crate::vcs::VcsExecutor for GitExecutor {
         // merge computed, the enclosing repository's `master` moved, and the row came back
         // `Succeeded` naming a sha from a repository nobody named.
         //
-        // Nothing constructs a `SubmitRequest` in production yet, so this is not reachable today.
-        // Resolving a project from an agent's cwd is what opens it, and there a stale root or a cwd
-        // one level off the project is enough.
+        // **A backstop now, and no longer the first line of defence.** `vcs::resolve_repo` puts the
+        // root through `repo_key` before a row can be inserted at all, and that check is strictly
+        // stronger than this one: it requires the root to BE the repository's top level, where this
+        // only requires it to contain a `.git`. What is left for this guard is the window between
+        // the two — a root that stopped being a repository between submitting and running, which a
+        // request queued behind two slow merges has plenty of time to do — and any future caller
+        // that reaches `execute` without having gone through `resolve_repo`. Both are real, and
+        // naming them is the point: a guard nobody can say what it still catches is a guard somebody
+        // eventually deletes.
         //
         // **Existence, not `is_file()`** — a project root is a main checkout, whose `.git` is a
         // DIRECTORY. `publish_by_fast_forward`'s guard states that distinction at length and this is
@@ -775,8 +884,11 @@ impl crate::vcs::VcsExecutor for GitExecutor {
         // repository, and reports success having done nothing.
         match &request.op {
             crate::vcs::Op::Merge { source, target } => {
-                match compute_merge(project_root, source, target, deadline).await {
-                    Ok(computed) => publish(project_root, target, computed, deadline).await,
+                match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
+                {
+                    Ok(computed) => {
+                        publish(project_root, target.as_str(), computed, deadline).await
+                    }
                     // Computing failed, which IS how this request ended.
                     Err(outcome) => outcome,
                 }
@@ -1648,6 +1760,124 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The founding scenario of the whole pillar, end to end: somebody is standing on the target
+    /// branch in a worktree of their own, and the queue lands the merge underneath them — HEAD, the
+    /// index and the files together — without their working copy ever telling a lie about it.**
+    ///
+    /// Nothing else in this module covers it, and the gap is not obvious from the names. The test
+    /// above holds `master` in the MAIN checkout, so it never stands up a linked worktree at all;
+    /// the only two tests that do — `a_refusal_the_user_cannot_fix_by_committing_is_not_reported_as_blocked`
+    /// and `a_holder_worktree_whose_git_file_is_gone_is_refused_rather_than_blamed_on_the_user` —
+    /// hand the publish a deliberately BROKEN holder, because their subject is the guards that
+    /// refuse one. Every piece of the composition was tested; that the pieces fit was not.
+    ///
+    /// So this runs through `GitExecutor::execute` with a `ClaimedRequest`, the way the daemon does,
+    /// rather than calling `publish` directly. Entering below the executor would skip everything
+    /// that decides WHICH publish runs — `project_root`'s guard, `compute_merge`'s detached HEAD,
+    /// and `worktree_holding`'s answer — and the composition is the whole point.
+    ///
+    /// **`status --porcelain` is the assertion that carries this test**, and it is not a tidiness
+    /// check. Moving the ref out from under a holder — what the compare-and-swap route would do
+    /// here — leaves HEAD at the new commit while the index and the files stay at the old one, and
+    /// `git status` in that worktree then reports the merge BACKWARDS: every file the merge brought
+    /// in shows as a staged deletion, waiting for a human to "restore" it. Neither sha assertion can
+    /// see that state, because the ref really did move. Spec §6.1 exists to prevent exactly it.
+    #[tokio::test]
+    async fn a_merge_into_a_branch_somebody_has_open_moves_their_whole_worktree() {
+        use crate::vcs::VcsExecutor;
+
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-holderff-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // The holder: somebody's own linked worktree with `release` checked out and a clean working
+        // copy. `release` rather than `master`, because `master` is held by the main checkout and a
+        // LINKED worktree is precisely what the test above cannot reach. Placed beside the
+        // repository rather than under `NUCLEOS_WORKTREE_ROOT`: this worktree belongs to the user,
+        // and that root is where the daemon's own directories go.
+        let holder = container.path().join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("release"),
+                holder.as_os_str()
+            ]
+        ));
+        let before = sha_of(&repo, "release");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Merge {
+                    source: "feat/x".into(),
+                    target: "release".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        let sha = match outcome {
+            Outcome::Succeeded { sha, .. } => sha,
+            other => panic!("expected a published merge, got {other:?}"),
+        };
+        // The sha the row reports IS the merge commit, established from its parents rather than by
+        // taking the row's word for it: first parent the old target, second the source.
+        assert_eq!(
+            sha_of(&repo, &format!("{sha}^1")),
+            before,
+            "the reported sha is a merge whose first parent is where `release` was"
+        );
+        assert_eq!(
+            sha_of(&repo, &format!("{sha}^2")),
+            sha_of(&repo, "feat/x"),
+            "and whose second parent is what was merged in"
+        );
+
+        assert_eq!(
+            sha_of(&repo, "refs/heads/release"),
+            sha,
+            "the target branch ref moved"
+        );
+        // Stated because the property is "the holder moved", and kept knowing what it can and cannot
+        // catch: the holder's `HEAD` is a SYMREF to `refs/heads/release`, so it follows the ref and
+        // cannot go red while the assertion above is green — the same trap the compare-and-swap test
+        // documents at `master`/`HEAD`. What it would catch is a publish that ever left the holder
+        // DETACHED rather than moving its branch. The two assertions below are the ones that see the
+        // difference between a ref that moved and a worktree that moved.
+        assert_eq!(
+            sha_of(&holder, "HEAD"),
+            sha,
+            "and the holder's HEAD is at it"
+        );
+
+        // **The one that separates "the ref moved" from "the user's worktree moved."**
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&holder)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git should start");
+        assert!(
+            status.stdout.is_empty(),
+            "the holder's index and files agree with its HEAD — a ref moved out from under it would show the merge backwards here; got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        // And the merge is on disk where the human will look for it. Byte-exact rather than merely
+        // present, which `initialize_repo`'s `core.autocrlf false` is what makes possible on Windows.
+        assert_eq!(
+            std::fs::read_to_string(holder.join("feature.txt"))
+                .expect("the file the merged branch introduced is in the holder's working copy"),
+            "from the branch\n",
+            "with the bytes the branch had"
+        );
+    }
+
     /// The whole design in one assertion. The user was in the middle of editing a file the merge
     /// touches; the merge does not happen to them, and their bytes are exactly where they left them.
     #[tokio::test]
@@ -1945,8 +2175,8 @@ pub(crate) mod tests {
             .execute(&crate::vcs::ClaimedRequest {
                 id: 1,
                 op: crate::vcs::Op::Merge {
-                    source: "feat/x".to_owned(),
-                    target: "master".to_owned(),
+                    source: "feat/x".into(),
+                    target: "master".into(),
                 },
                 project_id: "alpha".to_owned(),
                 project_root: project_root.to_string_lossy().into_owned(),
@@ -1996,6 +2226,126 @@ pub(crate) mod tests {
             std::fs::read_to_string(enclosing.join("seed.txt")).expect("read"),
             "uncommitted work\n",
             "the enclosing repository's uncommitted work is untouched"
+        );
+    }
+
+    /// The key is a property of the REPOSITORY, and a linked worktree is the case that proves it: its
+    /// own directory, its own `.git` (a file, not a directory), its own checked-out branch — and the
+    /// same repository. A key that disagreed here would let a merge computed in one worktree run at the
+    /// same moment as a merge publishing into another, which is the collision the pillar exists for.
+    #[tokio::test]
+    async fn a_linked_worktree_and_its_main_checkout_share_one_key() {
+        let (container, repo) = init_contained_repo("nucleos-gitexec-key-");
+        let linked = container.path().join("linked");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                linked.as_os_str(),
+                OsStr::new("-b"),
+                OsStr::new("side"),
+            ]
+        ));
+
+        assert_eq!(
+            repo_key(&repo, deadline()).await.unwrap(),
+            repo_key(&linked, deadline()).await.unwrap()
+        );
+    }
+
+    /// Two repositories must not collapse into one key, or the fix would buy exclusivity by serializing
+    /// the whole machine.
+    #[tokio::test]
+    async fn two_repositories_have_two_keys() {
+        let (_first_container, first) = init_contained_repo("nucleos-gitexec-key-a-");
+        let (_second_container, second) = init_contained_repo("nucleos-gitexec-key-b-");
+
+        assert_ne!(
+            repo_key(&first, deadline()).await.unwrap(),
+            repo_key(&second, deadline()).await.unwrap()
+        );
+    }
+
+    /// The `git -C` walk-up, for the third time in this file and in a new place.
+    ///
+    /// `rev-parse` inside a plain subdirectory SUCCEEDS and answers about the enclosing repository. A
+    /// project whose recorded root is wrong by one level would be handed a key naming a repository
+    /// nobody chose — and everything downstream, the merge included, would then operate on it while
+    /// reporting the name of the project that was asked for.
+    #[tokio::test]
+    async fn a_directory_inside_a_repository_is_not_given_that_repositorys_key() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-key-inside-");
+        let inside = repo.join("subdir");
+        std::fs::create_dir(&inside).expect("create subdirectory");
+
+        let error = repo_key(&inside, deadline()).await.unwrap_err();
+
+        assert!(
+            error.contains("not the root of a repository"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A directory outside every repository is an error rather than a key — and this is the ONLY
+    /// test that reaches the non-zero-exit branch, which is why it does not use
+    /// `space_free_tempdir`.
+    ///
+    /// That helper creates its directory *under the checkout* (cargo cannot link beneath a path
+    /// containing a space), so a directory it makes is inside this very repository: `git -C` walks
+    /// up, succeeds, and answers about the enclosing checkout — the refusal then comes from the
+    /// top-level guard rather than from git. Written that way, this test passed for a reason its own
+    /// name denied, and deleting the non-zero-exit branch altogether left the suite green. The
+    /// system temp directory is outside every repository, and pointing git at one costs no linking.
+    ///
+    /// The assertion is on the message rather than on `is_err()` for the same reason: two guards
+    /// refuse here, and only the wording says which one did. If this ever fails with the *other*
+    /// message, the machine's temp directory has ended up inside a repository — the assertion will
+    /// say so in as many words, which is the whole point of asserting on it.
+    #[tokio::test]
+    async fn a_directory_outside_every_repository_has_no_key() {
+        let container = tempfile::tempdir().expect("create a temp directory outside the checkout");
+
+        let error = repo_key(container.path(), deadline()).await.unwrap_err();
+
+        assert!(
+            error.contains("is not inside a git repository"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The comparison the guard makes is between two paths that git and the caller spell differently:
+    /// git answers with forward slashes, the caller holds a Windows path. Canonicalising BOTH sides is
+    /// what makes the comparison mean "same directory" rather than "same string" — and without it the
+    /// guard would reject every valid root, so the two tests above are what hold it.
+    ///
+    /// This test covers `canonical` itself, on the one property `repo_key`'s own tests cannot see.
+    #[tokio::test]
+    async fn two_spellings_of_one_directory_canonicalise_together() {
+        let container = space_free_tempdir("nucleos-gitexec-canon-");
+        let nested = container.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("create nested directories");
+
+        assert_eq!(
+            canonical(&nested).await.unwrap(),
+            canonical(&nested.join("..").join("b")).await.unwrap()
+        );
+    }
+
+    /// The budget is for the whole operation, and a spent one must refuse before spawning git — the
+    /// same guarantee `remaining` gives the merge path, for the same reason: `tokio`'s `Command::output`
+    /// spawns the child eagerly, so a spent budget would launch git only to kill it.
+    #[tokio::test]
+    async fn an_exhausted_budget_refuses_before_running_git() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-key-budget-");
+
+        let error = repo_key(&repo, std::time::Instant::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains("ran out of time"),
+            "unexpected error: {error}"
         );
     }
 }

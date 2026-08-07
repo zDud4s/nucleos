@@ -269,6 +269,91 @@ impl DaemonClient {
             .map_err(|e| e.to_string())?;
         json_or_null(response).await
     }
+
+    /// Queues one operation and waits for it, up to the daemon's own ceiling.
+    ///
+    /// Two calls rather than one: the submit answers as soon as the row is committed, and the wait is
+    /// a separate route so a caller that only wants a ticket is not made to block for it. What this
+    /// method does is spend the wait on the caller's behalf, which is spec decision 3's hybrid —
+    /// block for a while, then hand back a ticket rather than a timeout.
+    pub async fn vcs_request(
+        &self,
+        project_id: &str,
+        operation: &str,
+        source: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<Value, String> {
+        let body = vcs_submit_body(project_id, operation, source, target)?;
+        let response = self
+            .request(reqwest::Method::POST, "/vcs/requests")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        // A refusal is a bare status with an empty body (`submit_vcs_request` returns
+        // `Result<Json<Ticket>, StatusCode>`), so `.json()` on it would fail with a decoding error
+        // that names nothing useful. The status IS the message: 404 is an unknown project, 422 a
+        // project whose recorded root is not a repository or a body the queue will not accept, 403 a
+        // token that may not queue.
+        if !response.status().is_success() {
+            return Err(format!(
+                "the daemon refused the request: {}",
+                response.status()
+            ));
+        }
+        let submitted: Value = response.json().await.map_err(|e| e.to_string())?;
+
+        match submitted["id"].as_i64() {
+            Some(id) => self.vcs_ticket(id, true).await,
+            None => Ok(submitted),
+        }
+    }
+
+    /// One queued operation's ticket: what was asked for and how it ended. `wait` spends up to the
+    /// daemon's ceiling waiting for it to finish; without it the answer is whatever the row says now.
+    pub async fn vcs_ticket(&self, id: i64, wait: bool) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, &ticket_path(id, wait))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The submit body, built and validated before anything is sent.
+///
+/// Named `VcsSubmitBody` and not `VcsRequestBody` on purpose: `http.rs` has a private type by that
+/// second name for the *receiving* side of the same wire shape, and two identically named structs at
+/// opposite ends of one request are a trap for whoever changes one of them.
+#[derive(Serialize)]
+pub struct VcsSubmitBody {
+    pub project_id: String,
+    pub operation: crate::vcs::Op,
+}
+
+/// PURE: the body for one queue submission, or why the request is not one.
+pub fn vcs_submit_body(
+    project_id: &str,
+    operation: &str,
+    source: Option<&str>,
+    target: Option<&str>,
+) -> Result<VcsSubmitBody, String> {
+    Ok(VcsSubmitBody {
+        project_id: project_id.to_owned(),
+        operation: crate::vcs::Op::from_request(operation, source, target)?,
+    })
+}
+
+/// PURE: which of the two ticket routes to call. Extracted so the choice is asserted somewhere —
+/// inline, the difference between blocking and not blocking is one path segment nothing reads.
+fn ticket_path(id: i64, wait: bool) -> String {
+    if wait {
+        format!("/vcs/requests/{id}/wait")
+    } else {
+        format!("/vcs/requests/{id}")
+    }
 }
 
 /// Percent-encodes a query value.
@@ -413,6 +498,36 @@ mod tests {
             wip_limit: Some(3),
             queue_full: false,
         }
+    }
+
+    #[test]
+    fn a_request_body_carries_the_typed_operation() {
+        let body = vcs_submit_body("nucleos", "merge", Some("feature"), Some("master")).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "project_id": "nucleos",
+                "operation": {"op": "merge", "source": "feature", "target": "master"}
+            })
+        );
+    }
+
+    /// The validation lives in `vcs::Op`, and this asserts the client actually consults it rather than
+    /// posting whatever it was handed — a caller that named an operation the queue does not have is told
+    /// so without a round trip, and the daemon never sees a request it would only reject.
+    #[test]
+    fn an_operation_the_queue_does_not_have_never_reaches_the_daemon() {
+        assert!(vcs_submit_body("nucleos", "push", Some("origin"), Some("master")).is_err());
+        assert!(vcs_submit_body("nucleos", "merge", Some("-f"), Some("master")).is_err());
+    }
+
+    /// The two ticket routes differ only in a suffix, and nothing else in the suite would notice if they
+    /// were swapped: both return the same shape, and one merely blocks longer.
+    #[test]
+    fn waiting_and_not_waiting_are_different_routes() {
+        assert_eq!(ticket_path(7, false), "/vcs/requests/7");
+        assert_eq!(ticket_path(7, true), "/vcs/requests/7/wait");
     }
 
     #[test]

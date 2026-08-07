@@ -9,6 +9,13 @@
 //! holds it, so it survives the daemon restart a mutex would not — and `reconcile_interrupted` is
 //! what releases a slot that restart found still held.
 //!
+//! **What that index is keyed on is the repository, not the project**, and the distinction is the
+//! whole of the promise rather than a detail of it. A project is a label somebody chose; a
+//! repository is what a merge actually touches, and two labels can name one. `ResolvedRepo` is the
+//! only way to obtain the key — git's own canonical common directory, one value for a main checkout
+//! and for every linked worktree of it — so a caller cannot lock one repository while running git in
+//! another.
+//!
 //! Requests are typed (`Op`), never command strings: parsing shell is the surface `classifier.rs`
 //! exists to keep closed, so the daemon builds every argv itself. This module decides WHEN an
 //! operation runs and records how it ended. It never decides whether the actor was allowed to ask
@@ -32,17 +39,124 @@ use serde::{Deserialize, Serialize};
 ///    accident rather than design: a dashed string can set an option but cannot also name a commit,
 ///    HEAD in the integration worktree is always detached so `merge`'s upstream fallback dies, and
 ///    `update-ref` rejects a dashed ref name. A variant with a different argv shape does not inherit
-///    any of that.
+///    any of that. `Branch` is that accident turned into a rule for the two fields `Merge` has; a
+///    variant carrying a name of some other kind owes its own type.
+/// 3. The operation names in `from_request` are matched as `&str`, so adding a variant here does NOT
+///    fail to compile there. Whoever adds one must also take its name out of the "not yet" arm by
+///    hand, or the queue will go on refusing an operation it has learned to perform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    Merge { source: String, target: String },
+    Merge { source: Branch, target: Branch },
+}
+
+/// A branch name the daemon is willing to put on a git command line.
+///
+/// A newtype rather than a validating constructor on `Op`, because the validation has to hold on
+/// every route into the queue and there are three: the flat parameters an MCP tool call carries, a
+/// raw `POST /vcs/requests` body that deserializes an `Op` directly (`http.rs`), and `Op::from_stored`
+/// reading a row back. A `Deserialize` that validates covers all three; a checked constructor covers
+/// the first only, which is how `{"op":"merge","source":"--upload-pack=x"}` would have got through.
+///
+/// The leading-dash rule is the load-bearing one. `Op`'s own doc comment records that `Merge`'s
+/// arguments survive today by accident — a dashed string can set an option but cannot also name a
+/// commit, and the integration worktree's HEAD is always detached so `merge`'s upstream fallback
+/// dies. This is that accident replaced by a rule.
+///
+/// **This is an argv guard and not a ref validator, and the difference has to be said out loud
+/// because the name does not say it.** Empty, a leading `-`, whitespace, control characters — that
+/// is the whole list. `feat/x;rm -rf`, `..`, `@{u}`, `HEAD`, a name carrying `~ ^ : ? * [`, a name
+/// ending in `.lock`: every one of them passes here, and `git check-ref-format` rejects several. That
+/// is fine, and it is fine for a reason rather than by luck. `git_exec::run_git` builds an argv and
+/// spawns it with no shell anywhere in the path, so a `;` is not a separator — it is one more
+/// character in a ref name, git looks for a branch spelled that way, finds none, and the row records
+/// what it said. Git stays the authority on which names resolve; this type only decides which ones
+/// may be handed to it. Whoever wants the other guarantee wants `git check-ref-format --branch` or a
+/// character allowlist, and owes it its own check rather than a quiet widening of this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Branch(String);
+
+impl Branch {
+    pub fn new(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("a branch name may not be empty".to_owned());
+        }
+        if value.starts_with('-') {
+            return Err(format!("a branch name may not start with '-': {value}"));
+        }
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(format!("a branch name may not contain whitespace: {value}"));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Branch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Branch::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Tests build branches from literals everywhere. Panicking is right for a literal a developer
+/// wrote; production has only the fallible path, and this impl does not exist there.
+#[cfg(test)]
+impl From<&str> for Branch {
+    fn from(value: &str) -> Self {
+        Branch::new(value).expect("a test used an invalid branch name literal")
+    }
+}
+
+/// PURE: a caller-supplied branch name for one named role, or why it is not usable as one.
+fn named_branch(value: Option<&str>, which: &str) -> Result<Branch, String> {
+    let Some(value) = value else {
+        return Err(format!("a merge needs a {which} branch"));
+    };
+    Branch::new(value).map_err(|reason| format!("{which}: {reason}"))
 }
 
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::Merge { .. } => "merge",
+        }
+    }
+
+    /// Builds an operation from the flat parameters a tool call carries.
+    ///
+    /// Flat rather than the tagged union `Op` serialises to, because the caller on the other side is
+    /// a language model reading a tool description: the union is the right wire shape and the wrong
+    /// prompt. It is a convenience over `Branch`, not a boundary — the boundary is the type.
+    ///
+    /// Every rejection names what is wrong, and the rejection for an operation the SPEC lists but
+    /// the executor cannot perform yet is deliberately different from the one for a word that is not
+    /// an operation at all. A caller told "unknown operation: push" would go looking for a typo in
+    /// its own request; a caller told "push is not queued yet" knows to wait or do something else.
+    pub fn from_request(
+        operation: &str,
+        source: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<Self, String> {
+        match operation.trim().to_ascii_lowercase().as_str() {
+            "merge" => Ok(Op::Merge {
+                source: named_branch(source, "source")?,
+                target: named_branch(target, "target")?,
+            }),
+            other @ ("rebase" | "push" | "pull" | "fetch" | "tag" | "branch-delete"
+            | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
+                "{other} is not yet queued by this daemon — merge is the only operation the queue \
+                 can execute today"
+            )),
+            other => Err(format!(
+                "unknown operation: {other} — the queue understands merge"
+            )),
         }
     }
 
@@ -73,7 +187,19 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Human,
-    // Constructed by Chunk 3, when the MCP tools give an external session its own provenance.
+    // **Nothing maps to this, and that is a decision rather than an omission.** `http.rs`'s
+    // `vcs_origin` argues the whole case: in this repo "shell" means the Tauri desktop app, which
+    // holds the *control* token and therefore already arrives as `Human`, and an admin API token is
+    // deliberately NOT recorded as `shell` because that would name the one client that did not make
+    // the call. An arm here would need a scope that means something no scope means today — a
+    // credential belonging to an external session in its own right, distinct from both the desktop
+    // app's control token and a run's.
+    //
+    // It survives anyway, because the schema outranks the mapping: the `origin` column's CHECK
+    // constraint accepts `'shell'`, and `Ticket` and `RequestSummary` hand a row's columns back
+    // verbatim rather than parsing them, so such a row can exist and be listed whether or not this
+    // variant does. Deleting it would leave the one enum that is meant to be the authority on that
+    // column unable to name a value the column permits, which is the wrong way round.
     #[allow(dead_code)]
     Shell,
     Run(i64),
@@ -112,13 +238,91 @@ impl Origin {
     }
 }
 
-/// What a caller asks the queue to do, before provenance decides whether it may queue yet.
+/// A project resolved to the repository it names, with the key the queue locks on.
+///
+/// Private fields with one production constructor, because the defect this type exists to kill was
+/// two fields allowed to disagree: a caller that could set `key` and `root` independently could take
+/// the lock on one repository and run git in another, and the row would look entirely ordinary.
 #[derive(Debug, Clone)]
-pub struct SubmitRequest {
-    pub op: Op,
-    pub project_id: String,
-    pub project_root: String,
-    pub origin: Origin,
+pub struct ResolvedRepo {
+    project_id: String,
+    root: String,
+    key: String,
+}
+
+impl ResolvedRepo {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Tests build repositories that do not exist on disk: what most of them exercise is the SQL,
+    /// and making each one create a real git repository would test git twice and slow the suite.
+    /// `resolve_repo` is the only constructor compiled into the daemon.
+    #[cfg(test)]
+    pub fn synthetic(project_id: &str, root: &str, key: &str) -> Self {
+        Self {
+            project_id: project_id.to_owned(),
+            root: root.to_owned(),
+            key: key.to_owned(),
+        }
+    }
+}
+
+/// Why a project could not be resolved to a repository.
+///
+/// Two failure arms rather than one string because the HTTP layer answers them differently and a
+/// caller deserves to know which happened: an unknown project is the caller naming something that is
+/// not there, and a bad root is the daemon's own recorded state being wrong.
+#[derive(Debug)]
+pub enum ResolveError {
+    UnknownProject,
+    NotARepository(String),
+    Database(sqlx::Error),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownProject => {
+                write!(formatter, "no such project, or it has no recorded root")
+            }
+            Self::NotARepository(reason) => write!(formatter, "{reason}"),
+            Self::Database(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// The single production path from a project id to a repository the queue may lock.
+///
+/// Both halves are needed: `autopilot_state` is the only place a root is recorded, and git is what
+/// makes two projects sharing a repository share a lock. It runs a subprocess, so it is neither free
+/// nor infallible — that is the trade against keying on a label, which is what it replaces.
+pub async fn resolve_repo(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> Result<ResolvedRepo, ResolveError> {
+    let root = crate::inspect::project_root(pool, project_id)
+        .await
+        .map_err(ResolveError::Database)?
+        .ok_or(ResolveError::UnknownProject)?;
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let key = crate::git_exec::repo_key(std::path::Path::new(&root), deadline)
+        .await
+        .map_err(ResolveError::NotARepository)?;
+
+    Ok(ResolvedRepo {
+        project_id: project_id.to_owned(),
+        root,
+        key,
+    })
 }
 
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
@@ -126,23 +330,31 @@ pub struct SubmitRequest {
 /// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
 /// into `queued`, or `rejected` — belongs to Chunk 4 alongside the `proposals.rs` wiring that
 /// grants it; this function only ever writes the initial state.
-pub async fn submit(pool: &sqlx::SqlitePool, request: &SubmitRequest) -> sqlx::Result<i64> {
-    let status = if request.origin.needs_approval() {
+///
+/// The repository arrives resolved rather than as fields to be trusted — see `ResolvedRepo`.
+pub async fn submit(
+    pool: &sqlx::SqlitePool,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64> {
+    let status = if origin.needs_approval() {
         "awaiting_approval"
     } else {
         "queued"
     };
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, run_id, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(request.op.kind())
-    .bind(request.op.to_args())
-    .bind(&request.project_id)
-    .bind(&request.project_root)
-    .bind(request.origin.as_str())
-    .bind(request.origin.run_id())
+    .bind(op.kind())
+    .bind(op.to_args())
+    .bind(repo.project_id())
+    .bind(repo.root())
+    .bind(repo.key())
+    .bind(origin.as_str())
+    .bind(origin.run_id())
     .bind(status)
     .bind(created_at)
     .execute(pool)
@@ -266,7 +478,7 @@ impl Outcome {
 /// section it waits on is one `serde_json::from_str` plus a commit.
 pub async fn claim_next(
     pool: &sqlx::SqlitePool,
-    project_id: &str,
+    repo_key: &str,
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
@@ -275,16 +487,16 @@ pub async fn claim_next(
             SET status = 'running', started_at = ?1
           WHERE id = (
               SELECT id FROM vcs_requests
-               WHERE project_id = ?2 AND status = 'queued'
+               WHERE repo_key = ?2 AND status = 'queued'
                ORDER BY id LIMIT 1
           )
             AND NOT EXISTS (
-              SELECT 1 FROM vcs_requests WHERE project_id = ?2 AND status = 'running'
+              SELECT 1 FROM vcs_requests WHERE repo_key = ?2 AND status = 'running'
             )
          RETURNING id, op, args, project_id, project_root",
     )
     .bind(started_at)
-    .bind(project_id)
+    .bind(repo_key)
     .fetch_optional(&mut *transaction)
     .await?;
 
@@ -413,10 +625,10 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
 /// exactly this back as its HTTP response body, whether the queue answered inside the deadline or
 /// not.
 ///
-/// `status` is the same string the `status` column holds rather than an enum: `rejected` and
-/// `cancelled` are already in that column's CHECK constraint even though nothing in this module
-/// writes them yet, and a `Ticket` round-trips whichever one a row holds without this module
-/// needing to know what it means.
+/// `status` is the same string the `status` column holds rather than an enum: `rejected` is in that
+/// column's CHECK constraint even though nothing in this module writes it yet — `cancelled` was too
+/// until `cancel_for_run` arrived — and a `Ticket` round-trips whichever one a row holds without this
+/// module needing to know what it means.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticket {
     pub id: i64,
@@ -526,10 +738,15 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// caller a hard timeout: it gets a ticket back instead and decides for itself whether to keep
 /// waiting.
 ///
-/// Terminal means `succeeded`, `failed`, `blocked`, or `interrupted` — the four statuses `finish`
-/// and `reconcile_interrupted` actually write today, matching the vocabulary those two already use
-/// (see `finish`'s own doc comment, and the interrupted-is-terminal test above). `blocked` is as
-/// terminal as the other three: the queue never retries it, so a caller held to the deadline would
+/// Terminal means `succeeded`, `failed`, `blocked`, `interrupted`, or `cancelled` — the five statuses
+/// `finish`, `reconcile_interrupted`, `cancel_for_run` and `reap_requests_of_ended_runs` actually
+/// write today, matching the vocabulary those four already use (see `finish`'s own doc comment, and
+/// the interrupted-is-terminal test above). `cancelled` is the one this list gained last, and it has
+/// two writers rather than one: `cancel_for_run` retires a request the moment its run is cancelled,
+/// and the reaper retires one whose run had already ended by some other door when the queue reached
+/// it. Either way the row can no longer change, so a caller waiting on it must be told now rather
+/// than at the deadline. `blocked` is as
+/// terminal as the other four: the queue never retries it, so a caller held to the deadline would
 /// be waiting on a row that can no longer change — and it is the outcome that most needs a human to
 /// see it promptly. `queued`, `running` and `awaiting_approval` are treated identically: all three
 /// can still change, so none of them ends the wait early, and if the deadline passes while a row is
@@ -572,7 +789,7 @@ pub async fn wait_for(
 
         let terminal = matches!(
             status.as_str(),
-            "succeeded" | "failed" | "blocked" | "interrupted"
+            "succeeded" | "failed" | "blocked" | "interrupted" | "cancelled"
         );
         if terminal || started.elapsed() >= deadline {
             return Ok(Ticket {
@@ -625,6 +842,136 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
         .await;
     }
     Ok(reconciled.len() as u64)
+}
+
+/// Cancels every request run `run_id` asked for that has not started, and returns how many.
+///
+/// **`running` is deliberately excluded.** Spec §7: an operation already in flight finishes. A merge
+/// abandoned half-way is worse than one nobody is waiting for any more, and the queue could not stop
+/// it in any case — the git it spawned belongs to the daemon, not to the run whose context ran out.
+/// What this reclaims is the place a dead run would otherwise hold in the FIFO.
+///
+/// `awaiting_approval` is swept alongside `queued`, and that is the arm that matters most: a request
+/// nobody has approved yet, belonging to a run that no longer exists, would otherwise sit there until
+/// a human approved work for an agent that is gone.
+///
+/// **Why this cannot race the claim**, which is worth writing down because it is conditional on
+/// something a future edit could break: `claim_next` opens a transaction whose FIRST statement is its
+/// conditional UPDATE, so it takes SQLite's single write lock outright. Either the claim commits
+/// first — the row is `running`, and the filter below excludes it — or this commits first and the
+/// claim's subquery finds no `queued` row. There is no window in which a row goes `cancelled` while
+/// git is running against it. And even if there were, `finish` is scoped to `status = 'running'`, so
+/// a lost race lands in `drain_once`'s existing warn arm rather than overwriting a terminal status.
+///
+/// The feed write is best-effort per row, this crate's convention for observational writes: a feed
+/// row that cannot be written must not undo the cancellation it is only reporting on.
+pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<u64> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let cancelled: Vec<(i64, String)> = sqlx::query_as(
+        "UPDATE vcs_requests
+            SET status = 'cancelled', finished_at = ?,
+                failure_reason = 'the run that asked for this ended before it started'
+          WHERE run_id = ? AND status IN ('queued', 'awaiting_approval')
+         RETURNING id, project_id",
+    )
+    .bind(finished_at)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+
+    for (id, project_id) in &cancelled {
+        let _ = crate::feed::append(
+            pool,
+            Some(project_id.as_str()),
+            "vcs_request_cancelled",
+            &format!("vcs request {id} cancelled with run {run_id}"),
+            Some(run_id),
+        )
+        .await;
+    }
+
+    Ok(cancelled.len() as u64)
+}
+
+/// Retires every request in this repository whose submitting run has already ended, and returns how
+/// many. Called by `drain_once` before it claims.
+///
+/// **This is the pull half of spec §7's "the agent that submitted dies", and it exists because the
+/// push half cannot be complete.** `runs::finalize_termination` sweeps the paths that go through it,
+/// but a run's terminal status is also written by direct UPDATEs elsewhere, and the next one will be
+/// written by somebody who does not know the list exists. Asking here — at the one point that must be
+/// correct anyway, because it is where a merge is about to be executed — makes the guarantee true by
+/// construction rather than by everyone remembering.
+///
+/// "Elsewhere" is deliberately not a number. It was written as "four other places" and an audit put
+/// the real count at roughly twice that, which is the argument for this function rather than against
+/// it — but a count in a comment is a claim that goes stale on its own, and this one would go stale
+/// in the direction of sounding smaller than it is.
+///
+/// `cancel_for_run` is kept alongside it and is not redundant: it makes a cancelled run's requests
+/// disappear *immediately*, rather than at the next poll of a repository that may have nothing else
+/// queued for hours.
+///
+/// The status list comes from `runs::ENDED_RUN_STATUSES` rather than being spelled here. Note what
+/// is NOT in it: a run at `awaiting_approval` is paused for a human and will resume, so its merge
+/// must survive; and a run that finished its work normally never reaches `finalize_termination` at
+/// all, which is correct — it asked for the merge and should have it.
+///
+/// `running` is excluded by the same status filter `cancel_for_run` uses, and for the same reason
+/// spelled out there: an operation already in flight finishes. Here it is also structural — this
+/// runs *before* the claim, so there is nothing of this drain's in flight to protect.
+///
+/// The `IN` clause's placeholders are generated from the constant's length and every element bound,
+/// rather than the list being interpolated into the string: a status is data, and a query built by
+/// formatting values into SQL is the shape that stops being safe the moment one of them stops being
+/// a literal somebody wrote by hand.
+pub async fn reap_requests_of_ended_runs(
+    pool: &sqlx::SqlitePool,
+    repo_key: &str,
+) -> sqlx::Result<u64> {
+    let placeholders = vec!["?"; crate::runs::ENDED_RUN_STATUSES.len()].join(", ");
+    // `run_id IS NOT NULL` is redundant against the `EXISTS` below — a NULL joins nothing — and is
+    // written anyway because it is the sentence the reaper means: a request no run owns is not a
+    // request a run can have abandoned.
+    let sql = format!(
+        "UPDATE vcs_requests
+            SET status = 'cancelled', finished_at = ?,
+                failure_reason = 'the run that asked for this had already ended when the queue reached it'
+          WHERE repo_key = ? AND status IN ('queued', 'awaiting_approval')
+            AND run_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM runs
+                         WHERE runs.id = vcs_requests.run_id
+                           AND runs.status IN ({placeholders}))
+         RETURNING id, project_id, run_id"
+    );
+
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    // `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str`, and this string is built at
+    // runtime. Audited, and the audit is short: the only interpolation is `placeholders`, which is
+    // `n` question marks derived from a compile-time constant's length. No value reaches the SQL —
+    // the statuses themselves are bound below, one per placeholder.
+    let mut query = sqlx::query_as::<_, (i64, String, Option<i64>)>(sqlx::AssertSqlSafe(sql))
+        .bind(finished_at)
+        .bind(repo_key.to_string());
+    for status in crate::runs::ENDED_RUN_STATUSES {
+        query = query.bind(*status);
+    }
+    let reaped = query.fetch_all(pool).await?;
+
+    // Best-effort per row, this crate's convention for observational writes: a feed row that cannot
+    // be written must not undo the cancellation it is only reporting on.
+    for (id, project_id, run_id) in &reaped {
+        let _ = crate::feed::append(
+            pool,
+            Some(project_id.as_str()),
+            "vcs_request_cancelled",
+            &format!("vcs request {id} cancelled: the run that asked for it had already ended"),
+            *run_id,
+        )
+        .await;
+    }
+
+    Ok(reaped.len() as u64)
 }
 
 /// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
@@ -700,17 +1047,32 @@ pub trait VcsExecutor: Send + Sync {
 /// after the terminal write.
 pub async fn drain_once(
     pool: &sqlx::SqlitePool,
-    project_id: &str,
+    repo_key: &str,
     executor: &dyn VcsExecutor,
 ) -> bool {
-    let claimed = match claim_next(pool, project_id).await {
+    // Spec §7's pull half, and the reason the four other writers of a run's terminal status do not
+    // each need a sweep of their own — `reap_requests_of_ended_runs` argues the whole case. It goes
+    // before the claim because after it the row would already be `running`, which the reap leaves
+    // alone by design.
+    //
+    // Best-effort, like the feed appends below: a reap that could not run leaves stale requests a
+    // human can cancel, whereas returning early on it would stop the queue for this repository
+    // outright — including for every request whose run is perfectly alive.
+    if let Err(error) = reap_requests_of_ended_runs(pool, repo_key).await {
+        tracing::warn!(
+            repo_key = %repo_key,
+            %error,
+            "could not reap the vcs requests of runs that have already ended"
+        );
+    }
+    let claimed = match claim_next(pool, repo_key).await {
         Ok(Some(claimed)) => claimed,
         // Nothing queued, something already running, or only unapproved rows — all "come back
         // later", and the caller waits the same way for each.
         Ok(None) => return false,
         Err(error) => {
             tracing::warn!(
-                project_id = %project_id,
+                repo_key = %repo_key,
                 %error,
                 "could not claim the next vcs request"
             );
@@ -741,15 +1103,23 @@ pub async fn drain_once(
         // won a race rather than what this operation did.
         //
         // `None` for `run_id`: `ClaimedRequest` does not carry one and `claim_next` does not return
-        // one, and widening its `RETURNING` to supply it would buy nothing today. A `run` request
-        // starts `awaiting_approval` and nothing moves it to `queued` until Chunk 4 wires
-        // `proposals.rs`, so every claimable request in this chunk is `Human` or `Shell` and that
-        // column is NULL regardless. Chunk 4 is where threading it earns its keep.
+        // one, and widening its `RETURNING` to supply it would buy nothing today.
+        //
+        // **What that rests on is the approval transition not existing yet, and nothing weaker than
+        // that.** Rows carrying a `run_id` are ordinary now — `hooks.rs` submits as `Origin::Run`,
+        // and `reap_requests_of_ended_runs` a few functions up writes feed rows that attach one — so
+        // the premise is not "no request in play has a run". It is that a `Run` request starts
+        // `awaiting_approval` and nothing moves it to `queued` until Chunk 4 wires `proposals.rs`,
+        // so nothing carrying a `run_id` is claimable, and this column is NULL for everything that
+        // reaches here. The day that transition lands, this line stops being true and nothing breaks:
+        // a merge a run asked for appears in the feed with no run attached, which costs the person
+        // reading it the link back and costs the queue nothing. Chunk 4 is where threading it earns
+        // its keep.
         // (`reconcile_interrupted` does attach one, because it reads whole rows rather than a claim.)
         Ok(()) => {
             let _ = crate::feed::append(
                 pool,
-                Some(project_id),
+                Some(claimed.project_id.as_str()),
                 "vcs_request_finished",
                 &format!("vcs request {id} {}", outcome.status()),
                 None,
@@ -764,7 +1134,7 @@ pub async fn drain_once(
         // place it survives.
         Err(sqlx::Error::RowNotFound) => tracing::warn!(
             vcs_request_id = id,
-            project_id = %project_id,
+            repo_key = %repo_key,
             ?outcome,
             "a vcs request stopped running before its outcome arrived; the row refused it, so it is recorded here"
         ),
@@ -774,7 +1144,7 @@ pub async fn drain_once(
         // line is the only account of why the queue stopped.
         Err(error) => tracing::error!(
             vcs_request_id = id,
-            project_id = %project_id,
+            repo_key = %repo_key,
             ?outcome,
             %error,
             "could not record how a vcs request ended; it stays running until the daemon restarts"
@@ -824,13 +1194,13 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
     loop {
         interval.tick().await;
 
-        let projects: Vec<String> = match sqlx::query_scalar(
-            "SELECT DISTINCT project_id FROM vcs_requests WHERE status = 'queued'",
+        let repositories: Vec<String> = match sqlx::query_scalar(
+            "SELECT DISTINCT repo_key FROM vcs_requests WHERE status = 'queued'",
         )
         .fetch_all(&pool)
         .await
         {
-            Ok(projects) => projects,
+            Ok(repositories) => repositories,
             // Best-effort, like every other polling loop in this crate: a failed poll is the next
             // tick's problem, not a reason to stop draining every repository for ever.
             Err(error) => {
@@ -839,12 +1209,12 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
             }
         };
 
-        for project_id in projects {
+        for repo_key in repositories {
             let pool = pool.clone();
             let executor = std::sync::Arc::clone(&executor);
-            tokio::spawn(async move {
-                while drain_once(&pool, &project_id, executor.as_ref()).await {}
-            });
+            tokio::spawn(
+                async move { while drain_once(&pool, &repo_key, executor.as_ref()).await {} },
+            );
         }
     }
 }
@@ -988,19 +1358,22 @@ mod tests {
         pool
     }
 
-    fn request(origin: Origin) -> SubmitRequest {
-        request_for("alpha", origin)
+    fn repo() -> ResolvedRepo {
+        repo_for("alpha")
     }
 
-    fn request_for(project: &str, origin: Origin) -> SubmitRequest {
-        SubmitRequest {
-            op: Op::Merge {
-                source: "feat/x".into(),
-                target: "master".into(),
-            },
-            project_id: project.into(),
-            project_root: "C:/repo".into(),
-            origin,
+    /// In tests the repository key is the project name. That keeps every existing `claim_next(&pool,
+    /// "alpha")` meaning what it meant, so the rewrite cannot silently swap a key for a label — and it
+    /// leaves `two_projects_naming_one_repository_cannot_both_be_running` as the one place where the two
+    /// deliberately differ.
+    fn repo_for(project: &str) -> ResolvedRepo {
+        ResolvedRepo::synthetic(project, "C:/repo", project)
+    }
+
+    fn merge_op() -> Op {
+        Op::Merge {
+            source: "feat/x".into(),
+            target: "master".into(),
         }
     }
 
@@ -1057,11 +1430,16 @@ mod tests {
         status: &str,
         args: &str,
     ) -> sqlx::Result<i64> {
+        // `repo_key` is bound to the same project this is given, for the reason `repo_for` states:
+        // in tests the repository key is the project name. Left to the column's `''` default these
+        // rows would be invisible to every `claim_next` and would collide with each other on the
+        // partial unique index — two failures with nothing to do with what any caller is testing.
         sqlx::query(
-            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at)
-             VALUES ('merge', ?, ?, 'C:/repo', 'human', ?, '2026-08-02T00:00:00Z')",
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, status, created_at)
+             VALUES ('merge', ?, ?, 'C:/repo', ?, 'human', ?, '2026-08-02T00:00:00Z')",
         )
         .bind(args)
+        .bind(project)
         .bind(project)
         .bind(status)
         .execute(pool)
@@ -1136,7 +1514,9 @@ mod tests {
     #[tokio::test]
     async fn a_human_request_needs_no_second_approval() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert_eq!(status_of(&pool, id).await, "queued");
     }
 
@@ -1150,7 +1530,9 @@ mod tests {
     #[tokio::test]
     async fn a_shell_request_carries_the_same_approval_a_human_s_does() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Shell)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Shell)
+            .await
+            .unwrap();
 
         assert_eq!(status_of(&pool, id).await, "queued");
         let origin: String = sqlx::query_scalar("SELECT origin FROM vcs_requests WHERE id = ?")
@@ -1166,7 +1548,9 @@ mod tests {
     #[tokio::test]
     async fn an_autonomous_request_waits_for_approval_before_it_can_queue() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
         assert_eq!(status_of(&pool, id).await, "awaiting_approval");
     }
 
@@ -1180,8 +1564,10 @@ mod tests {
     async fn only_a_run_puts_its_id_in_run_id() {
         let pool = test_pool().await;
 
-        let from_run = submit(&pool, &request(Origin::Run(7))).await.unwrap();
-        let from_job = submit(&pool, &request_for("beta", Origin::Job(7)))
+        let from_run = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        let from_job = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Job(7))
             .await
             .unwrap();
 
@@ -1192,8 +1578,12 @@ mod tests {
     #[tokio::test]
     async fn the_queue_is_served_in_arrival_order() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
-        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         assert_eq!(claim_next(&pool, "alpha").await.unwrap().unwrap().id, first);
         assert!(
@@ -1222,15 +1612,40 @@ mod tests {
     #[tokio::test]
     async fn separate_repositories_do_not_wait_on_each_other() {
         let pool = test_pool().await;
-        submit(&pool, &request_for("alpha", Origin::Human))
+        submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        submit(&pool, &request_for("beta", Origin::Human))
+        submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
         assert!(claim_next(&pool, "beta").await.unwrap().is_some());
+    }
+
+    /// Two project ids, one repository. The queue's promise is per REPOSITORY, so the second waits.
+    ///
+    /// Before this chunk both were claimable at once: the unique index and the claim both filtered on
+    /// `project_id` while the git that would run used `project_root`. Inert only because nothing in
+    /// production built a request.
+    #[tokio::test]
+    async fn two_projects_naming_one_repository_cannot_both_be_running() {
+        let pool = test_pool().await;
+        let alpha = ResolvedRepo::synthetic("alpha", "C:/repo", "SHARED");
+        let beta = ResolvedRepo::synthetic("beta", "C:/repo", "SHARED");
+
+        submit(&pool, &alpha, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        submit(&pool, &beta, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        assert!(claim_next(&pool, "SHARED").await.unwrap().is_some());
+        assert!(
+            claim_next(&pool, "SHARED").await.unwrap().is_none(),
+            "the second project claimed the repository the first is holding"
+        );
     }
 
     /// A row nobody can execute must not take the repository down with it.
@@ -1247,7 +1662,9 @@ mod tests {
         let corrupt = insert(&pool, "alpha", "queued", r#"{"op":"rm_rf"}"#)
             .await
             .unwrap();
-        let behind_it = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let behind_it = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         assert!(
             claim_next(&pool, "alpha").await.is_err(),
@@ -1289,7 +1706,9 @@ mod tests {
     #[tokio::test]
     async fn a_claim_carries_the_operation_and_the_repository_it_names() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let claimed = claim_next(&pool, "alpha").await.unwrap().unwrap();
         assert_eq!(
@@ -1309,7 +1728,9 @@ mod tests {
     #[tokio::test]
     async fn a_succeeded_request_records_the_commit_it_produced() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap().unwrap();
 
         finish(
@@ -1352,7 +1773,9 @@ mod tests {
     #[tokio::test]
     async fn a_successful_operation_keeps_what_it_printed() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -1374,7 +1797,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_request_records_why_and_what_it_printed() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap().unwrap();
 
         finish(
@@ -1422,7 +1847,9 @@ mod tests {
     async fn a_request_that_never_ran_is_distinguishable_from_one_that_ran_and_failed() {
         let pool = test_pool().await;
 
-        let never_ran = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let never_ran = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -1434,7 +1861,9 @@ mod tests {
         .await
         .unwrap();
 
-        let ran = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let ran = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -1498,7 +1927,9 @@ mod tests {
     #[tokio::test]
     async fn nothing_awaiting_approval_is_ever_claimable() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_none());
     }
 
@@ -1511,13 +1942,13 @@ mod tests {
     #[tokio::test]
     async fn a_listing_narrows_to_one_repository_and_puts_the_newest_first() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request_for("alpha", Origin::Human))
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let second = submit(&pool, &request_for("beta", Origin::Human))
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let third = submit(&pool, &request_for("alpha", Origin::Human))
+        let third = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
@@ -1550,7 +1981,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_running_at_startup_is_marked_interrupted_not_retried() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
 
         let reconciled = reconcile_interrupted(&pool).await.unwrap();
@@ -1595,7 +2028,9 @@ mod tests {
     #[tokio::test]
     async fn a_reconciled_request_cannot_be_finished_by_a_late_worker() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         reconcile_interrupted(&pool).await.unwrap();
 
@@ -1630,8 +2065,12 @@ mod tests {
     #[tokio::test]
     async fn the_queue_is_drained_in_order_and_each_outcome_recorded() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
-        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let executor = FakeVcsExecutor::succeeding_with("abc123");
         drain_once(&pool, "alpha", &executor).await;
@@ -1680,7 +2119,9 @@ mod tests {
     #[tokio::test]
     async fn a_failing_operation_is_recorded_and_frees_the_repository() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         drain_once(
             &pool,
@@ -1697,7 +2138,9 @@ mod tests {
         );
 
         // The point of this half: a failure must not leave the repository claimed forever.
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
     }
 
@@ -1711,7 +2154,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_says_whether_it_found_anything_to_do() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let busy = FakeVcsExecutor::succeeding_with("abc123");
         assert!(
@@ -1739,7 +2184,9 @@ mod tests {
     #[tokio::test]
     async fn a_finished_request_is_reported_in_the_feed() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
@@ -1792,7 +2239,9 @@ mod tests {
     #[tokio::test]
     async fn an_outcome_the_row_refuses_survives_in_the_log_and_is_not_called_a_jam() {
         let pool = test_pool().await;
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
 
         let logged = logged_during(async {
@@ -1828,7 +2277,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_whose_row_was_reconciled_out_from_under_it_does_not_overwrite_the_record() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         // A 10x margin over the reconcile's own wait, so which lands first is not a race: an
         // in-memory claim takes microseconds, and `reconciled == 1` below fails loudly rather than
@@ -1884,7 +2335,9 @@ mod tests {
 
         // And the repository is free: a refused write means the row is terminal, so the queue moves
         // on rather than waiting behind it.
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert!(claim_next(&pool, "alpha").await.unwrap().is_some());
     }
 
@@ -1901,7 +2354,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_abandoned_mid_operation_jams_the_repository_until_a_restart_reconciles() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         // Far longer than the timeout, so which of the two fires is not a race.
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
@@ -1927,10 +2382,49 @@ mod tests {
         // acceptable rather than merely admitted.
         assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
         assert_eq!(status_of(&pool, id).await, "interrupted");
-        submit(&pool, &request(Origin::Human)).await.unwrap();
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         assert!(
             claim_next(&pool, "alpha").await.unwrap().is_some(),
             "once reconciled, the repository is free again"
+        );
+    }
+
+    /// The worker looks for repositories by their KEY, and in production a key is never a project's
+    /// name — it is git's canonical common directory. Polling `DISTINCT project_id` here would hand
+    /// `claim_next` a label that no row carries, and the queue would drain nothing, for ever, in
+    /// silence.
+    ///
+    /// **Every other test in this module is structurally blind to that.** `repo_for` makes the key
+    /// equal the project name on purpose, so that moving the lock from label to key preserved each
+    /// existing assertion's meaning. The cost of that choice is exactly this blindness, and it is
+    /// not hypothetical: a mutation that polls `project_id` passed all 41 of the others. This is the
+    /// one place where the two must differ.
+    #[tokio::test]
+    async fn the_worker_looks_for_repositories_by_key_and_not_by_project_name() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "a-key-that-is-not-a-project-name");
+        let id = submit(&pool, &repo, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
+        let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if status_of(&pool, id).await == "succeeded" {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        worker.abort();
+        settled.expect(
+            "the worker never found the repository — it is looking for it by the project's name",
         );
     }
 
@@ -1939,10 +2433,10 @@ mod tests {
     #[tokio::test]
     async fn separate_repositories_are_drained_concurrently() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request_for("alpha", Origin::Human))
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let second = submit(&pool, &request_for("beta", Origin::Human))
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
@@ -1991,7 +2485,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let first = submit(&pool, &request_for("alpha", Origin::Human))
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
         let drained_once = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2008,7 +2502,7 @@ mod tests {
         drained_once.expect("the worker's first pass should drain what was queued for it");
 
         // Submitted only now: the pass above is over, so nothing but a later poll can find this.
-        let second = submit(&pool, &request_for("beta", Origin::Human))
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
         let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2047,8 +2541,12 @@ mod tests {
     #[tokio::test]
     async fn one_repository_is_still_drained_in_order_one_at_a_time() {
         let pool = test_pool().await;
-        let first = submit(&pool, &request(Origin::Human)).await.unwrap();
-        let second = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
@@ -2083,7 +2581,9 @@ mod tests {
     #[tokio::test]
     async fn a_finished_request_returns_its_outcome_without_waiting() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
         let started = std::time::Instant::now();
@@ -2107,7 +2607,9 @@ mod tests {
     #[tokio::test]
     async fn an_unfinished_request_hands_back_a_ticket_rather_than_failing() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let ticket = wait_for(&pool, id, Duration::from_millis(50))
             .await
@@ -2123,7 +2625,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_requests_ticket_carries_its_id_and_its_reason() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         drain_once(
             &pool,
             "alpha",
@@ -2159,7 +2663,9 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_request_ends_the_wait_rather_than_running_it_out() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
         claim_next(&pool, "alpha").await.unwrap();
         finish(
             &pool,
@@ -2187,6 +2693,195 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "blocked is terminal: the wait must not run to its deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_cancels_the_requests_it_had_not_started() {
+        let pool = test_pool().await;
+        let queued = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+
+        assert_eq!(cancel_for_run(&pool, 7).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, queued).await, "cancelled");
+    }
+
+    /// Spec §7 is explicit: an operation already in flight finishes. The queue could not stop it in any
+    /// case — the git it spawned belongs to the daemon, not to the run whose context ran out.
+    #[tokio::test]
+    async fn cancelling_a_run_does_not_touch_an_operation_already_in_flight() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        // Approved, then claimed — the shape Chunk 4 will produce.
+        sqlx::query("UPDATE vcs_requests SET status = 'queued' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap().unwrap();
+
+        assert_eq!(cancel_for_run(&pool, 7).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, id).await, "running");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_leaves_another_runs_requests_alone() {
+        let pool = test_pool().await;
+        let mine = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        let theirs = submit(&pool, &repo(), &merge_op(), Origin::Run(8))
+            .await
+            .unwrap();
+
+        cancel_for_run(&pool, 7).await.unwrap();
+
+        assert_eq!(status_of(&pool, mine).await, "cancelled");
+        assert_eq!(status_of(&pool, theirs).await, "awaiting_approval");
+    }
+
+    /// A human's request is not a run's request, even when a run is what happens to be ending.
+    #[tokio::test]
+    async fn a_humans_request_survives_a_run_ending() {
+        let pool = test_pool().await;
+        let human = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        cancel_for_run(&pool, 7).await.unwrap();
+
+        assert_eq!(status_of(&pool, human).await, "queued");
+    }
+
+    /// The smallest `runs` row the table will accept: `prompt`, `status` and `created_at` are its
+    /// only NOT NULL columns without a default (`core/migrations/0002_runs.sql`). Written by hand
+    /// rather than by spawning a run, because the one column the reaper reads is `status`, and going
+    /// through `runs.rs` would drag a whole runner in to set it.
+    ///
+    /// The id is a parameter rather than returned, so a test can name the same number in the
+    /// request's `Origin::Run` and read as one fact what the reaper has to join on.
+    async fn insert_run(pool: &sqlx::SqlitePool, id: i64, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at)
+             VALUES (?, 'merge it', ?, '2026-08-02T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A request a run asked for that is past approval and waiting its turn — the state every one of
+    /// these tests is about, and the one `submit` cannot produce directly, since a `Run` request
+    /// starts `awaiting_approval`.
+    async fn queued_request_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> i64 {
+        let id = submit(pool, &repo(), &merge_op(), Origin::Run(run_id))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE vcs_requests SET status = 'queued' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The push half cannot be complete — four writers set a run's terminal status without going through
+    /// `finalize_termination`. This is the half that does not depend on anybody remembering.
+    #[tokio::test]
+    async fn a_request_whose_run_died_by_some_other_door_is_reaped_before_the_next_claim() {
+        let pool = test_pool().await;
+        // `timed_out` is written by a direct UPDATE in `runs.rs`'s progress-deadline arm, which does
+        // not sweep. Nothing told the queue this run was over; the queue has to ask.
+        insert_run(&pool, 7, "timed_out").await;
+        let id = queued_request_for_run(&pool, 7).await;
+
+        let executor = FakeVcsExecutor::succeeding_with("abc123");
+        assert!(
+            !drain_once(&pool, "alpha", &executor).await,
+            "the reap leaves nothing claimable, so the drain must report the queue empty"
+        );
+
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+        // The half that a status assertion alone cannot make: a merge that ran and was then
+        // overwritten with `cancelled` would satisfy the line above and still have touched the
+        // repository on behalf of a run that no longer exists.
+        assert_eq!(
+            executor.calls(),
+            0,
+            "a dead run's merge must never reach git"
+        );
+    }
+
+    /// The trap, again and one level deeper: a run paused for a human resumes, and its merge must
+    /// survive the pause. `status != 'running'` would fail this; a list of ended statuses passes it.
+    #[tokio::test]
+    async fn a_request_whose_run_is_only_paused_for_approval_is_not_reaped() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "awaiting_approval").await;
+        let id = queued_request_for_run(&pool, 7).await;
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// A request nobody's run owns is nobody's to reap.
+    #[tokio::test]
+    async fn a_humans_request_is_never_reaped() {
+        let pool = test_pool().await;
+        // An ended run exists, and is not this request's: without it the test would pass against a
+        // reaper that simply found nothing ended, which is not what it claims to check.
+        insert_run(&pool, 7, "cancelled").await;
+        let human = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, human).await, "queued");
+    }
+
+    /// A run that finished its work asked for the merge and should have it. `completed` is what
+    /// `runs.rs` writes for an exit code of zero (`runs.rs`'s terminal-status match, and the status
+    /// comment at the top of `0002_runs.sql`), and it is deliberately absent from
+    /// `runs::ENDED_RUN_STATUSES`.
+    #[tokio::test]
+    async fn a_request_whose_run_completed_normally_is_not_reaped() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "completed").await;
+        let id = queued_request_for_run(&pool, 7).await;
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// A cancelled request is terminal, so a caller waiting on one must be answered rather than held to
+    /// the deadline. This is the argument `a_blocked_request_ends_the_wait_rather_than_running_it_out`
+    /// already makes for `blocked`, and it becomes true for `cancelled` in this task.
+    #[tokio::test]
+    async fn a_cancelled_request_ends_the_wait_rather_than_running_it_out() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        cancel_for_run(&pool, 7).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let ticket = wait_for(&pool, id, Duration::from_secs(5)).await.unwrap();
+
+        assert_eq!(ticket.status, "cancelled");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     /// A caller waiting on an id nothing ever inserted must not spend the deadline finding that
@@ -2217,7 +2912,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_still_awaiting_approval_hands_back_a_ticket_too() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Run(7))).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
 
         let ticket = wait_for(&pool, id, Duration::from_millis(50))
             .await
@@ -2237,7 +2934,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_finishes_mid_wait_is_reported_before_the_deadline() {
         let pool = test_pool().await;
-        let id = submit(&pool, &request(Origin::Human)).await.unwrap();
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
 
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(20));
         let started = std::time::Instant::now();
@@ -2277,17 +2976,14 @@ mod tests {
         let roots = crate::git_exec::tests::space_free_tempdir("nucleos-vcs-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
 
+        // Real root, synthetic key: what this test exercises is the executor against a repository
+        // that is really there, and `repo_for`'s "the key is the project name" is what keeps
+        // `drain_once(&pool, "alpha", ..)` below meaning what it meant.
         let id = submit(
             &pool,
-            &SubmitRequest {
-                op: Op::Merge {
-                    source: "feat/x".into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".into(),
-                project_root: repo.to_string_lossy().into_owned(),
-                origin: Origin::Human,
-            },
+            &ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha"),
+            &merge_op(),
+            Origin::Human,
         )
         .await
         .unwrap();
@@ -2331,17 +3027,12 @@ mod tests {
         std::fs::write(repo.join("feature.txt"), "half-finished thought\n").expect("write");
         let before = crate::git_exec::tests::sha_of(&repo, "master");
 
+        // Real root, synthetic key, for the reason the test above states.
         let id = submit(
             &pool,
-            &SubmitRequest {
-                op: Op::Merge {
-                    source: "feat/x".into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".into(),
-                project_root: repo.to_string_lossy().into_owned(),
-                origin: Origin::Human,
-            },
+            &ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha"),
+            &merge_op(),
+            Origin::Human,
         )
         .await
         .unwrap();
@@ -2366,5 +3057,93 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(summaries, vec![format!("vcs request {id} blocked")]);
+    }
+
+    /// A branch name that could be read as an option must not exist, let alone reach argv.
+    #[test]
+    fn a_branch_name_cannot_be_an_option() {
+        for bad in ["-f", "--no-verify", "--upload-pack=x", "--", "", "  "] {
+            assert!(
+                Branch::new(bad).is_err(),
+                "{bad:?} was accepted as a branch name"
+            );
+        }
+    }
+
+    /// Whitespace and control characters go the same way; surrounding whitespace is trimmed rather
+    /// than rejected, because a model that sends " master" meant `master`.
+    #[test]
+    fn a_branch_name_is_trimmed_and_then_must_be_one_word() {
+        assert_eq!(Branch::new("  feature  ").unwrap().as_str(), "feature");
+        for bad in ["a b", "a\tb", "a\nb"] {
+            assert!(Branch::new(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// The route the flat builder does NOT cover, and the reason validation lives in the type rather
+    /// than in a constructor: `http.rs` deserializes an `Op` straight from the request body.
+    #[test]
+    fn a_dashed_branch_cannot_arrive_as_json_either() {
+        let raw = r#"{"op":"merge","source":"--upload-pack=touch x","target":"master"}"#;
+
+        assert!(serde_json::from_str::<Op>(raw).is_err());
+    }
+
+    /// A stored row is not trusted either: `from_stored` parses the same JSON.
+    #[test]
+    fn a_hand_edited_row_with_a_dashed_branch_will_not_parse() {
+        assert!(
+            Op::from_stored("merge", r#"{"op":"merge","source":"-f","target":"master"}"#).is_err()
+        );
+    }
+
+    /// A valid operation still round-trips through the column-plus-payload storage `from_stored`
+    /// reads.
+    #[test]
+    fn a_valid_operation_still_round_trips_through_storage() {
+        let op = Op::Merge {
+            source: "feat/x".into(),
+            target: "master".into(),
+        };
+
+        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
+    }
+
+    /// The door's whole vocabulary, stated as a table.
+    #[test]
+    fn the_queue_speaks_merge_and_says_so_about_everything_else() {
+        assert_eq!(
+            Op::from_request("merge", Some("feature"), Some("master")).unwrap(),
+            Op::Merge {
+                source: "feature".into(),
+                target: "master".into()
+            }
+        );
+
+        // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
+        // missing — "unknown operation: push" would send a caller looking for a typo.
+        let error = Op::from_request("push", Some("origin"), Some("master")).unwrap_err();
+        assert!(error.contains("not yet"), "unexpected error: {error}");
+        assert!(
+            error.contains("merge"),
+            "the error must name what the queue CAN do: {error}"
+        );
+
+        assert!(
+            Op::from_request("frobnicate", None, None)
+                .unwrap_err()
+                .contains("frobnicate")
+        );
+        assert!(
+            Op::from_request("merge", Some("feature"), None)
+                .unwrap_err()
+                .contains("target")
+        );
+        assert!(
+            Op::from_request("merge", None, Some("master"))
+                .unwrap_err()
+                .contains("source")
+        );
+        assert!(Op::from_request(" Merge ", Some("feature"), Some("master")).is_ok());
     }
 }
