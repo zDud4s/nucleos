@@ -49,7 +49,7 @@ fn git_bin() -> String {
 /// The diff-side command strings `inspect.rs` disables (`diff.external`, a `textconv` filter) are
 /// deliberately absent: nothing here produces a diff, and carrying flags that cannot apply would
 /// advertise a protection that was never at issue in this module.
-fn git() -> tokio::process::Command {
+pub(crate) fn git() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(git_bin());
     command.arg("-c").arg("core.fsmonitor=");
     command
@@ -2983,6 +2983,36 @@ mod tests {
         assert_eq!(owner_from_dir_name("job-5"), Some(Owner::Job(5)));
         assert_eq!(owner_from_dir_name("run-5"), Some(Owner::Run(5)));
         assert_eq!(owner_from_dir_name("not-a-run"), None);
+    }
+
+    /// The integration worktree is the daemon's own, and nothing in `vcs.rs` protects it from the
+    /// sweeper — only this module's naming rule does. The `run-99` directory is the control: without
+    /// it a sweeper that returned nothing at all would pass this test while collecting everything.
+    #[tokio::test]
+    async fn the_integration_worktree_is_not_an_orphan() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let container = space_free_tempdir();
+        let project_root = container.path().join("repo");
+        let roots = container.path().join("worktrees");
+        let _env = WorktreeRootEnv::set(Some(roots.as_path()));
+
+        let integration = crate::git_exec::integration_worktree(&project_root);
+        std::fs::create_dir_all(&integration).expect("create the integration worktree directory");
+        std::fs::create_dir_all(roots.join("run-99")).expect("create the control directory");
+
+        let orphans = orphaned_worktrees(&pool, &project_root, Duration::ZERO)
+            .await
+            .expect("sweep");
+
+        assert!(
+            orphans.contains(&roots.join("run-99")),
+            "the control must be collected, or this test proves nothing"
+        );
+        assert!(
+            !orphans.contains(&integration),
+            "the daemon's own worktree must never be swept"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -14,6 +14,7 @@ mod email;
 mod feed;
 mod files;
 mod gate;
+mod git_exec;
 mod handoff;
 mod health;
 mod hooks;
@@ -41,6 +42,7 @@ mod storage;
 mod transcribe;
 mod triage;
 mod trust;
+mod vcs;
 mod voice;
 mod web;
 mod web_client;
@@ -209,6 +211,27 @@ async fn main() {
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "orphaned-job reconciliation failed"),
+    }
+
+    // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
+    // below: louder than the sweep, quieter than the panics.
+    //
+    // A `vcs_requests` row left `running` holds its repository's only slot — the partial unique
+    // index sees to that — so failing to clear it means no git operation for that project until
+    // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
+    // refusing to boot mail, voice, calendar and runs over it would trade a stuck repository for a
+    // stuck machine.
+    match vcs::reconcile_interrupted(&pool).await {
+        Ok(released) if released > 0 => {
+            tracing::warn!(
+                "reconciled {released} vcs request(s) left 'running' by a previous crash -> 'interrupted'"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(
+            %error,
+            "vcs request reconciliation failed — a repository may stay queue-locked, and nothing retries before the next startup"
+        ),
     }
 
     // After the run reconciliations above, so nothing from a previous life still counts as live.
@@ -546,6 +569,10 @@ async fn main() {
     tokio::spawn(job::run_job_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
+    tokio::spawn(vcs::run_queue_worker(
+        state.pool.clone(),
+        std::sync::Arc::new(git_exec::GitExecutor::default()),
+    ));
 
     // Spawned whether or not the pillar is enabled: the loop also owns retention, and bodies
     // already stored do not stop needing to expire because polling was switched off.
