@@ -218,6 +218,13 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// of `/email/send`. Queueing is Admin's.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
+    // A job is several runs over one worktree, so it belongs to the scope that buys runs rather
+    // than to a scope of its own. What matters more is where it is NOT: `Scope::Run` reaches only
+    // `HOOK_ROUTE`, so an autonomous run cannot ask for a job — and it must never be able to. Each
+    // job starts runs, and a run that could start jobs would be a self-replication machine that no
+    // brake in this house counts, because none of them counts recursion. That is the same escape
+    // `runs.rs` describes closing for `POST /runs`.
+    (Method::POST, "/jobs"),
     (Method::POST, "/webhooks/push"),
     (Method::POST, "/presets/{id}/run"),
     (Method::POST, "/assistant/message"),
@@ -500,6 +507,7 @@ mod tests {
             .route("/feed", get(|| async {}))
             .route("/runs", get(|| async {}).post(|| async {}))
             .route("/runs/{id}", get(|| async {}))
+            .route("/jobs", get(|| async {}).post(|| async {}))
             .route("/webhooks/push", post(|| async {}))
             .route("/presets", get(|| async {}).post(|| async {}))
             .route("/presets/{id}/run", post(|| async {}))
@@ -717,6 +725,58 @@ mod tests {
         assert_eq!(
             status_of(&app, "GET", "/secret", &run_token).await,
             StatusCode::FORBIDDEN
+        );
+    }
+
+    /// The door a job route must never open: an autonomous run asking for a job.
+    ///
+    /// Each job starts runs, so a run that could start jobs is a self-replication machine — and not
+    /// one brake in this house counts recursion. The budget counts dollars, the WIP limit counts
+    /// unreviewed proposals, `one_live_job_per_project` counts one project.
+    ///
+    /// **Honest note on what this test is worth.** It passes before `POST /jobs` was added to any
+    /// table as well as after, because `permits` gives `Scope::Run` exactly one route and everything
+    /// else is refused by construction. So it did not drive the change and it is not evidence the
+    /// change works — it is a pin, and its value is the day somebody widens `Scope::Run` to a second
+    /// route and has to decide, in front of this assertion, whether jobs are on the list. The test
+    /// that DID have to fail first is the one below it.
+    #[tokio::test]
+    async fn a_run_token_cannot_ask_for_a_job() {
+        let state = test_state("control-token").await;
+        let (_, run_token) = running_run_with_token(&state).await;
+        let app = protected_router(state);
+
+        // 403 rather than 401: it authenticated perfectly well. It is simply not something that
+        // gets to ask for a night's work.
+        assert_eq!(
+            status_of(&app, "POST", "/jobs", &run_token).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_of(&app, "GET", "/jobs", &run_token).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// The grant that this change actually makes, and the one that failed before it.
+    ///
+    /// A job is several runs over one worktree, so the key that buys runs buys it. Asserting the
+    /// refusals beside it is what stops this from reading as "run-creating became admin".
+    #[tokio::test]
+    async fn a_run_creating_api_key_may_ask_for_a_job() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "POST", "/jobs", &token).await,
+            StatusCode::OK,
+            "a key that may start runs may ask for the job that starts several"
+        );
+        assert_eq!(
+            status_of(&app, "POST", "/autopilot/kill", &token).await,
+            StatusCode::FORBIDDEN,
+            "and it is still not an admin key"
         );
     }
 

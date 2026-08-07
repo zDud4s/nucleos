@@ -24,6 +24,17 @@ struct RunParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct JobParams {
+    project_id: String,
+    prompt: String,
+    /// Optional in the schema and inert in the daemon until Chunk 3. Kept in the schema now so the
+    /// tool description can say what it will mean, rather than the schema changing under a model
+    /// that has already learned the tool.
+    budget_usd: Option<f64>,
+    max_rounds: Option<i64>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct IdParams {
     id: i64,
 }
@@ -67,6 +78,38 @@ impl NucleosTools {
     ) -> String {
         match self.client.create_run(&project_id, &prompt).await {
             Ok(id) => serde_json::json!({"run_id": id}).to_string(),
+            Err(msg) => error_json(msg),
+        }
+    }
+
+    // The description has to distinguish this from `create_run` in the model's own terms, not in
+    // ours: if the two read alike it picks between them at random, and the two are not
+    // interchangeable in either direction. Asking for a run when a job was wanted gets one context
+    // window for a night's work; asking for a job when a run was wanted spends a worktree and a
+    // chain of runs on something one window would have finished.
+    #[tool(
+        description = "Create a NucleOS job: a large task that runs as a SEQUENCE of runs over a \
+                       git worktree of its own, each with a fresh context window. Use this when \
+                       the work is too large for one context window, or when asked to work through \
+                       something end to end or over a long period. Use create_run instead for \
+                       anything one context window can finish. The project must be in active mode. \
+                       budget_usd and max_rounds are accepted but have no effect yet."
+    )]
+    async fn create_job(
+        &self,
+        Parameters(JobParams {
+            project_id,
+            prompt,
+            budget_usd,
+            max_rounds,
+        }): Parameters<JobParams>,
+    ) -> String {
+        match self
+            .client
+            .create_job(&project_id, &prompt, budget_usd, max_rounds)
+            .await
+        {
+            Ok(job_id) => serde_json::json!({"job_id": job_id}).to_string(),
             Err(msg) => error_json(msg),
         }
     }
@@ -226,6 +269,8 @@ pub enum ToolEffect {
 const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("approve_proposal", ToolEffect::Acts),
     ("cancel_run", ToolEffect::Acts),
+    // A job is a chain of runs, so it is at least as much of an act as one run is.
+    ("create_job", ToolEffect::Acts),
     ("create_run", ToolEffect::Acts),
     ("get_budget", ToolEffect::ReadsOwn),
     ("get_email", ToolEffect::ReadsUntrusted),
@@ -303,6 +348,7 @@ mod tests {
             [
                 "approve_proposal",
                 "cancel_run",
+                "create_job",
                 "create_run",
                 "get_budget",
                 "get_email",
@@ -393,6 +439,7 @@ mod tests {
 
         assert_eq!(tool_effect("approve_proposal"), ToolEffect::Acts);
         assert_eq!(tool_effect("set_kill"), ToolEffect::Acts);
+        assert_eq!(tool_effect("create_job"), ToolEffect::Acts);
         assert_eq!(tool_effect("create_run"), ToolEffect::Acts);
 
         assert_eq!(tool_effect("list_proposals"), ToolEffect::ReadsOwn);

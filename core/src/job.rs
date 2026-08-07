@@ -446,7 +446,7 @@ pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// What a rule asks for when it starts a job.
+/// What a caller asks for when it starts a job.
 ///
 /// The shape is copied onto the row rather than re-read per node: `.ai/autopilot.yaml` can be
 /// edited mid-flight, and a job that changed shape between its own nodes would gate some items and
@@ -454,7 +454,11 @@ pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
 pub struct NewJob<'a> {
     pub project_id: &'a str,
     pub project_root: &'a str,
-    pub rule_name: &'a str,
+    /// `None` when no rule asked for this job — a person did, through the shell or through the
+    /// Telegram assistant. The column has been nullable since migration 0042, so this is the type
+    /// catching up with the schema rather than a widening: a sentinel name would invent a rule that
+    /// does not exist and that nothing could ever look up.
+    pub rule_name: Option<&'a str>,
     pub prompt: &'a str,
     pub max_items: i64,
     pub gate_each: bool,
@@ -493,6 +497,249 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+/// What `POST /jobs` accepts.
+///
+/// Neither the mode nor the root appears here, and neither ever will: both are resolved from the
+/// project's own autopilot state (`resolve_start`), because a caller that could name its own root
+/// would be naming a directory this daemon then creates a worktree in and writes to.
+#[derive(Deserialize)]
+pub struct CreateJobRequest {
+    pub project_id: String,
+    pub prompt: String,
+    /// Reserved for Chunk 3. Accepted and **ignored** here rather than rejected: a field the client
+    /// sends and the server refuses is a client that has to be rewritten the day the server learns
+    /// it, and the client is a tool description a model reads.
+    ///
+    /// `expect` rather than `allow`, on purpose. The day Chunk 3 reads either field the lint stops
+    /// firing and this attribute becomes an error, which is the compiler asking for it back. An
+    /// `allow` would sit here silently covering whatever went dead next.
+    #[expect(
+        dead_code,
+        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
+    )]
+    pub budget_usd: Option<f64>,
+    #[expect(
+        dead_code,
+        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
+    )]
+    pub max_rounds: Option<i64>,
+}
+
+/// Why a job cannot be started for a project.
+///
+/// Three refusals rather than one error string, because a caller answers them differently: an
+/// unknown project is a 404, and the other two are a 422 about a machine configured differently
+/// from what the request assumed rather than a request that is malformed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartRefusal {
+    UnknownProject,
+    NotActive(crate::autopilot::Mode),
+    NoRoot,
+}
+
+impl StartRefusal {
+    /// The sentence handed back to whoever asked. It says which state the project is in, because a
+    /// 422 that will not say what is wrong is a 422 somebody retries unchanged.
+    pub fn reason(&self, project_id: &str) -> String {
+        match self {
+            Self::UnknownProject => format!("unknown project: {project_id}"),
+            Self::NotActive(crate::autopilot::Mode::Shadow) => format!(
+                "project {project_id} is in shadow mode, which is plan-only; a job writes to a \
+                 worktree and needs active"
+            ),
+            Self::NotActive(_) => format!("project {project_id} has autopilot off"),
+            Self::NoRoot => format!("project {project_id} is active but has no root recorded"),
+        }
+    }
+}
+
+/// What a start resolved to.
+///
+/// One field today. It is a value rather than a bare `String` because Chunk 4 adds the claimed slot
+/// number beside it, and a caller that had unwrapped a `String` would have to be rewritten then.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedStart {
+    pub project_root: String,
+}
+
+/// PURE: what a job request resolves to, or why it does not.
+///
+/// Neither the mode nor the root is ever chosen by whoever asks — both are read off the project's
+/// own autopilot state, exactly as `resolve_run_request` does for runs.
+///
+/// **A job REQUIRES `Mode::Active`, and that is where this deliberately differs from that
+/// function.** `resolve_run_request` maps `Shadow` onto the `shadow` run mode, which is right for a
+/// run because a run can be plan-only. A job cannot: its plan node has to write the `plan.json`
+/// that the queue is taken from, and a plan-only node writes nothing — so a job quietly demoted to
+/// shadow would do nothing whatsoever while reporting that it was working all night. `Shadow` and
+/// `Off` are refusals with reasons of their own, never fallbacks. Copying that table across without
+/// noticing is the natural mistake here, which is why it has a test of its own.
+pub fn resolve_start(
+    roster: &[crate::autopilot::ProjectSummary],
+    project_id: &str,
+) -> Result<ResolvedStart, StartRefusal> {
+    let project = roster
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or(StartRefusal::UnknownProject)?;
+    if project.mode != crate::autopilot::Mode::Active {
+        return Err(StartRefusal::NotActive(project.mode));
+    }
+    // Active with no root is a real state rather than an impossible one: the root is recorded when
+    // a project is pointed at a directory, and the mode can be set without that having happened.
+    let project_root = project.project_root.clone().ok_or(StartRefusal::NoRoot)?;
+    Ok(ResolvedStart { project_root })
+}
+
+/// How a start attempt ended.
+///
+/// `AlreadyLive` is not a check that failed here — it is `one_live_job_per_project` (migration
+/// 0042) refusing the INSERT. With the constraint in the storage layer the INSERT *is* the lock, so
+/// a scheduler tick and a manual request racing for the same project cannot both pass a check and
+/// then both proceed. It mirrors what `one_open_worktree_run_per_project` does for runs.
+pub enum JobStart {
+    Started(i64),
+    AlreadyLive,
+    Failed,
+}
+
+/// Everything `start` needs, with no trace of who is asking.
+///
+/// Deliberately plain values rather than the `&ScheduleRule` + `&GraphConfig` this used to take.
+/// Those types made the scheduler the only caller that could exist — a rule and a graph config are
+/// what a *rule* has — and the request now arrives from `POST /jobs` as well. Whatever ceiling the
+/// caller applies to `max_items` is applied before it gets here, so this function has one job.
+pub struct StartRequest<'a> {
+    pub project_id: &'a str,
+    pub project_root: &'a str,
+    /// `None` for a job nobody scheduled. See `NewJob::rule_name`.
+    pub rule_name: Option<&'a str>,
+    pub prompt: &'a str,
+    pub max_items: i64,
+    pub gate_each: bool,
+    pub review: bool,
+    pub head_sha: Option<&'a str>,
+}
+
+/// Creates a job and provisions the worktree it will live in.
+///
+/// The worktree belongs to the JOB, not to any of its nodes — that is the whole reason a job can
+/// outlive one context window, and it is why this provisions it here rather than letting the first
+/// node do it.
+///
+/// This lives in `job.rs` rather than in `scheduler.rs` because creating jobs is what this module
+/// is for; the module map describes the scheduler as firing runs "through `runs::create_run_inner`;
+/// never defining them", and the same applies to jobs. It moved here when a second caller appeared:
+/// two copies of this sequence would mean one of them learning a fix the other never learns.
+pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
+    let job_id = match insert_job(
+        &state.pool,
+        &NewJob {
+            project_id: request.project_id,
+            project_root: request.project_root,
+            rule_name: request.rule_name,
+            prompt: request.prompt,
+            max_items: request.max_items,
+            gate_each: request.gate_each,
+            review: request.review,
+            head_sha: request.head_sha,
+        },
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation()) =>
+        {
+            return JobStart::AlreadyLive;
+        }
+        Err(error) => {
+            tracing::warn!(
+                project_id = request.project_id,
+                rule_name = request.rule_name.unwrap_or("(none)"),
+                %error,
+                "could not start a job"
+            );
+            return JobStart::Failed;
+        }
+    };
+
+    let owner = crate::worktree::Owner::Job(job_id);
+    let info = match crate::worktree::create(Path::new(request.project_root), owner).await {
+        Ok(info) => info,
+        Err(error) => {
+            return fail_early(state, request.project_id, job_id, &format!("{error}")).await;
+        }
+    };
+    let path = info.path.to_string_lossy().into_owned();
+    if let Err(error) = crate::worktree::record(
+        &state.pool,
+        owner,
+        request.project_id,
+        request.project_root,
+        &path,
+        &info.branch,
+    )
+    .await
+    {
+        // The directory exists and nothing in the database knows it does. Left alone it would be
+        // invisible to the GC forever; the startup orphan sweeper recognises `job-<id>` and is what
+        // eventually collects it.
+        return fail_early(
+            state,
+            request.project_id,
+            job_id,
+            &format!("its worktree was created but could not be recorded: {error}"),
+        )
+        .await;
+    }
+
+    // Two sentences rather than one with a hole in it. A job nobody scheduled has no rule, and
+    // `for rule 'None'` would be a line a person reads as a bug in the scheduler.
+    let started = match request.rule_name {
+        Some(rule_name) => format!(
+            "job {job_id} started for rule '{rule_name}' on {}",
+            info.branch
+        ),
+        None => format!("job {job_id} started on {}", info.branch),
+    };
+    let _ = crate::feed::append(
+        &state.pool,
+        Some(request.project_id),
+        "job_started",
+        &started,
+        None,
+    )
+    .await;
+    JobStart::Started(job_id)
+}
+
+/// Retires a job that never got as far as its first node, and says so where a person will see it.
+///
+/// A job left live with no worktree would be ticked forever and hold `one_live_job_per_project`,
+/// which would take the whole project's autonomy down with it — silently, since nothing else logs.
+async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) -> JobStart {
+    if let Err(error) = retire(&state.pool, job_id, Outcome::Failed.as_status()).await {
+        tracing::error!(
+            project_id,
+            job_id,
+            %error,
+            "a job could not be provisioned AND could not be retired; it holds the project's job slot"
+        );
+    }
+    let _ = crate::feed::append(
+        &state.pool,
+        Some(project_id),
+        "job_failed",
+        &format!("job {job_id} could not start: {why}"),
+        None,
+    )
+    .await;
+    JobStart::Failed
 }
 
 /// The statuses `one_live_job_per_project` covers, and therefore the ones a tick has to drive.
@@ -1790,7 +2037,7 @@ mod tests {
             &NewJob {
                 project_id,
                 project_root,
-                rule_name: "nightly-backlog",
+                rule_name: Some("nightly-backlog"),
                 prompt: "pull from the todo list and advance what you can",
                 max_items: 5,
                 gate_each: true,
@@ -2317,6 +2564,87 @@ mod tests {
         assert_eq!(list(&pool, None, 20).await.unwrap().len(), 3);
     }
 
+    // ---- resolving a request into a start ------------------------------------------------------
+
+    fn summary(
+        project_id: &str,
+        mode: crate::autopilot::Mode,
+        root: Option<&str>,
+    ) -> crate::autopilot::ProjectSummary {
+        crate::autopilot::ProjectSummary {
+            project_id: project_id.to_string(),
+            mode,
+            project_root: root.map(str::to_string),
+            pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            withheld_classes_ready: 0,
+            promotable: false,
+            open_proposals: 0,
+            wip_limit: None,
+            queue_full: false,
+        }
+    }
+
+    /// The whole refusal table, with no database in sight.
+    ///
+    /// The `Shadow` row is the one that matters. `resolve_run_request` maps shadow onto a real run
+    /// mode, and copying that table across is the natural mistake — but a job's plan node has to
+    /// WRITE `plan.json`, and a plan-only node writes nothing. A job demoted to shadow would do
+    /// nothing at all while reporting that it was working, which is the failure a person only
+    /// discovers in the morning.
+    #[test]
+    fn um_pedido_de_job_resolve_ou_recusa_com_motivo_proprio() {
+        use crate::autopilot::Mode;
+        let roster = vec![
+            summary("off", Mode::Off, Some("/repos/off")),
+            summary("shadow", Mode::Shadow, Some("/repos/shadow")),
+            summary("rootless", Mode::Active, None),
+            summary("live", Mode::Active, Some("/repos/live")),
+        ];
+
+        assert_eq!(
+            resolve_start(&roster, "nao-existe"),
+            Err(StartRefusal::UnknownProject)
+        );
+        assert_eq!(
+            resolve_start(&roster, "off"),
+            Err(StartRefusal::NotActive(Mode::Off))
+        );
+        assert_eq!(
+            resolve_start(&roster, "shadow"),
+            Err(StartRefusal::NotActive(Mode::Shadow)),
+            "shadow is plan-only, so it is a refusal and never a mode a job falls back to"
+        );
+        assert_eq!(
+            resolve_start(&roster, "rootless"),
+            Err(StartRefusal::NoRoot)
+        );
+        assert_eq!(
+            resolve_start(&roster, "live"),
+            Ok(ResolvedStart {
+                project_root: "/repos/live".to_string()
+            })
+        );
+
+        // The two refusals that share a status code still have to be told apart by the person
+        // reading them, or "422" is all the answer they get.
+        assert!(
+            StartRefusal::NotActive(Mode::Shadow)
+                .reason("live")
+                .contains("shadow")
+        );
+        assert!(
+            StartRefusal::NotActive(Mode::Off)
+                .reason("live")
+                .contains("off")
+        );
+        assert_ne!(
+            StartRefusal::NotActive(Mode::Shadow).reason("live"),
+            StartRefusal::NotActive(Mode::Off).reason("live")
+        );
+    }
+
     // ---- the whole walk ------------------------------------------------------------------------
 
     /// A repository with a real gate, so a walk measures something rather than waving items
@@ -2363,6 +2691,69 @@ mod tests {
             .expect("run git")
             .status
             .success()
+    }
+
+    /// A job nobody scheduled: no rule on the row, and no rule in the line a person reads.
+    ///
+    /// `rule_name` was `&'a str` until a second caller appeared that has no rule to name. The
+    /// column has accepted NULL since migration 0042, so this pins the type to the schema rather
+    /// than widening anything — and it pins the feed line, which is the half a person actually
+    /// sees. `job 7 started for rule 'None'` is the shape this exists to prevent: a line that reads
+    /// like a bug in the scheduler for a job the scheduler never touched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn um_job_sem_regra_nao_inventa_uma_no_registo_nem_no_feed() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-norule-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+
+        let started = start(
+            &state,
+            &StartRequest {
+                project_id: "nucleos",
+                project_root: &repo.to_string_lossy(),
+                rule_name: None,
+                prompt: "build the thing",
+                max_items: 3,
+                gate_each: true,
+                review: true,
+                head_sha: None,
+            },
+        )
+        .await;
+
+        let JobStart::Started(job_id) = started else {
+            panic!("a job with no rule must still start");
+        };
+
+        let rule_name: Option<String> =
+            sqlx::query_scalar("SELECT rule_name FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rule_name, None,
+            "no rule asked for this job, so the column has to say so rather than carry a sentinel"
+        );
+
+        let line: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'job_started' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !line.contains("rule"),
+            "a job with no rule must not name one: {line}"
+        );
+        // The positive half, without which the assertion above would pass on an empty line.
+        assert!(
+            line.starts_with(&format!("job {job_id} started on ")),
+            "the line still has to say what started and where: {line}"
+        );
     }
 
     struct WorktreeRootEnv(Option<std::ffi::OsString>);
@@ -2435,7 +2826,7 @@ mod tests {
             &NewJob {
                 project_id: "project-a",
                 project_root: &root,
-                rule_name: "nightly",
+                rule_name: Some("nightly"),
                 prompt: "advance the backlog",
                 max_items: 5,
                 gate_each: true,

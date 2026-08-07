@@ -66,6 +66,49 @@ impl DaemonClient {
             .ok_or_else(|| "create run response missing id".into())
     }
 
+    /// Asks for a job: several runs over one worktree, rather than one context window.
+    ///
+    /// Refused here as well as at the route, and by **the same function** the route uses. Two
+    /// copies of that table would eventually disagree, and the way they would disagree is the
+    /// dangerous one: a client that let `shadow` through would produce a job that does nothing at
+    /// all while reporting that it is working.
+    ///
+    /// What this deliberately does NOT do is send what it resolved. The `ResolvedStart` is dropped
+    /// on the floor — the daemon resolves the root from its own state, because a client that named
+    /// a root would be naming a directory the daemon then creates a worktree in and writes to. This
+    /// call is a courtesy that saves a round trip and hands back a better sentence, never an
+    /// authority.
+    pub async fn create_job(
+        &self,
+        project_id: &str,
+        prompt: &str,
+        budget_usd: Option<f64>,
+        max_rounds: Option<i64>,
+    ) -> Result<i64, String> {
+        let projects = self.list_projects().await?;
+        crate::job::resolve_start(&projects, project_id)
+            .map_err(|refusal| refusal.reason(project_id))?;
+
+        let response: Value = self
+            .request(reqwest::Method::POST, "/jobs")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "prompt": prompt,
+                "budget_usd": budget_usd,
+                "max_rounds": max_rounds,
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        response["job_id"]
+            .as_i64()
+            .ok_or_else(|| "create job response missing job_id".into())
+    }
+
     pub async fn get_run(&self, id: i64) -> Result<Value, String> {
         self.request(reqwest::Method::GET, &format!("/runs/{id}"))
             .send()
@@ -308,6 +351,68 @@ mod tests {
             urlencoding_encode("relatorio-2026_v1.docx"),
             "relatorio-2026_v1.docx"
         );
+    }
+
+    /// Resolving a JOB is not resolving a run, and this pins the two apart.
+    ///
+    /// `create_job` calls `job::resolve_start` rather than `resolve_run_request` beside it, and the
+    /// difference is the shadow row. A run may be plan-only, so shadow is a legitimate run mode. A
+    /// job may not: its plan node has to WRITE the plan.json its queue comes from, so a job
+    /// accepted for a shadow project would spend the night doing nothing and reporting that it was
+    /// working. If the two are ever "unified" for looking alike, this assertion is what says no.
+    ///
+    /// No network in either direction: both are pure functions over a roster.
+    #[test]
+    fn resolver_um_job_nao_e_resolver_um_run() {
+        let projects = vec![
+            summary_for("shadow-project", Mode::Shadow, Some("C:/projects/shadow")),
+            summary_for("live-project", Mode::Active, Some("C:/projects/live")),
+        ];
+
+        // The run path accepts shadow, and is right to.
+        assert_eq!(
+            resolve_run_request(&projects, "shadow-project", "inspect")
+                .unwrap()
+                .mode,
+            "shadow"
+        );
+        // The job path refuses it, and says which state it found.
+        let refusal = crate::job::resolve_start(&projects, "shadow-project")
+            .expect_err("a job must not be accepted for a plan-only project");
+        assert!(refusal.reason("shadow-project").contains("shadow"));
+
+        // An unknown project fails on both paths, so the courtesy check in `create_job` cannot be
+        // the thing that lets one through.
+        assert!(resolve_run_request(&projects, "nao-existe", "x").is_err());
+        assert_eq!(
+            crate::job::resolve_start(&projects, "nao-existe"),
+            Err(crate::job::StartRefusal::UnknownProject)
+        );
+
+        // And the one that must still work, without which the assertions above pass by refusing
+        // everything.
+        assert_eq!(
+            crate::job::resolve_start(&projects, "live-project")
+                .unwrap()
+                .project_root,
+            "C:/projects/live"
+        );
+    }
+
+    fn summary_for(project_id: &str, mode: Mode, root: Option<&str>) -> ProjectSummary {
+        ProjectSummary {
+            project_id: project_id.into(),
+            mode,
+            project_root: root.map(str::to_string),
+            pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            withheld_classes_ready: 0,
+            promotable: false,
+            open_proposals: 0,
+            wip_limit: Some(3),
+            queue_full: false,
+        }
     }
 
     #[test]
