@@ -347,9 +347,14 @@ pub async fn repo_key(path: &Path, deadline: std::time::Instant) -> Result<Strin
         budget,
     )
     .await?;
+    // Two refusals, deliberately worded apart. This one is "git found no repository from here at
+    // all"; the one below the parse is "git found one, and it is not this directory". They shared a
+    // sentence until a mutation pass showed what that cost: with one wording, a test naming either
+    // case passed through whichever branch happened to run, and deleting this block outright left
+    // the whole suite green. A message is a test's only way to say WHICH guard answered.
     if !result.succeeded() {
         return Err(format!(
-            "{} is not the root of a repository: {}",
+            "{} is not inside a git repository: {}",
             path.display(),
             result.output_tail.trim()
         ));
@@ -2152,12 +2157,31 @@ pub(crate) mod tests {
         );
     }
 
-    /// A directory that is not in any repository at all is an error rather than a key.
+    /// A directory outside every repository is an error rather than a key — and this is the ONLY
+    /// test that reaches the non-zero-exit branch, which is why it does not use
+    /// `space_free_tempdir`.
+    ///
+    /// That helper creates its directory *under the checkout* (cargo cannot link beneath a path
+    /// containing a space), so a directory it makes is inside this very repository: `git -C` walks
+    /// up, succeeds, and answers about the enclosing checkout — the refusal then comes from the
+    /// top-level guard rather than from git. Written that way, this test passed for a reason its own
+    /// name denied, and deleting the non-zero-exit branch altogether left the suite green. The
+    /// system temp directory is outside every repository, and pointing git at one costs no linking.
+    ///
+    /// The assertion is on the message rather than on `is_err()` for the same reason: two guards
+    /// refuse here, and only the wording says which one did. If this ever fails with the *other*
+    /// message, the machine's temp directory has ended up inside a repository — the assertion will
+    /// say so in as many words, which is the whole point of asserting on it.
     #[tokio::test]
-    async fn a_directory_in_no_repository_has_no_key() {
-        let container = space_free_tempdir("nucleos-gitexec-key-none-");
+    async fn a_directory_outside_every_repository_has_no_key() {
+        let container = tempfile::tempdir().expect("create a temp directory outside the checkout");
 
-        assert!(repo_key(container.path(), deadline()).await.is_err());
+        let error = repo_key(container.path(), deadline()).await.unwrap_err();
+
+        assert!(
+            error.contains("is not inside a git repository"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The comparison the guard makes is between two paths that git and the caller spell differently:
