@@ -1406,7 +1406,8 @@ async fn housekeeping(
 
 #[cfg(test)]
 mod tests {
-    /// The account whose mailbox these tests read: the address the outbound fixtures are sent from — the account whose mailbox these tests read.
+    /// The account whose mailbox these tests read, and so the address the outbound fixtures are
+    /// sent from.
     ///
     /// `ingest_batch` compares it against each sent message's `From`, so a value that did not
     /// match would stop the outbound fixtures recording anything and quietly hollow out every
