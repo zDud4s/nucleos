@@ -53,6 +53,26 @@ struct UrlParams {
     url: String,
 }
 
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct VcsRequestParams {
+    /// Which project's repository. Call list_projects if you do not know it.
+    project_id: String,
+    /// What to do. Today the queue executes "merge" and nothing else.
+    operation: String,
+    /// The branch being merged FROM.
+    source: Option<String>,
+    /// The branch being merged INTO.
+    target: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct VcsTicketParams {
+    /// The id the queue gave back when the operation was submitted.
+    id: i64,
+    /// Block until it finishes, up to about 45 seconds. Absent means answer immediately.
+    wait: Option<bool>,
+}
+
 #[tool_router]
 impl NucleosTools {
     #[tool(description = "List projects known to the NucleOS daemon")]
@@ -175,6 +195,48 @@ impl NucleosTools {
     async fn set_kill(&self, Parameters(KillParams { engaged }): Parameters<KillParams>) -> String {
         json_result(self.client.set_kill(engaged).await)
     }
+
+    #[tool(
+        description = "Ask the NucleOS queue to perform a git operation that touches shared state. \
+                       Merging is not something to do directly with git in this system: the queue \
+                       runs one operation per repository at a time, computes the merge in its own \
+                       worktree, and only then moves the branch — so two agents merging at the same \
+                       moment wait for each other instead of colliding. This call blocks for up to \
+                       about 45 seconds; if the operation is still going it returns a ticket, and \
+                       vcs_ticket reads it later. A result of 'blocked' means somebody's \
+                       uncommitted files are in the way and nothing was changed."
+    )]
+    async fn vcs_request(
+        &self,
+        Parameters(VcsRequestParams {
+            project_id,
+            operation,
+            source,
+            target,
+        }): Parameters<VcsRequestParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .vcs_request(
+                    &project_id,
+                    &operation,
+                    source.as_deref(),
+                    target.as_deref(),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read one queued git operation's ticket: what was asked for and how it ended. \
+                       Set wait to block until it finishes."
+    )]
+    async fn vcs_ticket(
+        &self,
+        Parameters(VcsTicketParams { id, wait }): Parameters<VcsTicketParams>,
+    ) -> String {
+        json_result(self.client.vcs_ticket(id, wait.unwrap_or(false)).await)
+    }
 }
 
 #[tool_handler(name = "nucleos", instructions = "NucleOS daemon control")]
@@ -223,6 +285,12 @@ pub enum ToolEffect {
 /// they arrive exactly as written, and ranking for a query somebody expects an agent to run is a
 /// thing people already do on purpose. Classifying search as `ReadsOwn` would leave the cheapest
 /// path — one poisoned result, never fetched — able to reach the kill switch.
+///
+/// `vcs_request` is the sharpest `Acts` on the list. Every other action here changes something
+/// inside NucleOS — a run, a proposal, the kill switch — and the owner can undo all of them from
+/// this same server. This one moves a branch in a repository other people build on: it is the only
+/// effect on this list that outlives the daemon, and the only one its owner cannot take back from
+/// here. `vcs_ticket` reads back what the owner's own queue did, and acts on nothing.
 const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("approve_proposal", ToolEffect::Acts),
     ("cancel_run", ToolEffect::Acts),
@@ -238,6 +306,8 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("reject_proposal", ToolEffect::Acts),
     ("set_kill", ToolEffect::Acts),
     ("triage_email", ToolEffect::Acts),
+    ("vcs_request", ToolEffect::Acts),
+    ("vcs_ticket", ToolEffect::ReadsOwn),
     ("web_read", ToolEffect::ReadsUntrusted),
     ("web_search", ToolEffect::ReadsUntrusted),
 ];
@@ -315,10 +385,21 @@ mod tests {
                 "reject_proposal",
                 "set_kill",
                 "triage_email",
+                "vcs_request",
+                "vcs_ticket",
                 "web_read",
                 "web_search",
             ]
         );
+    }
+
+    /// `vcs_request` publishes to a branch other people build on. It is the most consequential thing on
+    /// this server, and this classification is what keeps a turn that has already read a stranger's mail
+    /// from reaching it.
+    #[test]
+    fn queueing_a_merge_is_an_action_and_reading_a_ticket_is_not() {
+        assert_eq!(tool_effect("vcs_request"), ToolEffect::Acts);
+        assert_eq!(tool_effect("vcs_ticket"), ToolEffect::ReadsOwn);
     }
 
     /// The web tools are READ-ONLY, and the absence is the safety property.
