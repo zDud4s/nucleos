@@ -258,7 +258,13 @@ pub async fn pretooluse_decision(
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
     if classification.decision.decision == "deny" && is_in_flight {
-        count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+        count_denial_and_stop_a_prober(
+            &state,
+            payload.run_id,
+            &payload.tool_name,
+            classification.action_class,
+        )
+        .await;
     }
 
     if classification.decision.decision == "pending_approval" {
@@ -443,13 +449,45 @@ async fn get_run_names_a_triage_run(state: &AppState, tool_input: &Value) -> boo
 /// and a retry, and far too little to search a grammar with.
 const DENIAL_LIMIT: i64 = 3;
 
+/// How many redirected actions a run may attempt before it is stopped.
+///
+/// A redirect (`classifier::VCS_SHARED_CLASS`) is a denial in form and an instruction in substance,
+/// so it answers to its own bound. `DENIAL_LIMIT` is sized to stop a run searching a lexical grammar
+/// for a spelling that gets past the gate; a run told to queue its merge is not searching for
+/// anything — it is being handed the route it should have taken — and three attempts is thin for an
+/// agent that has still to discover the tool's parameters.
+///
+/// **A looser bound, and not an exemption.** Exempting it would make `deny`/`vcs-shared` the only
+/// verdict in the system that neither pauses the run nor spends anything: free, unlimited retries,
+/// and so the cheapest thing on the board for an agent that is not obeying.
+///
+/// It shares the one `denials` counter rather than getting a column of its own, and that direction
+/// matters: a run that has spent redirects is stopped SOONER by its next destructive attempt, never
+/// later. Two counters would have made the redirect a way to buy prober attempts.
+const REDIRECT_LIMIT: i64 = 10;
+
+/// The allowance a denial of this class is counted against.
+fn allowance_for(action_class: &str) -> i64 {
+    if action_class == crate::classifier::VCS_SHARED_CLASS {
+        REDIRECT_LIMIT
+    } else {
+        DENIAL_LIMIT
+    }
+}
+
 /// Records a denied attempt and, once a run has spent its allowance, stops it.
 ///
 /// Terminated to `failed` rather than `awaiting_approval`: a denied action is destructive by
 /// classification, and the pause path exists to make an action approvable. Offering a human an
 /// "approve" button here would launder precisely the verdict that is supposed to be final — the
 /// single-use grant deliberately only ever lifts a `pending_approval`.
-async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name: &str) {
+async fn count_denial_and_stop_a_prober(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+    action_class: &str,
+) {
+    let allowance = allowance_for(action_class);
     let denials: i64 = match sqlx::query_scalar(
         "UPDATE runs SET denials = denials + 1 WHERE id = ? RETURNING denials",
     )
@@ -473,9 +511,10 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         run_id,
         tool = %tool_name,
         denials,
-        "pretooluse-decision: denied action {denials}/{DENIAL_LIMIT} for this run"
+        action_class,
+        "pretooluse-decision: denied action {denials}/{allowance} for this run"
     );
-    if denials < DENIAL_LIMIT {
+    if denials < allowance {
         return;
     }
 
@@ -997,6 +1036,71 @@ mod tests {
         assert!(
             proposals.is_empty(),
             "stopping a prober must not mint something a human can approve"
+        );
+    }
+
+    /// A redirect is bounded, not exempt — and the bound it answers to is its own.
+    ///
+    /// The loop runs past `DENIAL_LIMIT` deliberately: under the ordinary allowance the run would be
+    /// dead on the third pass, and an agent that has been handed a tool it has never called deserves
+    /// more than three tries to get its parameters right. The last two assertions are the other half
+    /// — the allowance is looser, not absent.
+    #[tokio::test]
+    async fn a_redirected_merge_answers_to_its_own_allowance() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+        let body = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"git merge feature"}}}}"#
+        );
+
+        for attempt in 1..REDIRECT_LIMIT {
+            assert_eq!(decide(&app, &body).await.decision, "deny");
+            assert!(
+                state.run_handles.lock().unwrap().contains_key(&run_id),
+                "attempt {attempt} is within the redirect's allowance, and the ordinary one would \
+                 have stopped this run at {DENIAL_LIMIT}"
+            );
+        }
+
+        assert_eq!(decide(&app, &body).await.decision, "deny");
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            "a redirect ignored {REDIRECT_LIMIT} times is a run that is not obeying it"
+        );
+    }
+
+    /// One counter for both allowances, so spending redirects can only shorten what is left.
+    ///
+    /// This is the property that stops the looser bound being a loophole: if the two were counted
+    /// separately, a run could take its redirects for free and still arrive at the prober counter
+    /// with a full purse.
+    #[tokio::test]
+    async fn a_redirect_and_a_denial_are_spent_from_the_same_purse() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+
+        let merge = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"git merge feature"}}}}"#
+        );
+        for _ in 0..DENIAL_LIMIT {
+            assert_eq!(decide(&app, &merge).await.decision, "deny");
+        }
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&run_id),
+            "{DENIAL_LIMIT} redirects are inside the redirect allowance and must not stop the run"
+        );
+
+        let destructive = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"rm -rf /"}}}}"#
+        );
+        assert_eq!(decide(&app, &destructive).await.decision, "deny");
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            "the destructive attempt is this run's denial number {} and the prober allowance is \
+             {DENIAL_LIMIT}",
+            DENIAL_LIMIT + 1
         );
     }
 
