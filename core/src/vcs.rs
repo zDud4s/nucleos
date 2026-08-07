@@ -2107,6 +2107,43 @@ mod tests {
         );
     }
 
+    /// The worker looks for repositories by their KEY, and in production a key is never a project's
+    /// name — it is git's canonical common directory. Polling `DISTINCT project_id` here would hand
+    /// `claim_next` a label that no row carries, and the queue would drain nothing, for ever, in
+    /// silence.
+    ///
+    /// **Every other test in this module is structurally blind to that.** `repo_for` makes the key
+    /// equal the project name on purpose, so that moving the lock from label to key preserved each
+    /// existing assertion's meaning. The cost of that choice is exactly this blindness, and it is
+    /// not hypothetical: a mutation that polls `project_id` passed all 41 of the others. This is the
+    /// one place where the two must differ.
+    #[tokio::test]
+    async fn the_worker_looks_for_repositories_by_key_and_not_by_project_name() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "a-key-that-is-not-a-project-name");
+        let id = submit(&pool, &repo, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
+        let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if status_of(&pool, id).await == "succeeded" {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        worker.abort();
+        settled.expect(
+            "the worker never found the repository — it is looking for it by the project's name",
+        );
+    }
+
     /// Two repositories, one worker. If it drains them one after the other, neither of these executions
     /// can complete: the fake will not answer until both have arrived.
     #[tokio::test]
