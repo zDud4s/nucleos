@@ -645,7 +645,12 @@ async fn pause_for_approval(
 ///    the right one at all. An item left `running` in a job nobody is driving is a job that answers
 ///    `Wait` for ever — `next_step` sees a live node, there is no live node, and no later pass
 ///    rescues it. Every other loss here is recoverable; that one is not.
-/// 3. Revert the tree, then record the proposal. Both may fail, and neither failure is allowed to
+/// 3. **Take the pause off the run.** The caller parked it to ask; the asking is over. A run left
+///    `awaiting_approval` parks the whole job through `job::node_awaiting_approval`, which is the
+///    same stop by another door — the item reads `skipped` and the job waits on it anyway.
+///    Recoverable, unlike (2): `reconcile_stranded_approvals` writes the same `interrupted` at the
+///    next startup, which is why it goes second and not first.
+/// 4. Revert the tree, then record the proposal. Both may fail, and neither failure is allowed to
 ///    take the mark with it: an item skipped without a proposal is work nobody will be reminded of,
 ///    which is bad and survivable, where an item stuck `running` is a dead job.
 struct SkippedItem {
@@ -714,7 +719,47 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
         reason,
     } = item;
 
-    // (3a) Put the tree back. The item wrote whatever it wrote before it asked, and the next item
+    // (3) Take the pause off the RUN. The caller terminated it to `awaiting_approval`, because at
+    // that point the answer was still "ask a person". It is not any more — the answer was "skip it",
+    // and it has already been given.
+    //
+    // Without this the job stops anyway, one step later and for a different reason:
+    // `job::node_awaiting_approval` asks whether ANY run of the job is `awaiting_approval` and parks
+    // the whole job when one is, and `node_in_flight` counts that status as a node still to wait
+    // for. The item would read `skipped` while the job sat on a node nobody would ever answer —
+    // measured on 2026-08-08, job 3: item 0 `skipped`, job `awaiting_approval`, nothing pending.
+    //
+    // `interrupted` and not something new: it is what `reconcile_stranded_approvals` writes at
+    // startup for precisely this row (an `awaiting_approval` run with no `action-approval` proposal),
+    // and what `pause_for_approval` rolls back to when a pause turns out not to be one. Writing it
+    // here is the same verdict without waiting for a restart.
+    //
+    // AFTER the item's mark, never before, for two reasons. If this write is lost the damage is
+    // recoverable — that same startup reconciler writes it — where an item left `running` is a job
+    // that answers `Wait` for ever and no pass rescues. And the window between the two writes is
+    // only safe in this order: `job::reconcile_nodes` folds back every item that is still `running`
+    // whose run has left flight, and would read this one as `failed` and stop the chain. Marked
+    // first, the item is no longer `running` and that query cannot see it at all.
+    //
+    // Guarded on the status the caller set, so a cancel that landed in between keeps the last word.
+    let unpaused = sqlx::query(
+        "UPDATE runs SET status = 'interrupted', completed_at = ?
+         WHERE id = ? AND status = 'awaiting_approval'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(run_id)
+    .execute(&state.pool)
+    .await;
+    if let Err(error) = unpaused {
+        tracing::error!(
+            run_id,
+            job_id,
+            %error,
+            "pretooluse-decision: could not lift the pause off a skipped item's run — the job will park until restart"
+        );
+    }
+
+    // (4a) Put the tree back. The item wrote whatever it wrote before it asked, and the next item
     // must not build on a half-done change nobody approved.
     let footing = crate::job::footing_for_run(&state.pool, job_id, run_id).await;
     match (
@@ -733,7 +778,7 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
         ),
     }
 
-    // (3b) The proposal. A different `kind` from an action approval, and `wip.rs` counts only the
+    // (4b) The proposal. A different `kind` from an action approval, and `wip.rs` counts only the
     // other one: this is work NOT YET DONE waiting on a decision, where the WIP limit exists to cap
     // work already done waiting to be looked at. Conflating them closes the autonomy this change
     // just opened, at the third skipped item of the night.
@@ -1717,6 +1762,31 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a skipped item is a note, not something to approve — approving it resumes nothing"
+        );
+
+        // And the half the first version of this test did not ask about, which is what let the
+        // whole thing stop anyway. `job::node_awaiting_approval` parks a job when ANY of its runs
+        // is `awaiting_approval`, so a skipped item whose run keeps that status trades one stop for
+        // another: the item reads `skipped` and the job waits on it for ever.
+        let run_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_status, "interrupted",
+            "the run must not keep asking after the answer was given"
+        );
+        let still_parked: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM runs WHERE job_id = ? AND status = 'awaiting_approval' LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            still_parked.is_none(),
+            "this is the query `job::node_awaiting_approval` runs; a hit here parks the whole job"
         );
     }
 
