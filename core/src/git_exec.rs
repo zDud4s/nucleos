@@ -320,7 +320,7 @@ fn remaining(deadline: std::time::Instant, what: &str) -> Result<Duration, Outco
 /// — git already normalises drive-letter case and `.`/`..` itself (measured) — and is kept for
 /// junctions and symlinks, where two spellings genuinely reach one directory.
 ///
-/// A third sanctioned entry to `run_git` (see its doc comment, which names the other two): it
+/// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it
 /// computes what is left of the budget and refuses before spawning, which is the property that
 /// comment exists to protect.
 pub async fn repo_key(path: &Path, deadline: std::time::Instant) -> Result<String, String> {

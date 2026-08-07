@@ -9,6 +9,13 @@
 //! holds it, so it survives the daemon restart a mutex would not — and `reconcile_interrupted` is
 //! what releases a slot that restart found still held.
 //!
+//! **What that index is keyed on is the repository, not the project**, and the distinction is the
+//! whole of the promise rather than a detail of it. A project is a label somebody chose; a
+//! repository is what a merge actually touches, and two labels can name one. `ResolvedRepo` is the
+//! only way to obtain the key — git's own canonical common directory, one value for a main checkout
+//! and for every linked worktree of it — so a caller cannot lock one repository while running git in
+//! another.
+//!
 //! Requests are typed (`Op`), never command strings: parsing shell is the surface `classifier.rs`
 //! exists to keep closed, so the daemon builds every argv itself. This module decides WHEN an
 //! operation runs and records how it ended. It never decides whether the actor was allowed to ask
@@ -732,11 +739,13 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// waiting.
 ///
 /// Terminal means `succeeded`, `failed`, `blocked`, `interrupted`, or `cancelled` — the five statuses
-/// `finish`, `reconcile_interrupted` and `cancel_for_run` actually write today, matching the
-/// vocabulary those three already use (see `finish`'s own doc comment, and the
-/// interrupted-is-terminal test above). `cancelled` is the one this list gained last: the run that
-/// asked for the request ended before it started, so the row can no longer change and a caller
-/// waiting on it must be told now rather than at the deadline. `blocked` is as
+/// `finish`, `reconcile_interrupted`, `cancel_for_run` and `reap_requests_of_ended_runs` actually
+/// write today, matching the vocabulary those four already use (see `finish`'s own doc comment, and
+/// the interrupted-is-terminal test above). `cancelled` is the one this list gained last, and it has
+/// two writers rather than one: `cancel_for_run` retires a request the moment its run is cancelled,
+/// and the reaper retires one whose run had already ended by some other door when the queue reached
+/// it. Either way the row can no longer change, so a caller waiting on it must be told now rather
+/// than at the deadline. `blocked` is as
 /// terminal as the other four: the queue never retries it, so a caller held to the deadline would
 /// be waiting on a row that can no longer change — and it is the outcome that most needs a human to
 /// see it promptly. `queued`, `running` and `awaiting_approval` are treated identically: all three
@@ -889,10 +898,15 @@ pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Resul
 ///
 /// **This is the pull half of spec §7's "the agent that submitted dies", and it exists because the
 /// push half cannot be complete.** `runs::finalize_termination` sweeps the paths that go through it,
-/// but a run's terminal status is also written by direct UPDATEs in four other places, and the next
-/// one will be written by somebody who does not know the list exists. Asking here — at the one point
-/// that must be correct anyway, because it is where a merge is about to be executed — makes the
-/// guarantee true by construction rather than by everyone remembering.
+/// but a run's terminal status is also written by direct UPDATEs elsewhere, and the next one will be
+/// written by somebody who does not know the list exists. Asking here — at the one point that must be
+/// correct anyway, because it is where a merge is about to be executed — makes the guarantee true by
+/// construction rather than by everyone remembering.
+///
+/// "Elsewhere" is deliberately not a number. It was written as "four other places" and an audit put
+/// the real count at roughly twice that, which is the argument for this function rather than against
+/// it — but a count in a comment is a claim that goes stale on its own, and this one would go stale
+/// in the direction of sounding smaller than it is.
 ///
 /// `cancel_for_run` is kept alongside it and is not redundant: it makes a cancelled run's requests
 /// disappear *immediately*, rather than at the next poll of a repository that may have nothing else
