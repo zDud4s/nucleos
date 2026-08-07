@@ -95,6 +95,13 @@ pub enum ItemState {
     Cancelled,
     GateFailed,
     GateErrored,
+    /// This item asked for a decision, so the job put it down and moved on.
+    ///
+    /// Not a failure and not a cancellation: nothing broke, and nobody stopped anything. The work
+    /// was never attempted, the tree was reverted to where the item started, and a `skipped-item`
+    /// proposal carries what would be needed to pick it up. `next_step` walks past it the way it
+    /// walks past `Passed`, because the queue owes it nothing more.
+    Skipped,
 }
 
 /// Whether the job still owes a review node.
@@ -165,11 +172,22 @@ pub struct JobView {
 pub fn next_step(job: &JobView) -> Next {
     // Failures first, and before the in-flight check: a chain with a broken item must stop even if
     // another node is still running, rather than spending budget on work about to be thrown away.
+    //
+    // `GateFailed` is deliberately NOT here any more, and it is the only one that left. A red gate
+    // used to end the night at the first item that broke; now the tree is reverted to the item's
+    // footing and the queue carries on, because the remaining items were never the ones that broke
+    // and a night that stops on the first of five wastes the other four. What survives is the
+    // ENDING: `ending()` below still reports the job `gate_failed`, so nothing about the job's
+    // outcome is softened — only the point at which it is decided.
+    //
+    // `GateErrored` stays, and the asymmetry is the whole reason those two are separate states. A
+    // non-zero exit is a verdict about the code; a gate that would not run is silence. Continuing
+    // past a verdict is a judgement call this change makes; continuing past silence would be
+    // building on work nothing has measured, which is what the gate exists to prevent.
     for item in &job.items {
         match item {
             ItemState::Failed => return Next::Finish(Outcome::Failed),
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
-            ItemState::GateFailed => return Next::Finish(Outcome::GateFailed),
             ItemState::GateErrored => return Next::Finish(Outcome::GateErrored),
             _ => {}
         }
@@ -208,7 +226,24 @@ pub fn next_step(job: &JobView) -> Next {
     match job.review {
         ReviewState::Pending => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
-        ReviewState::NotWanted | ReviewState::Done => Next::Finish(Outcome::Completed),
+        ReviewState::NotWanted | ReviewState::Done => Next::Finish(ending(job)),
+    }
+}
+
+/// PURE: how a job that ran its whole queue ended.
+///
+/// One red gate anywhere makes the job `gate_failed`, however many items passed after it. The
+/// verdict is about the branch that is handed back, and a branch carrying an item the gate rejected
+/// is not one somebody should be told is complete.
+///
+/// Skipped items deliberately do NOT show up here. They are work that was never attempted, recorded
+/// as proposals for a person to decide on; a job that ran everything it was allowed to run did what
+/// was asked of it, and reporting that as a failure would teach the reader to ignore the word.
+fn ending(job: &JobView) -> Outcome {
+    if job.items.contains(&ItemState::GateFailed) {
+        Outcome::GateFailed
+    } else {
+        Outcome::Completed
     }
 }
 
@@ -234,6 +269,7 @@ fn item_state_from(status: &str) -> ItemState {
         STATUS_CANCELLED => ItemState::Cancelled,
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
+        STATUS_SKIPPED => ItemState::Skipped,
         // An unrecognised item status is treated as still to do rather than as done. Erring toward
         // "not finished" costs a repeated item; erring the other way silently skips work the job
         // was created to perform and reports it complete.
@@ -339,6 +375,10 @@ pub const STATUS_STOPPED: &str = "stopped";
 pub const STATUS_INTERRUPTED: &str = "interrupted";
 /// A job somebody stopped, at either level: one node, or the whole chain.
 pub const STATUS_CANCELLED: &str = "cancelled";
+/// An ITEM the job put down because it asked for a decision. Deliberately not in
+/// [`TERMINAL_STATUSES`] below: that list is job endings, and a skipped item ends nothing — the job
+/// carries on to the next one, which is the whole point of it.
+pub const STATUS_SKIPPED: &str = "skipped";
 
 /// Every ending this module can write.
 ///
@@ -1322,6 +1362,58 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
     record_gate(state, job, ordinal, outcome).await
 }
 
+/// The commit an item at `ordinal` falls back to when its own work has to be undone.
+///
+/// PURE apart from the read. The nearest earlier item that a gate agreed with, or — for the first
+/// item, and for a job whose earlier items were all skipped — the SHA the job was created at.
+///
+/// `None` is the one shape callers must handle rather than paper over: a job created before this
+/// column existed, or one whose `head_sha` could not be read at creation, has no footing at all, and
+/// the honest response is to leave the tree alone and stop rather than guess at a revision.
+async fn footing_for(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
+    let earlier: Option<String> = sqlx::query_scalar(
+        "SELECT checkpoint_sha FROM job_items
+         WHERE job_id = ? AND ordinal < ? AND checkpoint_sha IS NOT NULL
+         ORDER BY ordinal DESC LIMIT 1",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    earlier.or_else(|| job.head_sha.clone())
+}
+
+/// The footing for the item a given run owns, for callers outside this module.
+///
+/// `hooks.rs` knows a `run_id` and nothing else — it is answering a tool call, not walking a queue —
+/// so it cannot supply the ordinal [`footing_for`] wants. This resolves it, and deliberately reuses
+/// the same query rather than growing a second answer to "what does this item fall back to".
+pub async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
+    let ordinal: i64 =
+        sqlx::query_scalar("SELECT ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
+            .bind(job_id)
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+
+    let job = load_job(pool, job_id).await.ok()?;
+    footing_for(pool, &job, ordinal as usize).await
+}
+
+/// The job's worktree path, for callers outside this module that hold no `JobRow`.
+pub async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf> {
+    job_worktree(pool, job_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(path, _)| path)
+}
+
 async fn record_gate(
     state: &AppState,
     job: &JobRow,
@@ -1346,11 +1438,110 @@ async fn record_gate(
         ),
     };
 
+    // Green: take the footing the next item will stand on.
+    //
+    // Written in the SAME statement as the verdict, not a second one after it. Two writes leave a
+    // window where the item reads `passed` with no checkpoint, and an item that fails inside that
+    // window reverts to the item BEFORE this one — throwing away work a gate had just agreed with,
+    // silently, and only under a race nobody would reproduce.
+    //
+    // A checkpoint that cannot be taken does not fail the item. The work is on the branch either
+    // way; what is lost is the next item's footing, and `footing_for` already answers that with the
+    // nearest earlier one. Refusing a green gate over a `git commit` would turn a disk hiccup into a
+    // failed night.
+    let mut checkpoint_sha = None;
+    if matches!(outcome, crate::gate::GateOutcome::Passed) {
+        match job_worktree(pool, job.id).await {
+            Ok(Some((worktree, _))) => match crate::worktree::checkpoint(&worktree).await {
+                Ok(sha) => checkpoint_sha = Some(sha),
+                Err(error) => {
+                    tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint a green item");
+                }
+            },
+            _ => {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "no worktree on record to checkpoint"
+                );
+            }
+        }
+    }
+
+    // Red: put the tree back before anything else touches it.
+    //
+    // Before the mark, deliberately. The mark is what lets the queue move on, and the queue moving
+    // on to a tree still holding the rejected work is the exact defect this replaces — the item
+    // after it would build on code the gate has just called broken.
+    //
+    // `Errored` is NOT reverted, where the plan for this chunk said both should be. A gate that
+    // would not run measured nothing, so the work it did not judge might be perfectly good, and the
+    // job stops here and hands the branch to a person either way. Reverting would destroy work whose
+    // only crime is that nothing looked at it. `Failed` is different in kind: something looked, and
+    // said no.
+    if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
+        let reverted = match (
+            job_worktree(pool, job.id).await,
+            footing_for(pool, job, ordinal).await,
+        ) {
+            (Ok(Some((worktree, _))), Some(footing)) => {
+                match crate::worktree::revert_to(&worktree, &footing).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(job_id = job.id, ordinal, %error, "could not revert a red item");
+                        false
+                    }
+                }
+            }
+            (_, None) => {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "no footing to revert a red item to"
+                );
+                false
+            }
+            _ => {
+                tracing::warn!(job_id = job.id, ordinal, "no worktree on record to revert");
+                false
+            }
+        };
+
+        if !reverted {
+            // Mark the item first — a red gate is a fact whatever happened next — then stop. The
+            // queue must not advance onto a tree still holding work the gate rejected, and this is
+            // the one branch where continuing is worse than ending the job early.
+            let _ = sqlx::query(
+                "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(item_status)
+            .bind(gate_status)
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            say(
+                pool,
+                job,
+                "job_gate_failed",
+                &format!(
+                    "job {} at item {}: the gate failed and the worktree could not be put back, so the job stopped here",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            return Step::Stopped;
+        }
+    }
+
     let written = sqlx::query(
-        "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+        "UPDATE job_items SET status = ?, gate_status = ?, checkpoint_sha = ?
+         WHERE job_id = ? AND ordinal = ?",
     )
     .bind(item_status)
     .bind(gate_status)
+    .bind(checkpoint_sha.as_deref())
     .bind(job.id)
     .bind(ordinal as i64)
     .execute(pool)
@@ -2113,18 +2304,116 @@ mod tests {
         );
     }
 
+    /// The distinction gate.rs guards and §7 of the spec insists must survive the trip up to the
+    /// job: a non-zero exit says the code is broken, a binary that would not start says the
+    /// measurement never happened. One of those is a verdict; the other is silence.
+    ///
+    /// It now shows up as a difference in WHEN the job ends rather than only in what it is called.
+    /// A red gate lets the queue carry on — the item's work has been reverted, and the items after
+    /// it were never the ones that broke. Silence stops everything, because building on work
+    /// nothing has measured is what the gate exists to prevent.
     #[test]
     fn a_failed_gate_and_an_errored_gate_end_the_job_differently() {
-        // The distinction gate.rs guards and §7 of the spec insists must survive the trip up to the
-        // job: a non-zero exit says the code is broken, a binary that would not start says the
-        // measurement never happened. One of those is a verdict; the other is silence.
+        assert_eq!(
+            next_step(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
+            Next::Finish(Outcome::GateErrored),
+            "a gate that would not run has to stop the chain where it is"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateErrored, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::Finish(Outcome::GateErrored),
+            "and it stops it even with work still queued behind it"
+        );
+
         assert_eq!(
             next_step(&view(true, &[ItemState::GateFailed], ReviewState::Pending)),
+            Next::SpawnReview,
+            "a red gate is no longer where the job stops"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateFailed, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 1 },
+            "the item after a red one is still work worth doing"
+        );
+    }
+
+    /// What a red gate DOES still decide: the ending.
+    ///
+    /// The point of letting the queue carry on was never to soften the verdict. A branch carrying an
+    /// item the gate rejected is not one to tell somebody is complete, however many items passed
+    /// after it — including the case where the red one is not the last.
+    #[test]
+    fn one_red_gate_makes_the_whole_job_gate_failed_however_it_ends() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Passed, ItemState::GateFailed, ItemState::Passed],
+                ReviewState::Done
+            )),
             Next::Finish(Outcome::GateFailed)
         );
         assert_eq!(
-            next_step(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
-            Next::Finish(Outcome::GateErrored)
+            next_step(&view(
+                true,
+                &[ItemState::GateFailed, ItemState::Passed],
+                ReviewState::NotWanted
+            )),
+            Next::Finish(Outcome::GateFailed),
+            "a job that wanted no review reaches the same verdict by the other door"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Passed, ItemState::Passed],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::Completed),
+            "and a queue nothing rejected still completes"
+        );
+    }
+
+    /// A skipped item is walked past exactly like a passed one, and colours nothing.
+    ///
+    /// Both halves matter. If it blocked, one unrecognised command would park the night — which is
+    /// the state this chunk exists to leave. If it made the job `gate_failed`, then a job that did
+    /// everything it was ALLOWED to do would be reported as broken, and the word would stop meaning
+    /// anything to whoever reads it in the morning.
+    #[test]
+    fn a_skipped_item_neither_blocks_the_queue_nor_colours_the_ending() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Skipped, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 1 },
+            "the queue has to move past it"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Skipped, ItemState::Skipped],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::Completed),
+            "a job whose every item was skipped still did what it was allowed to do"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Skipped, ItemState::GateFailed],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::GateFailed),
+            "and it does not hide a red gate beside it"
         );
     }
 
@@ -2821,6 +3110,11 @@ mod tests {
     ) -> i64 {
         *runner.plan_to_write.lock().unwrap() = Some(plan.to_owned());
         let root = repo.to_string_lossy().into_owned();
+        // Through the same function `POST /jobs` and the scheduler both use, and NOT `None`.
+        // `head_sha` is the footing the first item reverts to, so a helper that left it empty would
+        // send every walk below down the "no footing, stop instead" branch — testing the fallback
+        // and never the behaviour.
+        let head_sha = crate::repo_trigger::current_branch_sha(repo, "HEAD", false).await;
         let job_id = insert_job(
             &state.pool,
             &NewJob {
@@ -2831,7 +3125,7 @@ mod tests {
                 max_items: 5,
                 gate_each: true,
                 review: true,
-                head_sha: None,
+                head_sha: head_sha.as_deref(),
             },
         )
         .await
@@ -2924,12 +3218,19 @@ mod tests {
             crate::worktree::remove(&repo, &root.path().join(format!("job-{job_id}")), &[]).await;
     }
 
-    /// Decision 6, walked rather than asserted against a seeded row: a red gate stops the chain
-    /// where it broke, and the item after it never starts. On a shared worktree, letting item i+1
-    /// build on unmeasured work is exactly what makes a later red gate unable to say which item
-    /// caused it.
+    /// Walked rather than asserted against a seeded row: a red gate no longer ends the night.
+    ///
+    /// This test used to pin the opposite, and the sentence it carried — *"Never started. The
+    /// partial stays on the branch and the second item is still there to do."* — was the honest
+    /// description of a real cost. The reason letting item i+1 run was unsafe is that it would build
+    /// on unmeasured work; the checkpoint removes that reason by putting the tree back to the
+    /// footing item i started from, so the objection no longer applies and the remaining items —
+    /// which were never the ones that broke — are worth doing.
+    ///
+    /// The verdict is untouched: the job still ends `gate_failed`, decided at the end instead of at
+    /// the first red item.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_red_gate_stops_the_chain_before_the_next_item_starts() {
+    async fn a_red_gate_reverts_the_item_and_lets_the_queue_carry_on() {
         let _lock = crate::worktree::test_env_lock();
         // A command that runs everywhere and always fails, so this measures the chain's answer to a
         // red gate rather than to a missing binary — which is the other outcome entirely, and one
@@ -2949,7 +3250,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(walk(&state, job_id).await, "gate_failed");
+        assert_eq!(
+            walk(&state, job_id).await,
+            "gate_failed",
+            "one red gate still decides what the job is called"
+        );
 
         let items: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT status, gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
@@ -2958,10 +3263,13 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
+        // Both, because this gate command fails for every item. The second one is the point: it ran.
         assert_eq!(items[0].0, "gate_failed");
         assert_eq!(items[0].1.as_deref(), Some("failed"));
-        // Never started. The partial stays on the branch and the second item is still there to do.
-        assert_eq!(items[1].0, "pending");
+        assert_eq!(
+            items[1].0, "gate_failed",
+            "the item after a red one has to have been attempted, not left pending"
+        );
         let stages: Vec<String> =
             sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
                 .bind(job_id)
@@ -2970,8 +3278,8 @@ mod tests {
                 .unwrap();
         assert_eq!(
             stages,
-            vec!["plan", "implement"],
-            "no review is spent on a chain that already stopped"
+            vec!["plan", "implement", "implement", "review"],
+            "the whole queue runs, and the review still gets to see what came out of it"
         );
 
         let _ =
@@ -3385,9 +3693,17 @@ mod tests {
         )
         .await;
 
+        // Neither job has a worktree on record, so the red one takes the branch where a revert
+        // cannot happen: `record_gate` marks the item anyway and answers `Stopped`, refusing to let
+        // a queue advance onto a tree it could not put back. The MARK is what these assertions read.
+        //
+        // And there the two part company, which is the point of the test. Silence stops the job
+        // where it stands. A verdict does not: the queue is spent, so the job goes on to have its
+        // work reviewed, and only then is it called `gate_failed` — pinned purely in
+        // `one_red_gate_makes_the_whole_job_gate_failed_however_it_ends`.
         assert_eq!(
             next_step(&load_view(&pool, broken).await.unwrap()),
-            Next::Finish(Outcome::GateFailed)
+            Next::SpawnReview
         );
         assert_eq!(
             next_step(&load_view(&pool, unmeasured).await.unwrap()),

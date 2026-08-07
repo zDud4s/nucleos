@@ -632,6 +632,150 @@ pub(crate) async fn preserve_uncommitted(
     Ok(true)
 }
 
+/// Commits whatever a job's item left behind, and answers with the commit it can be rolled back to.
+///
+/// The footing a job stands on. Until this existed there was no point to revert TO: an item that
+/// broke the tree left it broken, and the next item built on the wreckage — visible in the job that
+/// ran on 2026-08-07, where a red gate simply ended the night and left the partial on the branch.
+///
+/// Shares `preserve_uncommitted`'s road deliberately — the same [`git()`] wrapper carrying
+/// `-c core.fsmonitor=`, the same `add -A`, the same identity, the same `--no-verify` — and shares
+/// none of its body. They answer different questions and one of them is about to change: this runs
+/// on the happy path, per green gate, dozens of times a night.
+///
+/// **A clean tree is not an error, and does not get a commit.** An item that measured green without
+/// writing anything is already standing on `HEAD`, and `--allow-empty` would mint a distinct SHA per
+/// item that distinguishes nothing — a history where every revert target looks different and none of
+/// them mean anything.
+///
+/// **No byte ceiling, where `preserve_uncommitted` has one, and the asymmetry is the point.** That
+/// function runs while a worktree is being destroyed, so refusing to preserve 4 GB costs the work
+/// and saves the disk. Here, refusing costs the NEXT item its footing, which is the exact state this
+/// whole change exists to abolish. If a ceiling is ever wanted here it has to come with an answer to
+/// "and then what does the next item revert to", and today there is none.
+pub(crate) async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
+    if !is_worktree_root(worktree_path).await {
+        // Same door `preserve_uncommitted` keeps shut: a plain directory inside somebody else's
+        // repository would have its `add -A` land on THAT repository's work.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to checkpoint a path that is not a worktree root: {}",
+                worktree_path.display()
+            ),
+        ));
+    }
+
+    let status = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--untracked-files=all")
+        .output()
+        .await?;
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        return Err(io::Error::other(format!("git status failed: {stderr}")));
+    }
+
+    if !status.stdout.is_empty() {
+        let add = git()
+            .arg("-C")
+            .arg(worktree_path)
+            .arg("add")
+            .arg("-A")
+            .output()
+            .await?;
+        if !add.status.success() {
+            let stderr = String::from_utf8_lossy(&add.stderr);
+            return Err(io::Error::other(format!("git add failed: {stderr}")));
+        }
+
+        let commit = git()
+            .arg("-c")
+            .arg("user.name=nucleos")
+            .arg("-c")
+            .arg("user.email=nucleos@localhost")
+            .arg("-C")
+            .arg(worktree_path)
+            .arg("commit")
+            .arg("--no-verify")
+            .arg("-m")
+            .arg("nucleos: checkpoint a gate agreed with")
+            .output()
+            .await?;
+        if !commit.status.success() {
+            let stderr = String::from_utf8_lossy(&commit.stderr);
+            return Err(io::Error::other(format!("git commit failed: {stderr}")));
+        }
+    }
+
+    head_sha(worktree_path).await
+}
+
+/// Puts the tree back where `sha` left it, and takes the untracked files with it.
+///
+/// **`clean` is not tidiness, it is half the revert.** `reset --hard` restores tracked files and has
+/// nothing to say about a file the item CREATED — so without it the next item starts on top of the
+/// previous one's new modules, its scratch scripts and its `__pycache__`, in a tree that looks
+/// reverted. That is the defect this change is here to remove, wearing a disguise.
+///
+/// `-fd` and deliberately not `-fdx`: `-x` reaches what `.gitignore` covers, which in a job's
+/// worktree is `target/`. Throwing away a whole build per skipped item is a cost nobody would
+/// connect back to the commit that introduced it.
+///
+/// `sha` NEVER comes from a request. Every caller passes `job_items.checkpoint_sha` or
+/// `jobs.head_sha`, both written by this daemon. A `reset --hard` taking a caller-supplied ref is an
+/// arbitrary-write primitive pointed at the user's own repository.
+pub(crate) async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()> {
+    let reset = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("reset")
+        .arg("--hard")
+        .arg(sha)
+        .output()
+        .await?;
+    if !reset.status.success() {
+        let stderr = String::from_utf8_lossy(&reset.stderr);
+        return Err(io::Error::other(format!("git reset failed: {stderr}")));
+    }
+
+    let clean = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("clean")
+        .arg("-fd")
+        .output()
+        .await?;
+    if !clean.status.success() {
+        let stderr = String::from_utf8_lossy(&clean.stderr);
+        return Err(io::Error::other(format!("git clean failed: {stderr}")));
+    }
+    Ok(())
+}
+
+async fn head_sha(worktree_path: &Path) -> io::Result<String> {
+    let output = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!("git rev-parse failed: {stderr}")));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if sha.is_empty() {
+        return Err(io::Error::other("git rev-parse printed no revision"));
+    }
+    Ok(sha)
+}
+
 pub async fn remove(project_root: &Path, path: &Path, backoff: &[Duration]) -> io::Result<()> {
     if is_dangerous_removal_path(path, project_root) {
         return Err(io::Error::new(
@@ -1921,6 +2065,165 @@ mod tests {
             ),
             "",
             "an excluded handoff leaves the worktree looking clean"
+        );
+    }
+
+    /// The footing itself: an item's work becomes a commit, and the caller is told which one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_checkpoint_commits_what_an_item_left_and_answers_with_its_sha() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(60))
+            .await
+            .expect("create the job's worktree");
+
+        let before = head_sha(&info.path).await.expect("read HEAD before");
+        std::fs::write(info.path.join("seed.txt"), "an item's work\n").expect("modify a file");
+        std::fs::write(info.path.join("new_module.txt"), "and a new one\n").expect("add a file");
+
+        let sha = checkpoint(&info.path).await.expect("checkpoint the item");
+
+        assert_ne!(sha, before, "work that changed the tree must move HEAD");
+        assert_eq!(
+            sha,
+            head_sha(&info.path).await.expect("read HEAD after"),
+            "the answer has to be the commit that was just made, not some other revision"
+        );
+        assert_eq!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            ),
+            "",
+            "nothing may be left uncommitted, or the next item inherits it"
+        );
+    }
+
+    /// An item that measured green without writing anything is already standing on `HEAD`.
+    ///
+    /// `--allow-empty` would be the lazy spelling and would mint a distinct SHA per item that
+    /// distinguishes nothing — every revert target looking different and none of them meaning
+    /// anything. The property worth having is that the answer is always a commit the tree IS at.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_checkpoint_on_a_clean_tree_answers_head_without_committing() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(61))
+            .await
+            .expect("create the job's worktree");
+
+        let before = head_sha(&info.path).await.expect("read HEAD before");
+        let sha = checkpoint(&info.path)
+            .await
+            .expect("checkpoint a clean tree");
+
+        assert_eq!(
+            sha, before,
+            "a clean tree must not earn a commit of its own"
+        );
+    }
+
+    /// The same door `preserve_uncommitted` keeps shut, and for the sharper reason: this one runs
+    /// `add -A` on the happy path, dozens of times a night. Pointed at a plain directory inside
+    /// somebody else's repository it would commit THEIR work, on a schedule.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_checkpoint_refuses_a_path_that_is_not_a_worktree_root() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let inside = repo.path().join("just-a-directory");
+        std::fs::create_dir(&inside).expect("create a plain directory inside the repository");
+        std::fs::write(inside.join("theirs.txt"), "somebody else's work\n").expect("write");
+
+        let error = checkpoint(&inside)
+            .await
+            .expect_err("a plain directory must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("status"), OsStr::new("--porcelain")],
+            )
+            .trim(),
+            "?? just-a-directory/",
+            "the enclosing repository's work must be exactly as untouched as it was"
+        );
+    }
+
+    /// The half of the revert that `reset --hard` cannot do.
+    ///
+    /// A skipped item that only CREATED files has nothing for `reset` to undo, so without the clean
+    /// the next item starts on top of its modules, its scratch scripts and its `__pycache__` — in a
+    /// tree that looks reverted. Which is the defect this change exists to remove, in disguise.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reverting_takes_back_created_files_and_not_only_modified_ones() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(62))
+            .await
+            .expect("create the job's worktree");
+
+        let footing = checkpoint(&info.path).await.expect("take a footing");
+
+        std::fs::write(info.path.join("seed.txt"), "the item edited this\n").expect("modify");
+        std::fs::write(info.path.join("invented.txt"), "and invented this\n").expect("create");
+        std::fs::create_dir(info.path.join("scratch")).expect("create a directory");
+        std::fs::write(info.path.join("scratch/notes.txt"), "and this\n").expect("write");
+
+        revert_to(&info.path, &footing).await.expect("revert");
+
+        // Trimmed, because git's own end-of-line filter rewrites the checkout on this platform and
+        // the property under test is the CONTENT, not which bytes git chose to terminate it with.
+        assert_eq!(
+            std::fs::read_to_string(info.path.join("seed.txt"))
+                .expect("read the tracked file")
+                .trim(),
+            "seed",
+            "a tracked edit has to be taken back"
+        );
+        assert!(
+            !info.path.join("invented.txt").exists(),
+            "a created file has to be taken back too — this is the half reset cannot do"
+        );
+        assert!(
+            !info.path.join("scratch").exists(),
+            "and a created directory with it"
+        );
+        assert_eq!(
+            head_sha(&info.path).await.expect("read HEAD"),
+            footing,
+            "the tree must be standing on the footing it was given"
+        );
+    }
+
+    /// A revert that cannot name its target has to say so rather than half-happen. The caller's
+    /// answer to this error is to stop the job, and it can only make that choice if the tree is in
+    /// a state it recognises.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reverting_to_a_revision_that_does_not_exist_fails_and_leaves_the_work_alone() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Job(63))
+            .await
+            .expect("create the job's worktree");
+        std::fs::write(info.path.join("seed.txt"), "work in progress\n").expect("modify");
+
+        revert_to(&info.path, "0000000000000000000000000000000000000000")
+            .await
+            .expect_err("a revision that does not exist must be an error");
+
+        assert_eq!(
+            std::fs::read_to_string(info.path.join("seed.txt")).expect("read"),
+            "work in progress\n",
+            "a failed revert must not have thrown the work away on its way to failing"
         );
     }
 
