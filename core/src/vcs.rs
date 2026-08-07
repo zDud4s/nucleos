@@ -121,9 +121,6 @@ impl Op {
     /// the executor cannot perform yet is deliberately different from the one for a word that is not
     /// an operation at all. A caller told "unknown operation: push" would go looking for a typo in
     /// its own request; a caller told "push is not queued yet" knows to wait or do something else.
-    // Called by the tests below, and by Chunk 4's MCP tool — the flat shape exists for that caller
-    // and has no production one yet. Same waiver, and the same reason, as `Origin::Shell` above.
-    #[allow(dead_code)]
     pub fn from_request(
         operation: &str,
         source: Option<&str>,
