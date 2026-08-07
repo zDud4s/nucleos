@@ -861,6 +861,82 @@ pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Resul
     Ok(cancelled.len() as u64)
 }
 
+/// Retires every request in this repository whose submitting run has already ended, and returns how
+/// many. Called by `drain_once` before it claims.
+///
+/// **This is the pull half of spec §7's "the agent that submitted dies", and it exists because the
+/// push half cannot be complete.** `runs::finalize_termination` sweeps the paths that go through it,
+/// but a run's terminal status is also written by direct UPDATEs in four other places, and the next
+/// one will be written by somebody who does not know the list exists. Asking here — at the one point
+/// that must be correct anyway, because it is where a merge is about to be executed — makes the
+/// guarantee true by construction rather than by everyone remembering.
+///
+/// `cancel_for_run` is kept alongside it and is not redundant: it makes a cancelled run's requests
+/// disappear *immediately*, rather than at the next poll of a repository that may have nothing else
+/// queued for hours.
+///
+/// The status list comes from `runs::ENDED_RUN_STATUSES` rather than being spelled here. Note what
+/// is NOT in it: a run at `awaiting_approval` is paused for a human and will resume, so its merge
+/// must survive; and a run that finished its work normally never reaches `finalize_termination` at
+/// all, which is correct — it asked for the merge and should have it.
+///
+/// `running` is excluded by the same status filter `cancel_for_run` uses, and for the same reason
+/// spelled out there: an operation already in flight finishes. Here it is also structural — this
+/// runs *before* the claim, so there is nothing of this drain's in flight to protect.
+///
+/// The `IN` clause's placeholders are generated from the constant's length and every element bound,
+/// rather than the list being interpolated into the string: a status is data, and a query built by
+/// formatting values into SQL is the shape that stops being safe the moment one of them stops being
+/// a literal somebody wrote by hand.
+pub async fn reap_requests_of_ended_runs(
+    pool: &sqlx::SqlitePool,
+    repo_key: &str,
+) -> sqlx::Result<u64> {
+    let placeholders = vec!["?"; crate::runs::ENDED_RUN_STATUSES.len()].join(", ");
+    // `run_id IS NOT NULL` is redundant against the `EXISTS` below — a NULL joins nothing — and is
+    // written anyway because it is the sentence the reaper means: a request no run owns is not a
+    // request a run can have abandoned.
+    let sql = format!(
+        "UPDATE vcs_requests
+            SET status = 'cancelled', finished_at = ?,
+                failure_reason = 'the run that asked for this had already ended when the queue reached it'
+          WHERE repo_key = ? AND status IN ('queued', 'awaiting_approval')
+            AND run_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM runs
+                         WHERE runs.id = vcs_requests.run_id
+                           AND runs.status IN ({placeholders}))
+         RETURNING id, project_id, run_id"
+    );
+
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    // `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str`, and this string is built at
+    // runtime. Audited, and the audit is short: the only interpolation is `placeholders`, which is
+    // `n` question marks derived from a compile-time constant's length. No value reaches the SQL —
+    // the statuses themselves are bound below, one per placeholder.
+    let mut query = sqlx::query_as::<_, (i64, String, Option<i64>)>(sqlx::AssertSqlSafe(sql))
+        .bind(finished_at)
+        .bind(repo_key.to_string());
+    for status in crate::runs::ENDED_RUN_STATUSES {
+        query = query.bind(*status);
+    }
+    let reaped = query.fetch_all(pool).await?;
+
+    // Best-effort per row, this crate's convention for observational writes: a feed row that cannot
+    // be written must not undo the cancellation it is only reporting on.
+    for (id, project_id, run_id) in &reaped {
+        let _ = crate::feed::append(
+            pool,
+            Some(project_id.as_str()),
+            "vcs_request_cancelled",
+            &format!("vcs request {id} cancelled: the run that asked for it had already ended"),
+            *run_id,
+        )
+        .await;
+    }
+
+    Ok(reaped.len() as u64)
+}
+
 /// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
 /// decides *when* an operation may run and records how it ended, and this trait is the only thing
 /// that knows how to actually perform one. Chunk 1 has only the test double below, which is why
@@ -937,6 +1013,21 @@ pub async fn drain_once(
     repo_key: &str,
     executor: &dyn VcsExecutor,
 ) -> bool {
+    // Spec §7's pull half, and the reason the four other writers of a run's terminal status do not
+    // each need a sweep of their own — `reap_requests_of_ended_runs` argues the whole case. It goes
+    // before the claim because after it the row would already be `running`, which the reap leaves
+    // alone by design.
+    //
+    // Best-effort, like the feed appends below: a reap that could not run leaves stale requests a
+    // human can cancel, whereas returning early on it would stop the queue for this repository
+    // outright — including for every request whose run is perfectly alive.
+    if let Err(error) = reap_requests_of_ended_runs(pool, repo_key).await {
+        tracing::warn!(
+            repo_key = %repo_key,
+            %error,
+            "could not reap the vcs requests of runs that have already ended"
+        );
+    }
     let claimed = match claim_next(pool, repo_key).await {
         Ok(Some(claimed)) => claimed,
         // Nothing queued, something already running, or only unapproved rows — all "come back
@@ -2617,6 +2708,117 @@ mod tests {
         cancel_for_run(&pool, 7).await.unwrap();
 
         assert_eq!(status_of(&pool, human).await, "queued");
+    }
+
+    /// The smallest `runs` row the table will accept: `prompt`, `status` and `created_at` are its
+    /// only NOT NULL columns without a default (`core/migrations/0002_runs.sql`). Written by hand
+    /// rather than by spawning a run, because the one column the reaper reads is `status`, and going
+    /// through `runs.rs` would drag a whole runner in to set it.
+    ///
+    /// The id is a parameter rather than returned, so a test can name the same number in the
+    /// request's `Origin::Run` and read as one fact what the reaper has to join on.
+    async fn insert_run(pool: &sqlx::SqlitePool, id: i64, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at)
+             VALUES (?, 'merge it', ?, '2026-08-02T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A request a run asked for that is past approval and waiting its turn — the state every one of
+    /// these tests is about, and the one `submit` cannot produce directly, since a `Run` request
+    /// starts `awaiting_approval`.
+    async fn queued_request_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> i64 {
+        let id = submit(pool, &repo(), &merge_op(), Origin::Run(run_id))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE vcs_requests SET status = 'queued' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The push half cannot be complete — four writers set a run's terminal status without going through
+    /// `finalize_termination`. This is the half that does not depend on anybody remembering.
+    #[tokio::test]
+    async fn a_request_whose_run_died_by_some_other_door_is_reaped_before_the_next_claim() {
+        let pool = test_pool().await;
+        // `timed_out` is written by a direct UPDATE in `runs.rs`'s progress-deadline arm, which does
+        // not sweep. Nothing told the queue this run was over; the queue has to ask.
+        insert_run(&pool, 7, "timed_out").await;
+        let id = queued_request_for_run(&pool, 7).await;
+
+        let executor = FakeVcsExecutor::succeeding_with("abc123");
+        assert!(
+            !drain_once(&pool, "alpha", &executor).await,
+            "the reap leaves nothing claimable, so the drain must report the queue empty"
+        );
+
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+        // The half that a status assertion alone cannot make: a merge that ran and was then
+        // overwritten with `cancelled` would satisfy the line above and still have touched the
+        // repository on behalf of a run that no longer exists.
+        assert_eq!(
+            executor.calls(),
+            0,
+            "a dead run's merge must never reach git"
+        );
+    }
+
+    /// The trap, again and one level deeper: a run paused for a human resumes, and its merge must
+    /// survive the pause. `status != 'running'` would fail this; a list of ended statuses passes it.
+    #[tokio::test]
+    async fn a_request_whose_run_is_only_paused_for_approval_is_not_reaped() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "awaiting_approval").await;
+        let id = queued_request_for_run(&pool, 7).await;
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// A request nobody's run owns is nobody's to reap.
+    #[tokio::test]
+    async fn a_humans_request_is_never_reaped() {
+        let pool = test_pool().await;
+        // An ended run exists, and is not this request's: without it the test would pass against a
+        // reaper that simply found nothing ended, which is not what it claims to check.
+        insert_run(&pool, 7, "cancelled").await;
+        let human = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, human).await, "queued");
+    }
+
+    /// A run that finished its work asked for the merge and should have it. `completed` is what
+    /// `runs.rs` writes for an exit code of zero (`runs.rs`'s terminal-status match, and the status
+    /// comment at the top of `0002_runs.sql`), and it is deliberately absent from
+    /// `runs::ENDED_RUN_STATUSES`.
+    #[tokio::test]
+    async fn a_request_whose_run_completed_normally_is_not_reaped() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "completed").await;
+        let id = queued_request_for_run(&pool, 7).await;
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, id).await, "queued");
     }
 
     /// A cancelled request is terminal, so a caller waiting on one must be answered rather than held to

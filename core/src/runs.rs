@@ -1805,8 +1805,19 @@ pub async fn get_run(
 /// call site: `timed_out` has its own call in `spawn_run`'s wall-clock arm, and `interrupted` is
 /// inert today and would be obviously right if startup recovery ever routed through here.
 fn ends_the_run(status: &str) -> bool {
-    matches!(status, "cancelled" | "failed" | "interrupted" | "timed_out")
+    ENDED_RUN_STATUSES.contains(&status)
 }
+
+/// The run statuses that mean the run is over for good — it will not resume, and anything it asked
+/// for and never started should go with it.
+///
+/// A constant rather than a literal inside `ends_the_run`, because `vcs.rs` builds a SQL `IN` clause
+/// from this same list and a second copy would drift silently: the failure would be a queue that
+/// stops reaping, or one that reaps a run that was only paused, and neither announces itself.
+///
+/// `awaiting_approval` is deliberately absent, and it is the whole reason this is a list rather than
+/// `status != 'running'`: a run pausing for a human resumes, and its merge must survive the pause.
+pub const ENDED_RUN_STATUSES: &[&str] = &["cancelled", "failed", "interrupted", "timed_out"];
 
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
