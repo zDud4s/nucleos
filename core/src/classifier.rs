@@ -3,9 +3,24 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 6;
+pub const CLASSIFIER_VERSION: u32 = 7;
 
-const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+/// Tools that change nothing outside the session: they bring information in, or move the agent's own
+/// bookkeeping.
+///
+/// `Skill` reads a `SKILL.md` and puts its text into the agent's context. It is `Read` with a
+/// directory convention, and it grants no capability — every action a skill talks the agent into
+/// still arrives here as its own tool call and is classified on its own terms. What it does mean is
+/// that a skill file IS the agent's operating instructions, so writing one is guarded on the other
+/// side of the trade, in `SELF_GOVERNING_DIRS`. Same bargain every test runner struck with its
+/// inputs: the capability arrives with the thing that decides what it does already guarded.
+///
+/// Measured: both items of the job-7 dogfood were skipped for
+/// `Skill{"superpowers:test-driven-development"}` — the classifier refusing the agent the discipline
+/// this file's own changes were written under.
+///
+/// `TodoWrite` writes the agent's task list, which lives in the session and not in the project.
+const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill", "TodoWrite"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
 const SELF_GOVERNING_FILES: &[&str] = &[
     ".ai/autopilot.yaml",
@@ -21,6 +36,27 @@ const SELF_GOVERNING_FILES: &[&str] = &[
     ".ai/web.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
+];
+
+/// Directories where every file is the agent's own operating instructions, matched as a whole path
+/// segment the way `EXECUTES_ON_NEXT_COMMAND_DIRS` is.
+///
+/// The sibling of `SELF_GOVERNING_FILES` and the same argument: what makes these dangerous is that
+/// their CONTENTS are the policy. A hook script runs; a skill, an agent definition and a slash
+/// command are read as instructions by the agent itself. None of them grants a capability directly —
+/// every action they inspire still arrives at this classifier as its own tool call — but they steer
+/// what a run does and, more to the point, what it says it did. That is the third of the three
+/// things `SAFE_COMMAND_PREFIXES` says a command may not reach: what a person will be shown.
+///
+/// Added when `Skill` joined `READ_LOCAL_TOOLS`, because reading them without guarding the writing
+/// of them would have been half a trade. `.claude/agents/` and `.claude/commands/` were the same gap
+/// already open, and are closed here rather than left for the next person to find twice.
+const SELF_GOVERNING_DIRS: &[&str] = &[
+    ".claude/hooks/",
+    ".claude/skills/",
+    ".claude/agents/",
+    ".claude/commands/",
+    ".agents/skills/",
 ];
 
 /// Files whose contents are EXECUTED by a command this classifier already allows.
@@ -852,8 +888,9 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
     SELF_GOVERNING_FILES
         .iter()
         .any(|suffix| path_has_suffix(&normalized, suffix))
-        || normalized.contains("/.claude/hooks/")
-        || normalized.starts_with(".claude/hooks/")
+        || SELF_GOVERNING_DIRS
+            .iter()
+            .any(|dir| normalized.starts_with(dir) || normalized.contains(&format!("/{dir}")))
 }
 
 fn targets_file_that_runs_on_next_command(tool_input: &Value, cwd: Option<&Path>) -> bool {
@@ -1624,6 +1661,75 @@ mod tests {
                 classify(tool_name, &json!({"file_path": "src/main.rs"}), None),
                 "pending_approval",
                 "no-workspace",
+            );
+        }
+    }
+
+    /// A skill is text. Reading it grants nothing — every action it talks the agent into arrives
+    /// here as its own tool call — which is why it is allowed, and why writing one is not.
+    ///
+    /// Measured: both items of the job-7 dogfood were skipped for
+    /// `Skill{"superpowers:test-driven-development"}`, the classifier refusing the agent the
+    /// discipline this file's own changes were written under.
+    #[test]
+    fn reading_a_skill_is_allowed_and_writing_one_is_not() {
+        assert_classification(
+            classify(
+                "Skill",
+                &json!({"skill": "superpowers:test-driven-development"}),
+                None,
+            ),
+            "allow",
+            "read-local",
+        );
+        assert_classification(
+            classify("TodoWrite", &json!({"todos": []}), None),
+            "allow",
+            "read-local",
+        );
+
+        // The other half of the trade. A skill file IS the agent's operating instructions, so it is
+        // governance rather than source — the same reading `.claude/settings.json` already gets.
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for file_path in [
+            ".claude/skills/mine/SKILL.md",
+            r".claude\skills\mine\SKILL.md",
+            r"C:\work\repo\.claude\skills\mine\references\more.md",
+            ".claude/agents/reviewer.md",
+            ".claude/commands/ship.md",
+            ".agents/skills/mine/SKILL.md",
+        ] {
+            assert_eq!(
+                classify("Write", &json!({"file_path": file_path}), cwd)
+                    .decision
+                    .decision,
+                "pending_approval",
+                "{file_path}"
+            );
+        }
+
+        // The guard is a whole path segment, so ordinary source that merely reads like it is not
+        // caught. `docs/skills.md` is a document about skills, not a skill.
+        for file_path in ["docs/skills.md", "src/claude/skills.rs"] {
+            assert_eq!(
+                classify("Write", &json!({"file_path": file_path}), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{file_path}"
+            );
+        }
+    }
+
+    /// The tool axis defaults to refusing, and has to keep doing so: a tool nobody has reasoned
+    /// about is a capability nobody has bounded.
+    #[test]
+    fn a_tool_this_file_has_not_reasoned_about_still_asks() {
+        for tool_name in ["WebFetch", "WebSearch", "Task", "NotebookEdit"] {
+            assert_classification(
+                classify(tool_name, &json!({}), None),
+                "pending_approval",
+                "unrecognized",
             );
         }
     }
@@ -2426,13 +2532,13 @@ mod tests {
 
     /// Bumped once per policy change: 3 widened the allow list, 4 made the classifier read a line
     /// as the sequence it is, 5 stopped counting a stream join as a file write and let `echo`/`test`
-    /// through, 6 let `mkdir` place a directory inside the workspace. The version is stamped onto
-    /// every `shadow_decisions` row, so it is the only thing that tells two differently-classified
-    /// decisions apart after the fact — leaving it at 2 would have made the night of 2026-08-08 and
-    /// everything after it look alike.
+    /// through, 6 let `mkdir` place a directory inside the workspace, 7 let the agent read a skill
+    /// and stopped it writing one. The version is stamped onto every `shadow_decisions` row, so it
+    /// is the only thing that tells two differently-classified decisions apart after the fact —
+    /// leaving it at 2 would have made the night of 2026-08-08 and everything after it look alike.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 6);
+        assert_eq!(CLASSIFIER_VERSION, 7);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
