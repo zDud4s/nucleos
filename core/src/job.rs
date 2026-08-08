@@ -2576,6 +2576,48 @@ pub enum CancelOutcome {
     NotFound,
 }
 
+/// Ends a node that is parked on an approval, which `finalize_termination` cannot.
+///
+/// That function needs a live handle and guards its write with `status = 'running'`, and a parked
+/// node has neither: its task ended when it asked, and its row says `awaiting_approval`. So the loop
+/// below used to hand it a run it could do nothing with, and the run stayed parked after the job
+/// that owned it was gone — holding `one_open_worktree_run_per_project` and blocking every later
+/// worktree run of that project until a person noticed.
+///
+/// Measured on 2026-08-08: job 12 was cancelled while its review node was parked, and job 13 came up
+/// `waiting` with `wait_reason = slot` against a project whose only live job was itself. Nothing in
+/// the feed said why, because from the project's side nothing had gone wrong.
+///
+/// The proposal is closed FIRST, and that order is the point rather than tidiness: while it is
+/// pending, `/approve` is a working door into a node whose job is over — it would resume work
+/// nobody is waiting for, in a worktree the job no longer owns. `reject_proposal` also takes the run
+/// terminal through `worktree::release`, so the call after it is for the other case: a node parked
+/// with no pending proposal left to reject.
+async fn cancel_parked_node(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
+    let pending: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM proposals
+         WHERE run_id = ? AND kind = 'action-approval' AND status = 'pending'",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    for proposal_id in pending {
+        if let Err(error) = crate::proposals::reject_proposal(pool, proposal_id).await {
+            // Best effort, and the release below is why that is acceptable: a proposal that could
+            // not be rejected leaves a stale door, where a run that stayed parked would leave the
+            // whole project blocked. The worse of the two is the one this function must not skip.
+            tracing::warn!(
+                run_id,
+                proposal_id,
+                ?error,
+                "could not reject the parked node's proposal"
+            );
+        }
+    }
+    crate::worktree::release(pool, run_id).await?;
+    Ok(())
+}
+
 /// Stops a whole job: the node in flight, and the sequence behind it.
 ///
 /// This is the second of the two cancellation levels. Cancelling a *run* stops one node, and the
@@ -2599,14 +2641,20 @@ pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome
         return Ok(CancelOutcome::NotLive);
     }
 
-    let in_flight: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM runs WHERE job_id = ? AND status IN ('running','awaiting_approval')",
+    let in_flight: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM runs WHERE job_id = ? AND status IN ('running','awaiting_approval')",
     )
     .bind(job_id)
     .fetch_all(pool)
     .await?;
-    for run_id in in_flight {
-        crate::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
+    for (run_id, status) in in_flight {
+        // Branched on the run's own status rather than on what `finalize_termination` returns,
+        // because the two ends need different tools and the return value does not tell them apart.
+        if status == "awaiting_approval" {
+            cancel_parked_node(pool, run_id).await?;
+        } else {
+            crate::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
+        }
     }
 
     // Only the item that was in someone's hands. The ones still `pending` were never started, and
@@ -3722,6 +3770,64 @@ mod tests {
             feed_kinds(&pool)
                 .await
                 .contains(&"job_cancelled".to_owned())
+        );
+    }
+
+    /// Cancelling a job also ends the node that was parked asking for permission — and closes the
+    /// door that could still have said yes to it.
+    ///
+    /// `finalize_termination` cannot do this: it needs a live handle, and it guards its write with
+    /// `status = 'running'`. A parked node has neither. So the run stayed `awaiting_approval` after
+    /// the job that owned it was gone, holding `one_open_worktree_run_per_project` and blocking
+    /// every later worktree run of that project.
+    ///
+    /// Found in production on 2026-08-08: job 12 was cancelled with its review node parked, and the
+    /// next job came up `waiting` with `wait_reason = slot` against a project whose only live job
+    /// was itself — with nothing in the feed to say why, because from the project's side nothing
+    /// had gone wrong.
+    #[tokio::test]
+    async fn cancelling_a_job_ends_the_node_parked_on_an_approval_and_shuts_its_door() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_items(&pool, job_id, &["passed"]).await;
+        let run_id = seed_node(&pool, job_id, "review", "awaiting_approval").await;
+        let proposal_id = crate::proposals::create_action_approval(
+            &pool,
+            run_id,
+            None,
+            Some("project-a"),
+            "Bash",
+            "the review node wanted to look around",
+            Some(r#"{"command":"git branch -a"}"#),
+        )
+        .await
+        .expect("a parked node has a proposal");
+
+        assert_eq!(
+            cancel(&state, job_id).await.unwrap(),
+            CancelOutcome::Cancelled
+        );
+
+        let run_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            run_status, "awaiting_approval",
+            "the parked node outlived the job that owned it, and holds the project's slot"
+        );
+
+        let proposal_status: String =
+            sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+                .bind(proposal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            proposal_status, "pending",
+            "approving this would resume a node whose job is over"
         );
     }
 
