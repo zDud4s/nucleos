@@ -2434,6 +2434,14 @@ pub struct JobSummary {
     /// alone would leave them guessing which.
     pub wait_reason: Option<String>,
     pub max_items: i64,
+    /// The round the job is on, counted from zero, and how many it may run.
+    ///
+    /// Carried because without them a job with rounds is unreadable from outside: a queue of eight
+    /// items where the first five passed and the last three are pending looks the same whether the
+    /// plan node asked for eight at once — which `MAX_ITEMS_CEILING` forbids — or asked for five,
+    /// finished them, and had a replan node ask for three more. This pair is what says which.
+    pub round: i64,
+    pub max_rounds: i64,
     pub created_at: String,
     pub completed_at: Option<String>,
 }
@@ -2444,6 +2452,10 @@ pub struct JobItemView {
     pub ordinal: i64,
     pub description: String,
     pub status: String,
+    /// The round this item was queued in. `ordinal` cannot stand in for it: ordinals continue
+    /// across rounds rather than restart, so nothing in the number itself marks where one round
+    /// ended and the next began.
+    pub round: i64,
     /// The node that did it, so the shell can link to the transcript.
     pub run_id: Option<i64>,
     /// Carried separately from `status` because they answer different questions: `status` says
@@ -2465,7 +2477,8 @@ pub struct JobDetail {
 }
 
 const ONE_SUMMARY_SQL: &str =
-    "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at, completed_at
+    "SELECT id, project_id, rule_name, status, wait_reason, max_items, round, max_rounds,
+        created_at, completed_at
      FROM jobs WHERE id = ?";
 
 /// The most recent jobs, newest first.
@@ -2480,8 +2493,8 @@ pub async fn list(
     match project_id {
         Some(project_id) => {
             sqlx::query_as(
-                "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at,
-                    completed_at
+                "SELECT id, project_id, rule_name, status, wait_reason, max_items, round,
+                    max_rounds, created_at, completed_at
              FROM jobs WHERE project_id = ? ORDER BY id DESC LIMIT ?",
             )
             .bind(project_id)
@@ -2491,8 +2504,8 @@ pub async fn list(
         }
         None => {
             sqlx::query_as(
-                "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at,
-                    completed_at
+                "SELECT id, project_id, rule_name, status, wait_reason, max_items, round,
+                    max_rounds, created_at, completed_at
              FROM jobs ORDER BY id DESC LIMIT ?",
             )
             .bind(limit)
@@ -2512,7 +2525,7 @@ pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDe
     };
 
     let items: Vec<JobItemView> = sqlx::query_as(
-        "SELECT ordinal, description, status, run_id, gate_status
+        "SELECT ordinal, description, status, round, run_id, gate_status
          FROM job_items WHERE job_id = ? ORDER BY ordinal",
     )
     .bind(job_id)
@@ -3706,6 +3719,52 @@ mod tests {
         assert_eq!(detail.items[1].gate_status.as_deref(), Some("passed"));
         assert_eq!(detail.branch.as_deref(), Some("nucleos/job"));
         assert!(detail.items[0].ordinal < detail.items[1].ordinal);
+    }
+
+    /// Which round an item came from has to travel, because nothing else in the view carries it.
+    ///
+    /// Ordinals continue across rounds rather than restart, so a queue of three passed items and two
+    /// pending ones reads identically whether the plan node asked for five at once or asked for
+    /// three and a replan added two. The round is the only thing that separates those, and until it
+    /// is on the wire the answer is only in the database.
+    #[tokio::test]
+    async fn a_jobs_detail_says_which_round_each_item_came_from() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "passed", "pending"]).await;
+        sqlx::query("UPDATE job_items SET round = 1 WHERE job_id = ? AND ordinal = 2")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET round = 1, max_rounds = 4 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let detail = detail(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job exists");
+
+        assert_eq!((detail.job.round, detail.job.max_rounds), (1, 4));
+        let rounds: Vec<i64> = detail.items.iter().map(|item| item.round).collect();
+        assert_eq!(rounds, vec![0, 0, 1]);
+        // The point of the field, stated as what it is not: the ordinals do not say this.
+        let ordinals: Vec<i64> = detail.items.iter().map(|item| item.ordinal).collect();
+        assert_eq!(ordinals, vec![0, 1, 2]);
+    }
+
+    /// A job of today reads as one round of one, not as round zero of nothing.
+    #[tokio::test]
+    async fn a_job_without_rounds_lists_as_a_single_round() {
+        let pool = test_pool().await;
+        seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        let listed = list(&pool, Some("project-a"), 20).await.unwrap();
+
+        assert_eq!((listed[0].round, listed[0].max_rounds), (0, 1));
     }
 
     /// Finished jobs stay in the listing. A job that stopped for the budget or ran out of clock is
