@@ -129,6 +129,14 @@ pub enum Outcome {
     Cancelled,
     GateFailed,
     GateErrored,
+    /// Ran out of an allowance rather than out of work: the round ceiling here, the job's own budget
+    /// once `brakes()` learns to read it.
+    ///
+    /// Apart from `Completed` for the same reason `Cancelled` is apart from `Failed` — it is what a
+    /// person reads in the morning. `completed` means "I finished"; `stopped` means "I was cut short
+    /// and what I did is on the branch". Reporting the second as the first is how somebody stops
+    /// looking at a job that still had work in it.
+    Stopped,
 }
 
 /// What the daemon should do next for a job.
@@ -142,10 +150,69 @@ pub enum Next {
         ordinal: usize,
     },
     SpawnReview,
+    /// Ask again now that this round's queue is empty: either for more work, or for "done".
+    SpawnReplan,
     /// A node is in flight; nothing to do until it lands.
     Wait,
     Finish(Outcome),
 }
+
+/// What the last replan node concluded, once it has landed.
+///
+/// Two values and not three, because "it produced a queue" is not a state this has to hold: the
+/// caller writes the items, bumps the round, and the queue in `JobView::items` IS the answer. What
+/// is left is the case with nothing to show for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Replan {
+    /// No replan node has landed for this round.
+    #[default]
+    NotYet,
+    /// It said `{"done": true}` — the thing that knows the work says the work is over.
+    Done,
+}
+
+/// Where a job is in its sequence of rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundState {
+    /// Which round the queue in `JobView::items` belongs to, counting from 0 so that the plan node's
+    /// items are round 0 and the first replan opens round 1.
+    pub round: i64,
+    /// The ceiling this job was given, already cut by `MAX_ROUNDS_CEILING` before it got here.
+    ///
+    /// `1` is a job of today and takes the pre-rounds path verbatim, which is what lets the schema
+    /// and this logic land without changing a single existing behaviour.
+    pub max_rounds: i64,
+    /// Consecutive rounds that added no new items.
+    pub dry_rounds: i64,
+    /// Whether a replan node is in flight right now.
+    ///
+    /// The sibling of `planning`, and needed for the identical reason: between spawning the node and
+    /// its items landing, the queue is empty, and without this every tick would spawn another one.
+    pub replanning: bool,
+    /// What the last replan node said.
+    pub replanned: Replan,
+}
+
+impl Default for RoundState {
+    /// A job of one round, which is every job that existed before this struct did.
+    fn default() -> Self {
+        Self {
+            round: 0,
+            max_rounds: 1,
+            dry_rounds: 0,
+            replanning: false,
+            replanned: Replan::NotYet,
+        }
+    }
+}
+
+/// How many rounds in a row may add nothing before the job calls itself finished.
+///
+/// Two, and one would be wrong: a replan can legitimately produce nothing while the previous round's
+/// work is still settling. Counting items to a target never finds the tail either — a model that
+/// will not say "done" would sit against `max_rounds` spending money — so the brake is "it dried up"
+/// and not "it reached a number".
+pub const DRY_ROUNDS_TO_STOP: i64 = 2;
 
 /// Everything the decision below needs to see, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,8 +226,14 @@ pub struct JobView {
     /// every tick would answer `SpawnPlan` while the first planner was still running. The item
     /// queue is what stops that from happening to an implement node; the plan node has no item.
     pub planning: bool,
+    /// The queue of the CURRENT round, never of every round the job has had.
+    ///
+    /// Load-bearing and easy to get wrong: read without filtering on `job_items.round`, round 2
+    /// would see round 1's finished items sitting beside its own and start the round again from the
+    /// first pending one it found.
     pub items: Vec<ItemState>,
     pub review: ReviewState,
+    pub rounds: RoundState,
 }
 
 /// Decides a job's next move from what is observable about it.
@@ -200,6 +273,9 @@ pub fn next_step(job: &JobView) -> Next {
             Next::SpawnPlan
         };
     }
+    // A planner that looked and found nothing. Only reachable on the first round: the queue is not
+    // filtered by round, so once anything has been queued at all this is never empty again, and a
+    // round that adds nothing shows up as `dry_rounds` rather than as an empty queue.
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
@@ -226,8 +302,50 @@ pub fn next_step(job: &JobView) -> Next {
     match job.review {
         ReviewState::Pending => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
-        ReviewState::NotWanted | ReviewState::Done => Next::Finish(ending(job)),
+        ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
     }
+}
+
+/// PURE: what happens when a round's queue is spent and its review has been had.
+///
+/// The four endings of §5.2, in the order they are observable — and the order is observable because
+/// two of them say `completed` and two say `stopped`, which is the difference between "I finished"
+/// and "I was cut short and what I did is on the branch".
+///
+/// A **one-round job takes the old path verbatim** and that is the first thing this checks, because
+/// it is what makes rounds inert until somebody asks for them. It is also the honest answer: a job
+/// that was never asked to run more than one round did not run OUT of rounds, so reporting it
+/// `stopped` would name the ceiling of a feature it never used.
+fn close_the_round(job: &JobView) -> Next {
+    if job.rounds.max_rounds <= 1 {
+        return Next::Finish(ending(job));
+    }
+    // A red gate ends the job whatever the rounds say. The branch carries work the gate rejected,
+    // and another round would build on top of it — which is the one thing the per-item revert exists
+    // to stop happening WITHIN a round, and it does not stop being true across them.
+    if job.items.contains(&ItemState::GateFailed) {
+        return Next::Finish(Outcome::GateFailed);
+    }
+
+    // (1) The replan declared itself done. The cheapest ending there is, and the most trustworthy:
+    // the node that just looked at the work is the one saying the work is over.
+    if job.rounds.replanned == Replan::Done {
+        return Next::Finish(Outcome::Completed);
+    }
+    if job.rounds.replanning {
+        return Next::Wait;
+    }
+    // (3) It dried up. Ahead of the ceiling deliberately: both stop the job, and this one is the
+    // reading a person can act on — `completed` here means "there was nothing left", where the
+    // ceiling below means "there may well have been".
+    if job.rounds.dry_rounds >= DRY_ROUNDS_TO_STOP {
+        return Next::Finish(Outcome::Completed);
+    }
+    // (4) Out of rounds. `round` counts from 0, so the round that closes is `round + 1` of them.
+    if job.rounds.round + 1 >= job.rounds.max_rounds {
+        return Next::Finish(Outcome::Stopped);
+    }
+    Next::SpawnReplan
 }
 
 /// PURE: how a job that ran its whole queue ended.
@@ -256,6 +374,7 @@ impl Outcome {
             Outcome::Cancelled => STATUS_CANCELLED,
             Outcome::GateFailed => "gate_failed",
             Outcome::GateErrored => "gate_errored",
+            Outcome::Stopped => STATUS_STOPPED,
         }
     }
 }
@@ -321,6 +440,22 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             .await?;
     let stage = effective_status(&status, resume_status.as_deref());
 
+    let (round, dry_rounds, max_rounds, replan_done): (i64, i64, Option<i64>, i64) =
+        sqlx::query_as("SELECT round, dry_rounds, max_rounds, replan_done FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+
+    // Deliberately NOT filtered by round, and the reason is worth writing down because filtering is
+    // the obvious thing to reach for. A round closes only when every item in it is terminal, so an
+    // earlier round's items are all `Passed`, `Skipped`, `GateFailed` or worse — states `next_step`
+    // already walks past. The unfiltered queue therefore reads correctly on its own, and it keeps
+    // `ordinal` meaning one thing everywhere: the nth item of this job, ever, which is also its
+    // primary key. Filtering would have made the position in this vector stop being the ordinal in
+    // the table, and `advance` looks items up by that number.
+    //
+    // It also keeps `ending()` right across rounds: a red gate in round 1 still makes the job
+    // `gate_failed` when round 3 finishes, which is what a reader of the branch needs to know.
     let items: Vec<String> =
         sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
             .bind(job_id)
@@ -340,6 +475,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     };
     let plan_run = latest_node("plan").await?;
     let review_run = latest_node("review").await?;
+    let replan_run = latest_node("replan").await?;
 
     let review = match (review_wanted != 0, review_run.as_deref()) {
         (false, _) => ReviewState::NotWanted,
@@ -361,6 +497,20 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items.iter().map(|s| item_state_from(s)).collect(),
         review,
+        rounds: RoundState {
+            round,
+            // NULL means "nobody asked for rounds", which is one round and the behaviour of every
+            // job written before this column existed. Resolving it to the daemon ceiling instead
+            // would switch rounds on for every `graph:` rule already scheduled, silently.
+            max_rounds: max_rounds.unwrap_or(1).max(1),
+            dry_rounds,
+            replanning: replan_run.as_deref().is_some_and(node_in_flight),
+            replanned: if replan_done != 0 {
+                Replan::Done
+            } else {
+                Replan::NotYet
+            },
+        },
     })
 }
 
@@ -1754,6 +1904,21 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
             spawn_node(state, job, "review", prompt, None, worktree).await
         }
+        // Unreachable until Task 11 gives the round a node to run, and reachable only for a job
+        // whose `max_rounds` is above 1 — which nothing writes yet, because `load_view` resolves a
+        // NULL column to one round. Parked rather than ignored: a `Step::Stopped` here would end a
+        // job silently if the two halves ever landed out of order, and the log line is what makes
+        // that findable in one grep instead of one dogfood.
+        Next::SpawnReplan => {
+            tracing::warn!(
+                job_id = job.id,
+                round = view.rounds.round,
+                "a job asked to replan before the replan node exists — stopping it rather than \
+                 reporting work it did not do"
+            );
+            finish(pool, job.id, Outcome::Stopped).await.ok();
+            Step::Stopped
+        }
         Next::Wait | Next::Finish(_) | Next::RunGate { .. } => Step::Stopped,
     }
 }
@@ -2213,12 +2378,25 @@ mod tests {
             .unwrap()
     }
 
+    /// A job of one round, which is what every test written before rounds existed is about.
     fn view(planned: bool, items: &[ItemState], review: ReviewState) -> JobView {
         JobView {
             planned,
             planning: false,
             items: items.to_vec(),
             review,
+            rounds: RoundState::default(),
+        }
+    }
+
+    /// The same, for a job that was asked for more than one round.
+    fn view_in_round(items: &[ItemState], review: ReviewState, rounds: RoundState) -> JobView {
+        JobView {
+            planned: true,
+            planning: false,
+            items: items.to_vec(),
+            review,
+            rounds,
         }
     }
 
@@ -2551,6 +2729,199 @@ mod tests {
         let view = load_view(&pool, job_id).await.unwrap();
 
         assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+    }
+
+    // ---- rounds (Chunk 3) ------------------------------------------------------------------------
+
+    /// The whole point of landing the schema and this logic together and inert: a job nobody asked
+    /// for rounds takes the pre-rounds path, verdict for verdict.
+    ///
+    /// `max_rounds = 1` is what `load_view` resolves a NULL column to, so this is every job that
+    /// existed before migration 0051 and every `graph:` rule scheduled today.
+    #[test]
+    fn a_one_round_job_ends_exactly_as_it_did_before_rounds_existed() {
+        for (items, expected) in [
+            (vec![ItemState::Passed], Outcome::Completed),
+            (
+                vec![ItemState::Passed, ItemState::GateFailed],
+                Outcome::GateFailed,
+            ),
+            (vec![ItemState::Skipped], Outcome::Completed),
+        ] {
+            assert_eq!(
+                next_step(&view(true, &items, ReviewState::Done)),
+                Next::Finish(expected),
+                "{items:?}"
+            );
+        }
+    }
+
+    /// The four endings of §5.2, one case per row, and the order between them is what the table is
+    /// for: two say `completed` and two say `stopped`, which is the difference a person reads in the
+    /// morning between "I finished" and "I was cut short and it is on the branch".
+    #[test]
+    fn a_round_closes_by_the_first_condition_that_holds() {
+        let rounds = |round, dry, replanned| RoundState {
+            round,
+            max_rounds: 5,
+            dry_rounds: dry,
+            replanning: false,
+            replanned,
+        };
+
+        // (1) The replan said so. Ahead of everything: the node that just looked at the work is the
+        // one saying the work is over.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(1, 0, Replan::Done)
+            )),
+            Next::Finish(Outcome::Completed)
+        );
+
+        // (3) It dried up. `completed`, because there was nothing left to do.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(1, DRY_ROUNDS_TO_STOP, Replan::NotYet)
+            )),
+            Next::Finish(Outcome::Completed)
+        );
+
+        // (4) Out of rounds. `stopped`, because there may well have been more.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(4, 0, Replan::NotYet)
+            )),
+            Next::Finish(Outcome::Stopped)
+        );
+
+        // None of them: ask again.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(1, 1, Replan::NotYet)
+            )),
+            Next::SpawnReplan
+        );
+    }
+
+    /// A red gate ends the job whatever the rounds say.
+    ///
+    /// The per-item revert stops the NEXT ITEM building on work the gate rejected; that reason does
+    /// not stop being true at a round boundary, and a replan looking at a branch carrying a red item
+    /// would plan on top of it.
+    #[test]
+    fn a_red_gate_ends_a_job_that_had_rounds_left() {
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed, ItemState::GateFailed],
+                ReviewState::Done,
+                RoundState {
+                    round: 0,
+                    max_rounds: 5,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Finish(Outcome::GateFailed)
+        );
+    }
+
+    /// The sibling of `planning`, and it exists for the identical reason: between spawning the node
+    /// and its items landing the queue is empty, so without it every tick would spawn another.
+    #[test]
+    fn a_replan_in_flight_is_waited_on_rather_than_spawned_again() {
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                RoundState {
+                    round: 1,
+                    max_rounds: 5,
+                    replanning: true,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Wait
+        );
+    }
+
+    /// The one thing an empty queue can mean.
+    #[test]
+    fn an_empty_queue_is_a_planner_that_looked_and_found_nothing() {
+        // Round 0: the planner looked and found nothing. Done, as it always was.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[],
+                ReviewState::Pending,
+                RoundState {
+                    max_rounds: 5,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Finish(Outcome::Completed)
+        );
+
+        // Only reachable on the first round, and that is a property of the queue not being filtered
+        // by round: once anything has been queued at all, this is never empty again. A round that
+        // adds nothing shows up as `dry_rounds`, never as an empty queue.
+    }
+
+    /// Why the queue is read UNFILTERED, stated as the two things filtering would have broken.
+    ///
+    /// Filtering by round is the obvious first design, and it is wrong twice. `ordinal` is half this
+    /// table's primary key, so restarting it per round collides outright — which is how this was
+    /// found. And the position in the loaded queue would stop being the ordinal in the table, which
+    /// is the number `advance` binds into its lookups. Unfiltered costs nothing: a round closes only
+    /// when every item in it is terminal, and those are states `next_step` already walks past.
+    #[tokio::test]
+    async fn a_new_rounds_item_is_found_past_the_finished_ones_and_keeps_its_real_ordinal() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "skipped"]).await;
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, round)
+             VALUES (?, 2, 'what round 1 asked for', 'pending', 1)",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET round = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(
+            view.items,
+            vec![ItemState::Passed, ItemState::Skipped, ItemState::Pending],
+            "the earlier round's items stay in the queue, terminal and walked past"
+        );
+        assert_eq!(view.rounds.round, 1);
+        // 2, not 0. This is the number `advance` binds into
+        // `SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?`.
+        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+    }
+
+    /// A NULL `max_rounds` is "nobody asked for rounds", not "use the daemon's ceiling". Resolving it
+    /// the other way would switch rounds on for every `graph:` rule already scheduled, silently.
+    #[tokio::test]
+    async fn a_job_with_no_round_ceiling_is_a_job_of_one_round() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed"]).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.rounds.max_rounds, 1);
+        assert_eq!(view.rounds.round, 0);
+        assert_eq!(view.rounds.replanned, Replan::NotYet);
     }
 
     #[tokio::test]
