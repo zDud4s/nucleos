@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 7;
+pub const CLASSIFIER_VERSION: u32 = 8;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -165,6 +165,30 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "git diff",
     "git log",
     "git show",
+    // Git subcommands with NO mutating spelling at all, which is what earns them a prefix where
+    // `branch` and `remote` had to be pinned to exact forms below: `git branch feature` creates and
+    // `git branch` lists, so there the first token decides nothing. There is no `git rev-parse` that
+    // writes, no `git blame` that writes, no `git ls-files` that writes. Deliberately absent from
+    // this group for the opposite reason: `git config` (reads and writes through one door),
+    // `git symbolic-ref` (mutates with two arguments), `git stash` (`list` reads, bare stashes).
+    //
+    // Added as a group rather than one at a time because they were being discovered one at a time,
+    // a dogfood night per command — `git rev-parse HEAD` cost the whole of job 8.
+    "git rev-parse",
+    "git rev-list",
+    "git cat-file",
+    "git ls-files",
+    "git ls-tree",
+    "git describe",
+    "git blame",
+    "git shortlog",
+    "git merge-base",
+    "git check-ignore",
+    "git for-each-ref",
+    "git name-rev",
+    "git diff-tree",
+    "git count-objects",
+    "git grep",
     "cargo test",
     "cargo check",
     "cargo fmt --check",
@@ -1344,6 +1368,62 @@ mod tests {
                 classify("Bash", &json!({"command": command}), None),
                 "allow",
                 "read-local",
+            );
+        }
+    }
+
+    /// The group added because it was being discovered one command per dogfood night.
+    ///
+    /// These earn a PREFIX where `git branch` and `git remote` had to be pinned to exact forms, and
+    /// the difference is not a judgement call: there is no spelling of `git rev-parse` that writes.
+    /// `git branch feature` creates and `git branch` lists, so for that one the first token decides
+    /// nothing at all.
+    #[test]
+    fn allows_git_subcommands_that_have_no_mutating_spelling() {
+        for command in [
+            "git rev-parse HEAD",
+            "git rev-parse --show-toplevel",
+            "git rev-list --count HEAD",
+            "git cat-file -p HEAD:greet.py",
+            "git ls-files",
+            "git ls-tree -r HEAD --name-only",
+            "git describe --tags --dirty",
+            "git blame greet.py",
+            "git shortlog -sn",
+            "git merge-base main HEAD",
+            "git check-ignore -v target",
+            "git for-each-ref --format=%(refname)",
+            "git name-rev HEAD",
+            "git diff-tree --no-commit-id --name-only -r HEAD",
+            "git count-objects -v",
+            "git grep -n TODO",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// The three left out of that group, and why each one is not in it.
+    #[test]
+    fn git_subcommands_that_can_mutate_stay_pending() {
+        for command in [
+            // Reads and writes through the same door.
+            "git config user.email me@example.invalid",
+            "git config --get user.email",
+            // Mutates with two arguments, reads with one — the `git branch` problem again.
+            "git symbolic-ref HEAD refs/heads/other",
+            "git symbolic-ref HEAD",
+            // `git stash list` reads; bare `git stash` takes the working tree away.
+            "git stash",
+            "git stash list",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
             );
         }
     }
@@ -2533,12 +2613,13 @@ mod tests {
     /// Bumped once per policy change: 3 widened the allow list, 4 made the classifier read a line
     /// as the sequence it is, 5 stopped counting a stream join as a file write and let `echo`/`test`
     /// through, 6 let `mkdir` place a directory inside the workspace, 7 let the agent read a skill
-    /// and stopped it writing one. The version is stamped onto every `shadow_decisions` row, so it
-    /// is the only thing that tells two differently-classified decisions apart after the fact —
-    /// leaving it at 2 would have made the night of 2026-08-08 and everything after it look alike.
+    /// and stopped it writing one, 8 took the git subcommands that cannot mutate as a group. The
+    /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
+    /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
+    /// night of 2026-08-08 and everything after it look alike.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 7);
+        assert_eq!(CLASSIFIER_VERSION, 8);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
