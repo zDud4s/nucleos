@@ -752,11 +752,11 @@ pub struct NewJob<'a> {
 /// Always `planning`: a job's first act is to plan, and a caller that could choose the starting
 /// status could start one mid-queue with no queue.
 ///
-/// Fails when the project already has a live one. That refusal is the unique index
-/// `one_live_job_per_project` (migration 0042) rather than a check here, deliberately: with the
-/// constraint in the storage layer the INSERT itself is the lock, so a scheduler tick and a manual
-/// request racing for the same project cannot both pass a check and then both proceed. It mirrors
-/// what `one_open_worktree_run_per_project` already does for runs.
+/// Refuses nothing, and it used to. A project's second live job was turned away here by the unique
+/// index `one_live_job_per_project`, which came out in migration 0053; a project may now have as
+/// many live jobs as it has slots. The lock did not leave the storage layer, only moved table:
+/// `start` claims a `project_slots` row, and that INSERT is what a scheduler tick and a manual
+/// request racing for the same project resolve on.
 pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64> {
     let result = sqlx::query(
         "INSERT INTO jobs
@@ -868,13 +868,16 @@ pub fn resolve_start(
 
 /// How a start attempt ended.
 ///
-/// `AlreadyLive` is not a check that failed here — it is `one_live_job_per_project` (migration
-/// 0042) refusing the INSERT. With the constraint in the storage layer the INSERT *is* the lock, so
-/// a scheduler tick and a manual request racing for the same project cannot both pass a check and
-/// then both proceed. It mirrors what `one_open_worktree_run_per_project` does for runs.
+/// `NoRoom` replaced `AlreadyLive` when `one_live_job_per_project` came out (migration 0053). The
+/// two are the same answer at different ceilings — that index could only ever say "one" — and they
+/// are still not a check that failed here: the slot `INSERT` is the lock, so a scheduler tick and a
+/// manual request racing for the same project cannot both pass a count and then both proceed.
+///
+/// Kept apart from `Failed` because the caller turns them into different answers: no room is a 409
+/// the asker can act on by waiting, and `Failed` is a 500 nothing they do would have helped.
 pub enum JobStart {
     Started(i64),
-    AlreadyLive,
+    NoRoom(String),
     Failed,
 }
 
@@ -911,6 +914,23 @@ pub struct StartRequest<'a> {
 /// never defining them", and the same applies to jobs. It moved here when a second caller appeared:
 /// two copies of this sequence would mean one of them learning a fix the other never learns.
 pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
+    // Asked before the row exists, and it is not the decision — `claim` below is. A job cannot claim
+    // until it has an id, so the authoritative answer costs a row, and a scheduler firing at a full
+    // project every half hour would leave a retired job behind every time. This turns that into the
+    // rare case where two starts actually crossed.
+    match crate::concurrency::room_for(&state.pool, request.project_id).await {
+        Ok(Some(full)) => return JobStart::NoRoom(full.reason()),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                project_id = request.project_id,
+                %error,
+                "could not read the concurrency ceiling"
+            );
+            return JobStart::Failed;
+        }
+    }
+
     let job_id = match insert_job(
         &state.pool,
         &NewJob {
@@ -929,13 +949,6 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
     .await
     {
         Ok(job_id) => job_id,
-        Err(error)
-            if error
-                .as_database_error()
-                .is_some_and(|database_error| database_error.is_unique_violation()) =>
-        {
-            return JobStart::AlreadyLive;
-        }
         Err(error) => {
             tracing::warn!(
                 project_id = request.project_id,
@@ -956,23 +969,11 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
     // the primary key rather than on a read.
     match crate::concurrency::claim(&state.pool, request.project_id, owner).await {
         Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
-        Ok(crate::concurrency::ClaimOutcome::ProjectFull { limit }) => {
-            return fail_early(
-                state,
-                request.project_id,
-                job_id,
-                &format!("this project already has {limit} pieces of work in flight"),
-            )
-            .await;
-        }
-        Ok(crate::concurrency::ClaimOutcome::HouseFull { limit }) => {
-            return fail_early(
-                state,
-                request.project_id,
-                job_id,
-                &format!("the machine already has {limit} pieces of work in flight"),
-            )
-            .await;
+        // The race the pre-check cannot cover: somebody took the last slot in between. No room is
+        // not a failure, so the row is retired quietly and the caller is told which ceiling it hit.
+        Ok(crate::concurrency::ClaimOutcome::Full(full)) => {
+            let _ = retire(&state.pool, job_id, STATUS_CANCELLED).await;
+            return JobStart::NoRoom(full.reason());
         }
         Err(error) => {
             return fail_early(
@@ -1036,7 +1037,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
 
 /// Retires a job that never got as far as its first node, and says so where a person will see it.
 ///
-/// A job left live with no worktree would be ticked forever and hold `one_live_job_per_project`,
+/// A job left live with no worktree would be ticked forever and hold a concurrency slot,
 /// which would take the whole project's autonomy down with it — silently, since nothing else logs.
 async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) -> JobStart {
     if let Err(error) = retire(&state.pool, job_id, Outcome::Failed.as_status()).await {
@@ -1058,12 +1059,14 @@ async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) 
     JobStart::Failed
 }
 
-/// The statuses `one_live_job_per_project` covers, and therefore the ones a tick has to drive.
+/// The statuses that mean a job is live, and therefore the ones a tick has to drive.
 ///
 /// Kept beside the SQL that reads it rather than spelled out at each call site, because a status
-/// that falls out of this list stops being ticked while still holding the project's exclusivity
-/// slot: the project would go quiet with no error anywhere, until somebody opened the database.
-/// `a_live_status_the_index_covers_is_also_a_status_the_tick_drives` pins it to the migration.
+/// that falls out of this list stops being ticked while still holding a concurrency slot — the
+/// sweep spares exactly these statuses too — so the project goes quiet with no error anywhere,
+/// until somebody opens the database. Two tests pin the three copies together:
+/// `a_live_status_is_a_status_some_pass_would_load` here, and
+/// `every_live_status_is_a_status_the_sweep_spares` in `concurrency.rs`.
 pub const LIVE_STATUSES: [&str; 6] = [
     "planning",
     "implementing",
@@ -1542,7 +1545,7 @@ async fn archive_plans(worktree: &Path, round: i64) -> Vec<String> {
 ///
 /// Read wherever the job happens to be parked rather than from a status of its own: a replan node
 /// leaves `jobs.status` as it found it (`reviewing`, usually), which keeps the job holding the
-/// project's exclusivity slot through `one_live_job_per_project` without that index needing to learn
+/// project's concurrency slot without the slot table needing to learn
 /// a new word.
 async fn ingest_replan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     let pool = &state.pool;
@@ -2643,8 +2646,10 @@ pub enum CancelOutcome {
 /// That function needs a live handle and guards its write with `status = 'running'`, and a parked
 /// node has neither: its task ended when it asked, and its row says `awaiting_approval`. So the loop
 /// below used to hand it a run it could do nothing with, and the run stayed parked after the job
-/// that owned it was gone — holding `one_open_worktree_run_per_project` and blocking every later
-/// worktree run of that project until a person noticed.
+/// that owned it was gone, holding the project's exclusivity and blocking every later worktree run
+/// of it until a person noticed. (Measured before migration 0053, when that exclusivity was an
+/// index and one strand took the whole project down. It is a slot now, so the same leak narrows the
+/// project instead of stopping it — quieter, and still wrong.)
 ///
 /// Measured on 2026-08-08: job 12 was cancelled while its review node was parked, and job 13 came up
 /// `waiting` with `wait_reason = slot` against a project whose only live job was itself. Nothing in
@@ -2870,8 +2875,8 @@ mod tests {
     /// Adds a node run for a job, in whatever status the test needs it to have landed in.
     async fn seed_node(pool: &sqlx::SqlitePool, job_id: i64, stage: &str, status: &str) -> i64 {
         // The job's own project, not a literal: two `awaiting_approval` worktree runs sharing one
-        // project id would collide on `one_open_worktree_run_per_project`, which is migration 0009
-        // doing exactly its job and has nothing to do with what the test is asking.
+        // project id used to collide on `one_open_worktree_run_per_project`; that index is gone
+        // (0053), and the shared id stays because these nodes do belong to one job's project.
         let project_id: String = sqlx::query_scalar("SELECT project_id FROM jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(pool)
@@ -3632,8 +3637,15 @@ mod tests {
         assert_eq!(statuses, vec!["gate_failed", "gate_errored"]);
     }
 
+    /// A second live job for one project is now a row the database accepts.
+    ///
+    /// It used to be refused here, by `one_live_job_per_project`, and that index came out in 0053.
+    /// The lock did not move — it is still an `INSERT`, now into `project_slots` — but it moved
+    /// OFF this function, so `insert_job` no longer refuses anything and `start` is where a full
+    /// project is turned away. Asserted rather than deleted, because a reader who remembers the old
+    /// behaviour needs to find out here that it changed on purpose.
     #[tokio::test]
-    async fn a_second_live_job_for_a_project_is_rejected_by_the_index() {
+    async fn a_second_live_job_for_a_project_is_no_longer_refused_by_the_row() {
         let pool = test_pool().await;
         seed_job(&pool, "project-a", "planning")
             .await
@@ -3641,9 +3653,10 @@ mod tests {
 
         let second = seed_job(&pool, "project-a", "planning").await;
 
-        // Rejected by the unique index rather than by a check in this module: the INSERT is the
-        // lock, so the scheduler tick and a manual POST racing for the same project cannot both win.
-        assert!(second.is_err(), "a project may have only one live job");
+        assert!(
+            second.is_ok(),
+            "the row no longer holds exclusivity; the slot ceiling does"
+        );
     }
 
     #[tokio::test]
@@ -3663,41 +3676,35 @@ mod tests {
 
     // ---- what a pass sees ----------------------------------------------------------------------
 
-    /// The constant the tick iterates and the index the migration created have to name the same
-    /// statuses. A status that only the index knows about holds the project's exclusivity slot
-    /// while nothing drives it: the project goes quiet, with no error anywhere, until somebody
-    /// opens the database.
-    #[tokio::test]
-    async fn a_live_status_the_index_covers_is_also_a_status_the_tick_drives() {
-        let pool = test_pool().await;
-        let index: String = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_master WHERE name = 'one_live_job_per_project'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
+    /// The constant the tick iterates and the SQL a pass loads with have to name the same statuses,
+    /// in both directions.
+    ///
+    /// It used to be checked against `one_live_job_per_project`, which is gone (migration 0053).
+    /// The hazard survived the index, and only changed hands: a job in a status the tick does not
+    /// drive still holds a concurrency slot, and `reconcile_orphaned_slots` still spares it, because
+    /// the sweep's live-list is this same constant. So the project goes quiet with no error
+    /// anywhere — with one slot fewer instead of none at all. `concurrency.rs` guards the sweep's
+    /// half of that agreement; this guards the loader's.
+    #[test]
+    fn a_live_status_is_a_status_some_pass_would_load() {
         for status in LIVE_STATUSES {
-            assert!(
-                index.contains(&format!("'{status}'")),
-                "the tick drives `{status}` but the index does not hold the slot for it"
-            );
             assert!(
                 LIVE_JOBS_SQL.contains(&format!("'{status}'")),
                 "`{status}` is live but no pass would ever load it"
             );
         }
-        // And the other direction, which is the dangerous one.
-        let covered = index
+        // And the other direction, which is the dangerous one: SQL that loads a status the tick has
+        // no arm for would drive a job nothing knows how to move.
+        let loaded = LIVE_JOBS_SQL
             .split('\'')
             .skip(1)
             .step_by(2)
             .filter(|token| !token.is_empty())
             .count();
         assert_eq!(
-            covered,
+            loaded,
             LIVE_STATUSES.len(),
-            "the index covers a status the tick does not drive: {index}"
+            "a pass loads a status the tick does not drive: {LIVE_JOBS_SQL}"
         );
     }
 
@@ -3840,8 +3847,8 @@ mod tests {
     ///
     /// `finalize_termination` cannot do this: it needs a live handle, and it guards its write with
     /// `status = 'running'`. A parked node has neither. So the run stayed `awaiting_approval` after
-    /// the job that owned it was gone, holding `one_open_worktree_run_per_project` and blocking
-    /// every later worktree run of that project.
+    /// the job that owned it was gone, holding the project's exclusivity — an index then, a
+    /// concurrency slot since 0053, and a leak either way.
     ///
     /// Found in production on 2026-08-08: job 12 was cancelled with its review node parked, and the
     /// next job came up `waiting` with `wait_reason = slot` against a project whose only live job

@@ -502,10 +502,10 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
 
 /// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
 /// pause actionable. These two belong together — a run parked in `awaiting_approval` with no
-/// proposal can be neither approved nor rejected, and `one_open_worktree_run_per_project`
-/// (migration 0009) makes it block every later worktree run for that project, permanently: startup
-/// recovery only reconciles rows left `running`. Hence the caller runs this as a detachable task
-/// rather than inline in a request that may not survive its own side effects.
+/// proposal can be neither approved nor rejected, and it goes on holding one of the project's
+/// concurrency slots, permanently: the sweep spares `awaiting_approval`, and startup recovery only
+/// reconciles rows left `running`. Hence the caller runs this as a detachable task rather than
+/// inline in a request that may not survive its own side effects.
 async fn pause_for_approval(
     state: AppState,
     run_id: i64,
@@ -596,9 +596,10 @@ async fn pause_for_approval(
         .await;
 
         // Warning alone left the run parked in `awaiting_approval` with nothing to approve or
-        // reject, and `one_open_worktree_run_per_project` (migration 0009) turns that into a block
-        // on every later worktree run for the project. `reconcile_stranded_approvals` clears it —
-        // but only at startup, so the project stayed jammed until someone restarted the daemon.
+        // reject, holding one of the project's concurrency slots for good: the sweep spares that
+        // status on purpose, because a run with a PENDING proposal is resumable.
+        // `reconcile_stranded_approvals` is what tells the two apart — but only at startup, so the
+        // project ran one slot narrower until someone restarted the daemon.
         //
         // Undo the pause instead. `interrupted` is the status startup recovery already uses for
         // exactly this shape, so a run that ends here reads the same either way, and the slot is
@@ -1402,9 +1403,10 @@ mod tests {
     /// way `abort()` does — so everything sequenced after the termination is lost.
     ///
     /// The loss is unrecoverable, not merely untidy: a run parked in `awaiting_approval` with no
-    /// proposal can be neither approved nor rejected, and `one_open_worktree_run_per_project`
-    /// (migration 0009) then makes it block every later worktree run for that project. Startup
-    /// recovery does not help — it only reconciles rows left `running`.
+    /// proposal can be neither approved nor rejected, and it holds one of the project's concurrency
+    /// slots for as long as it sits there — the sweep spares that status, because a run with a
+    /// pending proposal is resumable. Startup recovery does not help either: it only reconciles rows
+    /// left `running`.
     #[tokio::test]
     async fn a_dropped_hook_request_still_records_the_approval_proposal() {
         use std::future::Future;
@@ -1838,8 +1840,8 @@ mod tests {
     /// Found by dogfooding the change above on 2026-08-07 — the plan node asked to run `find`, took
     /// the job road because its run has a `job_id`, matched no item, and returned before writing any
     /// proposal. The run sat in `awaiting_approval` with nothing to approve, which is precisely the
-    /// state `pause_for_approval`'s rollback exists to prevent and which
-    /// `one_open_worktree_run_per_project` turns into a permanent block on the project.
+    /// state `pause_for_approval`'s rollback exists to prevent, and which holds one of the
+    /// project's concurrency slots until a restart notices.
     ///
     /// The queue is what the plan produces, so there is nothing to skip and nothing to carry on to.
     /// It parks and asks, like any other run. A review node — which runs after every item — is the

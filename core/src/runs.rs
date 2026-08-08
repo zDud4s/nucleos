@@ -254,7 +254,7 @@ pub async fn create_run(
     // Uncancellable: the run row is INSERTed `running` before the worktree is provisioned, so
     // `git worktree add` holds that window open for as long as git takes. A request dropped inside
     // it strands a `running` worktree row with no task and no abort handle — `/cancel` answers 404,
-    // the GC skips it, and `one_open_worktree_run_per_project` (migration 0009) blocks the whole
+    // the GC skips it, and it holds one of the project's concurrency slots, narrowing the whole
     // project until the daemon restarts, the only thing that reconciles `running` rows.
     let id = crate::http::uncancellable(async move {
         create_run_inner(
@@ -1338,6 +1338,28 @@ async fn create_run_with(
         ));
     }
 
+    // Asked before the row exists, and not instead of the claim below — a run cannot claim until it
+    // has an id, so the authoritative answer costs a row, and a scheduler that fires at a full
+    // project every thirty seconds would leave a failed run behind every time. A node is exempt: it
+    // works inside its job's worktree, on its job's slot.
+    if mode == "worktree"
+        && node.is_none()
+        && let Some(project) = project_id.as_deref()
+    {
+        // Swept first, and this is where the staleness that matters gets paid off. A run's slot is
+        // given back by the sweep rather than at each ending — `runs` has ten places that write a
+        // terminal status and no funnel like `job::retire`, so threading a release through all ten
+        // is a coverage claim that would be wrong the first time an eleventh appears. The release is
+        // derived from liveness instead, which cannot drift; the one moment the derivation has to be
+        // current is the moment it refuses somebody, which is here.
+        let _ = crate::concurrency::reconcile_orphaned_slots(&state.pool).await;
+        match crate::concurrency::room_for(&state.pool, project).await {
+            Ok(Some(_)) => return Err(CreateRunError::Busy),
+            Ok(None) => {}
+            Err(error) => return Err(CreateRunError::Db(error)),
+        }
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let session_id = crate::auth::generate_uuid_v4();
     let inserted = sqlx::query(
@@ -1426,26 +1448,14 @@ async fn create_run_with(
                 // its job's slot with it — charging the node a second one would have a five-item job
                 // refuse itself at the second item.
                 //
-                // Swept immediately before the count, and this is where the latency that matters is
-                // paid. A run's slot is given back by the sweep rather than at each ending: `runs`
-                // has ten places that write a terminal status and no single funnel like `retire`, so
-                // threading a release through all ten is a coverage claim that would be wrong the
-                // first time an eleventh appears. The release is derived from liveness instead,
-                // which cannot drift — and the one moment the derivation must be current is this
-                // one, so it runs here.
-                let _ = crate::concurrency::reconcile_orphaned_slots(&state.pool).await;
+                // The table was swept before the row was inserted, at the pre-check above, so this
+                // is the authoritative answer against an already-current count.
                 match crate::concurrency::claim(&state.pool, worktree_project_id, owner).await {
                     Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
-                    Ok(full) => {
+                    Ok(crate::concurrency::ClaimOutcome::Full(full)) => {
                         // The same 409 the unique index gave, reached by counting instead of by
                         // colliding. `Busy` is what every caller already maps.
-                        fail_provisioning(
-                            state,
-                            id,
-                            project_id.as_deref(),
-                            &format!("no concurrency slot was free: {full:?}"),
-                        )
-                        .await;
+                        fail_provisioning(state, id, project_id.as_deref(), &full.reason()).await;
                         return Err(CreateRunError::Busy);
                     }
                     Err(error) => {
@@ -1477,8 +1487,8 @@ async fn create_run_with(
         };
         // Every exit from here on has to leave a terminal status behind. Past the INSERT the row is
         // `running` with no task and no abort handle: `/cancel` answers 404, the GC skips it, and
-        // `one_open_worktree_run_per_project` (migration 0009) blocks every later worktree run for
-        // the project — until a restart, the only thing that reconciles `running`. The `create`
+        // it holds one of the project's concurrency slots for as long as it reads live, and
+        // `running` is reconciled only by a restart, which no sweep can help. The `create`
         // branch above compensated; these two propagated with `?` and stranded the run.
         let worktree_path = info.path.to_string_lossy().into_owned();
         if node.is_none()
@@ -1652,7 +1662,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // when the proposal was read, and a release or a cancel can have finalised it since. No rows
     // means one of those got there first, so the supersede is a no-op rather than a status this
     // resume is entitled to overwrite — the live-worktree lookup above is what actually stops a
-    // resume onto a discarded worktree, and `one_open_worktree_run_per_project` (migration 0009)
+    // resume onto a discarded worktree, and a run left `awaiting_approval` holds a slot that
     // rejects the INSERT below if the slot is still held.
     sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'")
         .bind(&now)
@@ -1947,8 +1957,8 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
 ///
 /// Such a run is unreachable, not merely idle: both `/approve` and `/reject` start from the pending
 /// proposal row, so with none there is no input left that can move it. It is also load-bearing:
-/// `one_open_worktree_run_per_project` (migration 0009) counts `awaiting_approval`, so one strand
-/// blocks every later worktree run of its project, and the worktree GC only collects terminal runs.
+/// the concurrency sweep spares `awaiting_approval`, so one strand holds a slot for good, and the
+/// worktree GC only collects terminal runs.
 /// A run holding a *pending* proposal is resumable by design — the NOT EXISTS leaves it alone.
 ///
 /// The doors that created these strands are closed, so this only heals rows predating that fix; the
@@ -3676,7 +3686,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     /// A client that disconnects cancels the request it was making, which drops the handler's future
     /// exactly the way `abort()` drops a run's, and everything past that point is simply never done:
     /// no task, no abort handle (so `/cancel` answers 404), and a `running` worktree row that
-    /// `one_open_worktree_run_per_project` (migration 0009) turns into a project-wide block on every
+    /// the concurrency sweep spares, so it goes on holding a slot against every
     /// later worktree run — until the daemon restarts, the only thing that reconciles `running` rows.
     #[tokio::test(flavor = "current_thread")]
     async fn a_dropped_create_request_still_finishes_the_run_it_started() {
@@ -3768,7 +3778,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
 
     /// The half the test above does not cover. Releasing the handle keeps the in-flight map honest,
     /// but the `runs` row was left `running` behind a dead task — `/cancel` answering 404, the GC
-    /// skipping it, and `one_open_worktree_run_per_project` blocking the project until a restart.
+    /// skipping it, and the run holding a concurrency slot the sweep will not take back.
     #[tokio::test]
     async fn a_panicking_run_task_records_the_run_as_failed() {
         let state = test_state().await;
@@ -4088,8 +4098,14 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         assert!(matches!(missing_cwd, Err(CreateRunError::Invalid(_))));
     }
 
+    /// A project runs up to its ceiling and no further.
+    ///
+    /// This used to assert that the SECOND was busy, because `one_open_worktree_run_per_project`
+    /// could only ever say one. It says two now (migration 0053), so the same test measures the same
+    /// property at the number the configuration actually holds — and the second succeeding is the
+    /// whole point of the change.
     #[tokio::test(flavor = "current_thread")]
-    async fn second_worktree_run_while_one_is_running_is_busy() {
+    async fn a_project_runs_up_to_its_slot_ceiling_and_the_next_is_busy() {
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
@@ -4097,20 +4113,30 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         advance_run_ids_past(&state.pool, 10_000).await;
         let project_root = repo.to_string_lossy().into_owned();
+        // The house ceiling out of the way, so this measures the per-project one.
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 2, max_concurrent_total = 9")
+            .execute(&state.pool)
+            .await
+            .unwrap();
 
         create_worktree_run(&state, "first", "proj", &project_root)
             .await
-            .unwrap();
-        let second = create_run_inner(
+            .expect("slot 0");
+        create_worktree_run(&state, "second", "proj", &project_root)
+            .await
+            .expect("slot 1 — impossible before 0053");
+
+        let third = create_run_inner(
             &state,
-            "second".into(),
+            "third".into(),
             Some("proj".into()),
             Some(project_root),
             "worktree",
-        false,)
+            false,
+        )
         .await;
 
-        assert!(matches!(second, Err(CreateRunError::Busy)));
+        assert!(matches!(third, Err(CreateRunError::Busy)));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4139,7 +4165,11 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-pinned-");
         let state = test_state().await;
         let project_root = repo.to_string_lossy().into_owned();
-        sqlx::query(
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let pinned = sqlx::query(
             "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
              VALUES ('proj', ?, 'pinned', 'awaiting_approval', 'worktree', ?)",
         )
@@ -4147,7 +4177,14 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&state.pool)
         .await
-        .unwrap();
+        .unwrap()
+        .last_insert_rowid();
+        // The seeded row claims nothing by itself — `create_run_inner` is what claims — so the
+        // parked run is given the slot it would have been holding. The property under test is that
+        // the sweep does NOT take it back while the run is still `awaiting_approval`.
+        crate::concurrency::claim(&state.pool, "proj", crate::worktree::Owner::Run(pinned))
+            .await
+            .expect("the parked run holds the slot");
 
         let result = create_run_inner(
             &state,
@@ -4675,8 +4712,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         db.close().await;
     }
 
-    // One project per run: `one_open_worktree_run_per_project` (migration 0009) is exactly what a
-    // stranded pause jams, so two of them cannot coexist under the same project_id.
+    // One project per run: a stranded pause is exactly what holds a concurrency slot, and these
+    // tests need each one attributable to the project whose ceiling it would narrow.
     async fn insert_awaiting_run(pool: &sqlx::SqlitePool, project_id: &str, prompt: &str) -> i64 {
         sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)

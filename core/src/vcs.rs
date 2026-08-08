@@ -506,10 +506,11 @@ pub async fn claim_next(
     };
     // A row whose stored operation will not parse is an error, never `Ok(None)`: `None` means "come
     // back later", and no amount of waiting makes an unexecutable row executable. Left claimed, it
-    // would hold this repository's only slot until the next daemon restart — the jam
-    // `core/AGENTS.md` § "Cancellation safety" describes for `one_open_worktree_run_per_project`,
-    // where a run stranded at `running` "blocks *every* later worktree run for that project". A
-    // queue that can trap the repository it exists to protect is not doing its job.
+    // would hold this repository's only slot until the next daemon restart. That is the strong
+    // form of the jam `core/AGENTS.md` § "Cancellation safety" describes — and this queue still HAS
+    // the strong form, where runs and jobs traded it for numbered slots in migration 0053: a
+    // repository has one slot and no ceiling anybody may raise. A queue that can trap the repository
+    // it exists to protect is not doing its job.
     match Op::from_stored(&op, &args) {
         Ok(op) => {
             transaction.commit().await?;
@@ -1019,8 +1020,9 @@ pub trait VcsExecutor: Send + Sync {
 ///
 /// So the window is real and is left open on purpose. A drain dropped between the claim and `finish`
 /// leaves its row `running`, and the partial unique index makes that row hold the repository's only
-/// slot until the next startup's `reconcile_interrupted` releases it — the same jam AGENTS.md
-/// describes for `one_open_worktree_run_per_project`. What keeps it acceptable is who calls this:
+/// slot until the next startup's `reconcile_interrupted` releases it — the jam AGENTS.md describes,
+/// in the strong form runs and jobs left behind in migration 0053 and this queue keeps, because a
+/// repository has exactly one slot. What keeps it acceptable is who calls this:
 /// the only production caller is the **detached task** `run_queue_worker` spawns per repository, and
 /// a detached task's future is dropped only at runtime shutdown, which is precisely the case
 /// `reconcile_interrupted` exists for — `main.rs` runs that reconcile before it spawns the worker.

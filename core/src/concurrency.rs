@@ -23,22 +23,38 @@
 use crate::worktree::Owner;
 use sqlx::SqlitePool;
 
-/// How a claim ended.
+/// Why there was no slot.
 ///
-/// The two full states are kept apart because they have different remedies: one waits for this
-/// project's own work to finish, the other for anybody's. Collapsing them into a single `Full` would
-/// send a user to look at a project that has room.
+/// The two are kept apart because they have different remedies: one waits for this project's own
+/// work to finish, the other for anybody's. Collapsing them into a single "full" would send someone
+/// to look at a project that has room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRoom {
+    /// Every slot this PROJECT may hold is taken.
+    Project { limit: i64 },
+    /// The house is at its ceiling across all projects, even though this project has room of its own.
+    House { limit: i64 },
+}
+
+impl NoRoom {
+    /// What to tell whoever asked. One sentence, and it names which wall was hit.
+    pub fn reason(self) -> String {
+        match self {
+            Self::Project { limit } => {
+                format!("this project already has {limit} piece(s) of work in flight")
+            }
+            Self::House { limit } => {
+                format!("the machine already has {limit} piece(s) of work in flight")
+            }
+        }
+    }
+}
+
+/// How a claim ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOutcome {
     Claimed(i64),
-    /// Every slot this PROJECT may hold is taken.
-    ProjectFull {
-        limit: i64,
-    },
-    /// The house is at its ceiling across all projects, even though this project has room of its own.
-    HouseFull {
-        limit: i64,
-    },
+    Full(NoRoom),
 }
 
 /// The ceiling a project falls back to when its configured one cannot be read.
@@ -111,9 +127,8 @@ pub async fn claim(
         return Ok(ClaimOutcome::Claimed(slot));
     }
 
-    let house = house_limit(pool).await?;
-    if slots_in_flight(pool).await? >= house {
-        return Ok(ClaimOutcome::HouseFull { limit: house });
+    if let Some(full) = room_for(pool, project_id).await? {
+        return Ok(ClaimOutcome::Full(full));
     }
 
     let limit = slots_limit(pool, project_id).await?;
@@ -139,7 +154,33 @@ pub async fn claim(
             Err(error) => return Err(error),
         }
     }
-    Ok(ClaimOutcome::ProjectFull { limit })
+    Ok(ClaimOutcome::Full(NoRoom::Project { limit }))
+}
+
+/// Whether a claim would find room, without taking anything.
+///
+/// **Advisory. `claim` is the only authoritative answer**, and a caller that treats this as the
+/// decision has reintroduced count-then-insert — two askers can both read room and both proceed.
+///
+/// It exists because the authoritative answer costs a row. A job has to be inserted before it can
+/// claim (a slot is keyed on its owner's id), so a refused job leaves a retired row behind; a
+/// scheduler firing every half hour against a full project would mint one of those every time, and
+/// `/jobs` would fill with jobs that never began. Asking first turns that into the rare case where
+/// two starts actually crossed.
+pub async fn room_for(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<NoRoom>> {
+    let house = house_limit(pool).await?;
+    if slots_in_flight(pool).await? >= house {
+        return Ok(Some(NoRoom::House { limit: house }));
+    }
+    let limit = slots_limit(pool, project_id).await?;
+    let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_slots WHERE project_id = ?")
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?;
+    if held >= limit {
+        return Ok(Some(NoRoom::Project { limit }));
+    }
+    Ok(None)
 }
 
 /// Gives the slot back. Idempotent — releasing what was never claimed is not an error, because the
@@ -299,7 +340,7 @@ mod tests {
 
         assert_eq!(
             claim(&pool, "project-a", Owner::Run(3)).await.unwrap(),
-            ClaimOutcome::ProjectFull { limit: 2 }
+            ClaimOutcome::Full(NoRoom::Project { limit: 2 })
         );
     }
 
@@ -331,7 +372,7 @@ mod tests {
 
         assert_eq!(
             claim(&pool, "project-a", Owner::Run(3)).await.unwrap(),
-            ClaimOutcome::HouseFull { limit: 2 }
+            ClaimOutcome::Full(NoRoom::House { limit: 2 })
         );
     }
 
@@ -462,6 +503,19 @@ mod tests {
                 "the sweep does not spare live job status `{status}`"
             );
         }
+        // And the other direction, which is the one that leaks: a status the sweep spares but no
+        // pass drives is a slot held forever by a job nothing will ever move.
+        let spared = ORPHANED_SLOTS_SQL
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| !token.is_empty())
+            .count();
+        assert_eq!(
+            spared,
+            LIVE_RUN_STATUSES.len() + crate::job::LIVE_STATUSES.len() + 2,
+            "the sweep spares a status nothing drives, or names an owner kind it cannot judge"
+        );
     }
 
     /// An unreadable ceiling is one, not two. Failing closed for a concurrency limit means fewer in

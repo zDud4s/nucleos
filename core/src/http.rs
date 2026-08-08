@@ -2053,8 +2053,8 @@ async fn get_project_diff(
 /// — the same mechanism `abort()` uses on a run's task, with the same consequence: everything
 /// sequenced after the drop point is silently never done. That is only a missing reply when the
 /// handler reads; when it mutates durable state across awaits, it strands the half it had finished,
-/// and the half-states here (a `running` or `awaiting_approval` worktree run) block their whole
-/// project through `one_open_worktree_run_per_project` (migration 0009).
+/// and the half-states here (a `running` or `awaiting_approval` worktree run) hold one of their
+/// project's concurrency slots until something notices (`concurrency.rs`).
 ///
 /// Awaiting the JoinHandle leaves the response exactly as it was; dropping a JoinHandle only
 /// detaches its task, so the work still runs to the end. A panicking task becomes a 500 — the task
@@ -2853,7 +2853,7 @@ struct CreateJobResponse {
 /// The whole creation is **uncancellable**. The job row is INSERTed `planning` before its worktree
 /// exists, and `git worktree add` holds that window open for as long as git takes. A request
 /// dropped inside it would strand a live job with no worktree, which the tick then drives forever
-/// while holding `one_live_job_per_project` — taking the project's whole autonomy down with it.
+/// while holding one of the project's concurrency slots, which nothing but the sweep gives back.
 /// Same window `create_run` documents, and wider here, because provisioning a job's worktree is
 /// the slowest thing this route does.
 ///
@@ -2940,10 +2940,10 @@ async fn create_job(
         crate::job::JobStart::Started(job_id) => {
             Ok((StatusCode::CREATED, Json(CreateJobResponse { job_id })))
         }
-        crate::job::JobStart::AlreadyLive => Err((
-            StatusCode::CONFLICT,
-            "this project already has a live job".to_string(),
-        )),
+        // Still a 409, and still not a 500: no room is a state the asker can act on by waiting. The
+        // reason travels because the two ceilings have different remedies — one waits for this
+        // project's own work, the other for anybody's.
+        crate::job::JobStart::NoRoom(reason) => Err((StatusCode::CONFLICT, reason)),
         // Past the INSERT: the row existed and `fail_early` retired it and said so in the feed. 500
         // rather than 409, because nothing the caller could change would have helped.
         crate::job::JobStart::Failed => Err((
@@ -5418,9 +5418,8 @@ mod tests {
     /// `rejected`, and only then is the paused run discarded and its worktree slot freed. A client
     /// that disconnects cancels the request, dropping the handler future the way `abort()` drops a
     /// run's — and what is left behind cannot be undone through the same door, because the proposal
-    /// is no longer `pending` and a retry answers 409. The run stays `awaiting_approval`, which
-    /// `one_open_worktree_run_per_project` (migration 0009) turns into a project-wide block that
-    /// only the separate release queue can lift.
+    /// is no longer `pending` and a retry answers 409. The run stays `awaiting_approval`, holding
+    /// a concurrency slot that only the separate release queue — or the sweep — can lift.
     #[tokio::test]
     async fn a_dropped_reject_request_still_discards_the_paused_run() {
         use std::future::Future;
@@ -5912,8 +5911,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        // Nothing written, not merely nothing driven. A row created and then refused would hold
-        // `one_live_job_per_project` against a project that has no job.
+        // Nothing written, not merely nothing driven. A row created and then refused would sit in
+        // the listing forever as a job that never began.
         assert_eq!(job_count(&pool).await, 0);
     }
 
@@ -5959,7 +5958,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn um_segundo_job_no_mesmo_projeto_e_recusado_pelo_indice() {
+    async fn um_projeto_corre_ate_ao_tecto_de_slots_e_o_seguinte_leva_409() {
         let _lock = crate::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-second-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -5967,6 +5966,14 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+        // The house ceiling out of the way, so this measures the per-project one. They bound
+        // different resources and a test that hit whichever came first would not say which.
+        sqlx::query(
+            "UPDATE autopilot_global SET max_concurrent_slots = 2, max_concurrent_total = 9",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let first = build_router(state.clone())
             .oneshot(create_job_request("p"))
@@ -5974,13 +5981,22 @@ mod tests {
             .unwrap();
         assert_eq!(first.status(), StatusCode::CREATED);
 
-        let second = build_router(state)
+        // This is what the chunk delivers, and it was impossible until 0053: a second live job for
+        // the same project.
+        let second = build_router(state.clone())
             .oneshot(create_job_request("p"))
             .await
             .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
 
-        assert_eq!(second.status(), StatusCode::CONFLICT);
-        assert_eq!(job_count(&pool).await, 1);
+        let third = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::CONFLICT);
+        // And no row for the one that was turned away: `start` asks before it inserts, so a project
+        // sitting at its ceiling does not accumulate retired jobs that never began.
+        assert_eq!(job_count(&pool).await, 2);
     }
 
     /// A job from this route is driven by the same tick, down the same path.
