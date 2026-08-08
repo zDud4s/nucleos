@@ -2226,6 +2226,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
@@ -2426,6 +2428,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await

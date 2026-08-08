@@ -734,6 +734,11 @@ pub struct NewJob<'a> {
     /// The repository HEAD the job starts from. `None` when git would not answer, which crash
     /// recovery reads as "cannot prove the tree stayed put" and therefore as not resumable.
     pub head_sha: Option<&'a str>,
+    /// How many rounds the caller asked for, uncut — `insert_job` applies `rounds_allowed`. `None`
+    /// is one round, which is every job a `graph:` rule starts.
+    pub max_rounds: Option<i64>,
+    /// What the job may spend on itself. `None` leaves only the house limit.
+    pub budget_usd: Option<f64>,
 }
 
 /// Starts a job and returns its id.
@@ -750,8 +755,8 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     let result = sqlx::query(
         "INSERT INTO jobs
            (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
-            head_sha, created_at)
-         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?)",
+            head_sha, max_rounds, budget_usd, created_at)
+         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.project_id)
     .bind(job.project_root)
@@ -761,6 +766,10 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .bind(i64::from(job.gate_each))
     .bind(i64::from(job.review))
     .bind(job.head_sha)
+    // Cut HERE, at the write, and not where it is read. A ceiling applied at read time is one a
+    // forgetful caller walks past; stored already cut, the row itself is the promise.
+    .bind(crate::config::rounds_allowed(job.max_rounds))
+    .bind(job.budget_usd)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
@@ -776,22 +785,12 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
 pub struct CreateJobRequest {
     pub project_id: String,
     pub prompt: String,
-    /// Reserved for Chunk 3. Accepted and **ignored** here rather than rejected: a field the client
-    /// sends and the server refuses is a client that has to be rewritten the day the server learns
-    /// it, and the client is a tool description a model reads.
-    ///
-    /// `expect` rather than `allow`, on purpose. The day Chunk 3 reads either field the lint stops
-    /// firing and this attribute becomes an error, which is the compiler asking for it back. An
-    /// `allow` would sit here silently covering whatever went dead next.
-    #[expect(
-        dead_code,
-        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
-    )]
+    /// What this job may spend on itself, under the house limit rather than instead of it. `None`
+    /// means only the house limit governs — what every `graph:` rule has always meant.
     pub budget_usd: Option<f64>,
-    #[expect(
-        dead_code,
-        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
-    )]
+    /// How many rounds it may run. Cut by `config::rounds_allowed` before it is stored, never after:
+    /// this number comes from a model filling in a tool call, and a ceiling applied at read time is
+    /// a ceiling one forgetful caller can walk past. `None` is one round.
     pub max_rounds: Option<i64>,
 }
 
@@ -889,6 +888,10 @@ pub struct StartRequest<'a> {
     pub gate_each: bool,
     pub review: bool,
     pub head_sha: Option<&'a str>,
+    /// Both `None` for a scheduled job: a `graph:` rule asks for neither, which keeps it at one
+    /// round under the house limit — exactly what it did before rounds existed.
+    pub max_rounds: Option<i64>,
+    pub budget_usd: Option<f64>,
 }
 
 /// Creates a job and provisions the worktree it will live in.
@@ -913,6 +916,8 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             gate_each: request.gate_each,
             review: request.review,
             head_sha: request.head_sha,
+            max_rounds: request.max_rounds,
+            budget_usd: request.budget_usd,
         },
     )
     .await
@@ -1044,6 +1049,9 @@ pub struct JobRow {
     /// questions: the view's copy drives the pure decision, this one is what a node's prompt and the
     /// feed lines say out loud, and neither should have to load the other.
     pub round: i64,
+    /// This job's own allowance. `None` means only the house limit governs, which is what every
+    /// `graph:` rule has always meant and keeps meaning.
+    pub budget_usd: Option<f64>,
     pub created_at: String,
 }
 
@@ -1057,14 +1065,16 @@ impl JobRow {
 /// runtime — a guard worth keeping. The test named above compares this text against both the
 /// constant and the migration's index, so the three cannot drift apart in silence.
 const LIVE_JOBS_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
-                                    wait_reason, max_items, gate_each, head_sha, round, created_at
+                                    wait_reason, max_items, gate_each, head_sha, round, budget_usd,
+                                    created_at
                              FROM jobs
                              WHERE status IN ('planning','implementing','gating','reviewing',
                                               'awaiting_approval','waiting')
                              ORDER BY id";
 
 const ONE_JOB_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
-                                  wait_reason, max_items, gate_each, head_sha, round, created_at
+                                  wait_reason, max_items, gate_each, head_sha, round, budget_usd,
+                                    created_at
                            FROM jobs WHERE id = ?";
 
 pub async fn live_jobs(pool: &SqlitePool) -> sqlx::Result<Vec<JobRow>> {
@@ -2086,6 +2096,32 @@ enum Brake {
     },
 }
 
+/// Whether starting one more node would take this job past its own allowance, and how to say so.
+///
+/// Asks about the NEXT node, never the one in flight: the reserve is what a node is expected to cost,
+/// so the test is "would starting another cross the line" rather than "has the line been crossed".
+/// Killing a node mid-flight would throw away what it has already spent and leave the tree in a state
+/// no gate has measured — the identical decision the global budget took on 2026-07-20, for the
+/// identical reason.
+async fn job_over_budget(
+    pool: &SqlitePool,
+    job: &JobRow,
+    limit: f64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Option<String>> {
+    let spent = crate::budget::job_spend(pool, job.id, now).await?;
+    let reserve = crate::budget::load_budget_config(pool)
+        .await?
+        .per_run_reserve_usd;
+    if spent + reserve <= limit {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "this job has spent ${spent:.2} of its ${limit:.2} allowance, and the next node reserves \
+         ${reserve:.2}"
+    )))
+}
+
 async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     // Re-read per node rather than once per pass. A pass can spend a whole gate timeout inside one
     // job, and a stop that keeps starting work for another fifteen minutes is not a stop. Fails
@@ -2116,6 +2152,26 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
             reason,
             kind: crate::budget::PauseKind::Window,
         } => return Brake::Stop { detail: reason },
+    }
+
+    // The job's own ceiling, under the house's. Two different questions and both worth asking: a job
+    // can be stopped by what it was given or by what is left in the till.
+    //
+    // `Stop` and never `Park`, which is the whole difference from the window brake above. A calendar
+    // window reopens; a task's allowance does not, and a job parked on it would sit there until the
+    // four-hour ceiling swept it up with `waiting` on its row and no reason a reader could act on.
+    if let Some(limit) = job.budget_usd {
+        match job_over_budget(&state.pool, job, limit, now).await {
+            // Fails CLOSED, like every other brake here: a spend that cannot be read stops the job
+            // rather than letting it keep spending against a number nobody could check.
+            Err(error) => {
+                return Brake::Stop {
+                    detail: format!("this job's spend could not be read: {error}"),
+                };
+            }
+            Ok(Some(detail)) => return Brake::Stop { detail },
+            Ok(None) => {}
+        }
     }
 
     // Decision 10, and the whole of what it adds: the brake was a check made once at admission, and
@@ -2764,6 +2820,8 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await?;
@@ -3825,6 +3883,8 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await;
@@ -3942,6 +4002,8 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha: head_sha.as_deref(),
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
@@ -4520,6 +4582,69 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_job_run(pool: &sqlx::SqlitePool, job_id: i64, cost: f64) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, job_id, cost_usd, created_at, completed_at)
+             VALUES ('a node', 'completed', 'worktree', ?, ?, ?, ?)",
+        )
+        .bind(job_id)
+        .bind(cost)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A job's own allowance STOPS it and never parks it, which is the whole difference from the
+    /// window brake above. A calendar window reopens; a task's allowance does not, so a job parked
+    /// on it would sit at `waiting` until the four-hour ceiling swept it up, wearing a reason nobody
+    /// could act on.
+    #[tokio::test]
+    async fn a_job_that_spent_its_own_allowance_stops_rather_than_waiting() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_job_run(&pool, job_id, 4.5).await;
+
+        // The house limit is off, so anything that fires here is the job's own.
+        sqlx::query("UPDATE jobs SET budget_usd = 5.0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(
+            matches!(brakes(&state, &job, Utc::now()).await, Brake::Stop { .. }),
+            "spent 4.50 of 5.00 and the next node reserves 1.00"
+        );
+
+        // Room for another node: the test is about the NEXT one, never the one in flight.
+        sqlx::query("UPDATE jobs SET budget_usd = 20.0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
+    }
+
+    /// A NULL allowance means "only the house limit governs", which is what every `graph:` rule has
+    /// always meant. A job that spent plenty is untouched by a brake it never asked for.
+    #[tokio::test]
+    async fn a_job_with_no_allowance_of_its_own_is_governed_only_by_the_house() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_job_run(&pool, job_id, 500.0).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(job.budget_usd, None);
+        assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
     }
 
     /// Decision 9, and the whole reason `PauseKind` exists. The hourly brake lifts by itself, so

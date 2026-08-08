@@ -2920,6 +2920,12 @@ async fn create_job(
                 // has no field for it. `.ai/autopilot.yaml` may only lower the fan-out, and an HTTP
                 // body filled in by a model is reviewed even less than that file is.
                 max_items: crate::config::MAX_ITEMS_CEILING as i64,
+                // These two DO come from the caller, unlike `max_items`, and the asymmetry is the
+                // point. `max_items` is fan-out per round and has a hard ceiling nobody may raise;
+                // these are how long and how much, which are the caller's to choose — under
+                // `MAX_ROUNDS_CEILING` and under the house budget, both applied on the way in.
+                max_rounds: request.max_rounds,
+                budget_usd: request.budget_usd,
                 gate_each: true,
                 review: true,
                 head_sha: head_sha.as_deref(),
@@ -5719,18 +5725,19 @@ mod tests {
     }
 
     fn create_job_request(project_id: &str) -> Request<Body> {
+        create_job_request_with(serde_json::json!({
+            "project_id": project_id,
+            "prompt": "build the thing",
+        }))
+    }
+
+    fn create_job_request_with(body: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri("/jobs")
             .header("Authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "project_id": project_id,
-                    "prompt": "build the thing",
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     }
 
@@ -5793,6 +5800,90 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(branch, format!("nucleos/job-{job_id}"));
+    }
+
+    /// The two numbers a caller may choose, and the one it may not.
+    ///
+    /// `max_rounds` and `budget_usd` are how long and how much, which are the caller's to say —
+    /// under the daemon's ceiling and under the house budget. `max_items` is fan-out per round and
+    /// has no field at all: `.ai/autopilot.yaml` may lower it and nobody may raise it.
+    ///
+    /// The ceiling is asserted on the STORED row rather than on behaviour, because that is where it
+    /// is applied: a number cut on the way in is a promise the row itself keeps, where one cut at
+    /// read time is a promise every future reader has to remember.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_caller_may_ask_for_rounds_and_a_budget_but_not_for_more_fan_out() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-rounds-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request_with(serde_json::json!({
+                "project_id": "p",
+                "prompt": "build the thing",
+                "max_rounds": 10_000,
+                "budget_usd": 4.5,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["job_id"]
+            .as_i64()
+            .unwrap();
+
+        let (max_rounds, budget, max_items): (i64, Option<f64>, i64) =
+            sqlx::query_as("SELECT max_rounds, budget_usd, max_items FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            max_rounds,
+            crate::config::MAX_ROUNDS_CEILING,
+            "cut on the way in, so the row is the promise"
+        );
+        assert_eq!(budget, Some(4.5));
+        assert_eq!(
+            max_items,
+            crate::config::MAX_ITEMS_CEILING as i64,
+            "fan-out is the daemon's number, never the caller's"
+        );
+    }
+
+    /// A job nobody said anything about is a job of one round under the house limit — which is
+    /// exactly what it was before rounds existed, and what every `graph:` rule keeps being.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_that_asked_for_nothing_is_a_job_of_one_round() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-oneround-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let (max_rounds, budget): (i64, Option<f64>) =
+            sqlx::query_as("SELECT max_rounds, budget_usd FROM jobs ORDER BY id DESC LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(max_rounds, 1);
+        assert_eq!(budget, None, "only the house limit governs");
     }
 
     /// The emergency stop is checked before anything is written, and it fails closed.

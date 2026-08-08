@@ -256,6 +256,11 @@ async fn start_job(
             gate_each: graph.gate_after_each_item,
             review: graph.review,
             head_sha,
+            // A scheduled job asks for neither, which keeps it at one round under the house limit —
+            // exactly what a `graph:` rule did before rounds existed. Rounds are opt-in per request,
+            // not something a rule already in somebody's `.ai/autopilot.yaml` acquires overnight.
+            max_rounds: None,
+            budget_usd: None,
         },
     )
     .await
@@ -977,6 +982,8 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
