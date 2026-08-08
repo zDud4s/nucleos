@@ -1479,6 +1479,55 @@ mod tests {
         pool
     }
 
+    /// An empty database with the schema exactly as it stood after migration `version`.
+    ///
+    /// **This is what makes a DATA migration testable at all in this repository.**
+    /// `sqlx::migrate!().run()` applies the whole chain against empty tables, so every `UPDATE` in
+    /// every migration has always been unreachable by the suite: delete one and nothing goes red.
+    /// `email.rs:812` records the same limitation, and the vcs pillar's own handoff carries it as the
+    /// one untested guarantee it could not close. Stopping the chain part-way and putting rows in the
+    /// gap is all it needed.
+    ///
+    /// The migrator's own list is walked rather than the files read directly, so this cannot drift
+    /// from what ships: the SQL is the SQL that will run on the real database, in the order it will
+    /// run there. Nothing is written to `_sqlx_migrations` — the bookkeeping is not what is under
+    /// test, and a caller finishes the chain with `apply_migrations_after`.
+    ///
+    /// Not vcs-specific. It lives here because 0049 is the first data migration anybody tried to
+    /// test; the second module to need it should move it somewhere neutral rather than copy it.
+    pub(crate) async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        apply_migrations(&pool, |candidate| candidate <= version).await;
+        pool
+    }
+
+    pub(crate) async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64) {
+        apply_migrations(pool, |candidate| candidate > version).await;
+    }
+
+    async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool) {
+        for migration in sqlx::migrate!("./migrations").iter() {
+            if !wanted(migration.version) {
+                continue;
+            }
+            // `raw_sql` rather than `query`: a migration is many statements, and `query` runs the
+            // first and silently drops the rest — which would have made this harness quietly test
+            // a fraction of each file.
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(pool)
+                .await
+                .unwrap_or_else(|error| panic!("migration {} failed: {error}", migration.version));
+        }
+    }
+
     fn repo() -> ResolvedRepo {
         repo_for("alpha")
     }
@@ -1819,6 +1868,94 @@ mod tests {
             claim_next(&pool, "SHARED").await.unwrap().is_none(),
             "the second project claimed the repository the first is holding"
         );
+    }
+
+    /// Migration 0049's data half, which until now nothing could reach.
+    ///
+    /// Both `UPDATE`s in that file could be deleted with the whole suite green, and it is the one
+    /// instruction in this pillar that runs exactly once, on a real database, with no rehearsal.
+    /// What it has to get right is a pair: the backfill must key every existing row, and every row
+    /// that was still LIVE must be retired — because a backfilled key is a project LABEL, so a
+    /// surviving `queued` row would be claimable under `alpha` while a new request for the same
+    /// repository holds its real key, which is two operations against one repository and the exact
+    /// defect the migration exists to remove.
+    #[tokio::test]
+    async fn migration_0049_keys_every_row_and_retires_the_live_ones() {
+        let pool = pool_migrated_through(48).await;
+
+        // The pre-0049 shape: no `repo_key` column exists yet, which is itself part of the test —
+        // naming it here would fail to compile against the schema this row is written into.
+        for (id, status) in [
+            (1, "queued"),
+            (2, "running"),
+            (3, "awaiting_approval"),
+            (4, "succeeded"),
+            (5, "failed"),
+            (6, "cancelled"),
+        ] {
+            sqlx::query(
+                "INSERT INTO vcs_requests
+                 (id, op, args, project_id, project_root, origin, status, created_at)
+                 VALUES (?, 'merge', ?, 'alpha', 'C:/repo', 'human', ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(MERGE_ARGS)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        apply_migrations_after(&pool, 48).await;
+
+        // Named rather than a tuple, for the reason `RequestSummary` gives two hundred lines up:
+        // four of these five are `Option<String>` or `String`, so a positional read of the wrong
+        // column would compile and pass. Clippy asks for the same thing from the other direction.
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            repo_key: String,
+            status: String,
+            failure_reason: Option<String>,
+            finished_at: Option<String>,
+        }
+
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT repo_key, status, failure_reason, finished_at FROM vcs_requests ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            rows.iter().all(|row| row.repo_key == "alpha"),
+            "every row is keyed from its project_id: {rows:?}"
+        );
+
+        let statuses: Vec<&str> = rows.iter().map(|row| row.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "interrupted",
+                "interrupted",
+                "interrupted",
+                "succeeded",
+                "failed",
+                "cancelled"
+            ],
+            "the three live rows are retired and the three terminal ones are left exactly as they were"
+        );
+
+        let retired = &rows[0];
+        assert!(
+            retired
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resubmit")),
+            "a retired row has to say why, or its owner cannot know to ask again: {retired:?}"
+        );
+        // Deliberately NOT stamped, and the migration argues why at length: the daemon does not know
+        // when these ended, and SQLite's `datetime('now')` does not even sort with its neighbours.
+        assert_eq!(retired.finished_at, None);
     }
 
     /// The one spelling that becomes a queued merge, and its neighbours that must not.
