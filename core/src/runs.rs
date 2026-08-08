@@ -1740,26 +1740,31 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // **Only when the queue did not take it**, and this `if` is the whole of decision (B). A grant
-    // is permission for the RUN to perform the action itself; minting one beside a queued merge
-    // would authorise the very thing the queueing exists to take away, and the two would race for
-    // the same refs — the one race this pillar was built to abolish.
+    // One row either way, and `queued_request_id` is what it says (migration 0051). NULL is the
+    // grant this has always minted: permission for the RUN to perform the action itself, once. Set
+    // is the opposite fact — the queue has it, the run does not — and `consume_matching_grant`
+    // excludes those rows, so recording the takeover cannot accidentally authorise the very thing it
+    // records having taken away.
     //
-    // `tool_input` rides along so the grant names the action the human actually read and approved,
-    // not merely the tool that would perform it (migration 0020).
-    if queued_request_id.is_none() {
-        sqlx::query(
-            "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at)
-             VALUES (?, ?, ?, ?, ?, NULL)",
-        )
-        .bind(resume_id)
-        .bind(&tool_name)
-        .bind(proposal.tool_input.as_deref())
-        .bind(proposal_id)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-    }
+    // Written even when nothing is granted because the run has to be ABLE to be told. Without the
+    // row, a resumed run that tried its merge again would be paused and would mint a second proposal
+    // for a person to read — and approving that one would queue the merge twice.
+    //
+    // `tool_input` rides along so the row names the action the human actually read and approved, not
+    // merely the tool that would perform it (migration 0020) — and it is what `hooks.rs` matches the
+    // retry against.
+    sqlx::query(
+        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)",
+    )
+    .bind(resume_id)
+    .bind(&tool_name)
+    .bind(proposal.tool_input.as_deref())
+    .bind(proposal_id)
+    .bind(&now)
+    .bind(queued_request_id)
+    .execute(&mut *tx)
+    .await?;
     // Compare-and-set on the state this resume was authorised from, like every other writer of a
     // proposal decision (`proposals::transition`, `worktree::release`). The `status != "pending"`
     // check at the top of this function reads OUTSIDE the transaction, so a reject arriving in
@@ -2666,12 +2671,13 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
 
         let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
 
-        let (op, args, origin, status): (String, String, String, String) = sqlx::query_as(
-            "SELECT op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .expect("the approved merge is in the queue");
+        let (request_id, op, args, origin, status): (i64, String, String, String, String) =
+            sqlx::query_as(
+                "SELECT id, op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("the approved merge is in the queue");
         assert_eq!(op, "merge");
         assert_eq!(
             (origin.as_str(), status.as_str()),
@@ -2685,10 +2691,22 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             serde_json::json!({"op": "merge", "source": "feature/x", "target": branch})
         );
 
-        assert_eq!(
-            grants_for(&state, resume_id).await,
-            0,
+        // Asserted through the two queries rather than by counting rows: since migration 0051 the
+        // approval writes a row EITHER way, and what separates them is what that row answers. It
+        // must record the takeover and must not authorize anything.
+        let input = serde_json::json!({ "command": "git merge feature/x" }).to_string();
+        assert!(
+            !proposals::consume_matching_grant(&state.pool, resume_id, "Bash", &input)
+                .await
+                .unwrap(),
             "the queue took the merge, so the run must NOT also be authorized to perform it"
+        );
+        assert_eq!(
+            proposals::matching_queued_request(&state.pool, resume_id, "Bash", &input)
+                .await
+                .unwrap(),
+            Some(request_id),
+            "and the run has to be able to be TOLD which request has its work"
         );
 
         let note: String = sqlx::query_scalar(

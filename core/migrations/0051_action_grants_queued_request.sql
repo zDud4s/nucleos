@@ -1,0 +1,14 @@
+-- A row in `action_grants` used to mean one thing: this run may perform this action, once.
+-- Approving a merge no longer means that — the queue performs it — so the row has to be able to say
+-- the other thing: this action was taken OUT of the run's hands, and here is the request that has it.
+--
+-- A column on this table rather than a table of its own, because the matching is identical and
+-- already argued for: `consume_matching_grant` matches on the tool AND the serialized input, since
+-- `tool_name` is "Bash" for every shell action. A second table would be a second copy of that rule,
+-- free to drift from it.
+--
+-- NULL means what every existing row means — an ordinary grant. Set means the queue has it, the run
+-- does not, and `consume_matching_grant` must not hand the run a pass off the back of it. That
+-- exclusion is the load-bearing half: without it, the row minted to record the takeover would
+-- authorise the very action it exists to record having taken away.
+ALTER TABLE action_grants ADD COLUMN queued_request_id INTEGER;

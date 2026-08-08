@@ -379,7 +379,8 @@ pub async fn consume_matching_grant(
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "UPDATE action_grants SET consumed_at = ?
-         WHERE run_id = ? AND tool_name = ? AND tool_input IS ? AND consumed_at IS NULL",
+         WHERE run_id = ? AND tool_name = ? AND tool_input IS ? AND consumed_at IS NULL
+           AND queued_request_id IS NULL",
     )
     .bind(&now)
     .bind(run_id)
@@ -388,6 +389,35 @@ pub async fn consume_matching_grant(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// The queued request that already has this action, if the approval handed it to the queue instead
+/// of back to the run (migration 0051).
+///
+/// The mirror of `consume_matching_grant`, matched the same way and for the same reason — and it
+/// consumes NOTHING. A grant is spent because it authorises one action; this is a standing fact
+/// about where the work went, and it has to answer identically however many times a run asks. A
+/// run that gets a different answer on its second attempt would be one that could wait out the
+/// refusal.
+///
+/// **The two must never both match the same row**, which is what the `IS NULL` / `IS NOT NULL` pair
+/// buys: the row minted to record the takeover would otherwise be a grant authorising the very
+/// action it records having taken away.
+pub async fn matching_queued_request(
+    pool: &SqlitePool,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &str,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT queued_request_id FROM action_grants
+          WHERE run_id = ? AND tool_name = ? AND tool_input IS ? AND queued_request_id IS NOT NULL",
+    )
+    .bind(run_id)
+    .bind(tool_name)
+    .bind(tool_input)
+    .fetch_optional(pool)
+    .await
 }
 
 #[cfg(test)]
@@ -667,6 +697,70 @@ mod tests {
         let result = reject_proposal(&pool, 999_999).await;
 
         assert!(matches!(result, Err(RejectError::NotFound)));
+    }
+
+    /// The row that RECORDS a takeover must never authorize the thing it records having taken away.
+    ///
+    /// Both queries match on the same three columns, so without the `queued_request_id` pair one
+    /// row would answer both questions: the daemon would note that the queue has the merge, and then
+    /// hand the run a pass to perform it anyway — the two racing for the same refs.
+    #[tokio::test]
+    async fn a_row_recording_a_takeover_is_not_a_grant() {
+        let pool = test_pool().await;
+        let input = r#"{"command":"git merge feature/x"}"#;
+        sqlx::query(
+            "INSERT INTO action_grants
+             (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+             VALUES (100, 'Bash', ?, 5, '2026-01-01T00:00:00Z', NULL, 77)",
+        )
+        .bind(input)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !consume_matching_grant(&pool, 100, "Bash", input)
+                .await
+                .unwrap(),
+            "a takeover must not be consumable as permission"
+        );
+        assert_eq!(
+            matching_queued_request(&pool, 100, "Bash", input)
+                .await
+                .unwrap(),
+            Some(77)
+        );
+        // Asked twice, it answers the same: this is a standing fact, not a single-use pass. A run
+        // that got a different answer on its second attempt could wait the refusal out.
+        assert_eq!(
+            matching_queued_request(&pool, 100, "Bash", input)
+                .await
+                .unwrap(),
+            Some(77)
+        );
+    }
+
+    /// And the other direction: an ordinary grant is invisible to the takeover lookup, so a run that
+    /// legitimately holds one is never told its action was queued when it was not.
+    #[tokio::test]
+    async fn an_ordinary_grant_is_not_mistaken_for_a_takeover() {
+        let pool = test_pool().await;
+        let input = r#"{"command":"git push origin main"}"#;
+        grant_action(&pool, 101, "Bash", Some(input), 5)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            matching_queued_request(&pool, 101, "Bash", input)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            consume_matching_grant(&pool, 101, "Bash", input)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
