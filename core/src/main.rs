@@ -573,6 +573,12 @@ async fn main() {
     tokio::spawn(job::run_job_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
+    // The worktree GC's counterpart inside the database. It collects the directories a finished run
+    // leaves on disk; this expires the transcript it leaves in `runs`, the events it leaves in
+    // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
+    // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
+    // third time, so they grew at three times the obvious rate.
+    tokio::spawn(runs::run_retention_loop(state.clone()));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor::default()),

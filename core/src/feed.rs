@@ -163,9 +163,97 @@ pub async fn search(
     query.build_query_as::<FeedEntry>().fetch_all(pool).await
 }
 
+/// How long an activity entry stays readable.
+///
+/// Longer than a run keeps its transcript, deliberately: an entry is one short line, and "what was
+/// this daemon doing in June" is a question people actually ask. It still needs a bound — every run,
+/// every gate, every worktree collected and every startup recovery writes one, for ever.
+pub const DEFAULT_RETENTION_DAYS: i64 = 90;
+
+/// The window, overridable the same way `runs` and `worktree` allow theirs to be.
+pub(crate) fn retention_days() -> i64 {
+    std::env::var("NUCLEOS_FEED_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_RETENTION_DAYS)
+}
+
+/// Removes activity entries past the window. Returns how many went.
+pub async fn prune(
+    pool: &sqlx::SqlitePool,
+    retain_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<u64> {
+    if retain_days <= 0 {
+        return Ok(0);
+    }
+    // RFC 3339 in Rust rather than SQLite's `datetime()`, for the reason `web::prune` sets out at
+    // length: the two spellings are compared as TEXT and disagree inside the cutoff's own day.
+    let cutoff = (now - chrono::Duration::days(retain_days)).to_rfc3339();
+    let result = sqlx::query("DELETE FROM feed WHERE created_at < ?")
+        .bind(&cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FeedScope, SearchFilter, append, list_all, list_feed, search};
+    use super::{FeedScope, SearchFilter, append, list_all, list_feed, prune, search};
+
+    /// Entries past the window go; the rest stay, and a second pass finds nothing left to do.
+    #[tokio::test]
+    async fn feed_entries_past_the_window_go_and_the_rest_stay() {
+        let pool = test_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for created_at in [
+            // Two the wrong side of a 90-day cutoff, and one a second inside it. The boundary case
+            // is the one that matters: `created_at` is RFC 3339 and SQLite's `datetime()` is not,
+            // and comparing the two as TEXT spares a day's worth of rows on every sweep for ever.
+            "2026-01-01T00:00:00+00:00",
+            "2026-05-10T11:59:59+00:00",
+            "2026-05-10T12:00:01+00:00",
+        ] {
+            sqlx::query(
+                "INSERT INTO feed (project_id, kind, summary, run_id, created_at)
+                 VALUES (NULL, 'run_completed', 'something happened', NULL, ?)",
+            )
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(prune(&pool, 90, now).await.unwrap(), 2);
+        assert_eq!(list_all(&pool, 100).await.unwrap().len(), 1);
+        assert_eq!(
+            prune(&pool, 90, now).await.unwrap(),
+            0,
+            "a sweep with nothing to do must say so, or the log reports work every hour for ever"
+        );
+    }
+
+    /// Zero is not a retention policy, it is a typo that empties the whole activity log.
+    #[tokio::test]
+    async fn a_zero_or_negative_feed_window_prunes_nothing() {
+        let pool = test_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        append(&pool, None, "run_completed", "ancient", None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE feed SET created_at = '2000-01-01T00:00:00+00:00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(prune(&pool, 0, now).await.unwrap(), 0);
+        assert_eq!(prune(&pool, -1, now).await.unwrap(), 0);
+        assert_eq!(list_all(&pool, 100).await.unwrap().len(), 1);
+    }
 
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
