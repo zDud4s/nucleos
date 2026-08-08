@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 2;
+pub const CLASSIFIER_VERSION: u32 = 3;
 
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
@@ -37,7 +37,37 @@ const SELF_GOVERNING_FILES: &[&str] = &[
 /// `Cargo.toml` earns its place despite being edited often: an autonomous run adding a dependency
 /// is a supply-chain change, which is precisely the sort of thing a person should see.
 /// Lowercase: `normalize_path` case-folds, so these are compared against folded paths.
-const EXECUTES_ON_NEXT_COMMAND_FILES: &[&str] = &["build.rs", "cargo.toml", ".mcp.json"];
+///
+/// The Python and Go entries arrived WITH their runners in `SAFE_COMMAND_PREFIXES` and are the
+/// price of them, not a separate tightening. Two shapes, the same two as Rust's:
+///
+/// - **Runs without anyone asking it to.** `conftest.py` is imported by every `pytest` invocation,
+///   including one a person types next week against a single unrelated test file, and it is picked
+///   up from parent directories — so a payload at the repository root runs from anywhere below it.
+///   `sitecustomize.py` and `usercustomize.py` are worse: Python's `site` imports them at
+///   interpreter startup, so they run on *any* python command at all. That is `.githooks/pre-commit`'s
+///   shape — code that executes on somebody else's later, innocuous-looking step — and it is the
+///   shape worth guarding, more than "the agent can run code it wrote", which `cargo test` already
+///   concedes above.
+/// - **Decides what runs, or what gets fetched.** `pyproject.toml`, `setup.py`, `setup.cfg`,
+///   `pytest.ini` and `tox.ini` carry `addopts` (`-p somemodule` loads a plugin) and dependency
+///   lists; `go.mod`/`go.sum` are what `go test` resolves against and therefore what it downloads.
+///   Same argument as `Cargo.toml`, same acceptance that they are edited often.
+const EXECUTES_ON_NEXT_COMMAND_FILES: &[&str] = &[
+    "build.rs",
+    "cargo.toml",
+    ".mcp.json",
+    "conftest.py",
+    "sitecustomize.py",
+    "usercustomize.py",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "pytest.ini",
+    "tox.ini",
+    "go.mod",
+    "go.sum",
+];
 
 /// Directories where EVERY file is executable surface, matched as a whole path segment.
 /// `.git/` subsumes `.git/hooks/` and `.git/config`; `.cargo/` covers `config.toml`'s `runner`.
@@ -55,6 +85,43 @@ const DESTRUCTIVE_COMMAND_PATTERNS: &[&str] = &[
     "rm -rf", "rm -fr", "rd /s /q", "rd /q /s", "rmdir /s", "del /s", "del /q",
 ];
 const VCS_LOCAL_PREFIXES: &[&str] = &["git add", "git commit"];
+/// Commands that run without asking, and the line they are picked by.
+///
+/// The line is NOT "does this execute code". Three entries already do: `cargo test`, `cargo check`
+/// and `cargo clippy` compile and run whatever is in the tree — including a test file the agent
+/// wrote a moment earlier — and the doc comment on `EXECUTES_ON_NEXT_COMMAND_FILES` says so out
+/// loud. That trade was taken deliberately, because autonomy that cannot run the suite cannot do
+/// the job.
+///
+/// The line actually drawn is narrower, and every entry here holds to it: **a command may run the
+/// code already in this workspace, and may not reach past it.** Past it means three things, each
+/// with its own guard rather than a gap in this list —
+///
+/// - *out of the workspace*: `deletes_outside_cwd`, the `Write`/`Edit` containment checks, and
+///   `uses_a_flag_its_program_makes_dangerous` for the flags that write a path without a `file_path`;
+/// - *onto the network*: nothing here fetches. `npm install`, `pip install` and `cargo add` are
+///   absent for that reason — a different reason from `cargo test`'s, and the manifests that make an
+///   already-allowed command fetch (`Cargo.toml`, `pyproject.toml`, `go.mod`) are guarded above;
+/// - *into what a person will be shown*: `SELF_GOVERNING_FILES` and the push/merge/publish list.
+///
+/// Read that way, the list before this one was not a policy — it was a shape. Rust and git, because
+/// Rust and git were what the first autopilot happened to need. The dogfood of 2026-08-08 measured
+/// what the shape cost: a four-node night job skipped BOTH its items, on
+/// `python -m unittest test_greet -v` and `find . -iname "greet.py"`. It ran to completion, stopped
+/// nobody, and produced nothing. Neither command is more dangerous than `cargo test`; neither was
+/// on the list.
+///
+/// Still deliberately absent, so the next person to wonder does not have to re-derive it:
+///
+/// - **bare `python` / `node`** — `python -c "..."` is arbitrary code with no file and no runner to
+///   constrain it, and it is pinned `pending_approval` by test. Only the `-m` test-runner spellings
+///   are here, which is why each interpreter costs three entries instead of one.
+/// - **`npm test`** — it runs `scripts.test` out of `package.json`, so that file's CONTENTS are the
+///   policy, exactly as `Cargo.toml`'s are. Guarding `package.json` is the honest price and it is
+///   edited far more often than `Cargo.toml`. Deferred until `shell/` exists and the trade can be
+///   weighed against a real repository instead of a hypothetical one.
+/// - **`go run`, `cargo run`** — they execute an arbitrary `main`, which is the `python foo.py`
+///   shape wearing a build tool's name.
 const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "ls",
     "cat",
@@ -68,6 +135,25 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "cargo clippy",
     "dir",
     "type",
+    // Test runners. `py` is the Windows launcher, and this daemon only builds for Windows.
+    "pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "py -m pytest",
+    "python -m unittest",
+    "python3 -m unittest",
+    "py -m unittest",
+    "go test",
+    "go build",
+    "go vet",
+    // Reading and searching. `find` and `rg` each carry one flag that turns them into something
+    // else entirely; both are rejected by name in `runs_a_helper_command`.
+    "find",
+    "rg",
+    "grep",
+    "head",
+    "tail",
+    "wc",
 ];
 /// Read-only commands whose safety lives in the EXACT form, so they get no argument tolerance: for
 /// `git branch` and `git remote` the listing spelling and the mutating spelling share a first token
@@ -321,6 +407,10 @@ fn has_destructive_flags(command: &str) -> bool {
             "rd" | "rmdir" => rest.contains(&"/s"),
             "del" => rest.iter().any(|token| matches!(*token, "/s" | "/q")),
             "remove-item" => rest.iter().any(|token| is_powershell_delete_switch(token)),
+            // `find . -delete` IS a recursive force delete, spelled as a search. It belongs here
+            // rather than merely off the allow list, because `deny` is what the identical `rm -rf`
+            // gets and the two differ only in which program walks the tree.
+            "find" => rest.contains(&"-delete"),
             _ => false,
         }
     })
@@ -348,6 +438,8 @@ fn is_safe_command(command: &str) -> bool {
         && !command.split_whitespace().any(|token| token == "--fix")
         && !writes_an_output_file(command)
         && !forces_external_diff_or_textconv(command)
+        && !runs_a_helper_command(command)
+        && !uses_a_flag_its_program_makes_dangerous(command)
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
 }
@@ -356,10 +448,67 @@ fn is_safe_command(command: &str) -> bool {
 /// `git show`, `git diff`) turns into a file write with one flag — read-local must never mean "wrote
 /// a file". Rejecting the whole `--output` family also costs the display-only spellings
 /// (`--output-indicator-new`); that over-reach is the cheap side of the trade.
+/// `find`'s spelling of the same thing is `-fprint`, `-fprintf`, `-fprint0` and `-fls`: each takes a
+/// path and writes the walk to it, so a search allowed for reading would write a file — and, given
+/// an absolute path, write it outside the workspace.
 fn writes_an_output_file(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        token.starts_with("--output") || token.starts_with("-fprint") || token == "-fls"
+    })
+}
+
+/// Whether the command asks an otherwise-safe program to run a second program for it.
+///
+/// Every entry is a flag that takes a COMMAND as its value, which makes the leading token a liar:
+/// `find . -exec sh -c '...' \;` is an `sh`, and `rg --pre ./x.sh pattern` runs `./x.sh` once per
+/// file. Neither guard upstream sees it — the safe-prefix match reads the first token only, and the
+/// destructive blocklist matches known program names, which is exactly what an arbitrary payload is
+/// not.
+///
+/// Matched as WHOLE tokens rather than by prefix, and that is load-bearing for `--pre`: `--pretty`
+/// starts with it, and `git log --pretty=oneline` is one of the most common commands there is.
+fn runs_a_helper_command(command: &str) -> bool {
+    const RUNS_A_COMMAND: &[&str] = &[
+        // find: `-ok`/`-okdir` prompt first, but the prompt goes to a stdin nobody is holding.
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        // ripgrep: `--pre` names a preprocessor run per file, `--hostname-bin` a command run to
+        // build hyperlinks. `--pre-glob` only filters which files reach `--pre` and is meaningless
+        // without it; it is listed so neither half reads as permitted on its own.
+        "--pre",
+        "--pre-glob",
+        "--hostname-bin",
+    ];
     command
         .split_whitespace()
-        .any(|token| token.starts_with("--output"))
+        .any(|token| RUNS_A_COMMAND.contains(&token))
+}
+
+/// Whether the command uses a flag that is harmless on most programs and a file write on this one.
+///
+/// `-o` is the case that forces this check to know the program. On `go build` and `go test` it names
+/// the output binary and takes a path, so `go build -o ../../evil.exe` writes outside the workspace
+/// with none of the containment guards ever seeing it — those read a tool call's `file_path`, and a
+/// shell command has none. On `grep` the same two characters mean `--only-matching` and print to
+/// stdout, which is how half the world uses grep.
+///
+/// The file's other rejections (`--fix`, `--output`, `--ext-diff`) are global because no allowed
+/// program gives them a second meaning. These do, so they are the only ones read next to a program.
+fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(program) = tokens.next().map(program_name) else {
+        return false;
+    };
+    match program {
+        "go" => tokens.any(|token| token == "-o"),
+        // `tail -f` never returns. Not a security hole — but an autonomous run that hangs until its
+        // ceiling is the failure this whole feature exists to avoid, and it costs a whole night.
+        // `-F` needs no arm of its own: the command reaching here has been lowercased already.
+        "tail" => tokens.any(|token| matches!(token, "-f" | "--follow")),
+        _ => false,
+    }
 }
 
 /// `--ext-diff` forces a repo-configured external diff driver to run — arbitrary command
@@ -1361,8 +1510,252 @@ mod tests {
         }
     }
 
+    /// The two commands the 2026-08-08 dogfood actually died on, first, and by name.
+    ///
+    /// A four-node night job skipped BOTH its items on these — so the machine no longer stopped to
+    /// ask anybody, ran to completion, and produced nothing. Neither is more dangerous than
+    /// `cargo test`, which has been allowed since the first version of this file; they were missing
+    /// because the list was Rust-and-git shaped, not because a line had been drawn anywhere near
+    /// them.
     #[test]
-    fn exposes_initial_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 2);
+    fn the_commands_the_night_job_died_on_are_allowed() {
+        for command in [
+            "python -m unittest test_greet -v",
+            "find . -iname \"greet.py\"",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn allows_test_runners_that_are_not_cargo() {
+        for command in [
+            "pytest",
+            "pytest -q tests/",
+            "python -m pytest -x",
+            "python3 -m pytest",
+            "py -m pytest tests/test_a.py",
+            "python -m unittest discover",
+            "python3 -m unittest -v",
+            "py -m unittest",
+            "go test ./...",
+            "go build ./cmd/echo",
+            "go vet ./...",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// Widening to the runners must not widen to the interpreters underneath them: the whole reason
+    /// each interpreter costs three entries instead of one is that `python -c` has no runner and no
+    /// file constraining what it executes.
+    #[test]
+    fn the_interpreters_under_the_test_runners_stay_pending() {
+        for command in [
+            "python -c \"print(1)\"",
+            "python script.py",
+            "python3 -m http.server",
+            "py setup.py install",
+            "node index.js",
+            "go run ./cmd/thing",
+            "npm test",
+            "pip install requests",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    #[test]
+    fn allows_read_only_search_and_paging() {
+        for command in [
+            "find . -name \"*.rs\"",
+            "rg fn_name core/src",
+            "grep -rn TODO core",
+            "grep -o pattern file.txt",
+            "head -20 README.md",
+            "tail -50 daemon.log",
+            "wc -l core/src/classifier.rs",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// `find . -delete` is a recursive force delete that never says `rm`. It gets `deny` and not
+    /// merely "off the allow list", because that is what the identical `rm -rf` gets and the two
+    /// differ only in which program walks the tree.
+    #[test]
+    fn a_search_that_deletes_is_denied_like_the_rm_it_is() {
+        for command in [
+            "find . -name \"*.rs\" -delete",
+            "find / -delete",
+            "/usr/bin/find . -delete",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "deny",
+                "destructive",
+            );
+        }
+    }
+
+    /// The flags that make a search run a second program. The leading token says `find` or `rg`;
+    /// what actually executes is whatever the flag names, which no blocklist can be written against.
+    #[test]
+    fn a_search_that_runs_a_second_program_is_not_a_search() {
+        for command in [
+            "find . -name x -exec cat {} +",
+            "find . -execdir ./payload.sh +",
+            "find . -ok cat {} +",
+            "find . -okdir ./payload.sh +",
+            "rg --pre ./payload.sh pattern",
+            "rg --pre-glob *.gz pattern",
+            "rg --hostname-bin ./payload.sh pattern",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// The reason `runs_a_helper_command` matches whole tokens and not prefixes. `--pretty` starts
+    /// with `--pre`, and `git log --pretty=...` is about as common as commands get — a prefix match
+    /// would have made the widening cost more than it bought on day one.
+    #[test]
+    fn pretty_is_not_the_preprocessor_flag() {
+        for command in [
+            "git log --pretty=oneline",
+            "git log --pretty=format:%h",
+            "git show --pretty=short HEAD",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// `-o` is a file write on `go` and stdout on `grep`, so it cannot be judged without knowing
+    /// which program is reading it. A shell command carries no `file_path`, so the containment
+    /// checks that catch `Write ../../evil.exe` never see `go build -o ../../evil.exe`.
+    #[test]
+    fn a_flag_is_read_next_to_the_program_that_defines_it() {
+        for command in [
+            "go build -o ../../evil.exe ./cmd",
+            "go test -o /tmp/suite.bin ./...",
+            // `tail -f` is availability, not security: a run that hangs until its ceiling costs
+            // exactly the night this feature exists to spend.
+            "tail -f daemon.log",
+            "tail --follow daemon.log",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+
+        // The same two characters, on a program where they mean "print only the match".
+        for command in ["grep -o pattern file.txt", "rg -o pattern"] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_that_writes_its_walk_to_a_file_stays_pending() {
+        for command in [
+            "find . -fprint out.txt",
+            "find . -fprintf out.txt %p",
+            "find . -fprint0 out.txt",
+            "find . -fls out.txt",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// The runners arrived with their inputs guarded, which is the same trade `cargo test` and
+    /// `build.rs`/`Cargo.toml` already struck. Two shapes: files an allowed command imports without
+    /// being asked (`conftest.py` on every pytest, `sitecustomize.py` on every python at all), and
+    /// files that decide what runs or what gets downloaded.
+    #[test]
+    fn the_new_runners_brought_their_own_guarded_inputs() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for file_path in [
+            "conftest.py",
+            "tests/conftest.py",
+            "sitecustomize.py",
+            "usercustomize.py",
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "pytest.ini",
+            "tox.ini",
+            "go.mod",
+            "go.sum",
+            r"C:\work\repo\sidecars\echo\go.mod",
+        ] {
+            assert_classification(
+                classify("Write", &json!({"file_path": file_path}), cwd),
+                "pending_approval",
+                "executes-on-next-command",
+            );
+        }
+    }
+
+    /// The guard list above must stay narrow for the same reason the Rust one does: ordinary Python
+    /// and Go source is what an autonomous run is there to write.
+    #[test]
+    fn ordinary_python_and_go_sources_are_still_allowed() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for file_path in [
+            "greet.py",
+            "tests/test_greet.py",
+            "docs/setup.md",
+            "sidecars/echo/main.go",
+            "sidecars/echo/main_test.go",
+            // Near-misses on the suffix match: a name that merely ENDS with a guarded one.
+            "myconftest.py",
+            "cargo.toml.bak",
+        ] {
+            assert_classification(
+                classify("Write", &json!({"file_path": file_path}), cwd),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// Bumped with the widening above: the version is stamped onto every `shadow_decisions` row, so
+    /// it is what tells two differently-classified decisions apart after the fact. Leaving it at 2
+    /// would make the night of 2026-08-08 and everything after it indistinguishable in the record.
+    #[test]
+    fn exposes_current_classifier_version() {
+        assert_eq!(CLASSIFIER_VERSION, 3);
     }
 }
