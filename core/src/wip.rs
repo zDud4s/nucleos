@@ -113,8 +113,14 @@ pub async fn wip_permits_new_run(pool: &SqlitePool, project_id: &str) -> WipDeci
     };
 
     if queue_full(open, Some(limit)) {
+        // "items", not "proposals". `OPEN_REVIEW_ITEMS_SQL` counts unreviewed `shadow_decisions`
+        // too, and for a project that has spent time in shadow mode they are nearly all of it: this
+        // said "85 proposals already waiting" for a project whose `/proposals` had exactly one, so
+        // the one person who went to look concluded the brake was broken and went hunting. A brake's
+        // reason is read precisely when something has stopped — naming the wrong queue sends the
+        // reader to a page that disagrees with it.
         return WipDecision::Defer {
-            reason: format!("{open} proposals already waiting for review (limit {limit})"),
+            reason: format!("{open} items already waiting for review (limit {limit})"),
         };
     }
     WipDecision::Allow
