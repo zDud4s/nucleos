@@ -253,6 +253,55 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     .await
 }
 
+/// The items a job put down overnight, still unread.
+///
+/// A separate door from `list_pending` rather than a `kind` parameter on it, because the two lists
+/// are answered by different actions and mixing them would put a decision that resumes a run next
+/// to one that resumes nothing. `list_pending` is a *queue*: everything in it is work stopped
+/// mid-stride, and `approve` lets it through. This is a *record*: the work was never started, the
+/// job moved on hours ago, and the only thing left to do with it is read it and put it away. Offered
+/// through the same endpoint they would share an approve button, and `reject_proposal` guards on
+/// `kind = 'action-approval'`, so half of it would answer 409 to a click that looked identical.
+///
+/// Newest first, unlike `list_pending`'s ascending order, and for the opposite reason: an approval
+/// queue is worked front to back, and this is read the morning after.
+pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals
+         WHERE status = 'pending' AND kind = 'skipped-item'
+         ORDER BY id DESC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Puts a skipped item away once it has been read.
+///
+/// Without it the listing above only ever grows: nothing else moves a `skipped-item` off `pending`,
+/// so a week of night jobs would bury the one item that mattered, and a list that cannot be cleared
+/// stops being read — which is the same outcome as having no route at all, arrived at more slowly.
+///
+/// `dismissed`, not `rejected` or `approved`: neither of those is true. Nothing was proposed, so
+/// there is nothing to refuse, and nothing runs on the way out — where `reject_proposal` also
+/// releases the paused run's worktree, this touches no run at all. The job's own machinery released
+/// everything when it skipped the item and carried on.
+///
+/// Reuses `RejectError` rather than growing a near-identical twin: the three cases a caller has to
+/// tell apart — gone, already decided, and the database said no — are the same three.
+pub async fn dismiss_skipped_item(pool: &SqlitePool, id: i64) -> Result<(), RejectError> {
+    let proposal = get(pool, id).await?.ok_or(RejectError::NotFound)?;
+    if proposal.kind != "skipped-item" || proposal.status != "pending" {
+        return Err(RejectError::NotPending);
+    }
+    // Compare-and-set, so a second dismissal racing this one is reported rather than answered 204.
+    if !transition(pool, id, "dismissed", "dismissed by user").await? {
+        return Err(RejectError::NotPending);
+    }
+    Ok(())
+}
+
 pub async fn transition(
     pool: &SqlitePool,
     id: i64,
@@ -598,6 +647,89 @@ mod tests {
                 .iter()
                 .all(|proposal| proposal.kind == "action-approval" && proposal.status == "pending")
         );
+    }
+
+    /// The two listings must not leak into each other. `list_pending` is a queue somebody works
+    /// through; this is a record somebody reads. A `skipped-item` appearing in the queue would be
+    /// offered an approve button that resumes nothing, and an action approval appearing here would
+    /// be offered a dismiss that abandons a run still holding a worktree.
+    #[tokio::test]
+    async fn the_skipped_items_listing_and_the_approval_queue_stay_apart() {
+        let pool = test_pool().await;
+
+        let approval =
+            create_action_approval(&pool, 10, Some("s10"), Some("p"), "Bash", "asked", None)
+                .await
+                .unwrap();
+        let older =
+            create_skipped_item(&pool, 11, Some("s11"), Some("p"), "Bash", "set aside", None)
+                .await
+                .unwrap();
+        let newer = create_skipped_item(
+            &pool,
+            12,
+            Some("s12"),
+            Some("p"),
+            "Bash",
+            "set aside later",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let skipped = list_skipped_items(&pool).await.unwrap();
+        // Newest first: this is read the morning after, not worked front to back.
+        assert_eq!(
+            skipped.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![newer, older]
+        );
+
+        let queue = list_pending(&pool).await.unwrap();
+        assert_eq!(
+            queue.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![approval]
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_skipped_item_takes_it_off_the_listing_once() {
+        let pool = test_pool().await;
+        let id = create_skipped_item(&pool, 11, Some("s11"), Some("p"), "Bash", "set aside", None)
+            .await
+            .unwrap();
+
+        dismiss_skipped_item(&pool, id).await.unwrap();
+
+        assert!(list_skipped_items(&pool).await.unwrap().is_empty());
+        // A second dismissal lost the race and is told so, rather than being answered 204 for a
+        // change it did not make.
+        assert!(matches!(
+            dismiss_skipped_item(&pool, id).await,
+            Err(RejectError::NotPending)
+        ));
+    }
+
+    /// Dismiss is not a third spelling of reject. An action approval holds a paused run and a
+    /// worktree, and putting it away without releasing either is how a project loses its
+    /// exclusivity slot until somebody restarts the daemon.
+    #[tokio::test]
+    async fn dismiss_refuses_anything_that_is_not_a_skipped_item() {
+        let pool = test_pool().await;
+        let approval =
+            create_action_approval(&pool, 10, Some("s10"), Some("p"), "Bash", "asked", None)
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            dismiss_skipped_item(&pool, approval).await,
+            Err(RejectError::NotPending)
+        ));
+        assert!(matches!(
+            dismiss_skipped_item(&pool, 999_999).await,
+            Err(RejectError::NotFound)
+        ));
+        // Still in the queue, still pending, still holding whatever it was holding.
+        assert_eq!(list_pending(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

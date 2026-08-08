@@ -104,8 +104,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/chats/{chat_id}", get(get_assistant_chat))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
+        // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
+        // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
+        // that `/runs/awaiting-approval` raises does not arise here.
+        .route("/proposals/skipped-items", get(get_skipped_items))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
+        .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
         .route(
             "/vcs/requests",
             post(submit_vcs_request).get(list_vcs_requests),
@@ -2595,6 +2600,48 @@ async fn get_proposals(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// What the night decided not to do, and why.
+///
+/// The half of the skip that was missing. A job's node that hits an action needing approval marks
+/// its item `skipped`, reverts the tree and lets the queue carry on — and files a `skipped-item`
+/// proposal so the morning knows what was set aside. `list_pending` deliberately does not carry
+/// those (approving one would resume nothing), which left the record with no door at all: measured
+/// on 2026-08-08, two items skipped and the only way to read either was to open the database.
+async fn get_skipped_items(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_skipped_items(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing skipped items failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Puts a read skipped item away. Its own door, not a third arm of `/reject`.
+///
+/// Nothing is being refused here and nothing is released — the job let go of the item and the
+/// worktree when it skipped, hours before anyone read this. Sharing `/reject` would give the two a
+/// single button whose label is wrong for one of them, and `reject_proposal` guards on
+/// `kind = 'action-approval'`, so that button would answer 409 half the time.
+async fn post_proposal_dismiss(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::proposals::dismiss_skipped_item(&state.pool, id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(crate::proposals::RejectError::NotFound) => Err(StatusCode::NOT_FOUND),
+        // Also the answer for a proposal of any other kind: nothing else is dismissable, and a
+        // caller that aimed this at an action approval wanted `/reject`.
+        Err(crate::proposals::RejectError::NotPending) => Err(StatusCode::CONFLICT),
+        Err(crate::proposals::RejectError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "dismissing a skipped item failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Turns a merge decision's outcome into the answer the caller gets.
@@ -7196,6 +7243,112 @@ mod tests {
         assert_eq!(entries[1]["tool_name"], "Edit");
         assert_eq!(entries[1]["reasoning"], "second pending");
         assert_eq!(entries[1]["run_id"], 11);
+    }
+
+    /// The route that was missing. A job that skipped two items on 2026-08-08 filed two of these
+    /// and nothing served them, so the record justifying the whole skip could only be read by
+    /// opening the database — and `/proposals` must keep NOT serving them, because approving one
+    /// resumes nothing.
+    #[tokio::test]
+    async fn skipped_items_have_a_door_of_their_own_and_can_be_put_away() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        proposals::create_action_approval(&pool, 10, Some("s10"), Some("p"), "Bash", "asked", None)
+            .await
+            .unwrap();
+        let skipped = proposals::create_skipped_item(
+            &pool,
+            11,
+            Some("s11"),
+            Some("p"),
+            "Bash",
+            "unrecognized shell commands and code execution require approval",
+            Some(r#"{"command":"python -m unittest test_greet -v"}"#),
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/proposals/skipped-items")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the action approval must not appear here");
+        assert_eq!(entries[0]["id"], skipped);
+        // `tool_input` is the whole point of the record: it is what tells an item worth picking up
+        // in the morning from one worth dropping.
+        assert!(
+            entries[0]["tool_input"]
+                .as_str()
+                .unwrap()
+                .contains("unittest")
+        );
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{skipped}/dismiss"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            proposals::list_skipped_items(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The approval queue never saw any of this.
+        assert_eq!(proposals::list_pending(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dismissing_an_action_approval_is_a_conflict_not_a_silent_discard() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let approval = proposals::create_action_approval(
+            &pool,
+            10,
+            Some("s10"),
+            Some("p"),
+            "Bash",
+            "asked",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{approval}/dismiss"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // An action approval holds a paused run and its worktree. Putting it away here would
+        // release neither, and the project would keep its exclusivity slot spent until a restart.
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(proposals::list_pending(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
