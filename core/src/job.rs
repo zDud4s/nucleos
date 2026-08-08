@@ -2492,7 +2492,37 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
         }
     };
     for job in jobs {
+        reclaim_the_slot(state, &job).await;
         drive(state, job, now).await;
+    }
+}
+
+/// Puts a live job back on a slot it should never have been off.
+///
+/// The gap this closes is small and real: `start` inserts the row and claims immediately after,
+/// because a slot is keyed on its owner's id, so a daemon that dies in that window leaves a job
+/// live and holding nothing. The sweep cannot heal it — that pass only takes slots AWAY from owners
+/// that died, and there is nothing here to take. Left alone, the project would run one over its
+/// ceiling for as long as the job lasts.
+///
+/// `claim` is idempotent per owner, so a job that already holds one costs a single indexed read.
+///
+/// A full house is logged and no more. This job is already running: refusing it a slot now would
+/// change nothing about what it is doing and would only make the books disagree with the machine.
+/// The ceiling governs what STARTS, and this one already did.
+async fn reclaim_the_slot(state: &AppState, job: &JobRow) {
+    let owner = crate::worktree::Owner::Job(job.id);
+    match crate::concurrency::claim(&state.pool, &job.project_id, owner).await {
+        Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
+        Ok(crate::concurrency::ClaimOutcome::Full(full)) => tracing::warn!(
+            job_id = job.id,
+            project_id = %job.project_id,
+            reason = %full.reason(),
+            "a live job holds no concurrency slot and there is no room to give it one"
+        ),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not confirm a live job's slot");
+        }
     }
 }
 
@@ -3898,6 +3928,37 @@ mod tests {
             proposal_status, "pending",
             "approving this would resume a node whose job is over"
         );
+    }
+
+    /// A live job that holds no slot is put back on one by the tick.
+    ///
+    /// The window is between `start`'s INSERT and its claim, which cannot be closed by ordering —
+    /// a slot is keyed on its owner's id, so the row must exist first. The sweep is no help either:
+    /// it only takes slots away from owners that died, and there is nothing here to take. Left
+    /// alone, the project runs one over its ceiling for as long as the job lasts.
+    #[tokio::test]
+    async fn the_tick_puts_a_live_job_back_on_a_slot_it_lost() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, owner).await.unwrap(),
+            None
+        );
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reclaim_the_slot(&state, &job).await;
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, owner).await.unwrap(),
+            Some(0)
+        );
+
+        // And again, because `claim` is idempotent per owner: a second pass must not take a second
+        // number, or every tick would spend one until the ceiling refused the project's next start.
+        reclaim_the_slot(&state, &job).await;
+        assert_eq!(crate::concurrency::slots_in_flight(&pool).await.unwrap(), 1);
     }
 
     /// Every ending gives the slot back, and `retire` is the one place that does it.
