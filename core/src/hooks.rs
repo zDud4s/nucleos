@@ -533,15 +533,23 @@ async fn pause_for_approval(
     // A node of a job takes the other road entirely, and three shapes of node take three roads.
     //
     // An **item's** node is put down and the job carries on to the next item. A **review** node owns
-    // no item, but it does not need one: its verdict is advisory — §5.5 gives ship/no-ship to the
-    // gate — and everything it was going to read is already written, gated and checkpointed. Losing
-    // it costs an opinion. Parking on it costs the night. A **plan** node is the one that still
-    // parks: the queue is what it produces, so a job that skips it has nothing to carry on to.
+    // no item and does not need one: its verdict is advisory — §5.5 gives ship/no-ship to the gate —
+    // and everything it was going to read is already written, gated and checkpointed. A **replan**
+    // node owns none either, and ending it hands the job to `stop_after_replan`, which stops it
+    // `Stopped` rather than `Failed` precisely so the rounds that DID run stay worth looking at.
     //
-    // The review road is new, and it was measured rather than guessed. Chunk 2 put review and plan
-    // on the same road with one sentence, and two jobs in a row falsified it: job 12 on 2026-08-08
-    // parked its review node on `git reflog` and job 13 parked its own on a `for` loop, each after
-    // every item was already done and gated. Both sat until a person cancelled them.
+    // The rule underneath all three: **a node that asks already has an ending written for it**, and
+    // the job's own handler picks it. What parking adds is not safety — it is a job that reads live,
+    // holds a concurrency slot and does nothing, with no sign anywhere until a person goes looking.
+    //
+    // Measured, not reasoned into. Chunk 2 put review and plan on one road with a single sentence,
+    // and four jobs falsified it in a day: 12 parked its review on `git reflog`, 13 parked its own
+    // on a `for` loop, and 14 and 16 both parked their REPLAN nodes after every item had passed.
+    //
+    // The **plan** node is the one that still parks, and the argument for it is the one Chunk 2
+    // made: the queue is what it produces, so there is nothing partial to preserve and nothing to
+    // carry on to. Ending it would fail a job that a single answer turns into a night's work, to
+    // save a slot that is now bounded by a ceiling rather than blocking the project.
     //
     // The mark is what decides for an item, and it is also step (2) of the skip — see
     // `skip_the_item`. Doing it here rather than inside keeps "did this run own an item?" and "put
@@ -555,7 +563,9 @@ async fn pause_for_approval(
         Some(job_id) if put_the_item_down(&state.pool, job_id, run_id).await => {
             Some((job_id, true))
         }
-        Some(job_id) if stage.as_deref() == Some("review") => Some((job_id, false)),
+        Some(job_id) if NODES_THAT_GIVE_UP.contains(&stage.as_deref().unwrap_or_default()) => {
+            Some((job_id, false))
+        }
         _ => None,
     };
     if let Some((job_id, had_an_item)) = road {
@@ -677,6 +687,18 @@ struct SkippedItem {
     /// design has nothing to revert.
     had_an_item: bool,
 }
+
+/// The job stages that give their node up rather than parking the job on it.
+///
+/// Both own no item, and both already have an ending written for the case where their run does not
+/// come back: `ingest_replan`'s failure arm hands the job to `stop_after_replan` (`Stopped`, with
+/// the rounds that ran still on the branch), and `load_view` reads any terminal review as `Done`
+/// ("a review that failed is still a review that happened").
+///
+/// `plan` is deliberately absent. Its ending exists too — `Outcome::Failed` — but it is the only one
+/// that throws away a whole job to save a slot: nothing has been done yet, so there is no partial
+/// work to preserve, and a single answer turns that same job into a night's work.
+const NODES_THAT_GIVE_UP: [&str; 2] = ["review", "replan"];
 
 /// Step (2) of the skip, and the question that decides whether there is a skip at all: mark this
 /// run's item `skipped`, and say whether there was one.
@@ -1921,6 +1943,69 @@ mod tests {
     /// The run must end TERMINAL, and that is the whole mechanism — `load_view` already reads any
     /// finished review as `ReviewState::Done` ("a review that failed is still a review that
     /// happened"), so the round closes with no change to the state machine at all.
+    /// The replan node too, and for the same reason with a different ending behind it.
+    ///
+    /// Its run ending non-successfully hands the job to `stop_after_replan`, which stops it
+    /// `Stopped` and not `Failed` — precisely so the rounds that already ran stay worth looking at.
+    /// That ending existed before this; all that was missing is the node reaching it.
+    ///
+    /// Measured on 2026-08-08: jobs 14 and 16 both passed every item, closed their round, spawned
+    /// their replan node — and both parked it, one on a `for` loop and one on `find`. Two jobs that
+    /// had done all their work sat holding a slot each.
+    #[tokio::test]
+    async fn a_jobs_replan_node_gives_up_instead_of_parking_the_job() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'replan' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                // A shell loop, which the classifier reads as a program rather than a line and so
+                // does not recognise. NOT `find`, which it allows — an allowed command never
+                // reaches this road, and the run would read terminal for the wrong reason.
+                "tool_input": {"command": "for f in *.py; do cat \"$f\"; done"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "awaiting_approval",
+            "a parked replan leaves a job that finished all its work reading live and doing nothing"
+        );
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["skipped-item"]);
+        // The rounds that ran are what `stop_after_replan` keeps, so nothing may be reverted here.
+        let item_statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert!(item_statuses.iter().all(|status| status == "passed"));
+    }
+
     #[tokio::test]
     async fn a_jobs_review_node_gives_up_the_review_instead_of_parking_the_job() {
         let state = test_state().await;
