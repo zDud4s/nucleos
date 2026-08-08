@@ -7,6 +7,7 @@ mod backup;
 mod budget;
 mod calendar;
 mod classifier;
+mod concurrency;
 mod config;
 mod contacts;
 mod daemon_client;
@@ -211,6 +212,17 @@ async fn main() {
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "orphaned-job reconciliation failed"),
+    }
+
+    // After both owner reconciliations above, and that order is the whole correctness of this pass:
+    // it frees a slot by asking whether its owner is still live, and before those two every dead
+    // owner still reads live. Run earlier it would free nothing at all.
+    match concurrency::reconcile_orphaned_slots(&pool).await {
+        Ok(freed) if freed > 0 => {
+            tracing::warn!("freed {freed} concurrency slot(s) left held by a previous crash");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned concurrency slot sweep failed"),
     }
 
     // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep

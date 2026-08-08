@@ -623,6 +623,11 @@ pub const TERMINAL_STATUSES: [&str; 8] = [
 ///
 /// Clears `wait_reason` on the way out: a finished job is not waiting for anything, and a stale
 /// reason left on the row is the sort of thing a feed renders forever.
+///
+/// Gives the concurrency slot back too, and this is the one place that does it for jobs — every
+/// ending funnels here, from `finish` to `cancel` to the startup reconciliation, so a new ending
+/// added later cannot forget. The sweep on the job tick is a backstop, not the mechanism: it frees
+/// what a crash left held, within a tick, rather than what this function forgot.
 pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<()> {
     if !TERMINAL_STATUSES.contains(&status) {
         // Written anyway. A job left live would hold the project's exclusivity slot forever and
@@ -643,6 +648,7 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
     .bind(job_id)
     .execute(pool)
     .await?;
+    crate::concurrency::release(pool, crate::worktree::Owner::Job(job_id)).await?;
     Ok(())
 }
 
@@ -942,6 +948,43 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
     };
 
     let owner = crate::worktree::Owner::Job(job_id);
+
+    // AFTER the row, not before it, and the reason is arithmetic rather than taste: a slot is keyed
+    // on its owner's id, and the job has no id until it is inserted. So the row goes in first and is
+    // retired again if there is no room — the same shape this function already uses when a worktree
+    // cannot be provisioned, and it keeps the claim itself an INSERT that two racing jobs resolve on
+    // the primary key rather than on a read.
+    match crate::concurrency::claim(&state.pool, request.project_id, owner).await {
+        Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
+        Ok(crate::concurrency::ClaimOutcome::ProjectFull { limit }) => {
+            return fail_early(
+                state,
+                request.project_id,
+                job_id,
+                &format!("this project already has {limit} pieces of work in flight"),
+            )
+            .await;
+        }
+        Ok(crate::concurrency::ClaimOutcome::HouseFull { limit }) => {
+            return fail_early(
+                state,
+                request.project_id,
+                job_id,
+                &format!("the machine already has {limit} pieces of work in flight"),
+            )
+            .await;
+        }
+        Err(error) => {
+            return fail_early(
+                state,
+                request.project_id,
+                job_id,
+                &format!("its concurrency slot could not be claimed: {error}"),
+            )
+            .await;
+        }
+    }
+
     let info = match crate::worktree::create(Path::new(request.project_root), owner).await {
         Ok(info) => info,
         Err(error) => {
@@ -2419,6 +2462,21 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
         return;
     }
 
+    // Before the pass, so a slot freed here is available to the very jobs about to be driven.
+    //
+    // A backstop rather than the mechanism. `retire` and the run terminations give slots back
+    // explicitly and immediately; this catches what a crash held, and it turns "every ending must
+    // remember" from a correctness requirement into a latency one — a forgotten release costs a slot
+    // for one tick instead of until the next restart. That matters because a held slot is silent:
+    // it lowers a project's ceiling without any error anywhere.
+    match crate::concurrency::reconcile_orphaned_slots(&state.pool).await {
+        Ok(freed) if freed > 0 => {
+            tracing::warn!("freed {freed} concurrency slot(s) whose owner was no longer live");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not sweep orphaned concurrency slots"),
+    }
+
     let jobs = match live_jobs(&state.pool).await {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -3828,6 +3886,29 @@ mod tests {
         assert_ne!(
             proposal_status, "pending",
             "approving this would resume a node whose job is over"
+        );
+    }
+
+    /// Every ending gives the slot back, and `retire` is the one place that does it.
+    ///
+    /// Asserted here rather than at each ending because that is the design: `finish`, `cancel` and
+    /// the startup reconciliation all funnel through this function, so an ending added later cannot
+    /// forget. A slot held by a finished job is silent — it lowers the project's ceiling with no
+    /// error anywhere — which is exactly the failure the sweep on the tick exists to bound.
+    #[tokio::test]
+    async fn retiring_a_job_gives_its_concurrency_slot_back() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        crate::concurrency::claim(&pool, "project-a", owner)
+            .await
+            .unwrap();
+
+        retire(&pool, job_id, STATUS_CANCELLED).await.unwrap();
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, owner).await.unwrap(),
+            None
         );
     }
 
