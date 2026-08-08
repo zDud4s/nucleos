@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 8;
+pub const CLASSIFIER_VERSION: u32 = 9;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -649,7 +649,37 @@ fn redirects_a_file(segment: &str) -> bool {
     segment.contains('<')
         || segment
             .split_whitespace()
-            .any(|token| token.contains('>') && !is_fd_duplication(token))
+            .any(|token| token.contains('>') && !touches_no_file(token))
+}
+
+/// PURE: whether a redirect token names something that is not a file — another stream, or the bit
+/// bucket.
+///
+/// The two exceptions this file makes to "a `>` means a file write", and both are exceptions because
+/// the TARGET is not a file rather than because the redirect is harmless.
+fn touches_no_file(token: &str) -> bool {
+    is_fd_duplication(token) || discards_output(token)
+}
+
+/// PURE: whether a redirect throws its output away — `2>/dev/null`, `>NUL`.
+///
+/// About as common an idiom as shell has, and it was costing an approval every time: the job-10
+/// dogfood parked its plan node on `cat greet.py 2>/dev/null | head -50`.
+///
+/// Both spellings are the null device on the platform this daemon builds for. `NUL` is reserved in
+/// every directory on Windows, which also makes `/dev/null` resolve to the device rather than to a
+/// file — so neither can create anything, on cmd or under the bundled bash. The left side must be
+/// empty or a file descriptor number, for the same reason `is_fd_duplication` checks it: `foo>nul`
+/// is a token whose leading part is a program, and this is not the place to be deciding about that.
+fn discards_output(token: &str) -> bool {
+    let Some(marker) = token.rfind('>') else {
+        return false;
+    };
+    let (left, target) = token.split_at(marker);
+    let target = target.trim_start_matches('>');
+    let left = left.trim_end_matches('>');
+    left.bytes().all(|byte| byte.is_ascii_digit())
+        && (target.eq_ignore_ascii_case("/dev/null") || target.eq_ignore_ascii_case("nul"))
 }
 
 fn is_fd_duplication(token: &str) -> bool {
@@ -662,7 +692,8 @@ fn is_fd_duplication(token: &str) -> bool {
         && (right == "-" || right.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// PURE: the same line with its stream joins taken out, so the rest of this file never sees them.
+/// PURE: the same line with its stream joins and discards taken out, so nothing downstream sees a
+/// `>` that was never going to reach a file.
 ///
 /// Reading it token by token is what makes this safe to do so early: a `>` glued to a filename
 /// (`2>out.txt`, `>&out.txt`) sits in a token that fails `is_fd_duplication`, survives here, and
@@ -673,7 +704,7 @@ fn is_fd_duplication(token: &str) -> bool {
 /// cuts on, and collapsing them is precisely how a second command once rode in behind a safe leading
 /// token. One `2>&1` anywhere in the line would have brought that back.
 fn strip_fd_duplications(command: &str) -> String {
-    if !command.contains(">&") {
+    if !command.contains('>') {
         return command.to_owned();
     }
     let mut stripped = String::with_capacity(command.len());
@@ -687,7 +718,7 @@ fn strip_fd_duplications(command: &str) -> String {
 
         let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let token = &rest[..token_end];
-        if !is_fd_duplication(token) {
+        if !touches_no_file(token) {
             stripped.push_str(token);
         }
         rest = &rest[token_end..];
@@ -2064,6 +2095,25 @@ mod tests {
             );
         }
 
+        // Thrown away, not written: `NUL` is reserved in every directory on Windows, which makes
+        // `/dev/null` the device too rather than a file under a `dev` folder. The job-10 dogfood
+        // parked its plan node on the first of these.
+        for command in [
+            "cat greet.py 2>/dev/null",
+            "cat greet.py 2>/dev/null | head -50",
+            "cargo test 2>NUL",
+            "cargo test >nul",
+            "cargo test 2>>/dev/null",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
+
         for command in [
             "cargo test > out.txt",
             "cargo test 2> err.txt",
@@ -2071,6 +2121,10 @@ mod tests {
             "cargo test >& out.txt",
             "cargo test &> out.txt",
             "cargo test 2>&1 > out.txt",
+            // Near-misses on the bit bucket: a real file that merely reads like one.
+            "cargo test 2>/dev/null.txt",
+            "cargo test 2>./dev/null",
+            "cargo test 2>nullify",
         ] {
             assert_eq!(
                 classify("Bash", &json!({"command": command}), cwd)
@@ -2619,7 +2673,7 @@ mod tests {
     /// night of 2026-08-08 and everything after it look alike.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 8);
+        assert_eq!(CLASSIFIER_VERSION, 9);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
