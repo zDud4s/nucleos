@@ -2530,20 +2530,47 @@ mod tests {
             .await
             .unwrap();
 
-        // Far longer than the timeout, so which of the two fires is not a race.
+        // Far longer than the guard below, so which of the two fires is not a race.
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
-        let drain = drain_once(&pool, "alpha", &executor);
-        tokio::time::timeout(Duration::from_millis(50), drain)
-            .await
-            .expect_err("the executor is still working, so the drain cannot have finished");
+        {
+            let drain = drain_once(&pool, "alpha", &executor);
+            tokio::pin!(drain);
 
-        assert_eq!(
-            executor.calls(),
-            1,
-            "the drain was abandoned inside the operation, not before it"
-        );
-        // Dropped at the executor's await, so `finish` never ran. This is the documented cost, not a
-        // defect: the row is stranded exactly as the doc comment says it is.
+            // Polled until the executor has actually been ENTERED, and abandoned there — rather
+            // than after a fixed slice of wall clock.
+            //
+            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. The
+            // executor's 30s makes it a non-race only for the half AFTER the operation begins;
+            // before that, `drain_once` still has a reap and a claim to get through, and 50ms was a
+            // real-time budget for two SQLite writes. On a machine also compiling and running the
+            // other thousand tests that budget is occasionally missed, and the drain is then
+            // abandoned BEFORE the operation — a different scenario wearing this test's name, which
+            // is why the flake read `calls(): 0 != 1` rather than anything about jamming.
+            //
+            // `calls()` is the property this test is about, so it is what is waited on. The outer
+            // timeout is not a budget: it is reached only if the drain never arrives at all, and it
+            // is there so that failure is a message rather than a hung suite.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        _ = &mut drain => {
+                            panic!("the executor sleeps for 30s — the drain cannot have finished")
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(1)) => {
+                            if executor.calls() == 1 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the drain never reached the executor");
+        }
+
+        // Dropped at the closing brace above, which is the executor's await, so `finish` never ran.
+        // This is the documented cost, not a defect: the row is stranded exactly as the doc
+        // comment says it is.
         assert_eq!(status_of(&pool, id).await, "running");
         assert!(
             claim_next(&pool, "alpha").await.unwrap().is_none(),
