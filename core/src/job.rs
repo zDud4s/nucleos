@@ -1174,6 +1174,21 @@ enum Step {
 ///
 /// Stated as what happens rather than as a prohibition, deliberately. A node told only "do not
 /// commit" invents a way around it; a node told the commit already happens has no reason to.
+/// What the nodes that only LOOK have to be told about how to look.
+///
+/// Measured across four jobs on 2026-08-08, and always the same shape: a node whose whole task is to
+/// inspect the tree reaches for a shell loop or a pipeline to do it — `for f in …; do cat "$f"; done`
+/// three times, `git reflog`, `ls -la && … && find … | sort`. The classifier reads a LINE, not a
+/// program, so none of those is recognised, and each one stopped its node dead.
+///
+/// It has `Read`, `Grep` and `Glob`, all of which run without asking and do the job better. Nothing
+/// was missing except being told. Said as the consequence rather than as a rule, because the
+/// consequence is what makes the choice obvious: this node is what the job spends to get an answer,
+/// and giving it up is not free.
+const LOOK_WITH_THE_READING_TOOLS: &str = "You are running unattended, so anything that needs a person is not answered — it ends this \
+     node. Look with Read, Grep and Glob rather than with shell loops or pipelines: they need \
+     nobody, and they are what this node has.";
+
 const HISTORY_IS_THE_JOBS: &str = "The job commits the tree itself once an item's gate agrees, so no \
      item should ask anyone to commit, stage or branch — that work is already done for you, and an \
      item that asks for it is skipped rather than done.";
@@ -1238,6 +1253,7 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
          it to run out of rounds costs a full round of work to discover the same thing. Do not begin \
          any of the work yourself.\n\n\
          {HISTORY_IS_THE_JOBS}\n\n\
+         {LOOK_WITH_THE_READING_TOOLS}\n\n\
          The task:\n\n{task}"
     )
 }
@@ -1286,7 +1302,8 @@ pub fn review_prompt(base: Option<&str>, artifacts: &str) -> String {
          Judge the diff, not the intent.\n\n\
          {diff}\n\n\
          The queue those changes were meant to satisfy is in {artifacts}/plan.json. Report what is \
-         wrong, what is missing against that queue, and nothing else. Change no files."
+         wrong, what is missing against that queue, and nothing else. Change no files.\n\n\
+         {LOOK_WITH_THE_READING_TOOLS}"
     )
 }
 
@@ -3316,6 +3333,26 @@ mod tests {
         // Said as what happens, not only as a prohibition: a node told only "do not commit" invents
         // a way around it.
         assert!(plan.contains("already done for you"));
+    }
+
+    /// The nodes that only LOOK are told how to look, because the way they reached for by default
+    /// was the one thing that could stop them.
+    ///
+    /// Across four jobs on 2026-08-08 every inspecting node reached for a shell loop or a pipeline —
+    /// `for f in …; do cat "$f"; done` three times, `git reflog`, `ls -la && … && find … | sort`.
+    /// The classifier reads a line and not a program, so none was recognised, and each one ended its
+    /// node. `Read`, `Grep` and `Glob` need nobody and were there the whole time.
+    #[test]
+    fn the_nodes_that_only_look_are_told_what_to_look_with() {
+        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos");
+        let review = review_prompt(Some("abc123"), "/wt/.nucleos");
+
+        for prompt in [&replan, &review] {
+            assert!(prompt.contains("Read, Grep and Glob"));
+            // The consequence, not just the rule: this node is what the job spends to get an
+            // answer, and a node told only "do not use shell" has no reason to care.
+            assert!(prompt.contains("running unattended"));
+        }
     }
 
     #[test]
