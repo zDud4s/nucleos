@@ -1274,16 +1274,19 @@ mod tests {
         assert_eq!(decision.reason, "recognized non-mutating shell command");
     }
 
+    /// The hook's pending path, and the classifier's verdict that reaches it, asserted together so
+    /// the two cannot drift apart. `echo hi` stood here until `classifier.rs` learned that saying
+    /// something is not doing something; the command changed, the path under test did not.
     #[tokio::test]
     async fn pends_unrecognized_command() {
-        let tool_input = serde_json::json!({"command": "echo hi"});
+        let tool_input = serde_json::json!({"command": "frobnicate --hard"});
         let classification = classifier::classify("Bash", &tool_input, None);
         assert_eq!(classification.action_class, "unrecognized");
 
         let app = test_router(test_state().await);
         let decision = decide(
             &app,
-            r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"echo hi"}}"#,
+            r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"frobnicate --hard"}}"#,
         )
         .await;
         assert_eq!(decision.decision, "pending_approval");
