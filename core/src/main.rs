@@ -35,6 +35,7 @@ mod repo_trigger;
 mod runner;
 mod runs;
 mod scheduler;
+mod search;
 mod secrets;
 mod shadow;
 mod sidecar;

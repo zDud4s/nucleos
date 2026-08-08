@@ -77,12 +77,7 @@ fn escape_like(query: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn fts_query(raw: &str) -> String {
-    raw.split_whitespace()
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use crate::search::fts_query;
 
 pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<AwaitingRun>> {
     sqlx::query_as::<_, AwaitingRun>(

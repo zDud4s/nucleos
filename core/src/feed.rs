@@ -141,10 +141,26 @@ pub async fn search(
         query.push(" AND kind = ").push_bind(kind);
     }
     if let Some(q) = &filter.q {
+        // Both, joined by OR, exactly as `runs::search` does it. The index answers by word, which is
+        // what makes an entry findable without recalling its phrasing; LIKE answers by substring,
+        // which is what still finds `nucleos-core` for somebody who types `leos-co`. Dropping either
+        // loses searches the other cannot do.
+        let fts = crate::search::fts_query(q);
         query
-            .push(" AND summary LIKE ")
+            .push(" AND (summary LIKE ")
             .push_bind(format!("%{}%", escape_like(q)))
             .push(" ESCAPE '\\'");
+        if fts.is_empty() {
+            // `MATCH ''` is an error rather than an empty result, so a query with no searchable
+            // words has to contribute a clause that is merely false.
+            query.push(" OR 0");
+        } else {
+            query
+                .push(" OR id IN (SELECT rowid FROM feed_fts WHERE feed_fts MATCH ")
+                .push_bind(fts)
+                .push(")");
+        }
+        query.push(")");
     }
     if let Some(since) = &filter.since {
         query
@@ -200,6 +216,97 @@ pub async fn prune(
 #[cfg(test)]
 mod tests {
     use super::{FeedScope, SearchFilter, append, list_all, list_feed, prune, search};
+
+    fn query(q: &str) -> SearchFilter {
+        SearchFilter {
+            scope: FeedScope::All,
+            q: Some(q.to_string()),
+            kind: None,
+            since: None,
+            until: None,
+            limit: 50,
+        }
+    }
+
+    /// What the index buys over the substring match that was here alone: a word out of the middle,
+    /// in any order, without recalling how the line was phrased.
+    #[tokio::test]
+    async fn an_entry_is_found_by_its_words_in_any_order() {
+        let pool = test_pool().await;
+        append(
+            &pool,
+            None,
+            "run_completed",
+            "worktree collected for nucleos-core",
+            None,
+        )
+        .await
+        .unwrap();
+
+        for q in ["collected", "nucleos-core collected", "COLLECTED"] {
+            assert_eq!(
+                search(&pool, &query(q)).await.unwrap().len(),
+                1,
+                "{q:?} found nothing"
+            );
+        }
+        assert!(search(&pool, &query("absent")).await.unwrap().is_empty());
+    }
+
+    /// Substring search has to survive the index arriving beside it: `leos-co` is not a word and
+    /// FTS5 will never match it, which is exactly why the OR keeps LIKE in the query.
+    #[tokio::test]
+    async fn a_mid_word_fragment_still_matches() {
+        let pool = test_pool().await;
+        append(&pool, None, "run_completed", "built nucleos-core", None)
+            .await
+            .unwrap();
+
+        assert_eq!(search(&pool, &query("leos-co")).await.unwrap().len(), 1);
+    }
+
+    /// The reason this migration carries a delete trigger at all. `feed::prune` runs hourly, and an
+    /// index that keeps the terms of a pruned entry is the bug the previous commit on this branch
+    /// was written to fix, one table over.
+    #[tokio::test]
+    async fn a_pruned_entry_leaves_the_index_with_it() {
+        let pool = test_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "INSERT INTO feed (project_id, kind, summary, run_id, created_at)
+             VALUES (NULL, 'run_completed', 'aardvark ate the invoice', NULL, '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(search(&pool, &query("aardvark")).await.unwrap().len(), 1);
+        assert_eq!(prune(&pool, 90, now).await.unwrap(), 1);
+
+        let indexed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed_fts WHERE feed_fts MATCH 'aardvark'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            indexed, 0,
+            "the terms of a pruned entry stayed searchable in the index"
+        );
+    }
+
+    /// A query of nothing but punctuation reaches `MATCH` as the empty string, which errors instead
+    /// of returning nothing. The `OR 0` branch is what keeps that a query rather than a 500.
+    #[tokio::test]
+    async fn a_query_with_no_searchable_words_is_answered_not_refused() {
+        let pool = test_pool().await;
+        append(&pool, None, "run_completed", "something happened", None)
+            .await
+            .unwrap();
+
+        assert!(search(&pool, &query("\"\"\"")).await.unwrap().is_empty());
+    }
 
     /// Entries past the window go; the rest stay, and a second pass finds nothing left to do.
     #[tokio::test]

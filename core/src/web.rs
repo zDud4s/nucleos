@@ -262,21 +262,7 @@ pub async fn search(pool: &SqlitePool, query: &str, limit: i64) -> sqlx::Result<
     Ok(rows.into_iter().map(hit_from_row).collect())
 }
 
-/// Turn a person's words into an FTS5 MATCH expression that cannot be one.
-///
-/// FTS5 has its own syntax — `NEAR`, `*`, `:`, `^`, `"`, `-` and parentheses all mean something —
-/// so a query typed by a person, or worse, composed by a model from a page it just read, is a
-/// small injection surface into the index. Every term is therefore quoted as a literal and joined
-/// with an implicit AND. The cost is that nobody can write an FTS expression on purpose; the
-/// benefit is that nobody can write one by accident either.
-fn fts_query(raw: &str) -> String {
-    raw.split_whitespace()
-        .map(|term| term.replace('"', ""))
-        .filter(|term| !term.is_empty())
-        .map(|term| format!("\"{term}\""))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use crate::search::fts_query;
 
 /// Delete pages older than the retention window.
 ///
