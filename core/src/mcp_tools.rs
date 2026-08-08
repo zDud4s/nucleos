@@ -4,6 +4,10 @@ use serde::Serialize;
 
 pub struct NucleosTools {
     client: crate::daemon_client::DaemonClient,
+    /// Who the results of this server's tools are being handed to. Read once at construction
+    /// because it cannot change while the process lives: the daemon spawns one of these per turn
+    /// and stamps the audience on it.
+    audience: crate::egress::Audience,
     #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
     tool_router: ToolRouter<Self>,
 }
@@ -12,6 +16,7 @@ impl NucleosTools {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
             client: crate::daemon_client::DaemonClient::from_env()?,
+            audience: crate::egress::Audience::from_env(),
             tool_router: Self::tool_router(),
         })
     }
@@ -283,7 +288,58 @@ impl NucleosTools {
 }
 
 #[tool_handler(name = "nucleos", instructions = "NucleOS daemon control")]
-impl ServerHandler for NucleosTools {}
+impl ServerHandler for NucleosTools {
+    /// Every tool result leaves through here, and that is the entire point of writing it by hand.
+    ///
+    /// `#[tool_handler]` generates this method only when the impl does not already define one, so
+    /// providing it costs nothing and takes ownership of the one path every call returns through.
+    /// The alternative — calling a filter at the end of each `#[tool]` body — is a rule enforced by
+    /// remembering, and the tool that forgets it is the tool nobody notices, because a missing
+    /// redaction looks exactly like text that had nothing to redact.
+    ///
+    /// The router is built by `Self::tool_router()` here for the same reason the macro does it:
+    /// that is the expression the generated body uses, and diverging from it would mean this
+    /// method dispatches against a different router than `list_tools` advertises.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = Self::tool_router().call(tcc).await?;
+        Ok(filter_outgoing(self.audience, result))
+    }
+}
+
+/// Applies the egress policy to one tool result.
+///
+/// Both carriers are filtered. `structured_content` is not decoration: a tool that returns JSON
+/// puts the same text there in parsed form, so redacting only the text blocks would leave the
+/// secret in the field a client is more likely to read programmatically.
+fn filter_outgoing(
+    audience: crate::egress::Audience,
+    mut result: rmcp::model::CallToolResult,
+) -> rmcp::model::CallToolResult {
+    if crate::egress::disposition(audience) == crate::egress::Disposition::Cross {
+        return result;
+    }
+
+    for block in &mut result.content {
+        if let rmcp::model::ContentBlock::Text(text) = block {
+            text.text = crate::redact::redact_secrets(&text.text);
+        }
+    }
+    if let Some(structured) = result.structured_content.take() {
+        let rendered = structured.to_string();
+        let redacted = crate::redact::redact_secrets(&rendered);
+        // Re-parsed rather than walked field by field: the markers contain no JSON metacharacters,
+        // so a redacted document still parses, and a walk would have to know every shape every tool
+        // returns. If it ever does not parse, the structured copy is dropped instead of being
+        // handed over unfiltered — the text blocks still carry the answer.
+        result.structured_content = serde_json::from_str(&redacted).ok();
+    }
+    result
+}
 
 /// What calling one NucleOS tool does to the turn that called it.
 ///
