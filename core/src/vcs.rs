@@ -322,6 +322,47 @@ pub async fn resolve_repo(
     })
 }
 
+/// PURE: the merge a shell command asks for, in the queue's own terms, or `None`.
+///
+/// `git merge X`, in a worktree whose HEAD is on `B`, means "bring X into B" — which is
+/// `Merge { source: X, target: B }`, the shape the queue already executes. The queue performs it in
+/// the integration worktree and moves the holder's worktree afterwards when the holder is the one
+/// standing on `B`, which is the case this whole pillar was written around.
+///
+/// **The strictest possible reading: exactly `git merge <ref>`, three tokens, nothing else.** Not
+/// because more could not be parsed, but because everything else is a DIFFERENT operation.
+/// `--no-ff` asks for a merge commit and `publish` is `--ff-only`; `--squash` does not merge at all;
+/// `--abort` unwinds one; a second ref is an octopus merge. A caller whose spelling is not this one
+/// keeps exactly the behaviour it has always had, rather than having the queue perform something
+/// adjacent to what it wrote.
+///
+/// **This is not the shell parsing `classifier.rs` exists to keep closed, and the difference is
+/// where the output goes.** Nothing here reaches an argv: both names pass through `Branch` — the
+/// argv guard — and `git_exec` builds its own command line from the typed value. The worst a
+/// misreading can do is refuse, or name a branch git will not resolve; it cannot inject. That is
+/// also why the verb is folded for comparison and the REF is not: git is case-sensitive about
+/// branch names and this must not quietly rename one.
+///
+/// A `target` of `HEAD` is refused rather than passed on. It is what `rev-parse --abbrev-ref` says
+/// for a detached HEAD, and it is meaningless as a merge target besides — the integration worktree's
+/// own HEAD is always detached, so publishing "into HEAD" names nothing.
+pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, source] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("merge") {
+        return None;
+    }
+    if current_branch.trim() == "HEAD" {
+        return None;
+    }
+    Some(Op::Merge {
+        source: Branch::new(source).ok()?,
+        target: Branch::new(current_branch).ok()?,
+    })
+}
+
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
 /// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
@@ -335,6 +376,29 @@ pub async fn submit(
     op: &Op,
     origin: Origin,
 ) -> sqlx::Result<i64> {
+    submit_on(pool, repo, op, origin).await
+}
+
+/// `submit`, against a caller's own executor, so an admission can be part of a larger transaction.
+///
+/// It exists for one caller: approving a paused run's merge (`runs::resume_approved_run`) has to
+/// admit the request in the SAME transaction that approves the proposal and resumes the run.
+/// Neither order works outside one: admit-then-commit can queue a merge whose approval then rolls
+/// back — an irreversible publication nobody authorised, and a proposal still pending so a human
+/// can authorise it a second time — and commit-then-admit can resume a run told its merge is
+/// queued when it is not.
+///
+/// Generic over the executor rather than taking a `&mut Transaction`, because `&SqlitePool` is one
+/// too: `submit` is this function, and there is no second copy of the INSERT to drift from it.
+pub async fn submit_on<'e, E>(
+    executor: E,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let status = if origin.needs_approval() {
         "awaiting_approval"
     } else {
@@ -354,7 +418,7 @@ pub async fn submit(
     .bind(origin.run_id())
     .bind(status)
     .bind(created_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.last_insert_rowid())
 }
@@ -1755,6 +1819,53 @@ mod tests {
             claim_next(&pool, "SHARED").await.unwrap().is_none(),
             "the second project claimed the repository the first is holding"
         );
+    }
+
+    /// The one spelling that becomes a queued merge, and its neighbours that must not.
+    ///
+    /// Each rejection is a different operation wearing a similar command line, and queueing any of
+    /// them would perform something the caller did not write: `--no-ff` wants a merge commit where
+    /// `publish` fast-forwards, `--squash` does not merge, `--abort` unwinds, two refs is an
+    /// octopus. `-X` is there to pin that `Branch` — the argv guard — is actually applied, and not
+    /// merely available.
+    #[test]
+    fn only_a_bare_git_merge_becomes_a_queued_operation() {
+        assert_eq!(
+            merge_from_command("git merge feature", "master"),
+            Some(Op::Merge {
+                source: "feature".into(),
+                target: "master".into(),
+            })
+        );
+        // The verb is folded because a shell is not case-sensitive about it; the REF is not,
+        // because git is, and a queued merge of `Feature` is not a merge of `feature`.
+        assert_eq!(
+            merge_from_command("GIT MERGE Feature", "master"),
+            Some(Op::Merge {
+                source: "Feature".into(),
+                target: "master".into(),
+            })
+        );
+
+        for command in [
+            "git merge --no-ff feature",
+            "git merge --squash feature",
+            "git merge --abort",
+            "git merge feature other",
+            "git merge",
+            "git status",
+            "git merge -X",
+        ] {
+            assert_eq!(merge_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// A worktree with no branch checked out has no merge target, and `HEAD` is exactly what
+    /// `rev-parse --abbrev-ref` answers for one. Queueing that would name nothing.
+    #[test]
+    fn a_detached_head_is_not_a_merge_target() {
+        assert_eq!(merge_from_command("git merge feature", "HEAD"), None);
+        assert_eq!(merge_from_command("git merge feature", ""), None);
     }
 
     /// A listing narrowed to a project shows the whole repository that project shares.
