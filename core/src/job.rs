@@ -1112,6 +1112,26 @@ enum Step {
     Stopped,
 }
 
+/// What every planning node has to be told about who owns the history.
+///
+/// Measured, not guessed. Job 12 on 2026-08-08 asked for eight modules and said "I want to review
+/// each one on its own" — a sentence about how to SPLIT the work. The plan node read it as a
+/// sentence about git and wrote "commit X and Y as two separate commits" into all four items. Every
+/// implement node then reached for `git commit`, which is a write and must ask, and under the
+/// zero-approval policy the night runs on, all four items were skipped. Nothing was built.
+///
+/// The prompt is the right place for the fix rather than the classifier, because the command was not
+/// misjudged: `git commit` genuinely writes and genuinely must ask. What was wrong is that the item
+/// asked for it at all. `worktree::checkpoint` already commits the whole tree after every green
+/// gate — an item that commits by hand is redoing the job's own work through the one door that
+/// stops.
+///
+/// Stated as what happens rather than as a prohibition, deliberately. A node told only "do not
+/// commit" invents a way around it; a node told the commit already happens has no reason to.
+const HISTORY_IS_THE_JOBS: &str = "The job commits the tree itself once an item's gate agrees, so no \
+     item should ask anyone to commit, stage or branch — that work is already done for you, and an \
+     item that asks for it is skipped rather than done.";
+
 /// The prompt the plan node is given.
 ///
 /// It says the file is the only thing read, because it is: §5.2 of the design takes the queue from
@@ -1122,6 +1142,7 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
         "You are the PLAN node of an autonomous job. Break the task below into at most {max_items} \
          items that can be done one after another, in order, in the same working tree. Prefer \
          fewer, larger items to more, smaller ones.\n\n\
+         {HISTORY_IS_THE_JOBS}\n\n\
          Write them to {artifacts}/plan.json and change nothing else:\n\n\
          {{\"items\": [{{\"description\": \"...\"}}]}}\n\n\
          That file is the only thing that is read; anything you print is discarded. If there is no \
@@ -1170,6 +1191,7 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
          {{\"done\": true}} when the task is met — saying so ends the job in one node, where leaving \
          it to run out of rounds costs a full round of work to discover the same thing. Do not begin \
          any of the work yourself.\n\n\
+         {HISTORY_IS_THE_JOBS}\n\n\
          The task:\n\n{task}"
     )
 }
@@ -1190,7 +1212,9 @@ pub fn implement_prompt(
          of the earlier items; this is the only one you do.\n\n\
          {description}\n\n\
          The full queue is in {artifacts}/plan.json for context. Do not start another item and do \
-         not edit that file. Your work is verified after you finish, so leave the tree building.",
+         not edit that file. Your work is verified after you finish, so leave the tree building. \
+         Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
+         stops this item to ask permission for something already arranged.",
         ordinal + 1
     )
 }
@@ -3122,6 +3146,31 @@ mod tests {
         let without = replan_prompt("t", 1, &[], "/wt/.nucleos");
         assert!(without.contains("could not be recovered"));
         assert!(!without.contains("Do not repropose"));
+    }
+
+    /// Every node that could reach for git is told the history is already handled.
+    ///
+    /// Job 12 on 2026-08-08 is why. A task that said "I want to review each one on its own" — about
+    /// how to split the work — became "commit X and Y as two separate commits" in all four items,
+    /// every implement node reached for `git commit`, and under the zero-approval policy the night
+    /// runs on, all four items were skipped with nothing built. The command was judged correctly;
+    /// what was wrong is that the item asked for it.
+    #[test]
+    fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
+        let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos");
+        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos");
+        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos");
+
+        for prompt in [&plan, &replan] {
+            assert!(
+                prompt.contains("The job commits the tree itself"),
+                "a planning node was not told who owns the history"
+            );
+        }
+        assert!(implement.contains("the job commits for you"));
+        // Said as what happens, not only as a prohibition: a node told only "do not commit" invents
+        // a way around it.
+        assert!(plan.contains("already done for you"));
     }
 
     #[test]
