@@ -702,6 +702,90 @@ async fn record_handoff_if_needed(
     Ok(true)
 }
 
+/// Pins a terminated run's time approximation onto the run itself, for a run that never reported a
+/// cost of its own.
+///
+/// A run killed before its `result` event recorded `$0` — the future was dropped, so there was no
+/// `RunOutcome` to read a cost from — and the ledger understated real spend by exactly the money
+/// that run burned. The budget's own approximation covered the gap only while recomputing, which
+/// made the figure move with `now` and left nothing durable behind.
+///
+/// `cost_usd IS NULL` is the whole safety of the write: a measured total is what the CLI actually
+/// charged, and a duration guess must never overwrite it. Best-effort throughout — the run IS
+/// terminated either way, and an approximation that failed to land leaves the budget exactly as it
+/// was before this existed, not the run broken.
+async fn record_time_approx_cost(pool: &sqlx::SqlitePool, id: i64) {
+    let timestamps: (String, Option<String>) =
+        match sqlx::query_as("SELECT created_at, completed_at FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(timestamps) => timestamps,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = id,
+                    %error,
+                    "could not read the terminated run's timestamps to approximate its cost"
+                );
+                return;
+            }
+        };
+
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value).map(|when| when.with_timezone(&chrono::Utc))
+    };
+    let Ok(created_at) = parse(&timestamps.0) else {
+        tracing::warn!(
+            run_id = id,
+            created_at = timestamps.0,
+            "could not parse the terminated run's start time to approximate its cost"
+        );
+        return;
+    };
+    // No `completed_at` means the terminal write lost its race or never landed; the run is over
+    // regardless, so `now` is the end of the only duration this can still measure.
+    let end = match timestamps.1.as_deref().map(parse).transpose() {
+        Ok(end) => end.unwrap_or_else(chrono::Utc::now),
+        Err(_) => {
+            tracing::warn!(
+                run_id = id,
+                "could not parse the terminated run's end time to approximate its cost"
+            );
+            return;
+        }
+    };
+
+    // The configured rate, not a constant: the budget approximates at whatever the operator set, and
+    // a stored cost computed at a different rate would disagree with every total that reads it.
+    let rate = match crate::budget::load_budget_config(pool).await {
+        Ok(config) => config.time_cost_per_hour_usd,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "could not load the budget rate to approximate the terminated run's cost"
+            );
+            return;
+        }
+    };
+
+    let approximated = crate::budget::time_approx_usd(created_at, end, rate);
+    if let Err(error) =
+        sqlx::query("UPDATE runs SET cost_usd = ? WHERE id = ? AND cost_usd IS NULL")
+            .bind(approximated)
+            .bind(id)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(
+            run_id = id,
+            %error,
+            "could not record the terminated run's approximated cost"
+        );
+    }
+}
+
 async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
@@ -1216,6 +1300,11 @@ fn spawn_run(
                                 "could not cancel the timed-out run's queued vcs requests"
                             );
                         }
+                        // This is the run that reports no cost at all, so its spend has to be
+                        // approximated from the duration the write above just made final. Inside
+                        // the same guard: losing that CAS means another terminator owns the row,
+                        // and it is the owner's business what the run's cost and status are.
+                        record_time_approx_cost(&pool, id).await;
                         Box::pin(spawn_handoff_if_needed(
                             handoff_state.clone(),
                             runner.clone(),
@@ -1889,10 +1978,16 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             // the status write, because this is a consequence of the run ending — and best-effort,
             // because the run IS terminated either way and a queue row that outlives its run is a
             // stale request a human can cancel, not a broken run.
-            if ends_the_run(status)
-                && let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await
-            {
-                tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+            if ends_the_run(status) {
+                if let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await {
+                    tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+                }
+                // Every status that ends a run also ends its chance to report a cost: the abort
+                // above dropped the future, so `cancelled`, `failed`, `interrupted` and `timed_out`
+                // all leave the same silent `$0`. Sharing `ends_the_run` is what keeps
+                // `awaiting_approval` out — that run resumes, and the resume carries the real cost
+                // for the whole session; approximating the pause would bill the same time twice.
+                record_time_approx_cost(&state.pool, id).await;
             }
             true
         }
@@ -2916,6 +3011,79 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         .await
         .unwrap();
         assert_eq!(event_counts, (1, 0));
+    }
+
+    /// A run the wall clock kills never reports a cost: the future is dropped, so there is no
+    /// `RunOutcome` and no `cost_usd` to write. The budget then read that run as `cost_usd IS NULL`
+    /// and the money it spent existed only as an approximation recomputed on every check — a number
+    /// nothing durable ever held, and one that quietly moved as `now` did while the run was live.
+    ///
+    /// Pinning it at termination is what makes the spend a fact: the run ended, its duration is
+    /// final, and the approximation for that duration is written once, at the configured rate.
+    #[tokio::test]
+    async fn a_run_killed_by_the_wall_clock_records_an_approximated_cost() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44001, 'a run the wall clock cut short', 'timed_out', 'worktree', NULL,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44001).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cost = cost.expect("a run whose cost was never reported must not be recorded as free");
+        assert!(cost > 0.0, "unmeasured time is never $0, got {cost}");
+        // Ten minutes at the default `budget_time_cost_per_hour_usd` of $3/h.
+        assert!(
+            (cost - 0.5).abs() < 1e-9,
+            "ten minutes at the configured $3/h is $0.50, got {cost}"
+        );
+    }
+
+    /// The approximation is a floor for runs that reported nothing, not a correction to runs that
+    /// reported something. A measured cost is what the CLI actually charged; overwriting it with a
+    /// duration guess would replace the one real number in the budget with a made-up one.
+    #[tokio::test]
+    async fn an_approximated_cost_never_overwrites_a_real_one() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44002, 'a run that reported its own cost', 'completed', 'worktree', 0.0123,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44002).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44002")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cost,
+            Some(0.0123),
+            "a measured cost is the one the run actually incurred; an approximation must not \
+             replace it"
+        );
     }
 
     /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by
