@@ -820,6 +820,7 @@ async fn spawn_handoff_if_needed(
     tool_policy: crate::runner::ToolPolicy,
     run_timeout: std::time::Duration,
     classifier_governs_tools: bool,
+    model: Option<String>,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -865,6 +866,9 @@ async fn spawn_handoff_if_needed(
         // Inherited for the same reason, and it is the same tree: re-deriving would let a handoff
         // quietly change what the work is allowed to do halfway through it.
         classifier_governs_tools,
+        // Inherited: a successor is the same node continuing the same task, so it belongs on the
+        // model its predecessor's stage was routed to.
+        model,
     );
 }
 
@@ -890,6 +894,9 @@ fn spawn_run(
     steerable: bool,
     run_timeout: std::time::Duration,
     classifier_governs_tools: bool,
+    // Which model answers this run, or `None` for the runner's own. Decided by the caller, because
+    // only it knows the stage — `spawn_run` must not learn to read job nodes.
+    model: Option<String>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -939,6 +946,10 @@ fn spawn_run(
                 steerable,
                 classifier_governs_tools,
                 messages: None,
+                // Autopilot runs pay for the ambient surface and call none of it.
+                ambient_mcp: false,
+                // Cloned rather than moved: the request is built once per attempt.
+                model: model.clone(),
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
             // be spoken to is settled where its argument vector is chosen, not by whatever later
@@ -1107,6 +1118,7 @@ fn spawn_run(
                             tool_policy,
                             run_timeout,
                             classifier_governs_tools,
+                            model.clone(),
                         ))
                         .await;
                     }
@@ -1218,6 +1230,7 @@ fn spawn_run(
                             tool_policy,
                             run_timeout,
                             classifier_governs_tools,
+                            model.clone(),
                         ))
                         .await;
                     }
@@ -1551,6 +1564,11 @@ async fn create_run_with(
         steerable,
         run_timeout_for_mode(state.run_timeout, mode),
         governed_by_classifier,
+        // A job node's stage is what may be routed elsewhere; every other run names no stage and so
+        // stays on the runner's own model.
+        state
+            .runner
+            .model_for_stage(node.as_ref().map(|node| node.stage)),
     );
 
     Ok(id)
@@ -1769,6 +1787,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             crate::runner::ToolPolicy::Unrestricted,
             Some(std::path::Path::new(&wt_path)),
         ),
+        // The resume row carries the node's stage forward, so an approved plan node resumes on the
+        // plan model rather than dropping back to the runner's own.
+        state.runner.model_for_stage(stage.as_deref()),
     );
 
     Ok(resume_id)

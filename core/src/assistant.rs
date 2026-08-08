@@ -298,6 +298,11 @@ fn spawn_assistant_turn(
                     // `McpOnly` besides, so the surface being argued over is nearly empty.
                     classifier_governs_tools: false,
                     messages: None,
+                    // `McpOnly` already pushes the strict flag unconditionally, so this changes
+                    // nothing here — it is the same answer said in the request rather than inferred.
+                    ambient_mcp: false,
+                    // An orchestrator turn is not a job node, so it has no role to route.
+                    model: None,
                 },
                 session_tx,
                 // Unread here, deliberately. An assistant turn's product is the reply that
