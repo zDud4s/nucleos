@@ -828,10 +828,12 @@ fn has_destructive_flags(command: &str) -> bool {
 /// `$` alone is deliberately not here: bare `$VAR` expands to an argument rather than executing,
 /// so refusing it would cost ordinary commit messages without closing anything.
 ///
-/// Now a backstop rather than the front door. `classify_shell_command` reaches `is_safe_command`
-/// only through `shell_segments`, which has already refused `$(`, backticks, `>`, `<` and a lone
-/// `&`, and has already cut the line at every separator — so no character in this list can survive
-/// into a segment. It stays because `is_safe_command` is a predicate about a command, not about a
+/// Now a backstop rather than the front door, and the split is worth knowing when reading this file
+/// top to bottom. `classify_shell_command` reaches `is_safe_command` only through `shell_segments`,
+/// which refuses `$(`, backticks and a lone `&` and cuts the line at every separator, and then
+/// through `classify_segment`, which refuses `<` and every `>` that could reach a file and strips
+/// the ones that could not. By the time a segment arrives here no character in this list can be in
+/// it. It stays because `is_safe_command` is a predicate about a command rather than about a
 /// segment, and the day something else calls it with a whole line the guard should be there.
 fn has_shell_control(command: &str) -> bool {
     const SHELL_CONTROL: &[char] = &[';', '|', '&', '>', '<', '\n', '\r', '`'];
