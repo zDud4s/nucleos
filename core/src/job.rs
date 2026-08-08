@@ -474,10 +474,17 @@ pub async fn pause(pool: &SqlitePool, job_id: i64, status: &str, reason: &str) -
 /// Falls back to `planning`, not to `implementing`, if the stage was somehow lost. Re-planning
 /// costs a run; assuming a queue exists when it does not reports work as complete that was never
 /// started, which is the failure nobody sees.
+///
+/// Clears `wait_reason` with the status, for the reason `retire` does: a job that is no longer
+/// waiting is not waiting for anything, and the note outlives the pause it explains. Left behind, a
+/// job running normally reads `implementing / budget` — which names a brake that lifted hours ago
+/// and is the one thing a reader would act on. `park` is unaffected either way: its "say it once"
+/// test is `reason changed OR status is not waiting`, and a resumed job fails the second half.
 pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE jobs
-         SET status = COALESCE(resume_status, 'planning'), resume_status = NULL
+         SET status = COALESCE(resume_status, 'planning'), resume_status = NULL,
+             wait_reason = NULL
          WHERE id = ? AND status IN ('waiting','awaiting_approval')",
     )
     .bind(job_id)
@@ -2576,6 +2583,30 @@ mod tests {
         // The reason is stored because `waiting` now covers a budget window that will reopen and a
         // slot another run holds, and those ask opposite things of whoever reads the feed.
         assert_eq!(reason.as_deref(), Some("slot"));
+    }
+
+    /// The note has to leave with the pause it explains.
+    ///
+    /// `retire` has cleared it since it was written; `resume` did not, so an unparked job carried
+    /// the reason for its last pause through everything that came after. What a reader saw was
+    /// `implementing / budget` — a job working normally, labelled with a brake that lifted hours
+    /// ago, which is exactly the sort of thing somebody acts on.
+    #[tokio::test]
+    async fn resuming_a_job_takes_the_pause_note_with_it() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        wait(&pool, job_id, "budget").await.unwrap();
+        resume(&pool, job_id).await.unwrap();
+
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "implementing", "the stage it was parked at");
+        assert_eq!(reason, None, "nothing is waiting, so nothing is the reason");
     }
 
     #[tokio::test]
