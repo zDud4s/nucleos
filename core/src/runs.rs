@@ -70,14 +70,7 @@ pub struct SearchFilter {
 /// Keep search results useful without turning the index into a prompt or output retrieval endpoint.
 const PROMPT_EXCERPT_CHARS: i64 = 500;
 
-fn escape_like(query: &str) -> String {
-    query
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
-use crate::search::fts_query;
+use crate::search::{escape_like, fts_query};
 
 pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<AwaitingRun>> {
     sqlx::query_as::<_, AwaitingRun>(

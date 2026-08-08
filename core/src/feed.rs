@@ -29,12 +29,7 @@ pub struct SearchFilter {
     pub limit: i64,
 }
 
-fn escape_like(query: &str) -> String {
-    query
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
+use crate::search::escape_like;
 
 pub async fn append(
     pool: &sqlx::SqlitePool,

@@ -1426,8 +1426,14 @@ async fn post_email_attachment_save(
 }
 
 /// The mail the pillar knows about: what is waiting, and what it most recently said.
+#[derive(Deserialize)]
+struct EmailQueueQuery {
+    q: Option<String>,
+}
+
 async fn get_email_queue(
     State(state): State<AppState>,
+    Query(query): Query<EmailQueueQuery>,
 ) -> Result<Json<Vec<QueuedEmail>>, StatusCode> {
     // Newest arrival first — the order a mailbox is read in. Deliberately NOT by triage time: a
     // verdict landing now would otherwise drag a week-old message to the top, and a list that
@@ -1444,18 +1450,50 @@ async fn get_email_queue(
     //
     // `failed` sorts with the rest rather than being hidden: it is the class most likely to be
     // requeued, so it is the one that must stay findable.
-    let mut queue = sqlx::query_as::<_, QueuedEmail>(
+    // Searching narrows this list rather than being a list of its own, so the ordering, the limit
+    // and the `inbound` filter above are stated once and hold either way. 0051 indexes only what
+    // survives triage — sender, subject, and the locally-written summary — so a search for a word
+    // that was only ever in a body finds nothing, which is the correct answer once the body is gone
+    // rather than a gap in the index.
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(|q| (q.to_string(), crate::search::fts_query(q)));
+
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
                 triaged_at, has_attachments, NULL AS sender_verdict
            FROM emails
-          WHERE direction = 'inbound'
-          ORDER BY received_at DESC, id DESC
-          LIMIT ?",
-    )
-    .bind(EMAIL_QUEUE_LIMIT)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+          WHERE direction = 'inbound'",
+    );
+    if let Some((raw, fts)) = &search {
+        builder
+            .push(" AND (subject LIKE ")
+            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
+            .push(" ESCAPE '\\' OR from_addr LIKE ")
+            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
+            .push(" ESCAPE '\\'");
+        if fts.is_empty() {
+            builder.push(" OR 0");
+        } else {
+            builder
+                .push(" OR id IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ")
+                .push_bind(fts)
+                .push(")");
+        }
+        builder.push(")");
+    }
+    builder
+        .push(" ORDER BY received_at DESC, id DESC LIMIT ")
+        .push_bind(EMAIL_QUEUE_LIMIT);
+
+    let mut queue = builder
+        .build_query_as::<QueuedEmail>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Filled in afterwards rather than joined in SQL, because matching `emails.from_addr` to a
     // contact means applying `contacts::normalize_address` — which strips a display name's angle
@@ -3979,6 +4017,123 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn search_queue(state: AppState, q: &str) -> Vec<serde_json::Value> {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/email/queue?q={}", urlencoding(q)))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn urlencoding(raw: &str) -> String {
+        raw.bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    async fn insert_triaged(
+        state: &AppState,
+        uid: i64,
+        subject: &str,
+        body: &str,
+        summary: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, from_name,
+                                 subject, body_text, received_at, ingested_at, direction,
+                                 triage_class, triage_summary)
+             VALUES (?, 'INBOX', 1, ?, 'remetente@example.com', 'Rita Sousa', ?, ?,
+                     '2026-07-28T11:00:00+00:00', '2026-07-28T11:00:00+00:00', 'inbound',
+                     'info', ?)",
+        )
+        .bind(format!("<{uid}@contact>"))
+        .bind(uid)
+        .bind(subject)
+        .bind(body)
+        .bind(summary)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// The index is fed by an UPDATE as much as by an INSERT — a message arrives with no verdict and
+    /// gains its summary later — so a search by a word that only ever appeared in the summary is the
+    /// case that proves the update trigger works.
+    #[tokio::test]
+    async fn mail_is_found_by_its_subject_sender_or_summary() {
+        let state = test_state().await;
+        insert_triaged(&state, 1, "Fatura de julho", "corpo", "pedido de pagamento").await;
+        insert_triaged(&state, 2, "Almoço", "corpo", "convite social").await;
+
+        for (q, expected) in [
+            ("Fatura", 1),
+            ("pagamento", 1),
+            ("Rita", 2),
+            ("convite", 1),
+            ("inexistente", 0),
+        ] {
+            assert_eq!(
+                search_queue(state.clone(), q).await.len(),
+                expected,
+                "{q:?} returned the wrong number of messages"
+            );
+        }
+    }
+
+    /// 0051 indexes nothing that triage deletes. A word that lived only in the body is unfindable,
+    /// and that is the retention decision holding rather than a hole in the index — the alternative
+    /// is an index that keeps a stranger's words after the row stopped storing them.
+    #[tokio::test]
+    async fn a_word_only_ever_in_the_body_is_not_searchable() {
+        let state = test_state().await;
+        insert_triaged(&state, 1, "Assunto", "aardvark", "resumo").await;
+
+        assert!(search_queue(state.clone(), "aardvark").await.is_empty());
+    }
+
+    /// Searching narrows the queue; it does not become a different query with its own rules. The
+    /// user's own sent mail stays out of it.
+    #[tokio::test]
+    async fn searching_still_excludes_the_users_own_sent_mail() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, direction)
+             VALUES ('<sent@user>', 'Sent', 1, 5, 'utilizador@example.com', 'Fatura de julho',
+                     '2026-07-28T10:00:00+00:00', '2026-07-28T10:00:00+00:00', 'outbound')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        assert!(search_queue(state.clone(), "Fatura").await.is_empty());
+    }
+
+    /// A query of nothing but punctuation reaches `MATCH` as the empty string, which errors rather
+    /// than matching nothing, so the handler has to answer instead of returning a 500.
+    #[tokio::test]
+    async fn a_search_with_no_searchable_words_is_answered() {
+        let state = test_state().await;
+        insert_triaged(&state, 1, "Assunto", "corpo", "resumo").await;
+
+        assert!(search_queue(state.clone(), "\"\"\"").await.is_empty());
     }
 
     #[tokio::test]

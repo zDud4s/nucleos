@@ -32,9 +32,33 @@ pub(crate) fn fts_query(raw: &str) -> String {
         .join(" ")
 }
 
+/// Escapes the wildcards in a `LIKE` pattern so a person's words match themselves.
+///
+/// `%` and `_` are LIKE's own wildcards, so an unescaped query for `100%` matches every row that
+/// contains `100`, and `a_b` matches `axb`. Callers must pair this with `ESCAPE '\'`, which is what
+/// makes the backslash mean anything; the backslash is doubled first so a literal one still matches.
+///
+/// The same shape as `fts_query` and here for the same reason: it existed twice, in `runs.rs` and
+/// `feed.rs`, and a third caller made that two copies too many.
+pub(crate) fn escape_like(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fts_query;
+    use super::{escape_like, fts_query};
+
+    #[test]
+    fn like_wildcards_are_escaped_and_a_literal_backslash_survives() {
+        assert_eq!(escape_like("100%"), "100\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        // Doubled first, so escaping the wildcards cannot be undone by a backslash the person typed.
+        assert_eq!(escape_like("c:\\dir"), "c:\\\\dir");
+        assert_eq!(escape_like("plain"), "plain");
+    }
 
     #[test]
     fn every_word_becomes_a_quoted_term() {

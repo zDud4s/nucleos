@@ -47,6 +47,12 @@ impl Audience {
 
     /// The value to stamp for this audience. Paired with `from_env` so the two spellings cannot
     /// drift apart unnoticed.
+    // `allow` rather than `expect`, matching `redact::redact_url`: the tests below DO call this, so
+    // an expectation would go unfulfilled in a test build and warn there instead of here.
+    #[allow(
+        dead_code,
+        reason = "nothing stamps the audience yet; the daemon starts doing so when a local runner can answer a turn"
+    )]
     pub fn as_env_value(self) -> &'static str {
         match self {
             Self::Local => "local",
