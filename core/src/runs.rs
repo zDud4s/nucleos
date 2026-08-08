@@ -2590,6 +2590,53 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             .unwrap()
     }
 
+    /// A merge admitted by an approval that then fails leaves no merge behind.
+    ///
+    /// **This is the only test that can tell `submit_on(&mut *tx, …)` from `submit(&pool, …)`.** On
+    /// the happy path the two write identical rows, so every other assertion here passes either
+    /// way; what separates them is a rollback, and a queued merge surviving one would be an
+    /// irreversible publication against an approval that did not happen — with the proposal still
+    /// pending, so a person could authorise it a second time.
+    ///
+    /// The failure is reached the way the code's own comment says it can be: the supersede is a
+    /// compare-and-set on `awaiting_approval`, so a run that has moved on since the proposal was
+    /// read is not superseded, and `one_open_worktree_run_per_project` then rejects the INSERT of
+    /// the resume — after the admission, which is exactly the window that matters.
+    #[tokio::test]
+    async fn a_merge_admitted_by_an_approval_that_fails_is_rolled_back_with_it() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "git merge feature/x").await;
+
+        // The paused run moves on after the proposal was written: the slot it holds is still this
+        // project's only one, so the resume's own INSERT cannot land.
+        sqlx::query("UPDATE runs SET status = 'running' WHERE project_id = 'proj'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            resume_approved_run(&state, proposal_id).await.is_err(),
+            "the resume cannot insert its run, so the approval cannot succeed"
+        );
+
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, 0,
+            "the merge was admitted inside the failed transaction and must have gone with it"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "nothing was decided, so nothing is decided");
+    }
+
     /// **Decision (B).** Approving a merge hands it to the queue; it does not hand the run a pass to
     /// perform the merge itself.
     ///
