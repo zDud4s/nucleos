@@ -39,7 +39,20 @@ impl std::fmt::Display for PlanError {
 
 #[derive(Debug, Deserialize)]
 struct PlanFile {
+    /// Absent when a replan node wrote `{"done": true}`. A plan node always writes it, so the
+    /// default is what makes ONE shape read both files — and what makes a plan node that forgot the
+    /// key indistinguishable from one that found nothing, which is the reading `parse_plan`'s caller
+    /// already treats as a successful empty night.
+    #[serde(default)]
     items: Vec<PlanItem>,
+    /// A replan node saying the work is over. `#[serde(default)]` so a plan node's file, which never
+    /// carries it, reads as `false` rather than as a parse failure.
+    #[serde(default)]
+    done: bool,
+    /// Why it is over, in the node's own words. Kept for the feed: "job 12 finished after 3 rounds"
+    /// is a fact, and the reason it stopped asking is the part a person can disagree with.
+    #[serde(default)]
+    why: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +67,13 @@ pub struct PlannedItems {
     /// Items the daemon's ceiling cut. Carried rather than discarded so the feed can say what was
     /// left out — a queue silently trimmed reads downstream as the whole of what the planner found.
     pub dropped: usize,
+    /// A replan node declaring the work over, and why.
+    ///
+    /// Distinct from an empty `items` on purpose, and the distinction is the whole of ending #1
+    /// versus ending #3: "there is nothing more to do" is a claim the node is making, while an empty
+    /// queue is a round that happened to produce nothing and might not be the last. One ends the job
+    /// now; the other feeds a counter that ends it after two.
+    pub done: Option<String>,
 }
 
 /// Reads the queue a plan node produced.
@@ -77,6 +97,12 @@ pub fn parse_plan(contents: Option<&[u8]>, max_items: usize) -> Result<PlannedIt
     Ok(PlannedItems {
         dropped: total - items.len(),
         items,
+        // `done` wins over any items alongside it, and the alternative would be worse in both
+        // directions: honouring the items would queue work the node just said was unnecessary, and
+        // treating the pair as malformed would fail a job over a node being redundant.
+        done: parsed
+            .done
+            .then(|| parsed.why.unwrap_or_else(|| "no reason given".to_owned())),
     })
 }
 
@@ -191,6 +217,13 @@ pub struct RoundState {
     pub replanning: bool,
     /// What the last replan node said.
     pub replanned: Replan,
+    /// Whether the current round queued no items of its own.
+    ///
+    /// Carried rather than derived from `items`, which is deliberately not filtered by round and so
+    /// cannot answer it. What it decides is whether the round gets a review node at all: a round that
+    /// added nothing has an unchanged branch, and reviewing it spends a whole run re-reading a diff
+    /// nobody wrote.
+    pub round_added_nothing: bool,
 }
 
 impl Default for RoundState {
@@ -202,6 +235,7 @@ impl Default for RoundState {
             dry_rounds: 0,
             replanning: false,
             replanned: Replan::NotYet,
+            round_added_nothing: false,
         }
     }
 }
@@ -297,6 +331,14 @@ pub fn next_step(job: &JobView) -> Next {
         .position(|item| *item == ItemState::Pending)
     {
         return Next::SpawnImplement { ordinal };
+    }
+
+    // Two ways a round closes without being reviewed, and both are about not spending a run for
+    // nothing. A replan that declared the work over closed a round that had already been reviewed
+    // before it ran — a second review would re-read a branch nobody is going to change. And a round
+    // that queued no items has no diff of its own to read at all.
+    if job.rounds.replanned == Replan::Done || job.rounds.round_added_nothing {
+        return close_the_round(job);
     }
 
     match job.review {
@@ -473,9 +515,35 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         .fetch_optional(pool)
         .await
     };
+    // The one question the unfiltered queue above cannot answer: did THIS round put anything in it.
+    let queued_this_round: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ? AND round = ?")
+            .bind(job_id)
+            .bind(round)
+            .fetch_one(pool)
+            .await?;
+
     let plan_run = latest_node("plan").await?;
-    let review_run = latest_node("review").await?;
-    let replan_run = latest_node("replan").await?;
+
+    // The replan node is what OPENS a round, so its id is the line between one round and the last —
+    // which is how the review below is scoped without a `runs.round` column. Without the scoping the
+    // second round would read the first round's finished review as its own and skip reviewing
+    // itself, silently, for every round after the first.
+    let latest_replan: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM runs WHERE job_id = ? AND stage = 'replan' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    let round_opened_at = latest_replan.as_ref().map_or(0, |(id, _)| *id);
+    let review_run: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job_id)
+    .bind(round_opened_at)
+    .fetch_optional(pool)
+    .await?;
 
     let review = match (review_wanted != 0, review_run.as_deref()) {
         (false, _) => ReviewState::NotWanted,
@@ -504,7 +572,10 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             // would switch rounds on for every `graph:` rule already scheduled, silently.
             max_rounds: max_rounds.unwrap_or(1).max(1),
             dry_rounds,
-            replanning: replan_run.as_deref().is_some_and(node_in_flight),
+            replanning: latest_replan
+                .as_ref()
+                .is_some_and(|(_, status)| node_in_flight(status)),
+            round_added_nothing: queued_this_round == 0,
             replanned: if replan_done != 0 {
                 Replan::Done
             } else {
@@ -969,6 +1040,10 @@ pub struct JobRow {
     // `review` is deliberately absent: `load_view` reads it in the same query as the review node's
     // status, because the two are only ever meaningful together.
     pub head_sha: Option<String>,
+    /// Which round this job is on. Here as well as in `JobView` because the two answer different
+    /// questions: the view's copy drives the pure decision, this one is what a node's prompt and the
+    /// feed lines say out loud, and neither should have to load the other.
+    pub round: i64,
     pub created_at: String,
 }
 
@@ -982,14 +1057,14 @@ impl JobRow {
 /// runtime — a guard worth keeping. The test named above compares this text against both the
 /// constant and the migration's index, so the three cannot drift apart in silence.
 const LIVE_JOBS_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
-                                    wait_reason, max_items, gate_each, head_sha, created_at
+                                    wait_reason, max_items, gate_each, head_sha, round, created_at
                              FROM jobs
                              WHERE status IN ('planning','implementing','gating','reviewing',
                                               'awaiting_approval','waiting')
                              ORDER BY id";
 
 const ONE_JOB_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
-                                  wait_reason, max_items, gate_each, head_sha, created_at
+                                  wait_reason, max_items, gate_each, head_sha, round, created_at
                            FROM jobs WHERE id = ?";
 
 pub async fn live_jobs(pool: &SqlitePool) -> sqlx::Result<Vec<JobRow>> {
@@ -1042,6 +1117,49 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
          That file is the only thing that is read; anything you print is discarded. If there is no \
          work to do, write {{\"items\": []}} — an empty queue is a legitimate answer and is not a \
          failure. Do not begin any of the work yourself.\n\n\
+         The task:\n\n{task}"
+    )
+}
+
+/// The prompt the replan node is given at the end of a round.
+///
+/// The node's whole job is to answer one question — is there more to do? — and the two answers go to
+/// the same file for the same reason the plan node's queue does: a stream truncated mid-write must
+/// not be readable as a plausible short answer.
+///
+/// It is given the archives and told what they are, because without them the pattern this feature
+/// rests on cannot work. A replan that cannot see what round 1 tried reproposes round 1, no round
+/// ever comes back empty, and the "until it dries up" brake never fires — leaving `max_rounds` as
+/// the only thing between the job and its budget.
+///
+/// Told to prefer `done` explicitly, and that is not politeness. The failure this feature has to
+/// avoid is a job that will not admit it is finished: ending #4 (out of rounds) costs a full round of
+/// runs to discover, where ending #1 costs one node.
+pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &str) -> String {
+    let history = if archives.is_empty() {
+        // Reachable when the archive copy failed, and the honest thing to say is that it is missing.
+        // Claiming a file that is not there sends the node looking, and what it finds is nothing.
+        "The earlier rounds' plans could not be recovered, so judge from the working tree and its \
+         git history alone."
+            .to_owned()
+    } else {
+        format!(
+            "What the earlier rounds already tried is in {}. Do not repropose any of it.",
+            archives.join(", ")
+        )
+    };
+    format!(
+        "You are the REPLAN node of an autonomous job, at the end of round {round}. The working tree \
+         holds everything the job has done so far.\n\n\
+         {history}\n\n\
+         Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
+         change nothing else:\n\n\
+         {{\"done\": true, \"why\": \"...\"}}\n\
+         {{\"items\": [{{\"description\": \"...\"}}]}}\n\n\
+         That file is the only thing that is read; anything you print is discarded. Prefer \
+         {{\"done\": true}} when the task is met — saying so ends the job in one node, where leaving \
+         it to run out of rounds costs a full round of work to discover the same thing. Do not begin \
+         any of the work yourself.\n\n\
          The task:\n\n{task}"
     )
 }
@@ -1192,6 +1310,10 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     if job.stage() == "planning" {
         ingest_plan(state, job).await?;
     }
+    // Unconditional, unlike the plan node's, because a replan node has no status of its own to key
+    // off — it leaves the job wherever it found it. Cheap when there is nothing to take: one indexed
+    // read of the latest `replan` run, and the very common case is that there has never been one.
+    ingest_replan(state, job).await?;
     Ok(())
 }
 
@@ -1309,6 +1431,225 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
 }
 
 pub const PLAN_FILE: &str = "plan.json";
+
+/// Copies a round's plan aside and lists every archive the job has, newest last.
+///
+/// Best-effort, and deliberately so: a copy that fails costs the replan node its history, which the
+/// prompt then says out loud rather than papering over. Failing the job instead would throw a
+/// night's work away over a file copy — and the node can still read the working tree and its git log,
+/// which is a worse account of what was tried but not no account at all.
+///
+/// Every archive, not just the one just written: round 3's replan needs to know what rounds 0, 1 and
+/// 2 tried, or it reproposes the oldest of them.
+async fn archive_plans(worktree: &Path, round: i64) -> Vec<String> {
+    let directory = worktree.join(crate::worktree::ARTIFACTS_DIR);
+    let archive = format!("plan-{round}.json");
+    if let Err(error) = tokio::fs::copy(directory.join(PLAN_FILE), directory.join(&archive)).await {
+        tracing::warn!(%error, round, "could not archive a round's plan for the replan node");
+    }
+
+    let mut archives = Vec::new();
+    for previous in 0..=round {
+        let name = format!("plan-{previous}.json");
+        if tokio::fs::try_exists(directory.join(&name))
+            .await
+            .unwrap_or(false)
+        {
+            archives.push(name);
+        }
+    }
+    archives
+}
+
+/// Takes the answer a replan node landed with, exactly once.
+///
+/// Read wherever the job happens to be parked rather than from a status of its own: a replan node
+/// leaves `jobs.status` as it found it (`reviewing`, usually), which keeps the job holding the
+/// project's exclusivity slot through `one_live_job_per_project` without that index needing to learn
+/// a new word.
+async fn ingest_replan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
+    let pool = &state.pool;
+    let Some((run_id, run_status)): Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM runs WHERE job_id = ? AND stage = 'replan' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job.id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(());
+    };
+    if node_in_flight(&run_status) {
+        return Ok(());
+    }
+    // The marker, and the reason it is a marker: a replan that produced nothing leaves every
+    // observable condition exactly as it found it, so any derived test would ingest it again on the
+    // next tick and keep bumping the round until the ceiling ended the job.
+    let taken: Option<i64> = sqlx::query_scalar("SELECT replan_run_id FROM jobs WHERE id = ?")
+        .bind(job.id)
+        .fetch_one(pool)
+        .await?;
+    if taken == Some(run_id) {
+        return Ok(());
+    }
+
+    // Everything below records the node as taken in the same statement that acts on it, so a job
+    // cannot end up acting twice on one answer.
+    if run_status != "completed" {
+        stop_after_replan(
+            state,
+            job,
+            run_id,
+            &format!("its replan node ended `{run_status}`"),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let contents = match job_worktree(pool, job.id).await? {
+        Some((worktree, _)) => {
+            let file = worktree
+                .join(crate::worktree::ARTIFACTS_DIR)
+                .join(PLAN_FILE);
+            tokio::fs::read(&file).await.ok()
+        }
+        None => None,
+    };
+    let planned = match parse_plan(contents.as_deref(), job.max_items.max(0) as usize) {
+        Ok(planned) => planned,
+        Err(error) => {
+            stop_after_replan(state, job, run_id, &format!("its replan node {error}")).await?;
+            return Ok(());
+        }
+    };
+
+    // Ending #1. `stopped` is not the word here and `failed` certainly is not: the node that just
+    // looked at the work says the work is over, which is the best evidence this system can get.
+    if let Some(why) = planned.done {
+        sqlx::query("UPDATE jobs SET replan_done = 1, replan_run_id = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(job.id)
+            .execute(pool)
+            .await?;
+        say(
+            pool,
+            job,
+            "job_replanned",
+            &format!(
+                "job {} says it is done after {} round(s): {why}",
+                job.id,
+                job.round + 1
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
+    open_the_next_round(state, job, run_id, &planned).await
+}
+
+/// Ends a job whose replan node could not answer, keeping what the earlier rounds did.
+///
+/// `Stopped` and not `Failed`, which is the whole point of the distinction: the rounds that ran are
+/// on the branch, gated, and worth looking at. A job reported `failed` for want of a replan teaches
+/// its reader to ignore the branch.
+async fn stop_after_replan(
+    state: &AppState,
+    job: &JobRow,
+    run_id: i64,
+    why: &str,
+) -> sqlx::Result<()> {
+    let pool = &state.pool;
+    sqlx::query("UPDATE jobs SET replan_run_id = ? WHERE id = ?")
+        .bind(run_id)
+        .bind(job.id)
+        .execute(pool)
+        .await?;
+    finish(pool, job.id, Outcome::Stopped).await?;
+    say(
+        pool,
+        job,
+        "job_stopped",
+        &format!(
+            "job {} stopped after round {}: {why}. What the earlier rounds did is on the branch.",
+            job.id,
+            job.round + 1
+        ),
+    )
+    .await;
+    Ok(())
+}
+
+/// Queues what a replan asked for and moves the job onto the next round.
+///
+/// Ordinals CONTINUE rather than restart, because `ordinal` is half `job_items`'s primary key and
+/// because the position in the loaded queue is the number `advance` looks an item up by. The round
+/// is carried on the row as a label, for the replan node's history and for a person reading which
+/// round a given item came from.
+async fn open_the_next_round(
+    state: &AppState,
+    job: &JobRow,
+    run_id: i64,
+    planned: &PlannedItems,
+) -> sqlx::Result<()> {
+    let pool = &state.pool;
+    let round = job.round + 1;
+    let next_ordinal: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_items WHERE job_id = ?")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await?;
+
+    for (offset, description) in planned.items.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, round)
+             VALUES (?, ?, ?, 'pending', ?)",
+        )
+        .bind(job.id)
+        .bind(next_ordinal + offset as i64)
+        .bind(description)
+        .bind(round)
+        .execute(pool)
+        .await?;
+    }
+
+    // A round that added nothing feeds the counter; one that added something resets it. Both are the
+    // same UPDATE, because the round advances either way — a dry round IS a round, and counting it
+    // as one is what makes `dry_rounds` reach two.
+    let dry = planned.items.is_empty();
+    sqlx::query(
+        "UPDATE jobs
+         SET round = ?, dry_rounds = CASE WHEN ? THEN dry_rounds + 1 ELSE 0 END,
+             replan_done = 0, replan_run_id = ?
+         WHERE id = ?",
+    )
+    .bind(round)
+    .bind(dry)
+    .bind(run_id)
+    .bind(job.id)
+    .execute(pool)
+    .await?;
+
+    if !dry {
+        sqlx::query("UPDATE jobs SET status = 'implementing' WHERE id = ?")
+            .bind(job.id)
+            .execute(pool)
+            .await?;
+    }
+
+    say(
+        pool,
+        job,
+        "job_replanned",
+        &format!(
+            "job {} opened round {} with {} item(s)",
+            job.id,
+            round + 1,
+            planned.items.len()
+        ),
+    )
+    .await;
+    Ok(())
+}
 
 /// Starts one node, and records that the item it belongs to is now in someone's hands.
 async fn spawn_node(
@@ -1904,20 +2245,13 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
             spawn_node(state, job, "review", prompt, None, worktree).await
         }
-        // Unreachable until Task 11 gives the round a node to run, and reachable only for a job
-        // whose `max_rounds` is above 1 — which nothing writes yet, because `load_view` resolves a
-        // NULL column to one round. Parked rather than ignored: a `Step::Stopped` here would end a
-        // job silently if the two halves ever landed out of order, and the log line is what makes
-        // that findable in one grep instead of one dogfood.
         Next::SpawnReplan => {
-            tracing::warn!(
-                job_id = job.id,
-                round = view.rounds.round,
-                "a job asked to replan before the replan node exists — stopping it rather than \
-                 reporting work it did not do"
-            );
-            finish(pool, job.id, Outcome::Stopped).await.ok();
-            Step::Stopped
+            // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
+            // with its own answer. The round's plan has to be put aside while it still exists.
+            let archives = archive_plans(&worktree.0, view.rounds.round).await;
+            let task = job.prompt.clone().unwrap_or_default();
+            let prompt = replan_prompt(&task, view.rounds.round, &archives, &artifacts);
+            spawn_node(state, job, "replan", prompt, None, worktree).await
         }
         Next::Wait | Next::Finish(_) | Next::RunGate { .. } => Step::Stopped,
     }
@@ -2650,6 +2984,75 @@ mod tests {
         assert!(matches!(parse_plan(None, 5), Err(PlanError::Absent)));
     }
 
+    /// The replan node's other answer, read out of the same file by the same parser.
+    ///
+    /// One shape for both nodes rather than two, because the failure mode of two is a plan node's
+    /// file becoming unreadable to the replan parser the day somebody adds a key to one of them.
+    #[test]
+    fn a_replan_can_say_the_work_is_over() {
+        let done = br#"{"done": true, "why": "the task is met and the suite is green"}"#;
+        let plan = parse_plan(Some(done), 5).expect("a done verdict is a result, not an error");
+        assert_eq!(
+            plan.done.as_deref(),
+            Some("the task is met and the suite is green")
+        );
+        assert!(plan.items.is_empty());
+
+        // Silence about the reason is not a parse failure: the verdict is the load-bearing half, and
+        // failing a job over a missing sentence would throw away the answer to keep the explanation.
+        let terse = br#"{"done": true}"#;
+        assert_eq!(
+            parse_plan(Some(terse), 5).unwrap().done.as_deref(),
+            Some("no reason given")
+        );
+
+        // `done` wins over items alongside it. Honouring the items would queue work the node just
+        // said was unnecessary; calling the pair malformed would fail a job over redundancy.
+        let both = br#"{"done": true, "items": [{"description": "one more thing"}]}"#;
+        assert!(parse_plan(Some(both), 5).unwrap().done.is_some());
+    }
+
+    /// The distinction ending #1 and ending #3 are built on. An empty queue is a round that produced
+    /// nothing and might not be the last; `done` is a claim the node is making. One ends the job now,
+    /// the other feeds a counter that ends it after two.
+    #[test]
+    fn an_empty_queue_is_not_a_claim_that_the_work_is_over() {
+        let plan = parse_plan(Some(br#"{"items": []}"#), 5).unwrap();
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.done, None);
+
+        // A plan node's file never carries the key at all, and must not read as a failure.
+        let ordinary = br#"{"items": [{"description": "a"}]}"#;
+        assert_eq!(parse_plan(Some(ordinary), 5).unwrap().done, None);
+    }
+
+    /// The replan node cannot do its job without the archives, and the prompt has to say so either
+    /// way. Without them it reproposes round 1, no round ever comes back empty, and the "until it
+    /// dries up" brake never fires — leaving `max_rounds` as the only thing between the job and its
+    /// budget.
+    #[test]
+    fn the_replan_prompt_carries_what_the_earlier_rounds_tried() {
+        let with = replan_prompt(
+            "add shout and whisper",
+            2,
+            &["plan-0.json".to_owned(), "plan-1.json".to_owned()],
+            "/wt/.nucleos",
+        );
+        assert!(with.contains("plan-0.json, plan-1.json"));
+        assert!(with.contains("Do not repropose"));
+        assert!(with.contains("/wt/.nucleos/plan.json"));
+        assert!(with.contains("add shout and whisper"));
+        // Ending #1 is one node; ending #4 costs a whole round to reach the same place, so the node
+        // is told which one to prefer.
+        assert!(with.contains("\"done\": true"));
+
+        // No archives is a reachable state — the copy can fail — and the honest thing is to say so.
+        // Naming a file that is not there sends the node looking, and what it finds is nothing.
+        let without = replan_prompt("t", 1, &[], "/wt/.nucleos");
+        assert!(without.contains("could not be recovered"));
+        assert!(!without.contains("Do not repropose"));
+    }
+
     #[test]
     fn an_unparseable_plan_is_a_planning_failure() {
         let garbage = br#"{"items": [ truncated"#;
@@ -2765,8 +3168,8 @@ mod tests {
             round,
             max_rounds: 5,
             dry_rounds: dry,
-            replanning: false,
             replanned,
+            ..RoundState::default()
         };
 
         // (1) The replan said so. Ahead of everything: the node that just looked at the work is the
@@ -3902,6 +4305,172 @@ mod tests {
             next_step(&load_view(&pool, job_id).await.unwrap()),
             Next::Finish(Outcome::Completed)
         );
+    }
+
+    // ---- the replan node (Chunk 3, task 11) ------------------------------------------------------
+
+    /// Seeds a job at the end of a round, with a landed replan node and the answer it wrote.
+    async fn seed_closed_round(
+        pool: &sqlx::SqlitePool,
+        worktree: &std::path::Path,
+        run_status: &str,
+        answer: Option<&str>,
+    ) -> i64 {
+        let job_id = seed_job(pool, "project-a", "reviewing").await.unwrap();
+        seed_worktree(pool, job_id, worktree).await;
+        seed_items(pool, job_id, &["passed", "passed"]).await;
+        sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        seed_node(pool, job_id, "replan", run_status).await;
+        if let Some(answer) = answer {
+            write_plan(worktree, answer).await;
+        }
+        job_id
+    }
+
+    async fn round_counters(pool: &sqlx::SqlitePool, job_id: i64) -> (i64, i64, i64) {
+        sqlx::query_as("SELECT round, dry_rounds, replan_done FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Ending #1. `completed` and not `stopped`, because the node that just looked at the work is
+    /// the one saying the work is over — the best evidence this system can get for that claim.
+    #[tokio::test]
+    async fn a_replan_that_says_done_ends_the_job_completed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"done": true, "why": "the task is met"}"#),
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(round_counters(&pool, job_id).await.2, 1, "replan_done");
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::Finish(Outcome::Completed)
+        );
+        assert!(
+            feed_kinds(&pool)
+                .await
+                .contains(&"job_replanned".to_owned())
+        );
+    }
+
+    /// Ordinals CONTINUE across rounds. They are half `job_items`'s primary key, and the position in
+    /// the loaded queue is the number `advance` binds into its lookups — restarting them per round
+    /// would collide on the first insert and mislead on every one after.
+    #[tokio::test]
+    async fn a_replan_with_items_opens_the_next_round_past_the_old_ordinals() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"items": [{"description": "one more thing"}]}"#),
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        let (round, dry, done) = round_counters(&pool, job_id).await;
+        assert_eq!(
+            (round, dry, done),
+            (1, 0, 0),
+            "a round that added work is not dry"
+        );
+        assert_eq!(job_status(&pool, job_id).await, "implementing");
+
+        let placed: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT ordinal, round FROM job_items WHERE job_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(placed, vec![(0, 0), (1, 0), (2, 1)]);
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnImplement { ordinal: 2 }
+        );
+    }
+
+    /// The whole reason `jobs.replan_run_id` exists, stated as the loop it prevents.
+    ///
+    /// A replan that produced nothing leaves every observable condition exactly as it found it: the
+    /// queue is still fully terminal, `replan_done` is still 0, and the latest replan run is still
+    /// the same one. Any DERIVED test for "already taken" therefore answers no on the next tick, and
+    /// the round would keep advancing — one per tick, thirty seconds apart — until the ceiling ended
+    /// a job that had done nothing at all.
+    #[tokio::test]
+    async fn a_dry_replan_is_counted_once_however_many_ticks_pass() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"items": []}"#),
+        )
+        .await;
+
+        for _ in 0..3 {
+            let job = load_job(&pool, job_id).await.unwrap();
+            reconcile_nodes(&state, &job).await.unwrap();
+        }
+
+        let (round, dry, _) = round_counters(&pool, job_id).await;
+        assert_eq!(
+            (round, dry),
+            (1, 1),
+            "three ticks, one answer: a dry round is still one round"
+        );
+        // One short of the brake, so the job asks again rather than ending.
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnReplan
+        );
+    }
+
+    /// A replan that could not answer stops the job; it does not fail it.
+    ///
+    /// The rounds that ran are on the branch, gated green, and worth looking at. `failed` for want of
+    /// a replan node teaches its reader to ignore the branch — which is the one thing the whole
+    /// `Completed`/`Stopped` split exists to prevent.
+    #[tokio::test]
+    async fn a_replan_that_could_not_answer_stops_the_job_rather_than_failing_it() {
+        for (run_status, answer) in [("failed", None), ("completed", None)] {
+            let pool = test_pool().await;
+            let state = test_state(pool.clone()).await;
+            let worktree = tempfile::tempdir().unwrap();
+            let job_id = seed_closed_round(&pool, worktree.path(), run_status, answer).await;
+
+            let job = load_job(&pool, job_id).await.unwrap();
+            reconcile_nodes(&state, &job).await.unwrap();
+
+            assert_eq!(
+                job_status(&pool, job_id).await,
+                STATUS_STOPPED,
+                "{run_status}"
+            );
+            assert!(feed_kinds(&pool).await.contains(&"job_stopped".to_owned()));
+        }
     }
 
     /// Truncation is reported, never silent: a queue quietly cut from seven to five reads

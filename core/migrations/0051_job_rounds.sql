@@ -46,6 +46,16 @@ ALTER TABLE jobs ADD COLUMN budget_usd REAL;
 -- flag that outlives the thing it describes is read as describing the next one.
 ALTER TABLE jobs ADD COLUMN replan_done INTEGER NOT NULL DEFAULT 0;
 
+-- Which replan node's answer has already been taken.
+--
+-- The marker that makes ingestion happen exactly once per node, and it has to be a marker rather
+-- than a derived condition. The obvious alternatives both fail on the same case: "the queue is fully
+-- terminal" is still true after a replan that produced nothing, and "the round advanced" cannot tell
+-- a round opened by THIS node from one opened by the last. A replan that returns an empty queue --
+-- the dry round, which the whole `dry_rounds` brake is built on -- would be ingested again on every
+-- tick, bumping the round each time until the ceiling ended the job.
+ALTER TABLE jobs ADD COLUMN replan_run_id INTEGER;
+
 -- Which round an item belongs to.
 --
 -- A label, and deliberately NOT a query key -- `load_view` reads the queue unfiltered. Filtering was
