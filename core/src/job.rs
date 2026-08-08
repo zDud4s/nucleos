@@ -2464,11 +2464,15 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
 
     // Before the pass, so a slot freed here is available to the very jobs about to be driven.
     //
-    // A backstop rather than the mechanism. `retire` and the run terminations give slots back
-    // explicitly and immediately; this catches what a crash held, and it turns "every ending must
-    // remember" from a correctness requirement into a latency one — a forgotten release costs a slot
-    // for one tick instead of until the next restart. That matters because a held slot is silent:
-    // it lowers a project's ceiling without any error anywhere.
+    // For jobs this is a backstop: `retire` gives the slot back the moment one ends, and every
+    // ending funnels there. For RUNS it is the mechanism — `runs` has ten places that write a
+    // terminal status and no funnel like `retire`, so a run's slot is derived from liveness instead
+    // of released by hand, which cannot drift the way ten call sites can. `create_run_inner` sweeps
+    // again immediately before it claims, so the derivation is current at the moment it decides
+    // anything; this pass is what keeps the table honest in between.
+    //
+    // Either way a held slot is silent — it lowers a project's ceiling with no error anywhere — and
+    // that silence is what the sweep bounds to one tick.
     match crate::concurrency::reconcile_orphaned_slots(&state.pool).await {
         Ok(freed) if freed > 0 => {
             tracing::warn!("freed {freed} concurrency slot(s) whose owner was no longer live");

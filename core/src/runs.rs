@@ -1421,6 +1421,45 @@ async fn create_run_with(
             },
             None => {
                 let owner = crate::worktree::Owner::Run(id);
+
+                // Only a standalone run claims a slot. A job node inherits its job's worktree, and
+                // its job's slot with it — charging the node a second one would have a five-item job
+                // refuse itself at the second item.
+                //
+                // Swept immediately before the count, and this is where the latency that matters is
+                // paid. A run's slot is given back by the sweep rather than at each ending: `runs`
+                // has ten places that write a terminal status and no single funnel like `retire`, so
+                // threading a release through all ten is a coverage claim that would be wrong the
+                // first time an eleventh appears. The release is derived from liveness instead,
+                // which cannot drift — and the one moment the derivation must be current is this
+                // one, so it runs here.
+                let _ = crate::concurrency::reconcile_orphaned_slots(&state.pool).await;
+                match crate::concurrency::claim(&state.pool, worktree_project_id, owner).await {
+                    Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
+                    Ok(full) => {
+                        // The same 409 the unique index gave, reached by counting instead of by
+                        // colliding. `Busy` is what every caller already maps.
+                        fail_provisioning(
+                            state,
+                            id,
+                            project_id.as_deref(),
+                            &format!("no concurrency slot was free: {full:?}"),
+                        )
+                        .await;
+                        return Err(CreateRunError::Busy);
+                    }
+                    Err(error) => {
+                        fail_provisioning(
+                            state,
+                            id,
+                            project_id.as_deref(),
+                            &format!("the concurrency slot could not be claimed: {error}"),
+                        )
+                        .await;
+                        return Err(CreateRunError::Db(error));
+                    }
+                }
+
                 match crate::worktree::create(std::path::Path::new(project_root), owner).await {
                     Ok(info) => info,
                     Err(error) => {
