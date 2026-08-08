@@ -3040,11 +3040,17 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    async fn file_test_state() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = crate::storage::open(&dir.path().join("nucleos.db"))
-            .await
-            .unwrap();
+    /// A state whose database is a real file, handed back inside a [`crate::storage::TempDb`] rather
+    /// than a bare `TempDir` — which is the whole reason that type exists. `TempDir`'s drop cannot
+    /// remove a directory SQLite still has open, and on Windows it fails silently, so every test
+    /// here left its database behind in the system temp directory forever: measured at three per
+    /// `cargo test` run, and hundreds of megabytes across a few weeks of running the suite.
+    ///
+    /// Closing is therefore the caller's last statement — `db.close().await` — because it is async
+    /// and consuming, and `Drop` can be neither (see `TempDb`'s own comment).
+    async fn file_test_state() -> (AppState, crate::storage::TempDb) {
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
         (
             AppState {
                 token: Token("test-token".into()),
@@ -3061,7 +3067,7 @@ mod tests {
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
                 progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             },
-            dir,
+            db,
         )
     }
 
@@ -3076,7 +3082,7 @@ mod tests {
     /// the row gets a 422 here rather than a ticket.
     #[tokio::test]
     async fn a_vcs_request_submitted_over_http_is_readable_as_a_ticket() {
-        let (state, _dir) = file_test_state().await;
+        let (state, db) = file_test_state().await;
         let (_container, repo) =
             crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-");
         sqlx::query(
@@ -3174,12 +3180,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        db.close().await;
     }
 
     /// A project the daemon does not know is a 404, not a merge in a directory somebody named.
     #[tokio::test]
     async fn a_vcs_request_for_an_unregistered_project_is_refused() {
-        let (state, _dir) = file_test_state().await;
+        let (state, db) = file_test_state().await;
         let app = Router::new()
             .route("/vcs/requests", post(submit_vcs_request))
             .layer(Extension(Scope::Control))
@@ -3199,6 +3206,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        db.close().await;
     }
 
     /// The sibling of the 404 above, and the other half of what keeps a caller from pointing the
@@ -3211,11 +3219,11 @@ mod tests {
     /// them differently, and an arm nothing reads could have been collapsed into the 404 unnoticed.
     #[tokio::test]
     async fn a_vcs_request_for_a_project_whose_root_is_not_a_repository_is_refused() {
-        let (state, dir) = file_test_state().await;
+        let (state, db) = file_test_state().await;
         // A directory that exists and is not a repository, and — because it lives under the system
         // temp directory rather than under this checkout — is not INSIDE one either. Both refusals
         // are `NotARepository`; this is the plainer of the two.
-        let not_a_repository = dir.path().join("not-a-repository");
+        let not_a_repository = db.path().join("not-a-repository");
         std::fs::create_dir_all(&not_a_repository).expect("a directory that is not a repository");
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
@@ -3245,6 +3253,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        db.close().await;
     }
 
     /// A branch name that could be read as a git option cannot get in through the raw body either —
@@ -3263,7 +3272,7 @@ mod tests {
     /// not worth making while no client branches on the difference.
     #[tokio::test]
     async fn a_dashed_branch_in_the_request_body_is_refused_and_queues_nothing() {
-        let (state, _dir) = file_test_state().await;
+        let (state, db) = file_test_state().await;
         let (_container, repo) =
             crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-dashed-");
         sqlx::query(
@@ -3304,6 +3313,7 @@ mod tests {
             vcs::list(&pool, None).await.unwrap().is_empty(),
             "the request was refused, so there must be no row for anything to execute later"
         );
+        db.close().await;
     }
 
     async fn backup_request(
@@ -3357,8 +3367,8 @@ mod tests {
 
     #[tokio::test]
     async fn backups_route_lists_newest_first() {
-        let (state, dir) = file_test_state().await;
-        let backup_dir = dir.path().join("backups");
+        let (state, db) = file_test_state().await;
+        let backup_dir = db.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
         let older = "nucleos-20260729T010203.000000000Z-0000.db";
         let newer = "nucleos-20260729T020203.000000000Z-0000.db";
@@ -3374,8 +3384,7 @@ mod tests {
         assert_eq!(listed[0]["name"], newer);
         assert_eq!(listed[1]["name"], older);
 
-        state.pool.close().await;
-        drop(dir);
+        db.close().await;
     }
 
     async fn test_state() -> AppState {
