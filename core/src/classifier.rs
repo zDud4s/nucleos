@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 5;
+pub const CLASSIFIER_VERSION: u32 = 6;
 
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
@@ -360,7 +360,7 @@ fn classify_segment(segment: &str, cwd: Option<&Path>) -> Segment {
     // Raw, not normalized: `normalize_command` lowercases, and a `cd` target is a path. Folding it
     // here would widen the workspace behind the containment check's back, which is the same reason
     // `deletes_outside_cwd` reads raw tokens.
-    if changes_directory_within_the_workspace(segment, cwd) {
+    if lands_inside_the_workspace(segment, cwd) {
         return Segment::ReadLocal;
     }
 
@@ -469,38 +469,64 @@ fn shell_segments(command: &str) -> Option<Vec<&str>> {
     )
 }
 
-/// Whether a piece is a `cd` that lands inside the run's workspace.
+/// Whether a piece is one of the commands judged by WHERE IT LANDS, and lands inside the workspace.
 ///
-/// `cd` is on nobody's allow list and could not be: where it goes decides what every piece after it
-/// does. It is here rather than in `SAFE_COMMAND_PREFIXES` because the answer depends on the
-/// argument, and the check is the containment check the write guards already use.
+/// Two so far, and they are here rather than in `SAFE_COMMAND_PREFIXES` for the same reason: a list
+/// answers "which program", and for these the program is not the question. `cd ..` and `cd core` are
+/// the same program and opposite answers.
+///
+/// - **`cd`** decides what every piece after it does, so a list entry would hand over the meaning of
+///   the whole line.
+/// - **`mkdir`** changes the tree, which is exactly what an ordinary `Write` does and is allowed to
+///   do — inside the workspace. `mkdir C:\Windows\evil` is not the same act with a different
+///   argument, it is a different act. Measured: the job-6 dogfood stopped its plan node dead on
+///   `mkdir -p "<worktree>/.nucleos"`, a directory the job itself needs.
 ///
 /// A `cd` this returns true for can only go deeper, never out, which is what makes judging the
 /// pieces AFTER it against the outer `cwd` safe rather than merely convenient: the real directory
 /// is at or below the workspace, so a `../` in a later piece is read as escaping sooner than it
 /// really would. Wrong, and wrong in the strict direction.
 ///
+/// The leading token is matched WHOLE, deliberately unlike `has_destructive_flags`, which strips the
+/// directory off with `program_name`. Stripping widens a blocklist and narrows an allow list: it
+/// would make `./mkdir` — a script sitting in the tree, named to look like the builtin — read as the
+/// builtin. `/usr/bin/mkdir` falls to `pending_approval` as the price, which is the safe half.
+///
 /// Without a `cwd` there is no boundary to be inside of, so the answer is no — the same reading
 /// `writes_outside_cwd` was corrected to.
-fn changes_directory_within_the_workspace(segment: &str, cwd: Option<&Path>) -> bool {
+fn lands_inside_the_workspace(segment: &str, cwd: Option<&Path>) -> bool {
     let tokens = shell_words(segment);
     let Some(program) = tokens.first() else {
         return false;
     };
-    if !["cd", "chdir", "set-location"]
+    // `cd` takes one destination; `mkdir` takes as many as you like, and every one has to land
+    // inside. Anything else is not judged this way at all.
+    let one_target_only = if ["cd", "chdir", "set-location"]
         .iter()
         .any(|name| program.eq_ignore_ascii_case(name))
     {
+        true
+    } else if ["mkdir", "md"]
+        .iter()
+        .any(|name| program.eq_ignore_ascii_case(name))
+    {
+        false
+    } else {
         return false;
-    }
+    };
     let Some(cwd) = cwd else {
         return false;
     };
 
-    let mut target = None;
+    let mut targets: Vec<&str> = Vec::new();
     for token in &tokens[1..] {
-        // cmd.exe's "change drive as well". It is not a destination and it changes nothing here.
-        if token.eq_ignore_ascii_case("/d") {
+        // The two flags that carry no destination: cmd.exe's "change drive as well", and "create the
+        // parents too", which asks for more directories in the same place rather than a different
+        // place.
+        if token.eq_ignore_ascii_case("/d")
+            || token.eq_ignore_ascii_case("-p")
+            || token.eq_ignore_ascii_case("--parents")
+        {
             continue;
         }
         // `cd -` is the previous directory — wherever that was, which is precisely what this check
@@ -508,26 +534,27 @@ fn changes_directory_within_the_workspace(segment: &str, cwd: Option<&Path>) -> 
         if token.starts_with('-') {
             return false;
         }
-        // A bare `cd` goes home, and two destinations is not a `cd` worth reading.
-        if target.replace(token.as_str()).is_some() {
-            return false;
-        }
+        targets.push(token.as_str());
     }
-    let Some(target) = target else {
-        return false;
-    };
-    // A destination the shell rewrites before `cd` ever sees it is not a destination this can
-    // check. `~`, `$HOME` and `%USERPROFILE%` are all the home directory, and all three arrive here
-    // as ordinary-looking names that `normalize_path` happily glues onto the workspace — so
-    // `cd ~ && …` read as landing in `<workspace>/~` and was allowed. Caught by the test that walks
-    // the ways out; the same hole in `%VAR%` form had no test and would have shipped with it.
-    if target.starts_with('~') || target.contains('$') || target.contains('%') {
+    // A bare `cd` goes home and a bare `mkdir` is an error; two destinations is not a `cd` worth
+    // reading.
+    if targets.is_empty() || (one_target_only && targets.len() > 1) {
         return false;
     }
 
-    let target = fold_for_containment(&normalize_path(target, Some(cwd)));
     let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
-    target == workspace || target.starts_with(&format!("{workspace}/"))
+    targets.iter().all(|target| {
+        // A destination the shell rewrites before the command ever sees it is not a destination this
+        // can check. `~`, `$HOME` and `%USERPROFILE%` are all the home directory, and all three
+        // arrive here as ordinary-looking names that `normalize_path` happily glues onto the
+        // workspace — so `cd ~ && …` read as landing in `<workspace>/~` and was allowed. Caught by
+        // the test that walks the ways out; the `%VAR%` form had no test and would have shipped.
+        if target.starts_with('~') || target.contains('$') || target.contains('%') {
+            return false;
+        }
+        let target = fold_for_containment(&normalize_path(target, Some(cwd)));
+        target == workspace || target.starts_with(&format!("{workspace}/"))
+    })
 }
 
 fn classification(decision: &str, action_class: &'static str, reason: &str) -> Classification {
@@ -1987,6 +2014,64 @@ mod tests {
         }
     }
 
+    /// `mkdir` changes the tree, which is what an ordinary `Write` does and is allowed to do —
+    /// inside the workspace. Outside it, it is not the same act with a different argument.
+    ///
+    /// Measured: the job-6 dogfood stopped its plan node dead on `mkdir -p "<worktree>/.nucleos"`,
+    /// a directory the job itself needs before it can write its own plan.
+    #[test]
+    fn a_mkdir_is_allowed_by_where_it_lands() {
+        let cwd = Path::new(r"C:\work\repo");
+
+        for command in [
+            r#"mkdir -p "C:/work/repo/.nucleos""#,
+            "mkdir -p core/generated",
+            "mkdir a b c",
+            "mkdir --parents core/a/b",
+            r"md C:\work\repo\tmp",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), Some(cwd))
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
+
+        for command in [
+            // Out of the workspace, and one target out of three is enough.
+            r"mkdir C:\Windows\evil",
+            "mkdir ../sibling",
+            "mkdir core/a ../../elsewhere core/b",
+            "mkdir ~/hidden",
+            "mkdir $HOME/hidden",
+            // A script in the tree named after the builtin is not the builtin. Stripping the
+            // directory widens a blocklist and narrows an allow list; this is the allow list.
+            "./mkdir core/generated",
+            "/usr/bin/mkdir core/generated",
+            // Nothing to place.
+            "mkdir",
+            "mkdir -p",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({"command": command}), Some(cwd))
+                    .decision
+                    .decision,
+                "pending_approval",
+                "{command}"
+            );
+        }
+
+        // No boundary, no containment.
+        assert_eq!(
+            classify("Bash", &json!({"command": "mkdir -p core/generated"}), None)
+                .decision
+                .decision,
+            "pending_approval"
+        );
+    }
+
     /// `cd` decides what every piece after it does, so it is judged by where it lands rather than
     /// by being on a list. Only ever deeper — which is what makes reading the later pieces against
     /// the outer `cwd` safe rather than merely convenient.
@@ -2341,12 +2426,13 @@ mod tests {
 
     /// Bumped once per policy change: 3 widened the allow list, 4 made the classifier read a line
     /// as the sequence it is, 5 stopped counting a stream join as a file write and let `echo`/`test`
-    /// through. The version is stamped onto every `shadow_decisions` row, so it is the only thing
-    /// that tells two differently-classified decisions apart after the fact — leaving it at 2 would
-    /// make the night of 2026-08-08 and everything after it look alike.
+    /// through, 6 let `mkdir` place a directory inside the workspace. The version is stamped onto
+    /// every `shadow_decisions` row, so it is the only thing that tells two differently-classified
+    /// decisions apart after the fact — leaving it at 2 would have made the night of 2026-08-08 and
+    /// everything after it look alike.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 5);
+        assert_eq!(CLASSIFIER_VERSION, 6);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
