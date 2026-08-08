@@ -482,11 +482,18 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             .await?;
     let stage = effective_status(&status, resume_status.as_deref());
 
-    let (round, dry_rounds, max_rounds, replan_done): (i64, i64, Option<i64>, i64) =
-        sqlx::query_as("SELECT round, dry_rounds, max_rounds, replan_done FROM jobs WHERE id = ?")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await?;
+    let (round, dry_rounds, max_rounds, replan_done, opened_by): (
+        i64,
+        i64,
+        Option<i64>,
+        i64,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT round, dry_rounds, max_rounds, replan_done, replan_run_id FROM jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
 
     // Deliberately NOT filtered by round, and the reason is worth writing down because filtering is
     // the obvious thing to reach for. A round closes only when every item in it is terminal, so an
@@ -535,7 +542,17 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     .bind(job_id)
     .fetch_optional(pool)
     .await?;
-    let round_opened_at = latest_replan.as_ref().map_or(0, |(id, _)| *id);
+    // `jobs.replan_run_id` and NOT the latest replan run, and the difference is a whole node.
+    //
+    // The latest replan may be the one deciding RIGHT NOW whether there is another round — it has
+    // opened nothing. Using its id moved the line the moment that node was spawned, which dropped
+    // this round's finished review out of view and made the review read `Pending` again. Measured
+    // on job 17, 2026-08-08: run 900179, a second review of a round whose queue had not changed,
+    // spawned between the replan being started and its answer being read. One wasted node per round.
+    //
+    // The column is the honest line because it is written by `open_the_next_round` and by
+    // `stop_after_replan` — the two places where a replan's answer has actually been acted on.
+    let round_opened_at = opened_by.unwrap_or(0);
     let review_run: Option<String> = sqlx::query_scalar(
         "SELECT status FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
          ORDER BY id DESC LIMIT 1",
@@ -4803,6 +4820,49 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// Starting a replan node must not make this round's finished review vanish.
+    ///
+    /// The review is scoped by "which replan opened this round", and reading that from the LATEST
+    /// replan run is wrong in exactly one window: while a replan is deciding whether there is a next
+    /// round, it has opened nothing. Its id moved the line anyway, the round's own review dropped
+    /// out of view, and the job spawned a second one over a queue that had not changed.
+    ///
+    /// Measured on job 17, 2026-08-08 — run 900179, one wasted node per round. `jobs.replan_run_id`
+    /// is the honest line because it is written where a replan's answer is acted on, not where the
+    /// node is started.
+    #[tokio::test]
+    async fn a_replan_in_flight_does_not_make_this_rounds_review_look_unrun() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "passed"]).await;
+        sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_node(&pool, job_id, "review", "completed").await;
+
+        // The round's review has landed, so the round closes into a replan.
+        let before = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(before.review, ReviewState::Done);
+        assert_eq!(next_step(&before), Next::SpawnReplan);
+
+        // ...and now that node exists and is thinking. Nothing about the round changed.
+        seed_node(&pool, job_id, "replan", "running").await;
+
+        let during = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(
+            during.review,
+            ReviewState::Done,
+            "the review this round already had was still had"
+        );
+        assert_eq!(
+            next_step(&during),
+            Next::Wait,
+            "waiting for the replan, not paying for a second review of the same queue"
+        );
     }
 
     /// Ending #1. `completed` and not `stopped`, because the node that just looked at the work is
