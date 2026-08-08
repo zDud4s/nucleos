@@ -519,41 +519,46 @@ async fn pause_for_approval(
         return;
     }
 
-    let (session_id, project_id, job_id) =
-        sqlx::query_as::<_, (Option<String>, Option<String>, Option<i64>)>(
-            "SELECT session_id, project_id, job_id FROM runs WHERE id = ?",
+    let (session_id, project_id, job_id, stage) =
+        sqlx::query_as::<_, (Option<String>, Option<String>, Option<i64>, Option<String>)>(
+            "SELECT session_id, project_id, job_id, stage FROM runs WHERE id = ?",
         )
         .bind(run_id)
         .fetch_optional(&state.pool)
         .await
         .ok()
         .flatten()
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
 
-    // A node of a job takes the other road entirely — but only if it owns an item to put down.
+    // A node of a job takes the other road entirely, and three shapes of node take three roads.
     //
-    // Not every node does. A **plan** node runs before the queue exists and a **review** node runs
-    // after every item in it; neither is an item, and neither can be skipped, because a job with no
-    // queue has nothing to carry on to. Those two park and ask, exactly as an ordinary run does —
-    // so this change does NOT stop the night parking on the plan node, which is where the dogfood
-    // of 2026-08-07 parked first. Deliberate, and the cheaper half of the problem: a plan that
-    // asked once and was answered produces a queue that then runs unattended.
+    // An **item's** node is put down and the job carries on to the next item. A **review** node owns
+    // no item, but it does not need one: its verdict is advisory — §5.5 gives ship/no-ship to the
+    // gate — and everything it was going to read is already written, gated and checkpointed. Losing
+    // it costs an opinion. Parking on it costs the night. A **plan** node is the one that still
+    // parks: the queue is what it produces, so a job that skips it has nothing to carry on to.
     //
-    // The mark is what decides, and it is also step (2) of the skip — see `skip_the_item`. Doing it
-    // here rather than inside keeps "did this run own an item?" and "put it down" as one write:
-    // asking first and marking after would be a race with the same cancel/reconcile the mark is
-    // already guarded against.
+    // The review road is new, and it was measured rather than guessed. Chunk 2 put review and plan
+    // on the same road with one sentence, and two jobs in a row falsified it: job 12 on 2026-08-08
+    // parked its review node on `git reflog` and job 13 parked its own on a `for` loop, each after
+    // every item was already done and gated. Both sat until a person cancelled them.
+    //
+    // The mark is what decides for an item, and it is also step (2) of the skip — see
+    // `skip_the_item`. Doing it here rather than inside keeps "did this run own an item?" and "put
+    // it down" as one write: asking first and marking after would be a race with the same
+    // cancel/reconcile the mark is already guarded against.
     //
     // Read HERE and not before the termination above, deliberately: `job_id` does not change when a
     // run ends, and moving the read earlier would put an extra query on the hot path of every
     // ordinary run's hook, which is nearly all of them.
-    let skippable = match job_id {
-        Some(job_id) => put_the_item_down(&state.pool, job_id, run_id)
-            .await
-            .then_some(job_id),
-        None => None,
+    let road = match job_id {
+        Some(job_id) if put_the_item_down(&state.pool, job_id, run_id).await => {
+            Some((job_id, true))
+        }
+        Some(job_id) if stage.as_deref() == Some("review") => Some((job_id, false)),
+        _ => None,
     };
-    if let Some(job_id) = skippable {
+    if let Some((job_id, had_an_item)) = road {
         skip_the_item(
             state,
             SkippedItem {
@@ -564,6 +569,7 @@ async fn pause_for_approval(
                 tool_name,
                 tool_input,
                 reason,
+                had_an_item,
             },
         )
         .await;
@@ -662,6 +668,14 @@ struct SkippedItem {
     tool_name: String,
     tool_input: String,
     reason: String,
+    /// Whether this run owned an item whose half-written edits have to be undone.
+    ///
+    /// False for a review node, the other thing that takes this road, and the difference is not
+    /// cosmetic. A review node owns no item, so `footing_for_run` would answer for whichever item
+    /// ran last — and reverting to that footing would throw away the checkpoint of the job's final
+    /// item, which is the one thing the review existed to look at. A node that changes nothing by
+    /// design has nothing to revert.
+    had_an_item: bool,
 }
 
 /// Step (2) of the skip, and the question that decides whether there is a skip at all: mark this
@@ -718,6 +732,7 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
         tool_name,
         tool_input,
         reason,
+        had_an_item,
     } = item;
 
     // (3) Take the pause off the RUN. The caller terminated it to `awaiting_approval`, because at
@@ -762,21 +777,28 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
 
     // (4a) Put the tree back. The item wrote whatever it wrote before it asked, and the next item
     // must not build on a half-done change nobody approved.
-    let footing = crate::job::footing_for_run(&state.pool, job_id, run_id).await;
-    match (
-        crate::job::job_worktree_path(&state.pool, job_id).await,
-        footing,
-    ) {
-        (Some(worktree), Some(sha)) => {
-            if let Err(error) = crate::worktree::revert_to(&worktree, &sha).await {
-                tracing::warn!(run_id, job_id, %error, "pretooluse-decision: could not revert a skipped item");
+    //
+    // Only for an item. A review node reaches this function too and must NOT come through here:
+    // it owns no item, so `footing_for_run` would answer for whichever one ran last, and reverting
+    // to that footing would discard the checkpoint of the job's final item — the very work the
+    // review was there to read. A node that changes nothing by design has nothing to put back.
+    if had_an_item {
+        let footing = crate::job::footing_for_run(&state.pool, job_id, run_id).await;
+        match (
+            crate::job::job_worktree_path(&state.pool, job_id).await,
+            footing,
+        ) {
+            (Some(worktree), Some(sha)) => {
+                if let Err(error) = crate::worktree::revert_to(&worktree, &sha).await {
+                    tracing::warn!(run_id, job_id, %error, "pretooluse-decision: could not revert a skipped item");
+                }
             }
+            _ => tracing::warn!(
+                run_id,
+                job_id,
+                "pretooluse-decision: no worktree or no footing to revert a skipped item to"
+            ),
         }
-        _ => tracing::warn!(
-            run_id,
-            job_id,
-            "pretooluse-decision: no worktree or no footing to revert a skipped item to"
-        ),
     }
 
     // (4b) The proposal. A different `kind` from an action approval, and `wip.rs` counts only the
@@ -1844,8 +1866,8 @@ mod tests {
     /// project's concurrency slots until a restart notices.
     ///
     /// The queue is what the plan produces, so there is nothing to skip and nothing to carry on to.
-    /// It parks and asks, like any other run. A review node — which runs after every item — is the
-    /// same shape and takes the same road.
+    /// It parks and asks, like any other run — and it is the ONLY node that still does. A review
+    /// node owns no item either and stopped taking this road; see the test below for why.
     #[tokio::test]
     async fn a_jobs_plan_node_owns_no_item_so_it_parks_and_asks() {
         let state = test_state().await;
@@ -1883,6 +1905,87 @@ mod tests {
         );
         assert_eq!(pending[0].kind, "action-approval");
         assert_eq!(pending[0].run_id, Some(run_id));
+    }
+
+    /// A review node abandons the review rather than parking the job on it.
+    ///
+    /// It owns no item, so it used to take the plan node's road and park — and the cost of that is
+    /// the whole night, not one opinion. Its verdict is advisory (§5.5 gives ship/no-ship to the
+    /// gate), it runs after every item is written, gated and checkpointed, and it changes nothing
+    /// itself. So the job loses a review and finishes, which is the trade the right way round.
+    ///
+    /// Measured twice before it was changed: job 12 on 2026-08-08 parked its review node on
+    /// `git reflog` and job 13 parked its own on a `for` loop, each with all the real work already
+    /// done. Both sat until a person cancelled them.
+    ///
+    /// The run must end TERMINAL, and that is the whole mechanism — `load_view` already reads any
+    /// finished review as `ReviewState::Done` ("a review that failed is still a review that
+    /// happened"), so the round closes with no change to the state machine at all.
+    #[tokio::test]
+    async fn a_jobs_review_node_gives_up_the_review_instead_of_parking_the_job() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        // What makes it a review node: it owns no running item, and its stage says so.
+        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'review' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "for f in *.py; do cat \"$f\"; done"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "awaiting_approval",
+            "a review left parked stops the job it was only ever going to comment on"
+        );
+
+        // Nothing pending: `list_pending` filters `skipped-item` out, because it is a note rather
+        // than a queue — work NOT done waiting on a decision, not work done waiting to be read.
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds,
+            vec!["skipped-item"],
+            "what it asked for is still on the record for the morning"
+        );
+
+        // And the items it was going to read are untouched. A review node owns no item, so a revert
+        // here would target whichever ran last and throw away that item's checkpoint.
+        let item_statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert!(item_statuses.iter().all(|status| status == "passed"));
     }
 
     /// The write that must not be lost: an item left `running` in a job nobody drives makes
