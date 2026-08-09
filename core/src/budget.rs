@@ -81,11 +81,23 @@ pub struct SpendRow {
 /// zero/near-zero-duration run is never counted as $0 (spec §8.5: unmeasured cost is never free).
 const MIN_APPROX_SECONDS: i64 = 60;
 
-fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
-    let end = row.completed_at.unwrap_or(now);
-    let elapsed_seconds = (end - row.created_at).num_seconds();
+/// PURE: what a run that lasted `created_at`..`end` is assumed to have cost at `rate_per_hour`.
+///
+/// Public because the same approximation is written durably at termination (`runs.rs`) for a run
+/// that ended without reporting a cost. Two implementations of one number would drift, and the drift
+/// would show up as a total that moves the moment a stored value lands.
+pub fn time_approx_usd(created_at: DateTime<Utc>, end: DateTime<Utc>, rate_per_hour: f64) -> f64 {
+    let elapsed_seconds = (end - created_at).num_seconds();
     let seconds = elapsed_seconds.max(MIN_APPROX_SECONDS);
     (seconds as f64 / 3600.0) * rate_per_hour
+}
+
+fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
+    time_approx_usd(
+        row.created_at,
+        row.completed_at.unwrap_or(now),
+        rate_per_hour,
+    )
 }
 
 /// Total spend across `rows`, deduping resumed sessions and approximating unknown costs by time.
@@ -187,19 +199,20 @@ fn window_start(period: BudgetPeriod, now: DateTime<Utc>) -> DateTime<Utc> {
         .and_utc()
 }
 
+// (session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
+// created_at, completed_at)
+type RawRow = (
+    Option<String>,
+    Option<f64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<String>,
+);
+
 async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
-    // (session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
-    // created_at, completed_at)
-    type RawRow = (
-        Option<String>,
-        Option<f64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        String,
-        Option<String>,
-    );
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
                 created_at, completed_at
@@ -208,7 +221,32 @@ async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
     )
     .fetch_all(pool)
     .await?;
+    spend_rows(raw)
+}
 
+/// The runs one job has spent money on.
+///
+/// Not filtered by mode, unlike the global figure: every run carrying this `job_id` was started by
+/// the job, so the mode list would only be a way to miss one. Filtered by nothing else either —
+/// a job's budget is for the whole job, and clipping it to a calendar window would let a job that
+/// crossed midnight start again with a full purse.
+async fn job_rows(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Vec<SpendRow>> {
+    let raw: Vec<RawRow> = sqlx::query_as(
+        "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
+                created_at, completed_at
+         FROM runs
+         WHERE job_id = ?",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+    spend_rows(raw)
+}
+
+/// Spelled out twice above rather than assembled, because sqlx refuses SQL built at runtime — a
+/// guard worth keeping. What the two queries share is the parsing, and that lives here so a
+/// timestamp cannot come to mean two different things depending on which limit is asking.
+fn spend_rows(raw: Vec<RawRow>) -> sqlx::Result<Vec<SpendRow>> {
     let parse = |value: &str| -> sqlx::Result<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(value)
             .map(|dt| dt.with_timezone(&Utc))
@@ -242,6 +280,18 @@ async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
             },
         )
         .collect()
+}
+
+/// What one job has spent, all of it, deduplicated by session exactly as the global figure is.
+///
+/// The same arithmetic as the house limit and deliberately so: a resumed node shares its session
+/// with the run it resumed and must not be counted twice, and a run whose cost the CLI never
+/// reported is approximated from elapsed time rather than treated as free — *failing to measure a
+/// cost cannot mean treating it as zero* (decision of 2026-07-20).
+pub async fn job_spend(pool: &SqlitePool, job_id: i64, now: DateTime<Utc>) -> sqlx::Result<f64> {
+    let cfg = load_budget_config(pool).await?;
+    let rows = job_rows(pool, job_id).await?;
+    Ok(compute_spend(&rows, now, &cfg))
 }
 
 /// Total autonomous spend in the current budget window (calendar-anchored in UTC by the configured period).

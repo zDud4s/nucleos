@@ -804,3 +804,151 @@ describe("mail cursor, requeue and the attention heartbeat", () => {
     expectPostCall(2, `${DAEMON_URL}/autopilot/attention`, { project_id: "alpha" });
   });
 });
+
+/** The routes that had no client at all until the shell grew pages for them. */
+describe("the git queue, skipped items and jobs started by hand", () => {
+  it("lists every git request, and narrows to one project when asked", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([])).mockResolvedValueOnce(okJson([]));
+
+    await api.listVcsRequests(TOKEN);
+    expectGetCall(1, `${DAEMON_URL}/vcs/requests`);
+    await api.listVcsRequests(TOKEN, "alpha");
+    expectGetCall(2, `${DAEMON_URL}/vcs/requests?project_id=alpha`);
+  });
+
+  /**
+   * The bare route, never `/wait`. Both are the same read; `/wait` holds the connection open for
+   * `vcs::DEFAULT_WAIT`, which a page that already polls would spend for nothing.
+   */
+  it("reads one request without holding the connection open", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ id: 3, status: "failed", result_sha: null, failure_reason: "conflict" }),
+    );
+
+    await expect(api.getVcsRequest(TOKEN, 3)).resolves.toEqual({
+      id: 3, status: "failed", result_sha: null, failure_reason: "conflict",
+    });
+    expectGetCall(1, `${DAEMON_URL}/vcs/requests/3`);
+  });
+
+  /** Its own door: `/reject` guards on `action-approval` and would answer 409 for these rows. */
+  it("dismisses a skipped item through dismiss, not reject", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 204 });
+
+    await expect(api.dismissSkippedItem(TOKEN, 4)).resolves.toBe(true);
+    expectPostCall(1, `${DAEMON_URL}/proposals/4/dismiss`);
+  });
+
+  it("reads the skipped items from their own list", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await expect(api.getSkippedItems(TOKEN)).resolves.toEqual([]);
+    expectGetCall(1, `${DAEMON_URL}/proposals/skipped-items`);
+  });
+
+  /**
+   * Blank means "the house limit governs" and "one round", which is what `null` says on the wire.
+   * Sending `0` would say something else entirely — a job that may spend nothing and run no rounds.
+   */
+  it("sends null for a budget and a round count left blank", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({ job_id: 9 }) });
+
+    await expect(
+      api.createJob(TOKEN, { projectId: "alpha", prompt: "tidy the logs" }),
+    ).resolves.toEqual({ ok: true, jobId: 9 });
+    expectPostCall(1, `${DAEMON_URL}/jobs`, {
+      project_id: "alpha", prompt: "tidy the logs", budget_usd: null, max_rounds: null,
+    });
+  });
+
+  it("passes a budget and a round count through when they are given", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({ job_id: 10 }) });
+
+    await api.createJob(TOKEN, {
+      projectId: "alpha", prompt: "tidy the logs", budgetUsd: 2.5, maxRounds: 3,
+    });
+    expectPostCall(1, `${DAEMON_URL}/jobs`, {
+      project_id: "alpha", prompt: "tidy the logs", budget_usd: 2.5, max_rounds: 3,
+    });
+  });
+
+  /**
+   * The status alone cannot identify this refusal: `409` is both "the kill switch is engaged" and
+   * "no room", and those have different remedies. The daemon writes a sentence; it must survive.
+   */
+  it("carries the daemon's own words back for a refusal", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      text: async () => "the kill switch is engaged; nothing autonomous starts",
+    });
+
+    await expect(
+      api.createJob(TOKEN, { projectId: "alpha", prompt: "go" }),
+    ).resolves.toEqual({
+      ok: false,
+      status: 409,
+      reason: "the kill switch is engaged; nothing autonomous starts",
+    });
+  });
+
+  it("falls back to a sentence of its own when a refusal carries none", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 503, text: async () => "  " });
+
+    await expect(
+      api.createJob(TOKEN, { projectId: "alpha", prompt: "go" }),
+    ).resolves.toEqual({
+      ok: false, status: 503, reason: "The daemon refused this job and gave no reason.",
+    });
+  });
+});
+
+describe("moving an occurrence, reading the web, and the dictations", () => {
+  /** The daemon rejects a move with no length, so the duration always travels with it. */
+  it("sends the occurrence, where it is going, and how long it runs", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 204 });
+
+    await expect(
+      api.moveCalendarOccurrence(TOKEN, 5, "2026-08-03T09:00:00", "2026-08-04T14:00:00", 30),
+    ).resolves.toBe(true);
+    expectPostCall(1, `${DAEMON_URL}/calendar/events/5/move`, {
+      occurrence_local: "2026-08-03T09:00:00",
+      to_local: "2026-08-04T14:00:00",
+      duration_minutes: 30,
+    });
+  });
+
+  it("searches the web through the daemon rather than a provider directly", async () => {
+    const view = { cached: [], provider: "brave", results: [] };
+    fetchMock.mockResolvedValueOnce(okJson(view));
+
+    await expect(api.searchWeb(TOKEN, "rust sqlite")).resolves.toEqual({ ok: true, value: view });
+    expectPostCall(1, `${DAEMON_URL}/web/search`, { query: "rust sqlite", limit: null });
+  });
+
+  /** A pillar switched off is a 503 the caller can act on, never collapsed into a null. */
+  it("reports a disabled pillar as its own status rather than as nothing", async () => {
+    fetchMock.mockResolvedValueOnce(nonOk(503));
+
+    await expect(api.searchWeb(TOKEN, "anything")).resolves.toEqual({
+      ok: false, fault: "failed", status: 503,
+    });
+  });
+
+  it("reads a page by URL and keeps the requester off the wire", async () => {
+    const view = { id: 1, from_cache: false };
+    fetchMock.mockResolvedValueOnce(okJson(view));
+
+    await api.readWebPage(TOKEN, "https://example.com/a");
+    // No `requester` field: the daemon derives it from owner presence, and a field here would be a
+    // permission the caller grants itself.
+    expectPostCall(1, `${DAEMON_URL}/web/read`, { url: "https://example.com/a" });
+  });
+
+  it("reads the dictations from their own route, apart from the memos", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await expect(api.listVoiceDictations(TOKEN)).resolves.toEqual([]);
+    expectGetCall(1, `${DAEMON_URL}/voice/dictations`);
+  });
+});

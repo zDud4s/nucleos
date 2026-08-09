@@ -104,8 +104,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/chats/{chat_id}", get(get_assistant_chat))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
+        // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
+        // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
+        // that `/runs/awaiting-approval` raises does not arise here.
+        .route("/proposals/skipped-items", get(get_skipped_items))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
+        .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
         .route(
             "/vcs/requests",
             post(submit_vcs_request).get(list_vcs_requests),
@@ -680,7 +685,21 @@ async fn post_email_incoming(
         )
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        // Logged, not discarded. `|_|` here made a failed ingest into a 500 with an empty body and
+        // no line anywhere: the sidecar reported `daemon returned 500:` on every cycle, the cursor
+        // stayed put, and the mailbox went eight days unread with nothing in the log to say why.
+        // The message names the mailbox and the batch, because the two things worth knowing next
+        // are which mailbox stalled and whether it is one message or the whole batch that cannot
+        // land. It never names what a message SAYS — see `redact.rs`.
+        .map_err(|error| {
+            tracing::warn!(
+                mailbox = %body.mailbox,
+                batch = body.messages.len(),
+                %error,
+                "email ingest failed — the cursor stays put and the sidecar will retry"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
     })
     .await?
 }
@@ -2116,8 +2135,8 @@ async fn get_project_diff(
 /// — the same mechanism `abort()` uses on a run's task, with the same consequence: everything
 /// sequenced after the drop point is silently never done. That is only a missing reply when the
 /// handler reads; when it mutates durable state across awaits, it strands the half it had finished,
-/// and the half-states here (a `running` or `awaiting_approval` worktree run) block their whole
-/// project through `one_open_worktree_run_per_project` (migration 0009).
+/// and the half-states here (a `running` or `awaiting_approval` worktree run) hold one of their
+/// project's concurrency slots until something notices (`concurrency.rs`).
 ///
 /// Awaiting the JoinHandle leaves the response exactly as it was; dropping a JoinHandle only
 /// detaches its task, so the work still runs to the end. A panicking task becomes a 500 — the task
@@ -2665,6 +2684,48 @@ async fn get_proposals(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// What the night decided not to do, and why.
+///
+/// The half of the skip that was missing. A job's node that hits an action needing approval marks
+/// its item `skipped`, reverts the tree and lets the queue carry on — and files a `skipped-item`
+/// proposal so the morning knows what was set aside. `list_pending` deliberately does not carry
+/// those (approving one would resume nothing), which left the record with no door at all: measured
+/// on 2026-08-08, two items skipped and the only way to read either was to open the database.
+async fn get_skipped_items(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_skipped_items(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing skipped items failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Puts a read skipped item away. Its own door, not a third arm of `/reject`.
+///
+/// Nothing is being refused here and nothing is released — the job let go of the item and the
+/// worktree when it skipped, hours before anyone read this. Sharing `/reject` would give the two a
+/// single button whose label is wrong for one of them, and `reject_proposal` guards on
+/// `kind = 'action-approval'`, so that button would answer 409 half the time.
+async fn post_proposal_dismiss(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::proposals::dismiss_skipped_item(&state.pool, id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(crate::proposals::RejectError::NotFound) => Err(StatusCode::NOT_FOUND),
+        // Also the answer for a proposal of any other kind: nothing else is dismissable, and a
+        // caller that aimed this at an action approval wanted `/reject`.
+        Err(crate::proposals::RejectError::NotPending) => Err(StatusCode::CONFLICT),
+        Err(crate::proposals::RejectError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "dismissing a skipped item failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// Turns a merge decision's outcome into the answer the caller gets.
 ///
 /// The conflict is a 409 with a body, not a bare status: it is the one refusal here that names
@@ -2874,7 +2935,7 @@ struct CreateJobResponse {
 /// The whole creation is **uncancellable**. The job row is INSERTed `planning` before its worktree
 /// exists, and `git worktree add` holds that window open for as long as git takes. A request
 /// dropped inside it would strand a live job with no worktree, which the tick then drives forever
-/// while holding `one_live_job_per_project` — taking the project's whole autonomy down with it.
+/// while holding one of the project's concurrency slots, which nothing but the sweep gives back.
 /// Same window `create_run` documents, and wider here, because provisioning a job's worktree is
 /// the slowest thing this route does.
 ///
@@ -2941,6 +3002,12 @@ async fn create_job(
                 // has no field for it. `.ai/autopilot.yaml` may only lower the fan-out, and an HTTP
                 // body filled in by a model is reviewed even less than that file is.
                 max_items: crate::config::MAX_ITEMS_CEILING as i64,
+                // These two DO come from the caller, unlike `max_items`, and the asymmetry is the
+                // point. `max_items` is fan-out per round and has a hard ceiling nobody may raise;
+                // these are how long and how much, which are the caller's to choose — under
+                // `MAX_ROUNDS_CEILING` and under the house budget, both applied on the way in.
+                max_rounds: request.max_rounds,
+                budget_usd: request.budget_usd,
                 gate_each: true,
                 review: true,
                 head_sha: head_sha.as_deref(),
@@ -2955,10 +3022,10 @@ async fn create_job(
         crate::job::JobStart::Started(job_id) => {
             Ok((StatusCode::CREATED, Json(CreateJobResponse { job_id })))
         }
-        crate::job::JobStart::AlreadyLive => Err((
-            StatusCode::CONFLICT,
-            "this project already has a live job".to_string(),
-        )),
+        // Still a 409, and still not a 500: no room is a state the asker can act on by waiting. The
+        // reason travels because the two ceilings have different remedies — one waits for this
+        // project's own work, the other for anybody's.
+        crate::job::JobStart::NoRoom(reason) => Err((StatusCode::CONFLICT, reason)),
         // Past the INSERT: the row existed and `fail_early` retired it and said so in the feed. 500
         // rather than 409, because nothing the caller could change would have helped.
         crate::job::JobStart::Failed => Err((
@@ -5555,9 +5622,8 @@ mod tests {
     /// `rejected`, and only then is the paused run discarded and its worktree slot freed. A client
     /// that disconnects cancels the request, dropping the handler future the way `abort()` drops a
     /// run's — and what is left behind cannot be undone through the same door, because the proposal
-    /// is no longer `pending` and a retry answers 409. The run stays `awaiting_approval`, which
-    /// `one_open_worktree_run_per_project` (migration 0009) turns into a project-wide block that
-    /// only the separate release queue can lift.
+    /// is no longer `pending` and a retry answers 409. The run stays `awaiting_approval`, holding
+    /// a concurrency slot that only the separate release queue — or the sweep — can lift.
     #[tokio::test]
     async fn a_dropped_reject_request_still_discards_the_paused_run() {
         use std::future::Future;
@@ -5863,18 +5929,19 @@ mod tests {
     }
 
     fn create_job_request(project_id: &str) -> Request<Body> {
+        create_job_request_with(serde_json::json!({
+            "project_id": project_id,
+            "prompt": "build the thing",
+        }))
+    }
+
+    fn create_job_request_with(body: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri("/jobs")
             .header("Authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "project_id": project_id,
-                    "prompt": "build the thing",
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     }
 
@@ -5939,6 +6006,90 @@ mod tests {
         assert_eq!(branch, format!("nucleos/job-{job_id}"));
     }
 
+    /// The two numbers a caller may choose, and the one it may not.
+    ///
+    /// `max_rounds` and `budget_usd` are how long and how much, which are the caller's to say —
+    /// under the daemon's ceiling and under the house budget. `max_items` is fan-out per round and
+    /// has no field at all: `.ai/autopilot.yaml` may lower it and nobody may raise it.
+    ///
+    /// The ceiling is asserted on the STORED row rather than on behaviour, because that is where it
+    /// is applied: a number cut on the way in is a promise the row itself keeps, where one cut at
+    /// read time is a promise every future reader has to remember.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_caller_may_ask_for_rounds_and_a_budget_but_not_for_more_fan_out() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-rounds-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request_with(serde_json::json!({
+                "project_id": "p",
+                "prompt": "build the thing",
+                "max_rounds": 10_000,
+                "budget_usd": 4.5,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["job_id"]
+            .as_i64()
+            .unwrap();
+
+        let (max_rounds, budget, max_items): (i64, Option<f64>, i64) =
+            sqlx::query_as("SELECT max_rounds, budget_usd, max_items FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            max_rounds,
+            crate::config::MAX_ROUNDS_CEILING,
+            "cut on the way in, so the row is the promise"
+        );
+        assert_eq!(budget, Some(4.5));
+        assert_eq!(
+            max_items,
+            crate::config::MAX_ITEMS_CEILING as i64,
+            "fan-out is the daemon's number, never the caller's"
+        );
+    }
+
+    /// A job nobody said anything about is a job of one round under the house limit — which is
+    /// exactly what it was before rounds existed, and what every `graph:` rule keeps being.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_that_asked_for_nothing_is_a_job_of_one_round() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-oneround-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let (max_rounds, budget): (i64, Option<f64>) =
+            sqlx::query_as("SELECT max_rounds, budget_usd FROM jobs ORDER BY id DESC LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(max_rounds, 1);
+        assert_eq!(budget, None, "only the house limit governs");
+    }
+
     /// The emergency stop is checked before anything is written, and it fails closed.
     // Holds `worktree::test_env_lock()` across its awaits on purpose: serialising the
     // process-wide NUCLEOS_WORKTREE_ROOT override is the whole reason that lock exists. A
@@ -5965,8 +6116,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        // Nothing written, not merely nothing driven. A row created and then refused would hold
-        // `one_live_job_per_project` against a project that has no job.
+        // Nothing written, not merely nothing driven. A row created and then refused would sit in
+        // the listing forever as a job that never began.
         assert_eq!(job_count(&pool).await, 0);
     }
 
@@ -6012,7 +6163,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn um_segundo_job_no_mesmo_projeto_e_recusado_pelo_indice() {
+    async fn um_projeto_corre_ate_ao_tecto_de_slots_e_o_seguinte_leva_409() {
         let _lock = crate::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-second-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -6020,6 +6171,14 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+        // The house ceiling out of the way, so this measures the per-project one. They bound
+        // different resources and a test that hit whichever came first would not say which.
+        sqlx::query(
+            "UPDATE autopilot_global SET max_concurrent_slots = 2, max_concurrent_total = 9",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let first = build_router(state.clone())
             .oneshot(create_job_request("p"))
@@ -6027,13 +6186,22 @@ mod tests {
             .unwrap();
         assert_eq!(first.status(), StatusCode::CREATED);
 
-        let second = build_router(state)
+        // This is what the chunk delivers, and it was impossible until 0053: a second live job for
+        // the same project.
+        let second = build_router(state.clone())
             .oneshot(create_job_request("p"))
             .await
             .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
 
-        assert_eq!(second.status(), StatusCode::CONFLICT);
-        assert_eq!(job_count(&pool).await, 1);
+        let third = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::CONFLICT);
+        // And no row for the one that was turned away: `start` asks before it inserts, so a project
+        // sitting at its ceiling does not accumulate retired jobs that never began.
+        assert_eq!(job_count(&pool).await, 2);
     }
 
     /// A job from this route is driven by the same tick, down the same path.
@@ -7387,6 +7555,112 @@ mod tests {
         assert_eq!(entries[1]["tool_name"], "Edit");
         assert_eq!(entries[1]["reasoning"], "second pending");
         assert_eq!(entries[1]["run_id"], 11);
+    }
+
+    /// The route that was missing. A job that skipped two items on 2026-08-08 filed two of these
+    /// and nothing served them, so the record justifying the whole skip could only be read by
+    /// opening the database — and `/proposals` must keep NOT serving them, because approving one
+    /// resumes nothing.
+    #[tokio::test]
+    async fn skipped_items_have_a_door_of_their_own_and_can_be_put_away() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        proposals::create_action_approval(&pool, 10, Some("s10"), Some("p"), "Bash", "asked", None)
+            .await
+            .unwrap();
+        let skipped = proposals::create_skipped_item(
+            &pool,
+            11,
+            Some("s11"),
+            Some("p"),
+            "Bash",
+            "unrecognized shell commands and code execution require approval",
+            Some(r#"{"command":"python -m unittest test_greet -v"}"#),
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/proposals/skipped-items")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the action approval must not appear here");
+        assert_eq!(entries[0]["id"], skipped);
+        // `tool_input` is the whole point of the record: it is what tells an item worth picking up
+        // in the morning from one worth dropping.
+        assert!(
+            entries[0]["tool_input"]
+                .as_str()
+                .unwrap()
+                .contains("unittest")
+        );
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{skipped}/dismiss"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            proposals::list_skipped_items(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The approval queue never saw any of this.
+        assert_eq!(proposals::list_pending(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dismissing_an_action_approval_is_a_conflict_not_a_silent_discard() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let approval = proposals::create_action_approval(
+            &pool,
+            10,
+            Some("s10"),
+            Some("p"),
+            "Bash",
+            "asked",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{approval}/dismiss"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // An action approval holds a paused run and its worktree. Putting it away here would
+        // release neither, and the project would keep its exclusivity slot spent until a restart.
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(proposals::list_pending(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

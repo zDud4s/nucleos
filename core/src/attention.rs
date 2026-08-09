@@ -121,10 +121,25 @@ fn defer(scope: AttentionScope, reason: impl Into<String>) -> AttentionDecision 
     }
 }
 
+/// Whether an in-flight run is evidence that the OWNER is here.
+///
+/// This function used to answer two questions under one name, and only one of them was ever about
+/// attention:
+///
+/// 1. *Is there already a run in flight in this project?* — that is concurrency, and it left. It is
+///    `concurrency.rs`'s slot ceiling now, which can say "two" where this could only ever say "one".
+/// 2. *Is the owner at the keyboard?* — that stayed, and it is what protects your nights.
+///
+/// The subtlety that survives the split is the one that made the old shape work by accident: **an
+/// assistant turn is evidence of presence.** A run with no `project_id` is a turn you are having
+/// with the daemon right now, and it deferred for the wrong reason (concurrency) with exactly the
+/// right effect (you are in Telegram, so you are awake). It still defers, now for the stated reason.
+///
+/// Without that carve-out the split would have been a silent safety regression: send a message at
+/// 23:00 and the daemon concludes nobody is there.
 async fn in_flight_attention(
     pool: &SqlitePool,
     run_handles: &RunHandles,
-    project_id: &str,
 ) -> Result<Option<(AttentionScope, i64)>, String> {
     // Never hold the process-wide mutex across SQLite awaits. A handle removed after this snapshot
     // can defer at most one scheduler tick; a handle added afterwards is seen on the next tick.
@@ -145,12 +160,9 @@ async fn in_flight_attention(
 
         match run_project {
             Some(None) => return Ok(Some((AttentionScope::Global, run_id))),
-            Some(Some(run_project_id)) if run_project_id == project_id => {
-                return Ok(Some((
-                    AttentionScope::Project(project_id.to_string()),
-                    run_id,
-                )));
-            }
+            // A run that belongs to a project is autonomous work, whatever project it is. It says
+            // the machine is busy, which is the slot ceiling's business, and nothing at all about
+            // whether anyone is watching.
             Some(Some(_)) => {}
             None => {
                 return Err(format!("in-flight run {run_id} has no durable run record"));
@@ -162,17 +174,20 @@ async fn in_flight_attention(
 }
 
 /// Fails CLOSED on a broken signal read, while allowing the valid empty state where no client has
-/// ever posted a heartbeat. In-flight daemon runs are attention too: model work outlives the request
-/// that started it, so the live handle map is checked before the expiring heartbeat rows.
+/// ever posted a heartbeat. An assistant turn in flight is attention too: model work outlives the
+/// request that started it, so the live handle map is checked before the expiring heartbeat rows.
+///
+/// Asks one question, since the split: is the owner here? How many pieces of work a project may run
+/// at once is `concurrency.rs`'s, and used to be answered here under the same name.
 pub async fn attention_permits_new_run(
     pool: &SqlitePool,
     run_handles: &RunHandles,
     project_id: &str,
     now: DateTime<Utc>,
 ) -> AttentionDecision {
-    match in_flight_attention(pool, run_handles, project_id).await {
+    match in_flight_attention(pool, run_handles).await {
         Ok(Some((scope, run_id))) => {
-            let reason = format!("run {run_id} is still in flight in {}", scope.label());
+            let reason = format!("turn {run_id} is still in flight in {}", scope.label());
             return defer(scope, reason);
         }
         Ok(None) => {}
@@ -366,10 +381,23 @@ mod tests {
         assert!(reason.contains("could not read"), "got: {reason}");
     }
 
+    /// The split, pinned from both sides — and the second half is the one that matters.
+    ///
+    /// This function used to answer "is there already a run in flight in this project?" and defer on
+    /// it. That is concurrency, and it moved to `concurrency.rs`, which can say "two" where this
+    /// could only ever say "one". So autonomous work in a project no longer defers that project.
+    ///
+    /// What did NOT move is that **an assistant turn is evidence of presence**. A run with no
+    /// `project_id` is a conversation you are having with the daemon right now; under the old shape
+    /// it deferred for the wrong reason with exactly the right effect. Without this half the split
+    /// would be a silent safety regression: send a message at 23:00 and the daemon concludes nobody
+    /// is there.
     #[tokio::test]
-    async fn an_in_flight_run_is_attention_only_for_its_project() {
+    async fn a_turn_is_presence_but_a_projects_own_work_is_not() {
         let pool = test_pool().await;
-        let run_id = sqlx::query(
+        let now = timestamp("2026-07-29T12:00:00Z");
+
+        let autonomous = sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
              VALUES ('project-a', 'work', 'running', 'worktree', '2026-07-29T12:00:00Z')",
         )
@@ -377,23 +405,40 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid();
-        let task = tokio::spawn(std::future::pending::<()>());
+        let work = tokio::spawn(std::future::pending::<()>());
         let handles = no_runs();
-        handles.lock().unwrap().insert(run_id, task.abort_handle());
+        handles
+            .lock()
+            .unwrap()
+            .insert(autonomous, work.abort_handle());
 
-        let now = timestamp("2026-07-29T12:00:00Z");
+        assert_eq!(
+            attention_permits_new_run(&pool, &handles, "project-a", now).await,
+            AttentionDecision::Allow,
+            "a project's own autonomous work is the slot ceiling's business, not attention's"
+        );
+
+        // A turn: no project, because it belongs to the conversation rather than to a repository.
+        let turn = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('are you there', 'running', 'shadow', '2026-07-29T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let talking = tokio::spawn(std::future::pending::<()>());
+        handles.lock().unwrap().insert(turn, talking.abort_handle());
+
         let AttentionDecision::Defer { reason, scope } =
             attention_permits_new_run(&pool, &handles, "project-a", now).await
         else {
-            panic!("an in-flight run must defer its project");
+            panic!("a turn in flight means somebody is awake");
         };
-        assert_eq!(scope, AttentionScope::Project("project-a".to_string()));
-        assert!(reason.contains(&run_id.to_string()), "got: {reason}");
-        assert_eq!(
-            attention_permits_new_run(&pool, &handles, "project-b", now).await,
-            AttentionDecision::Allow
-        );
+        assert_eq!(scope, AttentionScope::Global);
+        assert!(reason.contains(&turn.to_string()), "got: {reason}");
 
-        task.abort();
+        work.abort();
+        talking.abort();
     }
 }

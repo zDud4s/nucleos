@@ -55,14 +55,14 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git`, `add_worktree` and `repo_key` are the only sanctioned production entries**, and a new
-/// caller belongs behind one of them rather than here: each is a place where whatever is left of the
-/// operation's budget is computed and an already-spent one is refused *before* a child is spawned,
-/// which `output()` would otherwise do eagerly. `repo_key` is the third, and it is on the list
-/// because it passes that same test rather than because it arrived later — it computes its own
-/// remaining budget and returns without spawning when there is none. A caller that reaches past the
-/// three takes its `Duration` from somewhere else and quietly loses that gate. Naming them makes the
-/// gate greppable rather than conventional. The tests below call this directly on purpose — they are
+/// **`git`, `add_worktree`, `repo_key` and `current_branch` are the only sanctioned production
+/// entries**, and a new caller belongs behind one of them rather than here: each is a place where
+/// whatever is left of the operation's budget is computed and an already-spent one is refused
+/// *before* a child is spawned, which `output()` would otherwise do eagerly. `repo_key` and
+/// `current_branch` are on the list because they pass that same test rather than because they
+/// arrived later — each computes its own remaining budget and returns without spawning when there is
+/// none. A caller that reaches past the four takes its `Duration` from somewhere else and quietly
+/// loses that gate. Naming them makes the gate greppable rather than conventional. The tests below call this directly on purpose — they are
 /// testing the transport itself.
 ///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
@@ -374,6 +374,71 @@ pub async fn repo_key(path: &Path, deadline: std::time::Instant) -> Result<Strin
     }
 
     canonical(Path::new(common_dir.trim())).await
+}
+
+/// The branch a worktree has checked out, or why that question has no usable answer.
+///
+/// Approving a paused run's `git merge X` has to know what X would have been merged INTO, and the
+/// answer is the branch the run's own worktree stands on. Nothing else in the system records it:
+/// `worktrees.path` is where, not what.
+///
+/// **`--show-toplevel` is asked for and checked for the reason `repo_key` documents at length**, and
+/// the consequence of skipping it is worse here than there. `git -C <dir>` walks UP until it finds a
+/// repository, so a path that has been removed — and a resumed run's worktree can be — answers with
+/// the enclosing checkout's branch, cheerfully and with exit code 0. The queue would then be handed
+/// a merge into whatever branch the MAIN checkout happens to have open. A wrong answer that looks
+/// exactly like a right one is the failure mode this guard exists for.
+///
+/// A detached HEAD is `Ok("HEAD")` rather than an error: it is a fact about the worktree, not a
+/// failure to find one out, and `vcs::merge_from_command` is where the decision to refuse it lives —
+/// alongside the other reasons a command is not queueable, rather than split across two modules.
+///
+/// A fourth sanctioned entry to `run_git` (see its doc comment): it computes what is left of the
+/// budget and refuses before spawning, which is the property that comment protects.
+pub async fn current_branch(path: &Path, deadline: std::time::Instant) -> Result<String, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err("the operation ran out of time before the branch could be read".to_owned());
+    }
+
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--show-toplevel"),
+            OsStr::new("--abbrev-ref"),
+            OsStr::new("HEAD"),
+        ],
+        budget,
+    )
+    .await?;
+    if !result.succeeded() {
+        return Err(format!(
+            "{} is not inside a git repository: {}",
+            path.display(),
+            result.output_tail.trim()
+        ));
+    }
+
+    // Order is fixed by the argv above: the top level first, then HEAD abbreviated.
+    let mut lines = result.stdout.lines();
+    let (Some(toplevel), Some(branch)) = (lines.next(), lines.next()) else {
+        return Err(format!(
+            "git did not report both a top level and a branch for {}",
+            path.display()
+        ));
+    };
+
+    let toplevel = canonical(Path::new(toplevel.trim())).await?;
+    if canonical(path).await? != toplevel {
+        return Err(format!(
+            "{} is not the root of a worktree — it sits inside {toplevel}",
+            path.display()
+        ));
+    }
+
+    Ok(branch.trim().to_owned())
 }
 
 /// A path in the one spelling the filesystem itself uses.
@@ -967,7 +1032,9 @@ pub(crate) mod tests {
             .expect("create space-free tempdir")
     }
 
-    fn initialize_repo(repo: &Path) {
+    /// `pub(crate)` for `runs.rs`, which needs a real repository to test the approval path against —
+    /// the same reason `space_free_tempdir` above is.
+    pub(crate) fn initialize_repo(repo: &Path) {
         std::fs::create_dir_all(repo).expect("create repository directory");
         assert!(git_ok(repo, &[OsStr::new("init")]));
         assert!(git_ok(
@@ -2310,6 +2377,96 @@ pub(crate) mod tests {
 
         assert!(
             error.contains("is not inside a git repository"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The branch a worktree stands on, which is what an approved `git merge X` merges INTO.
+    #[tokio::test]
+    async fn the_branch_a_worktree_stands_on_is_readable() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-branch-");
+
+        // `git init` picks `master` or `main` depending on the installed default, and which one it
+        // chose is not this function's business — that HEAD's branch is what comes back is.
+        let initial = current_branch(&repo, deadline()).await.unwrap();
+        assert!(matches!(initial.as_str(), "master" | "main"), "{initial}");
+
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        assert_eq!(current_branch(&repo, deadline()).await.unwrap(), "feat/x");
+    }
+
+    /// A detached HEAD is an answer, not a failure. The decision to refuse it as a merge target is
+    /// `vcs::merge_from_command`'s, so that every reason a command is unqueueable lives in one place
+    /// rather than half here and half there.
+    #[tokio::test]
+    async fn a_detached_head_is_reported_rather_than_refused() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-detached-");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("--detach")]
+        ));
+
+        assert_eq!(current_branch(&repo, deadline()).await.unwrap(), "HEAD");
+    }
+
+    /// The walk-up guard, and here it is worth more than it is for `repo_key`.
+    ///
+    /// A wrong key is refused downstream by a project that does not match; a wrong BRANCH is a
+    /// perfectly ordinary name that the queue would then merge into. Asked about a directory that is
+    /// not a worktree root — a subdirectory, or a resumed run's worktree that has since been removed
+    /// — `git -C` walks up and answers about the enclosing checkout with exit code 0.
+    #[tokio::test]
+    async fn a_directory_inside_a_worktree_is_not_given_that_worktrees_branch() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-branch-inside-");
+        let inside = repo.join("subdir");
+        std::fs::create_dir(&inside).expect("create subdirectory");
+
+        let error = current_branch(&inside, deadline()).await.unwrap_err();
+
+        assert!(
+            error.contains("not the root of a worktree"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The other refusal, and — like `a_directory_outside_every_repository_has_no_key`, whose doc
+    /// comment argues this at length — it does NOT use `space_free_tempdir`, because that helper
+    /// builds under the checkout and so inside this very repository. Written that way the test would
+    /// pass through the top-level guard instead, and the non-zero-exit branch could be deleted whole
+    /// with the suite still green.
+    #[tokio::test]
+    async fn a_directory_outside_every_repository_has_no_branch() {
+        let container = tempfile::tempdir().expect("create a temp directory outside the checkout");
+
+        let error = current_branch(container.path(), deadline())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains("is not inside a git repository"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A spent budget refuses before spawning, which is what puts this on `run_git`'s sanctioned
+    /// list at all.
+    #[tokio::test]
+    async fn reading_a_branch_on_an_exhausted_budget_refuses_before_running_git() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-branch-budget-");
+
+        let error = current_branch(&repo, std::time::Instant::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains("ran out of time"),
             "unexpected error: {error}"
         );
     }

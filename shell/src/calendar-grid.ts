@@ -204,3 +204,47 @@ export function localStamp(day: Date, hour: number, minute = 0): string {
     `T${pad(hour)}:${pad(minute)}:00`
   );
 }
+
+/**
+ * What `<input type="datetime-local">` produced, in the spelling the daemon parses.
+ *
+ * The two formats differ by exactly the seconds field: the control yields `2026-08-03T09:00` and
+ * `calendar::LOCAL_FORMAT` is `%Y-%m-%dT%H:%M:%S`, which does not treat them as optional. A browser
+ * that includes seconds (some do, once the step attribute allows them) is passed through unchanged.
+ *
+ * `null` for anything else, including the empty string a cleared control gives — the daemon answers
+ * 400 for an unparseable stamp, and asking it to say so is a round trip to learn what the shape of
+ * the string already said.
+ */
+export function stampFromInput(value: string): string | null {
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return `${value}:00`;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(value)) return value;
+  return null;
+}
+
+/**
+ * The inverse, for prefilling the control from a stamp the daemon gave us.
+ *
+ * Truncating rather than reformatting: the stamp is already local wall-clock text, and putting it
+ * through a `Date` would apply this machine's offset to a string that never had one.
+ */
+export function inputFromStamp(stamp: string): string {
+  return stamp.slice(0, 16);
+}
+
+/**
+ * How long one occurrence runs, in whole minutes.
+ *
+ * Needed because moving an occurrence writes a whole exception row, and the daemon rejects one with
+ * a non-positive duration — a moved occurrence with no length is not a shorter event but an
+ * unreadable one. Derived from the occurrence in hand so that "move" means move and nothing else.
+ *
+ * Rounded rather than floored: a 30-minute block whose ends arrive a millisecond apart from the
+ * clock should stay 30 minutes, not become 29.
+ */
+export function occurrenceMinutes(startsAt: string, endsAt: string): number {
+  const minutes = Math.round(
+    (new Date(endsAt).getTime() - new Date(startsAt).getTime()) / 60_000,
+  );
+  return Number.isFinite(minutes) ? minutes : 0;
+}

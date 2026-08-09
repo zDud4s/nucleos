@@ -7,6 +7,7 @@ mod backup;
 mod budget;
 mod calendar;
 mod classifier;
+mod concurrency;
 mod config;
 mod contacts;
 mod daemon_client;
@@ -217,6 +218,17 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "orphaned-job reconciliation failed"),
     }
 
+    // After both owner reconciliations above, and that order is the whole correctness of this pass:
+    // it frees a slot by asking whether its owner is still live, and before those two every dead
+    // owner still reads live. Run earlier it would free nothing at all.
+    match concurrency::reconcile_orphaned_slots(&pool).await {
+        Ok(freed) if freed > 0 => {
+            tracing::warn!("freed {freed} concurrency slot(s) left held by a previous crash");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned concurrency slot sweep failed"),
+    }
+
     // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
     // below: louder than the sweep, quieter than the panics.
     //
@@ -397,6 +409,8 @@ async fn main() {
     // every unrelated daemon service.
     let claude_runner = || runner::ClaudeCliRunner {
         model: models_config.claude_model.clone(),
+        plan_model: models_config.plan_model.clone(),
+        review_model: models_config.review_model.clone(),
     };
     let configured_runner = models_config.primary_runner.as_deref();
     let primary_runner: Arc<dyn runner::CommandRunner> = match configured_runner {

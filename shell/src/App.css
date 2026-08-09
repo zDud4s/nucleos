@@ -720,6 +720,16 @@ details.scoreboard th {
 .rd-gate > pre { flex-basis: 100%; }
 .rd-out > summary { color: var(--muted); font-size: var(--fs-xs); cursor: pointer; }
 
+/* Separado por uma linha do resto do detalhe: o botão que está aqui apaga uma worktree, e não deve
+   parecer o próximo item de uma lista de factos sobre o run. */
+.rd-parked {
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: var(--sp-2);
+}
+
 /* Procurar no registo. Fechado por omissão — a página responde "o que precisa de mim agora", e
    um formulário sempre aberto empurra essa resposta para baixo. */
 .feed-search > summary {
@@ -730,6 +740,17 @@ details.scoreboard th {
 }
 .feed-search > summary:hover { color: var(--text); }
 .feed-search .filters { margin-bottom: var(--sp-3); }
+
+/* Fechado pela mesma razão que `.feed-search`: o painel responde "o que está a correr", e um
+   formulário sempre aberto por cima da lista responde outra pergunta antes dessa. */
+.job-new > summary {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+}
+.job-new > summary:hover { color: var(--text); }
+.job-new[open] { margin-bottom: var(--sp-4); }
 
 /* ── Regras de um projeto ───────────────────────────────── */
 
@@ -1133,6 +1154,16 @@ details.scoreboard th {
 .s-name, .b-name, .t-name { font: 400 var(--fs-sm) var(--mono); color: var(--text); }
 .s-reason, .b-meta { color: var(--muted); font-size: var(--fs-xs); margin-left: auto; }
 .backups li > .btn, .tokens li > .btn { margin-left: auto; }
+
+/* O que o sidecar disse, em linha própria por baixo do resto. A `li` é `flex` numa linha só, e uma
+   frase de erro do processo esmagaria o nome e o estado contra a margem se ficasse ao lado deles. */
+.subsystems li:has(.s-said) { flex-wrap: wrap; }
+.s-said {
+  flex-basis: 100%;
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
 .tokens li > time { color: var(--faint); font-size: var(--fs-xs); margin-left: auto; }
 
 .minted {
@@ -1262,6 +1293,23 @@ details.scoreboard th {
    pensamentos separados numa parede de texto. */
 .v-text { margin: 0; font-size: var(--fs-sm); line-height: 1.55; white-space: pre-wrap; }
 
+/* O que foi ouvido, por baixo do que ficou. Recuado e esbatido porque é o termo de comparação, não
+   o texto — quem lê está a ver o que a limpeza mudou, não a ler a transcrição outra vez. */
+.v-raw {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-3);
+  border-left: 1px solid var(--line);
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  white-space: pre-wrap;
+}
+.v-raw-label {
+  display: block;
+  font: 400 var(--fs-2xs) var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 /* Os dois botões de ditado. Em fila, com o memo a seguir ao ditado, porque é a ação menos frequente
    e a que não escreve em lado nenhum. */
 .v-actions { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); flex-wrap: wrap; }
@@ -1320,4 +1368,114 @@ details.scoreboard th {
   margin: var(--sp-3) 0;
   max-height: 60vh;
   overflow-y: auto;
+}
+
+/* A barra de endereço, que é o que é: um campo e um botão, sem ar de navegador. */
+.web-fetch { display: flex; gap: var(--sp-2); align-items: center; }
+.web-fetch input { flex: 1; min-width: 0; font: 400 var(--fs-sm) var(--mono); }
+
+/* Os destinos do provedor. Recuados face ao arquivo de propósito: nada disto foi lido, nada disto
+   foi julgado por regra nenhuma, e ler um deles é um ato com consequências. */
+.web-out { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.web-out li {
+  display: grid;
+  gap: 2px;
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--line);
+  justify-items: start;
+}
+.web-out li:first-child { border-top: 0; }
+.web-out__title { font-size: var(--fs-sm); font-weight: 500; }
+.web-out__url {
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+/* Cortado a duas linhas pela razão de `.web-row__snippet`: é texto de um estranho e não pode
+   empurrar a lista para fora do ecrã só por ser longo. */
+.web-out__snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+}
+
+/* --- Waiting: o que parou e espera por uma pessoa ------------------------------------------- */
+
+/* Listas de linhas, não de cartões. A `.approval-card` é vidro porque cada cartão ali é uma decisão
+   a tomar agora; nenhuma destas três é — a fila git é leitura, os runs são um ponteiro, e os itens
+   saltados já não têm ninguém à espera. Dar-lhes o mesmo peso visual dizia o contrário. */
+.vcs-list,
+.waiting-list,
+.skipped-list {
+  list-style: none;
+  margin: var(--sp-3) 0 0;
+  padding: 0;
+}
+
+.vcs-row,
+.waiting-list li,
+.skipped-row {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--line);
+}
+.vcs-list li:first-child,
+.waiting-list li:first-child,
+.skipped-list li:first-child { border-top: 0; }
+
+.vcs-row__head,
+.waiting-row__head,
+.skipped-row__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--faint);
+}
+.vcs-row__head b,
+.waiting-row__head b,
+.skipped-row__head b { color: var(--muted); font-weight: 500; }
+.waiting-row__head .proj,
+.skipped-row__head .proj { color: var(--muted); }
+
+.vcs-row__meta {
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--faint);
+}
+.vcs-row__meta .proj { color: var(--muted); }
+
+/* A chave do repositório em monoespaçado e esbatida: é o que diz se duas linhas com nomes diferentes
+   estavam na mesma fila, e é para ser comparada com os olhos, não lida. */
+.vcs-row__repo { font-size: var(--fs-xs); overflow-wrap: anywhere; }
+
+.vcs-ticket {
+  margin-top: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  display: grid;
+  gap: var(--sp-2);
+}
+.vcs-ticket h3 {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: var(--fs-sm);
+  margin: 0;
+}
+
+/* Ambos são texto escrito por um modelo e cortam-se a três linhas pela razão de `.web-row__snippet`:
+   não podem empurrar a lista para fora do ecrã só por serem longos. */
+.waiting-row__prompt,
+.skipped-row__why {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
 }

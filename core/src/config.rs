@@ -18,6 +18,13 @@ pub struct ModelsConfig {
     /// name, the same posture `local_triage_model` gives local inference.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub primary_runner: Option<String>,
+    /// Where a job's `plan` stage runs. Absent keeps it on `claude_model`, so a file written before
+    /// this key existed routes nothing anywhere.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub plan_model: Option<String>,
+    /// Where a job's `review` stage runs, on the same absent-means-unrouted posture as `plan_model`.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub review_model: Option<String>,
     /// Absent leaves chat turns from the Telegram sidecar answered by the cloud CLI, exactly as they
     /// are today. Naming a model here is what moves them onto this machine.
     ///
@@ -36,6 +43,8 @@ impl Default for ModelsConfig {
             local_triage_model: None,
             voice_cleanup_model: None,
             primary_runner: None,
+            plan_model: None,
+            review_model: None,
             local_assistant_model: None,
         }
     }
@@ -427,6 +436,61 @@ pub struct ScheduleRule {
 /// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
 pub const MAX_ITEMS_CEILING: usize = 5;
 
+/// The ceiling the daemon puts on how many ROUNDS one job may run.
+///
+/// The symmetric argument to `MAX_ITEMS_CEILING`'s, against a different threat. That one guards a
+/// number in a per-developer file no review ever sees; this guards a number in an HTTP body that a
+/// model filled in from a conversation, which is reviewed less still — an assistant asked to "keep
+/// going until it's done" can write 10 000 as easily as 10.
+///
+/// `MAX_ITEMS_CEILING` deliberately does NOT rise to meet it. Five stays the ceiling PER ROUND, and
+/// depth comes from rounds, which are counted in the database where a restart cannot lose them.
+/// Together they are 100 items in the worst case, each with its own gate — which is a lot, and is
+/// exactly why the per-job budget rather than either counter is the brake expected to fire first.
+pub const MAX_ROUNDS_CEILING: i64 = 20;
+
+/// The rounds actually allowed, after the daemon's own ceiling.
+///
+/// A free function rather than an accessor on a struct, because unlike `max_items` this number
+/// arrives loose in a request body and there is no struct to hang it on that a caller could not
+/// sidestep. Same purpose though: a caller that used the asked-for number directly would honour what
+/// the model wrote and leave the ceiling decorative.
+///
+/// `None` — nobody asked for rounds — resolves to ONE, never to the ceiling. Resolving it upward
+/// would switch rounds on for every `graph:` rule already scheduled, silently.
+pub fn rounds_allowed(asked: Option<i64>) -> i64 {
+    asked.unwrap_or(1).clamp(1, MAX_ROUNDS_CEILING)
+}
+
+#[cfg(test)]
+mod rounds_ceiling_tests {
+    use super::*;
+
+    /// The number arrives in a request body a model filled in from a conversation. An assistant
+    /// asked to "keep going until it's done" writes 10 000 as easily as 10, and a ceiling applied
+    /// anywhere other than the way in is one a forgetful caller walks past.
+    #[test]
+    fn the_rounds_a_caller_asks_for_are_cut_to_the_daemons_ceiling() {
+        // Nobody asked: one round, never the ceiling. Resolving upward would switch rounds on for
+        // every `graph:` rule already scheduled, silently.
+        assert_eq!(rounds_allowed(None), 1);
+        assert_eq!(rounds_allowed(Some(5)), 5);
+        assert_eq!(rounds_allowed(Some(10_000)), MAX_ROUNDS_CEILING);
+        // Below the floor is a job that could never do anything, which is not what any caller meant.
+        assert_eq!(rounds_allowed(Some(0)), 1);
+        assert_eq!(rounds_allowed(Some(-3)), 1);
+    }
+
+    /// The per-round ceiling deliberately does NOT rise to meet the round ceiling. Depth comes from
+    /// rounds, which are counted in the database where a restart cannot lose them; fan-out stays
+    /// where the argument for it was written.
+    #[test]
+    fn the_per_round_fan_out_is_unchanged_by_rounds_existing() {
+        assert_eq!(MAX_ITEMS_CEILING, 5);
+        assert_eq!(MAX_ROUNDS_CEILING, 20);
+    }
+}
+
 fn default_max_items() -> usize {
     MAX_ITEMS_CEILING
 }
@@ -699,6 +763,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_models_config(&path).unwrap().local_triage_model, None);
+    }
+
+    /// Per-role models are how a plan turn is priced apart from the implement turns that follow it.
+    /// Both keys keep the `local_triage_model` posture: absent or blank means the role is NOT routed
+    /// anywhere, so a file written before these keys existed changes nothing about what runs. The
+    /// blank case is the one worth pinning — a key left in the file with its value deleted reads as
+    /// "turn this off", and `Some("")` would instead pass an empty string to `--model`.
+    #[test]
+    fn models_config_reads_the_per_role_keys_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nplan_model: claude-opus-4-8\nreview_model: claude-haiku-4-5\n",
+        )
+        .unwrap();
+        let named = load_models_config(&path).unwrap();
+        assert_eq!(named.plan_model, Some("claude-opus-4-8".to_string()));
+        assert_eq!(named.review_model, Some("claude-haiku-4-5".to_string()));
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\n",
+        )
+        .unwrap();
+        let absent = load_models_config(&path).unwrap();
+        assert_eq!(absent.plan_model, None, "an older file routes nothing");
+        assert_eq!(absent.review_model, None, "an older file routes nothing");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nplan_model: \"\"\nreview_model: \"   \"\n",
+        )
+        .unwrap();
+        let blank = load_models_config(&path).unwrap();
+        assert_eq!(blank.plan_model, None, "a blanked key means off, not empty");
+        assert_eq!(
+            blank.review_model, None,
+            "a blanked key means off, not empty"
+        );
     }
 
     /// Absent and malformed must reach the SAME inert state, and neither may be an error.

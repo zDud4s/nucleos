@@ -105,6 +105,15 @@ pub struct RunRequest {
     /// stdin as a `user` line, and stdin then closes, which is exactly the one-turn run the argv path
     /// performs. What it costs is the ability to say anything more.
     pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// Whether this run opts in to the operator's ambient MCP surface.
+    ///
+    /// `false` everywhere today, and that is the point: the strict default closes the exfiltration
+    /// path a hostile mail body could otherwise use to reach a file-writing connector the daemon
+    /// never asked for. A run pays for every ambient server in re-sent tool definitions on every
+    /// turn, so the cost falls on whoever asks rather than on everyone who did not.
+    pub ambient_mcp: bool,
+    /// Per-run override of the runner's configured model. `None` keeps it.
+    pub model: Option<String>,
 }
 
 /// One line of `--input-format stream-json` stdin: a single user turn.
@@ -254,6 +263,9 @@ const BUILTIN_TOOLS: &[&str] = &[
 /// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
 /// reach are asserted in tests instead of inspected on a live process.
 pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
+    // The request wins: the runner is built once at startup, the request is made per run, so the
+    // reverse ordering would leave a per-run choice unexpressible.
+    let model = request.model.as_deref().unwrap_or(model);
     let mut args = vec!["-p".to_string()];
     // A steerable run's prompt is written to stdin instead. Measured against CLI 2.1.198,
     // `-p <prompt> --input-format stream-json` reads the positional AND waits on stdin, so leaving
@@ -283,6 +295,10 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("stream-json".to_string());
     }
     args.push("--verbose".to_string());
+    // Immediately after `--verbose`, and before anything conditional: the prompt cache is
+    // prefix-matched, so a stable prefix is what lets back-to-back job nodes hit it. A flag whose
+    // position moves with the request would push every token behind it out of the match.
+    args.push("--exclude-dynamic-system-prompt-sections".to_string());
     // `plan_only` first, and `else`, not a second `if`: a plan-only run must be unable to act no
     // matter what else is true of it, so the two must never both be able to write this flag.
     if request.plan_only {
@@ -299,7 +315,18 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("mcp__nucleos__*".to_string());
     }
     match request.tool_policy {
-        ToolPolicy::Unrestricted => {}
+        // No tool denial — the classifier governs what an autopilot run may call — but the ambient
+        // MCP servers are nobody's: each one is re-described in full on every turn, and nothing in
+        // the daemon's design calls them. The `--mcp-config` block above still runs, so a run
+        // carrying `request.mcp_config` keeps its nucleos server under the strict flag.
+        //
+        // Only this arm is opt-out-able. `McpOnly` and `None` keep their unconditional strict flag,
+        // where it is a safety property rather than an economy.
+        ToolPolicy::Unrestricted => {
+            if !request.ambient_mcp {
+                args.push("--strict-mcp-config".to_string());
+            }
+        }
         ToolPolicy::McpOnly => {
             // Drops every MCP server this user happens to have configured — the ambient surface a
             // spawned run inherits otherwise includes file-writing connectors.
@@ -643,6 +670,14 @@ pub trait CommandRunner: Send + Sync {
     ) -> std::io::Result<RunOutcome> {
         self.run_prompt(request, session_tx, transcript).await
     }
+
+    /// The per-role model for a job node's stage, or `None` for the runner's own model.
+    ///
+    /// Defaulted so a runner with one model — every runner but the CLI one — answers `None` without
+    /// having to say so, and so a caller that names no stage keeps today's behavior.
+    fn model_for_stage(&self, _stage: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 /// A tool-free Ollama boundary for local triage.
@@ -970,10 +1005,25 @@ impl CommandRunner for OllamaRunner {
 
 pub struct ClaudeCliRunner {
     pub model: String,
+    /// Where a job's `plan` stage runs, when an operator has named somewhere. `None` keeps `model`.
+    pub plan_model: Option<String>,
+    /// Where a job's `review` stage runs. `None` keeps `model`.
+    pub review_model: Option<String>,
 }
 
 #[async_trait]
 impl CommandRunner for ClaudeCliRunner {
+    /// Only `plan` and `review` are routable: both are read-mostly turns with short output.
+    /// `implement` is the turn that writes the code, and answering `Some(_)` for it would move real
+    /// work onto whatever a config file happens to name. An unnamed stage is every non-job run.
+    fn model_for_stage(&self, stage: Option<&str>) -> Option<String> {
+        match stage {
+            Some("plan") => self.plan_model.clone(),
+            Some("review") => self.review_model.clone(),
+            _ => None,
+        }
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,
@@ -1971,6 +2021,8 @@ mod tests {
             include_partial_messages: false,
             steerable: false,
             classifier_governs_tools: false,
+            ambient_mcp: false,
+            model: None,
             messages: None,
         }
     }
@@ -1990,6 +2042,8 @@ mod tests {
             include_partial_messages: false,
             steerable: false,
             classifier_governs_tools: false,
+            ambient_mcp: false,
+            model: None,
             messages: None,
         }
     }
@@ -2317,12 +2371,173 @@ mod tests {
     }
 
     /// An autopilot run keeps the full tool set — the hook and the classifier are what govern it,
-    /// and denying tools here would break every real run.
+    /// and denying tools here would break every real run. What it no longer keeps is the AMBIENT MCP
+    /// surface: every server the operator happens to have configured is inherited by a spawned run,
+    /// and each one's tool definitions are re-sent in full on every turn. Nothing in the daemon's
+    /// design calls those servers, so the run pays for them and gets nothing back.
+    ///
+    /// The two halves are deliberately different directions: no `--disallowedTools` (the tools this
+    /// run may call are the classifier's business), but `--strict-mcp-config` (the servers it
+    /// inherits are nobody's).
     #[test]
-    fn unrestricted_adds_no_tool_restriction_flags() {
+    fn unrestricted_runs_are_strict_about_mcp_by_default() {
         let args = args_for(ToolPolicy::Unrestricted, None);
-        assert!(!args.iter().any(|a| a == "--disallowedTools"));
-        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+
+        assert!(
+            !args.iter().any(|a| a == "--disallowedTools"),
+            "an autopilot run keeps its tools; the classifier is what governs them: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--strict-mcp-config"),
+            "an ambient MCP server nobody asked for is re-described on every turn: {args:?}"
+        );
+    }
+
+    /// The escape hatch for the run that genuinely needs an operator's own servers. It is an opt-in
+    /// on the request rather than a default, because the cost is paid by every run that did not ask.
+    /// It must not drag a tool DENIAL in with it: dropping the strict flag widens which servers the
+    /// run inherits, and that is the only thing it is allowed to change.
+    #[test]
+    fn ambient_mcp_opt_in_drops_the_strict_flag() {
+        let mut request = baseline_run_request();
+        request.ambient_mcp = true;
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            !args.iter().any(|a| a == "--strict-mcp-config"),
+            "a run that asked for the ambient servers must be allowed to see them: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--disallowedTools"),
+            "the opt-in governs servers, not tools: {args:?}"
+        );
+    }
+
+    /// The strict default must not cost the orchestrator the one server the daemon passes in. The
+    /// same property `mcp_only_keeps_the_nucleos_server_reachable` holds for `McpOnly`, asserted for
+    /// `Unrestricted` because that arm now carries the strict flag too — and this is the pairing
+    /// that would break silently, taking every `mcp__nucleos__*` call with it.
+    #[test]
+    fn the_nucleos_mcp_server_survives_the_strict_default() {
+        let args = args_for(
+            ToolPolicy::Unrestricted,
+            Some(std::path::Path::new("C:/tmp/mcp.json")),
+        );
+
+        assert!(
+            args.windows(2).any(|w| w[0] == "--mcp-config"),
+            "the daemon's own server must still be named: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--strict-mcp-config"),
+            "naming a server is not asking for everyone else's: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--allowedTools" && w[1] == "mcp__nucleos__*"),
+            "the server is reachable only if its tools are granted: {args:?}"
+        );
+    }
+
+    /// The dynamic sections of the system prompt (the date among them) change between runs, and the
+    /// prompt cache is prefix-matched: one moving token near the front misses the cache for every
+    /// token behind it. Excluding them is worth nothing unless the flag itself sits at a STABLE
+    /// position, which is why the placement is asserted and not just the presence.
+    #[test]
+    fn every_run_excludes_dynamic_system_prompt_sections() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        assert!(
+            args.iter()
+                .any(|a| a == "--exclude-dynamic-system-prompt-sections"),
+            "a system prompt that changes every run cannot be cached: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair[0] == "--verbose"
+                && pair[1] == "--exclude-dynamic-system-prompt-sections"),
+            "the flag must keep a fixed place in the vector, or the prefix it protects moves: \
+             {args:?}"
+        );
+    }
+
+    /// A per-request model is what lets one job run its plan turn on a larger model than its
+    /// implement turns. The request wins over the runner's configured default because the runner is
+    /// built once at startup and the request is made per run; the reverse ordering would make the
+    /// per-run choice unexpressible.
+    #[test]
+    fn cli_args_prefer_the_request_model_over_the_runner_default() {
+        let mut pinned = baseline_run_request();
+        pinned.model = Some("claude-haiku-4-5".to_string());
+        let pinned_args = cli_args(&pinned, "sonnet");
+
+        assert!(
+            pinned_args
+                .windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "claude-haiku-4-5"),
+            "the request's model must reach the command line: {pinned_args:?}"
+        );
+        assert!(
+            !pinned_args.iter().any(|a| a == "sonnet"),
+            "the runner default must not survive alongside it: {pinned_args:?}"
+        );
+
+        let unpinned = baseline_run_request();
+        assert!(unpinned.model.is_none(), "the baseline must pin nothing");
+        let unpinned_args = cli_args(&unpinned, "sonnet");
+
+        assert!(
+            unpinned_args
+                .windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "sonnet"),
+            "a request that pins nothing keeps today's model: {unpinned_args:?}"
+        );
+    }
+
+    /// Which stages may be routed elsewhere, and — the half that matters — which may not. `plan` and
+    /// `review` are read-mostly turns whose output is short; `implement` is the turn that writes the
+    /// code, and answering `Some(_)` for it would silently move real work onto whatever model the
+    /// file happens to name. `None` for an unnamed stage keeps every existing caller on the runner's
+    /// own model.
+    #[test]
+    fn plan_and_review_stages_get_their_configured_models() {
+        let configured = ClaudeCliRunner {
+            model: "claude-sonnet-5".to_string(),
+            plan_model: Some("claude-opus-4-8".to_string()),
+            review_model: Some("claude-haiku-4-5".to_string()),
+        };
+
+        assert_eq!(
+            configured.model_for_stage(Some("plan")).as_deref(),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            configured.model_for_stage(Some("review")).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(
+            configured.model_for_stage(Some("implement")),
+            None,
+            "the turn that writes code is not routable by this file"
+        );
+        assert_eq!(
+            configured.model_for_stage(None),
+            None,
+            "a run that named no stage keeps the runner's own model"
+        );
+
+        let unconfigured = ClaudeCliRunner {
+            model: "claude-sonnet-5".to_string(),
+            plan_model: None,
+            review_model: None,
+        };
+        for stage in [Some("plan"), Some("review"), Some("implement"), None] {
+            assert_eq!(
+                unconfigured.model_for_stage(stage),
+                None,
+                "an unconfigured runner routes nothing anywhere: {stage:?}"
+            );
+        }
     }
 
     /// The orchestrator reaches NucleOS through its MCP server and must reach nothing else. This is
@@ -2358,9 +2573,10 @@ mod tests {
     /// manual runs, and says removing them from this list would "unify the path". Read literally
     /// that is backwards in both halves, and acting on it would be a security regression:
     ///
-    /// - Those runs reach the web because `ToolPolicy::Unrestricted` pushes **no restriction flag
-    ///   at all** — asserted next door in `unrestricted_adds_no_tool_restriction_flags`. Their
-    ///   presence in this list has nothing to do with it.
+    /// - Those runs reach the web because `ToolPolicy::Unrestricted` pushes **no tool denial at
+    ///   all** — asserted next door in `unrestricted_runs_are_strict_about_mcp_by_default`, which
+    ///   also pins the one flag that arm DOES push, and it governs MCP servers rather than tools.
+    ///   Their presence in this list has nothing to do with it.
     /// - What this list actually does is DENY them to `McpOnly`, which is what every assistant turn
     ///   runs under. Removing a name from here GRANTS that tool to the surface that reads
     ///   summaries of mail written by strangers.

@@ -48,9 +48,30 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
 /// failure §8.4 describes: the system generating faster than the human reviews.
 ///
 /// Kept as one query so the roster's `queue_full` flag and this gate stay the same arithmetic.
+///
+/// **Excluding `skipped-item` is load-bearing and not tidying.** It and `action-approval` arrive
+/// through the same function in `hooks.rs` and say opposite things about the scarce resource this
+/// limit protects:
+///
+/// - *Work done, waiting for you to look at it.* That is what §8.4 says the limit is for — the
+///   system generating faster than a person reviews — and it is what an action approval, a contact
+///   merge and an unreviewed shadow decision all are.
+/// - *Work NOT done, waiting for you to decide whether it should be.* A skipped item cost nobody
+///   any attention and produced nothing to review. It is a note, not a queue.
+///
+/// Counting the second as the first would close autonomy at the third skipped item of a night with
+/// the default limit of 3 — the job that skipped them would be the reason the next job is refused,
+/// for work that was never done.
+///
+/// Spelled as an exclusion rather than as `kind = 'action-approval'`, deliberately, and the reason
+/// is about the kinds that do not exist yet. `contact-merge` and `calendar-event` never reach this
+/// count today for an unrelated reason — they are written with a NULL `project_id`, and the filter
+/// above is per project — so either spelling would agree about them. Where the two forms differ is
+/// on the NEXT kind somebody adds: an exclusion counts it by default and an inclusion drops it
+/// silently, and for a brake, being counted is the direction to fail in.
 pub const OPEN_REVIEW_ITEMS_SQL: &str = "SELECT
     (SELECT COUNT(*) FROM proposals
-     WHERE project_id = ?1 AND status = 'pending')
+     WHERE project_id = ?1 AND status = 'pending' AND kind <> 'skipped-item')
     +
     (SELECT COUNT(*) FROM shadow_decisions
      JOIN runs ON shadow_decisions.run_id = runs.id
@@ -92,8 +113,14 @@ pub async fn wip_permits_new_run(pool: &SqlitePool, project_id: &str) -> WipDeci
     };
 
     if queue_full(open, Some(limit)) {
+        // "items", not "proposals". `OPEN_REVIEW_ITEMS_SQL` counts unreviewed `shadow_decisions`
+        // too, and for a project that has spent time in shadow mode they are nearly all of it: this
+        // said "85 proposals already waiting" for a project whose `/proposals` had exactly one, so
+        // the one person who went to look concluded the brake was broken and went hunting. A brake's
+        // reason is read precisely when something has stopped — naming the wrong queue sends the
+        // reader to a page that disagrees with it.
         return WipDecision::Defer {
-            reason: format!("{open} proposals already waiting for review (limit {limit})"),
+            reason: format!("{open} items already waiting for review (limit {limit})"),
         };
     }
     WipDecision::Allow
@@ -168,6 +195,20 @@ mod tests {
         }
     }
 
+    async fn add_skipped_items(pool: &SqlitePool, project_id: &str, count: usize) {
+        for index in 0..count {
+            sqlx::query(
+                "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+                 VALUES ('skipped-item', 'pending', ?, ?, 'test', '2026-08-07T00:00:00Z')",
+            )
+            .bind(index as i64 + 100)
+            .bind(project_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn queue_full_only_when_a_limit_is_set_and_reached() {
         assert!(!queue_full(9, None));
@@ -222,6 +263,38 @@ mod tests {
         add_unreviewed_shadow_decisions(&pool, "project-a", 1).await;
 
         assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 3);
+    }
+
+    /// A skipped item is not a review backlog, and counting it as one would close the autonomy this
+    /// brake is supposed to pace.
+    ///
+    /// The two kinds share a table and arrive through the same function in `hooks.rs`, which is
+    /// exactly why the distinction has to be pinned rather than trusted to a reader: one is work
+    /// DONE waiting to be looked at — what §8.4 says the scarce resource is — and the other is work
+    /// NOT done, waiting on a decision, which has consumed no attention and produced nothing to
+    /// review.
+    ///
+    /// The arithmetic below is the failure this prevents, at the default limit of 3: a night that
+    /// skips three items would refuse the next job, for work nobody did.
+    #[tokio::test]
+    async fn a_skipped_item_is_not_a_review_backlog() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_pending_proposals(&pool, "project-a", 1).await;
+        add_skipped_items(&pool, "project-a", 5).await;
+
+        assert_eq!(
+            open_proposals(&pool, "project-a").await.unwrap(),
+            1,
+            "only the action approval is a review item"
+        );
+        assert!(
+            matches!(
+                wip_permits_new_run(&pool, "project-a").await,
+                WipDecision::Allow
+            ),
+            "five skipped items must not spend a limit of three"
+        );
     }
 
     #[tokio::test]

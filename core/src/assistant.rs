@@ -51,6 +51,14 @@ impl Drop for TurnGuard {
     }
 }
 
+/// How much context a chat's session may have occupied before resuming it stops paying for itself.
+///
+/// `runs.context_fill` is an ABSOLUTE token count, not a fraction: runner.rs writes
+/// `input_tokens + cache_read_input_tokens` from the live assistant events, so this compares against
+/// tokens directly. 140k is ≈0.7 of the 200k window the runner assumes as its conservative floor —
+/// past there a resume mostly re-buys prior turns whose useful part was the last exchange.
+const CONTEXT_ROTATION_TOKENS: i64 = 140_000;
+
 /// The session a chat's next turn resumes, or `None` when it must start clean.
 ///
 /// The `NOT EXISTS` is the second half of the barrier `hooks.rs` opens. That one refuses to let a
@@ -64,15 +72,24 @@ impl Drop for TurnGuard {
 /// being killed underneath it — five paths, of which the last runs no cleanup code at all. A
 /// session that is unresumable because of what the database says about it is unresumable on every
 /// one of them, including across a restart.
+///
+/// The second `NOT EXISTS` is context rotation, and it is on the READ for that same reason. It needs
+/// no counterpart anywhere else: `send_message` mints a fresh session id whenever this returns
+/// `None`, and `upsert_session` replaces the chat's row rather than adding one, so refusing to
+/// resume IS the whole rotation.
 pub async fn get_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
     let session_id: Option<Option<String>> = sqlx::query_scalar(
         "SELECT s.session_id FROM assistant_sessions s
           WHERE s.chat_id = ?
             AND NOT EXISTS (SELECT 1 FROM runs r
                              WHERE r.session_id = s.session_id
-                               AND r.read_untrusted = 1)",
+                               AND r.read_untrusted = 1)
+            AND NOT EXISTS (SELECT 1 FROM runs r
+                             WHERE r.session_id = s.session_id
+                               AND r.context_fill > ?)",
     )
     .bind(chat_id)
+    .bind(CONTEXT_ROTATION_TOKENS)
     .fetch_optional(pool)
     .await?;
 
@@ -512,6 +529,11 @@ fn spawn_assistant_turn(
                     // `McpOnly` besides, so the surface being argued over is nearly empty.
                     classifier_governs_tools: false,
                     messages: None,
+                    // `McpOnly` already pushes the strict flag unconditionally, so this changes
+                    // nothing here — it is the same answer said in the request rather than inferred.
+                    ambient_mcp: false,
+                    // An orchestrator turn is not a job node, so it has no role to route.
+                    model: None,
                 },
                 session_tx,
                 // Unread here, deliberately. An assistant turn's product is the reply that
@@ -1046,6 +1068,71 @@ mod tests {
         assert_eq!(
             get_session(&pool, chat_id).await.unwrap(),
             Some("sess-clean".to_string())
+        );
+    }
+
+    /// A chat is a conversation that never ends, and `--resume` hands every turn the whole of it.
+    /// Past the point where the window is mostly prior turns, the resume stops buying continuity and
+    /// starts buying the same tokens again on every message — the CLI re-reads a context whose useful
+    /// part is the last exchange, and the chat pays for the rest.
+    ///
+    /// So the resume has a ceiling. `runs.context_fill` is an absolute token count, not a fraction,
+    /// and once any turn on a session recorded more than `CONTEXT_ROTATION_TOKENS` of it, that
+    /// session stops being resumable and the next message starts clean.
+    ///
+    /// Written as rows rather than driven through a turn, for the same reason the mail-read test
+    /// above is: the condition lives on the READ, so it must hold for a session whose turn died
+    /// without running any cleanup.
+    #[tokio::test]
+    async fn a_chat_whose_session_filled_the_context_starts_clean() {
+        let pool = test_pool().await;
+        let chat_id = "assistant-rotated-session-chat";
+
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, context_fill, created_at)
+             VALUES ('x', 'completed', 'assistant', 'sess-full', ?, '2026-08-08T00:00:00Z')",
+        )
+        .bind(CONTEXT_ROTATION_TOKENS + 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_session(&pool, chat_id, "sess-full", "2026-08-08T00:00:00Z")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_session(&pool, chat_id).await.unwrap(),
+            None,
+            "a session that filled the context must not be resumed into again"
+        );
+    }
+
+    /// The contrast that stops the rotation from simply ending every conversation: a session still
+    /// inside the ceiling keeps being resumed, and a turn that never reported a fill at all is not
+    /// treated as though it had overflowed.
+    #[tokio::test]
+    async fn a_chat_below_the_rotation_threshold_still_resumes() {
+        let pool = test_pool().await;
+        let chat_id = "assistant-roomy-session-chat";
+
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, context_fill, created_at)
+             VALUES ('x', 'completed', 'assistant', 'sess-roomy', ?, '2026-08-08T00:00:00Z'),
+                    ('y', 'completed', 'assistant', 'sess-roomy', NULL, '2026-08-08T00:01:00Z')",
+        )
+        .bind(CONTEXT_ROTATION_TOKENS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_session(&pool, chat_id, "sess-roomy", "2026-08-08T00:01:00Z")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_session(&pool, chat_id).await.unwrap(),
+            Some("sess-roomy".to_string()),
+            "a chat with room left is still one conversation, and an unreported fill is not an \
+             overflow"
         );
     }
 

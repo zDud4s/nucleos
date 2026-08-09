@@ -256,6 +256,11 @@ async fn start_job(
             gate_each: graph.gate_after_each_item,
             review: graph.review,
             head_sha,
+            // A scheduled job asks for neither, which keeps it at one round under the house limit —
+            // exactly what a `graph:` rule did before rounds existed. Rounds are opt-in per request,
+            // not something a rule already in somebody's `.ai/autopilot.yaml` acquires overnight.
+            max_rounds: None,
+            budget_usd: None,
         },
     )
     .await
@@ -684,10 +689,10 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                         job_id,
                         "fired a scheduled job"
                     ),
-                    // The project already has a live job. Nothing was started, so the window goes
-                    // back — the same trade `CreateRunError::Busy` gets below, and for the same
-                    // reason: a busy project should retry next tick rather than skip its schedule.
-                    crate::job::JobStart::AlreadyLive => {
+                    // No slot was free. Nothing was started, so the window goes back — the same
+                    // trade `CreateRunError::Busy` gets below, and for the same reason: a busy
+                    // project should retry next tick rather than skip its schedule.
+                    crate::job::JobStart::NoRoom(_) => {
                         release_window(
                             state,
                             &project_id,
@@ -960,13 +965,20 @@ mod tests {
     /// and for the same reason: a busy project should retry on the next tick rather than skip its
     /// schedule for the day.
     #[tokio::test]
-    async fn a_project_that_already_has_a_live_job_keeps_its_window() {
+    async fn a_project_with_no_slot_free_keeps_its_window() {
         let project = tempfile::tempdir().expect("create active project");
         let state = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
         write_graph_schedule(project.path());
+        // A ceiling of one, which is what this used to get from `one_live_job_per_project`. The
+        // seeded job then has to hold the slot as well as the row: `insert_job` alone claims
+        // nothing, because claiming is `start`'s job and this is seeding, not starting.
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
         crate::job::insert_job(
             &state.pool,
             &crate::job::NewJob {
@@ -978,14 +990,19 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
         .expect("a job is already live for this project");
+        crate::concurrency::claim(&state.pool, "proj", crate::worktree::Owner::Job(1))
+            .await
+            .expect("the live job holds the project's only slot");
 
         scheduler_tick(&state, now).await;
 
-        // Refused by `one_live_job_per_project`, not by a check in the tick: the INSERT is the lock.
+        // Refused by the slot ceiling, not by a check in the tick: the INSERT is still the lock.
         assert_eq!(job_count(&state).await, 1);
         assert_eq!(run_count(&state).await, 0);
         let stored: String = sqlx::query_scalar(
@@ -1574,21 +1591,34 @@ mod tests {
         assert_eq!(project_id.as_deref(), Some("proj"));
     }
 
+    /// "Busy" used to mean the attention brake: a run in flight in this project deferred it. That
+    /// question moved to `concurrency.rs` (spec §7.3), which can say "two" where attention could
+    /// only ever say "one", so busy now means the slots are taken.
     #[tokio::test]
-    async fn tick_defers_when_the_project_is_busy() {
+    async fn tick_defers_when_no_slot_is_free() {
         let project = tempfile::tempdir().expect("create active project");
         let state = test_state(Some(Duration::from_millis(100))).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
-        sqlx::query(
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let running = sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
              VALUES ('proj', 'already running', 'running', 'worktree', ?)",
         )
         .bind(timestamp("2026-07-18T10:05:00Z").to_rfc3339())
         .execute(&state.pool)
         .await
-        .unwrap();
+        .unwrap()
+        .last_insert_rowid();
+        // Seeded rows claim nothing on their own; `create_run_inner` is what claims, and this row
+        // did not go through it.
+        crate::concurrency::claim(&state.pool, "proj", crate::worktree::Owner::Run(running))
+            .await
+            .expect("the running node holds the project's only slot");
 
         scheduler_tick(&state, now).await;
 

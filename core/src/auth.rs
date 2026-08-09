@@ -735,7 +735,7 @@ mod tests {
     ///
     /// Each job starts runs, so a run that could start jobs is a self-replication machine — and not
     /// one brake in this house counts recursion. The budget counts dollars, the WIP limit counts
-    /// unreviewed proposals, `one_live_job_per_project` counts one project.
+    /// unreviewed proposals, and the slot ceiling counts pieces of work in flight.
     ///
     /// **Honest note on what this test is worth.** It passes before `POST /jobs` was added to any
     /// table as well as after, because `permits` gives `Scope::Run` exactly one route and everything

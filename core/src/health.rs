@@ -758,6 +758,8 @@ mod tests {
             last_failure: None,
             last_failure_at: None,
             restarts: 0,
+            last_line: None,
+            last_line_at: None,
             spawn_error: None,
         };
         assert_eq!(entry.liveness(), Liveness::Running);

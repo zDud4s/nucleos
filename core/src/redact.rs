@@ -590,12 +590,10 @@ fn is_portuguese_nif(digits: &[u32]) -> bool {
 
 /// Removes credential-bearing and caller-controlled parts from an absolute URL before logging it.
 ///
-/// Future `email.rs` and `triage.rs` logging call sites that need to name a credentialed URL must
-/// use this helper first; it exists before those callers so their safe shape is already available.
-#[allow(
-    dead_code,
-    reason = "email.rs and triage.rs do not yet log credentialed URLs, but must use this helper when they do"
-)]
+/// Takes a string that IS a URL, not prose containing one: given `dial imaps://u:p@host failed` it
+/// reads the scheme as `dial imaps`, rejects it for the space, and hands the line back unchanged.
+/// `sidecar.rs`, its first caller, therefore splits a line into whitespace-separated tokens and
+/// applies this to each. Any future caller with a whole log line to clean must do the same.
 pub(crate) fn redact_url(input: &str) -> String {
     let Some(scheme_end) = input.find("://") else {
         return strip_userinfo_from_non_url(input).unwrap_or_else(|| input.to_owned());

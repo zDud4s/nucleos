@@ -39,21 +39,55 @@ impl std::fmt::Display for PlanError {
 
 #[derive(Debug, Deserialize)]
 struct PlanFile {
+    /// Absent when a replan node wrote `{"done": true}`. A plan node always writes it, so the
+    /// default is what makes ONE shape read both files — and what makes a plan node that forgot the
+    /// key indistinguishable from one that found nothing, which is the reading `parse_plan`'s caller
+    /// already treats as a successful empty night.
+    #[serde(default)]
     items: Vec<PlanItem>,
+    /// A replan node saying the work is over. `#[serde(default)]` so a plan node's file, which never
+    /// carries it, reads as `false` rather than as a parse failure.
+    #[serde(default)]
+    done: bool,
+    /// Why it is over, in the node's own words. Kept for the feed: "job 12 finished after 3 rounds"
+    /// is a fact, and the reason it stopped asking is the part a person can disagree with.
+    #[serde(default)]
+    why: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlanItem {
     description: String,
+    /// Defaulted rather than required, because the field is younger than the plans that have to
+    /// keep parsing: every `plan.json` written before it existed omits it, and so does any planner
+    /// that takes the prompt's offer to decline. Both mean the same thing, which is nothing.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+/// One item of the queue: what to do, and where the planner guessed it lives.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlannedItem {
+    pub description: String,
+    /// Empty when the planner named nothing. A hint and not a boundary — it is where the implement
+    /// node starts looking, never the extent of what it may touch.
+    pub files: Vec<String>,
 }
 
 /// A validated work queue, plus however much of it did not fit.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlannedItems {
-    pub items: Vec<String>,
+    pub items: Vec<PlannedItem>,
     /// Items the daemon's ceiling cut. Carried rather than discarded so the feed can say what was
     /// left out — a queue silently trimmed reads downstream as the whole of what the planner found.
     pub dropped: usize,
+    /// A replan node declaring the work over, and why.
+    ///
+    /// Distinct from an empty `items` on purpose, and the distinction is the whole of ending #1
+    /// versus ending #3: "there is nothing more to do" is a claim the node is making, while an empty
+    /// queue is a round that happened to produce nothing and might not be the last. One ends the job
+    /// now; the other feeds a counter that ends it after two.
+    pub done: Option<String>,
 }
 
 /// Reads the queue a plan node produced.
@@ -67,16 +101,22 @@ pub fn parse_plan(contents: Option<&[u8]>, max_items: usize) -> Result<PlannedIt
         serde_json::from_slice(bytes).map_err(|error| PlanError::Unreadable(error.to_string()))?;
 
     let total = parsed.items.len();
-    let items: Vec<String> = parsed
+    let items: Vec<PlannedItem> = parsed
         .items
         .into_iter()
         .take(max_items)
-        .map(|item| item.description)
+        .map(|PlanItem { description, files }| PlannedItem { description, files })
         .collect();
 
     Ok(PlannedItems {
         dropped: total - items.len(),
         items,
+        // `done` wins over any items alongside it, and the alternative would be worse in both
+        // directions: honouring the items would queue work the node just said was unnecessary, and
+        // treating the pair as malformed would fail a job over a node being redundant.
+        done: parsed
+            .done
+            .then(|| parsed.why.unwrap_or_else(|| "no reason given".to_owned())),
     })
 }
 
@@ -95,6 +135,13 @@ pub enum ItemState {
     Cancelled,
     GateFailed,
     GateErrored,
+    /// This item asked for a decision, so the job put it down and moved on.
+    ///
+    /// Not a failure and not a cancellation: nothing broke, and nobody stopped anything. The work
+    /// was never attempted, the tree was reverted to where the item started, and a `skipped-item`
+    /// proposal carries what would be needed to pick it up. `next_step` walks past it the way it
+    /// walks past `Passed`, because the queue owes it nothing more.
+    Skipped,
 }
 
 /// Whether the job still owes a review node.
@@ -122,6 +169,14 @@ pub enum Outcome {
     Cancelled,
     GateFailed,
     GateErrored,
+    /// Ran out of an allowance rather than out of work: the round ceiling here, the job's own budget
+    /// once `brakes()` learns to read it.
+    ///
+    /// Apart from `Completed` for the same reason `Cancelled` is apart from `Failed` — it is what a
+    /// person reads in the morning. `completed` means "I finished"; `stopped` means "I was cut short
+    /// and what I did is on the branch". Reporting the second as the first is how somebody stops
+    /// looking at a job that still had work in it.
+    Stopped,
 }
 
 /// What the daemon should do next for a job.
@@ -135,10 +190,77 @@ pub enum Next {
         ordinal: usize,
     },
     SpawnReview,
+    /// Ask again now that this round's queue is empty: either for more work, or for "done".
+    SpawnReplan,
     /// A node is in flight; nothing to do until it lands.
     Wait,
     Finish(Outcome),
 }
+
+/// What the last replan node concluded, once it has landed.
+///
+/// Two values and not three, because "it produced a queue" is not a state this has to hold: the
+/// caller writes the items, bumps the round, and the queue in `JobView::items` IS the answer. What
+/// is left is the case with nothing to show for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Replan {
+    /// No replan node has landed for this round.
+    #[default]
+    NotYet,
+    /// It said `{"done": true}` — the thing that knows the work says the work is over.
+    Done,
+}
+
+/// Where a job is in its sequence of rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundState {
+    /// Which round the queue in `JobView::items` belongs to, counting from 0 so that the plan node's
+    /// items are round 0 and the first replan opens round 1.
+    pub round: i64,
+    /// The ceiling this job was given, already cut by `MAX_ROUNDS_CEILING` before it got here.
+    ///
+    /// `1` is a job of today and takes the pre-rounds path verbatim, which is what lets the schema
+    /// and this logic land without changing a single existing behaviour.
+    pub max_rounds: i64,
+    /// Consecutive rounds that added no new items.
+    pub dry_rounds: i64,
+    /// Whether a replan node is in flight right now.
+    ///
+    /// The sibling of `planning`, and needed for the identical reason: between spawning the node and
+    /// its items landing, the queue is empty, and without this every tick would spawn another one.
+    pub replanning: bool,
+    /// What the last replan node said.
+    pub replanned: Replan,
+    /// Whether the current round queued no items of its own.
+    ///
+    /// Carried rather than derived from `items`, which is deliberately not filtered by round and so
+    /// cannot answer it. What it decides is whether the round gets a review node at all: a round that
+    /// added nothing has an unchanged branch, and reviewing it spends a whole run re-reading a diff
+    /// nobody wrote.
+    pub round_added_nothing: bool,
+}
+
+impl Default for RoundState {
+    /// A job of one round, which is every job that existed before this struct did.
+    fn default() -> Self {
+        Self {
+            round: 0,
+            max_rounds: 1,
+            dry_rounds: 0,
+            replanning: false,
+            replanned: Replan::NotYet,
+            round_added_nothing: false,
+        }
+    }
+}
+
+/// How many rounds in a row may add nothing before the job calls itself finished.
+///
+/// Two, and one would be wrong: a replan can legitimately produce nothing while the previous round's
+/// work is still settling. Counting items to a target never finds the tail either — a model that
+/// will not say "done" would sit against `max_rounds` spending money — so the brake is "it dried up"
+/// and not "it reached a number".
+pub const DRY_ROUNDS_TO_STOP: i64 = 2;
 
 /// Everything the decision below needs to see, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,8 +274,14 @@ pub struct JobView {
     /// every tick would answer `SpawnPlan` while the first planner was still running. The item
     /// queue is what stops that from happening to an implement node; the plan node has no item.
     pub planning: bool,
+    /// The queue of the CURRENT round, never of every round the job has had.
+    ///
+    /// Load-bearing and easy to get wrong: read without filtering on `job_items.round`, round 2
+    /// would see round 1's finished items sitting beside its own and start the round again from the
+    /// first pending one it found.
     pub items: Vec<ItemState>,
     pub review: ReviewState,
+    pub rounds: RoundState,
 }
 
 /// Decides a job's next move from what is observable about it.
@@ -165,11 +293,22 @@ pub struct JobView {
 pub fn next_step(job: &JobView) -> Next {
     // Failures first, and before the in-flight check: a chain with a broken item must stop even if
     // another node is still running, rather than spending budget on work about to be thrown away.
+    //
+    // `GateFailed` is deliberately NOT here any more, and it is the only one that left. A red gate
+    // used to end the night at the first item that broke; now the tree is reverted to the item's
+    // footing and the queue carries on, because the remaining items were never the ones that broke
+    // and a night that stops on the first of five wastes the other four. What survives is the
+    // ENDING: `ending()` below still reports the job `gate_failed`, so nothing about the job's
+    // outcome is softened — only the point at which it is decided.
+    //
+    // `GateErrored` stays, and the asymmetry is the whole reason those two are separate states. A
+    // non-zero exit is a verdict about the code; a gate that would not run is silence. Continuing
+    // past a verdict is a judgement call this change makes; continuing past silence would be
+    // building on work nothing has measured, which is what the gate exists to prevent.
     for item in &job.items {
         match item {
             ItemState::Failed => return Next::Finish(Outcome::Failed),
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
-            ItemState::GateFailed => return Next::Finish(Outcome::GateFailed),
             ItemState::GateErrored => return Next::Finish(Outcome::GateErrored),
             _ => {}
         }
@@ -182,6 +321,9 @@ pub fn next_step(job: &JobView) -> Next {
             Next::SpawnPlan
         };
     }
+    // A planner that looked and found nothing. Only reachable on the first round: the queue is not
+    // filtered by round, so once anything has been queued at all this is never empty again, and a
+    // round that adds nothing shows up as `dry_rounds` rather than as an empty queue.
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
@@ -205,10 +347,77 @@ pub fn next_step(job: &JobView) -> Next {
         return Next::SpawnImplement { ordinal };
     }
 
+    // Two ways a round closes without being reviewed, and both are about not spending a run for
+    // nothing. A replan that declared the work over closed a round that had already been reviewed
+    // before it ran — a second review would re-read a branch nobody is going to change. And a round
+    // that queued no items has no diff of its own to read at all.
+    if job.rounds.replanned == Replan::Done || job.rounds.round_added_nothing {
+        return close_the_round(job);
+    }
+
     match job.review {
         ReviewState::Pending => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
-        ReviewState::NotWanted | ReviewState::Done => Next::Finish(Outcome::Completed),
+        ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
+    }
+}
+
+/// PURE: what happens when a round's queue is spent and its review has been had.
+///
+/// The four endings of §5.2, in the order they are observable — and the order is observable because
+/// two of them say `completed` and two say `stopped`, which is the difference between "I finished"
+/// and "I was cut short and what I did is on the branch".
+///
+/// A **one-round job takes the old path verbatim** and that is the first thing this checks, because
+/// it is what makes rounds inert until somebody asks for them. It is also the honest answer: a job
+/// that was never asked to run more than one round did not run OUT of rounds, so reporting it
+/// `stopped` would name the ceiling of a feature it never used.
+fn close_the_round(job: &JobView) -> Next {
+    if job.rounds.max_rounds <= 1 {
+        return Next::Finish(ending(job));
+    }
+    // A red gate ends the job whatever the rounds say. The branch carries work the gate rejected,
+    // and another round would build on top of it — which is the one thing the per-item revert exists
+    // to stop happening WITHIN a round, and it does not stop being true across them.
+    if job.items.contains(&ItemState::GateFailed) {
+        return Next::Finish(Outcome::GateFailed);
+    }
+
+    // (1) The replan declared itself done. The cheapest ending there is, and the most trustworthy:
+    // the node that just looked at the work is the one saying the work is over.
+    if job.rounds.replanned == Replan::Done {
+        return Next::Finish(Outcome::Completed);
+    }
+    if job.rounds.replanning {
+        return Next::Wait;
+    }
+    // (3) It dried up. Ahead of the ceiling deliberately: both stop the job, and this one is the
+    // reading a person can act on — `completed` here means "there was nothing left", where the
+    // ceiling below means "there may well have been".
+    if job.rounds.dry_rounds >= DRY_ROUNDS_TO_STOP {
+        return Next::Finish(Outcome::Completed);
+    }
+    // (4) Out of rounds. `round` counts from 0, so the round that closes is `round + 1` of them.
+    if job.rounds.round + 1 >= job.rounds.max_rounds {
+        return Next::Finish(Outcome::Stopped);
+    }
+    Next::SpawnReplan
+}
+
+/// PURE: how a job that ran its whole queue ended.
+///
+/// One red gate anywhere makes the job `gate_failed`, however many items passed after it. The
+/// verdict is about the branch that is handed back, and a branch carrying an item the gate rejected
+/// is not one somebody should be told is complete.
+///
+/// Skipped items deliberately do NOT show up here. They are work that was never attempted, recorded
+/// as proposals for a person to decide on; a job that ran everything it was allowed to run did what
+/// was asked of it, and reporting that as a failure would teach the reader to ignore the word.
+fn ending(job: &JobView) -> Outcome {
+    if job.items.contains(&ItemState::GateFailed) {
+        Outcome::GateFailed
+    } else {
+        Outcome::Completed
     }
 }
 
@@ -221,6 +430,7 @@ impl Outcome {
             Outcome::Cancelled => STATUS_CANCELLED,
             Outcome::GateFailed => "gate_failed",
             Outcome::GateErrored => "gate_errored",
+            Outcome::Stopped => STATUS_STOPPED,
         }
     }
 }
@@ -234,6 +444,7 @@ fn item_state_from(status: &str) -> ItemState {
         STATUS_CANCELLED => ItemState::Cancelled,
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
+        STATUS_SKIPPED => ItemState::Skipped,
         // An unrecognised item status is treated as still to do rather than as done. Erring toward
         // "not finished" costs a repeated item; erring the other way silently skips work the job
         // was created to perform and reports it complete.
@@ -285,6 +496,29 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             .await?;
     let stage = effective_status(&status, resume_status.as_deref());
 
+    let (round, dry_rounds, max_rounds, replan_done, opened_by): (
+        i64,
+        i64,
+        Option<i64>,
+        i64,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT round, dry_rounds, max_rounds, replan_done, replan_run_id FROM jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+
+    // Deliberately NOT filtered by round, and the reason is worth writing down because filtering is
+    // the obvious thing to reach for. A round closes only when every item in it is terminal, so an
+    // earlier round's items are all `Passed`, `Skipped`, `GateFailed` or worse — states `next_step`
+    // already walks past. The unfiltered queue therefore reads correctly on its own, and it keeps
+    // `ordinal` meaning one thing everywhere: the nth item of this job, ever, which is also its
+    // primary key. Filtering would have made the position in this vector stop being the ordinal in
+    // the table, and `advance` looks items up by that number.
+    //
+    // It also keeps `ending()` right across rounds: a red gate in round 1 still makes the job
+    // `gate_failed` when round 3 finishes, which is what a reader of the branch needs to know.
     let items: Vec<String> =
         sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
             .bind(job_id)
@@ -302,8 +536,45 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         .fetch_optional(pool)
         .await
     };
+    // The one question the unfiltered queue above cannot answer: did THIS round put anything in it.
+    let queued_this_round: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ? AND round = ?")
+            .bind(job_id)
+            .bind(round)
+            .fetch_one(pool)
+            .await?;
+
     let plan_run = latest_node("plan").await?;
-    let review_run = latest_node("review").await?;
+
+    // The replan node is what OPENS a round, so its id is the line between one round and the last —
+    // which is how the review below is scoped without a `runs.round` column. Without the scoping the
+    // second round would read the first round's finished review as its own and skip reviewing
+    // itself, silently, for every round after the first.
+    let latest_replan: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM runs WHERE job_id = ? AND stage = 'replan' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    // `jobs.replan_run_id` and NOT the latest replan run, and the difference is a whole node.
+    //
+    // The latest replan may be the one deciding RIGHT NOW whether there is another round — it has
+    // opened nothing. Using its id moved the line the moment that node was spawned, which dropped
+    // this round's finished review out of view and made the review read `Pending` again. Measured
+    // on job 17, 2026-08-08: run 900179, a second review of a round whose queue had not changed,
+    // spawned between the replan being started and its answer being read. One wasted node per round.
+    //
+    // The column is the honest line because it is written by `open_the_next_round` and by
+    // `stop_after_replan` — the two places where a replan's answer has actually been acted on.
+    let round_opened_at = opened_by.unwrap_or(0);
+    let review_run: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job_id)
+    .bind(round_opened_at)
+    .fetch_optional(pool)
+    .await?;
 
     let review = match (review_wanted != 0, review_run.as_deref()) {
         (false, _) => ReviewState::NotWanted,
@@ -325,6 +596,23 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items.iter().map(|s| item_state_from(s)).collect(),
         review,
+        rounds: RoundState {
+            round,
+            // NULL means "nobody asked for rounds", which is one round and the behaviour of every
+            // job written before this column existed. Resolving it to the daemon ceiling instead
+            // would switch rounds on for every `graph:` rule already scheduled, silently.
+            max_rounds: max_rounds.unwrap_or(1).max(1),
+            dry_rounds,
+            replanning: latest_replan
+                .as_ref()
+                .is_some_and(|(_, status)| node_in_flight(status)),
+            round_added_nothing: queued_this_round == 0,
+            replanned: if replan_done != 0 {
+                Replan::Done
+            } else {
+                Replan::NotYet
+            },
+        },
     })
 }
 
@@ -339,6 +627,10 @@ pub const STATUS_STOPPED: &str = "stopped";
 pub const STATUS_INTERRUPTED: &str = "interrupted";
 /// A job somebody stopped, at either level: one node, or the whole chain.
 pub const STATUS_CANCELLED: &str = "cancelled";
+/// An ITEM the job put down because it asked for a decision. Deliberately not in
+/// [`TERMINAL_STATUSES`] below: that list is job endings, and a skipped item ends nothing — the job
+/// carries on to the next one, which is the whole point of it.
+pub const STATUS_SKIPPED: &str = "skipped";
 
 /// Every ending this module can write.
 ///
@@ -362,6 +654,11 @@ pub const TERMINAL_STATUSES: [&str; 8] = [
 ///
 /// Clears `wait_reason` on the way out: a finished job is not waiting for anything, and a stale
 /// reason left on the row is the sort of thing a feed renders forever.
+///
+/// Gives the concurrency slot back too, and this is the one place that does it for jobs — every
+/// ending funnels here, from `finish` to `cancel` to the startup reconciliation, so a new ending
+/// added later cannot forget. The sweep on the job tick is a backstop, not the mechanism: it frees
+/// what a crash left held, within a tick, rather than what this function forgot.
 pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<()> {
     if !TERMINAL_STATUSES.contains(&status) {
         // Written anyway. A job left live would hold the project's exclusivity slot forever and
@@ -382,6 +679,7 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
     .bind(job_id)
     .execute(pool)
     .await?;
+    crate::concurrency::release(pool, crate::worktree::Owner::Job(job_id)).await?;
     Ok(())
 }
 
@@ -434,10 +732,17 @@ pub async fn pause(pool: &SqlitePool, job_id: i64, status: &str, reason: &str) -
 /// Falls back to `planning`, not to `implementing`, if the stage was somehow lost. Re-planning
 /// costs a run; assuming a queue exists when it does not reports work as complete that was never
 /// started, which is the failure nobody sees.
+///
+/// Clears `wait_reason` with the status, for the reason `retire` does: a job that is no longer
+/// waiting is not waiting for anything, and the note outlives the pause it explains. Left behind, a
+/// job running normally reads `implementing / budget` — which names a brake that lifted hours ago
+/// and is the one thing a reader would act on. `park` is unaffected either way: its "say it once"
+/// test is `reason changed OR status is not waiting`, and a resumed job fails the second half.
 pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE jobs
-         SET status = COALESCE(resume_status, 'planning'), resume_status = NULL
+         SET status = COALESCE(resume_status, 'planning'), resume_status = NULL,
+             wait_reason = NULL
          WHERE id = ? AND status IN ('waiting','awaiting_approval')",
     )
     .bind(job_id)
@@ -466,6 +771,11 @@ pub struct NewJob<'a> {
     /// The repository HEAD the job starts from. `None` when git would not answer, which crash
     /// recovery reads as "cannot prove the tree stayed put" and therefore as not resumable.
     pub head_sha: Option<&'a str>,
+    /// How many rounds the caller asked for, uncut — `insert_job` applies `rounds_allowed`. `None`
+    /// is one round, which is every job a `graph:` rule starts.
+    pub max_rounds: Option<i64>,
+    /// What the job may spend on itself. `None` leaves only the house limit.
+    pub budget_usd: Option<f64>,
 }
 
 /// Starts a job and returns its id.
@@ -473,17 +783,17 @@ pub struct NewJob<'a> {
 /// Always `planning`: a job's first act is to plan, and a caller that could choose the starting
 /// status could start one mid-queue with no queue.
 ///
-/// Fails when the project already has a live one. That refusal is the unique index
-/// `one_live_job_per_project` (migration 0042) rather than a check here, deliberately: with the
-/// constraint in the storage layer the INSERT itself is the lock, so a scheduler tick and a manual
-/// request racing for the same project cannot both pass a check and then both proceed. It mirrors
-/// what `one_open_worktree_run_per_project` already does for runs.
+/// Refuses nothing, and it used to. A project's second live job was turned away here by the unique
+/// index `one_live_job_per_project`, which came out in migration 0053; a project may now have as
+/// many live jobs as it has slots. The lock did not leave the storage layer, only moved table:
+/// `start` claims a `project_slots` row, and that INSERT is what a scheduler tick and a manual
+/// request racing for the same project resolve on.
 pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64> {
     let result = sqlx::query(
         "INSERT INTO jobs
            (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
-            head_sha, created_at)
-         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?)",
+            head_sha, max_rounds, budget_usd, created_at)
+         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.project_id)
     .bind(job.project_root)
@@ -493,6 +803,10 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .bind(i64::from(job.gate_each))
     .bind(i64::from(job.review))
     .bind(job.head_sha)
+    // Cut HERE, at the write, and not where it is read. A ceiling applied at read time is one a
+    // forgetful caller walks past; stored already cut, the row itself is the promise.
+    .bind(crate::config::rounds_allowed(job.max_rounds))
+    .bind(job.budget_usd)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
@@ -508,22 +822,12 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
 pub struct CreateJobRequest {
     pub project_id: String,
     pub prompt: String,
-    /// Reserved for Chunk 3. Accepted and **ignored** here rather than rejected: a field the client
-    /// sends and the server refuses is a client that has to be rewritten the day the server learns
-    /// it, and the client is a tool description a model reads.
-    ///
-    /// `expect` rather than `allow`, on purpose. The day Chunk 3 reads either field the lint stops
-    /// firing and this attribute becomes an error, which is the compiler asking for it back. An
-    /// `allow` would sit here silently covering whatever went dead next.
-    #[expect(
-        dead_code,
-        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
-    )]
+    /// What this job may spend on itself, under the house limit rather than instead of it. `None`
+    /// means only the house limit governs — what every `graph:` rule has always meant.
     pub budget_usd: Option<f64>,
-    #[expect(
-        dead_code,
-        reason = "Chunk 3 gives budget_usd and max_rounds meaning; delete this attribute then"
-    )]
+    /// How many rounds it may run. Cut by `config::rounds_allowed` before it is stored, never after:
+    /// this number comes from a model filling in a tool call, and a ceiling applied at read time is
+    /// a ceiling one forgetful caller can walk past. `None` is one round.
     pub max_rounds: Option<i64>,
 }
 
@@ -595,13 +899,16 @@ pub fn resolve_start(
 
 /// How a start attempt ended.
 ///
-/// `AlreadyLive` is not a check that failed here — it is `one_live_job_per_project` (migration
-/// 0042) refusing the INSERT. With the constraint in the storage layer the INSERT *is* the lock, so
-/// a scheduler tick and a manual request racing for the same project cannot both pass a check and
-/// then both proceed. It mirrors what `one_open_worktree_run_per_project` does for runs.
+/// `NoRoom` replaced `AlreadyLive` when `one_live_job_per_project` came out (migration 0053). The
+/// two are the same answer at different ceilings — that index could only ever say "one" — and they
+/// are still not a check that failed here: the slot `INSERT` is the lock, so a scheduler tick and a
+/// manual request racing for the same project cannot both pass a count and then both proceed.
+///
+/// Kept apart from `Failed` because the caller turns them into different answers: no room is a 409
+/// the asker can act on by waiting, and `Failed` is a 500 nothing they do would have helped.
 pub enum JobStart {
     Started(i64),
-    AlreadyLive,
+    NoRoom(String),
     Failed,
 }
 
@@ -621,6 +928,10 @@ pub struct StartRequest<'a> {
     pub gate_each: bool,
     pub review: bool,
     pub head_sha: Option<&'a str>,
+    /// Both `None` for a scheduled job: a `graph:` rule asks for neither, which keeps it at one
+    /// round under the house limit — exactly what it did before rounds existed.
+    pub max_rounds: Option<i64>,
+    pub budget_usd: Option<f64>,
 }
 
 /// Creates a job and provisions the worktree it will live in.
@@ -634,6 +945,23 @@ pub struct StartRequest<'a> {
 /// never defining them", and the same applies to jobs. It moved here when a second caller appeared:
 /// two copies of this sequence would mean one of them learning a fix the other never learns.
 pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
+    // Asked before the row exists, and it is not the decision — `claim` below is. A job cannot claim
+    // until it has an id, so the authoritative answer costs a row, and a scheduler firing at a full
+    // project every half hour would leave a retired job behind every time. This turns that into the
+    // rare case where two starts actually crossed.
+    match crate::concurrency::room_for(&state.pool, request.project_id).await {
+        Ok(Some(full)) => return JobStart::NoRoom(full.reason()),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                project_id = request.project_id,
+                %error,
+                "could not read the concurrency ceiling"
+            );
+            return JobStart::Failed;
+        }
+    }
+
     let job_id = match insert_job(
         &state.pool,
         &NewJob {
@@ -645,18 +973,13 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             gate_each: request.gate_each,
             review: request.review,
             head_sha: request.head_sha,
+            max_rounds: request.max_rounds,
+            budget_usd: request.budget_usd,
         },
     )
     .await
     {
         Ok(job_id) => job_id,
-        Err(error)
-            if error
-                .as_database_error()
-                .is_some_and(|database_error| database_error.is_unique_violation()) =>
-        {
-            return JobStart::AlreadyLive;
-        }
         Err(error) => {
             tracing::warn!(
                 project_id = request.project_id,
@@ -669,6 +992,31 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
     };
 
     let owner = crate::worktree::Owner::Job(job_id);
+
+    // AFTER the row, not before it, and the reason is arithmetic rather than taste: a slot is keyed
+    // on its owner's id, and the job has no id until it is inserted. So the row goes in first and is
+    // retired again if there is no room — the same shape this function already uses when a worktree
+    // cannot be provisioned, and it keeps the claim itself an INSERT that two racing jobs resolve on
+    // the primary key rather than on a read.
+    match crate::concurrency::claim(&state.pool, request.project_id, owner).await {
+        Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
+        // The race the pre-check cannot cover: somebody took the last slot in between. No room is
+        // not a failure, so the row is retired quietly and the caller is told which ceiling it hit.
+        Ok(crate::concurrency::ClaimOutcome::Full(full)) => {
+            let _ = retire(&state.pool, job_id, STATUS_CANCELLED).await;
+            return JobStart::NoRoom(full.reason());
+        }
+        Err(error) => {
+            return fail_early(
+                state,
+                request.project_id,
+                job_id,
+                &format!("its concurrency slot could not be claimed: {error}"),
+            )
+            .await;
+        }
+    }
+
     let info = match crate::worktree::create(Path::new(request.project_root), owner).await {
         Ok(info) => info,
         Err(error) => {
@@ -720,7 +1068,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
 
 /// Retires a job that never got as far as its first node, and says so where a person will see it.
 ///
-/// A job left live with no worktree would be ticked forever and hold `one_live_job_per_project`,
+/// A job left live with no worktree would be ticked forever and hold a concurrency slot,
 /// which would take the whole project's autonomy down with it — silently, since nothing else logs.
 async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) -> JobStart {
     if let Err(error) = retire(&state.pool, job_id, Outcome::Failed.as_status()).await {
@@ -742,12 +1090,14 @@ async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) 
     JobStart::Failed
 }
 
-/// The statuses `one_live_job_per_project` covers, and therefore the ones a tick has to drive.
+/// The statuses that mean a job is live, and therefore the ones a tick has to drive.
 ///
 /// Kept beside the SQL that reads it rather than spelled out at each call site, because a status
-/// that falls out of this list stops being ticked while still holding the project's exclusivity
-/// slot: the project would go quiet with no error anywhere, until somebody opened the database.
-/// `a_live_status_the_index_covers_is_also_a_status_the_tick_drives` pins it to the migration.
+/// that falls out of this list stops being ticked while still holding a concurrency slot — the
+/// sweep spares exactly these statuses too — so the project goes quiet with no error anywhere,
+/// until somebody opens the database. Two tests pin the three copies together:
+/// `a_live_status_is_a_status_some_pass_would_load` here, and
+/// `every_live_status_is_a_status_the_sweep_spares` in `concurrency.rs`.
 pub const LIVE_STATUSES: [&str; 6] = [
     "planning",
     "implementing",
@@ -772,6 +1122,13 @@ pub struct JobRow {
     // `review` is deliberately absent: `load_view` reads it in the same query as the review node's
     // status, because the two are only ever meaningful together.
     pub head_sha: Option<String>,
+    /// Which round this job is on. Here as well as in `JobView` because the two answer different
+    /// questions: the view's copy drives the pure decision, this one is what a node's prompt and the
+    /// feed lines say out loud, and neither should have to load the other.
+    pub round: i64,
+    /// This job's own allowance. `None` means only the house limit governs, which is what every
+    /// `graph:` rule has always meant and keeps meaning.
+    pub budget_usd: Option<f64>,
     pub created_at: String,
 }
 
@@ -785,14 +1142,16 @@ impl JobRow {
 /// runtime — a guard worth keeping. The test named above compares this text against both the
 /// constant and the migration's index, so the three cannot drift apart in silence.
 const LIVE_JOBS_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
-                                    wait_reason, max_items, gate_each, head_sha, created_at
+                                    wait_reason, max_items, gate_each, head_sha, round, budget_usd,
+                                    created_at
                              FROM jobs
                              WHERE status IN ('planning','implementing','gating','reviewing',
                                               'awaiting_approval','waiting')
                              ORDER BY id";
 
 const ONE_JOB_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
-                                  wait_reason, max_items, gate_each, head_sha, created_at
+                                  wait_reason, max_items, gate_each, head_sha, round, budget_usd,
+                                    created_at
                            FROM jobs WHERE id = ?";
 
 pub async fn live_jobs(pool: &SqlitePool) -> sqlx::Result<Vec<JobRow>> {
@@ -830,6 +1189,41 @@ enum Step {
     Stopped,
 }
 
+/// What every planning node has to be told about who owns the history.
+///
+/// Measured, not guessed. Job 12 on 2026-08-08 asked for eight modules and said "I want to review
+/// each one on its own" — a sentence about how to SPLIT the work. The plan node read it as a
+/// sentence about git and wrote "commit X and Y as two separate commits" into all four items. Every
+/// implement node then reached for `git commit`, which is a write and must ask, and under the
+/// zero-approval policy the night runs on, all four items were skipped. Nothing was built.
+///
+/// The prompt is the right place for the fix rather than the classifier, because the command was not
+/// misjudged: `git commit` genuinely writes and genuinely must ask. What was wrong is that the item
+/// asked for it at all. `worktree::checkpoint` already commits the whole tree after every green
+/// gate — an item that commits by hand is redoing the job's own work through the one door that
+/// stops.
+///
+/// Stated as what happens rather than as a prohibition, deliberately. A node told only "do not
+/// commit" invents a way around it; a node told the commit already happens has no reason to.
+/// What the nodes that only LOOK have to be told about how to look.
+///
+/// Measured across four jobs on 2026-08-08, and always the same shape: a node whose whole task is to
+/// inspect the tree reaches for a shell loop or a pipeline to do it — `for f in …; do cat "$f"; done`
+/// three times, `git reflog`, `ls -la && … && find … | sort`. The classifier reads a LINE, not a
+/// program, so none of those is recognised, and each one stopped its node dead.
+///
+/// It has `Read`, `Grep` and `Glob`, all of which run without asking and do the job better. Nothing
+/// was missing except being told. Said as the consequence rather than as a rule, because the
+/// consequence is what makes the choice obvious: this node is what the job spends to get an answer,
+/// and giving it up is not free.
+const LOOK_WITH_THE_READING_TOOLS: &str = "You are running unattended, so anything that needs a person is not answered — it ends this \
+     node. Look with Read, Grep and Glob rather than with shell loops or pipelines: they need \
+     nobody, and they are what this node has.";
+
+const HISTORY_IS_THE_JOBS: &str = "The job commits the tree itself once an item's gate agrees, so no \
+     item should ask anyone to commit, stage or branch — that work is already done for you, and an \
+     item that asks for it is skipped rather than done.";
+
 /// The prompt the plan node is given.
 ///
 /// It says the file is the only thing read, because it is: §5.2 of the design takes the queue from
@@ -840,11 +1234,59 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
         "You are the PLAN node of an autonomous job. Break the task below into at most {max_items} \
          items that can be done one after another, in order, in the same working tree. Prefer \
          fewer, larger items to more, smaller ones.\n\n\
+         {HISTORY_IS_THE_JOBS}\n\n\
          Write them to {artifacts}/plan.json and change nothing else:\n\n\
-         {{\"items\": [{{\"description\": \"...\"}}]}}\n\n\
+         {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\", \"...\"]}}]}}\n\n\
+         \"files\" is optional and best-effort — name the files you expect the item to touch if you \
+         know them, and omit the field if you do not. A wrong guess costs more than no guess.\n\n\
          That file is the only thing that is read; anything you print is discarded. If there is no \
          work to do, write {{\"items\": []}} — an empty queue is a legitimate answer and is not a \
          failure. Do not begin any of the work yourself.\n\n\
+         The task:\n\n{task}"
+    )
+}
+
+/// The prompt the replan node is given at the end of a round.
+///
+/// The node's whole job is to answer one question — is there more to do? — and the two answers go to
+/// the same file for the same reason the plan node's queue does: a stream truncated mid-write must
+/// not be readable as a plausible short answer.
+///
+/// It is given the archives and told what they are, because without them the pattern this feature
+/// rests on cannot work. A replan that cannot see what round 1 tried reproposes round 1, no round
+/// ever comes back empty, and the "until it dries up" brake never fires — leaving `max_rounds` as
+/// the only thing between the job and its budget.
+///
+/// Told to prefer `done` explicitly, and that is not politeness. The failure this feature has to
+/// avoid is a job that will not admit it is finished: ending #4 (out of rounds) costs a full round of
+/// runs to discover, where ending #1 costs one node.
+pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &str) -> String {
+    let history = if archives.is_empty() {
+        // Reachable when the archive copy failed, and the honest thing to say is that it is missing.
+        // Claiming a file that is not there sends the node looking, and what it finds is nothing.
+        "The earlier rounds' plans could not be recovered, so judge from the working tree and its \
+         git history alone."
+            .to_owned()
+    } else {
+        format!(
+            "What the earlier rounds already tried is in {}. Do not repropose any of it.",
+            archives.join(", ")
+        )
+    };
+    format!(
+        "You are the REPLAN node of an autonomous job, at the end of round {round}. The working tree \
+         holds everything the job has done so far.\n\n\
+         {history}\n\n\
+         Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
+         change nothing else:\n\n\
+         {{\"done\": true, \"why\": \"...\"}}\n\
+         {{\"items\": [{{\"description\": \"...\"}}]}}\n\n\
+         That file is the only thing that is read; anything you print is discarded. Prefer \
+         {{\"done\": true}} when the task is met — saying so ends the job in one node, where leaving \
+         it to run out of rounds costs a full round of work to discover the same thing. Do not begin \
+         any of the work yourself.\n\n\
+         {HISTORY_IS_THE_JOBS}\n\n\
+         {LOOK_WITH_THE_READING_TOOLS}\n\n\
          The task:\n\n{task}"
     )
 }
@@ -854,20 +1296,39 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
 /// It gets the item and the queue, and no account of how the previous node reasoned — §5.4 of the
 /// design makes each node's independence structural rather than requested, by never keeping a
 /// session another node could resume.
+///
+/// `files` is the plan node's guess, appended only when it made one: a node with no hint is given
+/// the brief it has always been given, word for word, rather than a paragraph about a mechanism it
+/// has nothing to put in.
 pub fn implement_prompt(
     description: &str,
     ordinal: usize,
     total: usize,
     artifacts: &str,
+    files: &[String],
 ) -> String {
-    format!(
+    let mut prompt = format!(
         "You are item {} of {total} in an autonomous job. The working tree already holds the work \
          of the earlier items; this is the only one you do.\n\n\
          {description}\n\n\
          The full queue is in {artifacts}/plan.json for context. Do not start another item and do \
-         not edit that file. Your work is verified after you finish, so leave the tree building.",
+         not edit that file. Your work is verified after you finish, so leave the tree building. \
+         Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
+         stops this item to ask permission for something already arranged.",
         ordinal + 1
-    )
+    );
+    if !files.is_empty() {
+        // Told where to begin, and told in the same breath that beginning is all it is. A list
+        // written before any of the earlier items ran cannot know what they moved, so a node that
+        // reads it as the edge of its work stops halfway and leaves the tree half-changed.
+        prompt.push_str(&format!(
+            "\n\nThe plan expected this item to touch {}. Start there, and treat that list as \
+             possibly incomplete or wrong — it was guessed before any of the work was done. Edit \
+             whatever the item actually needs.",
+            files.join(", ")
+        ));
+    }
+    prompt
 }
 
 /// The prompt the review node is given.
@@ -891,7 +1352,8 @@ pub fn review_prompt(base: Option<&str>, artifacts: &str) -> String {
          Judge the diff, not the intent.\n\n\
          {diff}\n\n\
          The queue those changes were meant to satisfy is in {artifacts}/plan.json. Report what is \
-         wrong, what is missing against that queue, and nothing else. Change no files."
+         wrong, what is missing against that queue, and nothing else. Change no files.\n\n\
+         {LOOK_WITH_THE_READING_TOOLS}"
     )
 }
 
@@ -995,6 +1457,10 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     if job.stage() == "planning" {
         ingest_plan(state, job).await?;
     }
+    // Unconditional, unlike the plan node's, because a replan node has no status of its own to key
+    // off — it leaves the job wherever it found it. Cheap when there is nothing to take: one indexed
+    // read of the latest `replan` run, and the very common case is that there has never been one.
+    ingest_replan(state, job).await?;
     Ok(())
 }
 
@@ -1071,14 +1537,22 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
         }
     };
 
-    for (ordinal, description) in planned.items.iter().enumerate() {
+    for (ordinal, item) in planned.items.iter().enumerate() {
+        // NULL rather than `[]`: the column that says nothing reads downstream as "the planner did
+        // not say", where an empty array would read as "the planner said no files". A hint that
+        // will not serialize is treated as one that was never given — losing a guess is cheaper
+        // than failing a plan over it.
+        let files = (!item.files.is_empty())
+            .then(|| serde_json::to_string(&item.files).ok())
+            .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status)
-             VALUES (?, ?, ?, 'pending')",
+            "INSERT INTO job_items (job_id, ordinal, description, status, files)
+             VALUES (?, ?, ?, 'pending', ?)",
         )
         .bind(job.id)
         .bind(ordinal as i64)
-        .bind(description)
+        .bind(&item.description)
+        .bind(files)
         .execute(pool)
         .await?;
     }
@@ -1112,6 +1586,233 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
 }
 
 pub const PLAN_FILE: &str = "plan.json";
+
+/// Copies a round's plan aside and lists every archive the job has, newest last.
+///
+/// Best-effort, and deliberately so: a copy that fails costs the replan node its history, which the
+/// prompt then says out loud rather than papering over. Failing the job instead would throw a
+/// night's work away over a file copy — and the node can still read the working tree and its git log,
+/// which is a worse account of what was tried but not no account at all.
+///
+/// Every archive, not just the one just written: round 3's replan needs to know what rounds 0, 1 and
+/// 2 tried, or it reproposes the oldest of them.
+async fn archive_plans(worktree: &Path, round: i64) -> Vec<String> {
+    let directory = worktree.join(crate::worktree::ARTIFACTS_DIR);
+    let archive = format!("plan-{round}.json");
+    if let Err(error) = tokio::fs::copy(directory.join(PLAN_FILE), directory.join(&archive)).await {
+        tracing::warn!(%error, round, "could not archive a round's plan for the replan node");
+    }
+
+    let mut archives = Vec::new();
+    for previous in 0..=round {
+        let name = format!("plan-{previous}.json");
+        if tokio::fs::try_exists(directory.join(&name))
+            .await
+            .unwrap_or(false)
+        {
+            archives.push(name);
+        }
+    }
+    archives
+}
+
+/// Takes the answer a replan node landed with, exactly once.
+///
+/// Read wherever the job happens to be parked rather than from a status of its own: a replan node
+/// leaves `jobs.status` as it found it (`reviewing`, usually), which keeps the job holding the
+/// project's concurrency slot without the slot table needing to learn
+/// a new word.
+async fn ingest_replan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
+    let pool = &state.pool;
+    let Some((run_id, run_status)): Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM runs WHERE job_id = ? AND stage = 'replan' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job.id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(());
+    };
+    if node_in_flight(&run_status) {
+        return Ok(());
+    }
+    // The marker, and the reason it is a marker: a replan that produced nothing leaves every
+    // observable condition exactly as it found it, so any derived test would ingest it again on the
+    // next tick and keep bumping the round until the ceiling ended the job.
+    let taken: Option<i64> = sqlx::query_scalar("SELECT replan_run_id FROM jobs WHERE id = ?")
+        .bind(job.id)
+        .fetch_one(pool)
+        .await?;
+    if taken == Some(run_id) {
+        return Ok(());
+    }
+
+    // Everything below records the node as taken in the same statement that acts on it, so a job
+    // cannot end up acting twice on one answer.
+    if run_status != "completed" {
+        stop_after_replan(
+            state,
+            job,
+            run_id,
+            &format!("its replan node ended `{run_status}`"),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let contents = match job_worktree(pool, job.id).await? {
+        Some((worktree, _)) => {
+            let file = worktree
+                .join(crate::worktree::ARTIFACTS_DIR)
+                .join(PLAN_FILE);
+            tokio::fs::read(&file).await.ok()
+        }
+        None => None,
+    };
+    let planned = match parse_plan(contents.as_deref(), job.max_items.max(0) as usize) {
+        Ok(planned) => planned,
+        Err(error) => {
+            stop_after_replan(state, job, run_id, &format!("its replan node {error}")).await?;
+            return Ok(());
+        }
+    };
+
+    // Ending #1. `stopped` is not the word here and `failed` certainly is not: the node that just
+    // looked at the work says the work is over, which is the best evidence this system can get.
+    if let Some(why) = planned.done {
+        sqlx::query("UPDATE jobs SET replan_done = 1, replan_run_id = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(job.id)
+            .execute(pool)
+            .await?;
+        say(
+            pool,
+            job,
+            "job_replanned",
+            &format!(
+                "job {} says it is done after {} round(s): {why}",
+                job.id,
+                job.round + 1
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
+    open_the_next_round(state, job, run_id, &planned).await
+}
+
+/// Ends a job whose replan node could not answer, keeping what the earlier rounds did.
+///
+/// `Stopped` and not `Failed`, which is the whole point of the distinction: the rounds that ran are
+/// on the branch, gated, and worth looking at. A job reported `failed` for want of a replan teaches
+/// its reader to ignore the branch.
+async fn stop_after_replan(
+    state: &AppState,
+    job: &JobRow,
+    run_id: i64,
+    why: &str,
+) -> sqlx::Result<()> {
+    let pool = &state.pool;
+    sqlx::query("UPDATE jobs SET replan_run_id = ? WHERE id = ?")
+        .bind(run_id)
+        .bind(job.id)
+        .execute(pool)
+        .await?;
+    finish(pool, job.id, Outcome::Stopped).await?;
+    say(
+        pool,
+        job,
+        "job_stopped",
+        &format!(
+            "job {} stopped after round {}: {why}. What the earlier rounds did is on the branch.",
+            job.id,
+            job.round + 1
+        ),
+    )
+    .await;
+    Ok(())
+}
+
+/// Queues what a replan asked for and moves the job onto the next round.
+///
+/// Ordinals CONTINUE rather than restart, because `ordinal` is half `job_items`'s primary key and
+/// because the position in the loaded queue is the number `advance` looks an item up by. The round
+/// is carried on the row as a label, for the replan node's history and for a person reading which
+/// round a given item came from.
+async fn open_the_next_round(
+    state: &AppState,
+    job: &JobRow,
+    run_id: i64,
+    planned: &PlannedItems,
+) -> sqlx::Result<()> {
+    let pool = &state.pool;
+    let round = job.round + 1;
+    let next_ordinal: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_items WHERE job_id = ?")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await?;
+
+    for (offset, item) in planned.items.iter().enumerate() {
+        // The same NULL-rather-than-`[]` rule as the first round's ingestion, and carried here for
+        // the reason it exists there. A later round's items are planned by a node looking at the
+        // same tree, so an item of round 3 arriving without its file hint is not a different kind of
+        // item — it is the hint being dropped on the way in, silently, for every round but the first.
+        let files = (!item.files.is_empty())
+            .then(|| serde_json::to_string(&item.files).ok())
+            .flatten();
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, round, files)
+             VALUES (?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(job.id)
+        .bind(next_ordinal + offset as i64)
+        .bind(&item.description)
+        .bind(round)
+        .bind(files)
+        .execute(pool)
+        .await?;
+    }
+
+    // A round that added nothing feeds the counter; one that added something resets it. Both are the
+    // same UPDATE, because the round advances either way — a dry round IS a round, and counting it
+    // as one is what makes `dry_rounds` reach two.
+    let dry = planned.items.is_empty();
+    sqlx::query(
+        "UPDATE jobs
+         SET round = ?, dry_rounds = CASE WHEN ? THEN dry_rounds + 1 ELSE 0 END,
+             replan_done = 0, replan_run_id = ?
+         WHERE id = ?",
+    )
+    .bind(round)
+    .bind(dry)
+    .bind(run_id)
+    .bind(job.id)
+    .execute(pool)
+    .await?;
+
+    if !dry {
+        sqlx::query("UPDATE jobs SET status = 'implementing' WHERE id = ?")
+            .bind(job.id)
+            .execute(pool)
+            .await?;
+    }
+
+    say(
+        pool,
+        job,
+        "job_replanned",
+        &format!(
+            "job {} opened round {} with {} item(s)",
+            job.id,
+            round + 1,
+            planned.items.len()
+        ),
+    )
+    .await;
+    Ok(())
+}
 
 /// Starts one node, and records that the item it belongs to is now in someone's hands.
 async fn spawn_node(
@@ -1254,6 +1955,17 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
     let pool = &state.pool;
     let last = ordinal + 1 == items;
 
+    // Deliberately takes NO checkpoint, where `record_gate`'s green arm does.
+    //
+    // A checkpoint is the commit a gate agreed with, and there was no gate here. Leaving
+    // `checkpoint_sha` NULL makes `footing_for` look further back — past every ungated item, to the
+    // last measured one or to `jobs.head_sha` — so a later red gate takes the whole ungated stretch
+    // with it when it reverts.
+    //
+    // That is the intended reading rather than an oversight: with `gate_after_each_item` off,
+    // nothing has agreed with any of that work, so there is no point in it worth returning to. A
+    // footing minted here would name a commit no gate ever blessed, which is exactly the false
+    // comfort the column exists to avoid.
     let pass_without_measuring = |why: &'static str| async move {
         let _ =
             sqlx::query("UPDATE job_items SET status = 'passed' WHERE job_id = ? AND ordinal = ?")
@@ -1322,6 +2034,58 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
     record_gate(state, job, ordinal, outcome).await
 }
 
+/// The commit an item at `ordinal` falls back to when its own work has to be undone.
+///
+/// PURE apart from the read. The nearest earlier item that a gate agreed with, or — for the first
+/// item, and for a job whose earlier items were all skipped — the SHA the job was created at.
+///
+/// `None` is the one shape callers must handle rather than paper over: a job created before this
+/// column existed, or one whose `head_sha` could not be read at creation, has no footing at all, and
+/// the honest response is to leave the tree alone and stop rather than guess at a revision.
+async fn footing_for(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
+    let earlier: Option<String> = sqlx::query_scalar(
+        "SELECT checkpoint_sha FROM job_items
+         WHERE job_id = ? AND ordinal < ? AND checkpoint_sha IS NOT NULL
+         ORDER BY ordinal DESC LIMIT 1",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    earlier.or_else(|| job.head_sha.clone())
+}
+
+/// The footing for the item a given run owns, for callers outside this module.
+///
+/// `hooks.rs` knows a `run_id` and nothing else — it is answering a tool call, not walking a queue —
+/// so it cannot supply the ordinal [`footing_for`] wants. This resolves it, and deliberately reuses
+/// the same query rather than growing a second answer to "what does this item fall back to".
+pub async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
+    let ordinal: i64 =
+        sqlx::query_scalar("SELECT ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
+            .bind(job_id)
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+
+    let job = load_job(pool, job_id).await.ok()?;
+    footing_for(pool, &job, ordinal as usize).await
+}
+
+/// The job's worktree path, for callers outside this module that hold no `JobRow`.
+pub async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf> {
+    job_worktree(pool, job_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(path, _)| path)
+}
+
 async fn record_gate(
     state: &AppState,
     job: &JobRow,
@@ -1346,11 +2110,110 @@ async fn record_gate(
         ),
     };
 
+    // Green: take the footing the next item will stand on.
+    //
+    // Written in the SAME statement as the verdict, not a second one after it. Two writes leave a
+    // window where the item reads `passed` with no checkpoint, and an item that fails inside that
+    // window reverts to the item BEFORE this one — throwing away work a gate had just agreed with,
+    // silently, and only under a race nobody would reproduce.
+    //
+    // A checkpoint that cannot be taken does not fail the item. The work is on the branch either
+    // way; what is lost is the next item's footing, and `footing_for` already answers that with the
+    // nearest earlier one. Refusing a green gate over a `git commit` would turn a disk hiccup into a
+    // failed night.
+    let mut checkpoint_sha = None;
+    if matches!(outcome, crate::gate::GateOutcome::Passed) {
+        match job_worktree(pool, job.id).await {
+            Ok(Some((worktree, _))) => match crate::worktree::checkpoint(&worktree).await {
+                Ok(sha) => checkpoint_sha = Some(sha),
+                Err(error) => {
+                    tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint a green item");
+                }
+            },
+            _ => {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "no worktree on record to checkpoint"
+                );
+            }
+        }
+    }
+
+    // Red: put the tree back before anything else touches it.
+    //
+    // Before the mark, deliberately. The mark is what lets the queue move on, and the queue moving
+    // on to a tree still holding the rejected work is the exact defect this replaces — the item
+    // after it would build on code the gate has just called broken.
+    //
+    // `Errored` is NOT reverted, where the plan for this chunk said both should be. A gate that
+    // would not run measured nothing, so the work it did not judge might be perfectly good, and the
+    // job stops here and hands the branch to a person either way. Reverting would destroy work whose
+    // only crime is that nothing looked at it. `Failed` is different in kind: something looked, and
+    // said no.
+    if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
+        let reverted = match (
+            job_worktree(pool, job.id).await,
+            footing_for(pool, job, ordinal).await,
+        ) {
+            (Ok(Some((worktree, _))), Some(footing)) => {
+                match crate::worktree::revert_to(&worktree, &footing).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(job_id = job.id, ordinal, %error, "could not revert a red item");
+                        false
+                    }
+                }
+            }
+            (_, None) => {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "no footing to revert a red item to"
+                );
+                false
+            }
+            _ => {
+                tracing::warn!(job_id = job.id, ordinal, "no worktree on record to revert");
+                false
+            }
+        };
+
+        if !reverted {
+            // Mark the item first — a red gate is a fact whatever happened next — then stop. The
+            // queue must not advance onto a tree still holding work the gate rejected, and this is
+            // the one branch where continuing is worse than ending the job early.
+            let _ = sqlx::query(
+                "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(item_status)
+            .bind(gate_status)
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            say(
+                pool,
+                job,
+                "job_gate_failed",
+                &format!(
+                    "job {} at item {}: the gate failed and the worktree could not be put back, so the job stopped here",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            return Step::Stopped;
+        }
+    }
+
     let written = sqlx::query(
-        "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+        "UPDATE job_items SET status = ?, gate_status = ?, checkpoint_sha = ?
+         WHERE job_id = ? AND ordinal = ?",
     )
     .bind(item_status)
     .bind(gate_status)
+    .bind(checkpoint_sha.as_deref())
     .bind(job.id)
     .bind(ordinal as i64)
     .execute(pool)
@@ -1386,6 +2249,32 @@ enum Brake {
     },
 }
 
+/// Whether starting one more node would take this job past its own allowance, and how to say so.
+///
+/// Asks about the NEXT node, never the one in flight: the reserve is what a node is expected to cost,
+/// so the test is "would starting another cross the line" rather than "has the line been crossed".
+/// Killing a node mid-flight would throw away what it has already spent and leave the tree in a state
+/// no gate has measured — the identical decision the global budget took on 2026-07-20, for the
+/// identical reason.
+async fn job_over_budget(
+    pool: &SqlitePool,
+    job: &JobRow,
+    limit: f64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Option<String>> {
+    let spent = crate::budget::job_spend(pool, job.id, now).await?;
+    let reserve = crate::budget::load_budget_config(pool)
+        .await?
+        .per_run_reserve_usd;
+    if spent + reserve <= limit {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "this job has spent ${spent:.2} of its ${limit:.2} allowance, and the next node reserves \
+         ${reserve:.2}"
+    )))
+}
+
 async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     // Re-read per node rather than once per pass. A pass can spend a whole gate timeout inside one
     // job, and a stop that keeps starting work for another fifteen minutes is not a stop. Fails
@@ -1416,6 +2305,26 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
             reason,
             kind: crate::budget::PauseKind::Window,
         } => return Brake::Stop { detail: reason },
+    }
+
+    // The job's own ceiling, under the house's. Two different questions and both worth asking: a job
+    // can be stopped by what it was given or by what is left in the till.
+    //
+    // `Stop` and never `Park`, which is the whole difference from the window brake above. A calendar
+    // window reopens; a task's allowance does not, and a job parked on it would sit there until the
+    // four-hour ceiling swept it up with `waiting` on its row and no reason a reader could act on.
+    if let Some(limit) = job.budget_usd {
+        match job_over_budget(&state.pool, job, limit, now).await {
+            // Fails CLOSED, like every other brake here: a spend that cannot be read stops the job
+            // rather than letting it keep spending against a number nobody could check.
+            Err(error) => {
+                return Brake::Stop {
+                    detail: format!("this job's spend could not be read: {error}"),
+                };
+            }
+            Ok(Some(detail)) => return Brake::Stop { detail },
+            Ok(None) => {}
+        }
     }
 
     // Decision 10, and the whole of what it adds: the brake was a check made once at admission, and
@@ -1525,8 +2434,8 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             spawn_node(state, job, "plan", prompt, None, worktree).await
         }
         Next::SpawnImplement { ordinal } => {
-            let description: Option<String> = sqlx::query_scalar(
-                "SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?",
+            let row = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT description, files FROM job_items WHERE job_id = ? AND ordinal = ?",
             )
             .bind(job.id)
             .bind(ordinal as i64)
@@ -1534,16 +2443,31 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             .await
             .ok()
             .flatten();
-            let Some(description) = description else {
+            let Some((description, files)) = row else {
                 tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
                 return Step::Stopped;
             };
-            let prompt = implement_prompt(&description, ordinal, view.items.len(), &artifacts);
+            // A hint that will not parse is no hint. It is an optimisation for where to start
+            // reading, and refusing to run the item over it would fail the work for the sake of the
+            // advice about the work.
+            let files: Vec<String> = files
+                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+                .unwrap_or_default();
+            let prompt =
+                implement_prompt(&description, ordinal, view.items.len(), &artifacts, &files);
             spawn_node(state, job, "implement", prompt, Some(ordinal), worktree).await
         }
         Next::SpawnReview => {
             let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
             spawn_node(state, job, "review", prompt, None, worktree).await
+        }
+        Next::SpawnReplan => {
+            // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
+            // with its own answer. The round's plan has to be put aside while it still exists.
+            let archives = archive_plans(&worktree.0, view.rounds.round).await;
+            let task = job.prompt.clone().unwrap_or_default();
+            let prompt = replan_prompt(&task, view.rounds.round, &archives, &artifacts);
+            spawn_node(state, job, "replan", prompt, None, worktree).await
         }
         Next::Wait | Next::Finish(_) | Next::RunGate { .. } => Step::Stopped,
     }
@@ -1631,6 +2555,25 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
         return;
     }
 
+    // Before the pass, so a slot freed here is available to the very jobs about to be driven.
+    //
+    // For jobs this is a backstop: `retire` gives the slot back the moment one ends, and every
+    // ending funnels there. For RUNS it is the mechanism — `runs` has ten places that write a
+    // terminal status and no funnel like `retire`, so a run's slot is derived from liveness instead
+    // of released by hand, which cannot drift the way ten call sites can. `create_run_inner` sweeps
+    // again immediately before it claims, so the derivation is current at the moment it decides
+    // anything; this pass is what keeps the table honest in between.
+    //
+    // Either way a held slot is silent — it lowers a project's ceiling with no error anywhere — and
+    // that silence is what the sweep bounds to one tick.
+    match crate::concurrency::reconcile_orphaned_slots(&state.pool).await {
+        Ok(freed) if freed > 0 => {
+            tracing::warn!("freed {freed} concurrency slot(s) whose owner was no longer live");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not sweep orphaned concurrency slots"),
+    }
+
     let jobs = match live_jobs(&state.pool).await {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -1639,7 +2582,37 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
         }
     };
     for job in jobs {
+        reclaim_the_slot(state, &job).await;
         drive(state, job, now).await;
+    }
+}
+
+/// Puts a live job back on a slot it should never have been off.
+///
+/// The gap this closes is small and real: `start` inserts the row and claims immediately after,
+/// because a slot is keyed on its owner's id, so a daemon that dies in that window leaves a job
+/// live and holding nothing. The sweep cannot heal it — that pass only takes slots AWAY from owners
+/// that died, and there is nothing here to take. Left alone, the project would run one over its
+/// ceiling for as long as the job lasts.
+///
+/// `claim` is idempotent per owner, so a job that already holds one costs a single indexed read.
+///
+/// A full house is logged and no more. This job is already running: refusing it a slot now would
+/// change nothing about what it is doing and would only make the books disagree with the machine.
+/// The ceiling governs what STARTS, and this one already did.
+async fn reclaim_the_slot(state: &AppState, job: &JobRow) {
+    let owner = crate::worktree::Owner::Job(job.id);
+    match crate::concurrency::claim(&state.pool, &job.project_id, owner).await {
+        Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
+        Ok(crate::concurrency::ClaimOutcome::Full(full)) => tracing::warn!(
+            job_id = job.id,
+            project_id = %job.project_id,
+            reason = %full.reason(),
+            "a live job holds no concurrency slot and there is no room to give it one"
+        ),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not confirm a live job's slot");
+        }
     }
 }
 
@@ -1670,6 +2643,14 @@ pub struct JobSummary {
     /// alone would leave them guessing which.
     pub wait_reason: Option<String>,
     pub max_items: i64,
+    /// The round the job is on, counted from zero, and how many it may run.
+    ///
+    /// Carried because without them a job with rounds is unreadable from outside: a queue of eight
+    /// items where the first five passed and the last three are pending looks the same whether the
+    /// plan node asked for eight at once — which `MAX_ITEMS_CEILING` forbids — or asked for five,
+    /// finished them, and had a replan node ask for three more. This pair is what says which.
+    pub round: i64,
+    pub max_rounds: i64,
     pub created_at: String,
     pub completed_at: Option<String>,
 }
@@ -1680,6 +2661,10 @@ pub struct JobItemView {
     pub ordinal: i64,
     pub description: String,
     pub status: String,
+    /// The round this item was queued in. `ordinal` cannot stand in for it: ordinals continue
+    /// across rounds rather than restart, so nothing in the number itself marks where one round
+    /// ended and the next began.
+    pub round: i64,
     /// The node that did it, so the shell can link to the transcript.
     pub run_id: Option<i64>,
     /// Carried separately from `status` because they answer different questions: `status` says
@@ -1701,7 +2686,8 @@ pub struct JobDetail {
 }
 
 const ONE_SUMMARY_SQL: &str =
-    "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at, completed_at
+    "SELECT id, project_id, rule_name, status, wait_reason, max_items, round, max_rounds,
+        created_at, completed_at
      FROM jobs WHERE id = ?";
 
 /// The most recent jobs, newest first.
@@ -1716,8 +2702,8 @@ pub async fn list(
     match project_id {
         Some(project_id) => {
             sqlx::query_as(
-                "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at,
-                    completed_at
+                "SELECT id, project_id, rule_name, status, wait_reason, max_items, round,
+                    max_rounds, created_at, completed_at
              FROM jobs WHERE project_id = ? ORDER BY id DESC LIMIT ?",
             )
             .bind(project_id)
@@ -1727,8 +2713,8 @@ pub async fn list(
         }
         None => {
             sqlx::query_as(
-                "SELECT id, project_id, rule_name, status, wait_reason, max_items, created_at,
-                    completed_at
+                "SELECT id, project_id, rule_name, status, wait_reason, max_items, round,
+                    max_rounds, created_at, completed_at
              FROM jobs ORDER BY id DESC LIMIT ?",
             )
             .bind(limit)
@@ -1748,7 +2734,7 @@ pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDe
     };
 
     let items: Vec<JobItemView> = sqlx::query_as(
-        "SELECT ordinal, description, status, run_id, gate_status
+        "SELECT ordinal, description, status, round, run_id, gate_status
          FROM job_items WHERE job_id = ? ORDER BY ordinal",
     )
     .bind(job_id)
@@ -1775,6 +2761,50 @@ pub enum CancelOutcome {
     NotFound,
 }
 
+/// Ends a node that is parked on an approval, which `finalize_termination` cannot.
+///
+/// That function needs a live handle and guards its write with `status = 'running'`, and a parked
+/// node has neither: its task ended when it asked, and its row says `awaiting_approval`. So the loop
+/// below used to hand it a run it could do nothing with, and the run stayed parked after the job
+/// that owned it was gone, holding the project's exclusivity and blocking every later worktree run
+/// of it until a person noticed. (Measured before migration 0053, when that exclusivity was an
+/// index and one strand took the whole project down. It is a slot now, so the same leak narrows the
+/// project instead of stopping it — quieter, and still wrong.)
+///
+/// Measured on 2026-08-08: job 12 was cancelled while its review node was parked, and job 13 came up
+/// `waiting` with `wait_reason = slot` against a project whose only live job was itself. Nothing in
+/// the feed said why, because from the project's side nothing had gone wrong.
+///
+/// The proposal is closed FIRST, and that order is the point rather than tidiness: while it is
+/// pending, `/approve` is a working door into a node whose job is over — it would resume work
+/// nobody is waiting for, in a worktree the job no longer owns. `reject_proposal` also takes the run
+/// terminal through `worktree::release`, so the call after it is for the other case: a node parked
+/// with no pending proposal left to reject.
+async fn cancel_parked_node(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
+    let pending: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM proposals
+         WHERE run_id = ? AND kind = 'action-approval' AND status = 'pending'",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    for proposal_id in pending {
+        if let Err(error) = crate::proposals::reject_proposal(pool, proposal_id).await {
+            // Best effort, and the release below is why that is acceptable: a proposal that could
+            // not be rejected leaves a stale door, where a run that stayed parked would leave the
+            // whole project blocked. The worse of the two is the one this function must not skip.
+            tracing::warn!(
+                run_id,
+                proposal_id,
+                ?error,
+                "could not reject the parked node's proposal"
+            );
+        }
+    }
+    crate::worktree::release(pool, run_id).await?;
+    Ok(())
+}
+
 /// Stops a whole job: the node in flight, and the sequence behind it.
 ///
 /// This is the second of the two cancellation levels. Cancelling a *run* stops one node, and the
@@ -1798,14 +2828,20 @@ pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome
         return Ok(CancelOutcome::NotLive);
     }
 
-    let in_flight: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM runs WHERE job_id = ? AND status IN ('running','awaiting_approval')",
+    let in_flight: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM runs WHERE job_id = ? AND status IN ('running','awaiting_approval')",
     )
     .bind(job_id)
     .fetch_all(pool)
     .await?;
-    for run_id in in_flight {
-        crate::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
+    for (run_id, status) in in_flight {
+        // Branched on the run's own status rather than on what `finalize_termination` returns,
+        // because the two ends need different tools and the return value does not tell them apart.
+        if status == "awaiting_approval" {
+            cancel_parked_node(pool, run_id).await?;
+        } else {
+            crate::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
+        }
     }
 
     // Only the item that was in someone's hands. The ones still `pending` were never started, and
@@ -1960,8 +2996,8 @@ mod tests {
     /// Adds a node run for a job, in whatever status the test needs it to have landed in.
     async fn seed_node(pool: &sqlx::SqlitePool, job_id: i64, stage: &str, status: &str) -> i64 {
         // The job's own project, not a literal: two `awaiting_approval` worktree runs sharing one
-        // project id would collide on `one_open_worktree_run_per_project`, which is migration 0009
-        // doing exactly its job and has nothing to do with what the test is asking.
+        // project id used to collide on `one_open_worktree_run_per_project`; that index is gone
+        // (0053), and the shared id stays because these nodes do belong to one job's project.
         let project_id: String = sqlx::query_scalar("SELECT project_id FROM jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(pool)
@@ -2005,12 +3041,25 @@ mod tests {
             .unwrap()
     }
 
+    /// A job of one round, which is what every test written before rounds existed is about.
     fn view(planned: bool, items: &[ItemState], review: ReviewState) -> JobView {
         JobView {
             planned,
             planning: false,
             items: items.to_vec(),
             review,
+            rounds: RoundState::default(),
+        }
+    }
+
+    /// The same, for a job that was asked for more than one round.
+    fn view_in_round(items: &[ItemState], review: ReviewState, rounds: RoundState) -> JobView {
+        JobView {
+            planned: true,
+            planning: false,
+            items: items.to_vec(),
+            review,
+            rounds,
         }
     }
 
@@ -2044,6 +3093,8 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await?;
@@ -2114,18 +3165,116 @@ mod tests {
         );
     }
 
+    /// The distinction gate.rs guards and §7 of the spec insists must survive the trip up to the
+    /// job: a non-zero exit says the code is broken, a binary that would not start says the
+    /// measurement never happened. One of those is a verdict; the other is silence.
+    ///
+    /// It now shows up as a difference in WHEN the job ends rather than only in what it is called.
+    /// A red gate lets the queue carry on — the item's work has been reverted, and the items after
+    /// it were never the ones that broke. Silence stops everything, because building on work
+    /// nothing has measured is what the gate exists to prevent.
     #[test]
     fn a_failed_gate_and_an_errored_gate_end_the_job_differently() {
-        // The distinction gate.rs guards and §7 of the spec insists must survive the trip up to the
-        // job: a non-zero exit says the code is broken, a binary that would not start says the
-        // measurement never happened. One of those is a verdict; the other is silence.
+        assert_eq!(
+            next_step(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
+            Next::Finish(Outcome::GateErrored),
+            "a gate that would not run has to stop the chain where it is"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateErrored, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::Finish(Outcome::GateErrored),
+            "and it stops it even with work still queued behind it"
+        );
+
         assert_eq!(
             next_step(&view(true, &[ItemState::GateFailed], ReviewState::Pending)),
+            Next::SpawnReview,
+            "a red gate is no longer where the job stops"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateFailed, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 1 },
+            "the item after a red one is still work worth doing"
+        );
+    }
+
+    /// What a red gate DOES still decide: the ending.
+    ///
+    /// The point of letting the queue carry on was never to soften the verdict. A branch carrying an
+    /// item the gate rejected is not one to tell somebody is complete, however many items passed
+    /// after it — including the case where the red one is not the last.
+    #[test]
+    fn one_red_gate_makes_the_whole_job_gate_failed_however_it_ends() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Passed, ItemState::GateFailed, ItemState::Passed],
+                ReviewState::Done
+            )),
             Next::Finish(Outcome::GateFailed)
         );
         assert_eq!(
-            next_step(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
-            Next::Finish(Outcome::GateErrored)
+            next_step(&view(
+                true,
+                &[ItemState::GateFailed, ItemState::Passed],
+                ReviewState::NotWanted
+            )),
+            Next::Finish(Outcome::GateFailed),
+            "a job that wanted no review reaches the same verdict by the other door"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Passed, ItemState::Passed],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::Completed),
+            "and a queue nothing rejected still completes"
+        );
+    }
+
+    /// A skipped item is walked past exactly like a passed one, and colours nothing.
+    ///
+    /// Both halves matter. If it blocked, one unrecognised command would park the night — which is
+    /// the state this chunk exists to leave. If it made the job `gate_failed`, then a job that did
+    /// everything it was ALLOWED to do would be reported as broken, and the word would stop meaning
+    /// anything to whoever reads it in the morning.
+    #[test]
+    fn a_skipped_item_neither_blocks_the_queue_nor_colours_the_ending() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Skipped, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 1 },
+            "the queue has to move past it"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Skipped, ItemState::Skipped],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::Completed),
+            "a job whose every item was skipped still did what it was allowed to do"
+        );
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Skipped, ItemState::GateFailed],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::GateFailed),
+            "and it does not hide a red gate beside it"
         );
     }
 
@@ -2166,6 +3315,121 @@ mod tests {
         assert!(matches!(parse_plan(None, 5), Err(PlanError::Absent)));
     }
 
+    /// The replan node's other answer, read out of the same file by the same parser.
+    ///
+    /// One shape for both nodes rather than two, because the failure mode of two is a plan node's
+    /// file becoming unreadable to the replan parser the day somebody adds a key to one of them.
+    #[test]
+    fn a_replan_can_say_the_work_is_over() {
+        let done = br#"{"done": true, "why": "the task is met and the suite is green"}"#;
+        let plan = parse_plan(Some(done), 5).expect("a done verdict is a result, not an error");
+        assert_eq!(
+            plan.done.as_deref(),
+            Some("the task is met and the suite is green")
+        );
+        assert!(plan.items.is_empty());
+
+        // Silence about the reason is not a parse failure: the verdict is the load-bearing half, and
+        // failing a job over a missing sentence would throw away the answer to keep the explanation.
+        let terse = br#"{"done": true}"#;
+        assert_eq!(
+            parse_plan(Some(terse), 5).unwrap().done.as_deref(),
+            Some("no reason given")
+        );
+
+        // `done` wins over items alongside it. Honouring the items would queue work the node just
+        // said was unnecessary; calling the pair malformed would fail a job over redundancy.
+        let both = br#"{"done": true, "items": [{"description": "one more thing"}]}"#;
+        assert!(parse_plan(Some(both), 5).unwrap().done.is_some());
+    }
+
+    /// The distinction ending #1 and ending #3 are built on. An empty queue is a round that produced
+    /// nothing and might not be the last; `done` is a claim the node is making. One ends the job now,
+    /// the other feeds a counter that ends it after two.
+    #[test]
+    fn an_empty_queue_is_not_a_claim_that_the_work_is_over() {
+        let plan = parse_plan(Some(br#"{"items": []}"#), 5).unwrap();
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.done, None);
+
+        // A plan node's file never carries the key at all, and must not read as a failure.
+        let ordinary = br#"{"items": [{"description": "a"}]}"#;
+        assert_eq!(parse_plan(Some(ordinary), 5).unwrap().done, None);
+    }
+
+    /// The replan node cannot do its job without the archives, and the prompt has to say so either
+    /// way. Without them it reproposes round 1, no round ever comes back empty, and the "until it
+    /// dries up" brake never fires — leaving `max_rounds` as the only thing between the job and its
+    /// budget.
+    #[test]
+    fn the_replan_prompt_carries_what_the_earlier_rounds_tried() {
+        let with = replan_prompt(
+            "add shout and whisper",
+            2,
+            &["plan-0.json".to_owned(), "plan-1.json".to_owned()],
+            "/wt/.nucleos",
+        );
+        assert!(with.contains("plan-0.json, plan-1.json"));
+        assert!(with.contains("Do not repropose"));
+        assert!(with.contains("/wt/.nucleos/plan.json"));
+        assert!(with.contains("add shout and whisper"));
+        // Ending #1 is one node; ending #4 costs a whole round to reach the same place, so the node
+        // is told which one to prefer.
+        assert!(with.contains("\"done\": true"));
+
+        // No archives is a reachable state — the copy can fail — and the honest thing is to say so.
+        // Naming a file that is not there sends the node looking, and what it finds is nothing.
+        let without = replan_prompt("t", 1, &[], "/wt/.nucleos");
+        assert!(without.contains("could not be recovered"));
+        assert!(!without.contains("Do not repropose"));
+    }
+
+    /// Every node that could reach for git is told the history is already handled.
+    ///
+    /// Job 12 on 2026-08-08 is why. A task that said "I want to review each one on its own" — about
+    /// how to split the work — became "commit X and Y as two separate commits" in all four items,
+    /// every implement node reached for `git commit`, and under the zero-approval policy the night
+    /// runs on, all four items were skipped with nothing built. The command was judged correctly;
+    /// what was wrong is that the item asked for it.
+    #[test]
+    fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
+        let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos");
+        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos");
+        // No hint, because what this pins is the paragraph every node gets regardless of one.
+        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[]);
+
+        for prompt in [&plan, &replan] {
+            assert!(
+                prompt.contains("The job commits the tree itself"),
+                "a planning node was not told who owns the history"
+            );
+        }
+        assert!(implement.contains("the job commits for you"));
+        // Said as what happens, not only as a prohibition: a node told only "do not commit" invents
+        // a way around it.
+        assert!(plan.contains("already done for you"));
+    }
+
+    /// The nodes that only LOOK are told how to look, because the way they reached for by default
+    /// was the one thing that could stop them.
+    ///
+    /// Across four jobs on 2026-08-08 every inspecting node reached for a shell loop or a pipeline —
+    /// `for f in …; do cat "$f"; done` three times, `git reflog`, `ls -la && … && find … | sort`.
+    /// The classifier reads a line and not a program, so none was recognised, and each one ended its
+    /// node. `Read`, `Grep` and `Glob` need nobody and were there the whole time.
+    #[test]
+    fn the_nodes_that_only_look_are_told_what_to_look_with() {
+        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos");
+        let review = review_prompt(Some("abc123"), "/wt/.nucleos");
+
+        for prompt in [&replan, &review] {
+            assert!(prompt.contains("Read, Grep and Glob"));
+            // The consequence, not just the rule: this node is what the job spends to get an
+            // answer, and a node told only "do not use shell" has no reason to care.
+            assert!(prompt.contains("running unattended"));
+        }
+    }
+
     #[test]
     fn an_unparseable_plan_is_a_planning_failure() {
         let garbage = br#"{"items": [ truncated"#;
@@ -2192,9 +3456,44 @@ mod tests {
             parse_plan(Some(seven), 5).expect("an oversized plan is truncated, not rejected");
 
         assert_eq!(plan.items.len(), 5);
+        // The queue is items, not strings: a description with no file hint is still a whole item,
+        // and truncation cuts items rather than descriptions.
+        assert_eq!(
+            plan.items[0],
+            PlannedItem {
+                description: "a".to_owned(),
+                files: Vec::new(),
+            }
+        );
         // Reported, never silent: a queue quietly cut from seven to five reads downstream as "the
         // planner found five things", which is a different and wrong statement about the work.
         assert_eq!(plan.dropped, 2);
+    }
+
+    /// The hint is the planner's, and it is optional at both ends: a planner that names files is
+    /// believed, a planner that names none is not treated as having named an empty set of them.
+    /// The absent case is not hypothetical — every plan.json written before this column existed
+    /// looks exactly like it, and reading one has to stay a plan rather than a parse failure.
+    #[test]
+    fn parse_plan_reads_optional_file_hints_and_tolerates_their_absence() {
+        let mixed = br#"{"items":[{"description":"x","files":["a.rs","b.rs"]},
+                                  {"description":"y"}]}"#;
+        let plan = parse_plan(Some(mixed), 5).expect("a plan without hints is still a plan");
+
+        assert_eq!(
+            plan.items,
+            vec![
+                PlannedItem {
+                    description: "x".to_owned(),
+                    files: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+                },
+                PlannedItem {
+                    description: "y".to_owned(),
+                    files: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(plan.dropped, 0);
     }
 
     async fn seed_items(pool: &sqlx::SqlitePool, job_id: i64, statuses: &[&str]) {
@@ -2247,6 +3546,199 @@ mod tests {
         assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
     }
 
+    // ---- rounds (Chunk 3) ------------------------------------------------------------------------
+
+    /// The whole point of landing the schema and this logic together and inert: a job nobody asked
+    /// for rounds takes the pre-rounds path, verdict for verdict.
+    ///
+    /// `max_rounds = 1` is what `load_view` resolves a NULL column to, so this is every job that
+    /// existed before migration 0051 and every `graph:` rule scheduled today.
+    #[test]
+    fn a_one_round_job_ends_exactly_as_it_did_before_rounds_existed() {
+        for (items, expected) in [
+            (vec![ItemState::Passed], Outcome::Completed),
+            (
+                vec![ItemState::Passed, ItemState::GateFailed],
+                Outcome::GateFailed,
+            ),
+            (vec![ItemState::Skipped], Outcome::Completed),
+        ] {
+            assert_eq!(
+                next_step(&view(true, &items, ReviewState::Done)),
+                Next::Finish(expected),
+                "{items:?}"
+            );
+        }
+    }
+
+    /// The four endings of §5.2, one case per row, and the order between them is what the table is
+    /// for: two say `completed` and two say `stopped`, which is the difference a person reads in the
+    /// morning between "I finished" and "I was cut short and it is on the branch".
+    #[test]
+    fn a_round_closes_by_the_first_condition_that_holds() {
+        let rounds = |round, dry, replanned| RoundState {
+            round,
+            max_rounds: 5,
+            dry_rounds: dry,
+            replanned,
+            ..RoundState::default()
+        };
+
+        // (1) The replan said so. Ahead of everything: the node that just looked at the work is the
+        // one saying the work is over.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(1, 0, Replan::Done)
+            )),
+            Next::Finish(Outcome::Completed)
+        );
+
+        // (3) It dried up. `completed`, because there was nothing left to do.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(1, DRY_ROUNDS_TO_STOP, Replan::NotYet)
+            )),
+            Next::Finish(Outcome::Completed)
+        );
+
+        // (4) Out of rounds. `stopped`, because there may well have been more.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(4, 0, Replan::NotYet)
+            )),
+            Next::Finish(Outcome::Stopped)
+        );
+
+        // None of them: ask again.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                rounds(1, 1, Replan::NotYet)
+            )),
+            Next::SpawnReplan
+        );
+    }
+
+    /// A red gate ends the job whatever the rounds say.
+    ///
+    /// The per-item revert stops the NEXT ITEM building on work the gate rejected; that reason does
+    /// not stop being true at a round boundary, and a replan looking at a branch carrying a red item
+    /// would plan on top of it.
+    #[test]
+    fn a_red_gate_ends_a_job_that_had_rounds_left() {
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed, ItemState::GateFailed],
+                ReviewState::Done,
+                RoundState {
+                    round: 0,
+                    max_rounds: 5,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Finish(Outcome::GateFailed)
+        );
+    }
+
+    /// The sibling of `planning`, and it exists for the identical reason: between spawning the node
+    /// and its items landing the queue is empty, so without it every tick would spawn another.
+    #[test]
+    fn a_replan_in_flight_is_waited_on_rather_than_spawned_again() {
+        assert_eq!(
+            next_step(&view_in_round(
+                &[ItemState::Passed],
+                ReviewState::Done,
+                RoundState {
+                    round: 1,
+                    max_rounds: 5,
+                    replanning: true,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Wait
+        );
+    }
+
+    /// The one thing an empty queue can mean.
+    #[test]
+    fn an_empty_queue_is_a_planner_that_looked_and_found_nothing() {
+        // Round 0: the planner looked and found nothing. Done, as it always was.
+        assert_eq!(
+            next_step(&view_in_round(
+                &[],
+                ReviewState::Pending,
+                RoundState {
+                    max_rounds: 5,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Finish(Outcome::Completed)
+        );
+
+        // Only reachable on the first round, and that is a property of the queue not being filtered
+        // by round: once anything has been queued at all, this is never empty again. A round that
+        // adds nothing shows up as `dry_rounds`, never as an empty queue.
+    }
+
+    /// Why the queue is read UNFILTERED, stated as the two things filtering would have broken.
+    ///
+    /// Filtering by round is the obvious first design, and it is wrong twice. `ordinal` is half this
+    /// table's primary key, so restarting it per round collides outright — which is how this was
+    /// found. And the position in the loaded queue would stop being the ordinal in the table, which
+    /// is the number `advance` binds into its lookups. Unfiltered costs nothing: a round closes only
+    /// when every item in it is terminal, and those are states `next_step` already walks past.
+    #[tokio::test]
+    async fn a_new_rounds_item_is_found_past_the_finished_ones_and_keeps_its_real_ordinal() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "skipped"]).await;
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, round)
+             VALUES (?, 2, 'what round 1 asked for', 'pending', 1)",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET round = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(
+            view.items,
+            vec![ItemState::Passed, ItemState::Skipped, ItemState::Pending],
+            "the earlier round's items stay in the queue, terminal and walked past"
+        );
+        assert_eq!(view.rounds.round, 1);
+        // 2, not 0. This is the number `advance` binds into
+        // `SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?`.
+        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+    }
+
+    /// A NULL `max_rounds` is "nobody asked for rounds", not "use the daemon's ceiling". Resolving it
+    /// the other way would switch rounds on for every `graph:` rule already scheduled, silently.
+    #[tokio::test]
+    async fn a_job_with_no_round_ceiling_is_a_job_of_one_round() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed"]).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.rounds.max_rounds, 1);
+        assert_eq!(view.rounds.round, 0);
+        assert_eq!(view.rounds.replanned, Replan::NotYet);
+    }
+
     #[tokio::test]
     async fn an_unrecognised_item_status_is_unfinished_rather_than_done() {
         let pool = test_pool().await;
@@ -2279,6 +3771,30 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("slot"));
     }
 
+    /// The note has to leave with the pause it explains.
+    ///
+    /// `retire` has cleared it since it was written; `resume` did not, so an unparked job carried
+    /// the reason for its last pause through everything that came after. What a reader saw was
+    /// `implementing / budget` — a job working normally, labelled with a brake that lifted hours
+    /// ago, which is exactly the sort of thing somebody acts on.
+    #[tokio::test]
+    async fn resuming_a_job_takes_the_pause_note_with_it() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        wait(&pool, job_id, "budget").await.unwrap();
+        resume(&pool, job_id).await.unwrap();
+
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "implementing", "the stage it was parked at");
+        assert_eq!(reason, None, "nothing is waiting, so nothing is the reason");
+    }
+
     #[tokio::test]
     async fn a_finished_job_records_which_kind_of_ending_it_had() {
         let pool = test_pool().await;
@@ -2298,8 +3814,15 @@ mod tests {
         assert_eq!(statuses, vec!["gate_failed", "gate_errored"]);
     }
 
+    /// A second live job for one project is now a row the database accepts.
+    ///
+    /// It used to be refused here, by `one_live_job_per_project`, and that index came out in 0053.
+    /// The lock did not move — it is still an `INSERT`, now into `project_slots` — but it moved
+    /// OFF this function, so `insert_job` no longer refuses anything and `start` is where a full
+    /// project is turned away. Asserted rather than deleted, because a reader who remembers the old
+    /// behaviour needs to find out here that it changed on purpose.
     #[tokio::test]
-    async fn a_second_live_job_for_a_project_is_rejected_by_the_index() {
+    async fn a_second_live_job_for_a_project_is_no_longer_refused_by_the_row() {
         let pool = test_pool().await;
         seed_job(&pool, "project-a", "planning")
             .await
@@ -2307,9 +3830,10 @@ mod tests {
 
         let second = seed_job(&pool, "project-a", "planning").await;
 
-        // Rejected by the unique index rather than by a check in this module: the INSERT is the
-        // lock, so the scheduler tick and a manual POST racing for the same project cannot both win.
-        assert!(second.is_err(), "a project may have only one live job");
+        assert!(
+            second.is_ok(),
+            "the row no longer holds exclusivity; the slot ceiling does"
+        );
     }
 
     #[tokio::test]
@@ -2329,41 +3853,35 @@ mod tests {
 
     // ---- what a pass sees ----------------------------------------------------------------------
 
-    /// The constant the tick iterates and the index the migration created have to name the same
-    /// statuses. A status that only the index knows about holds the project's exclusivity slot
-    /// while nothing drives it: the project goes quiet, with no error anywhere, until somebody
-    /// opens the database.
-    #[tokio::test]
-    async fn a_live_status_the_index_covers_is_also_a_status_the_tick_drives() {
-        let pool = test_pool().await;
-        let index: String = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_master WHERE name = 'one_live_job_per_project'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
+    /// The constant the tick iterates and the SQL a pass loads with have to name the same statuses,
+    /// in both directions.
+    ///
+    /// It used to be checked against `one_live_job_per_project`, which is gone (migration 0053).
+    /// The hazard survived the index, and only changed hands: a job in a status the tick does not
+    /// drive still holds a concurrency slot, and `reconcile_orphaned_slots` still spares it, because
+    /// the sweep's live-list is this same constant. So the project goes quiet with no error
+    /// anywhere — with one slot fewer instead of none at all. `concurrency.rs` guards the sweep's
+    /// half of that agreement; this guards the loader's.
+    #[test]
+    fn a_live_status_is_a_status_some_pass_would_load() {
         for status in LIVE_STATUSES {
-            assert!(
-                index.contains(&format!("'{status}'")),
-                "the tick drives `{status}` but the index does not hold the slot for it"
-            );
             assert!(
                 LIVE_JOBS_SQL.contains(&format!("'{status}'")),
                 "`{status}` is live but no pass would ever load it"
             );
         }
-        // And the other direction, which is the dangerous one.
-        let covered = index
+        // And the other direction, which is the dangerous one: SQL that loads a status the tick has
+        // no arm for would drive a job nothing knows how to move.
+        let loaded = LIVE_JOBS_SQL
             .split('\'')
             .skip(1)
             .step_by(2)
             .filter(|token| !token.is_empty())
             .count();
         assert_eq!(
-            covered,
+            loaded,
             LIVE_STATUSES.len(),
-            "the index covers a status the tick does not drive: {index}"
+            "a pass loads a status the tick does not drive: {LIVE_JOBS_SQL}"
         );
     }
 
@@ -2501,6 +4019,118 @@ mod tests {
         );
     }
 
+    /// Cancelling a job also ends the node that was parked asking for permission — and closes the
+    /// door that could still have said yes to it.
+    ///
+    /// `finalize_termination` cannot do this: it needs a live handle, and it guards its write with
+    /// `status = 'running'`. A parked node has neither. So the run stayed `awaiting_approval` after
+    /// the job that owned it was gone, holding the project's exclusivity — an index then, a
+    /// concurrency slot since 0053, and a leak either way.
+    ///
+    /// Found in production on 2026-08-08: job 12 was cancelled with its review node parked, and the
+    /// next job came up `waiting` with `wait_reason = slot` against a project whose only live job
+    /// was itself — with nothing in the feed to say why, because from the project's side nothing
+    /// had gone wrong.
+    #[tokio::test]
+    async fn cancelling_a_job_ends_the_node_parked_on_an_approval_and_shuts_its_door() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_items(&pool, job_id, &["passed"]).await;
+        let run_id = seed_node(&pool, job_id, "review", "awaiting_approval").await;
+        let proposal_id = crate::proposals::create_action_approval(
+            &pool,
+            run_id,
+            None,
+            Some("project-a"),
+            "Bash",
+            "the review node wanted to look around",
+            Some(r#"{"command":"git branch -a"}"#),
+        )
+        .await
+        .expect("a parked node has a proposal");
+
+        assert_eq!(
+            cancel(&state, job_id).await.unwrap(),
+            CancelOutcome::Cancelled
+        );
+
+        let run_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            run_status, "awaiting_approval",
+            "the parked node outlived the job that owned it, and holds the project's slot"
+        );
+
+        let proposal_status: String =
+            sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+                .bind(proposal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            proposal_status, "pending",
+            "approving this would resume a node whose job is over"
+        );
+    }
+
+    /// A live job that holds no slot is put back on one by the tick.
+    ///
+    /// The window is between `start`'s INSERT and its claim, which cannot be closed by ordering —
+    /// a slot is keyed on its owner's id, so the row must exist first. The sweep is no help either:
+    /// it only takes slots away from owners that died, and there is nothing here to take. Left
+    /// alone, the project runs one over its ceiling for as long as the job lasts.
+    #[tokio::test]
+    async fn the_tick_puts_a_live_job_back_on_a_slot_it_lost() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, owner).await.unwrap(),
+            None
+        );
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reclaim_the_slot(&state, &job).await;
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, owner).await.unwrap(),
+            Some(0)
+        );
+
+        // And again, because `claim` is idempotent per owner: a second pass must not take a second
+        // number, or every tick would spend one until the ceiling refused the project's next start.
+        reclaim_the_slot(&state, &job).await;
+        assert_eq!(crate::concurrency::slots_in_flight(&pool).await.unwrap(), 1);
+    }
+
+    /// Every ending gives the slot back, and `retire` is the one place that does it.
+    ///
+    /// Asserted here rather than at each ending because that is the design: `finish`, `cancel` and
+    /// the startup reconciliation all funnel through this function, so an ending added later cannot
+    /// forget. A slot held by a finished job is silent — it lowers the project's ceiling with no
+    /// error anywhere — which is exactly the failure the sweep on the tick exists to bound.
+    #[tokio::test]
+    async fn retiring_a_job_gives_its_concurrency_slot_back() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        crate::concurrency::claim(&pool, "project-a", owner)
+            .await
+            .unwrap();
+
+        retire(&pool, job_id, STATUS_CANCELLED).await.unwrap();
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, owner).await.unwrap(),
+            None
+        );
+    }
+
     /// "I stopped it" and "it had already finished" are different answers to the question the user
     /// just asked, so the second one is not reported as success.
     #[tokio::test]
@@ -2544,6 +4174,52 @@ mod tests {
         assert_eq!(detail.items[1].gate_status.as_deref(), Some("passed"));
         assert_eq!(detail.branch.as_deref(), Some("nucleos/job"));
         assert!(detail.items[0].ordinal < detail.items[1].ordinal);
+    }
+
+    /// Which round an item came from has to travel, because nothing else in the view carries it.
+    ///
+    /// Ordinals continue across rounds rather than restart, so a queue of three passed items and two
+    /// pending ones reads identically whether the plan node asked for five at once or asked for
+    /// three and a replan added two. The round is the only thing that separates those, and until it
+    /// is on the wire the answer is only in the database.
+    #[tokio::test]
+    async fn a_jobs_detail_says_which_round_each_item_came_from() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "passed", "pending"]).await;
+        sqlx::query("UPDATE job_items SET round = 1 WHERE job_id = ? AND ordinal = 2")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET round = 1, max_rounds = 4 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let detail = detail(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job exists");
+
+        assert_eq!((detail.job.round, detail.job.max_rounds), (1, 4));
+        let rounds: Vec<i64> = detail.items.iter().map(|item| item.round).collect();
+        assert_eq!(rounds, vec![0, 0, 1]);
+        // The point of the field, stated as what it is not: the ordinals do not say this.
+        let ordinals: Vec<i64> = detail.items.iter().map(|item| item.ordinal).collect();
+        assert_eq!(ordinals, vec![0, 1, 2]);
+    }
+
+    /// A job of today reads as one round of one, not as round zero of nothing.
+    #[tokio::test]
+    async fn a_job_without_rounds_lists_as_a_single_round() {
+        let pool = test_pool().await;
+        seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        let listed = list(&pool, Some("project-a"), 20).await.unwrap();
+
+        assert_eq!((listed[0].round, listed[0].max_rounds), (0, 1));
     }
 
     /// Finished jobs stay in the listing. A job that stopped for the budget or ran out of clock is
@@ -2721,6 +4397,8 @@ mod tests {
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await;
@@ -2822,6 +4500,11 @@ mod tests {
     ) -> i64 {
         *runner.plan_to_write.lock().unwrap() = Some(plan.to_owned());
         let root = repo.to_string_lossy().into_owned();
+        // Through the same function `POST /jobs` and the scheduler both use, and NOT `None`.
+        // `head_sha` is the footing the first item reverts to, so a helper that left it empty would
+        // send every walk below down the "no footing, stop instead" branch — testing the fallback
+        // and never the behaviour.
+        let head_sha = crate::repo_trigger::current_branch_sha(repo, "HEAD", false).await;
         let job_id = insert_job(
             &state.pool,
             &NewJob {
@@ -2832,7 +4515,9 @@ mod tests {
                 max_items: 5,
                 gate_each: true,
                 review: true,
-                head_sha: None,
+                head_sha: head_sha.as_deref(),
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
@@ -2925,12 +4610,19 @@ mod tests {
             crate::worktree::remove(&repo, &root.path().join(format!("job-{job_id}")), &[]).await;
     }
 
-    /// Decision 6, walked rather than asserted against a seeded row: a red gate stops the chain
-    /// where it broke, and the item after it never starts. On a shared worktree, letting item i+1
-    /// build on unmeasured work is exactly what makes a later red gate unable to say which item
-    /// caused it.
+    /// Walked rather than asserted against a seeded row: a red gate no longer ends the night.
+    ///
+    /// This test used to pin the opposite, and the sentence it carried — *"Never started. The
+    /// partial stays on the branch and the second item is still there to do."* — was the honest
+    /// description of a real cost. The reason letting item i+1 run was unsafe is that it would build
+    /// on unmeasured work; the checkpoint removes that reason by putting the tree back to the
+    /// footing item i started from, so the objection no longer applies and the remaining items —
+    /// which were never the ones that broke — are worth doing.
+    ///
+    /// The verdict is untouched: the job still ends `gate_failed`, decided at the end instead of at
+    /// the first red item.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_red_gate_stops_the_chain_before_the_next_item_starts() {
+    async fn a_red_gate_reverts_the_item_and_lets_the_queue_carry_on() {
         let _lock = crate::worktree::test_env_lock();
         // A command that runs everywhere and always fails, so this measures the chain's answer to a
         // red gate rather than to a missing binary — which is the other outcome entirely, and one
@@ -2950,7 +4642,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(walk(&state, job_id).await, "gate_failed");
+        assert_eq!(
+            walk(&state, job_id).await,
+            "gate_failed",
+            "one red gate still decides what the job is called"
+        );
 
         let items: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT status, gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
@@ -2959,10 +4655,13 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
+        // Both, because this gate command fails for every item. The second one is the point: it ran.
         assert_eq!(items[0].0, "gate_failed");
         assert_eq!(items[0].1.as_deref(), Some("failed"));
-        // Never started. The partial stays on the branch and the second item is still there to do.
-        assert_eq!(items[1].0, "pending");
+        assert_eq!(
+            items[1].0, "gate_failed",
+            "the item after a red one has to have been attempted, not left pending"
+        );
         let stages: Vec<String> =
             sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
                 .bind(job_id)
@@ -2971,8 +4670,8 @@ mod tests {
                 .unwrap();
         assert_eq!(
             stages,
-            vec!["plan", "implement"],
-            "no review is spent on a chain that already stopped"
+            vec!["plan", "implement", "implement", "review"],
+            "the whole queue runs, and the review still gets to see what came out of it"
         );
 
         let _ =
@@ -3184,6 +4883,215 @@ mod tests {
         );
     }
 
+    // ---- the replan node (Chunk 3, task 11) ------------------------------------------------------
+
+    /// Seeds a job at the end of a round, with a landed replan node and the answer it wrote.
+    async fn seed_closed_round(
+        pool: &sqlx::SqlitePool,
+        worktree: &std::path::Path,
+        run_status: &str,
+        answer: Option<&str>,
+    ) -> i64 {
+        let job_id = seed_job(pool, "project-a", "reviewing").await.unwrap();
+        seed_worktree(pool, job_id, worktree).await;
+        seed_items(pool, job_id, &["passed", "passed"]).await;
+        sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        seed_node(pool, job_id, "replan", run_status).await;
+        if let Some(answer) = answer {
+            write_plan(worktree, answer).await;
+        }
+        job_id
+    }
+
+    async fn round_counters(pool: &sqlx::SqlitePool, job_id: i64) -> (i64, i64, i64) {
+        sqlx::query_as("SELECT round, dry_rounds, replan_done FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Starting a replan node must not make this round's finished review vanish.
+    ///
+    /// The review is scoped by "which replan opened this round", and reading that from the LATEST
+    /// replan run is wrong in exactly one window: while a replan is deciding whether there is a next
+    /// round, it has opened nothing. Its id moved the line anyway, the round's own review dropped
+    /// out of view, and the job spawned a second one over a queue that had not changed.
+    ///
+    /// Measured on job 17, 2026-08-08 — run 900179, one wasted node per round. `jobs.replan_run_id`
+    /// is the honest line because it is written where a replan's answer is acted on, not where the
+    /// node is started.
+    #[tokio::test]
+    async fn a_replan_in_flight_does_not_make_this_rounds_review_look_unrun() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "passed"]).await;
+        sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_node(&pool, job_id, "review", "completed").await;
+
+        // The round's review has landed, so the round closes into a replan.
+        let before = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(before.review, ReviewState::Done);
+        assert_eq!(next_step(&before), Next::SpawnReplan);
+
+        // ...and now that node exists and is thinking. Nothing about the round changed.
+        seed_node(&pool, job_id, "replan", "running").await;
+
+        let during = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(
+            during.review,
+            ReviewState::Done,
+            "the review this round already had was still had"
+        );
+        assert_eq!(
+            next_step(&during),
+            Next::Wait,
+            "waiting for the replan, not paying for a second review of the same queue"
+        );
+    }
+
+    /// Ending #1. `completed` and not `stopped`, because the node that just looked at the work is
+    /// the one saying the work is over — the best evidence this system can get for that claim.
+    #[tokio::test]
+    async fn a_replan_that_says_done_ends_the_job_completed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"done": true, "why": "the task is met"}"#),
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(round_counters(&pool, job_id).await.2, 1, "replan_done");
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::Finish(Outcome::Completed)
+        );
+        assert!(
+            feed_kinds(&pool)
+                .await
+                .contains(&"job_replanned".to_owned())
+        );
+    }
+
+    /// Ordinals CONTINUE across rounds. They are half `job_items`'s primary key, and the position in
+    /// the loaded queue is the number `advance` binds into its lookups — restarting them per round
+    /// would collide on the first insert and mislead on every one after.
+    #[tokio::test]
+    async fn a_replan_with_items_opens_the_next_round_past_the_old_ordinals() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"items": [{"description": "one more thing"}]}"#),
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        let (round, dry, done) = round_counters(&pool, job_id).await;
+        assert_eq!(
+            (round, dry, done),
+            (1, 0, 0),
+            "a round that added work is not dry"
+        );
+        assert_eq!(job_status(&pool, job_id).await, "implementing");
+
+        let placed: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT ordinal, round FROM job_items WHERE job_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(placed, vec![(0, 0), (1, 0), (2, 1)]);
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnImplement { ordinal: 2 }
+        );
+    }
+
+    /// The whole reason `jobs.replan_run_id` exists, stated as the loop it prevents.
+    ///
+    /// A replan that produced nothing leaves every observable condition exactly as it found it: the
+    /// queue is still fully terminal, `replan_done` is still 0, and the latest replan run is still
+    /// the same one. Any DERIVED test for "already taken" therefore answers no on the next tick, and
+    /// the round would keep advancing — one per tick, thirty seconds apart — until the ceiling ended
+    /// a job that had done nothing at all.
+    #[tokio::test]
+    async fn a_dry_replan_is_counted_once_however_many_ticks_pass() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"items": []}"#),
+        )
+        .await;
+
+        for _ in 0..3 {
+            let job = load_job(&pool, job_id).await.unwrap();
+            reconcile_nodes(&state, &job).await.unwrap();
+        }
+
+        let (round, dry, _) = round_counters(&pool, job_id).await;
+        assert_eq!(
+            (round, dry),
+            (1, 1),
+            "three ticks, one answer: a dry round is still one round"
+        );
+        // One short of the brake, so the job asks again rather than ending.
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnReplan
+        );
+    }
+
+    /// A replan that could not answer stops the job; it does not fail it.
+    ///
+    /// The rounds that ran are on the branch, gated green, and worth looking at. `failed` for want of
+    /// a replan node teaches its reader to ignore the branch — which is the one thing the whole
+    /// `Completed`/`Stopped` split exists to prevent.
+    #[tokio::test]
+    async fn a_replan_that_could_not_answer_stops_the_job_rather_than_failing_it() {
+        for (run_status, answer) in [("failed", None), ("completed", None)] {
+            let pool = test_pool().await;
+            let state = test_state(pool.clone()).await;
+            let worktree = tempfile::tempdir().unwrap();
+            let job_id = seed_closed_round(&pool, worktree.path(), run_status, answer).await;
+
+            let job = load_job(&pool, job_id).await.unwrap();
+            reconcile_nodes(&state, &job).await.unwrap();
+
+            assert_eq!(
+                job_status(&pool, job_id).await,
+                STATUS_STOPPED,
+                "{run_status}"
+            );
+            assert!(feed_kinds(&pool).await.contains(&"job_stopped".to_owned()));
+        }
+    }
+
     /// Truncation is reported, never silent: a queue quietly cut from seven to five reads
     /// downstream as "the planner found five things", which is a different and wrong statement
     /// about the work.
@@ -3219,6 +5127,43 @@ mod tests {
         );
     }
 
+    /// The hint has to survive the gap between the plan node and the implement node, which is a
+    /// database row and not a process — nothing of `PlannedItems` is still in memory by the time
+    /// the item is spawned. An item with no hint stores NULL rather than `[]`: the column that says
+    /// nothing is the one that reads downstream as "the planner did not say", and an empty array
+    /// would read as "the planner said no files", which is a different claim.
+    #[tokio::test]
+    async fn planned_file_hints_are_stored_with_the_item() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_node(&pool, job_id, "plan", "completed").await;
+        write_plan(
+            worktree.path(),
+            r#"{"items":[{"description":"hinted","files":["core/src/job.rs","core/src/runs.rs"]},
+                        {"description":"unhinted"}]}"#,
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        let stored: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT files FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        let hinted: Vec<String> =
+            serde_json::from_str(stored[0].as_deref().expect("a hinted item keeps its hint"))
+                .expect("the hint is stored as a JSON array");
+        assert_eq!(hinted, vec!["core/src/job.rs", "core/src/runs.rs"]);
+        assert_eq!(stored[1], None, "no hint is NULL, not an empty array");
+    }
+
     // ---- the brakes between nodes --------------------------------------------------------------
 
     async fn set_budget(pool: &sqlx::SqlitePool, window: Option<f64>, hourly: Option<f64>) {
@@ -3231,6 +5176,69 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn seed_job_run(pool: &sqlx::SqlitePool, job_id: i64, cost: f64) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, job_id, cost_usd, created_at, completed_at)
+             VALUES ('a node', 'completed', 'worktree', ?, ?, ?, ?)",
+        )
+        .bind(job_id)
+        .bind(cost)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A job's own allowance STOPS it and never parks it, which is the whole difference from the
+    /// window brake above. A calendar window reopens; a task's allowance does not, so a job parked
+    /// on it would sit at `waiting` until the four-hour ceiling swept it up, wearing a reason nobody
+    /// could act on.
+    #[tokio::test]
+    async fn a_job_that_spent_its_own_allowance_stops_rather_than_waiting() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_job_run(&pool, job_id, 4.5).await;
+
+        // The house limit is off, so anything that fires here is the job's own.
+        sqlx::query("UPDATE jobs SET budget_usd = 5.0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(
+            matches!(brakes(&state, &job, Utc::now()).await, Brake::Stop { .. }),
+            "spent 4.50 of 5.00 and the next node reserves 1.00"
+        );
+
+        // Room for another node: the test is about the NEXT one, never the one in flight.
+        sqlx::query("UPDATE jobs SET budget_usd = 20.0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
+    }
+
+    /// A NULL allowance means "only the house limit governs", which is what every `graph:` rule has
+    /// always meant. A job that spent plenty is untouched by a brake it never asked for.
+    #[tokio::test]
+    async fn a_job_with_no_allowance_of_its_own_is_governed_only_by_the_house() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_job_run(&pool, job_id, 500.0).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(job.budget_usd, None);
+        assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
     }
 
     /// Decision 9, and the whole reason `PauseKind` exists. The hourly brake lifts by itself, so
@@ -3386,9 +5394,17 @@ mod tests {
         )
         .await;
 
+        // Neither job has a worktree on record, so the red one takes the branch where a revert
+        // cannot happen: `record_gate` marks the item anyway and answers `Stopped`, refusing to let
+        // a queue advance onto a tree it could not put back. The MARK is what these assertions read.
+        //
+        // And there the two part company, which is the point of the test. Silence stops the job
+        // where it stands. A verdict does not: the queue is spent, so the job goes on to have its
+        // work reviewed, and only then is it called `gate_failed` — pinned purely in
+        // `one_red_gate_makes_the_whole_job_gate_failed_however_it_ends`.
         assert_eq!(
             next_step(&load_view(&pool, broken).await.unwrap()),
-            Next::Finish(Outcome::GateFailed)
+            Next::SpawnReview
         );
         assert_eq!(
             next_step(&load_view(&pool, unmeasured).await.unwrap()),
@@ -3491,6 +5507,82 @@ mod tests {
         assert!(prompt.contains("/wt/.nucleos/plan.json"));
         assert!(prompt.contains("at most 5"));
         assert!(prompt.contains(r#"{"items": []}"#));
+    }
+
+    /// The hint is asked for, and asked for as optional. A planner told to name files without being
+    /// told it may decline will name some for every item, and a confident wrong list is worse than
+    /// no list: the implement node is told to start there, so an invented path spends a whole
+    /// context window in the wrong place.
+    #[test]
+    fn plan_prompt_asks_for_optional_file_hints() {
+        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos");
+
+        assert!(
+            prompt.contains(r#""files""#),
+            "the shape must name the field: {prompt}"
+        );
+        let lowered = prompt.to_lowercase();
+        assert!(
+            lowered.contains("optional") || lowered.contains("if you"),
+            "naming files must be offered, not required: {prompt}"
+        );
+        assert!(
+            lowered.contains("best effort")
+                || lowered.contains("best-effort")
+                || lowered.contains("guess"),
+            "the planner must be told a partial answer is acceptable: {prompt}"
+        );
+    }
+
+    /// Two halves of one contract. With a hint the node is told where to start *and* told the list
+    /// is not a boundary — an implement node that treats a planner's guess as the full extent of the
+    /// change leaves the tree half-edited. With no hint the prompt is byte-for-byte what it has
+    /// always been, so a job planned before this existed is not silently given a different brief.
+    #[test]
+    fn implement_prompt_names_the_hinted_files_as_a_possibly_incomplete_list() {
+        let hints = [
+            "core/src/job.rs".to_owned(),
+            "core/migrations/0052.sql".to_owned(),
+        ];
+        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints);
+
+        assert!(hinted.contains("core/src/job.rs"));
+        assert!(hinted.contains("core/migrations/0052.sql"));
+        assert!(
+            hinted.to_lowercase().contains("incomplete"),
+            "the list is a hint, not a boundary: {hinted}"
+        );
+
+        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[]);
+        assert_eq!(
+            bare,
+            "You are item 1 of 3 in an autonomous job. The working tree already holds the work \
+             of the earlier items; this is the only one you do.\n\n\
+             write the thing\n\n\
+             The full queue is in /wt/.nucleos/plan.json for context. Do not start another item \
+             and do not edit that file. Your work is verified after you finish, so leave the tree \
+             building. Leave it UNCOMMITTED: the job commits for you once the gate agrees, and \
+             committing by hand stops this item to ask permission for something already arranged."
+        );
+        // Said twice on purpose: the equality above is the guarantee, and this says what it is a
+        // guarantee *of* — an unhinted node is never told about a hint mechanism it has no hint for,
+        // and never invited to wonder which files were meant.
+        let lowered = bare.to_lowercase();
+        assert!(
+            !lowered.contains("hint"),
+            "no hint, no hint paragraph: {bare}"
+        );
+        assert!(
+            !lowered.contains("incomplete"),
+            "nothing to be incomplete: {bare}"
+        );
+        assert!(
+            !lowered.contains("start with"),
+            "no files to start with: {bare}"
+        );
+
+        // The paragraph is appended, so everything the node was told before it is still there.
+        assert!(hinted.starts_with(&bare));
     }
 
     /// §5.4: the review node's independence is structural, not requested. It is never given a

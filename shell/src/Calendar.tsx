@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelCalendarOccurrence, createCalendarEvent, deleteCalendarEvent, getCalendarBusy,
-  getCalendarConfig, getCalendarEvents, listPendingNotifications,
+  getCalendarConfig, getCalendarEvents, listPendingNotifications, moveCalendarOccurrence,
   type CalendarConfigView, type CalendarOccurrence, type ConnectionState,
   type NewCalendarEvent, type PendingNotification,
 } from "./api";
 import {
-  dayBounds, hourMarks, hoursInSpan, localStamp, monthMatrix, nowFraction, overlapLanes,
-  placeInDay, sameDay, weekOf,
+  dayBounds, hourMarks, hoursInSpan, inputFromStamp, localStamp, monthMatrix, nowFraction,
+  occurrenceMinutes, overlapLanes, placeInDay, sameDay, stampFromInput, weekOf,
 } from "./calendar-grid";
 import { relativeTime } from "./derive";
 import { Badge, Button, ConfirmButton, ErrorNote } from "./ui";
@@ -180,6 +180,35 @@ export default function Calendar({ token, connection }: CalendarProps) {
     [token, refresh],
   );
 
+  /**
+   * Moves one occurrence, leaving the series where it is.
+   *
+   * The third thing that can be done to a recurring event, beside skipping one and deleting all of
+   * them, and the one that was reachable only over HTTP: a weekly meeting pushed to Thursday this
+   * week had to be skipped and re-created as a one-off, which loses that it is the same meeting.
+   *
+   * The length travels with it, derived from the occurrence rather than asked for. The daemon
+   * rejects a move with no duration, and re-asking for a length the block on screen already knows
+   * would be a question with one right answer.
+   */
+  const moveOne = useCallback(
+    async (occurrence: CalendarOccurrence, toLocal: string) => {
+      if (token === null) return;
+      setWorking(true);
+      const moved = await moveCalendarOccurrence(
+        token,
+        occurrence.event_id,
+        occurrence.occurrence_local,
+        toLocal,
+        occurrenceMinutes(occurrence.starts_at, occurrence.ends_at),
+      );
+      if (!moved) setFailed("that occurrence could not be moved");
+      await refresh();
+      setWorking(false);
+    },
+    [token, refresh],
+  );
+
   const removeSeries = useCallback(
     async (id: number) => {
       if (token === null) return;
@@ -326,6 +355,7 @@ export default function Calendar({ token, connection }: CalendarProps) {
                   setDraft({ day, hour });
                 }}
                 onSkip={skipOne}
+                onMove={moveOne}
                 onDelete={removeSeries}
               />
             ))}
@@ -379,11 +409,67 @@ interface WeekColumnProps {
   busy: boolean;
   onPick: (hour: number) => void;
   onSkip: (occurrence: CalendarOccurrence) => void;
+  onMove: (occurrence: CalendarOccurrence, toLocal: string) => void;
   onDelete: (id: number) => void;
 }
 
+/**
+ * The "move this one" control, folded into the block it belongs to.
+ *
+ * A `datetime-local` input rather than dragging the block, and that is the v1 scope rather than an
+ * omission: dragging has to answer what a drop between two columns means, what happens at the edge
+ * of the visible week, and how a keyboard does the same thing. A field answers all three by not
+ * asking, and moves an occurrence to a time outside the week on screen — which dragging cannot.
+ */
+function MoveOne({
+  occurrence, busy, onMove,
+}: {
+  occurrence: CalendarOccurrence;
+  busy: boolean;
+  onMove: (occurrence: CalendarOccurrence, toLocal: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [when, setWhen] = useState(() => inputFromStamp(occurrence.occurrence_local));
+
+  if (!open) {
+    return (
+      <Button variant="ghost" size="sm" disabled={busy} onClick={() => setOpen(true)}>
+        Move
+      </Button>
+    );
+  }
+
+  const stamp = stampFromInput(when);
+
+  return (
+    <span className="cal-move">
+      <input
+        type="datetime-local"
+        value={when}
+        aria-label={`Move ${occurrence.title} to`}
+        onChange={(event) => setWhen(event.target.value)}
+      />
+      <Button
+        variant="approve"
+        size="sm"
+        disabled={busy || stamp === null || stamp === occurrence.occurrence_local}
+        onClick={() => {
+          if (stamp === null) return;
+          onMove(occurrence, stamp);
+          setOpen(false);
+        }}
+      >
+        Move it
+      </Button>
+      <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+        Cancel
+      </Button>
+    </span>
+  );
+}
+
 function WeekColumn({
-  day, now, events, workFrom, workTo, working, busy, onPick, onSkip, onDelete,
+  day, now, events, workFrom, workTo, working, busy, onPick, onSkip, onMove, onDelete,
 }: WeekColumnProps) {
   const [start, end] = dayBounds(day);
   const hours = hoursInSpan(start, end);
@@ -476,6 +562,7 @@ function WeekColumn({
                 <Button variant="ghost" size="sm" disabled={busy} onClick={() => onSkip(event)}>
                   Skip
                 </Button>
+                <MoveOne occurrence={event} busy={busy} onMove={onMove} />
                 <ConfirmButton
                   variant="danger"
                   size="sm"

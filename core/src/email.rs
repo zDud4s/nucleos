@@ -461,6 +461,20 @@ pub async fn ingest_batch(
         .execute(tx.as_mut())
         .await?;
 
+        // Taken from THIS statement's result, before anything else writes.
+        //
+        // It used to be a `SELECT last_insert_rowid()` further down, after `record_inbound` had run
+        // — and `record_inbound` inserts a row of its own the first time an address is seen. So for
+        // a message from a NEW sender that carried an attachment, the id read back was the contact's
+        // and not the mail's, and the attachment insert below aimed at an `emails.id` that did not
+        // exist. SQLite answered `FOREIGN KEY constraint failed`, the whole batch rolled back, the
+        // cursor stayed put, and the mailbox stopped at that message for as long as it took somebody
+        // to notice. It took eight days and 19 unread messages, because nothing logged the 500.
+        //
+        // A known sender never triggered it: `record_inbound` only UPDATEs then, and an UPDATE does
+        // not move `last_insert_rowid`. That is what made it look intermittent rather than certain.
+        let email_id = result.last_insert_rowid();
+
         if result.rows_affected() == 1 {
             match direction {
                 crate::contacts::MessageDirection::Inbound => {
@@ -507,9 +521,6 @@ pub async fn ingest_batch(
             // Only for a row this batch actually created. A duplicate already has its attachments,
             // and re-inserting them would either collide on the UNIQUE or silently double a list
             // the user reads as "what came with this message".
-            let email_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
-                .fetch_one(tx.as_mut())
-                .await?;
             if matches!(direction, crate::contacts::MessageDirection::Inbound) {
                 for attachment in &message.attachments {
                     sqlx::query(
@@ -717,8 +728,23 @@ mod tests {
     use super::*;
     use sqlx::Row;
 
+    /// A pool that enforces what production enforces.
+    ///
+    /// `foreign_keys` is OFF by default in SQLite and `storage.rs` turns it on, so a pool built
+    /// with the bare connect string is a laxer database than the one the daemon runs — and this
+    /// suite was written against the laxer one. That is not a detail: the attachment insert below
+    /// aimed at a non-existent `emails.id` for over a week, and no test could fail on it because no
+    /// test had the constraint switched on. Matching production here is what lets the regression
+    /// test underneath actually regress.
     pub(crate) async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        // The URL form, not `SqliteConnectOptions::new().filename(":memory:")`. The two are not the
+        // same database: built from the filename, every connection in the pool gets a private
+        // in-memory database of its own, so the migrations run on one connection and the next query
+        // lands on an empty one — `no such table: email_cursor`, from a pool that looked identical.
+        let options: sqlx::sqlite::SqliteConnectOptions = "sqlite::memory:".parse().unwrap();
+        let pool = sqlx::SqlitePool::connect_with(options.foreign_keys(true))
+            .await
+            .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
     }
@@ -1916,6 +1942,73 @@ mod tests {
         let cursor = get_cursor(&pool, "INBOX").await.unwrap().unwrap();
         assert_eq!(cursor.uidvalidity, 2);
         assert_eq!(cursor.last_uid, 5);
+    }
+
+    /// A message from a sender never seen before, carrying an attachment.
+    ///
+    /// The exact combination that stopped a real mailbox for eight days. `record_inbound` inserts a
+    /// contact row the first time it sees an address, and the email id used to be read with a
+    /// `SELECT last_insert_rowid()` placed AFTER that call — so the attachment was filed against the
+    /// contact's id instead of the mail's. With foreign keys on, SQLite rejects the whole batch;
+    /// with them off, as this suite used to run, it stored an attachment pointing at nothing.
+    ///
+    /// A known sender takes the UPDATE branch, which does not move `last_insert_rowid`, so the same
+    /// code path worked all day for everyone already in the contacts table. That is what made this
+    /// look intermittent and what kept it alive: the first message from each new correspondent was
+    /// the one that jammed the queue behind it.
+    #[tokio::test]
+    async fn a_first_message_from_a_new_sender_files_its_attachment_against_the_mail() {
+        let pool = test_pool().await;
+
+        // Three from a sender already known, FIRST, and this is the whole difficulty of the test.
+        //
+        // On an empty database the mail and the contact are both row 1, so the wrong id and the
+        // right one are the same number and the bug hides behind the coincidence — a version of
+        // this test without these three messages passes against the broken code. Ingesting them
+        // pushes `emails.id` to 4 while `contacts` is still on row 1, so the substitution shows.
+        for uid in [10, 11, 12] {
+            ingest(&pool, std::slice::from_ref(&message(uid)), uid).await;
+        }
+
+        let mut stranger = message_with_attachment(41);
+        stranger.message_id = Some("<stranger@x>".into());
+        stranger.from_addr = "nobody-has-written-before@elsewhere.test".into();
+        stranger.from_name = Some("Estranho".into());
+
+        let outcome = ingest_batch(
+            &pool,
+            crate::contacts::MessageDirection::Inbound,
+            "INBOX",
+            1,
+            41,
+            &[],
+            std::slice::from_ref(&stranger),
+            OWNER,
+            14,
+            now(),
+        )
+        .await
+        .expect("a new sender with an attachment must not fail the batch");
+        assert_eq!(outcome.ingested, 1);
+
+        let email_id: i64 =
+            sqlx::query_scalar("SELECT id FROM emails WHERE message_id = '<stranger@x>'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let owner_of_attachment: i64 =
+            sqlx::query_scalar("SELECT email_id FROM email_attachments")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            owner_of_attachment, email_id,
+            "the attachment must hang off the mail, not off the contact created beside it"
+        );
+
+        // And the cursor moved, which is the part the mailbox actually felt: a rolled-back batch
+        // left it where it was, so the same 19 messages were re-read every five minutes forever.
+        assert_eq!(outcome.cursor, 41);
     }
 
     // ---- §4.4, the four cases that separate the wrong versions of the cutoff from the right one.

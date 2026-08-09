@@ -242,7 +242,7 @@ pub async fn create_run(
     // Uncancellable: the run row is INSERTed `running` before the worktree is provisioned, so
     // `git worktree add` holds that window open for as long as git takes. A request dropped inside
     // it strands a `running` worktree row with no task and no abort handle — `/cancel` answers 404,
-    // the GC skips it, and `one_open_worktree_run_per_project` (migration 0009) blocks the whole
+    // the GC skips it, and it holds one of the project's concurrency slots, narrowing the whole
     // project until the daemon restarts, the only thing that reconciles `running` rows.
     let id = crate::http::uncancellable(async move {
         create_run_inner(
@@ -690,6 +690,90 @@ async fn record_handoff_if_needed(
     Ok(true)
 }
 
+/// Pins a terminated run's time approximation onto the run itself, for a run that never reported a
+/// cost of its own.
+///
+/// A run killed before its `result` event recorded `$0` — the future was dropped, so there was no
+/// `RunOutcome` to read a cost from — and the ledger understated real spend by exactly the money
+/// that run burned. The budget's own approximation covered the gap only while recomputing, which
+/// made the figure move with `now` and left nothing durable behind.
+///
+/// `cost_usd IS NULL` is the whole safety of the write: a measured total is what the CLI actually
+/// charged, and a duration guess must never overwrite it. Best-effort throughout — the run IS
+/// terminated either way, and an approximation that failed to land leaves the budget exactly as it
+/// was before this existed, not the run broken.
+async fn record_time_approx_cost(pool: &sqlx::SqlitePool, id: i64) {
+    let timestamps: (String, Option<String>) =
+        match sqlx::query_as("SELECT created_at, completed_at FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(timestamps) => timestamps,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = id,
+                    %error,
+                    "could not read the terminated run's timestamps to approximate its cost"
+                );
+                return;
+            }
+        };
+
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value).map(|when| when.with_timezone(&chrono::Utc))
+    };
+    let Ok(created_at) = parse(&timestamps.0) else {
+        tracing::warn!(
+            run_id = id,
+            created_at = timestamps.0,
+            "could not parse the terminated run's start time to approximate its cost"
+        );
+        return;
+    };
+    // No `completed_at` means the terminal write lost its race or never landed; the run is over
+    // regardless, so `now` is the end of the only duration this can still measure.
+    let end = match timestamps.1.as_deref().map(parse).transpose() {
+        Ok(end) => end.unwrap_or_else(chrono::Utc::now),
+        Err(_) => {
+            tracing::warn!(
+                run_id = id,
+                "could not parse the terminated run's end time to approximate its cost"
+            );
+            return;
+        }
+    };
+
+    // The configured rate, not a constant: the budget approximates at whatever the operator set, and
+    // a stored cost computed at a different rate would disagree with every total that reads it.
+    let rate = match crate::budget::load_budget_config(pool).await {
+        Ok(config) => config.time_cost_per_hour_usd,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "could not load the budget rate to approximate the terminated run's cost"
+            );
+            return;
+        }
+    };
+
+    let approximated = crate::budget::time_approx_usd(created_at, end, rate);
+    if let Err(error) =
+        sqlx::query("UPDATE runs SET cost_usd = ? WHERE id = ? AND cost_usd IS NULL")
+            .bind(approximated)
+            .bind(id)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(
+            run_id = id,
+            %error,
+            "could not record the terminated run's approximated cost"
+        );
+    }
+}
+
 async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
@@ -808,6 +892,7 @@ async fn spawn_handoff_if_needed(
     tool_policy: crate::runner::ToolPolicy,
     run_timeout: std::time::Duration,
     classifier_governs_tools: bool,
+    model: Option<String>,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -853,6 +938,9 @@ async fn spawn_handoff_if_needed(
         // Inherited for the same reason, and it is the same tree: re-deriving would let a handoff
         // quietly change what the work is allowed to do halfway through it.
         classifier_governs_tools,
+        // Inherited: a successor is the same node continuing the same task, so it belongs on the
+        // model its predecessor's stage was routed to.
+        model,
     );
 }
 
@@ -878,6 +966,9 @@ fn spawn_run(
     steerable: bool,
     run_timeout: std::time::Duration,
     classifier_governs_tools: bool,
+    // Which model answers this run, or `None` for the runner's own. Decided by the caller, because
+    // only it knows the stage — `spawn_run` must not learn to read job nodes.
+    model: Option<String>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -927,6 +1018,10 @@ fn spawn_run(
                 steerable,
                 classifier_governs_tools,
                 messages: None,
+                // Autopilot runs pay for the ambient surface and call none of it.
+                ambient_mcp: false,
+                // Cloned rather than moved: the request is built once per attempt.
+                model: model.clone(),
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
             // be spoken to is settled where its argument vector is chosen, not by whatever later
@@ -1095,6 +1190,7 @@ fn spawn_run(
                             tool_policy,
                             run_timeout,
                             classifier_governs_tools,
+                            model.clone(),
                         ))
                         .await;
                     }
@@ -1192,6 +1288,11 @@ fn spawn_run(
                                 "could not cancel the timed-out run's queued vcs requests"
                             );
                         }
+                        // This is the run that reports no cost at all, so its spend has to be
+                        // approximated from the duration the write above just made final. Inside
+                        // the same guard: losing that CAS means another terminator owns the row,
+                        // and it is the owner's business what the run's cost and status are.
+                        record_time_approx_cost(&pool, id).await;
                         Box::pin(spawn_handoff_if_needed(
                             handoff_state.clone(),
                             runner.clone(),
@@ -1206,6 +1307,7 @@ fn spawn_run(
                             tool_policy,
                             run_timeout,
                             classifier_governs_tools,
+                            model.clone(),
                         ))
                         .await;
                     }
@@ -1326,6 +1428,28 @@ async fn create_run_with(
         ));
     }
 
+    // Asked before the row exists, and not instead of the claim below — a run cannot claim until it
+    // has an id, so the authoritative answer costs a row, and a scheduler that fires at a full
+    // project every thirty seconds would leave a failed run behind every time. A node is exempt: it
+    // works inside its job's worktree, on its job's slot.
+    if mode == "worktree"
+        && node.is_none()
+        && let Some(project) = project_id.as_deref()
+    {
+        // Swept first, and this is where the staleness that matters gets paid off. A run's slot is
+        // given back by the sweep rather than at each ending — `runs` has ten places that write a
+        // terminal status and no funnel like `job::retire`, so threading a release through all ten
+        // is a coverage claim that would be wrong the first time an eleventh appears. The release is
+        // derived from liveness instead, which cannot drift; the one moment the derivation has to be
+        // current is the moment it refuses somebody, which is here.
+        let _ = crate::concurrency::reconcile_orphaned_slots(&state.pool).await;
+        match crate::concurrency::room_for(&state.pool, project).await {
+            Ok(Some(_)) => return Err(CreateRunError::Busy),
+            Ok(None) => {}
+            Err(error) => return Err(CreateRunError::Db(error)),
+        }
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let session_id = crate::auth::generate_uuid_v4();
     let inserted = sqlx::query(
@@ -1409,6 +1533,33 @@ async fn create_run_with(
             },
             None => {
                 let owner = crate::worktree::Owner::Run(id);
+
+                // Only a standalone run claims a slot. A job node inherits its job's worktree, and
+                // its job's slot with it — charging the node a second one would have a five-item job
+                // refuse itself at the second item.
+                //
+                // The table was swept before the row was inserted, at the pre-check above, so this
+                // is the authoritative answer against an already-current count.
+                match crate::concurrency::claim(&state.pool, worktree_project_id, owner).await {
+                    Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
+                    Ok(crate::concurrency::ClaimOutcome::Full(full)) => {
+                        // The same 409 the unique index gave, reached by counting instead of by
+                        // colliding. `Busy` is what every caller already maps.
+                        fail_provisioning(state, id, project_id.as_deref(), &full.reason()).await;
+                        return Err(CreateRunError::Busy);
+                    }
+                    Err(error) => {
+                        fail_provisioning(
+                            state,
+                            id,
+                            project_id.as_deref(),
+                            &format!("the concurrency slot could not be claimed: {error}"),
+                        )
+                        .await;
+                        return Err(CreateRunError::Db(error));
+                    }
+                }
+
                 match crate::worktree::create(std::path::Path::new(project_root), owner).await {
                     Ok(info) => info,
                     Err(error) => {
@@ -1426,8 +1577,8 @@ async fn create_run_with(
         };
         // Every exit from here on has to leave a terminal status behind. Past the INSERT the row is
         // `running` with no task and no abort handle: `/cancel` answers 404, the GC skips it, and
-        // `one_open_worktree_run_per_project` (migration 0009) blocks every later worktree run for
-        // the project — until a restart, the only thing that reconciles `running`. The `create`
+        // it holds one of the project's concurrency slots for as long as it reads live, and
+        // `running` is reconciled only by a restart, which no sweep can help. The `create`
         // branch above compensated; these two propagated with `?` and stranded the run.
         let worktree_path = info.path.to_string_lossy().into_owned();
         if node.is_none()
@@ -1539,9 +1690,69 @@ async fn create_run_with(
         steerable,
         run_timeout_for_mode(state.run_timeout, mode),
         governed_by_classifier,
+        // A job node's stage is what may be routed elsewhere; every other run names no stage and so
+        // stays on the runner's own model.
+        state
+            .runner
+            .model_for_stage(node.as_ref().map(|node| node.stage)),
     );
 
     Ok(id)
+}
+
+/// The merge this approval should hand to the queue instead of handing back to the run, if it is
+/// one at all.
+///
+/// **Every `None` here means "keep the behaviour this approval has always had"** — a single-use
+/// grant, and the run performs the action itself. That is deliberately the conservative direction
+/// and not a shrug. Refusing the approval outright would leave a person holding an action they have
+/// approved, no way to perform it, and nothing to read explaining why; queueing an operation we are
+/// not certain is the one they read would be worse than either.
+///
+/// So the bar is: the tool is a shell, the input parses, the command is exactly `git merge <ref>`
+/// (`vcs::merge_from_command` argues that strictness), the worktree is really there and really on a
+/// branch, and the project resolves to a repository. Anything else falls back.
+///
+/// It runs git twice and must therefore be called before the transaction opens — see the call site.
+async fn queueable_merge(
+    state: &AppState,
+    proposal: &crate::proposals::Proposal,
+    project_id: &str,
+    worktree_path: &str,
+) -> Option<(crate::vcs::ResolvedRepo, crate::vcs::Op)> {
+    if !matches!(proposal.tool_name.as_deref(), Some("Bash" | "PowerShell")) {
+        return None;
+    }
+    let input: serde_json::Value = serde_json::from_str(proposal.tool_input.as_deref()?).ok()?;
+    let command = input.get("command")?.as_str()?;
+
+    // One deadline for both calls, so a slow repository cannot spend the budget twice over.
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let branch = crate::git_exec::current_branch(std::path::Path::new(worktree_path), deadline)
+        .await
+        .map_err(|error| {
+            tracing::info!(
+                worktree = %worktree_path,
+                %error,
+                "approval: could not read the worktree's branch — authorizing the run instead of queueing"
+            );
+        })
+        .ok()?;
+    let op = crate::vcs::merge_from_command(command, &branch)?;
+    crate::vcs::resolve_repo(&state.pool, project_id)
+        .await
+        .map_err(|error| {
+            // `?` rather than `%`: `ResolveError` is a two-arm enum carrying a source, and it has no
+            // `Display` on purpose — the HTTP layer answers its arms with different statuses instead
+            // of rendering them.
+            tracing::info!(
+                project_id,
+                ?error,
+                "approval: could not resolve the project's repository — authorizing the run instead of queueing"
+            );
+        })
+        .ok()
+        .map(|repo| (repo, op))
 }
 
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
@@ -1591,9 +1802,30 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         "no live worktree for the paused run",
     ))?;
 
-    let prompt = format!(
-        "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — that one high-risk action is now authorized for this run — then finish the task."
-    );
+    // Spec decision 2, arrived at the other way round: rather than letting the run perform the merge
+    // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
+    // it runs git twice — reading the worktree's branch and identifying the repository — and holding
+    // SQLite's write lock across a subprocess would stall every other writer in the daemon.
+    let queueable = queueable_merge(state, &proposal, &wt_project_id, &wt_path).await;
+
+    // The class the grant will authorize, derived before the transaction opens so a parse cannot
+    // hold SQLite's write lock. Re-derived here rather than carried on the proposal because
+    // `classify` is pure and `wt_path` is the very cwd the hook will hand it when the resume
+    // attempts the action — the same inputs, so the same answer, with nothing to keep in step.
+    // Absent or unparseable input yields no class, and a classless grant authorizes nothing.
+    //
+    // Derived even when the action was queued instead of authorized. The row is excluded from
+    // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
+    // no class would be a row that could not say what was taken over.
+    let action_class = proposal
+        .tool_input
+        .as_deref()
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+        .map(|input| {
+            crate::classifier::classify(&tool_name, &input, Some(std::path::Path::new(&wt_path)))
+                .action_class
+        });
+
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
 
@@ -1601,13 +1833,47 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // when the proposal was read, and a release or a cancel can have finalised it since. No rows
     // means one of those got there first, so the supersede is a no-op rather than a status this
     // resume is entitled to overwrite — the live-worktree lookup above is what actually stops a
-    // resume onto a discarded worktree, and `one_open_worktree_run_per_project` (migration 0009)
-    // rejects the INSERT below if the slot is still held.
+    // resume onto a discarded worktree.
+    //
+    // It used to say, here, that a run left `awaiting_approval` holds a slot which rejects the
+    // INSERT below. That stopped being true at migration 0053, which dropped the index the claim was
+    // really made of; a stranded run holds a numbered slot now and blocks nothing. Nothing below
+    // depends on the refusal — the slot is HANDED OVER further down rather than competed for — but
+    // the sentence outlived the mechanism, which is how a guard comes to be believed in and not
+    // written.
     sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'")
         .bind(&now)
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // Admitted inside this transaction, and that is the whole reason `submit_on` exists. Queue then
+    // commit separately, either order, and one of two things can happen: a merge queued against an
+    // approval that rolls back — an irreversible publication nobody authorised, with the proposal
+    // still pending so it can be authorised again — or a run resumed and told its merge is queued
+    // when it is not.
+    //
+    // `Origin::Human` rather than `Origin::Run`, and the difference is not bookkeeping. A human just
+    // approved this, so it carries their authority and starts `queued` rather than waiting for an
+    // approval it already has. Tying it to the run instead would tie it to a row this very
+    // transaction is about to mark `superseded`, and the merge must outlive the run that asked for
+    // it — that is the point of handing it to a queue.
+    let queued_request_id = match &queueable {
+        Some((repo, op)) => {
+            Some(crate::vcs::submit_on(&mut *tx, repo, op, crate::vcs::Origin::Human).await?)
+        }
+        None => None,
+    };
+
+    // The run is told which of the two happened, because the two ask opposite things of it.
+    let prompt = match queued_request_id {
+        Some(request_id) => format!(
+            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the merge it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
+        ),
+        None => format!(
+            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
+        ),
+    };
+
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
     // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
     // sits there until the four-hour ceiling retires it, with the approved work already done.
@@ -1634,6 +1900,24 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // The slot follows the tree, and is a no-op for a job's for the same reason — hence the same
+    // `owner_kind = 'run'` filter.
+    //
+    // Handed over rather than claimed anew, and the difference is not style. A claim is per owner:
+    // the resume would ask for a SECOND slot while its own predecessor still held the first, so a
+    // project at its ceiling would refuse an approval a human had already given — the resume denied
+    // a slot by the very run it replaces. Handing it over keeps one piece of work to one slot.
+    //
+    // Left out entirely, which is what happened until now, the row keeps pointing at the run
+    // `superseded` a few lines above. `reconcile_orphaned_slots` frees any slot whose owner is not
+    // live and runs on every job tick, so it collects this one out from under a run still working in
+    // the tree — and the project, reading one fewer in flight than it has, starts another. Two
+    // worktrees in one repository is precisely what `project_slots` exists to prevent.
+    sqlx::query("UPDATE project_slots SET owner_id=? WHERE owner_kind='run' AND owner_id=?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
     // The item follows its node. Left pointing at the run just marked `superseded`, the job's next
     // pass would read a terminal node that did not complete and stop the whole chain — turning an
     // approval into a failure, and throwing away the work the user just authorised.
@@ -1642,17 +1926,35 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // `tool_input` rides along so the grant names the action the human actually read and approved,
-    // not merely the tool that would perform it (migration 0020).
+    // One row either way, and it carries both keys because the two columns answer different
+    // questions about it.
+    //
+    // `action_class` is what an authorization is checked against (migration 0055); a NULL there
+    // authorizes nothing, so the resume would park again on the action just approved. `tool_input`
+    // is the record of the exact spelling the human read (migration 0020), and it is what `hooks.rs`
+    // matches a retry against when the action was taken over rather than authorized.
+    //
+    // `queued_request_id` is which of the two this row is (migration 0054). NULL is an authorization
+    // — the run may perform actions of that class for the rest of its life. Set is the opposite
+    // fact: the queue has this action, the run does not. `grant_covers_class` excludes those rows,
+    // and the class rule is what makes that exclusion load-bearing rather than tidy — a takeover row
+    // that covered its class would authorize every later merge the run attempted, off a row minted
+    // to say merging had been taken away from it.
+    //
+    // Written even when nothing is granted because the run has to be ABLE to be told. Without the
+    // row, a resumed run that tried its merge again would be paused and would mint a second proposal
+    // for a person to read — and approving that one would queue the merge twice.
     sqlx::query(
-        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at)
-         VALUES (?, ?, ?, ?, ?, NULL)",
+        "INSERT INTO action_grants (run_id, tool_name, tool_input, action_class, proposal_id, created_at, consumed_at, queued_request_id)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
     )
     .bind(resume_id)
     .bind(&tool_name)
     .bind(proposal.tool_input.as_deref())
+    .bind(action_class)
     .bind(proposal_id)
     .bind(&now)
+    .bind(queued_request_id)
     .execute(&mut *tx)
     .await?;
     // Compare-and-set on the state this resume was authorised from, like every other writer of a
@@ -1678,7 +1980,15 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // the grant all disappear with it, so a lost race leaves nothing half-applied.
         return Err(ResumeError::ProposalNotPending);
     }
-    let note = format!("approved; resume run {resume_id}");
+    // The queued request id belongs in the audit trail, not only in the resumed run's prompt: this
+    // row is where somebody reconstructs what an approval actually did, and "approved" alone no
+    // longer says whether the action was authorised or taken over.
+    let note = match queued_request_id {
+        Some(request_id) => {
+            format!("approved; merge queued as vcs request {request_id}; resume run {resume_id}")
+        }
+        None => format!("approved; resume run {resume_id}"),
+    };
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
          VALUES (?, 'pending', 'approved', ?, ?)",
@@ -1757,6 +2067,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             crate::runner::ToolPolicy::Unrestricted,
             Some(std::path::Path::new(&wt_path)),
         ),
+        // The resume row carries the node's stage forward, so an approved plan node resumes on the
+        // plan model rather than dropping back to the runner's own.
+        state.runner.model_for_stage(stage.as_deref()),
     );
 
     Ok(resume_id)
@@ -1863,10 +2176,16 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             // the status write, because this is a consequence of the run ending — and best-effort,
             // because the run IS terminated either way and a queue row that outlives its run is a
             // stale request a human can cancel, not a broken run.
-            if ends_the_run(status)
-                && let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await
-            {
-                tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+            if ends_the_run(status) {
+                if let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await {
+                    tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+                }
+                // Every status that ends a run also ends its chance to report a cost: the abort
+                // above dropped the future, so `cancelled`, `failed`, `interrupted` and `timed_out`
+                // all leave the same silent `$0`. Sharing `ends_the_run` is what keeps
+                // `awaiting_approval` out — that run resumes, and the resume carries the real cost
+                // for the whole session; approximating the pause would bill the same time twice.
+                record_time_approx_cost(&state.pool, id).await;
             }
             true
         }
@@ -1919,8 +2238,8 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
 ///
 /// Such a run is unreachable, not merely idle: both `/approve` and `/reject` start from the pending
 /// proposal row, so with none there is no input left that can move it. It is also load-bearing:
-/// `one_open_worktree_run_per_project` (migration 0009) counts `awaiting_approval`, so one strand
-/// blocks every later worktree run of its project, and the worktree GC only collects terminal runs.
+/// the concurrency sweep spares `awaiting_approval`, so one strand holds a slot for good, and the
+/// worktree GC only collects terminal runs.
 /// A run holding a *pending* proposal is resumable by design — the NOT EXISTS leaves it alone.
 ///
 /// The doors that created these strands are closed, so this only heals rows predating that fix; the
@@ -2638,6 +2957,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
@@ -2768,6 +3089,9 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// The proposal carries a real approved command, not a placeholder: the grant the approval mints
+    /// records the action's CLASS, which is derived from that input. A `{}` input classifies as
+    /// `unrecognized`, so it would pin the fallback rather than the answer.
     async fn seed_resumable_action_approval(
         state: &AppState,
         session_id: Option<&str>,
@@ -2808,12 +3132,326 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             Some("proj"),
             "Bash",
             "push needs approval",
-            Some("{}"),
+            Some(r#"{"command":"git push origin main"}"#),
         )
         .await
         .unwrap();
 
         (original_run_id, proposal_id, worktree_path)
+    }
+
+    /// A paused run whose worktree and project really exist on disk, because the approval path now
+    /// asks git two questions about them.
+    ///
+    /// `seed_resumable_action_approval` deliberately uses invented paths, and that keeps working:
+    /// git cannot answer about a directory that is not there, so those approvals take the fallback
+    /// and every assertion written before this feature still means what it meant. This helper is for
+    /// the other side of that branch.
+    async fn seed_real_worktree_approval(
+        state: &AppState,
+        command: &str,
+    ) -> (i64, String, tempfile::TempDir) {
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-approve-merge-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let root = root.to_string_lossy().replace('\\', "/");
+        let branch = crate::git_exec::current_branch(
+            std::path::Path::new(&root),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("the seeded repository has a branch");
+
+        let created_at = chrono::Utc::now().to_rfc3339();
+        // `mode` is NOT NULL with a CHECK; `off` is the honest value, since nothing here is driving
+        // autopilot — the row exists only because `project_root` lives on it.
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'off', ?)
+             ON CONFLICT(project_id) DO UPDATE SET project_root = excluded.project_root",
+        )
+        .bind(&root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let original_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', 'sess-1', 'worktree', ?)",
+        )
+        .bind(&root)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        // The paused run stands in the repository root itself. A linked worktree would be more
+        // lifelike and would test nothing extra here: what the approval reads is the branch of the
+        // directory this row names, and one real worktree root is as good as another.
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', ?, ?, ?, ?)",
+        )
+        .bind(original_run_id)
+        .bind(&root)
+        .bind(&root)
+        .bind(&branch)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            original_run_id,
+            Some("sess-1"),
+            Some("proj"),
+            "Bash",
+            "needs approval",
+            Some(&serde_json::json!({ "command": command }).to_string()),
+        )
+        .await
+        .unwrap();
+
+        (proposal_id, branch, container)
+    }
+
+    async fn grants_for(state: &AppState, run_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM action_grants WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A merge admitted by an approval that then fails leaves no merge behind.
+    ///
+    /// A queued merge surviving a rolled-back approval would be an irreversible publication against
+    /// an approval that did not happen — with the proposal still pending, so a person could
+    /// authorise it a second time. What is pinned is that pair: nothing queued, nothing decided.
+    ///
+    /// The failure has to be induced, and the way this test induced it before the merge is gone. It
+    /// moved the paused run off `awaiting_approval` so that `one_open_worktree_run_per_project`
+    /// (migration 0009) would refuse the resume's INSERT. Migration 0053 dropped that index: a run
+    /// stranded at `running` no longer blocks its whole project, it holds one numbered slot in
+    /// `project_slots`, and a resume takes over the paused run's tree rather than competing with it
+    /// for the project. There is no longer a domain state in which the resume's INSERT is refused —
+    /// that is the new concurrency model working, not a hole in it.
+    ///
+    /// So the INSERT is made impossible mechanically instead: `runs.id` is `AUTOINCREMENT`, and with
+    /// the sequence parked at `i64::MAX` SQLite has no id left to hand out and fails the statement.
+    /// The specific failure is not what is under test — it stands in for any failure between the
+    /// admission and the commit — only that the admission is inside that transaction and leaves with
+    /// it.
+    ///
+    /// **What this test does NOT do, written down because the first version of this comment claimed
+    /// the opposite.** It does not distinguish `submit_on(&mut *tx, …)` from `submit(&pool, …)`.
+    /// Run against that mutation it still passes: the pool's INSERT blocks on the write lock the
+    /// open transaction already holds and never lands, so "errored, and nothing queued" is the
+    /// outcome either way and no assertion here can separate them.
+    ///
+    /// The mutation IS caught — by `approving_a_merge_queues_it_instead_of_letting_the_run_perform_it`,
+    /// which deadlocks and dies on the busy timeout after 30s. That is coverage by seizing up rather
+    /// than by saying anything, and it is worth knowing which of the two you have: a change that made
+    /// the admission merely SLOW instead of deadlocked would take that catcher away in silence, and
+    /// nothing here would notice.
+    #[tokio::test]
+    async fn a_merge_admitted_by_an_approval_that_fails_is_rolled_back_with_it() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "git merge feature/x").await;
+
+        // After the seeding, and it has to be: every row above needs an id of its own. From here on
+        // the sequence is exhausted, so the resume's INSERT is the first one that cannot land.
+        advance_run_ids_past(&state.pool, i64::MAX).await;
+
+        // On the VARIANT, not merely on `is_err`. Every assertion below this line is also satisfied
+        // by a resume that failed BEFORE it admitted anything — `NotResumable` because the seeded
+        // worktree was not found, say — and a test that cannot tell those apart would report the
+        // rollback it never exercised. `Db` is reachable only past the admission here.
+        let failed = resume_approved_run(&state, proposal_id).await;
+        assert!(
+            matches!(failed, Err(ResumeError::Db(_))),
+            "the resume must fail on its own INSERT, past the admission: {failed:?}"
+        );
+
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, 0,
+            "the merge was admitted inside the failed transaction and must have gone with it"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "nothing was decided, so nothing is decided");
+    }
+
+    /// The resume takes over the slot its paused run was holding, exactly as it takes over the tree.
+    ///
+    /// A slot is claimed by an OWNER, and this approval retires one owner and creates another over
+    /// the same piece of work. Left on the retired one, the row is not merely untidy: the paused run
+    /// is `superseded` in the same transaction, `reconcile_orphaned_slots` frees any slot whose
+    /// owner is no longer live, and it runs on every job tick. So the slot is collected out from
+    /// under a run that is still working — and the project, now reading one fewer slot in flight
+    /// than it has work in flight, starts another. What that permits is the thing `project_slots`
+    /// exists to prevent: two worktrees writing one repository.
+    ///
+    /// The sweep is run here rather than described, because the bookkeeping assertion alone passes
+    /// against a transfer that puts the row on any live id at all.
+    ///
+    /// Filtered to `owner_kind = 'run'` for the same reason the worktree hand-over is: a job's slot
+    /// belongs to the JOB, which outlives this node and every other node in its queue.
+    #[tokio::test]
+    async fn an_approved_resume_takes_over_the_slot_the_paused_run_held() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        // Not a merge: this pins what happens to the SLOT, and the queueing path would only add a
+        // second thing for the test to be about.
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused: i64 =
+            sqlx::query_scalar("SELECT id FROM runs WHERE status = 'awaiting_approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        // The seeded row claims nothing by itself — `create_run_inner` is what claims — so the
+        // paused run is given the slot it would have been holding.
+        crate::concurrency::claim(&state.pool, "proj", crate::worktree::Owner::Run(paused))
+            .await
+            .expect("the paused run holds a slot");
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let holder: Option<i64> =
+            sqlx::query_scalar("SELECT owner_id FROM project_slots WHERE owner_kind = 'run'")
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            holder,
+            Some(resume_id),
+            "the slot follows the work, as the worktree does"
+        );
+
+        crate::concurrency::reconcile_orphaned_slots(&state.pool)
+            .await
+            .unwrap();
+        let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_slots")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            held, 1,
+            "the resume is running, so the sweep has nothing to collect"
+        );
+    }
+
+    /// **Decision (B).** Approving a merge hands it to the queue; it does not hand the run a pass to
+    /// perform the merge itself.
+    ///
+    /// This is the answer to the thing this pillar was built for. Before it, the sanctioned route
+    /// for an autonomous run to merge was: pause, ask a person, and on yes the RUN merges — with its
+    /// own hands, against the same refs another run might be merging into at that moment, which is
+    /// the race the queue exists to abolish. The approval was the last place still handing that out.
+    ///
+    /// The absent grant is half the assertion and the more important half: a queued merge beside a
+    /// minted grant would be both at once, and the two would race each other.
+    #[tokio::test]
+    async fn approving_a_merge_queues_it_instead_of_letting_the_run_perform_it() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git merge feature/x").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (request_id, op, args, origin, status): (i64, String, String, String, String) =
+            sqlx::query_as(
+                "SELECT id, op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("the approved merge is in the queue");
+        assert_eq!(op, "merge");
+        assert_eq!(
+            (origin.as_str(), status.as_str()),
+            ("human", "queued"),
+            "a human just approved it, so it carries their authority and waits for nothing"
+        );
+        // The command named the source; the target is the branch the run's worktree stands on,
+        // which is the half no command line carries.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            serde_json::json!({"op": "merge", "source": "feature/x", "target": branch})
+        );
+
+        // Asserted through the two queries rather than by counting rows: since migration 0054 the
+        // approval writes a row EITHER way, and what separates them is what that row answers. It
+        // must record the takeover and must not authorize anything.
+        //
+        // The authorizing half is asked by CLASS, which is what a grant covers since migration 0055,
+        // and `push-merge-deploy` is the class this very command was paused under. Asking it the old
+        // way — by the exact input — would leave the test passing while the row authorized every
+        // other merge the run went on to try.
+        let input = serde_json::json!({ "command": "git merge feature/x" }).to_string();
+        assert!(
+            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                .await
+                .unwrap(),
+            "the queue took the merge, so the run must NOT also be authorized to perform it"
+        );
+        assert_eq!(
+            proposals::matching_queued_request(&state.pool, resume_id, "Bash", &input)
+                .await
+                .unwrap(),
+            Some(request_id),
+            "and the run has to be able to be TOLD which request has its work"
+        );
+
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains("merge queued as vcs request"),
+            "the audit trail has to say what the approval actually did: {note}"
+        );
+    }
+
+    /// The other side of the branch, and the one that keeps this from being a regression: an
+    /// approved action the queue cannot perform is authorized exactly as it always was.
+    ///
+    /// `git push` is the case that matters — it is on the approval list, the queue has no executor
+    /// for it, and redirecting it would leave a run denied with nowhere to go.
+    #[tokio::test]
+    async fn approving_something_the_queue_cannot_perform_still_authorizes_the_run() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "git push origin main").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "the queue cannot push, so it must not claim to");
+        assert_eq!(
+            grants_for(&state, resume_id).await,
+            1,
+            "an action the queue does not take is still the run's to perform, once"
+        );
     }
 
     /// §6.2 of the design, and the one path where the shell offered a button that could not work.
@@ -2838,6 +3476,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 gate_each: true,
                 review: true,
                 head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
             },
         )
         .await
@@ -2945,7 +3585,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     }
 
     #[tokio::test]
-    async fn approve_resumes_session_in_same_worktree_and_grants_the_action() {
+    async fn approve_resumes_session_in_same_worktree_and_grants_the_approved_actions_class() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         let (original_run_id, proposal_id, worktree_path) =
@@ -2988,14 +3628,25 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 .unwrap();
         assert_eq!(transferred_run_id, resume_run_id);
 
-        let grant = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT tool_name, consumed_at FROM action_grants WHERE run_id = ?",
+        // The class is what the grant authorizes, so it is what the approval has to write down. A
+        // NULL here authorizes nothing, and the resume would park again on the very action the user
+        // just approved. `consumed_at` is NULL at mint: the stamp records first USE, and nothing has
+        // used it yet.
+        let grant = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT tool_name, action_class, consumed_at FROM action_grants WHERE run_id = ?",
         )
         .bind(resume_run_id)
         .fetch_one(&state.pool)
         .await
         .unwrap();
-        assert_eq!(grant, ("Bash".to_owned(), None));
+        assert_eq!(
+            grant,
+            (
+                "Bash".to_owned(),
+                Some("push-merge-deploy".to_owned()),
+                None
+            )
+        );
 
         let proposal = proposals::get(&state.pool, proposal_id)
             .await
@@ -3277,6 +3928,79 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         .await
         .unwrap();
         assert_eq!(event_counts, (1, 0));
+    }
+
+    /// A run the wall clock kills never reports a cost: the future is dropped, so there is no
+    /// `RunOutcome` and no `cost_usd` to write. The budget then read that run as `cost_usd IS NULL`
+    /// and the money it spent existed only as an approximation recomputed on every check — a number
+    /// nothing durable ever held, and one that quietly moved as `now` did while the run was live.
+    ///
+    /// Pinning it at termination is what makes the spend a fact: the run ended, its duration is
+    /// final, and the approximation for that duration is written once, at the configured rate.
+    #[tokio::test]
+    async fn a_run_killed_by_the_wall_clock_records_an_approximated_cost() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44001, 'a run the wall clock cut short', 'timed_out', 'worktree', NULL,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44001).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cost = cost.expect("a run whose cost was never reported must not be recorded as free");
+        assert!(cost > 0.0, "unmeasured time is never $0, got {cost}");
+        // Ten minutes at the default `budget_time_cost_per_hour_usd` of $3/h.
+        assert!(
+            (cost - 0.5).abs() < 1e-9,
+            "ten minutes at the configured $3/h is $0.50, got {cost}"
+        );
+    }
+
+    /// The approximation is a floor for runs that reported nothing, not a correction to runs that
+    /// reported something. A measured cost is what the CLI actually charged; overwriting it with a
+    /// duration guess would replace the one real number in the budget with a made-up one.
+    #[tokio::test]
+    async fn an_approximated_cost_never_overwrites_a_real_one() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44002, 'a run that reported its own cost', 'completed', 'worktree', 0.0123,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44002).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44002")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cost,
+            Some(0.0123),
+            "a measured cost is the one the run actually incurred; an approximation must not \
+             replace it"
+        );
     }
 
     /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by
@@ -4045,7 +4769,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     /// A client that disconnects cancels the request it was making, which drops the handler's future
     /// exactly the way `abort()` drops a run's, and everything past that point is simply never done:
     /// no task, no abort handle (so `/cancel` answers 404), and a `running` worktree row that
-    /// `one_open_worktree_run_per_project` (migration 0009) turns into a project-wide block on every
+    /// the concurrency sweep spares, so it goes on holding a slot against every
     /// later worktree run — until the daemon restarts, the only thing that reconciles `running` rows.
     #[tokio::test(flavor = "current_thread")]
     async fn a_dropped_create_request_still_finishes_the_run_it_started() {
@@ -4137,7 +4861,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
 
     /// The half the test above does not cover. Releasing the handle keeps the in-flight map honest,
     /// but the `runs` row was left `running` behind a dead task — `/cancel` answering 404, the GC
-    /// skipping it, and `one_open_worktree_run_per_project` blocking the project until a restart.
+    /// skipping it, and the run holding a concurrency slot the sweep will not take back.
     #[tokio::test]
     async fn a_panicking_run_task_records_the_run_as_failed() {
         let state = test_state().await;
@@ -4457,8 +5181,14 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         assert!(matches!(missing_cwd, Err(CreateRunError::Invalid(_))));
     }
 
+    /// A project runs up to its ceiling and no further.
+    ///
+    /// This used to assert that the SECOND was busy, because `one_open_worktree_run_per_project`
+    /// could only ever say one. It says two now (migration 0053), so the same test measures the same
+    /// property at the number the configuration actually holds — and the second succeeding is the
+    /// whole point of the change.
     #[tokio::test(flavor = "current_thread")]
-    async fn second_worktree_run_while_one_is_running_is_busy() {
+    async fn a_project_runs_up_to_its_slot_ceiling_and_the_next_is_busy() {
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
@@ -4466,20 +5196,30 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         advance_run_ids_past(&state.pool, 10_000).await;
         let project_root = repo.to_string_lossy().into_owned();
+        // The house ceiling out of the way, so this measures the per-project one.
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 2, max_concurrent_total = 9")
+            .execute(&state.pool)
+            .await
+            .unwrap();
 
         create_worktree_run(&state, "first", "proj", &project_root)
             .await
-            .unwrap();
-        let second = create_run_inner(
+            .expect("slot 0");
+        create_worktree_run(&state, "second", "proj", &project_root)
+            .await
+            .expect("slot 1 — impossible before 0053");
+
+        let third = create_run_inner(
             &state,
-            "second".into(),
+            "third".into(),
             Some("proj".into()),
             Some(project_root),
             "worktree",
-        false,)
+            false,
+        )
         .await;
 
-        assert!(matches!(second, Err(CreateRunError::Busy)));
+        assert!(matches!(third, Err(CreateRunError::Busy)));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4508,7 +5248,11 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-pinned-");
         let state = test_state().await;
         let project_root = repo.to_string_lossy().into_owned();
-        sqlx::query(
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let pinned = sqlx::query(
             "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at)
              VALUES ('proj', ?, 'pinned', 'awaiting_approval', 'worktree', ?)",
         )
@@ -4516,7 +5260,14 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&state.pool)
         .await
-        .unwrap();
+        .unwrap()
+        .last_insert_rowid();
+        // The seeded row claims nothing by itself — `create_run_inner` is what claims — so the
+        // parked run is given the slot it would have been holding. The property under test is that
+        // the sweep does NOT take it back while the run is still `awaiting_approval`.
+        crate::concurrency::claim(&state.pool, "proj", crate::worktree::Owner::Run(pinned))
+            .await
+            .expect("the parked run holds the slot");
 
         let result = create_run_inner(
             &state,
@@ -5044,8 +5795,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         db.close().await;
     }
 
-    // One project per run: `one_open_worktree_run_per_project` (migration 0009) is exactly what a
-    // stranded pause jams, so two of them cannot coexist under the same project_id.
+    // One project per run: a stranded pause is exactly what holds a concurrency slot, and these
+    // tests need each one attributable to the project whose ceiling it would narrow.
     async fn insert_awaiting_run(pool: &sqlx::SqlitePool, project_id: &str, prompt: &str) -> i64 {
         sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
