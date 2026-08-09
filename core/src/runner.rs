@@ -805,10 +805,24 @@ pub struct OllamaChat {
     model: String,
 }
 
+/// Ceiling on one exchange with the local model.
+///
+/// A turn is up to `MAX_TOOL_ROUNDS` of these, so this is per round rather than per turn — the turn
+/// itself is bounded again by the caller. Generous because a cold model loads from disk on the
+/// first request, and a first message that times out while Ollama is still starting looks exactly
+/// like a broken bot.
+const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl OllamaChat {
     pub fn new(base_url: String, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // A client timeout, not a default client. `reqwest::Client::new()` waits for ever, and
+            // for ever here means the chat slot is never released and every later message in that
+            // chat is refused with 409 until the daemon restarts.
+            client: reqwest::Client::builder()
+                .timeout(OLLAMA_EXCHANGE_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
         }

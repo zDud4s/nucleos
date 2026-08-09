@@ -353,11 +353,25 @@ async fn spawn_local_turn(
     .last_insert_rowid();
 
     let pool = state.pool.clone();
+    let run_timeout = state.run_timeout;
     crate::runs::spawn_registered(state, id, async move {
         // Holds the chat for the length of the turn and releases it however this ends, including by
         // being aborted mid-await — the same guarantee `TurnGuard` gives the CLI path.
         let _slot = slot;
-        let outcome = assistant.answer(&history, &text).await;
+        // Wrapped for the same reason the CLI path is: the slot is released by this task ending,
+        // so a turn that never ends is a chat that answers nothing ever again — every later message
+        // refused with 409 until the daemon restarts. The HTTP client has its own per-exchange
+        // timeout; this one bounds the whole turn, including a loop that keeps making progress
+        // slowly.
+        let outcome = match tokio::time::timeout(run_timeout, assistant.answer(&history, &text))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the local model did not finish this turn in time",
+            )),
+        };
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Guarded on `status = 'running'` for the reason the CLI path sets out: a `/cancel` that

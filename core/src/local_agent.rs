@@ -75,6 +75,13 @@ pub enum Ending {
     RoundsExhausted,
     /// The model asked for the same thing that had already failed.
     RepeatedAFailedCall,
+    /// The model stopped without calling a tool and without writing anything.
+    ///
+    /// Distinct from `Answered` because it is not one. An empty reply used to be recorded as a
+    /// completed turn with an empty answer: the chat showed nothing, `NO_ANSWER` never fired, and
+    /// the exchange was then dropped from history for having no text — so the conversation lost a
+    /// turn as well as an answer, and nothing anywhere said why.
+    SaidNothing,
 }
 
 #[derive(Debug, Clone)]
@@ -122,10 +129,21 @@ pub async fn run_turn(
         let calls = tool_calls(&message);
 
         if calls.is_empty() {
-            return Ok(Turn {
-                answer: content_of(&message),
-                ending: Ending::Answered,
-                tool_calls: executed,
+            let answer = content_of(&message);
+            // No calls and no text is a stop, not an answer. It happens: a model can emit a
+            // malformed tool call that `tool_calls` drops, leaving a message with neither.
+            return Ok(if answer.is_empty() {
+                Turn {
+                    answer: NO_ANSWER.to_string(),
+                    ending: Ending::SaidNothing,
+                    tool_calls: executed,
+                }
+            } else {
+                Turn {
+                    answer,
+                    ending: Ending::Answered,
+                    tool_calls: executed,
+                }
             });
         }
 
@@ -423,6 +441,28 @@ mod tests {
 
         assert_eq!(turn.ending, Ending::Answered);
         assert_eq!(turn.tool_calls, 2);
+    }
+
+    /// A reply with neither text nor a usable call is a stop, not an answer. Recorded as an answer
+    /// it produced a completed turn showing nothing, which was then dropped from history for having
+    /// no text — the conversation losing a turn as well as a reply, with nothing saying why.
+    #[tokio::test]
+    async fn a_reply_with_no_text_and_no_calls_is_not_an_answer() {
+        for reply in [
+            serde_json::json!({"role": "assistant", "content": ""}),
+            serde_json::json!({"role": "assistant"}),
+            serde_json::json!({"role": "assistant", "content": "   "}),
+            // A malformed call: `tool_calls` drops it, leaving a message with neither.
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{"nope": 1}]}),
+        ] {
+            let chat = ScriptedChat::new(vec![reply.clone()]);
+            let tools = FakeTools::answering("{}");
+
+            let turn = run_turn(&chat, &tools, "system", &[], "go").await.unwrap();
+
+            assert_eq!(turn.ending, Ending::SaidNothing, "{reply}");
+            assert_eq!(turn.answer, NO_ANSWER, "{reply}");
+        }
     }
 
     #[tokio::test]

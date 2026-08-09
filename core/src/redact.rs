@@ -82,32 +82,71 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
 
     while let Some(relative) = input[from..].find(BEGIN) {
         let start = from + relative;
-        let Some(header_end) = input[start..].find("-----\n").or(input[start..].find("-----\r")) else {
-            break;
+        // `continue` past this header rather than abandoning the scan. A malformed block early in a
+        // message used to `break`, which silently gave up on every real key after it — the failure
+        // mode where one bad input disarms the detector for the rest of the text.
+        let Some(header_end) = input[start..]
+            .find("-----\n")
+            .or(input[start..].find("-----\r"))
+        else {
+            from = start + BEGIN.len();
+            continue;
         };
         let header = &input[start + BEGIN.len()..start + header_end];
         if !header.contains("PRIVATE KEY") {
             from = start + BEGIN.len();
             continue;
         }
-        let Some(end_relative) = input[start..].find(END_MARK) else {
-            break;
+
+        // A truncated block — pasted without its footer, or cut by a length limit — is still a key,
+        // and used to pass through whole. Falling back to the body's own extent covers it without
+        // swallowing the rest of the message: the body ends where the base64 stops.
+        let end = match input[start..].find(END_MARK) {
+            Some(end_relative) => {
+                let after_end = start + end_relative;
+                input[after_end + END_MARK.len()..]
+                    .find("-----")
+                    .map_or(input.len(), |offset| {
+                        after_end + END_MARK.len() + offset + "-----".len()
+                    })
+            }
+            None => start + header_end + base64_body_len(&input[start + header_end..]),
         };
-        let after_end = start + end_relative;
-        let tail = input[after_end..]
-            .find("-----\n")
-            .or(input[after_end..].find("-----\r"))
-            .or(input[after_end..].rfind("-----"))
-            .map_or(input.len(), |offset| after_end + offset + "-----".len());
+
         findings.push(Finding {
             start,
-            end: tail.min(input.len()),
+            end: end.min(input.len()),
             label: "[SECRET:private-key]",
         });
-        from = tail;
+        from = end;
     }
 
     findings
+}
+
+/// How far a PEM body runs: consecutive lines made only of base64 characters.
+///
+/// Used only when the END line is missing, to bound a truncated block. Stopping at the first line
+/// that is not base64 is what keeps a key with no footer from redacting the paragraph after it.
+fn base64_body_len(input: &str) -> usize {
+    let mut consumed = 0;
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let is_body = !trimmed.is_empty()
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'));
+        // The header's own trailing newline is consumed before any body line is examined.
+        if consumed == 0 && trimmed.is_empty() {
+            consumed += line.len();
+            continue;
+        }
+        if !is_body {
+            break;
+        }
+        consumed += line.len();
+    }
+    consumed
 }
 
 /// Credentials whose issuer stamped a recognisable prefix on them.
@@ -186,12 +225,16 @@ fn json_web_tokens(input: &str) -> Vec<Finding> {
                 .chars()
                 .next_back()
                 .is_some_and(is_token_character);
-        let run: usize = input[start..]
+        let raw: usize = input[start..]
             .chars()
             .take_while(|character| is_token_character(*character) || *character == '.')
             .map(char::len_utf8)
             .sum();
-        let candidate = &input[start..start + run];
+        // Trailing dots belong to the sentence, not the token. Without this, a JWT ending a
+        // sentence split into four segments, failed the three-segment test, and was published
+        // whole — the detector defeated by a full stop.
+        let candidate = input[start..start + raw].trim_end_matches('.');
+        let run = candidate.len();
         let segments: Vec<&str> = candidate.split('.').collect();
 
         if boundary
@@ -242,15 +285,26 @@ fn checksummed_numbers(input: &str) -> Vec<Finding> {
                 continue;
             }
 
-            let label = classify_number(&compact);
-            if let Some(label) = label {
-                best = Some(Finding {
-                    start: *start,
-                    end,
-                    label,
-                });
-                break;
+            let Some(label) = classify_number(&compact) else {
+                continue;
+            };
+            // A check digit is necessary and, for two of these three, not sufficient. An IBAN
+            // carries its own anchor — two letters and two check digits in fixed positions — so
+            // mod-97 identifies it. Luhn and the NIF's mod-11 do not: roughly one 13-digit
+            // millisecond timestamp in ten passes Luhn, and about one nine-digit integer in eleven
+            // passes mod-11, so a byte count or an epoch was being replaced by `[CARD]` or `[NIF]`
+            // in text on its way to a model trying to reason about it. Corrupting the numbers a
+            // reader needs is a worse failure than missing a card written with no context, so those
+            // two now need a word nearby that says what they are.
+            if label != "[IBAN]" && !trigger_precedes(input, *start) {
+                continue;
             }
+            best = Some(Finding {
+                start: *start,
+                end,
+                label,
+            });
+            break;
         }
         if let Some(finding) = best {
             findings.push(finding);
@@ -258,6 +312,47 @@ fn checksummed_numbers(input: &str) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// Words that say a number is a card or a taxpayer id rather than a measurement.
+///
+/// Portuguese and English, matching the trigger list the entropy rule uses, and with the same
+/// known gap: a number announced in a third language is not caught. That is a miss, and a miss is
+/// the direction this detector is allowed to fail in — the shadow pass is what will measure whether
+/// it happens enough to matter.
+const NUMBER_TRIGGERS: &[&str] = &[
+    "card",
+    "cartao",
+    "cartão",
+    "visa",
+    "mastercard",
+    "amex",
+    "nif",
+    "contribuinte",
+    "vat",
+    "iban",
+    "conta",
+    "account",
+    "number",
+    "numero",
+    "número",
+];
+
+/// How far back a trigger word may sit. Wide enough for "the card number ends ...", short enough
+/// that a word in the previous sentence does not vouch for a number in this one.
+const TRIGGER_WINDOW_CHARS: usize = 40;
+
+/// Whether one of `NUMBER_TRIGGERS` appears just before `start`.
+fn trigger_precedes(input: &str, start: usize) -> bool {
+    let before = &input[..start];
+    let window_start = before
+        .char_indices()
+        .rev()
+        .take(TRIGGER_WINDOW_CHARS)
+        .last()
+        .map_or(0, |(index, _)| index);
+    let window = before[window_start..].to_lowercase();
+    NUMBER_TRIGGERS.iter().any(|word| window.contains(word))
 }
 
 /// PURE: what a compacted, space-free run of characters proves itself to be, if anything.
@@ -513,6 +608,68 @@ mod tests {
         ] {
             assert_eq!(redact_secrets(input), input, "{input:?} was altered");
         }
+    }
+
+    /// The false positives the first version of this test was too kind to find. A check digit is
+    /// necessary and not sufficient: roughly one 13-digit millisecond timestamp in ten passes Luhn,
+    /// and about one nine-digit integer in eleven passes the NIF's mod-11. Replacing a byte count
+    /// with `[NIF]` corrupts the number a model was asked to reason about, which is worse than
+    /// missing a card nobody labelled.
+    #[test]
+    fn measurements_that_happen_to_pass_a_checksum_survive() {
+        for input in [
+            "run finished at 1786000000003 ms",
+            "processed 100000002 bytes",
+            "elapsed 1786000000003",
+            "id 100000002 completed",
+        ] {
+            assert_eq!(
+                redact_secrets(input),
+                input,
+                "{input:?} was redacted with nothing saying what the number is"
+            );
+        }
+    }
+
+    /// The other half: with a word nearby saying what it is, the same digits are redacted. Without
+    /// this the fix above would be indistinguishable from deleting the rule.
+    #[test]
+    fn a_labelled_card_or_nif_is_still_redacted() {
+        assert!(redact_secrets("card 4111 1111 1111 1111").contains("[CARD]"));
+        assert!(redact_secrets("o NIF dele é 123456789").contains("[NIF]"));
+        assert!(redact_secrets("Número de contribuinte: 123456789").contains("[NIF]"));
+        // An IBAN carries its own anchor — country code and check digits — so it needs no word.
+        assert!(redact_secrets("GB82 WEST 1234 5698 7654 32").contains("[IBAN]"));
+    }
+
+    /// A full stop is not part of a token. The detector used to be defeated by one.
+    #[test]
+    fn a_jwt_ending_a_sentence_is_still_redacted() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r";
+        let redacted = redact_secrets(&format!("the token is {jwt}."));
+        assert!(redacted.contains("[SECRET:jwt]"), "{redacted:?}");
+        assert!(redacted.ends_with('.'), "{redacted:?}");
+        assert!(!redacted.contains("dBjftJeZ"), "{redacted:?}");
+    }
+
+    /// A key pasted without its footer is still a key, and used to pass through whole.
+    #[test]
+    fn a_private_key_block_with_no_end_line_is_still_redacted() {
+        let input = "here it is:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nbG9uZ2Jhc2U2NA==\n\nand that is all";
+        let redacted = redact_secrets(input);
+
+        assert!(redacted.contains("[SECRET:private-key]"), "{redacted:?}");
+        assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
+        // Bounded by where the base64 stops, so the sentence after it survives.
+        assert!(redacted.contains("and that is all"), "{redacted:?}");
+    }
+
+    /// A malformed block used to `break`, abandoning the scan — so one bad header disarmed the
+    /// detector for every real key after it.
+    #[test]
+    fn a_malformed_header_does_not_disarm_the_rest_of_the_scan() {
+        let input = "-----BEGIN NOT A KEY\nthen: ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        assert!(redact_secrets(input).contains("[SECRET:github]"));
     }
 
     #[test]

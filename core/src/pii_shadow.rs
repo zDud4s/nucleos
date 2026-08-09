@@ -82,13 +82,19 @@ Field: {field}\nText:\n{capped}"
 ///   carrying no evidence for it.
 /// - A confidence outside 0..=1 is dropped to `None` rather than clamped, because a model that
 ///   answered `95` meant percent and clamping would silently record `1.0` for it.
-pub fn parse_observations(answer: &str, source: &str) -> Vec<Observation> {
-    let Ok(raw) = serde_json::from_str::<Vec<RawObservation>>(answer.trim()) else {
-        return Vec::new();
-    };
+///
+/// Returns `None` when the answer could not be READ at all, which is not the same as
+/// `Some(vec![])`. An empty array is the model saying it found nothing, and that is a measurement —
+/// it is the denominator. An answer that does not parse is the model failing, and recording that as
+/// "found nothing" would write a permanent clean verdict for a summary nobody successfully looked
+/// at: the sweep's `NOT EXISTS` clause never revisits a summary that has a row, so the denominator
+/// this table exists to produce would quietly absorb every garbled reply.
+pub fn parse_observations(answer: &str, source: &str) -> Option<Vec<Observation>> {
+    let raw = serde_json::from_str::<Vec<RawObservation>>(answer.trim()).ok()?;
 
     let mut seen = std::collections::HashSet::new();
-    raw.into_iter()
+    let observations = raw
+        .into_iter()
         .filter(|entry| !entry.excerpt.trim().is_empty())
         .filter(|entry| source.contains(entry.excerpt.trim()))
         .filter(|entry| seen.insert((entry.class.clone(), entry.excerpt.trim().to_string())))
@@ -103,7 +109,8 @@ pub fn parse_observations(answer: &str, source: &str) -> Vec<Observation> {
                 .confidence
                 .filter(|value| (0.0..=1.0).contains(value)),
         })
-        .collect()
+        .collect();
+    Some(observations)
 }
 
 /// Records observations, ignoring ones already recorded for the same source.
@@ -212,9 +219,21 @@ pub async fn observe_pending(
             }
         };
 
-        // A message with nothing in it still has to be marked as looked at, or every sweep for ever
-        // reconsiders the same clean summaries and never reaches the new ones. `none` is that mark,
-        // and it is also a measurement: it is the denominator.
+        // An unreadable answer is left unrecorded, so the next sweep tries it again. Marking it as
+        // looked-at would be permanent — the `NOT EXISTS` clause above never revisits a summary
+        // with a row — and it would record "clean" for something nobody managed to read, quietly
+        // inflating the very denominator this table exists to produce.
+        let Some(observations) = observations else {
+            tracing::warn!(
+                email_id = id,
+                "pii shadow: unreadable answer, leaving this summary for the next sweep"
+            );
+            continue;
+        };
+
+        // A summary with nothing in it still has to be marked as looked at, or every sweep for ever
+        // reconsiders the same clean ones and never reaches the new. `none` is that mark, and it is
+        // also the measurement: it is the denominator.
         let to_write = if observations.is_empty() {
             vec![Observation {
                 class: "none".to_string(),
@@ -273,7 +292,7 @@ mod tests {
             {"class":"name","excerpt":"Joana","confidence":0.9}
         ]"#;
 
-        let found = parse_observations(answer, source);
+        let found = parse_observations(answer, source).expect("a JSON array parses");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].excerpt, "Rita");
     }
@@ -283,7 +302,7 @@ mod tests {
         let source = "meeting at Rua das Flores 3";
         let answer = r#"[{"class":"postal_code","excerpt":"Rua das Flores 3"}]"#;
 
-        let found = parse_observations(answer, source);
+        let found = parse_observations(answer, source).expect("a JSON array parses");
         assert_eq!(found[0].class, "other");
         assert_eq!(found[0].confidence, None);
     }
@@ -295,17 +314,27 @@ mod tests {
         let source = "Rita";
         for raw in ["95", "-1", "1.5"] {
             let answer = format!(r#"[{{"class":"name","excerpt":"Rita","confidence":{raw}}}]"#);
-            assert_eq!(parse_observations(&answer, source)[0].confidence, None);
+            assert_eq!(
+                parse_observations(&answer, source).unwrap()[0].confidence,
+                None
+            );
         }
         let answer = r#"[{"class":"name","excerpt":"Rita","confidence":0.4}]"#;
-        assert_eq!(parse_observations(answer, source)[0].confidence, Some(0.4));
+        assert_eq!(
+            parse_observations(answer, source).unwrap()[0].confidence,
+            Some(0.4)
+        );
     }
 
+    /// An unreadable answer must be distinguishable from "found nothing". Recording it as clean
+    /// would be permanent, and would inflate the denominator with summaries nobody could read.
     #[test]
-    fn an_answer_that_is_not_a_json_array_yields_nothing() {
+    fn an_answer_that_is_not_a_json_array_is_unreadable_rather_than_clean() {
         for answer in ["", "sorry, I cannot", "{}", "[{\"class\":\"name\"}]"] {
-            assert!(parse_observations(answer, "Rita").is_empty(), "{answer:?}");
+            assert_eq!(parse_observations(answer, "Rita"), None, "{answer:?}");
         }
+        // The contrast: an empty array IS a reading, and it is the one that counts as clean.
+        assert_eq!(parse_observations("[]", "Rita"), Some(Vec::new()));
     }
 
     #[test]
@@ -316,7 +345,7 @@ mod tests {
             {"class":"name","excerpt":"Rita"},
             {"class":"name","excerpt":"  "}
         ]"#;
-        assert_eq!(parse_observations(answer, source).len(), 1);
+        assert_eq!(parse_observations(answer, source).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -337,6 +366,80 @@ mod tests {
 
         assert_eq!((first, second), (1, 0));
         assert_eq!(tally(&pool).await.unwrap(), vec![("name".to_string(), 1)]);
+    }
+
+    /// Stands up a stub Ollama that answers the same body every time, and returns its base URL.
+    async fn stub_ollama(answer: &'static str) -> String {
+        let app = axum::Router::new().fallback(axum::routing::post(move || async move {
+            axum::Json(serde_json::json!({
+                "message": {"role": "assistant", "content": answer}
+            }))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn triaged_email(pool: &sqlx::SqlitePool, id: i64, summary: &str) {
+        sqlx::query(
+            "INSERT INTO emails (id, message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, direction, triage_class, triage_summary)
+             VALUES (?, ?, 'INBOX', 1, ?, 'a@b', 'Assunto', '2026-08-09T00:00:00Z',
+                     '2026-08-09T00:00:00Z', 'inbound', 'info', ?)",
+        )
+        .bind(id)
+        .bind(format!("<{id}@b>"))
+        .bind(id)
+        .bind(summary)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The sweep records a clean reading, so the same summary is not reconsidered for ever.
+    #[tokio::test]
+    async fn a_summary_the_model_read_as_clean_is_recorded_and_not_revisited() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "pedido de orçamento").await;
+        let base = stub_ollama("[]").await;
+        let client = reqwest::Client::new();
+
+        let first = observe_pending(&pool, &client, &base, "m", "2026-08-09T00:00:00Z")
+            .await
+            .unwrap();
+        let second = observe_pending(&pool, &client, &base, "m", "2026-08-09T01:00:00Z")
+            .await
+            .unwrap();
+
+        assert_eq!((first, second), (1, 0), "a clean reading is written once");
+        assert_eq!(tally(&pool).await.unwrap(), vec![("none".to_string(), 1)]);
+    }
+
+    /// The failure the `none` mark is most at risk of. A garbled answer must leave NO row: the
+    /// sweep's `NOT EXISTS` clause never revisits a summary that has one, so recording it would
+    /// permanently count an unread summary as clean and inflate the denominator.
+    #[tokio::test]
+    async fn a_summary_the_model_garbled_is_left_for_the_next_sweep() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "pedido de orçamento").await;
+        let client = reqwest::Client::new();
+
+        let garbled = stub_ollama("I'm sorry, I cannot help with that.").await;
+        let written = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(written, 0);
+        assert!(tally(&pool).await.unwrap().is_empty());
+
+        // And it is still pending, so a working model later still gets to look at it.
+        let working = stub_ollama("[]").await;
+        let retried = observe_pending(&pool, &client, &working, "m", "2026-08-09T01:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(retried, 1, "the summary was not left for the next sweep");
     }
 
     /// The table must not outlive what it describes. Without the trigger, deleting a message would
