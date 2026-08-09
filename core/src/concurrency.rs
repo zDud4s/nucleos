@@ -259,6 +259,95 @@ const ORPHANED_SLOTS_SQL: &str = "DELETE FROM project_slots
                               AND jobs.status IN ('planning','implementing','gating','reviewing',
                                                   'awaiting_approval','waiting')))";
 
+/// One taken slot, with its owner.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct HeldSlot {
+    pub project_id: String,
+    pub slot: i64,
+    /// `'run'` or `'job'`. A `String` and not `Owner`, because this leaves over JSON and the
+    /// consumer is an interface that only wants to know which tab to link to.
+    pub owner_kind: String,
+    pub owner_id: i64,
+    pub claimed_at: String,
+}
+
+/// Every slot taken right now, in project and number order.
+pub async fn held_slots(pool: &SqlitePool) -> sqlx::Result<Vec<HeldSlot>> {
+    sqlx::query_as(
+        "SELECT project_id, slot, owner_kind, owner_id, claimed_at
+         FROM project_slots ORDER BY project_id, slot",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct HouseReadout {
+    pub limit: i64,
+    pub held: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProjectReadout {
+    pub project_id: String,
+    pub limit: i64,
+    pub slots: Vec<HeldSlot>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct Readout {
+    pub house: HouseReadout,
+    pub projects: Vec<ProjectReadout>,
+}
+
+/// How much fits, and what is inside it.
+///
+/// The project list is the **union** of the roster with the projects that hold slots. The roster
+/// alone would leave a slot invisible if its project left `autopilot_state`, and capacity vanishing
+/// in silence is the one outcome this reading cannot have — it is the screen's authority, and the
+/// other calls only lay description over it.
+pub async fn readout(pool: &SqlitePool) -> sqlx::Result<Readout> {
+    let held = held_slots(pool).await?;
+    let roster: Vec<String> =
+        sqlx::query_scalar("SELECT project_id FROM autopilot_state ORDER BY project_id")
+            .fetch_all(pool)
+            .await?;
+
+    let mut ids: Vec<String> = roster;
+    for slot in &held {
+        if !ids.iter().any(|id| id == &slot.project_id) {
+            ids.push(slot.project_id.clone());
+        }
+    }
+    ids.sort();
+
+    let mut projects = Vec::with_capacity(ids.len());
+    for project_id in ids {
+        let limit = slots_limit(pool, &project_id).await?;
+        let slots = held
+            .iter()
+            .filter(|slot| slot.project_id == project_id)
+            .cloned()
+            .collect();
+        projects.push(ProjectReadout {
+            project_id,
+            limit,
+            slots,
+        });
+    }
+
+    Ok(Readout {
+        house: HouseReadout {
+            limit: house_limit(pool).await?,
+            // `held.len()` and not `slots_in_flight(pool)`: counting the reading just made is what
+            // stops the total and the sum of the columns from disagreeing because of a write
+            // landing between two queries.
+            held: held.len() as i64,
+        },
+        projects,
+    })
+}
+
 fn is_unique_violation(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
@@ -573,5 +662,99 @@ mod tests {
             sql.contains("PRIMARY KEY (project_id, slot)"),
             "project_slots is not keyed on (project_id, slot): {sql}"
         );
+    }
+
+    async fn seed_project(pool: &SqlitePool, project_id: &str) {
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES (?, 'active')")
+            .bind(project_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The roster, not the slots table. A quiet project has to keep its column: `project_slots`
+    /// only has rows for slots that were taken, and a column that comes and goes would make the
+    /// layout jump every night that ends.
+    #[tokio::test]
+    async fn the_readout_enumerates_the_roster_including_a_project_holding_nothing() {
+        let pool = test_pool().await;
+        set_limits(&pool, 2, 9).await;
+        seed_project(&pool, "project-a").await;
+        seed_project(&pool, "project-quiet").await;
+        let job = seed_job(&pool, "project-a", "implementing").await;
+        claim(&pool, "project-a", Owner::Job(job)).await.unwrap();
+
+        let readout = readout(&pool).await.unwrap();
+
+        let ids: Vec<&str> = readout
+            .projects
+            .iter()
+            .map(|project| project.project_id.as_str())
+            .collect();
+        assert_eq!(ids, ["project-a", "project-quiet"]);
+        let quiet = &readout.projects[1];
+        assert_eq!(quiet.limit, 2);
+        assert!(quiet.slots.is_empty());
+    }
+
+    /// An autonomous worktree run holds a slot too. A reading that counted only jobs would say
+    /// `0/2` about a project that is going to refuse the next job — and the screen would offer
+    /// *New job* against a guaranteed 409.
+    #[tokio::test]
+    async fn a_project_with_a_worktree_run_reports_honest_capacity() {
+        let pool = test_pool().await;
+        set_limits(&pool, 2, 9).await;
+        seed_project(&pool, "project-a").await;
+        let run = seed_run(&pool, "project-a", "running").await;
+        claim(&pool, "project-a", Owner::Run(run)).await.unwrap();
+
+        let readout = readout(&pool).await.unwrap();
+
+        let project = &readout.projects[0];
+        // `1/2` is two numbers, and the denominator is half the honesty: without this line the
+        // test passes with `slots_limit` wired up wrongly in `readout`.
+        assert_eq!(project.slots.len(), 1);
+        assert_eq!(project.limit, 2);
+        assert_eq!(project.slots[0].owner_kind, "run");
+        assert_eq!(project.slots[0].owner_id, run);
+        assert_eq!(readout.house.held, 1);
+    }
+
+    /// A slot whose project is not on the roster still counts. Capacity never lies, even when the
+    /// description fails — and an invisible slot would be capacity vanishing in silence.
+    #[tokio::test]
+    async fn a_slot_for_a_project_outside_the_roster_still_gets_a_column() {
+        let pool = test_pool().await;
+        set_limits(&pool, 2, 9).await;
+        let run = seed_run(&pool, "project-ghost", "running").await;
+        claim(&pool, "project-ghost", Owner::Run(run))
+            .await
+            .unwrap();
+
+        let readout = readout(&pool).await.unwrap();
+
+        assert_eq!(readout.projects.len(), 1);
+        assert_eq!(readout.projects[0].project_id, "project-ghost");
+        assert_eq!(readout.projects[0].slots.len(), 1);
+    }
+
+    /// The unreadable ceiling is one, and it is tested here rather than over HTTP:
+    /// `UNREADABLE_CEILING` is private, and the `1` that comes out is indistinguishable from a
+    /// ceiling configured to 1 when seen from outside.
+    #[tokio::test]
+    async fn a_ceiling_that_cannot_be_read_reaches_the_readout_as_one() {
+        let pool = test_pool().await;
+        seed_project(&pool, "project-a").await;
+        sqlx::query(
+            "UPDATE autopilot_global SET max_concurrent_slots = NULL, max_concurrent_total = NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let readout = readout(&pool).await.unwrap();
+
+        assert_eq!(readout.house.limit, UNREADABLE_CEILING);
+        assert_eq!(readout.projects[0].limit, UNREADABLE_CEILING);
     }
 }

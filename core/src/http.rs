@@ -65,6 +65,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/autopilot/attention", post(post_attention_heartbeat))
         .route("/projects", get(get_projects))
+        // The fleet canvas's authority: how much fits, and who is inside it. Beside `/projects`
+        // because it answers about the same set — the roster — seen through capacity rather than
+        // through mode.
+        .route("/concurrency", get(get_concurrency))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
@@ -1999,6 +2003,15 @@ async fn get_projects(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn get_concurrency(
+    State(state): State<AppState>,
+) -> Result<Json<crate::concurrency::Readout>, StatusCode> {
+    crate::concurrency::readout(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn get_project_ls(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3208,7 +3221,11 @@ mod tests {
         assert!(live.iter().any(|job| job.id == old_live));
 
         let today = jobs_at(&app, "/jobs").await;
-        assert_eq!(today.len(), 20, "without the parameter, today's ceiling holds");
+        assert_eq!(
+            today.len(),
+            20,
+            "without the parameter, today's ceiling holds"
+        );
         assert!(!today.iter().any(|job| job.id == old_live));
 
         db.close().await;
@@ -3278,7 +3295,11 @@ mod tests {
             .with_state(state);
 
         let today = runs_at(&app, "/runs").await;
-        assert_eq!(today.len(), 50, "without the parameter, search's window holds");
+        assert_eq!(
+            today.len(),
+            50,
+            "without the parameter, search's window holds"
+        );
         assert!(!today.iter().any(|run| run.id == parked));
 
         let live = runs_at(&app, "/runs?live=true").await;
@@ -3781,6 +3802,21 @@ mod tests {
         .await
         .unwrap();
         token
+    }
+
+    /// The weakest key in the house reaches capacity for real — through the production router, not
+    /// through the table. It is the only thing linking `build_router` to `READ_ONLY_ROUTES`: a
+    /// difference of one character between the route line and the table line passes `permits()` and
+    /// gives a 403 in service.
+    #[tokio::test]
+    async fn a_read_only_key_can_read_the_house_capacity() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        let response = api_token_request(state, "GET", "/concurrency", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        db.close().await;
     }
 
     #[tokio::test]

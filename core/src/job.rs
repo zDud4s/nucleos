@@ -4371,7 +4371,10 @@ mod tests {
 
         let listed = list(&pool, Some("project-a"), 20).await.unwrap();
 
-        assert_eq!(listed[0].slot, None, "that slot is the run's, not this job's");
+        assert_eq!(
+            listed[0].slot, None,
+            "that slot is the run's, not this job's"
+        );
     }
 
     /// The listing's ceiling of 20 is a window onto history. A live job outside it is precisely
