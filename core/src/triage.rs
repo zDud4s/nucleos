@@ -420,7 +420,7 @@ async fn claimed_batch(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<(i64, Vec
 
     let terminal: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT 1 FROM runs WHERE id = ? AND {}",
-        crate::email::RUN_IS_TERMINAL
+        crate::email::RUN_IS_TERMINAL.as_str()
     )))
     .bind(run_id)
     .fetch_optional(pool)

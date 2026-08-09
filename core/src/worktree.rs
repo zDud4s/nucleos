@@ -1027,17 +1027,20 @@ async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted:
 // terminal run's would have its worktree collected mid-use. There is a test on exactly that
 // (`a_job_worktree_is_not_collected_by_a_run_of_the_same_id`).
 //
-// The job arm lists terminal statuses explicitly rather than excluding live ones. A status added
-// later then defaults to *not collected* — a stale directory — instead of to deleting the worktree
-// of a job still using it. That is the safe direction and still a leak, so
-// `every_ending_a_job_can_have_is_an_ending_the_gc_collects` holds this list against `job.rs`.
+// Both arms list terminal statuses explicitly rather than excluding live ones. A status added later
+// then defaults to *not collected* — a stale directory — instead of to deleting the worktree of
+// something still using it. That is the safe direction and still a leak, so each arm is held
+// against the module that writes those statuses:
+// `job::every_ending_a_job_can_have_is_an_ending_the_gc_collects` for the job arm, and
+// `runs::every_ending_a_run_can_have_is_an_ending_the_gc_collects` for the run arm. The run arm had
+// no such guard until `superseded` was found missing from it.
 pub(crate) const GC_CANDIDATES_SQL: &str =
     "SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
          FROM worktrees w
          JOIN runs r ON r.id = w.owner_id
          WHERE w.owner_kind = 'run'
            AND w.removed_at IS NULL
-           AND r.status IN ('completed','failed','cancelled','timed_out','interrupted')
+           AND r.status IN ('completed','failed','cancelled','timed_out','interrupted','superseded')
            AND COALESCE(r.completed_at, w.created_at) <= ?
          UNION ALL
          SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch

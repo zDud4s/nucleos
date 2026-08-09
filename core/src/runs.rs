@@ -1868,6 +1868,29 @@ fn ends_the_run(status: &str) -> bool {
 /// `status != 'running'`: a run pausing for a human resumes, and its merge must survive the pause.
 pub const ENDED_RUN_STATUSES: &[&str] = &["cancelled", "failed", "interrupted", "timed_out"];
 
+/// Every status a run can come to rest in — which is a wider question than the one above.
+///
+/// [`ENDED_RUN_STATUSES`] asks "did this run stop without finishing, so should its queued work be
+/// thrown away?", and deliberately excludes both `completed` (whose queued merge is the point) and
+/// `superseded` (whose work continues in the successor). This one asks "is this run still using its
+/// worktree?", and the answer for all six is no.
+///
+/// It exists because something else has to agree with it: `worktree::gc_candidates` collects a
+/// run's worktree only for a status it lists, so an ending missing from there leaks a directory
+/// forever — invisibly, because as far as the system is concerned that run is over and its tree is
+/// nobody's. `every_ending_a_run_can_have_is_an_ending_the_gc_collects` holds the two lists
+/// together. The job side has had that guard since `stopped` opened exactly this leak
+/// (`job::TERMINAL_STATUSES`); the run side had the same shape and no guard, and `superseded` —
+/// added later, by the approval resume — was already missing from the GC when this was written.
+pub const TERMINAL_RUN_STATUSES: &[&str] = &[
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+    "timed_out",
+    "superseded",
+];
+
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
@@ -1994,6 +2017,150 @@ pub async fn reconcile_stranded_approvals(pool: &sqlx::SqlitePool) -> Result<u64
     Ok(reconciled.len() as u64)
 }
 
+/// How long a finished run keeps the bulk it produced.
+///
+/// A run's transcript is stored twice — the whole stream as `runs.stdout`, and again line by line
+/// in `run_events`, which migration 0035 then indexes for search. Nothing removed any of it, so the
+/// three copies grew for as long as the daemon was ever used. Measured on one lightly-used install:
+/// 4.9 MB of `stdout` and 4.1 MB of `run_events` from 87 runs, one transcript alone a megabyte.
+///
+/// The row itself is NOT deleted, and that is the whole design. What costs is the transcript; what
+/// people look at months later is the metadata — what ran, when, whether it passed, what it cost —
+/// and that is a couple of hundred bytes a run. So a finished run keeps its history forever and
+/// loses its transcript on a window, rather than the row disappearing out from under a feed entry,
+/// a job item or a proposal that still points at it.
+pub const DEFAULT_TRANSCRIPT_RETENTION_DAYS: i64 = 30;
+
+/// The window, overridable for an operator who wants a different one.
+///
+/// An environment variable rather than a config file, matching `NUCLEOS_WORKTREE_RETENTION_HOURS`
+/// in `worktree.rs`: runs are not a pillar, and a knob nobody has yet asked to turn does not earn
+/// a `.ai/*.yaml` of its own.
+fn transcript_retention_days() -> i64 {
+    std::env::var("NUCLEOS_TRANSCRIPT_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_TRANSCRIPT_RETENTION_DAYS)
+}
+
+/// What one retention pass removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PrunedTranscripts {
+    /// Runs whose transcript columns were emptied.
+    pub runs: u64,
+    /// Rows removed from `run_events` — and, through migration 0035's delete trigger, the terms
+    /// they had put in the search index.
+    pub events: u64,
+}
+
+/// Empties the transcript of every finished run past the window, leaving the row and its metadata.
+///
+/// Only terminal runs, read from [`TERMINAL_RUN_STATUSES`] rather than spelled here: a run still
+/// `running` or paused at `awaiting_approval` is going to write more, and stripping it mid-flight
+/// would delete a transcript while its author still holds the file. The `IN` clause's placeholders
+/// are generated from the constant's length and every status bound, for the reason
+/// `vcs::reap_requests_of_ended_runs` gives at length: a status is data.
+pub async fn prune_transcripts(
+    pool: &sqlx::SqlitePool,
+    retain_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<PrunedTranscripts> {
+    if retain_days <= 0 {
+        // Zero would empty every transcript on the machine at the next sweep, which is not a
+        // retention policy but a typo with a plausible-looking value. Refusing to act is the safe
+        // reading — the same call `web::prune` makes.
+        return Ok(PrunedTranscripts::default());
+    }
+
+    // Computed here rather than with SQLite's `datetime('now', '-N days')`, and the difference is
+    // not stylistic — see `web::prune`, which pays for this lesson in full. `completed_at` is
+    // RFC 3339 (`2026-08-01T12:00:00+00:00`), `datetime()` returns `2026-08-01 12:00:00`, and they
+    // are compared as TEXT: within the cutoff's own day `T` (0x54) sorts after the space (0x20), so
+    // a row hours too old compares as newer and survives every sweep for ever.
+    // `transcript_retention_is_exact_at_the_boundary` is what fails if this goes back to
+    // `datetime()`; the coarse test beside it does not.
+    let cutoff = (now - chrono::Duration::days(retain_days)).to_rfc3339();
+    let placeholders = vec!["?"; TERMINAL_RUN_STATUSES.len()].join(", ");
+    // `COALESCE(completed_at, created_at)` because a terminal row with no completion stamp is a row
+    // some older path left half-written; ageing it from when it was created is what keeps it from
+    // being immortal.
+    let past_the_window =
+        format!("status IN ({placeholders}) AND COALESCE(completed_at, created_at) < ?");
+
+    // `AssertSqlSafe` because sqlx otherwise takes only `&'static str`. The sole interpolated thing
+    // is a row of `?` generated from a constant's length — every status and the cutoff are bound —
+    // so nothing caller-supplied reaches the SQL text (same justification as
+    // `vcs::reap_requests_of_ended_runs`).
+    //
+    // Events first. Between the two statements the row still says it holds a transcript, so a crash
+    // in the gap leaves work to redo rather than a run that claims to have events it no longer has.
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM run_events
+          WHERE run_id IN (SELECT id FROM runs WHERE {past_the_window})"
+    )));
+    for status in TERMINAL_RUN_STATUSES {
+        delete = delete.bind(status);
+    }
+    let events = delete.bind(&cutoff).execute(pool).await?.rows_affected();
+
+    // The `IS NOT NULL` guard is what makes the count mean something: without it every sweep
+    // rewrites every old row for ever and reports them all as freshly pruned.
+    // Assistant turns are exempt, and only from THIS half. A turn is a run whose `stdout` holds the
+    // reply rather than a stream, and the shell rebuilds a conversation out of those replies
+    // (`GET /assistant/{chat}` selects `stdout AS answer`) — so emptying the column would give the
+    // app a chat history that erases itself a month at a time. Their events are pruned above with
+    // everyone else's, which is where their bulk actually is.
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE runs SET stdout = NULL, stderr = NULL, gate_output = NULL
+          WHERE {past_the_window}
+            AND (mode IS NULL OR mode <> 'assistant')
+            AND (stdout IS NOT NULL OR stderr IS NOT NULL OR gate_output IS NOT NULL)"
+    )));
+    for status in TERMINAL_RUN_STATUSES {
+        update = update.bind(status);
+    }
+    let runs = update.bind(&cutoff).execute(pool).await?.rows_affected();
+
+    Ok(PrunedTranscripts { runs, events })
+}
+
+/// How often retention runs while the daemon is up.
+///
+/// Hourly rather than tied to a read, for the reason `main.rs` gives the web cache: a transcript
+/// nobody opens again must still expire, or "30 days" means "30 days after the last time anyone
+/// looked". Once at startup too, because a daemon that only ever runs for an hour at a time would
+/// otherwise never reach a sweep at all — the lesson `triage::run_triage_loop` already learned.
+const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Retention for everything a finished run leaves behind: its transcript, its events, and in time
+/// its entries in the activity feed.
+///
+/// One loop rather than three, because they are the same sweep at different windows and splitting
+/// them would mean three tasks waking on the same hour to take the same write lock. Every failure
+/// is best-effort and logged: a sweep that could not run is a fuller disk later, not a reason to
+/// take a daemon down now.
+pub async fn run_retention_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(RETENTION_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let now = chrono::Utc::now();
+        match prune_transcripts(&state.pool, transcript_retention_days(), now).await {
+            Ok(pruned) if pruned == PrunedTranscripts::default() => {}
+            Ok(pruned) => tracing::info!(
+                runs = pruned.runs,
+                events = pruned.events,
+                "runs: transcripts past the retention window"
+            ),
+            Err(error) => tracing::warn!(%error, "runs: transcript retention sweep failed"),
+        }
+        match crate::feed::prune(&state.pool, crate::feed::retention_days(), now).await {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "feed: entries past the retention window"),
+            Err(error) => tracing::warn!(%error, "feed: retention sweep failed"),
+        }
+    }
+}
+
 #[rustfmt::skip]
 #[cfg(test)]
 mod tests {
@@ -2019,6 +2186,31 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    /// A run that ends in a status the GC does not collect keeps its worktree forever, and nothing
+    /// reports it: the run is over, so nothing is waiting on the tree and nobody goes looking.
+    ///
+    /// The twin of `job::every_ending_a_job_can_have_is_an_ending_the_gc_collects`, which the job
+    /// arm has had since `stopped` opened precisely this leak. The run arm had no such guard, and
+    /// `superseded` — written by the approval resume, added long after the GC's list — was missing
+    /// from it. That it was not yet leaking was luck rather than design: the same transaction hands
+    /// the worktree to the successor, so today no row is left pointing at the superseded run. This
+    /// test is what makes the next status a design decision instead of an accident.
+    #[test]
+    fn every_ending_a_run_can_have_is_an_ending_the_gc_collects() {
+        for status in TERMINAL_RUN_STATUSES {
+            assert!(
+                crate::worktree::GC_CANDIDATES_SQL.contains(&format!("'{status}'")),
+                "a run can end `{status}` and its worktree would never be collected"
+            );
+            // Migration 0009's partial index: a status that holds the project's only worktree slot
+            // must not also be one the GC collects, or the tree goes while the run still has it.
+            assert!(
+                !["running", "awaiting_approval"].contains(status),
+                "`{status}` both holds the project's slot and is collectable"
+            );
+        }
+    }
+
     /// The shell draws a run's context pressure as a fraction of this window, and it cannot read a
     /// Rust constant — `CONTEXT_WINDOW_TOKENS` in `shell/src/derive.ts` is a copy of the number
     /// below. `GET /runs/{id}` reports the fill and not the window, so nothing at runtime would
@@ -2032,6 +2224,237 @@ mod tests {
         assert_eq!(
             HANDOFF_CONTEXT_LIMIT_FLOOR, 200_000,
             "update CONTEXT_WINDOW_TOKENS in shell/src/derive.ts to match, then this number here",
+        );
+    }
+
+    async fn retention_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    /// Inserts a run with a transcript in both places it is stored, plus one searchable event.
+    async fn run_with_a_transcript(
+        pool: &sqlx::SqlitePool,
+        status: &str,
+        completed_at: &str,
+    ) -> i64 {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, cwd, prompt, status, stdout, stderr, gate_output,
+                               cost_usd, created_at, completed_at)
+             VALUES ('proj', '/tmp', 'ask', ?, 'a very long transcript', 'noise', 'gate said no',
+                     0.5, '2026-01-01T00:00:00+00:00', ?)
+             RETURNING id",
+        )
+        .bind(status)
+        .bind(completed_at)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+             VALUES (?, 0, 'assistant', 'aardvark', ?)",
+        )
+        .bind(id)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn transcript_of(pool: &sqlx::SqlitePool, id: i64) -> (Option<String>, i64) {
+        let stdout: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM run_events WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (stdout, events)
+    }
+
+    /// The whole point: both copies of a finished run's transcript go once it is past the window.
+    #[tokio::test]
+    async fn a_finished_runs_transcript_goes_once_it_is_past_the_window() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let old = run_with_a_transcript(&pool, "completed", "2026-06-01T00:00:00+00:00").await;
+        let recent = run_with_a_transcript(&pool, "completed", "2026-08-07T00:00:00+00:00").await;
+
+        let pruned = prune_transcripts(&pool, 30, now).await.unwrap();
+
+        assert_eq!(pruned, PrunedTranscripts { runs: 1, events: 1 });
+        assert_eq!(transcript_of(&pool, old).await, (None, 0));
+        let (stdout, events) = transcript_of(&pool, recent).await;
+        assert!(stdout.is_some(), "a run inside the window keeps its transcript");
+        assert_eq!(events, 1, "and keeps its events");
+    }
+
+    /// An assistant turn IS a run, and its `stdout` is not a transcript — it is the reply, and it is
+    /// what the shell rebuilds the conversation from (`GET /assistant/{chat}` reads
+    /// `stdout AS answer`). Emptying it on a window would give the app a chat history that erases
+    /// itself a month at a time, which is a far worse bargain than the bytes it saves: a reply is a
+    /// sentence, the transcript it would have cost is in `run_events` and goes anyway.
+    #[tokio::test]
+    async fn an_assistant_turn_keeps_its_reply_and_still_gives_up_its_events() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let id = run_with_a_transcript(&pool, "completed", "2026-01-01T00:00:00+00:00").await;
+        sqlx::query("UPDATE runs SET mode = 'assistant', chat_id = 'chat-1' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let pruned = prune_transcripts(&pool, 30, now).await.unwrap();
+
+        let (stdout, events) = transcript_of(&pool, id).await;
+        assert!(
+            stdout.is_some(),
+            "the reply the conversation is made of must survive the sweep"
+        );
+        assert_eq!(events, 0, "its event stream is still bulk, and still goes");
+        assert_eq!(pruned, PrunedTranscripts { runs: 0, events: 1 });
+    }
+
+    /// A run that has not finished is still writing, whatever its row's dates say.
+    #[tokio::test]
+    async fn a_run_that_has_not_finished_keeps_its_transcript_however_old() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let running = run_with_a_transcript(&pool, "running", "2020-01-01T00:00:00+00:00").await;
+        let paused =
+            run_with_a_transcript(&pool, "awaiting_approval", "2020-01-01T00:00:00+00:00").await;
+
+        let pruned = prune_transcripts(&pool, 30, now).await.unwrap();
+
+        assert_eq!(pruned, PrunedTranscripts::default());
+        assert!(transcript_of(&pool, running).await.0.is_some());
+        assert!(transcript_of(&pool, paused).await.0.is_some());
+    }
+
+    /// The metadata is what survives, and it is the reason the row is not deleted.
+    #[tokio::test]
+    async fn pruning_a_transcript_keeps_the_run_and_what_it_cost() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let id = run_with_a_transcript(&pool, "completed", "2026-01-01T00:00:00+00:00").await;
+
+        prune_transcripts(&pool, 30, now).await.unwrap();
+
+        let (status, cost): (String, Option<f64>) =
+            sqlx::query_as("SELECT status, cost_usd FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(cost, Some(0.5), "what the run cost outlives what it said");
+    }
+
+    /// The search index is external-content, so a deleted event that stayed in the index would
+    /// return a rowid pointing at nothing — migration 0035's delete trigger is what stops that, and
+    /// this is what notices if it ever goes.
+    #[tokio::test]
+    async fn the_search_index_forgets_a_pruned_transcript() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        run_with_a_transcript(&pool, "completed", "2026-01-01T00:00:00+00:00").await;
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_events_fts WHERE run_events_fts MATCH 'aardvark'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 1, "the event has to be findable before it is pruned");
+
+        prune_transcripts(&pool, 30, now).await.unwrap();
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_events_fts WHERE run_events_fts MATCH 'aardvark'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, 0, "a pruned event must leave the index with it");
+    }
+
+    /// Copied from `web::retention_is_exact_at_the_boundary`, and for its reason: `completed_at` is
+    /// RFC 3339 and SQLite's `datetime()` is not, and the two are compared as TEXT. Within the
+    /// cutoff's own day `T` sorts after the space, so a `datetime()` cutoff spares a day's worth of
+    /// rows on every sweep, forever. The coarse test above would not notice.
+    #[tokio::test]
+    async fn transcript_retention_is_exact_at_the_boundary() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // One second the wrong side of a 30-day cutoff, and one second the right side.
+        let past = run_with_a_transcript(&pool, "completed", "2026-07-09T11:59:59+00:00").await;
+        let inside = run_with_a_transcript(&pool, "completed", "2026-07-09T12:00:01+00:00").await;
+
+        prune_transcripts(&pool, 30, now).await.unwrap();
+
+        assert_eq!(transcript_of(&pool, past).await.0, None);
+        assert!(transcript_of(&pool, inside).await.0.is_some());
+    }
+
+    /// Zero is not a retention policy, it is a typo that empties every transcript on the machine.
+    #[tokio::test]
+    async fn a_zero_or_negative_window_prunes_nothing() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let id = run_with_a_transcript(&pool, "completed", "2020-01-01T00:00:00+00:00").await;
+
+        assert_eq!(
+            prune_transcripts(&pool, 0, now).await.unwrap(),
+            PrunedTranscripts::default()
+        );
+        assert_eq!(
+            prune_transcripts(&pool, -1, now).await.unwrap(),
+            PrunedTranscripts::default()
+        );
+        assert!(transcript_of(&pool, id).await.0.is_some());
+    }
+
+    /// A second pass over the same rows must report nothing, or the log says work is happening
+    /// every hour for ever and the counter stops meaning anything.
+    #[tokio::test]
+    async fn a_second_pass_over_already_pruned_runs_reports_nothing() {
+        let pool = retention_pool().await;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        run_with_a_transcript(&pool, "completed", "2026-01-01T00:00:00+00:00").await;
+
+        assert_eq!(
+            prune_transcripts(&pool, 30, now).await.unwrap(),
+            PrunedTranscripts { runs: 1, events: 1 }
+        );
+        assert_eq!(
+            prune_transcripts(&pool, 30, now).await.unwrap(),
+            PrunedTranscripts::default()
         );
     }
 

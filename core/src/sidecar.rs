@@ -26,6 +26,25 @@ const RESTART_BASE: Duration = Duration::from_secs(2);
 /// enough that a sidecar which starts working again is back within a minute.
 const RESTART_MAX: Duration = Duration::from_secs(60);
 
+/// How long a sidecar has to stay up before the supervisor treats it as having genuinely started.
+///
+/// Anything shorter is a process that failed during startup — a bad config, a port already taken, a
+/// missing credential — and those do not fix themselves by being tried again immediately.
+const HEALTHY_UPTIME: Duration = Duration::from_secs(60);
+
+/// PURE: how long to wait before the next attempt, given how long the process that just ended lived.
+///
+/// A spawn failure passes `Duration::ZERO`: it lived for no time at all, which is the same thing
+/// this says about a process that died during startup. That is deliberate — the two failures differ
+/// in how they are reported, not in how often it is worth retrying them.
+fn next_delay(lived: Duration, current: Duration) -> Duration {
+    if lived >= HEALTHY_UPTIME {
+        RESTART_BASE
+    } else {
+        (current * 2).min(RESTART_MAX)
+    }
+}
+
 /// What each supervised sidecar is doing, as its own supervisor last saw it.
 ///
 /// Process-wide rather than a field on `AppState`, the way `assistant::BUSY_CHATS` is: there is one
@@ -143,6 +162,7 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         match cmd.spawn() {
             Ok(mut child) => {
                 let started_at = chrono::Utc::now().to_rfc3339();
+                let launched = std::time::Instant::now();
                 let restarts = attempts;
                 record(&name, |entry| {
                     entry.state = RUNNING;
@@ -165,8 +185,12 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                     entry.spawn_error = None;
                 });
                 // Ran and then died is a different event from cannot start: a rare crash should
-                // restart promptly rather than inherit a backoff earned by something else.
-                delay = RESTART_BASE;
+                // restart promptly rather than inherit a backoff earned by something else. But
+                // only a sidecar that actually RAN has earned that — resetting on every exit
+                // whatsoever turned a binary that dies during startup into a process launch and a
+                // log line every two seconds, for as long as the machine stayed on. How long it
+                // lived is what tells the two apart.
+                delay = next_delay(launched.elapsed(), delay);
             }
             Err(error) => {
                 // Exponential, because the usual cause is a binary that was never built — `main.rs`
@@ -189,7 +213,7 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                     entry.last_failure_at = Some(failed_at);
                     entry.spawn_error = Some(kind);
                 });
-                delay = (delay * 2).min(RESTART_MAX);
+                delay = next_delay(Duration::ZERO, delay);
             }
         }
         attempts = attempts.saturating_add(1);
@@ -334,6 +358,45 @@ pub fn email_env(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A sidecar that starts and dies immediately, over and over, must cost less each time.
+    ///
+    /// The supervisor used to reset the delay on every exit, on the reasoning that a rare crash
+    /// should restart promptly rather than inherit a backoff earned by something else. That is true
+    /// of a rare crash and false of a permanent one: a binary that exits during startup — bad
+    /// config, port taken, missing credential — then respawned every two seconds forever, which is
+    /// a process launch and a log line every two seconds for as long as the machine is on. The
+    /// spawn-failure path had already learned this; the exit path had not.
+    #[test]
+    fn a_sidecar_that_dies_during_startup_is_retried_more_slowly_each_time() {
+        let mut delay = RESTART_BASE;
+        let mut seen = vec![delay];
+        for _ in 0..8 {
+            delay = next_delay(Duration::from_secs(1), delay);
+            seen.push(delay);
+        }
+        assert!(
+            seen.windows(2)
+                .all(|pair| pair[1] > pair[0] || pair[1] == RESTART_MAX),
+            "a startup crash loop must back off, not hold at one delay: {seen:?}"
+        );
+        assert_eq!(
+            delay, RESTART_MAX,
+            "and it must settle at the ceiling rather than growing without bound"
+        );
+    }
+
+    /// The property the reset existed to protect, kept: a sidecar that worked for a while and then
+    /// crashed is back almost at once, and does not inherit a backoff from some earlier trouble.
+    #[test]
+    fn a_sidecar_that_ran_before_dying_restarts_promptly() {
+        assert_eq!(next_delay(HEALTHY_UPTIME, RESTART_MAX), RESTART_BASE);
+        assert_eq!(
+            next_delay(HEALTHY_UPTIME * 10, RESTART_MAX),
+            RESTART_BASE,
+            "a long-lived sidecar's first crash is a fresh incident, whatever came before it"
+        );
+    }
 
     #[test]
     fn email_env_carries_exactly_the_contract() {

@@ -611,8 +611,19 @@ pub async fn ingest_batch(
 /// `awaiting_approval`. Written as a SQL fragment because both the requeue guard and the triage
 /// loop's single-flight check ask the same question, and two spellings of it would drift.
 /// (A triage run never reaches `awaiting_approval` — it has no tools to trigger an approval.)
-pub const RUN_IS_TERMINAL: &str =
-    "status IN ('completed','failed','timed_out','cancelled','interrupted','superseded')";
+///
+/// Built from [`crate::runs::TERMINAL_RUN_STATUSES`] rather than spelled out here, because a
+/// hand-written third copy of that list is precisely how `superseded` went missing from the
+/// worktree GC: this fragment had it, `worktree::GC_CANDIDATES_SQL` did not, and nothing compared
+/// the two. One list, quoted for SQL in one place.
+pub static RUN_IS_TERMINAL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let statuses = crate::runs::TERMINAL_RUN_STATUSES
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("status IN ({statuses})")
+});
 
 /// Why a requeue was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,10 +660,12 @@ pub async fn requeue(pool: &sqlx::SqlitePool, id: i64) -> Result<(), RequeueErro
     // behind.
     if let Some(run_id) = claim {
         // `AssertSqlSafe` because sqlx only accepts `&'static str` otherwise. The interpolated
-        // fragment is a private const in this file and the run id stays a bound parameter, so
-        // nothing caller-supplied reaches the SQL text (same justification as `shadow.rs`).
+        // fragment is built in this file from a fixed list of status literals, and the run id stays
+        // a bound parameter, so nothing caller-supplied reaches the SQL text (same justification as
+        // `shadow.rs`).
         let terminal: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT 1 FROM runs WHERE id = ? AND {RUN_IS_TERMINAL}"
+            "SELECT 1 FROM runs WHERE id = ? AND {}",
+            RUN_IS_TERMINAL.as_str()
         )))
         .bind(run_id)
         .fetch_optional(pool)
