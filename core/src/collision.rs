@@ -10,13 +10,7 @@
 //! warning that only comes once both worktrees have written to the same file comes late — hence
 //! both — and an intention presented as fact would be a lie — hence separate.
 
-// TEMPORARY, and it goes away with the read path: until `http.rs` calls `for_project`, nothing
-// reachable from `main` names anything in this module, and `cargo clippy --all-targets -- -D
-// warnings` fails the gate on seven `dead_code` findings. At module level rather than seven
-// attributes because it is meant to be deleted in one edit, not maintained.
-#![allow(dead_code)]
-
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The pair `worktrees` and `project_slots` use to name an owner.
 ///
@@ -63,6 +57,20 @@ pub struct Source {
 pub struct Collisions {
     pub declared: Source,
     pub observed: Source,
+}
+
+impl Collisions {
+    /// What is said when the question could not be asked. Never `Clean`.
+    pub fn unmeasured() -> Self {
+        let unmeasured = || Source {
+            state: State::NotMeasured,
+            overlaps: Vec::new(),
+        };
+        Self {
+            declared: unmeasured(),
+            observed: unmeasured(),
+        }
+    }
 }
 
 /// PURE: every pair of trees sharing at least one path.
@@ -267,6 +275,188 @@ pub async fn forget(pool: &sqlx::SqlitePool, owner_kind: &str, owner_id: i64) ->
     Ok(())
 }
 
+/// Both sources, for one project.
+///
+/// The order of work is: gather the observed sets, gather the predicted ones, cross each, and
+/// **subtract the observed from the predicted** — because a path both name is one event, not two.
+///
+/// **The declared source's `Clean` is about JOB worktrees, not about the whole project.** A project
+/// with one job (which declared files) and one live run reads `declared: clean`, even though the
+/// run was never consulted — because a run has no items and so declares nothing, leaving no
+/// declaration of its to collide with. §3.3 licenses this; it is worth saying, because the word
+/// `clean` in that table speaks of "every live worktree" and here it is only the ones that can
+/// declare.
+pub async fn for_project(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Collisions> {
+    let (measured, observed_complete) = observed_sets(pool, project_id).await?;
+    let observed = overlaps(&measured);
+
+    let (predicted, anybody_declared) = declared_sets(pool, project_id).await?;
+    let declared = only_predicted(overlaps(&predicted), &observed);
+
+    Ok(Collisions {
+        declared: Source {
+            // `not_measured` on the declared source means one thing only: no live worktree of this
+            // project declared any files. That includes every project whose slots are runs, which
+            // have no items. It does not contaminate the observed source.
+            //
+            // `Clean` here subsumes a case the word does not say well: when ALL the predicted paths
+            // have been confirmed by the observed source, `only_predicted` empties the list and
+            // this source reads `clean` beside an observed one reading `collide`. The intersection
+            // was not empty — it changed source. That is the design (the stronger one wins) and not
+            // a mistake; a fourth state just for it would be one more word on the card.
+            state: source_state(&declared, anybody_declared),
+            overlaps: declared,
+        },
+        observed: Source {
+            state: source_state(&observed, observed_complete),
+            overlaps: observed,
+        },
+    })
+}
+
+/// A collision that was found is true even when the measurement is incomplete — what incompleteness
+/// forbids is saying `clean`, not saying `collide`.
+fn source_state(found: &[Overlap], complete: bool) -> State {
+    if !found.is_empty() {
+        State::Collide
+    } else if complete {
+        State::Clean
+    } else {
+        State::NotMeasured
+    }
+}
+
+/// The observed sets, and whether they are complete.
+///
+/// Complete means: **every** live worktree of the project has a row, that row is later than the
+/// birth of the tree it claims to describe, it is within its shelf life, and its JSON parses. Each
+/// of those failures is a way of not having measured, and none of them is `clean`.
+///
+/// **One worktree poisons the whole project, and old ones have no cure.** A tree created before
+/// migration `0057` has `base_sha = NULL`, is never measured, and therefore never has a row — which
+/// puts its project into `not_measured` for as long as it lives. That is the correct behaviour
+/// (where it branched from is unknown and unrecoverable after the fact), and this is where the
+/// consequence shows up.
+async fn observed_sets(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<(Vec<(OwnerRef, BTreeSet<String>)>, bool)> {
+    let live: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT owner_kind, owner_id, created_at
+         FROM worktrees WHERE project_id = ? AND removed_at IS NULL
+         ORDER BY owner_kind, owner_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    let measured: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT owner_kind, owner_id, paths, measured_at
+         FROM worktree_touched_paths WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    let by_owner: BTreeMap<(String, i64), (String, String)> = measured
+        .into_iter()
+        .map(|(kind, id, paths, at)| ((kind, id), (paths, at)))
+        .collect();
+
+    let fresh_enough = chrono::Utc::now() - MEASUREMENT_TTL;
+    let mut sets = Vec::new();
+    let mut complete = true;
+    for (kind, id, born) in live {
+        let usable = by_owner
+            .get(&(kind.clone(), id))
+            .and_then(|(paths, at)| {
+                let measured_at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+                let born_at = chrono::DateTime::parse_from_rfc3339(&born).ok()?;
+                (measured_at >= born_at && measured_at.with_timezone(&chrono::Utc) >= fresh_enough)
+                    .then_some(paths)
+            })
+            // Malformed reads as absent, never as an empty set.
+            .and_then(|paths| serde_json::from_str::<Vec<String>>(paths).ok());
+
+        match usable {
+            Some(paths) => sets.push((
+                OwnerRef { kind, id },
+                paths.into_iter().collect::<BTreeSet<String>>(),
+            )),
+            None => complete = false,
+        }
+    }
+    Ok((sets, complete))
+}
+
+/// The predicted sets, and whether anybody predicted anything.
+///
+/// Joined at read time and copied nowhere: `job_items.files` is already in SQLite, and holding it
+/// here would give it a staleness window it does not have.
+///
+/// Only `'job'` owners: a run has no items, so it declares nothing. `files` is nullable and NULL is
+/// the ordinary case — a planner that names no files did not name an empty set of them.
+///
+/// **A negative list, and not `IN ('pending','running')`.** `item_state_from` (`job.rs:438`) has no
+/// arm for `"pending"` — `Pending` is the *fallback*, with the reason written down: *"An
+/// unrecognised item status is treated as still to do rather than as done… erring the other way
+/// silently skips work the job was created to perform"*. A positive list would invert that default:
+/// a new status the core reads as `Pending` would fall outside the predicted set, shrinking the
+/// intersection and turning a real `Collide` into a `Clean` — the outcome this module exists never
+/// to produce. Written as the negation of the explicit arms, an unknown status counts, exactly as
+/// it does there.
+async fn declared_sets(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<(Vec<(OwnerRef, BTreeSet<String>)>, bool)> {
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(DECLARED_SETS_SQL)
+        .bind(project_id)
+        .fetch_all(pool)
+        .await?;
+
+    let mut by_job: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    let mut anybody = false;
+    for (job_id, files) in rows {
+        let entry = by_job.entry(job_id).or_default();
+        let Some(files) = files else { continue };
+        let Ok(paths) = serde_json::from_str::<Vec<String>>(&files) else {
+            continue;
+        };
+        if !paths.is_empty() {
+            anybody = true;
+        }
+        entry.extend(paths);
+    }
+
+    let sets = by_job
+        .into_iter()
+        .map(|(id, paths)| {
+            (
+                OwnerRef {
+                    kind: "job".to_string(),
+                    id,
+                },
+                paths,
+            )
+        })
+        .collect();
+    Ok((sets, anybody))
+}
+
+/// The states that **leave** the predicted set; whatever is left goes in.
+///
+/// Mirrors the explicit arms of `item_state_from` minus `"running"`. Kept apart from the function
+/// because it is what the drift guard compares, and written by hand because sqlx refuses SQL built
+/// at runtime — the same trade `LIVE_JOBS_SQL` and `ORPHANED_SLOTS_SQL` make, with the same guard.
+const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.files
+     FROM worktrees
+     JOIN job_items ON job_items.job_id = worktrees.owner_id
+     WHERE worktrees.project_id = ?
+       AND worktrees.removed_at IS NULL
+       AND worktrees.owner_kind = 'job'
+       AND job_items.status NOT IN ('implemented','passed','failed','cancelled',
+                                    'gate_failed','gate_errored','skipped')
+     ORDER BY worktrees.owner_id";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +589,332 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 0);
         db.close().await;
+    }
+
+    fn at(path: &str) -> &std::path::Path {
+        std::path::Path::new(path)
+    }
+
+    /// Two measured trees sharing one file: it collides, and it names the path.
+    #[tokio::test]
+    async fn two_measured_trees_on_one_file_collide() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_worktree_row(
+            &db.pool,
+            "run",
+            2,
+            "project-a",
+            at("C:/y"),
+            Some(&"b".repeat(40)),
+        )
+        .await;
+        seed_measurement(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            &["core/src/runs.rs", "core/src/job.rs"],
+        )
+        .await;
+        seed_measurement(&db.pool, "run", 2, "project-a", &["core/src/runs.rs"]).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::Collide);
+        assert_eq!(
+            collisions.observed.overlaps[0].paths,
+            vec!["core/src/runs.rs".to_string()]
+        );
+        db.close().await;
+    }
+
+    /// A live tree with no row: `not_measured`, and **never** `clean`. It is the outcome this
+    /// module exists not to produce by accident.
+    #[tokio::test]
+    async fn a_live_tree_with_no_measurement_makes_the_project_not_measured() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_worktree_row(
+            &db.pool,
+            "run",
+            2,
+            "project-a",
+            at("C:/y"),
+            Some(&"b".repeat(40)),
+        )
+        .await;
+        seed_measurement(&db.pool, "job", 1, "project-a", &["a.rs"]).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::NotMeasured);
+        db.close().await;
+    }
+
+    /// A measurement older than the birth of the tree it claims to describe does not describe it.
+    #[tokio::test]
+    async fn a_measurement_older_than_the_tree_it_describes_does_not_count() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        sqlx::query("UPDATE worktrees SET created_at = '2026-06-01T00:00:00Z'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        seed_measurement_at(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            &["a.rs"],
+            "2026-05-01T00:00:00Z",
+        )
+        .await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::NotMeasured);
+        db.close().await;
+    }
+
+    /// A measurement past its shelf life stops counting. (This plan's addition to the spec.)
+    #[tokio::test]
+    async fn a_measurement_past_its_shelf_life_stops_counting() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+        seed_measurement_at(&db.pool, "job", 1, "project-a", &["a.rs"], &stale).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::NotMeasured);
+        db.close().await;
+    }
+
+    /// A malformed `paths` reads as ABSENT, never as an empty set. Empty would claim "I measured
+    /// and it touched nothing", which is something a read error did not say.
+    #[tokio::test]
+    async fn a_malformed_path_list_reads_as_absent_and_not_as_empty() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO worktree_touched_paths (owner_kind, owner_id, project_id, paths, measured_at)
+             VALUES ('job', 1, 'project-a', 'not json at all', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::NotMeasured);
+        db.close().await;
+    }
+
+    /// A tree with `removed_at` contributes nothing on the READ side — the twin of the Task 8 test,
+    /// which only proves the write side. Without this half, a row that survived `forget` would let
+    /// a tree no longer on disk carry on colliding with one that is.
+    #[tokio::test]
+    async fn a_removed_worktree_contributes_nothing_even_if_its_measurement_survives() {
+        let db = crate::storage::TempDb::new().await;
+        let base = "a".repeat(40);
+        seed_worktree_row(&db.pool, "job", 1, "project-a", at("C:/x"), Some(&base)).await;
+        seed_worktree_row(&db.pool, "job", 2, "project-a", at("C:/y"), Some(&base)).await;
+        seed_measurement(&db.pool, "job", 1, "project-a", &["shared.rs"]).await;
+        seed_measurement(&db.pool, "job", 2, "project-a", &["shared.rs"]).await;
+        // The row is left behind on purpose: `forget` is best-effort and can fail.
+        sqlx::query("UPDATE worktrees SET removed_at = '2026-08-09T00:00:00Z' WHERE owner_id = 2")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::Clean);
+        assert!(collisions.observed.overlaps.is_empty());
+        db.close().await;
+    }
+
+    /// The two sources do NOT collapse: a project of runs alone has the declared source in
+    /// `not_measured` — runs have no items — and the observed one with a real answer.
+    #[tokio::test]
+    async fn a_project_of_runs_has_no_declared_source_and_a_real_observed_one() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "run",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_measurement(&db.pool, "run", 1, "project-a", &["a.rs"]).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.declared.state, State::NotMeasured);
+        assert_eq!(collisions.observed.state, State::Clean);
+        db.close().await;
+    }
+
+    /// The declared set is the union of the items that have not yet written anything that survives:
+    /// `Pending` and `Running`. `Implemented` is OUT — its writes are already on disk, so they are
+    /// already the observed source's business. `Skipped` and `GateFailed` are out on their own
+    /// merit: in both the tree is reverted to where the item started, so nothing they were going to
+    /// write survived.
+    #[tokio::test]
+    async fn the_predicted_set_is_the_items_that_have_not_written_anything_that_survives() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            2,
+            "project-a",
+            at("C:/y"),
+            Some(&"b".repeat(40)),
+        )
+        .await;
+        seed_job_row(&db.pool, 1, "project-a").await;
+        seed_job_row(&db.pool, 2, "project-a").await;
+        seed_item(&db.pool, 1, 0, "pending", Some(&["shared.rs"])).await;
+        seed_item(&db.pool, 1, 1, "implemented", Some(&["already_written.rs"])).await;
+        seed_item(&db.pool, 1, 2, "skipped", Some(&["never_written.rs"])).await;
+        seed_item(
+            &db.pool,
+            2,
+            0,
+            "running",
+            Some(&["shared.rs", "already_written.rs", "never_written.rs"]),
+        )
+        .await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.declared.state, State::Collide);
+        assert_eq!(
+            collisions.declared.overlaps[0].paths,
+            vec!["shared.rs".to_string()],
+            "only what neither side has already written"
+        );
+        db.close().await;
+    }
+
+    /// A path predicted by a `Running` item and already written yields ONE warning, marked observed.
+    #[tokio::test]
+    async fn a_path_predicted_and_already_written_is_one_warning_on_the_observed_source() {
+        let db = crate::storage::TempDb::new().await;
+        for (id, path) in [(1, "C:/x"), (2, "C:/y")] {
+            seed_worktree_row(
+                &db.pool,
+                "job",
+                id,
+                "project-a",
+                at(path),
+                Some(&"a".repeat(40)),
+            )
+            .await;
+            seed_job_row(&db.pool, id, "project-a").await;
+            seed_item(&db.pool, id, 0, "running", Some(&["shared.rs"])).await;
+            seed_measurement(&db.pool, "job", id, "project-a", &["shared.rs"]).await;
+        }
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::Collide);
+        assert!(
+            collisions.declared.overlaps.is_empty(),
+            "the stronger source wins; the warning does not appear twice"
+        );
+        db.close().await;
+    }
+
+    /// A state an item can take that this SQL does not know is a predicted path lost in silence —
+    /// and a lost path reads as `clean`. The guard walks the explicit arms of `item_state_from` and
+    /// demands each be named, minus the two that stay in.
+    ///
+    /// Written as a literal list and not by reflection because Rust has no reflection over `match`.
+    /// What it catches is the asymmetric edit: somebody adds a state to `job.rs` and not here.
+    #[test]
+    fn the_predicted_set_names_every_state_that_has_finished_writing() {
+        // The explicit arms of `item_state_from` (`job.rs:438`), minus `running`, which stays in
+        // the predicted set because it is still writing.
+        let finished = [
+            "implemented",
+            "passed",
+            "failed",
+            crate::job::STATUS_CANCELLED,
+            "gate_failed",
+            "gate_errored",
+            crate::job::STATUS_SKIPPED,
+        ];
+        for status in finished {
+            assert!(
+                DECLARED_SETS_SQL.contains(&format!("'{status}'")),
+                "the predicted set does not exclude `{status}`"
+            );
+        }
+        let named = DECLARED_SETS_SQL
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| !token.is_empty())
+            .count();
+        assert_eq!(
+            named,
+            finished.len() + 1,
+            "the SQL names something extra (the +1 is the join's 'job'), or has lost a state"
+        );
     }
 
     /// The measurement writes down what `changed_paths` returned, and this is where the tick and

@@ -292,6 +292,7 @@ pub struct ProjectReadout {
     pub project_id: String,
     pub limit: i64,
     pub slots: Vec<HeldSlot>,
+    pub collision: crate::collision::Collisions,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -329,10 +330,22 @@ pub async fn readout(pool: &SqlitePool) -> sqlx::Result<Readout> {
             .filter(|slot| slot.project_id == project_id)
             .cloned()
             .collect();
+        // No `?`. Collision is a best-effort warning and this route is the fleet's authority: a
+        // malformed row or a locked table must not take the capacity, the cards and the start-a-job
+        // action down with it. A failure degrades to `not measured`, which the screen already knows
+        // how to draw — the same posture `measure` takes on the write side.
+        let collision = match crate::collision::for_project(pool, &project_id).await {
+            Ok(collision) => collision,
+            Err(error) => {
+                tracing::warn!(%project_id, %error, "could not read the collision state");
+                crate::collision::Collisions::unmeasured()
+            }
+        };
         projects.push(ProjectReadout {
             project_id,
             limit,
             slots,
+            collision,
         });
     }
 
