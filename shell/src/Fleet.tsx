@@ -28,6 +28,8 @@ import {
   type CollisionBadge,
   type SlotDetail,
 } from "./fleet-derive";
+import { jobIsLive } from "./derive";
+import JobGraph from "./JobGraph";
 import { Button, ConfirmButton, ErrorNote } from "./ui";
 
 interface FleetProps {
@@ -317,7 +319,11 @@ interface SlotCardProps {
  * **It has no "cancelling" state.** Cancelling takes the owner out of the column at the instant of
  * the click, so a card halfway through a cancel does not exist to be drawn.
  */
-export function SlotCard({ slot, detail, badges, onCancel, onOpenRuns }: SlotCardProps) {
+export function SlotCard({ slot, detail, badges, token, onCancel, onOpenRuns }: SlotCardProps) {
+  // The open state lives here rather than above, as it does in Autopilot's `JobRow`: opening one
+  // card says nothing to the others, and lifting it would re-render the whole column on every
+  // keystroke elsewhere in it.
+  const [open, setOpen] = useState(false);
   const modifier =
     detail.kind === "unknown" ? " is-unknown" : detail.kind === "orphaned" ? " is-orphaned" : "";
 
@@ -338,6 +344,12 @@ export function SlotCard({ slot, detail, badges, onCancel, onOpenRuns }: SlotCar
           <p className="slot-rounds">
             round {detail.job.round + 1} of {detail.job.max_rounds}
           </p>
+          <Button size="sm" onClick={() => setOpen((current) => !current)}>
+            {open ? "Hide items" : "Show items"}
+          </Button>
+          {open && (
+            <JobGraph token={token} jobId={detail.job.id} live={jobIsLive(detail.job.status)} />
+          )}
         </>
       )}
       {detail.kind === "run" && (

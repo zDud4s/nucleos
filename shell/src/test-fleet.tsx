@@ -1,7 +1,14 @@
 import { act } from "@testing-library/react";
 import { vi } from "vitest";
 
-import type { Concurrency, Job, ProjectConcurrency, RunSearchResult } from "./api";
+import type {
+  Concurrency,
+  Job,
+  JobDetail,
+  JobItem,
+  ProjectConcurrency,
+  RunSearchResult,
+} from "./api";
 
 /**
  * The harness both fleet test files share.
@@ -82,6 +89,41 @@ export function job(over: Partial<Job> = {}): Job {
     max_rounds: 1,
     created_at: "2026-08-09T00:00:00Z",
     completed_at: null,
+    ...over,
+  };
+}
+
+export function item(over: Partial<JobItem> = {}): JobItem {
+  return {
+    ordinal: 0,
+    description: "an item",
+    status: "pending",
+    round: 0,
+    run_id: null,
+    gate_status: null,
+    ...over,
+  };
+}
+
+/**
+ * A job of two rounds with all three gate outcomes represented.
+ *
+ * `round: 1, max_rounds: 2` and not `job()`'s `0`/`1`: rounds are counted from zero, and a job is
+ * retired as soon as `round + 1 >= max_rounds`. A job at `round: 0, max_rounds: 1` can **never**
+ * have round-1 items — it would be a fixture describing a state the daemon cannot emit.
+ */
+export function detail(over: Partial<JobDetail> = {}): JobDetail {
+  return {
+    ...job({ round: 1, max_rounds: 2 }),
+    branch: "nucleos/job-41",
+    items: [
+      item({ ordinal: 0, status: "passed", gate_status: "passed", run_id: 1 }),
+      item({ ordinal: 1, status: "passed", gate_status: null, run_id: 2 }),
+      item({ ordinal: 2, status: "gate_failed", gate_status: "failed", run_id: 3 }),
+      item({ ordinal: 3, status: "gate_errored", gate_status: "errored", run_id: 4 }),
+      item({ ordinal: 4, status: "skipped", round: 1, run_id: 5 }),
+      item({ ordinal: 5, status: "running", round: 1, run_id: 6 }),
+    ],
     ...over,
   };
 }

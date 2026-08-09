@@ -8,6 +8,7 @@ import {
   RUNS,
   advance,
   column,
+  detail,
   fetchMock,
   job,
   readout,
@@ -206,6 +207,20 @@ it("does not put a cancelled card back when a tick lands mid-cancel", async () =
   await settle();
 
   expect(screen.queryByText(/job 41/)).toBeNull();
+});
+
+/** A job's card opens into the chain of items it is running, and closes again. */
+it("opens a job's card into its items", async () => {
+  respondWith({ [CONCURRENCY]: readout([column()]), [JOBS]: [job()], "/jobs/41": detail() });
+  renderFleet();
+  await settle();
+
+  fireEvent.click(screen.getByRole("button", { name: /show items/i }));
+  await settle();
+  expect(screen.getAllByText("an item").length).toBeGreaterThan(0);
+
+  fireEvent.click(screen.getByRole("button", { name: /hide items/i }));
+  expect(screen.queryByText("an item")).toBeNull();
 });
 
 /**

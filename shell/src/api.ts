@@ -240,6 +240,11 @@ export interface JobItem {
   description: string;
   /** `pending` | `running` | `implemented` | `passed` | `failed` | `cancelled` | `gate_*`. */
   status: string;
+  /**
+   * The round this item was queued in. `ordinal` is no substitute: ordinals carry on across rounds
+   * rather than restarting, so nothing in the number marks where one ended.
+   */
+  round: number;
   run_id: number | null;
   /**
    * Whether anything measured this item, kept apart from `status` because they answer different

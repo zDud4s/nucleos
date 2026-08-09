@@ -295,7 +295,7 @@ describe("JobsPanel", () => {
   }
 
   function jobItem(over: Partial<JobItem> = {}): JobItem {
-    return { ordinal: 0, description: "an item", status: "pending", run_id: null, gate_status: null, ...over };
+    return { ordinal: 0, description: "an item", status: "pending", round: 0, run_id: null, gate_status: null, ...over };
   }
 
   /** Answers the detail route with a queue, and every other route with a bare ok. */

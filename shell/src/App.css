@@ -1563,3 +1563,40 @@ details.scoreboard th {
   border: 1px dashed var(--line);
   color: var(--faint);
 }
+
+/* ── O zoom 2: a cadeia de itens de um job ────────────── */
+
+.item-chain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+}
+.item-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: var(--sp-2);
+  align-items: baseline;
+}
+.item-row__ordinal { color: var(--faint); font-variant-numeric: tabular-nums; }
+.item-row__what { overflow-wrap: anywhere; }
+.item-row__reading { color: var(--muted); white-space: nowrap; }
+/* Fora da grelha de três colunas de propósito: cai para a linha seguinte em vez de espremer a
+   descrição, que é o que se está a ler. */
+.item-row__run { grid-column: 3; color: var(--faint); }
+
+/* A marca de ronda separa "pediu oito de uma vez" de "pediu cinco e replaneou" — e é a única coisa
+   que o faz, porque os ordinais continuam entre rondas em vez de recomeçarem. */
+.item-round {
+  margin: var(--sp-2) 0 0;
+  padding-top: var(--sp-1);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.item-why, .item-note { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
