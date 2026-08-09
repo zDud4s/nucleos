@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { collisionBadges, orderColumns, slotDetail } from "./fleet";
+import { collisionBadges, orderColumns, slotDetail } from "./fleet-derive";
 import {
   LIVE_LIST_LIMIT,
   type HeldSlot,
