@@ -177,10 +177,13 @@ describe("App navigation and presence", () => {
     await settle();
 
     const nav = screen.getByLabelText("NucleOS views");
+    // The ORDER is asserted, not just the membership, and Fleet's place in it is load-bearing: the
+    // `approvals` comment in `App.tsx` says Waiting comes "straight after Autopilot", so anything
+    // inserted between those two would make that sentence false.
     expect(
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
     ).toEqual([
-      "Home", "Autopilot", "Waiting", "Runs", "Projects", "Assistant",
+      "Home", "Fleet", "Autopilot", "Waiting", "Runs", "Projects", "Assistant",
       "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "System",
     ]);
   });
