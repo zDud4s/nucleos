@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  approveProposal, cancelJob, getBudget, getFeed, getJob, getJobs, getProjects, getProposals,
-  getScopedKills, getScoreboard, getShadowDecisions, rejectProposal,
+  approveProposal, cancelJob, createJob, getBudget, getFeed, getJob, getJobs, getProjects,
+  getProposals, getScopedKills, getScoreboard, getShadowDecisions, rejectProposal,
   setProjectMode, setScopedKill, setVerdict,
   type AutopilotMode, type Budget, type ClassTally, type ConnectionState,
   type FeedEntry, type Job, type JobDetail, type ProjectSummary, type Proposal,
@@ -381,9 +381,141 @@ function JobRow({ job, token, refresh, isKill }: { job: Job; token: string; refr
   );
 }
 
+/**
+ * Starts a job by hand, without waiting for a schedule rule to fire.
+ *
+ * Until now a job could only be born from a `graph:` rule in `.ai/autopilot.yaml`, which meant the
+ * only way to try one was to write a schedule and wait for it. It goes through the same front door
+ * the scheduler uses, so it inherits every refusal: the kill switch, the roster, the project's mode
+ * and the concurrency slots all answer here exactly as they would at 3am.
+ *
+ * Folded shut by default. A form that stands open above the job list would answer "start something"
+ * on a page whose job is to answer "what is running".
+ */
+function NewJob({ token, projectId, onStarted, isKill }: {
+  token: string;
+  projectId: string | null;
+  onStarted: () => Promise<void>;
+  isKill: boolean;
+}) {
+  const [prompt, setPrompt] = useState("");
+  const [project, setProject] = useState(projectId ?? "");
+  const [budget, setBudget] = useState("");
+  const [rounds, setRounds] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function start() {
+    setBusy(true);
+    setFailed(null);
+    setNote(null);
+    /**
+     * Blank means "the house limit governs", which is not the same as zero and must not be sent as
+     * one. `Number.parseFloat("")` is NaN rather than 0, but an explicit check is what says the
+     * distinction was noticed rather than survived by accident.
+     */
+    const budgetUsd = budget.trim() === "" ? undefined : Number.parseFloat(budget);
+    const maxRounds = rounds.trim() === "" ? undefined : Number.parseInt(rounds, 10);
+    if (budgetUsd !== undefined && !Number.isFinite(budgetUsd)) {
+      setBusy(false);
+      setFailed("The budget must be a number of dollars, or blank for the house limit.");
+      return;
+    }
+    if (maxRounds !== undefined && !Number.isInteger(maxRounds)) {
+      setBusy(false);
+      setFailed("Rounds must be a whole number, or blank for one round.");
+      return;
+    }
+    const outcome = await createJob(token, {
+      projectId: project.trim(),
+      prompt: prompt.trim(),
+      budgetUsd,
+      maxRounds,
+    });
+    setBusy(false);
+    if (!outcome.ok) {
+      // The daemon's own sentence, verbatim. It distinguishes the two 409s — the kill switch and no
+      // free slot — which the status code alone does not.
+      setFailed(outcome.reason);
+      return;
+    }
+    setNote(`Job ${outcome.jobId} started.`);
+    setPrompt("");
+    await onStarted();
+  }
+
+  return (
+    <details className="job-new">
+      <summary>Start a job by hand</summary>
+      <form
+        className="form-grid"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (prompt.trim() === "" || project.trim() === "" || busy) return;
+          void start();
+        }}
+      >
+        <label>
+          Project
+          <input
+            value={project}
+            placeholder="which project"
+            onChange={(event) => setProject(event.target.value)}
+          />
+        </label>
+        <label>
+          Budget
+          <input
+            value={budget}
+            inputMode="decimal"
+            placeholder="(the house limit)"
+            onChange={(event) => setBudget(event.target.value)}
+          />
+        </label>
+        <label>
+          Rounds
+          <input
+            value={rounds}
+            inputMode="numeric"
+            placeholder="(one)"
+            onChange={(event) => setRounds(event.target.value)}
+          />
+        </label>
+        <label className="wide">
+          What should it work on?
+          <textarea
+            rows={3}
+            value={prompt}
+            placeholder="The same sentence a graph: rule would carry."
+            onChange={(event) => setPrompt(event.target.value)}
+          />
+        </label>
+        <div className="form-actions">
+          <Button
+            type="submit"
+            variant="approve"
+            disabled={prompt.trim() === "" || project.trim() === "" || busy || isKill}
+          >
+            {busy ? "Starting…" : "Start job"}
+          </Button>
+          <span className="cta-note">
+            {isKill
+              ? "The kill switch is engaged, so nothing autonomous starts."
+              : "It plans its own list, gates every item, and reviews at the end."}
+          </span>
+        </div>
+      </form>
+      {note !== null && <p className="gate-note">{note}</p>}
+      {failed !== null && <ErrorNote>{failed}</ErrorNote>}
+    </details>
+  );
+}
+
 export function JobsPanel({ jobs, loading, selectedProject, token, refresh, isKill }: JobsPanelProps) {
   return (
     <Panel dim={isKill} title="Jobs" aside={selectedProject ?? "one trigger, several runs, one worktree"}>
+      <NewJob token={token} projectId={selectedProject} onStarted={refresh} isKill={isKill} />
       {jobs === null ? !loading && <ErrorNote>Could not load jobs from the daemon.</ErrorNote>
         : jobs.length === 0
           ? <Teach title="No job has run yet.">A schedule rule with a <code>graph:</code> block turns one trigger into a sequence of runs over a shared worktree, so a night's work is not capped by one context window.</Teach>

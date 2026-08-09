@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  cancelRun, createRun, endRunTurns, getRun, getRuns, steerRun,
+  cancelRun, createRun, endRunTurns, getRun, getRuns, releaseWorktree, steerRun,
   RUN_MODES, RUN_MODE_FILTERS, RUN_STATUSES,
   type ConnectionState, type RunDetail, type RunSearchResult, type RunsFilter,
 } from "./api";
@@ -292,12 +292,39 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
     onCancelled();
   }
 
+  /**
+   * Abandons a run parked for approval, and deletes the tree it was holding.
+   *
+   * The other door out of `awaiting_approval`, beside answering the proposal on the Autopilot tab.
+   * Rejecting there refuses one request; this refuses the run — it cancels the row and removes the
+   * worktree without an answer ever being given, which is what you want for a parked run whose
+   * question you are not going to answer at all.
+   *
+   * The edits in that tree go with it. That is the point of the button rather than a caveat about
+   * it: a run stuck at a proposal pins a worktree, and until now nothing in this window could let
+   * one go — the daemon's GC does not touch a tree an `awaiting_approval` run still owns.
+   */
+  async function release() {
+    setBusy(true);
+    setFailed(null);
+    const released = await releaseWorktree(token, runId);
+    setBusy(false);
+    if (!released) {
+      // 409 means the run left `awaiting_approval` between the draw and the click — most often
+      // because the proposal was answered elsewhere, which is the good ending, not a failure.
+      setFailed("Nothing to release — this run is no longer waiting for approval.");
+    }
+    onCancelled();
+  }
+
   if (loading) return <p className="a-note">Opening…</p>;
   if (detail === null) return <ErrorNote>Could not read this run.</ErrorNote>;
 
   const gate = gateTone(detail.gate_status);
   const pressure = contextPressure(detail.context_fill);
   const stillRunning = runIsLive(detail.status);
+  // The one state the daemon accepts a release in; it answers 409 for every other.
+  const parked = detail.status === "awaiting_approval";
 
   return (
     <div className="run-detail">
@@ -367,6 +394,25 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
           >
             Cancel run
           </ConfirmButton>
+        </div>
+      )}
+      {parked && (
+        <div className="rd-parked">
+          <p className="a-note">
+            Parked waiting for approval. Answering it is on the Autopilot tab; letting it go is here,
+            and takes the worktree — and everything written in it — with it.
+          </p>
+          <div className="a-actions">
+            <ConfirmButton
+              size="sm"
+              variant="danger"
+              confirmLabel="Discard run and worktree?"
+              disabled={busy}
+              onConfirm={() => void release()}
+            >
+              Abandon and release worktree
+            </ConfirmButton>
+          </div>
         </div>
       )}
       {failed !== null && <p className="gate-note">{failed}</p>}

@@ -911,3 +911,79 @@ export function feedKindLabel(kind: string): string {
       return kind;
   }
 }
+
+/**
+ * The badge tone for one queued git operation, on the same scale `runTone` uses.
+ *
+ * `awaiting_approval` is the only one that wants something from a person, so it takes `pending` —
+ * the same tone a run awaiting approval takes, because it is the same sentence about a different
+ * queue. `running` borrows `shadow` ("in flight, no verdict yet"), and everything already over
+ * recedes to `off` whether it ended well or badly, except the two endings a person would want to
+ * find: `failed` and `blocked` keep `paused`.
+ */
+export function vcsStatusTone(status: string): BadgeTone {
+  switch (status) {
+    case "succeeded":
+      return "active";
+    case "running":
+      return "shadow";
+    case "awaiting_approval":
+      return "pending";
+    case "failed":
+    case "blocked":
+      return "paused";
+    case "queued":
+      return "shadow";
+    default:
+      // `rejected`, `cancelled`, `interrupted`, and any status a future núcleo invents.
+      return "off";
+  }
+}
+
+/** A request status as a person reads it. Only the two-word one needs translating. */
+export function vcsStatusLabel(status: string): string {
+  return status === "awaiting_approval" ? "awaiting approval" : status;
+}
+
+/**
+ * Who asked for this git operation.
+ *
+ * The distinction is the one `vcs.rs` draws with `needs_approval`: `human` and `shell` carry their
+ * own approval because a person was at the keyboard, while `run` and `job` are autonomous and had
+ * to be let through. Naming the origin is what tells a reader which of those a row was.
+ */
+export function vcsOriginLabel(origin: string): string {
+  switch (origin) {
+    case "human":
+      return "you";
+    case "shell":
+      return "this app";
+    case "run":
+      return "a run";
+    case "job":
+      return "a job";
+    default:
+      return origin;
+  }
+}
+
+/**
+ * Whether a request has stopped moving.
+ *
+ * Drives the polling in the same direction `runIsLive` does, and errs the same way: a status this
+ * shell does not recognise counts as settled, because polling forever is the worse mistake.
+ */
+export function vcsIsSettled(status: string): boolean {
+  return status !== "awaiting_approval" && status !== "queued" && status !== "running";
+}
+
+/**
+ * How much of a git queue is still going somewhere.
+ *
+ * Counted rather than taken from the list's length, because the listing is the permanent history of
+ * every operation the daemon ever queued — 200 rows of mostly-finished work. "3 in flight" is the
+ * number a reader wants; "200 requests" is an artefact of uptime.
+ */
+export function vcsPending(requests: { status: string }[]): number {
+  return requests.filter((request) => !vcsIsSettled(request.status)).length;
+}

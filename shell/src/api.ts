@@ -202,6 +202,76 @@ export async function getJobs(
   }
 }
 
+/**
+ * What a job may spend and how far it may go, or the house limits if left out.
+ *
+ * Both are optional in the daemon's sense, not the shell's convenience: `budget_usd: null` means
+ * "only the house limit governs", which is what every `graph:` rule has always meant, and
+ * `max_rounds: null` is one round. Sending `0` for either would mean something else entirely, so
+ * the form omits the field rather than sending a falsy number.
+ */
+export interface NewJob {
+  projectId: string;
+  prompt: string;
+  budgetUsd?: number;
+  maxRounds?: number;
+}
+
+/**
+ * Why a job did not start, in the daemon's own words.
+ *
+ * Its own type rather than `ApiResult`, because the status alone does not identify the refusal
+ * here: `409` is both "the kill switch is engaged" and "no room — something else is running", and
+ * those have different remedies. The daemon writes a sentence for every refusal it raises, so the
+ * sentence travels instead of being reconstructed from a number the shell would have to guess at.
+ */
+export type CreateJobOutcome =
+  | { ok: true; jobId: number }
+  | { ok: false; status: number; reason: string };
+
+/**
+ * Asks for a job the way `createRun` asks for a run.
+ *
+ * Note what the request cannot carry: `max_items`. Fan-out per round has a hard ceiling in
+ * `config::MAX_ITEMS_CEILING` that no caller may raise, so there is deliberately no field for it —
+ * how long and how much are the caller's to choose, how wide is not.
+ */
+export async function createJob(
+  token: string,
+  job: NewJob,
+): Promise<CreateJobOutcome> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        project_id: job.projectId,
+        prompt: job.prompt,
+        budget_usd: job.budgetUsd ?? null,
+        max_rounds: job.maxRounds ?? null,
+      }),
+    });
+    if (!res.ok) {
+      // The body is the reason, as plain text. An empty one is possible for a status raised by the
+      // middleware rather than the handler, so there is a fallback — but it is a fallback, not the
+      // usual path.
+      const reason = (await res.text()).trim();
+      return {
+        ok: false,
+        status: res.status,
+        reason: reason === "" ? "The daemon refused this job and gave no reason." : reason,
+      };
+    }
+    const data = await res.json();
+    return { ok: true, jobId: data.job_id };
+  } catch {
+    return { ok: false, status: 0, reason: "The daemon is not reachable." };
+  }
+}
+
 export async function getJob(
   token: string,
   id: number,
@@ -816,6 +886,132 @@ export async function rejectProposal(
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+/**
+ * The items a job put down instead of finishing, waiting to be read.
+ *
+ * Shares `Proposal` with `getProposals` because the daemon hands back the same rows from the same
+ * table — but the two lists are answered differently and must not be merged into one. A pending
+ * `action-approval` is a run holding still until someone answers it; a skipped item is work that
+ * already stopped, hours ago, with nothing waiting on the reply. Showing them together would put a
+ * clock on half the list that does not apply to the other half.
+ */
+export async function getSkippedItems(
+  token: string,
+): Promise<Proposal[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/skipped-items`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Puts a read skipped item away.
+ *
+ * Deliberately NOT `rejectProposal` with a different label. `reject_proposal` guards on
+ * `kind = 'action-approval'` and answers 409 for anything else, so pointing a "dismiss" button at
+ * `/reject` would fail on exactly the rows it was drawn for.
+ */
+export async function dismissSkippedItem(
+  token: string,
+  id: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/${id}/dismiss`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One row of the git queue, as a listing shows it.
+ *
+ * `repo_key` travels alongside `project_id` rather than instead of it, and the shell shows both for
+ * the reason `vcs.rs` gives: the project is the label a reader recognises, the key is the only thing
+ * that says whether two differently-labelled rows were queued behind the same refs. A listing that
+ * contains another project's work reads as a bug in the listing without it.
+ *
+ * `op` and `status` are the columns verbatim — the daemon does not parse them before handing them
+ * over, precisely so a row written by an older version cannot fail the whole listing, and the shell
+ * keeps that property by rendering whatever string arrives.
+ */
+export interface VcsRequestSummary {
+  id: number;
+  op: string;
+  project_id: string;
+  repo_key: string;
+  origin: string;
+  status: string;
+  created_at: string;
+}
+
+/**
+ * The whole git queue, newest first, optionally narrowed to one project.
+ *
+ * Note what this list is: nothing prunes `vcs_requests`, so it is the permanent history of every
+ * git operation the daemon has queued, not a snapshot of what is pending. The daemon caps it at 200
+ * rows. Hitting that cap means the daemon has been running a while — it is not a finding, and the
+ * shell must not present it as one.
+ */
+export async function listVcsRequests(
+  token: string,
+  projectId?: string,
+): Promise<VcsRequestSummary[] | null> {
+  const path = projectId === undefined
+    ? "/vcs/requests"
+    : `/vcs/requests?project_id=${encodeURIComponent(projectId)}`;
+  try {
+    const res = await fetch(`${DAEMON_URL}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** How one request ended: the sha it produced, or why it did not. */
+export interface VcsTicket {
+  id: number;
+  status: string;
+  result_sha: string | null;
+  failure_reason: string | null;
+}
+
+/**
+ * One request's outcome, read with a zero deadline.
+ *
+ * The daemon also offers `/vcs/requests/{id}/wait`, which holds the connection open until the row
+ * settles. The shell uses this one: it already polls, and a blocking read would tie a fetch up for
+ * the whole of `vcs::DEFAULT_WAIT` while the rest of the page has nothing to show for it.
+ */
+export async function getVcsRequest(
+  token: string,
+  id: number,
+): Promise<VcsTicket | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/vcs/requests/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
   }
 }
 
@@ -2223,6 +2419,30 @@ export async function listVoiceMemos(token: string): Promise<VoiceCapture[] | nu
 }
 
 /**
+ * The dictations, which are the other half of what the microphone produced.
+ *
+ * Same row shape as a memo and a separate list, because the two are separate surfaces in the daemon
+ * too: memos and dictations draw from one id sequence, and `/voice/memos/{id}` answers 404 for a
+ * dictation's id on purpose. There is deliberately no delete here — `delete_memo` guards on
+ * `Kind::Memo`, so a delete button on this list would 404 on every row.
+ *
+ * `voice.rs` calls this route one read "by hand for prompt tuning, not by the shell". That was true
+ * while nothing rendered it; what a dictation shows is how the transcript was cleaned up, which is
+ * the only place the cleanup model's work is visible at all.
+ */
+export async function listVoiceDictations(token: string): Promise<VoiceCapture[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/voice/dictations`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as VoiceCapture[];
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Deletes a memo. `false` covers both "no such memo" and a failed request, because the page's only
  * response to either is to reload the list and show what is actually there.
  *
@@ -2379,6 +2599,37 @@ export async function cancelCalendarOccurrence(
   }
 }
 
+/**
+ * Relocates one occurrence, leaving the rest of the series where it was.
+ *
+ * `durationMinutes` is required by the daemon, which rejects a non-positive value — a moved
+ * occurrence writes a whole exception row, and an exception with no length is not a shorter event
+ * but an unreadable one. The caller passes the occurrence's current length, so "move" means move
+ * and nothing else.
+ */
+export async function moveCalendarOccurrence(
+  token: string,
+  id: number,
+  occurrenceLocal: string,
+  toLocal: string,
+  durationMinutes: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/calendar/events/${id}/move`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        occurrence_local: occurrenceLocal,
+        to_local: toLocal,
+        duration_minutes: durationMinutes,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function listPendingNotifications(token: string): Promise<PendingNotification[]> {
   try {
     const res = await fetch(`${DAEMON_URL}/notifications/pending`, {
@@ -2455,5 +2706,106 @@ export async function getWebPage(token: string, id: number): Promise<WebPage | n
     return (await res.json()) as WebPage;
   } catch {
     return null;
+  }
+}
+
+/** One destination the provider offered. Nothing has been fetched — these are links, not reads. */
+export interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/**
+ * `cached` first, then the internet — the order the pillar is meant to be used in, and the order
+ * the daemon's own response shape puts them in.
+ *
+ * `cached` is `WebHit`, the same rows `listWebPages` returns, because it is the same `web::Hit` from
+ * the same index on the daemon's side. A parallel type would let the two drift apart while the
+ * server kept sending one shape.
+ *
+ * `provider` is worth showing rather than swallowing: the local index answers even when no provider
+ * is configured, so hits with an empty `results` is a working search on an installation with no API
+ * key, not a failure.
+ */
+export interface WebSearchView {
+  cached: WebHit[];
+  provider: string;
+  results: WebSearchResult[];
+}
+
+/**
+ * Searches what has been read, and the internet beside it.
+ *
+ * `ApiResult` rather than `null`, because the pillar being switched off is the answer this call
+ * gets most often on a fresh install and it is not an error — `/web/search` answers 503 when
+ * `.ai/web.yaml` has not enabled it, and "turn the pillar on" is a different sentence from "the
+ * search failed".
+ */
+export async function searchWeb(
+  token: string,
+  query: string,
+  limit?: number,
+): Promise<ApiResult<WebSearchView>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/web/search`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, limit: limit ?? null }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as WebSearchView };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * What a read hands back. Close to `WebPage` and deliberately not the same type: this one carries
+ * `from_cache`, which only a read can answer, and lacks `bytes` and `byline`, which only the stored
+ * row has. Aliasing them would put fields on screen that are absent from the payload.
+ */
+export interface WebReadView {
+  id: number;
+  requested_url: string;
+  final_url: string;
+  host: string;
+  title: string | null;
+  trust: string;
+  trust_rule: string;
+  extract_status: string;
+  content_md: string;
+  from_cache: boolean;
+  fetched_at: string;
+}
+
+/**
+ * Fetches one page by URL and files it in the archive.
+ *
+ * Admin-scoped in the daemon, unlike `/web/search` — see `auth.rs`. The shell holds the control
+ * token so it is allowed, but the 403 is worth surfacing rather than flattening: an installation
+ * driving the shell with a lesser API token would otherwise see a read silently do nothing.
+ *
+ * Who is asking is derived by the daemon from owner presence and never sent from here. A
+ * `requester` field on the wire would be a permission the caller grants itself.
+ */
+export async function readWebPage(
+  token: string,
+  url: string,
+): Promise<ApiResult<WebReadView>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/web/read`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as WebReadView };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
