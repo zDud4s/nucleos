@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  deleteVoiceMemo, getVoiceConfig, listVoiceMemos, postVoiceCapture,
+  deleteVoiceMemo, getVoiceConfig, listVoiceDictations, listVoiceMemos, postVoiceCapture,
   type ConnectionState, type VoiceCapture, type VoiceConfigView, type VoiceKind,
 } from "./api";
 import { durationMs, encodeCapture } from "./audio";
@@ -150,6 +150,59 @@ function Memos({
 }
 
 /**
+ * The dictations, newest first — the other half of what the microphone produced.
+ *
+ * Read-only, and that is the daemon's shape rather than a shortcut: `delete_memo` guards on
+ * `Kind::Memo`, so a delete button here would answer 404 on every row. They leave on the retention
+ * in the configuration above instead, which is the difference between the two kinds — a memo is
+ * kept until you delete it, a dictation expires.
+ *
+ * Worth a panel at all because of the middle column: a dictation is text that was typed into
+ * another application and is gone from this window the moment it lands. This is the only place the
+ * cleanup model's work on it can be seen — and the only way to notice it cleaning up badly.
+ */
+function Dictations({ dictations }: { dictations: VoiceCapture[] }) {
+  if (dictations.length === 0) {
+    return (
+      <Panel title="Dictations">
+        <p className="a-note">
+          Nothing dictated yet. A dictation is typed straight into whatever had focus and is not
+          kept as a document — it appears here until the retention above collects it.
+        </p>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title="Dictations" aside={<span className="v-count">{dictations.length}</span>}>
+      <ul className="v-memos">
+        {dictations.map((dictation) => (
+          <li key={dictation.id}>
+            <header>
+              <Badge tone={voiceCleanupTone(dictation.cleanup_state)}>
+                {voiceCleanupLabel(dictation.cleanup_state)}
+              </Badge>
+              <span className="v-when">{relativeTime(dictation.created_at)}</span>
+              <span className="v-len">{spokenDuration(dictation.duration_ms)}</span>
+              {dictation.model !== null && <span className="v-model">{dictation.model}</span>}
+            </header>
+            <p className="v-text">{dictation.clean_text ?? dictation.raw_text}</p>
+            {/* Both, when they differ: the point of this list is what the cleanup changed, and one
+                line of final text cannot show that. */}
+            {dictation.clean_text !== null && dictation.clean_text !== dictation.raw_text && (
+              <p className="v-raw">
+                <span className="v-raw-label">as heard</span>
+                {dictation.raw_text}
+              </p>
+            )}
+          </li>
+        ))}
+      </ul>
+    </Panel>
+  );
+}
+
+/**
  * The voice pillar's window: dictate, and read what has been said.
  *
  * The microphone is opened here rather than in the shell's Rust side because `cpal` cannot currently
@@ -165,6 +218,7 @@ export default function Voice({
 }) {
   const [config, setConfig] = useState<VoiceConfigView | null>(null);
   const [memos, setMemos] = useState<VoiceCapture[] | null>(null);
+  const [dictations, setDictations] = useState<VoiceCapture[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<number | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -183,12 +237,14 @@ export default function Voice({
 
   const load = useCallback(async () => {
     if (token === null) return;
-    const [nextConfig, nextMemos] = await Promise.all([
+    const [nextConfig, nextMemos, nextDictations] = await Promise.all([
       getVoiceConfig(token),
       listVoiceMemos(token),
+      listVoiceDictations(token),
     ]);
     setConfig(nextConfig);
     setMemos(nextMemos);
+    setDictations(nextDictations);
     setLoading(false);
   }, [token]);
 
@@ -439,6 +495,11 @@ export default function Voice({
       {memos === null
         ? !loading && <ErrorNote>Could not list the memos.</ErrorNote>
         : <Memos memos={memos} busy={busy} onDelete={remove} />}
+      {/* After the memos, because a memo is something you kept and a dictation is something that
+          already went where it was going. */}
+      {dictations === null
+        ? !loading && <ErrorNote>Could not list the dictations.</ErrorNote>
+        : <Dictations dictations={dictations} />}
     </section>
   );
 }

@@ -187,3 +187,85 @@ describe("how close a run is to handing off", () => {
     expect(screen.getByText(/past the handoff line/)).toBeTruthy();
   });
 });
+
+/**
+ * The other door out of `awaiting_approval`.
+ *
+ * `worktree::release` claims the run with `status = 'awaiting_approval'` inside its own write and
+ * answers 409 for anything else, so the button belongs to exactly one state. Until it landed here
+ * nothing in this window could let a parked run's tree go: the daemon's GC will not touch a
+ * worktree an `awaiting_approval` run still owns.
+ */
+describe("abandoning a run parked for approval", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fetchMock.mockReset();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fetchMock.mockReset();
+  });
+
+  async function openParked(status = "awaiting_approval") {
+    daemonWith(detail({ status }));
+    render(<Runs token="t" connection="connected" />);
+    await settle();
+    await openTheRun();
+  }
+
+  it("offers no release for a run that is still working", async () => {
+    await openParked("running");
+    expect(screen.queryByText("Abandon and release worktree")).toBeNull();
+  });
+
+  it("offers no release for a run that has already finished", async () => {
+    await openParked("completed");
+    expect(screen.queryByText("Abandon and release worktree")).toBeNull();
+  });
+
+  it("releases the worktree through the run's own route", async () => {
+    await openParked();
+
+    fireEvent.click(screen.getByText("Abandon and release worktree"));
+    // Armed, not fired. This deletes a tree and everything written in it.
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/release"))).toBe(false);
+
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Discard run and worktree?"));
+    });
+
+    const call = fetchMock.mock.calls.find(([url]) => String(url).includes("/release"));
+    expect(call).toBeTruthy();
+    expect(String(call![0])).toContain("/worktrees/7/release");
+    expect((call![1] as RequestInit).method).toBe("POST");
+  });
+
+  /** 409 means the proposal was answered elsewhere — the good ending, not a fault to chase. */
+  it("does not call a race with the proposal queue a failure", async () => {
+    await openParked();
+
+    fetchMock.mockImplementation(async (url: string) => {
+      const target = String(url);
+      if (target.includes("/release")) return { ok: false, status: 409 };
+      if (/\/runs\/\d+$/.test(target)) {
+        return { ok: true, status: 200, json: async () => detail({ status: "awaiting_approval" }) };
+      }
+      // The row stays in the index the refresh reads, or the detail view unmounts under the note it
+      // was about to show and the test would be measuring its own mock.
+      return { ok: true, status: 200, json: async () => [row({ status: "awaiting_approval" })] };
+    });
+
+    fireEvent.click(screen.getByText("Abandon and release worktree"));
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Discard run and worktree?"));
+    });
+
+    expect(screen.getByText(/no longer waiting for approval/)).toBeTruthy();
+  });
+});

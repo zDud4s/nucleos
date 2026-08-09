@@ -408,4 +408,93 @@ describe("JobsPanel", () => {
     await settle();
     expect(fetchMock.mock.calls.length).toBe(once);
   });
+
+  /**
+   * Starting a job by hand.
+   *
+   * Until this landed a job could only be born from a `graph:` rule, so trying one meant writing a
+   * schedule and waiting for it to fire. It goes through `POST /jobs` — the scheduler's own front
+   * door — so every refusal the daemon raises at 3am is raised here too.
+   */
+  describe("starting one by hand", () => {
+    function openForm() {
+      renderPanel([]);
+      fireEvent.click(screen.getByText("Start a job by hand"));
+    }
+
+    it("sends null for the two limits left blank rather than zero", async () => {
+      fetchMock.mockImplementation(() =>
+        Promise.resolve({ ok: true, status: 201, json: async () => ({ job_id: 42 }) }),
+      );
+      openForm();
+
+      fireEvent.change(screen.getByPlaceholderText("which project"), {
+        target: { value: "alpha" },
+      });
+      fireEvent.change(screen.getByPlaceholderText(/graph: rule would carry/), {
+        target: { value: "tidy the logs" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Start job" }));
+      });
+
+      const call = fetchMock.mock.calls.find(([url]) => String(url) === `${DAEMON_URL}/jobs`);
+      expect(call).toBeTruthy();
+      // Blank means "the house limit governs" and "one round". Zero would mean a job allowed to
+      // spend nothing and run nothing.
+      expect(JSON.parse((call![1] as RequestInit).body as string)).toEqual({
+        project_id: "alpha", prompt: "tidy the logs", budget_usd: null, max_rounds: null,
+      });
+      expect(screen.getByText("Job 42 started.")).toBeTruthy();
+    });
+
+    /**
+     * The daemon's sentence, not a translation of the status. `409` is both "the kill switch is
+     * engaged" and "no room"; the two have different remedies, and only the body tells them apart.
+     */
+    it("shows the daemon's own words when it refuses", async () => {
+      fetchMock.mockImplementation(() =>
+        Promise.resolve({
+          ok: false,
+          status: 409,
+          text: async () => "no free slot for alpha; something else is running",
+        }),
+      );
+      openForm();
+
+      fireEvent.change(screen.getByPlaceholderText("which project"), {
+        target: { value: "alpha" },
+      });
+      fireEvent.change(screen.getByPlaceholderText(/graph: rule would carry/), {
+        target: { value: "tidy the logs" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Start job" }));
+      });
+
+      expect(screen.getByText("no free slot for alpha; something else is running")).toBeTruthy();
+    });
+
+    /** Caught here rather than at the daemon, which would answer 422 for a body it cannot parse. */
+    it("refuses a budget that is not a number without asking the daemon", async () => {
+      fetchMock.mockClear();
+      openForm();
+
+      fireEvent.change(screen.getByPlaceholderText("which project"), {
+        target: { value: "alpha" },
+      });
+      fireEvent.change(screen.getByPlaceholderText(/graph: rule would carry/), {
+        target: { value: "tidy the logs" },
+      });
+      fireEvent.change(screen.getByPlaceholderText("(the house limit)"), {
+        target: { value: "as much as it takes" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Start job" }));
+      });
+
+      expect(screen.getByText(/must be a number of dollars/)).toBeTruthy();
+      expect(fetchMock.mock.calls.some(([url]) => String(url) === `${DAEMON_URL}/jobs`)).toBe(false);
+    });
+  });
 });

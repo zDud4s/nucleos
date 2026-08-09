@@ -172,8 +172,20 @@
 .cal-block.is-short b { font-size: var(--fs-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* Ações só no hover: em repouso a grelha mostra tempo, não botões. */
-.cal-block-do { display: none; gap: var(--sp-1); margin-top: 2px; }
+.cal-block-do { display: none; gap: var(--sp-1); margin-top: 2px; flex-wrap: wrap; }
 .cal-block:hover .cal-block-do { display: flex; }
+/* O hover sozinho escondia o formulário de mover a meio de o preencher: o rato sai do bloco para
+   chegar ao calendário do sistema, as ações desaparecem por baixo dele e o estado fica aberto onde
+   ninguém o vê. O foco e a presença do próprio formulário prendem-nas abertas. */
+.cal-block:focus-within .cal-block-do,
+.cal-block-do:has(.cal-move) { display: flex; }
+
+.cal-move { display: inline-flex; align-items: center; gap: var(--sp-1); flex-wrap: wrap; }
+.cal-move input {
+  font: 400 var(--fs-2xs) var(--mono);
+  padding: 2px var(--sp-1);
+  min-width: 0;
+}
 
 /* ── Mês ───────────────────────────────────────────────── */
 

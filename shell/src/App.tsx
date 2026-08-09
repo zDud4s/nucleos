@@ -4,6 +4,7 @@ import {
   checkHealth, getKillSwitch, getStatus, sendAttentionHeartbeat, setKillSwitch,
   type ConnectionState,
 } from "./api";
+import Approvals from "./Approvals";
 import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
 import Contacts from "./Contacts";
@@ -21,12 +22,16 @@ import "./App.css";
 import "./calendar.css";
 
 type Tab =
-  | "home" | "autopilot" | "runs" | "projects" | "assistant"
+  | "home" | "autopilot" | "approvals" | "runs" | "projects" | "assistant"
   | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
   { key: "autopilot", label: "Autopilot" },
+  // Straight after Autopilot because it is the same subject seen from the other side: Autopilot is
+  // what the machine is doing, this is what it stopped doing and is waiting on you for. Ahead of
+  // Runs, so the parked work is passed before the running work rather than after it.
+  { key: "approvals", label: "Waiting" },
   { key: "runs", label: "Runs" },
   { key: "projects", label: "Projects" },
   { key: "assistant", label: "Assistant" },
@@ -297,6 +302,7 @@ function App() {
               toggleKill={toggleKill}
             />
           )}
+          {tab === "approvals" && <Approvals token={token} connection={connection} />}
           {tab === "runs" && <Runs token={token} connection={connection} />}
           {tab === "projects" && <Projects token={token} connection={connection} />}
           {tab === "assistant" && (

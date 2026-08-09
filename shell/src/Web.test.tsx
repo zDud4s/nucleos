@@ -132,16 +132,77 @@ describe("the web archive", () => {
   });
 
   /**
-   * There is no address bar, and that is scope rather than an oversight: the browser belongs to the
-   * sidecar when it arrives, because the daemon runs with this window closed. A control that
-   * fetched a URL from here would be the wrong half of the feature, built first.
+   * The archive search stays exactly one box, and it is still the local one.
+   *
+   * The tab now has a second field that fetches, so the risk this pins is the opposite of the one it
+   * used to: not that a URL control exists, but that the two get confused. Searching what has been
+   * read must never become a call that spends an API request on a provider.
    */
-  it("offers no way to fetch a new page from this tab", async () => {
+  it("keeps the archive search local and separate from the address field", async () => {
     await show([hit()]);
 
     const searches = screen.getAllByRole("searchbox");
     expect(searches).toHaveLength(1);
     expect(searches[0].getAttribute("aria-label")).toBe("Search what has been read");
-    expect(screen.queryByPlaceholderText(/https?:/i)).toBeNull();
+
+    fetchMock.mockClear();
+    fireEvent.change(searches[0], { target: { value: "fetch" } });
+    await act(async () => {
+      fireEvent.submit(searches[0].closest("form")!);
+    });
+
+    const called = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(called.every((url) => url.includes("/web/pages"))).toBe(true);
+    expect(called.some((url) => url.includes("/web/search"))).toBe(false);
+  });
+
+  it("fetches a page through the daemon's own read route", async () => {
+    await show([hit()]);
+
+    fetchMock.mockClear();
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes("/web/read")) {
+        return Promise.resolve({ ok: true, json: async () => ({ id: 1, from_cache: false }) });
+      }
+      if (/\/web\/pages\/\d+$/.test(String(url))) {
+        return Promise.resolve({ ok: true, json: async () => page() });
+      }
+      return Promise.resolve({ ok: true, json: async () => [hit()] });
+    });
+
+    const address = screen.getByLabelText("Address to read");
+    fireEvent.change(address, { target: { value: "https://example.com/a" } });
+    await act(async () => {
+      fireEvent.submit(address.closest("form")!);
+    });
+
+    const read = fetchMock.mock.calls.find((call) => String(call[0]).includes("/web/read"));
+    expect(read).toBeTruthy();
+    expect(read![1].method).toBe("POST");
+    expect(JSON.parse(read![1].body)).toEqual({ url: "https://example.com/a" });
+    // What was filed is what gets shown, read back from the archive rather than rendered from the
+    // fetch's own reply. `bytes` is the proof: the read's own response has no such field, so a
+    // reader rendered from it could not show this number at all.
+    expect(fetchMock.mock.calls.some((call) => /\/web\/pages\/1$/.test(String(call[0])))).toBe(true);
+    // Locale-independent on purpose: the number is run through `toLocaleString`, and pinning its
+    // separator would make this test a statement about the machine it runs on.
+    expect(screen.getByText(/bytes of source/)).toBeTruthy();
+  });
+
+  /** A refused pillar is a switch to flip, not an outage, and must not be reported as one. */
+  it("says the pillar is off when a read is refused with 503", async () => {
+    await show([hit()]);
+
+    fetchMock.mockImplementation(() =>
+      Promise.resolve({ ok: false, status: 503, text: async () => "the web pillar is disabled" }),
+    );
+
+    const address = screen.getByLabelText("Address to read");
+    fireEvent.change(address, { target: { value: "https://example.com/a" } });
+    await act(async () => {
+      fireEvent.submit(address.closest("form")!);
+    });
+
+    expect(screen.getAllByText(/enabled: true in \.ai\/web\.yaml/).length).toBeGreaterThan(0);
   });
 });

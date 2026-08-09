@@ -44,6 +44,11 @@ import {
   runTone,
   spokenDuration,
   tokenLevelHint,
+  vcsIsSettled,
+  vcsOriginLabel,
+  vcsPending,
+  vcsStatusLabel,
+  vcsStatusTone,
   voiceCleanupLabel,
   voiceCleanupTone,
   promotionBlock,
@@ -908,5 +913,72 @@ describe("a shift-click range", () => {
   it("falls back to the row that was clicked when the anchor is gone", () => {
     expect(namesBetween(names, "gone", "c")).toEqual(["c"]);
     expect(namesBetween(names, "gone", "")).toEqual([]);
+  });
+});
+
+/**
+ * The nine statuses the `vcs_requests` CHECK constraint permits, and the four origins beside them.
+ * Every one is pinned, because the shell renders whatever string the daemon sends and a status it
+ * has no arm for must still land somewhere sensible rather than uncoloured.
+ */
+describe("a git request's badge", () => {
+  it("marks the one status that wants a person apart from the rest", () => {
+    expect(vcsStatusTone("awaiting_approval")).toBe("pending");
+    expect(vcsStatusLabel("awaiting_approval")).toBe("awaiting approval");
+  });
+
+  it("keeps the two endings worth finding visible, and lets the rest recede", () => {
+    expect(vcsStatusTone("failed")).toBe("paused");
+    expect(vcsStatusTone("blocked")).toBe("paused");
+    expect(vcsStatusTone("succeeded")).toBe("active");
+    expect(vcsStatusTone("rejected")).toBe("off");
+    expect(vcsStatusTone("cancelled")).toBe("off");
+    expect(vcsStatusTone("interrupted")).toBe("off");
+  });
+
+  it("gives in-flight work the shadow tone it shares with a running run", () => {
+    expect(vcsStatusTone("queued")).toBe("shadow");
+    expect(vcsStatusTone("running")).toBe("shadow");
+  });
+
+  /** A status from a newer daemon must not crash or shout — it recedes and prints itself. */
+  it("survives a status this shell has never heard of", () => {
+    expect(vcsStatusTone("teleported")).toBe("off");
+    expect(vcsStatusLabel("teleported")).toBe("teleported");
+  });
+
+  /** The distinction `needs_approval` draws: a person was there, or nothing was. */
+  it("says who asked in words rather than in column values", () => {
+    expect(vcsOriginLabel("human")).toBe("you");
+    expect(vcsOriginLabel("shell")).toBe("this app");
+    expect(vcsOriginLabel("run")).toBe("a run");
+    expect(vcsOriginLabel("job")).toBe("a job");
+    expect(vcsOriginLabel("something-new")).toBe("something-new");
+  });
+});
+
+describe("what the git queue is still doing", () => {
+  /** Errs the way `runIsLive` errs: an unknown status counts as settled, so polling ends. */
+  it("counts anything it does not recognise as over", () => {
+    expect(vcsIsSettled("teleported")).toBe(true);
+    expect(vcsIsSettled("queued")).toBe(false);
+    expect(vcsIsSettled("running")).toBe(false);
+    expect(vcsIsSettled("awaiting_approval")).toBe(false);
+    expect(vcsIsSettled("succeeded")).toBe(true);
+  });
+
+  /**
+   * The listing is the daemon's whole history of queued git operations, not a pending list, so the
+   * number on screen must be of what is moving. `requests.length` would be a statement about uptime.
+   */
+  it("counts what is in flight, not how long the daemon has been up", () => {
+    expect(
+      vcsPending([
+        { status: "succeeded" }, { status: "failed" }, { status: "cancelled" },
+        { status: "queued" }, { status: "awaiting_approval" },
+      ]),
+    ).toBe(2);
+    expect(vcsPending([])).toBe(0);
+    expect(vcsPending([{ status: "succeeded" }])).toBe(0);
   });
 });

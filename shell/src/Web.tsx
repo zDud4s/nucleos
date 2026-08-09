@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  getWebPage, listWebPages,
-  type ConnectionState, type WebHit, type WebPage,
+  getWebPage, listWebPages, readWebPage, searchWeb,
+  type ConnectionState, type WebHit, type WebPage, type WebSearchResult,
 } from "./api";
 import { relativeTime } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
 
 /**
- * The archive of what NucleOS has read, and a search of it.
+ * The archive of what NucleOS has read, a search of it, and the two doors into it.
  *
- * Deliberately NOT a browser. There is no address bar and no way to fetch a page from this tab, and
- * that is the v1 scope rather than an omission: the browser belongs to the sidecar when it arrives
- * (spec §3.5), because the daemon runs without this window open and a browser that only exists
- * while the tray app is up is useless to the Autopilot.
+ * Still NOT a browser, and the distinction is narrower than it used to be, so it is worth stating
+ * exactly. There is no rendering engine here, no navigation, no session and no cookies: a read
+ * fetches one URL through the same sidecar an agent uses, extracts the article, files it, and shows
+ * you the text. Following a link means asking for that link by name. The browsing sidecar (spec
+ * §3.5) is still the thing that will browse, because the daemon runs without this window open.
  *
- * What this tab is for is the thing nothing else can show: WHICH pages an agent has read, and what
- * it actually saw when it read them.
+ * What changed is that `/web/search` and `/web/read` were reachable only by an agent, which made
+ * this tab a mirror with no handle: you could see what a run had read and could not read the same
+ * page yourself to check it. Both doors go through the daemon's own routes, so a page you fetch
+ * here is trust-decided, quarantined and filed by exactly the rules a run's read obeys.
  */
 
 /**
@@ -72,11 +75,60 @@ interface WebProps {
   connection: ConnectionState;
 }
 
+/**
+ * What the provider offered, none of it fetched.
+ *
+ * Kept visually apart from the archive rows above it, because the difference is the whole point:
+ * these are strangers' titles and snippets that no rule has judged, and reading one is an act with
+ * consequences — it puts that page's prose through the trust decision and into the archive.
+ */
+function Destinations({
+  results, provider, busy, onRead,
+}: {
+  results: WebSearchResult[];
+  provider: string;
+  busy: string | null;
+  onRead: (url: string) => void;
+}) {
+  return (
+    <Panel title="On the web" aside={provider}>
+      {results.length === 0 ? (
+        <p className="faint">
+          The provider returned nothing. An installation with no API key still searches the archive
+          above — that list is answered locally and does not need one.
+        </p>
+      ) : (
+        <ul className="web-out">
+          {results.map((result) => (
+            <li key={result.url}>
+              <span className="web-out__title">{result.title}</span>
+              <span className="web-out__url">{result.url}</span>
+              <span className="web-out__snippet">{result.snippet}</span>
+              <Button
+                size="sm"
+                disabled={busy !== null}
+                onClick={() => onRead(result.url)}
+              >
+                {busy === result.url ? "Reading…" : "Read it"}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
 export default function Web({ token, connection }: WebProps) {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<WebHit[] | null>(null);
   const [open, setOpen] = useState<WebPage | null>(null);
   const [failed, setFailed] = useState(false);
+  const [url, setUrl] = useState("");
+  /** The URL currently being fetched, so only its own button says "Reading…". */
+  const [reading, setReading] = useState<string | null>(null);
+  const [outward, setOutward] = useState<{ provider: string; results: WebSearchResult[] } | null>(null);
+  const [note, setNote] = useState<string | null>(null);
 
   const load = useCallback(
     async (q: string) => {
@@ -103,6 +155,73 @@ export default function Web({ token, connection }: WebProps) {
     [token],
   );
 
+  /**
+   * Asks the provider as well as the archive.
+   *
+   * A separate action from the archive search rather than the same box doing both, because the two
+   * cost different things: searching what has been read is a local query, and searching the web
+   * spends an API call on a third party. A single box would spend it on every keystroke's worth of
+   * curiosity about the archive.
+   */
+  const searchOut = useCallback(
+    async (q: string) => {
+      if (token === null || q.trim() === "") return;
+      setNote(null);
+      const result = await searchWeb(token, q.trim());
+      if (!result.ok) {
+        setNote(
+          result.status === 503
+            ? "The web pillar is off. It stays off until enabled: true in .ai/web.yaml."
+            : "Could not search the web.",
+        );
+        setOutward(null);
+        return;
+      }
+      // The cached half is the archive list this page already shows, so only the outward half is
+      // new information. Showing both would put the same rows on screen twice under two headings.
+      setOutward({ provider: result.value.provider, results: result.value.results });
+      setHits(result.value.cached);
+    },
+    [token],
+  );
+
+  /**
+   * Fetches one page and opens what was filed.
+   *
+   * Re-read through `getWebPage` rather than rendered from the read's own response: the two shapes
+   * differ, and the archive row is the one that carries `bytes` and `byline` — so the reader shows
+   * the page as the archive holds it, which is what a run would later see.
+   */
+  const read = useCallback(
+    async (target: string) => {
+      if (token === null || target.trim() === "") return;
+      setReading(target);
+      setNote(null);
+      const result = await readWebPage(token, target.trim());
+      setReading(null);
+      if (!result.ok) {
+        setNote(
+          result.status === 503
+            ? "The web pillar is off. It stays off until enabled: true in .ai/web.yaml."
+            : result.status === 403
+              ? "This token may search but not fetch. Reading a page needs the admin scope."
+              : result.status === 400
+                ? "The daemon would not fetch that address."
+                : "Could not read that page.",
+        );
+        return;
+      }
+      setNote(
+        result.value.from_cache
+          ? "Already in the archive — this is the copy that was read before, not a fresh fetch."
+          : null,
+      );
+      await load(query);
+      await openPage(result.value.id);
+    },
+    [token, load, openPage, query],
+  );
+
   if (connection !== "connected" || token === null) {
     return <ErrorNote>The daemon is not reachable, so there is nothing to show.</ErrorNote>;
   }
@@ -114,10 +233,33 @@ export default function Web({ token, connection }: WebProps) {
   return (
     <>
       <Teach title="What has been read">
-        Everything NucleOS has read from the web, searchable. This is an archive, not a browser:
-        pages arrive here when you or an agent asks for one, and the badge says whether the agent
-        saw the page itself or a summary a local model wrote from it.
+        Everything NucleOS has read from the web, searchable, plus the two ways to add to it. The
+        badge says whether the agent saw the page itself or a summary a local model wrote from it —
+        and a page you fetch here goes through the same decision, so what you see is what a run
+        would get.
       </Teach>
+
+      <Panel title="Read a page" aside="through the same door an agent uses">
+        <form
+          className="web-fetch"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void read(url);
+          }}
+        >
+          <input
+            type="url"
+            value={url}
+            placeholder="https://…"
+            aria-label="Address to read"
+            onChange={(event) => setUrl(event.target.value)}
+          />
+          <Button type="submit" variant="approve" disabled={url.trim() === "" || reading !== null}>
+            {reading === url.trim() ? "Reading…" : "Read"}
+          </Button>
+        </form>
+        {note !== null && <p className="gate-note">{note}</p>}
+      </Panel>
 
       <Panel title="Read" aside={hits === null ? undefined : `${hits.length} pages`}>
         <form
@@ -134,11 +276,21 @@ export default function Web({ token, connection }: WebProps) {
             onChange={(event) => setQuery(event.target.value)}
           />
           <Button type="submit">Search</Button>
+          {/* Second verb on the same words, and a separate button on purpose: this one spends an
+              API call on a third party, and the one beside it does not. */}
+          <Button
+            variant="ghost"
+            disabled={query.trim() === ""}
+            onClick={() => void searchOut(query)}
+          >
+            Search the web too
+          </Button>
           {query.length > 0 && (
             <Button
               variant="ghost"
               onClick={() => {
                 setQuery("");
+                setOutward(null);
                 void load("");
               }}
             >
@@ -172,6 +324,15 @@ export default function Web({ token, connection }: WebProps) {
           ))}
         </ul>
       </Panel>
+
+      {outward !== null && (
+        <Destinations
+          results={outward.results}
+          provider={outward.provider}
+          busy={reading}
+          onRead={(target) => void read(target)}
+        />
+      )}
     </>
   );
 }

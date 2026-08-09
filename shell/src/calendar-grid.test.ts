@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  hourMarks, hoursInSpan, localStamp, monthMatrix, nowFraction, overlapLanes, placeInDay, sameDay,
-  weekOf,
+  hourMarks, hoursInSpan, inputFromStamp, localStamp, monthMatrix, nowFraction, occurrenceMinutes,
+  overlapLanes, placeInDay, sameDay, stampFromInput, weekOf,
 } from "./calendar-grid";
 
 const HOUR = 3_600_000;
@@ -191,5 +191,55 @@ describe("sameDay", () => {
   it("separates the same date in different months", () => {
     expect(sameDay(new Date(2026, 7, 3), new Date(2026, 8, 3))).toBe(false);
     expect(sameDay(new Date(2026, 7, 3, 1), new Date(2026, 7, 3, 23))).toBe(true);
+  });
+});
+
+/**
+ * The move control writes a stamp the daemon parses with `%Y-%m-%dT%H:%M:%S`, which does not treat
+ * the seconds as optional — and `<input type="datetime-local">` omits them.
+ */
+describe("stampFromInput", () => {
+  it("adds the seconds the control leaves out", () => {
+    expect(stampFromInput("2026-08-03T09:30")).toBe("2026-08-03T09:30:00");
+  });
+
+  it("leaves a stamp that already has them alone", () => {
+    expect(stampFromInput("2026-08-03T09:30:45")).toBe("2026-08-03T09:30:45");
+  });
+
+  /** Rejected here rather than at the daemon: the shape of the string already says it is wrong. */
+  it("refuses anything that is not a local stamp", () => {
+    expect(stampFromInput("")).toBeNull();
+    expect(stampFromInput("2026-08-03")).toBeNull();
+    expect(stampFromInput("2026-08-03T09:30:00Z")).toBeNull();
+    expect(stampFromInput("tomorrow")).toBeNull();
+  });
+});
+
+describe("inputFromStamp", () => {
+  /** Truncated, never re-parsed: a `Date` would apply this machine's offset to local wall-clock. */
+  it("hands the control back the minutes without a timezone ever being applied", () => {
+    expect(inputFromStamp("2026-08-03T09:30:00")).toBe("2026-08-03T09:30");
+  });
+
+  it("round-trips with stampFromInput", () => {
+    expect(stampFromInput(inputFromStamp("2026-12-31T23:59:00"))).toBe("2026-12-31T23:59:00");
+  });
+});
+
+/** The daemon rejects a move with a non-positive duration, so this number has to be right. */
+describe("occurrenceMinutes", () => {
+  it("measures the occurrence in whole minutes", () => {
+    expect(occurrenceMinutes("2026-08-03T09:00:00Z", "2026-08-03T09:30:00Z")).toBe(30);
+    expect(occurrenceMinutes("2026-08-03T09:00:00Z", "2026-08-03T10:00:00Z")).toBe(60);
+  });
+
+  /** Rounded, not floored: a 30-minute block whose ends drift by a millisecond is still 30. */
+  it("rounds rather than truncating", () => {
+    expect(occurrenceMinutes("2026-08-03T09:00:00.000Z", "2026-08-03T09:29:59.600Z")).toBe(30);
+  });
+
+  it("answers zero for a pair it cannot read, rather than NaN", () => {
+    expect(occurrenceMinutes("not a date", "2026-08-03T09:30:00Z")).toBe(0);
   });
 });
