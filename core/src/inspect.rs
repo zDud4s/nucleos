@@ -11,6 +11,14 @@ const GREP_FILE_CAP: usize = 2 * 1024 * 1024;
 /// output gets a ceiling — neither of which it had.
 const DIFF_TIMEOUT_SECS: u64 = 20;
 const DIFF_CAP: usize = 1024 * 1024;
+/// What `changed_paths` gives git before giving up. A number of its own rather than
+/// `DIFF_TIMEOUT_SECS`: this one runs on the job tick, not inside a request somebody is waiting on.
+#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
+const CHANGED_PATHS_TIMEOUT_SECS: u64 = 20;
+/// A ceiling on the output, in bytes. ~1 MiB of path names is tens of thousands of files; past
+/// that is a repository this measurement does not serve.
+#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
+const CHANGED_PATHS_CAP: usize = 1024 * 1024;
 const SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "__pycache__"];
 
 #[derive(Debug)]
@@ -265,10 +273,293 @@ pub fn diff(root: &Path) -> Result<String, InspectError> {
     Ok(text)
 }
 
+/// Every path this worktree has touched since it was born, committed or not.
+///
+/// The union of two questions, and **both** are required. `git diff` alone lies in exactly the case
+/// that matters: `job.rs` commits a checkpoint at every green gate, so a diff of the working tree
+/// comes back empty halfway through a job that has already rewritten a dozen files. `git status`
+/// alone loses everything already committed.
+///
+/// `base` is a sha this daemon wrote into `worktrees.base_sha` — never a string from a caller — and
+/// is still validated as hexadecimal. A revision argument that may begin with `-` is an option to
+/// git, and the value travels through a database other code writes.
+///
+/// Error rather than truncation, unlike `diff`: a truncated list loses paths and reads as `clean`
+/// for those files, which is the one outcome this measurement must not have.
+#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
+pub fn changed_paths(root: &Path, base: &str) -> Result<Vec<String>, InspectError> {
+    // 40 hexadecimal characters, which is what `git rev-parse HEAD` returns under SHA-1 — and the
+    // repository's `core.abbrev` does not shorten it. A repository on `--object-format=sha256`
+    // returns 64 and would be refused forever, in permanent `not measured` with no diagnosis; so
+    // the pair is accepted rather than one length.
+    let hexadecimal = base.chars().all(|character| character.is_ascii_hexdigit());
+    if !matches!(base.len(), 40 | 64) || !hexadecimal {
+        return Err(InspectError::UnsafePath);
+    }
+
+    let range = format!("{base}..HEAD");
+    let committed = run_git(
+        root,
+        &[
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.fsmonitor=",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            &range,
+            "--",
+        ],
+    )?;
+    // `--no-optional-locks` because this runs on the job tick against a **live** worktree, where an
+    // agent is running git at the same time: a normal `git status` refreshes and rewrites the
+    // index, and takes `.git/index.lock` to do it. The flag removes the contention; the price is an
+    // uncached walk, which is what this measurement was going to do anyway.
+    let uncommitted = run_git(
+        root,
+        &[
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
+
+    let mut paths: std::collections::BTreeSet<String> = committed
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| String::from_utf8_lossy(record).into_owned())
+        .collect();
+    paths.extend(parse_status_z(&uncommitted));
+    Ok(paths.into_iter().collect())
+}
+
+/// The parsing contract of `--porcelain=v1 -z`, written out in full because a mistake here produces
+/// a false `clean`.
+///
+/// Records are NUL-terminated. Each is `XY <path>`: two status columns, a space, then the path,
+/// taken by position. `-z` also **turns off** git's C-quoting, which would otherwise escape paths
+/// with spaces or non-ASCII into something a naive reader splits in half.
+///
+/// A rename or copy (`R`/`C` in either column) emits a **second** NUL-terminated field right after
+/// the record: the origin path. Both count — a worktree that renames a file another one is editing
+/// has collided with it.
+#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
+fn parse_status_z(output: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let (status, path) = record.split_at(3);
+        paths.push(String::from_utf8_lossy(path).into_owned());
+        let renamed = matches!(status[0], b'R' | b'C') || matches!(status[1], b'R' | b'C');
+        if renamed && let Some(origin) = records.next() {
+            paths.push(String::from_utf8_lossy(origin).into_owned());
+        }
+    }
+    paths
+}
+
+/// A git with a deadline and a ceiling, whose output is returned whole or not returned.
+///
+/// The shape follows `diff` above, polling included — this code runs on a blocking thread, and a
+/// git that ignores a closed pipe is exactly the case worth killing. The difference is at the end:
+/// here, exceeding the deadline or the ceiling is an `Err`.
+///
+/// **Inherited limitation, said out loud:** `read_to_end` blocks until EOF, so the deadline only
+/// applies once git has closed its output — a git hung *without writing anything* pins this thread.
+/// It is the shape `diff` already has and is not fixed here. The mitigation is on the caller's
+/// side: the tick does not wait for the measurement, and how many worktrees it measures per tick
+/// has a ceiling.
+#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
+fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, InspectError> {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(InspectError::Io)?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut bytes = Vec::new();
+    let read = stdout
+        .by_ref()
+        .take(CHANGED_PATHS_CAP as u64 + 1)
+        .read_to_end(&mut bytes);
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(CHANGED_PATHS_TIMEOUT_SECS);
+    let refused;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                refused = !status.success();
+                break;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                refused = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(error) => return Err(InspectError::Io(error)),
+        }
+    }
+    read.map_err(InspectError::Io)?;
+
+    if refused || bytes.len() > CHANGED_PATHS_CAP {
+        return Err(InspectError::Io(std::io::Error::other(
+            "git refused, timed out, or wrote past the ceiling",
+        )));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A git that has to succeed.
+    ///
+    /// `pub(crate)` along with `seeded_repo` below, because `collision.rs` reuses them — the same
+    /// pattern `git_exec.rs` already uses to expose its `mod tests` to `http.rs`.
+    pub(crate) fn git_in_repo(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A repository with one commit, and that commit's sha.
+    pub(crate) fn seeded_repo() -> (tempfile::TempDir, String) {
+        let repo = tempdir().unwrap();
+        git_in_repo(repo.path(), &["init"]);
+        git_in_repo(repo.path(), &["config", "user.email", "test@x"]);
+        git_in_repo(repo.path(), &["config", "user.name", "test"]);
+        // Rename detection is a user setting (`status.renames`), so the rename test would otherwise
+        // depend on the machine running it. Pinned in the test repository instead.
+        git_in_repo(repo.path(), &["config", "status.renames", "true"]);
+        std::fs::write(repo.path().join("seed.txt"), "seed\n").unwrap();
+        git_in_repo(repo.path(), &["add", "-A"]);
+        git_in_repo(repo.path(), &["commit", "-m", "seed"]);
+
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        (repo, base)
+    }
+
+    /// The case that makes the measurement lie if only one of the two questions is asked: `job.rs`
+    /// commits a checkpoint at every green gate, so a plain `git diff` returns empty halfway
+    /// through a job that has already rewritten half a dozen files.
+    #[test]
+    fn a_checkpointed_change_and_an_untracked_one_both_count() {
+        let (repo, base) = seeded_repo();
+        std::fs::write(repo.path().join("committed.rs"), "fn a() {}\n").unwrap();
+        git_in_repo(repo.path(), &["add", "-A"]);
+        git_in_repo(repo.path(), &["commit", "-m", "checkpoint"]);
+        std::fs::write(repo.path().join("scratch.rs"), "fn b() {}\n").unwrap();
+
+        let paths = changed_paths(repo.path(), &base).unwrap();
+
+        assert!(paths.contains(&"committed.rs".to_string()), "{paths:?}");
+        assert!(paths.contains(&"scratch.rs".to_string()), "{paths:?}");
+    }
+
+    /// A rename yields both paths. A worktree that renames a file another one is editing has
+    /// collided with it, and naming only the destination would hide half of what happened.
+    #[test]
+    fn a_rename_yields_both_the_source_and_the_destination() {
+        let (repo, base) = seeded_repo();
+        git_in_repo(repo.path(), &["mv", "seed.txt", "renamed.txt"]);
+
+        let paths = changed_paths(repo.path(), &base).unwrap();
+
+        assert!(paths.contains(&"seed.txt".to_string()), "{paths:?}");
+        assert!(paths.contains(&"renamed.txt".to_string()), "{paths:?}");
+    }
+
+    /// The input where a naive split loses half and produces a false `clean`. `-z` turns off git's
+    /// C-quoting and NUL-terminates precisely for this.
+    #[test]
+    fn a_rename_whose_destination_has_a_space_yields_both_paths_whole() {
+        let (repo, base) = seeded_repo();
+        git_in_repo(repo.path(), &["mv", "seed.txt", "a name with spaces.txt"]);
+
+        let paths = changed_paths(repo.path(), &base).unwrap();
+
+        assert!(
+            paths.contains(&"a name with spaces.txt".to_string()),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"seed.txt".to_string()), "{paths:?}");
+    }
+
+    #[test]
+    fn an_untracked_path_with_a_space_is_not_split() {
+        let (repo, base) = seeded_repo();
+        std::fs::write(repo.path().join("two words.rs"), "x\n").unwrap();
+
+        let paths = changed_paths(repo.path(), &base).unwrap();
+
+        assert_eq!(paths, vec!["two words.rs".to_string()]);
+    }
+
+    /// A base that is not a sha is refused, rather than silently handed to git as an argument. The
+    /// value travels through a database other code writes, and an argument starting with `-` is an
+    /// option.
+    #[test]
+    fn a_base_that_is_not_a_commit_sha_is_refused() {
+        let (repo, _) = seeded_repo();
+
+        for base in ["--output=/tmp/x", "", "HEAD", &"z".repeat(40)] {
+            assert!(
+                matches!(
+                    changed_paths(repo.path(), base),
+                    Err(InspectError::UnsafePath)
+                ),
+                "accepted `{base}`"
+            );
+        }
+    }
+
+    /// A git that refuses is an error, never an empty set. Empty reads as `clean`, and saying
+    /// `clean` without having measured is the one way this screen can do active damage.
+    #[test]
+    fn a_base_git_does_not_know_is_an_error_and_not_an_empty_set() {
+        let (repo, _) = seeded_repo();
+        let absent = "0".repeat(40);
+
+        assert!(changed_paths(repo.path(), &absent).is_err());
+    }
 
     /// The lexical filter is right about `..`, drive prefixes and UNC, but it never checks the path
     /// it produced. A directory symlink or junction inside the project has only `Normal` components
