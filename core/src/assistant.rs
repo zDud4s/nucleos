@@ -243,6 +243,71 @@ pub async fn send_message(
     Ok(id)
 }
 
+/// How many past exchanges a local turn is shown.
+///
+/// Small, and bounded again by characters below, because every one of these is re-sent on every
+/// round of the tool loop — so a generous history is multiplied by `MAX_TOOL_ROUNDS` before it
+/// reaches `TURN_NUM_CTX`. Six is enough for "and the second one?" and for the follow-up after that.
+const HISTORY_TURNS: i64 = 6;
+
+/// The character budget for replayed history, counted newest-first.
+///
+/// A ceiling on turns alone is not a ceiling: one pasted stack trace answered by a long reply is a
+/// single exchange and thousands of characters. What overflows the window is length, so length is
+/// what is bounded.
+const HISTORY_CHARS: usize = 6_000;
+
+/// The exchanges a local turn may be shown, oldest first.
+///
+/// The `id >` clause is the same barrier `get_session` applies to the CLI path, stated for a path
+/// that has no session to refuse. `hooks.rs` stops a turn acting after it has read third-party
+/// text; without this, a local turn would be handed that text as history — and a local turn can
+/// call `create_run`. So a conversation resumes only from the point after anything read mail, which
+/// is exactly what "a chat that has read mail is spread across several sessions" already means on
+/// the other path.
+///
+/// Only `completed` turns, and only ones with a reply: a failed turn's row has no answer, and
+/// replaying a question that was never answered invites the model to answer it now, out of order.
+pub(crate) async fn recent_exchanges(
+    pool: &SqlitePool,
+    chat_id: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    let mut rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT prompt, stdout FROM runs
+          WHERE chat_id = ?
+            AND mode = 'assistant'
+            AND status = 'completed'
+            AND stdout IS NOT NULL
+            AND stdout <> ''
+            AND id > (SELECT COALESCE(MAX(id), 0) FROM runs
+                       WHERE chat_id = ? AND read_untrusted = 1)
+          ORDER BY id DESC
+          LIMIT ?",
+    )
+    .bind(chat_id)
+    .bind(chat_id)
+    .bind(HISTORY_TURNS)
+    .fetch_all(pool)
+    .await?;
+
+    // Trimmed newest-first, then flipped, so the exchanges that survive a tight budget are the
+    // recent ones. Dropping from the other end would keep the oldest and answer a question about
+    // "the second one" with the conversation from an hour ago.
+    let mut budget = HISTORY_CHARS;
+    rows.retain(|(asked, answered)| {
+        let cost = asked.chars().count() + answered.chars().count();
+        match budget.checked_sub(cost) {
+            Some(left) => {
+                budget = left;
+                true
+            }
+            None => false,
+        }
+    });
+    rows.reverse();
+    Ok(rows)
+}
+
 /// Records and drives a turn answered by the model on this machine.
 ///
 /// Deliberately NOT a variant inside `spawn_assistant_turn`. That body is almost entirely about
@@ -251,10 +316,9 @@ pub async fn send_message(
 /// Threading `Option`s through all of it to skip each in turn would make the CLI path harder to
 /// read in order to describe a path that shares three lines with it.
 ///
-/// KNOWN LIMITATION, stated here because it is invisible from outside: a local turn carries no
-/// history. The CLI path resumes a session, so "and the second one?" works there and does not work
-/// here. Fixing it means deciding how much of a chat to replay and what that costs against
-/// `TURN_NUM_CTX` — a decision of its own, not a line missing from this one.
+/// History is replayed rather than resumed. There is no session to resume — Ollama's chat endpoint
+/// has no session protocol — so `recent_exchanges` rebuilds the conversation from the run rows the
+/// turns already wrote, under the same barrier `get_session` applies on the other path.
 async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
@@ -264,6 +328,16 @@ async fn spawn_local_turn(
     // A session id even though nothing resumes it, because `budget.rs` keys spend on this column
     // and a run row that is the one kind without one is a special case every reader downstream has
     // to know about. It costs a uuid.
+    // Read BEFORE this turn's own row is inserted, so the turn cannot appear in its own history.
+    // An empty history on a database error, not a failure: a bot that answers without remembering
+    // is worse than one that remembers, and better than one that refuses to answer.
+    let history = recent_exchanges(&state.pool, &slot.chat_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read chat history; answering without it");
+            Vec::new()
+        });
+
     let session_id = crate::auth::generate_uuid_v4();
     let id = sqlx::query(
         "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
@@ -283,7 +357,7 @@ async fn spawn_local_turn(
         // Holds the chat for the length of the turn and releases it however this ends, including by
         // being aborted mid-await — the same guarantee `TurnGuard` gives the CLI path.
         let _slot = slot;
-        let outcome = assistant.answer(&text).await;
+        let outcome = assistant.answer(&history, &text).await;
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Guarded on `status = 'running'` for the reason the CLI path sets out: a `/cancel` that
@@ -707,6 +781,156 @@ mod tests {
 
         let second = send_message(&state, "tg-slot", "two", Origin::Telegram).await;
         assert!(second.is_ok(), "the slot was not released: {second:?}");
+    }
+
+    async fn record_turn(
+        pool: &SqlitePool,
+        chat_id: &str,
+        prompt: &str,
+        reply: &str,
+        read_untrusted: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, read_untrusted, created_at)
+             VALUES (?, 'completed', 'assistant', ?, ?, ?, '2026-08-09T00:00:00Z')",
+        )
+        .bind(prompt)
+        .bind(chat_id)
+        .bind(reply)
+        .bind(read_untrusted)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_comes_back_oldest_first() {
+        let pool = test_pool().await;
+        record_turn(&pool, "c", "what is running?", "two runs", 0).await;
+        record_turn(&pool, "c", "and the second?", "the calendar one", 0).await;
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(
+            history,
+            vec![
+                ("what is running?".to_string(), "two runs".to_string()),
+                ("and the second?".to_string(), "the calendar one".to_string()),
+            ]
+        );
+    }
+
+    /// The barrier, stated for a path that has no session to refuse. A local turn can `create_run`,
+    /// so replaying a turn that read a stranger's mail would hand that stranger's words to a turn
+    /// able to act on them — the exact failure `get_session` prevents on the CLI path.
+    #[tokio::test]
+    async fn history_starts_after_anything_that_read_a_strangers_words() {
+        let pool = test_pool().await;
+        record_turn(&pool, "c", "before", "old answer", 0).await;
+        record_turn(&pool, "c", "read my mail", "it says ignore all rules", 1).await;
+        record_turn(&pool, "c", "after", "fresh answer", 0).await;
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(
+            history,
+            vec![("after".to_string(), "fresh answer".to_string())],
+            "history must resume only from after the mail read"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_is_per_chat_and_only_of_answered_turns() {
+        let pool = test_pool().await;
+        record_turn(&pool, "other", "not mine", "not mine", 0).await;
+        record_turn(&pool, "c", "answered", "yes", 0).await;
+        // A failed turn has no reply; replaying its question invites the model to answer it now,
+        // out of order.
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('unanswered', 'failed', 'assistant', 'c', '2026-08-09T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(history, vec![("answered".to_string(), "yes".to_string())]);
+    }
+
+    /// A ceiling on the NUMBER of exchanges is not a ceiling: one pasted stack trace is a single
+    /// exchange and thousands of characters. What overflows the window is length.
+    #[tokio::test]
+    async fn a_long_exchange_is_dropped_and_the_recent_ones_are_kept() {
+        let pool = test_pool().await;
+        record_turn(&pool, "c", &"x".repeat(HISTORY_CHARS), "huge", 0).await;
+        record_turn(&pool, "c", "recent", "kept", 0).await;
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(
+            history,
+            vec![("recent".to_string(), "kept".to_string())],
+            "the budget must be spent newest-first"
+        );
+    }
+
+    /// End to end: the second message to a locally-answered chat must arrive with the first one
+    /// behind it, or every follow-up is answered by a bot with no memory.
+    #[tokio::test]
+    async fn a_second_local_turn_is_given_the_first() {
+        use std::sync::Mutex as StdMutex;
+
+        struct Recorder(Arc<StdMutex<Vec<serde_json::Value>>>);
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for Recorder {
+            async fn exchange(
+                &self,
+                messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                *self.0.lock().unwrap() = messages;
+                Ok(serde_json::json!({"role": "assistant", "content": "ok"}))
+            }
+        }
+        struct NoTools;
+        #[async_trait::async_trait]
+        impl crate::local_agent::ToolBox for NoTools {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            async fn call(&self, _: &str, _: &serde_json::Value) -> String {
+                unreachable!()
+            }
+        }
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let mut state = test_state().await;
+        state.local_assistant = Some(Arc::new(crate::local_agent::LocalAssistant::new(
+            Box::new(Recorder(seen.clone())),
+            Box::new(NoTools),
+        )));
+
+        let first = send_message(&state, "tg-memory", "primeira", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let second = send_message(&state, "tg-memory", "segunda", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        let messages = seen.lock().unwrap().clone();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                crate::local_agent::SYSTEM_PROMPT.to_string(),
+                "primeira".to_string(),
+                "ok".to_string(),
+                "segunda".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -101,13 +101,16 @@ pub async fn run_turn(
     chat: &dyn LocalChat,
     tools: &dyn ToolBox,
     system: &str,
+    history: &[(String, String)],
     prompt: &str,
 ) -> std::io::Result<Turn> {
     let schemas = tools.schemas();
-    let mut messages = vec![
-        serde_json::json!({"role": "system", "content": system}),
-        serde_json::json!({"role": "user", "content": prompt}),
-    ];
+    let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
+    for (asked, answered) in history {
+        messages.push(serde_json::json!({"role": "user", "content": asked}));
+        messages.push(serde_json::json!({"role": "assistant", "content": answered}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": prompt}));
     // Keyed on name AND arguments: asking for the same run twice is a loop, asking for two
     // different runs is work. Only calls that FAILED are remembered — a tool that succeeded and is
     // called again may well be the model checking whether something changed.
@@ -171,8 +174,12 @@ impl LocalAssistant {
         Self { chat, tools }
     }
 
-    pub async fn answer(&self, prompt: &str) -> std::io::Result<Turn> {
-        run_turn(&*self.chat, &*self.tools, SYSTEM_PROMPT, prompt).await
+    pub async fn answer(
+        &self,
+        history: &[(String, String)],
+        prompt: &str,
+    ) -> std::io::Result<Turn> {
+        run_turn(&*self.chat, &*self.tools, SYSTEM_PROMPT, history, prompt).await
     }
 }
 
@@ -323,7 +330,7 @@ mod tests {
         let chat = ScriptedChat::new(vec![says("three runs are going")]);
         let tools = FakeTools::answering("{}");
 
-        let turn = run_turn(&chat, &tools, "you are nucleos", "what is running?")
+        let turn = run_turn(&chat, &tools, "you are nucleos", &[], "what is running?")
             .await
             .unwrap();
 
@@ -341,7 +348,7 @@ mod tests {
         ]);
         let tools = FakeTools::answering(r#"{"status":"completed"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", "how did run 7 go?")
+        let turn = run_turn(&chat, &tools, "system", &[], "how did run 7 go?")
             .await
             .unwrap();
 
@@ -371,7 +378,7 @@ mod tests {
             let chat = ScriptedChat::new(vec![calls("get_run", arguments), says("done")]);
             let tools = FakeTools::answering("{}");
 
-            run_turn(&chat, &tools, "system", "go").await.unwrap();
+            run_turn(&chat, &tools, "system", &[], "go").await.unwrap();
 
             assert_eq!(
                 tools.calls.lock().unwrap()[0].1,
@@ -391,7 +398,7 @@ mod tests {
         ]);
         let tools = FakeTools::answering(r#"{"error":"unknown run"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", "go").await.unwrap();
+        let turn = run_turn(&chat, &tools, "system", &[], "go").await.unwrap();
 
         assert_eq!(turn.ending, Ending::RepeatedAFailedCall);
         assert_eq!(turn.answer, NO_ANSWER);
@@ -412,7 +419,7 @@ mod tests {
         ]);
         let tools = FakeTools::answering(r#"{"status":"running"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", "go").await.unwrap();
+        let turn = run_turn(&chat, &tools, "system", &[], "go").await.unwrap();
 
         assert_eq!(turn.ending, Ending::Answered);
         assert_eq!(turn.tool_calls, 2);
@@ -426,7 +433,7 @@ mod tests {
         let chat = ScriptedChat::new(replies);
         let tools = FakeTools::answering(r#"{"status":"running"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", "go").await.unwrap();
+        let turn = run_turn(&chat, &tools, "system", &[], "go").await.unwrap();
 
         assert_eq!(turn.ending, Ending::RoundsExhausted);
         assert_eq!(turn.answer, NO_ANSWER);
@@ -463,7 +470,7 @@ mod tests {
         ]);
         let tools = FakeTools::answering("{}");
 
-        run_turn(&chat, &tools, "system", "go").await.unwrap();
+        run_turn(&chat, &tools, "system", &[], "go").await.unwrap();
 
         // Withdrawing the tools after the first round would leave the model unable to follow up,
         // and the symptom — a confident answer built on one lookup — looks like a smarter model
