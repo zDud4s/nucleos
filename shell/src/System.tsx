@@ -130,6 +130,14 @@ function Sidecars({ token }: { token: string }) {
               {/* The count is the tell for a sidecar that is technically up and in fact thrashing. */}
               {one.restarts > 0 && ` · ${one.restarts} restart${one.restarts === 1 ? "" : "s"}`}
             </span>
+            {/* What it last said, which for a running sidecar is the only evidence there is.
+                `state` and `last_failure` both describe the PROCESS, so a poller that fails on
+                every cycle and never exits looks perfectly healthy in both. */}
+            {one.last_line !== null && (
+              <span className="s-said" title={one.last_line_at ?? undefined}>
+                {one.last_line}
+              </span>
+            )}
           </li>
         ))}
       </ul>

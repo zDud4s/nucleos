@@ -349,6 +349,16 @@ export interface SidecarState {
   last_failure: string | null;
   last_failure_at: string | null;
   restarts: number;
+  /**
+   * The last line the sidecar printed.
+   *
+   * The field that makes a silently-failing sidecar visible. `last_failure` describes how a process
+   * ENDED, so a poller whose every cycle fails while the process stays up has none — it read
+   * `running`, no failure, for the eight days the mailbox went unread. This is what it was saying
+   * during them. Credentials are stripped and the length is capped daemon-side.
+   */
+  last_line: string | null;
+  last_line_at: string | null;
 }
 
 export async function getSidecars(token: string): Promise<SidecarState[] | null> {

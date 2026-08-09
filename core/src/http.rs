@@ -676,7 +676,21 @@ async fn post_email_incoming(
         )
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        // Logged, not discarded. `|_|` here made a failed ingest into a 500 with an empty body and
+        // no line anywhere: the sidecar reported `daemon returned 500:` on every cycle, the cursor
+        // stayed put, and the mailbox went eight days unread with nothing in the log to say why.
+        // The message names the mailbox and the batch, because the two things worth knowing next
+        // are which mailbox stalled and whether it is one message or the whole batch that cannot
+        // land. It never names what a message SAYS — see `redact.rs`.
+        .map_err(|error| {
+            tracing::warn!(
+                mailbox = %body.mailbox,
+                batch = body.messages.len(),
+                %error,
+                "email ingest failed — the cursor stays put and the sidecar will retry"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
     })
     .await?
 }
