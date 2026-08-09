@@ -2653,6 +2653,13 @@ pub struct JobSummary {
     pub max_rounds: i64,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// The slot this job holds, or `None` if it holds none.
+    ///
+    /// Left-joined from `project_slots` rather than kept as a column on `jobs`, because the slots
+    /// table is the authority: a finished job still has its row in `jobs` and has already given the
+    /// number back. Copying the slot onto `jobs` would give two truths that can disagree, and the
+    /// one the daemon obeys would be the other.
+    pub slot: Option<i64>,
 }
 
 /// One item of a job's queue, as the shell shows it.
@@ -2685,10 +2692,16 @@ pub struct JobDetail {
     pub branch: Option<String>,
 }
 
+/// The owner-kind predicate belongs in the `ON` clause and not in a `WHERE`. In a `WHERE` it would
+/// turn the left join into an inner one and drop every job holding no slot — which is most of them.
 const ONE_SUMMARY_SQL: &str =
-    "SELECT id, project_id, rule_name, status, wait_reason, max_items, round, max_rounds,
-        created_at, completed_at
-     FROM jobs WHERE id = ?";
+    "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
+            jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at, jobs.completed_at,
+            project_slots.slot AS slot
+     FROM jobs
+     LEFT JOIN project_slots
+       ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
+     WHERE jobs.id = ?";
 
 /// The most recent jobs, newest first.
 ///
@@ -2702,9 +2715,13 @@ pub async fn list(
     match project_id {
         Some(project_id) => {
             sqlx::query_as(
-                "SELECT id, project_id, rule_name, status, wait_reason, max_items, round,
-                    max_rounds, created_at, completed_at
-             FROM jobs WHERE project_id = ? ORDER BY id DESC LIMIT ?",
+                "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
+                        jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at,
+                        jobs.completed_at, project_slots.slot AS slot
+                 FROM jobs
+                 LEFT JOIN project_slots
+                   ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
+                 WHERE jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?",
             )
             .bind(project_id)
             .bind(limit)
@@ -2713,9 +2730,13 @@ pub async fn list(
         }
         None => {
             sqlx::query_as(
-                "SELECT id, project_id, rule_name, status, wait_reason, max_items, round,
-                    max_rounds, created_at, completed_at
-             FROM jobs ORDER BY id DESC LIMIT ?",
+                "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
+                        jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at,
+                        jobs.completed_at, project_slots.slot AS slot
+                 FROM jobs
+                 LEFT JOIN project_slots
+                   ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
+                 ORDER BY jobs.id DESC LIMIT ?",
             )
             .bind(limit)
             .fetch_all(pool)
@@ -4238,6 +4259,41 @@ mod tests {
             "newest first, and the finished one is still there"
         );
         assert_eq!(list(&pool, None, 20).await.unwrap().len(), 3);
+    }
+
+    /// The canvas draws a slot, and this is what ties one to the job holding it. `None` for a
+    /// finished job is not a serialisation detail: a job that ended has already given the number
+    /// back, and saying it still holds one would make the column count work that does not exist.
+    #[tokio::test]
+    async fn a_jobs_summary_carries_the_slot_it_holds_and_drops_it_when_it_ends() {
+        let pool = test_pool().await;
+        let live = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let done = seed_job(&pool, "project-a", "completed").await.unwrap();
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(live))
+            .await
+            .unwrap();
+
+        let listed = list(&pool, Some("project-a"), 20).await.unwrap();
+
+        let live_row = listed.iter().find(|row| row.id == live).unwrap();
+        let done_row = listed.iter().find(|row| row.id == done).unwrap();
+        assert_eq!(live_row.slot, Some(0));
+        assert_eq!(done_row.slot, None);
+    }
+
+    /// Job ids and run ids come from different sequences and collide constantly. A join on the id
+    /// alone would hand this job the slot belonging to the run that shares its number.
+    #[tokio::test]
+    async fn a_job_does_not_borrow_the_slot_of_the_run_with_its_number() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Run(job_id))
+            .await
+            .unwrap();
+
+        let listed = list(&pool, Some("project-a"), 20).await.unwrap();
+
+        assert_eq!(listed[0].slot, None, "that slot is the run's, not this job's");
     }
 
     // ---- resolving a request into a start ------------------------------------------------------
