@@ -110,7 +110,12 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
                         after_end + END_MARK.len() + offset + "-----".len()
                     })
             }
-            None => start + header_end + base64_body_len(&input[start + header_end..]),
+            None => {
+                // Past the `-----` that closes the header, not just up to it, or the marker lands
+                // before the dashes and leaves them in the text.
+                let body_start = start + header_end + "-----".len();
+                body_start + base64_body_len(&input[body_start..])
+            }
         };
 
         findings.push(Finding {
@@ -129,19 +134,29 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
 /// Used only when the END line is missing, to bound a truncated block. Stopping at the first line
 /// that is not base64 is what keeps a key with no footer from redacting the paragraph after it.
 fn base64_body_len(input: &str) -> usize {
+    /// PEM wraps at 64 characters, so a body line is long. The bound is what stops a sign-off being
+    /// eaten: "Cumprimentos" and "Duarte" are punctuation-free single words and were being read as
+    /// key material, which redacted the end of a message rather than the end of a key.
+    const MIN_BODY_LINE: usize = 16;
+
     let mut consumed = 0;
     for line in input.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\n', '\r']);
-        let is_body = !trimmed.is_empty()
-            && trimmed
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'));
         // The header's own trailing newline is consumed before any body line is examined.
         if consumed == 0 && trimmed.is_empty() {
             consumed += line.len();
             continue;
         }
-        if !is_body {
+
+        let charset_ok = trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'));
+
+        // Length is the whole discriminator, and it is enough: the words that ended a message and
+        // were being eaten — Obrigado, Cumprimentos, Duarte — are all shorter than this, while PEM
+        // wraps at 64. Requiring a digit or padding character as well was tried and is wrong: a
+        // short base64 line legitimately has neither.
+        if trimmed.len() < MIN_BODY_LINE || !charset_ok {
             break;
         }
         consumed += line.len();
@@ -342,7 +357,12 @@ const NUMBER_TRIGGERS: &[&str] = &[
 /// that a word in the previous sentence does not vouch for a number in this one.
 const TRIGGER_WINDOW_CHARS: usize = 40;
 
-/// Whether one of `NUMBER_TRIGGERS` appears just before `start`.
+/// Whether one of `NUMBER_TRIGGERS` appears as a WORD just before `start`.
+///
+/// Whole words, not substrings, and the difference is the whole rule rather than a nicety.
+/// "contains" ends in "conta", "discarded" contains "card", and "private" contains "vat" — so a
+/// substring test re-armed the exact corruption this gate exists to prevent, and did it on
+/// sentences as ordinary as "the message contains 100000002 bytes".
 fn trigger_precedes(input: &str, start: usize) -> bool {
     let before = &input[..start];
     let window_start = before
@@ -351,8 +371,11 @@ fn trigger_precedes(input: &str, start: usize) -> bool {
         .take(TRIGGER_WINDOW_CHARS)
         .last()
         .map_or(0, |(index, _)| index);
-    let window = before[window_start..].to_lowercase();
-    NUMBER_TRIGGERS.iter().any(|word| window.contains(word))
+
+    before[window_start..]
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| NUMBER_TRIGGERS.contains(&word))
 }
 
 /// PURE: what a compacted, space-free run of characters proves itself to be, if anything.
@@ -662,6 +685,46 @@ mod tests {
         assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
         // Bounded by where the base64 stops, so the sentence after it survives.
         assert!(redacted.contains("and that is all"), "{redacted:?}");
+    }
+
+    /// The bound has to survive a sign-off, not just a blank line. "Cumprimentos" and "Duarte" are
+    /// punctuation-free single words, which an earlier version read as key material — redacting the
+    /// end of the message along with the end of the key.
+    #[test]
+    fn a_footerless_key_does_not_swallow_the_sign_off() {
+        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nDuarte";
+        let redacted = redact_secrets(input);
+
+        assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
+        assert!(redacted.contains("Obrigado"), "{redacted:?}");
+        assert!(redacted.ends_with("Duarte"), "{redacted:?}");
+    }
+
+    /// The substring bug this gate had at first: "contains" ends in "conta", "discarded" contains
+    /// "card", "private" contains "vat". Each re-armed the corruption the gate exists to prevent,
+    /// on sentences as ordinary as these.
+    #[test]
+    fn a_trigger_inside_a_longer_word_does_not_vouch_for_a_number() {
+        for input in [
+            "the message contains 100000002 bytes",
+            "discarded 1786000000003 rows",
+            "private buffer 100000002 wide",
+            "the account was 100000002",
+        ] {
+            let redacted = redact_secrets(input);
+            let vouched = input.to_lowercase().split_whitespace().any(|word| {
+                super::NUMBER_TRIGGERS
+                    .contains(&word.trim_matches(|c: char| !c.is_alphanumeric()))
+            });
+            if vouched {
+                assert_ne!(
+                    redacted, input,
+                    "{input:?} names the number and was not redacted"
+                );
+            } else {
+                assert_eq!(redacted, input, "{input:?} was redacted by a substring match");
+            }
+        }
     }
 
     /// A malformed block used to `break`, abandoning the scan — so one bad header disarmed the

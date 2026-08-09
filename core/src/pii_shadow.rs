@@ -219,16 +219,32 @@ pub async fn observe_pending(
             }
         };
 
-        // An unreadable answer is left unrecorded, so the next sweep tries it again. Marking it as
-        // looked-at would be permanent — the `NOT EXISTS` clause above never revisits a summary
-        // with a row — and it would record "clean" for something nobody managed to read, quietly
-        // inflating the very denominator this table exists to produce.
-        let Some(observations) = observations else {
-            tracing::warn!(
-                email_id = id,
-                "pii shadow: unreadable answer, leaving this summary for the next sweep"
-            );
-            continue;
+        // An answer nobody could read is recorded as `unreadable`, which is neither a finding nor a
+        // clean reading — it is its own outcome and its own measurement.
+        //
+        // Leaving it unrecorded to be retried was the first attempt and it deadlocks the sweep:
+        // the query takes the twenty newest unobserved summaries, so twenty the model garbles
+        // deterministically are twenty it garbles again every fifteen minutes, and everything older
+        // is never reached. A frozen denominator is worse than an honest gap in it.
+        let observations = match observations {
+            Some(observations) => observations,
+            None => {
+                tracing::warn!(email_id = id, "pii shadow: answer could not be read");
+                written += record(
+                    pool,
+                    "emails",
+                    id,
+                    "triage_summary",
+                    &[Observation {
+                        class: "unreadable".to_string(),
+                        excerpt: String::new(),
+                        confidence: None,
+                    }],
+                    now,
+                )
+                .await?;
+                continue;
+            }
         };
 
         // A summary with nothing in it still has to be marked as looked at, or every sweep for ever
@@ -418,11 +434,14 @@ mod tests {
         assert_eq!(tally(&pool).await.unwrap(), vec![("none".to_string(), 1)]);
     }
 
-    /// The failure the `none` mark is most at risk of. A garbled answer must leave NO row: the
-    /// sweep's `NOT EXISTS` clause never revisits a summary that has one, so recording it would
-    /// permanently count an unread summary as clean and inflate the denominator.
+    /// A garbled answer is its own outcome, neither a finding nor a clean reading.
+    ///
+    /// Recording it as `none` would permanently count an unread summary as clean. Recording nothing
+    /// at all — the first attempt at this fix — deadlocks the sweep instead: the query takes the
+    /// twenty newest unobserved summaries, so twenty the model garbles deterministically are twenty
+    /// it garbles again every fifteen minutes, and everything older is never reached.
     #[tokio::test]
-    async fn a_summary_the_model_garbled_is_left_for_the_next_sweep() {
+    async fn a_summary_the_model_garbled_is_recorded_as_unreadable_not_as_clean() {
         let pool = test_pool().await;
         triaged_email(&pool, 1, "pedido de orçamento").await;
         let client = reqwest::Client::new();
@@ -431,15 +450,41 @@ mod tests {
         let written = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T00:00:00Z")
             .await
             .unwrap();
-        assert_eq!(written, 0);
-        assert!(tally(&pool).await.unwrap().is_empty());
 
-        // And it is still pending, so a working model later still gets to look at it.
-        let working = stub_ollama("[]").await;
-        let retried = observe_pending(&pool, &client, &working, "m", "2026-08-09T01:00:00Z")
+        assert_eq!(written, 1);
+        assert_eq!(
+            tally(&pool).await.unwrap(),
+            vec![("unreadable".to_string(), 1)],
+            "an unread summary must not be counted as clean"
+        );
+
+        // And the sweep moves on rather than reconsidering it for ever.
+        let again = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T01:00:00Z")
             .await
             .unwrap();
-        assert_eq!(retried, 1, "the summary was not left for the next sweep");
+        assert_eq!(again, 0, "the sweep is stuck on a summary it cannot read");
+    }
+
+    /// The sweep must reach older summaries even when the newest ones cannot be read. Without a
+    /// mark on the unreadable ones, a full batch of them starves everything behind.
+    #[tokio::test]
+    async fn unreadable_summaries_do_not_starve_the_ones_behind_them() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "o mais antigo").await;
+        triaged_email(&pool, 2, "o mais recente").await;
+        let client = reqwest::Client::new();
+
+        let garbled = stub_ollama("not json").await;
+        observe_pending(&pool, &client, &garbled, "m", "2026-08-09T00:00:00Z")
+            .await
+            .unwrap();
+
+        let counts = tally(&pool).await.unwrap();
+        assert_eq!(
+            counts,
+            vec![("unreadable".to_string(), 2)],
+            "both summaries must have been looked at in one sweep"
+        );
     }
 
     /// The table must not outlive what it describes. Without the trigger, deleting a message would

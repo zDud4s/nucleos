@@ -363,22 +363,28 @@ async fn spawn_local_turn(
         // refused with 409 until the daemon restarts. The HTTP client has its own per-exchange
         // timeout; this one bounds the whole turn, including a loop that keeps making progress
         // slowly.
-        let outcome = match tokio::time::timeout(run_timeout, assistant.answer(&history, &text))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the local model did not finish this turn in time",
-            )),
-        };
+        let outcome = tokio::time::timeout(run_timeout, assistant.answer(&history, &text)).await;
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Guarded on `status = 'running'` for the reason the CLI path sets out: a `/cancel` that
         // already wrote its status can still be followed by one last wake-up here, and an unguarded
         // write would report a completed turn for one that was killed.
         let written = match outcome {
-            Ok(turn) => {
+            // `timed_out`, not `failed`, matching the CLI path below. A wall-clock kill is a
+            // distinct ending there and anything filtering runs by it would simply not see a local
+            // turn — the status is what the rest of the system reads, so it has to mean the same
+            // thing whichever runner produced it.
+            Err(_) => {
+                tracing::warn!(run_id = id, "local turn exceeded the wall clock");
+                sqlx::query(
+                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+            }
+            Ok(Ok(turn)) => {
                 if turn.ending != crate::local_agent::Ending::Answered {
                     // Worth a log line and not worth an error: the person gets a usable sentence
                     // either way, and this is the only place recording WHY it was that sentence.
@@ -400,7 +406,7 @@ async fn spawn_local_turn(
             }
             // Transport failure: Ollama stopped, or the model was pulled out from under us. The
             // chat is told rather than handed a silence it cannot interpret.
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(run_id = id, %error, "local turn failed");
                 sqlx::query(
                     "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",

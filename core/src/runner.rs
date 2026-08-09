@@ -819,10 +819,16 @@ impl OllamaChat {
             // A client timeout, not a default client. `reqwest::Client::new()` waits for ever, and
             // for ever here means the chat slot is never released and every later message in that
             // chat is refused with 409 until the daemon restarts.
+            // `expect` rather than `unwrap_or_default`, which read like a fallback and is not one:
+            // `Client::default()` is `Client::new()`, which builds with the same settings and
+            // panics on the same failure — so the "fallback" would panic identically, one line
+            // later, with a message naming nothing. The causes are TLS backend and proxy
+            // environment problems, which are startup misconfiguration; saying so is worth more
+            // than pretending to recover.
             client: reqwest::Client::builder()
                 .timeout(OLLAMA_EXCHANGE_TIMEOUT)
                 .build()
-                .unwrap_or_default(),
+                .expect("HTTP client for the local model (check TLS and proxy environment)"),
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
         }
