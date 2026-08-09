@@ -494,6 +494,11 @@ struct GrepQuery {
 struct AssistantMessageRequest {
     chat_id: String,
     text: String,
+    /// Which client is asking, so the daemon routes the turn without inferring it from the shape of
+    /// `chat_id`. Absent means the shell, which is what every caller written before this field
+    /// existed means too.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1548,7 +1553,8 @@ async fn post_assistant_message(
     // reports it running forever and `/cancel` answers 404. The Telegram sidecar is the caller, and
     // it gives up on a turn after a timeout, so the disconnect is routine rather than theoretical.
     let outcome = uncancellable(async move {
-        crate::assistant::send_message(&state, &body.chat_id, &body.text).await
+        let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
+        crate::assistant::send_message(&state, &body.chat_id, &body.text, origin).await
     })
     .await?;
 
@@ -3096,6 +3102,7 @@ mod tests {
                 runner: Arc::new(FakeCommandRunner::default()),
                 triage_runner: None,
                 local_triage_disabled: None,
+                local_assistant: None,
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
@@ -3442,6 +3449,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
@@ -5555,6 +5563,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

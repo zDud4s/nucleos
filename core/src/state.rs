@@ -217,6 +217,15 @@ pub struct AppState {
     /// to the remote CLI there would violate that at exactly the moment nobody is watching, so triage
     /// stops instead and mail queues, the same way it already does for the kill switch and the budget.
     pub local_triage_disabled: Option<String>,
+    /// The model on this machine that answers chat turns which asked to be answered here.
+    ///
+    /// `None` is the ship-dark default and means every turn goes to `runner` above, exactly as
+    /// before. Unlike `triage_runner`, a failed probe here needs no separate "disabled" field and
+    /// falls back instead of stopping — the two protect different things. Local triage exists so
+    /// mail bodies do not leave, and falling back would defeat it. A local chat turn reads only the
+    /// daemon's own state, so answering it in the cloud is what already happens today rather than a
+    /// leak the operator asked to prevent.
+    pub local_assistant: Option<Arc<crate::local_agent::LocalAssistant>>,
     /// Read-only after startup, so it is shared rather than copied per clone of the state.
     pub email: Arc<EmailRuntime>,
     /// The voice pillar's settings, its transcriber and its HTTP client, resolved once at startup.

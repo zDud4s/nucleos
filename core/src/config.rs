@@ -18,6 +18,14 @@ pub struct ModelsConfig {
     /// name, the same posture `local_triage_model` gives local inference.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub primary_runner: Option<String>,
+    /// Absent leaves chat turns from the Telegram sidecar answered by the cloud CLI, exactly as they
+    /// are today. Naming a model here is what moves them onto this machine.
+    ///
+    /// Ship-dark like `local_triage_model` and `primary_runner`, and here it matters more than for
+    /// either: this key changes the behaviour of a channel already in daily use, so an upgrade must
+    /// change nothing at all until somebody asks for it by name.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub local_assistant_model: Option<String>,
 }
 
 impl Default for ModelsConfig {
@@ -28,6 +36,7 @@ impl Default for ModelsConfig {
             local_triage_model: None,
             voice_cleanup_model: None,
             primary_runner: None,
+            local_assistant_model: None,
         }
     }
 }

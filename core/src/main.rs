@@ -22,6 +22,7 @@ mod hooks;
 mod http;
 mod inspect;
 mod job;
+mod local_agent;
 mod logging;
 mod mailsend;
 mod mcp_tools;
@@ -435,12 +436,72 @@ async fn main() {
         None
     };
 
+    // The model that answers a chat turn asking to be answered on this machine.
+    //
+    // Probed exactly like local triage and voice cleanup, against this feature's own window: a turn
+    // accumulates its tool schemas and every result on each round, so it needs more room than a
+    // single triage prompt and the probe has to say so or Ollama silently truncates the middle of a
+    // conversation.
+    //
+    // A failed probe falls back rather than disabling, which is the opposite of local triage and for
+    // a reason worth stating: triage refuses because the alternative is mail bodies leaving the
+    // machine, while this turn reads only the daemon's own state, so the fallback is what already
+    // happens today. Warning and carrying on is right here and would be wrong there.
+    let local_assistant = match models_config.local_assistant_model.clone() {
+        Some(model) => {
+            let probe = match reqwest::Client::new()
+                .post(format!("{}/api/show", runner::OLLAMA_BASE_URL))
+                .json(&serde_json::json!({ "model": &model }))
+                .send()
+                .await
+            {
+                Ok(response) => match response.text().await {
+                    Ok(body) => {
+                        runner::interpret_context_probe(&body, local_agent::TURN_NUM_CTX)
+                    }
+                    Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
+                        "could not read the local assistant probe response: {error}"
+                    ))),
+                },
+                Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
+                    "could not reach the loopback Ollama endpoint: {error}"
+                ))),
+            };
+            match runner::local_triage_decision(probe) {
+                runner::LocalTriageDecision::Enabled => {
+                    tracing::info!(%model, "local assistant enabled for chat turns that ask for it");
+                    Some(Arc::new(local_agent::LocalAssistant::new(
+                        Box::new(runner::OllamaChat::new(
+                            runner::OLLAMA_BASE_URL.to_string(),
+                            model,
+                        )),
+                        // Loopback to this same daemon, holding the control token it just loaded.
+                        // The tools are the ones the MCP subprocess exposes, through the same
+                        // handlers, so a local turn and a cloud turn cannot disagree about what a
+                        // tool does — only about which ones they are offered.
+                        Box::new(mcp_tools::LocalToolBox::new(
+                            "http://127.0.0.1:8791".to_string(),
+                            token_value.clone(),
+                            pool.clone(),
+                        )),
+                    )))
+                }
+                runner::LocalTriageDecision::Disabled(reason) => {
+                    tracing::warn!(%model, %reason, "local assistant disabled; chat turns stay on the CLI");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     let state = AppState {
         token: Token(token_value),
         pool,
         runner: primary_runner,
         triage_runner,
         local_triage_disabled,
+        local_assistant,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
