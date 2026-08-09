@@ -54,6 +54,29 @@ struct RawObservation {
 /// being dropped, because an unexpected class is a finding about the prompt.
 const KNOWN_CLASSES: &[&str] = &["name", "address", "health", "financial"];
 
+/// The sampling grammar handed to Ollama, forcing the answer to BE the array this parses.
+///
+/// A schema, not `"format": "json"`, and the difference is not cosmetic: `"json"` constrains the
+/// answer to a JSON *object*, so a model asked for a list of findings returns the first one alone —
+/// `{"class":"financial","excerpt":"IBAN",...}`. `parse_observations` reads that as unreadable, so
+/// against a real model every summary would have been recorded `unreadable` and the table would
+/// have measured nothing at all. Verified against qwen3.5:4b, which returns a bare object under
+/// `"json"` and a correct array under this.
+fn answer_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "class": {"type": "string"},
+                "excerpt": {"type": "string"},
+                "confidence": {"type": "number"}
+            },
+            "required": ["class", "excerpt"]
+        }
+    })
+}
+
 /// The instruction given to the local model.
 ///
 /// It asks for spans that are actually present, and the `excerpt` requirement is what makes that
@@ -204,7 +227,7 @@ pub async fn observe_pending(
             model,
             &prompt_for("triage_summary", &summary),
             serde_json::json!({"num_ctx": crate::triage::LOCAL_NUM_CTX}),
-            Some(serde_json::json!("json")),
+            Some(answer_schema()),
             false,
         )
         .await;
@@ -384,19 +407,59 @@ mod tests {
         assert_eq!(tally(&pool).await.unwrap(), vec![("name".to_string(), 1)]);
     }
 
-    /// Stands up a stub Ollama that answers the same body every time, and returns its base URL.
-    async fn stub_ollama(answer: &'static str) -> String {
-        let app = axum::Router::new().fallback(axum::routing::post(move || async move {
-            axum::Json(serde_json::json!({
-                "message": {"role": "assistant", "content": answer}
-            }))
-        }));
+    type SeenBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// Stands up a stub Ollama that answers the same body every time, and records what it was sent.
+    async fn stub_ollama_capturing(answer: &'static str) -> (String, SeenBodies) {
+        let seen: SeenBodies = SeenBodies::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": answer}
+                    }))
+                }
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{address}")
+        (format!("http://{address}"), seen)
+    }
+
+    async fn stub_ollama(answer: &'static str) -> String {
+        stub_ollama_capturing(answer).await.0
+    }
+
+    /// The wire format, read from the wire. This is the assertion that would have caught the bug a
+    /// real model found: `"format": "json"` constrains Ollama to a JSON OBJECT, so a model asked
+    /// for a list returned the first finding alone, `parse_observations` read it as unreadable, and
+    /// every summary would have been recorded `unreadable` for ever. Asserting on the OUTCOME could
+    /// not catch it, because a stub answers whatever it was told to.
+    #[tokio::test]
+    async fn the_request_asks_for_an_array_and_not_merely_for_json() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "resumo").await;
+        let (base, seen) = stub_ollama_capturing("[]").await;
+
+        observe_pending(&pool, &reqwest::Client::new(), &base, "m", "2026-08-09T00:00:00Z")
+            .await
+            .unwrap();
+
+        let body = &seen.lock().unwrap()[0];
+        assert_eq!(
+            body["format"]["type"], "array",
+            "the grammar must force an array; {body}"
+        );
+        assert_eq!(body["format"]["items"]["required"][0], "class");
+        // Stated explicitly for the reason `voice.rs` records: Ollama truncates silently against
+        // its own default window.
+        assert_eq!(body["options"]["num_ctx"], crate::triage::LOCAL_NUM_CTX as i64);
     }
 
     async fn triaged_email(pool: &sqlx::SqlitePool, id: i64, summary: &str) {
