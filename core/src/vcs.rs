@@ -322,6 +322,47 @@ pub async fn resolve_repo(
     })
 }
 
+/// PURE: the merge a shell command asks for, in the queue's own terms, or `None`.
+///
+/// `git merge X`, in a worktree whose HEAD is on `B`, means "bring X into B" — which is
+/// `Merge { source: X, target: B }`, the shape the queue already executes. The queue performs it in
+/// the integration worktree and moves the holder's worktree afterwards when the holder is the one
+/// standing on `B`, which is the case this whole pillar was written around.
+///
+/// **The strictest possible reading: exactly `git merge <ref>`, three tokens, nothing else.** Not
+/// because more could not be parsed, but because everything else is a DIFFERENT operation.
+/// `--no-ff` asks for a merge commit and `publish` is `--ff-only`; `--squash` does not merge at all;
+/// `--abort` unwinds one; a second ref is an octopus merge. A caller whose spelling is not this one
+/// keeps exactly the behaviour it has always had, rather than having the queue perform something
+/// adjacent to what it wrote.
+///
+/// **This is not the shell parsing `classifier.rs` exists to keep closed, and the difference is
+/// where the output goes.** Nothing here reaches an argv: both names pass through `Branch` — the
+/// argv guard — and `git_exec` builds its own command line from the typed value. The worst a
+/// misreading can do is refuse, or name a branch git will not resolve; it cannot inject. That is
+/// also why the verb is folded for comparison and the REF is not: git is case-sensitive about
+/// branch names and this must not quietly rename one.
+///
+/// A `target` of `HEAD` is refused rather than passed on. It is what `rev-parse --abbrev-ref` says
+/// for a detached HEAD, and it is meaningless as a merge target besides — the integration worktree's
+/// own HEAD is always detached, so publishing "into HEAD" names nothing.
+pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, source] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("merge") {
+        return None;
+    }
+    if current_branch.trim() == "HEAD" {
+        return None;
+    }
+    Some(Op::Merge {
+        source: Branch::new(source).ok()?,
+        target: Branch::new(current_branch).ok()?,
+    })
+}
+
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
 /// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
@@ -335,6 +376,29 @@ pub async fn submit(
     op: &Op,
     origin: Origin,
 ) -> sqlx::Result<i64> {
+    submit_on(pool, repo, op, origin).await
+}
+
+/// `submit`, against a caller's own executor, so an admission can be part of a larger transaction.
+///
+/// It exists for one caller: approving a paused run's merge (`runs::resume_approved_run`) has to
+/// admit the request in the SAME transaction that approves the proposal and resumes the run.
+/// Neither order works outside one: admit-then-commit can queue a merge whose approval then rolls
+/// back — an irreversible publication nobody authorised, and a proposal still pending so a human
+/// can authorise it a second time — and commit-then-admit can resume a run told its merge is
+/// queued when it is not.
+///
+/// Generic over the executor rather than taking a `&mut Transaction`, because `&SqlitePool` is one
+/// too: `submit` is this function, and there is no second copy of the INSERT to drift from it.
+pub async fn submit_on<'e, E>(
+    executor: E,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let status = if origin.needs_approval() {
         "awaiting_approval"
     } else {
@@ -354,7 +418,7 @@ pub async fn submit(
     .bind(origin.run_id())
     .bind(status)
     .bind(created_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.last_insert_rowid())
 }
@@ -647,13 +711,20 @@ pub struct Ticket {
 /// older version or edited by hand, and one such row must not be able to fail the whole listing —
 /// the listing is exactly where somebody would go to find out that a row is wrong.
 /// `FromRow` rather than a positional tuple, for the reason `runs.rs` states: a tuple makes the
-/// column-order-to-field-order correspondence load-bearing and invisible, and five of these six
+/// column-order-to-field-order correspondence load-bearing and invisible, and six of these seven
 /// fields are `String`, so a swap would compile and pass.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestSummary {
     pub id: i64,
     pub op: String,
     pub project_id: String,
+    /// What the queue locked on for this row, and therefore what the listing is grouped by.
+    ///
+    /// Carried ALONGSIDE `project_id` rather than instead of it. The project is the label a reader
+    /// recognises; the key is the only thing that says whether two differently-labelled rows were
+    /// competing for the same refs. Without it, a listing that contains another project's work
+    /// reads as a bug in the listing rather than as the fact it is reporting.
+    pub repo_key: String,
     pub origin: String,
     pub status: String,
     pub created_at: String,
@@ -673,14 +744,37 @@ const LIST_LIMIT: i64 = 200;
 ///
 /// Newest first because the question a listing answers is almost always "what just happened", and a
 /// caller reading a truncated oldest-first list would be reading history while missing the present.
+///
+/// **Narrowed by REPOSITORY, though the caller names a project.** The lock this queue takes is on
+/// the repository, so two projects pointing at one checkout share a queue and compete for the same
+/// refs. A listing that filtered on `project_id` would hand each of them a view with the other's
+/// operations missing — which is the single fact about this queue a listing must not hide, and it
+/// was the abbreviation this function shipped with while `project_id` and the key were still the
+/// same thing.
+///
+/// The key is read from the TABLE, not from `resolve_repo`, and that is deliberate twice over.
+/// A listing must not need a git subprocess: it is where somebody goes when something is already
+/// wrong, and a project whose directory has moved or gone would then have no listing at all rather
+/// than a listing of what it did. And the row's own `repo_key` is the better authority anyway — it
+/// is what the queue actually locked on at the time, which is not necessarily what the disk would
+/// say now.
+///
+/// A project with nothing queued yet makes the subquery NULL, so the comparison is NULL and the
+/// listing is empty. That is the right answer and not an accident of SQL: nothing has been queued
+/// for it, so there is no repository to widen to.
 pub async fn list(
     pool: &sqlx::SqlitePool,
     project_id: Option<&str>,
 ) -> sqlx::Result<Vec<RequestSummary>> {
     sqlx::query_as(
-        "SELECT id, op, project_id, origin, status, created_at
+        "SELECT id, op, project_id, repo_key, origin, status, created_at
            FROM vcs_requests
-          WHERE ?1 IS NULL OR project_id = ?1
+          WHERE ?1 IS NULL
+             OR repo_key = (
+                  SELECT repo_key FROM vcs_requests
+                   WHERE project_id = ?1
+                   ORDER BY id DESC LIMIT 1
+                )
           ORDER BY id DESC
           LIMIT ?2",
     )
@@ -1387,6 +1481,55 @@ mod tests {
         pool
     }
 
+    /// An empty database with the schema exactly as it stood after migration `version`.
+    ///
+    /// **This is what makes a DATA migration testable at all in this repository.**
+    /// `sqlx::migrate!().run()` applies the whole chain against empty tables, so every `UPDATE` in
+    /// every migration has always been unreachable by the suite: delete one and nothing goes red.
+    /// `email.rs:812` records the same limitation, and the vcs pillar's own handoff carries it as the
+    /// one untested guarantee it could not close. Stopping the chain part-way and putting rows in the
+    /// gap is all it needed.
+    ///
+    /// The migrator's own list is walked rather than the files read directly, so this cannot drift
+    /// from what ships: the SQL is the SQL that will run on the real database, in the order it will
+    /// run there. Nothing is written to `_sqlx_migrations` — the bookkeeping is not what is under
+    /// test, and a caller finishes the chain with `apply_migrations_after`.
+    ///
+    /// Not vcs-specific. It lives here because 0049 is the first data migration anybody tried to
+    /// test; the second module to need it should move it somewhere neutral rather than copy it.
+    pub(crate) async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        apply_migrations(&pool, |candidate| candidate <= version).await;
+        pool
+    }
+
+    pub(crate) async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64) {
+        apply_migrations(pool, |candidate| candidate > version).await;
+    }
+
+    async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool) {
+        for migration in sqlx::migrate!("./migrations").iter() {
+            if !wanted(migration.version) {
+                continue;
+            }
+            // `raw_sql` rather than `query`: a migration is many statements, and `query` runs the
+            // first and silently drops the rest — which would have made this harness quietly test
+            // a fraction of each file.
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(pool)
+                .await
+                .unwrap_or_else(|error| panic!("migration {} failed: {error}", migration.version));
+        }
+    }
+
     fn repo() -> ResolvedRepo {
         repo_for("alpha")
     }
@@ -1726,6 +1869,204 @@ mod tests {
         assert!(
             claim_next(&pool, "SHARED").await.unwrap().is_none(),
             "the second project claimed the repository the first is holding"
+        );
+    }
+
+    /// Migration 0049's data half, which until now nothing could reach.
+    ///
+    /// Both `UPDATE`s in that file could be deleted with the whole suite green, and it is the one
+    /// instruction in this pillar that runs exactly once, on a real database, with no rehearsal.
+    /// What it has to get right is a pair: the backfill must key every existing row, and every row
+    /// that was still LIVE must be retired — because a backfilled key is a project LABEL, so a
+    /// surviving `queued` row would be claimable under `alpha` while a new request for the same
+    /// repository holds its real key, which is two operations against one repository and the exact
+    /// defect the migration exists to remove.
+    #[tokio::test]
+    async fn migration_0049_keys_every_row_and_retires_the_live_ones() {
+        let pool = pool_migrated_through(48).await;
+
+        // The pre-0049 shape: no `repo_key` column exists yet, which is itself part of the test —
+        // naming it here would fail to compile against the schema this row is written into.
+        for (id, status) in [
+            (1, "queued"),
+            (2, "running"),
+            (3, "awaiting_approval"),
+            (4, "succeeded"),
+            (5, "failed"),
+            (6, "cancelled"),
+        ] {
+            sqlx::query(
+                "INSERT INTO vcs_requests
+                 (id, op, args, project_id, project_root, origin, status, created_at)
+                 VALUES (?, 'merge', ?, 'alpha', 'C:/repo', 'human', ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(MERGE_ARGS)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        apply_migrations_after(&pool, 48).await;
+
+        // Named rather than a tuple, for the reason `RequestSummary` gives two hundred lines up:
+        // four of these five are `Option<String>` or `String`, so a positional read of the wrong
+        // column would compile and pass. Clippy asks for the same thing from the other direction.
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            repo_key: String,
+            status: String,
+            failure_reason: Option<String>,
+            finished_at: Option<String>,
+        }
+
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT repo_key, status, failure_reason, finished_at FROM vcs_requests ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            rows.iter().all(|row| row.repo_key == "alpha"),
+            "every row is keyed from its project_id: {rows:?}"
+        );
+
+        let statuses: Vec<&str> = rows.iter().map(|row| row.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "interrupted",
+                "interrupted",
+                "interrupted",
+                "succeeded",
+                "failed",
+                "cancelled"
+            ],
+            "the three live rows are retired and the three terminal ones are left exactly as they were"
+        );
+
+        let retired = &rows[0];
+        assert!(
+            retired
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resubmit")),
+            "a retired row has to say why, or its owner cannot know to ask again: {retired:?}"
+        );
+        // Deliberately NOT stamped, and the migration argues why at length: the daemon does not know
+        // when these ended, and SQLite's `datetime('now')` does not even sort with its neighbours.
+        assert_eq!(retired.finished_at, None);
+    }
+
+    /// The one spelling that becomes a queued merge, and its neighbours that must not.
+    ///
+    /// Each rejection is a different operation wearing a similar command line, and queueing any of
+    /// them would perform something the caller did not write: `--no-ff` wants a merge commit where
+    /// `publish` fast-forwards, `--squash` does not merge, `--abort` unwinds, two refs is an
+    /// octopus. `-X` is there to pin that `Branch` — the argv guard — is actually applied, and not
+    /// merely available.
+    #[test]
+    fn only_a_bare_git_merge_becomes_a_queued_operation() {
+        assert_eq!(
+            merge_from_command("git merge feature", "master"),
+            Some(Op::Merge {
+                source: "feature".into(),
+                target: "master".into(),
+            })
+        );
+        // The verb is folded because a shell is not case-sensitive about it; the REF is not,
+        // because git is, and a queued merge of `Feature` is not a merge of `feature`.
+        assert_eq!(
+            merge_from_command("GIT MERGE Feature", "master"),
+            Some(Op::Merge {
+                source: "Feature".into(),
+                target: "master".into(),
+            })
+        );
+
+        for command in [
+            "git merge --no-ff feature",
+            "git merge --squash feature",
+            "git merge --abort",
+            "git merge feature other",
+            "git merge",
+            "git status",
+            "git merge -X",
+        ] {
+            assert_eq!(merge_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// A worktree with no branch checked out has no merge target, and `HEAD` is exactly what
+    /// `rev-parse --abbrev-ref` answers for one. Queueing that would name nothing.
+    #[test]
+    fn a_detached_head_is_not_a_merge_target() {
+        assert_eq!(merge_from_command("git merge feature", "HEAD"), None);
+        assert_eq!(merge_from_command("git merge feature", ""), None);
+    }
+
+    /// A listing narrowed to a project shows the whole repository that project shares.
+    ///
+    /// The thing being pinned is that a reader asking "what is queued for alpha" is not shown a
+    /// view in which beta's merge into the same branch is invisible. They are in one queue, waiting
+    /// on one lock, competing for one set of refs — a listing that split them by label would be
+    /// most misleading exactly when it matters, which is when the two are about to collide.
+    #[tokio::test]
+    async fn a_listing_shows_the_whole_repository_and_not_just_the_project_named() {
+        let pool = test_pool().await;
+        let alpha = ResolvedRepo::synthetic("alpha", "C:/repo", "SHARED");
+        let beta = ResolvedRepo::synthetic("beta", "C:/repo", "SHARED");
+        let elsewhere = ResolvedRepo::synthetic("gamma", "C:/other", "OTHER");
+
+        submit(&pool, &alpha, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        submit(&pool, &beta, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        submit(&pool, &elsewhere, &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        let listed = list(&pool, Some("alpha")).await.unwrap();
+        let projects: Vec<&str> = listed
+            .iter()
+            .map(|row| row.project_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            projects.contains(&"alpha") && projects.contains(&"beta"),
+            "both projects share one repository and one queue: {projects:?}"
+        );
+        assert!(
+            !projects.contains(&"gamma"),
+            "widening to the repository must not widen to every repository: {projects:?}"
+        );
+        assert!(
+            listed.iter().all(|row| row.repo_key == "SHARED"),
+            "a listing that groups by repository has to say which one"
+        );
+    }
+
+    /// A project nothing has been queued for lists nothing — not everything.
+    ///
+    /// The subquery that finds the repository answers NULL for such a project, and `= NULL` is NULL
+    /// rather than true, so the row is not returned. Written down as a test because the failure
+    /// mode of getting that wrong is not an error: it is a listing that quietly shows every
+    /// repository on the machine to a caller who asked about one.
+    #[tokio::test]
+    async fn a_project_with_nothing_queued_lists_nothing_rather_than_everything() {
+        let pool = test_pool().await;
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        assert!(list(&pool, Some("never-used")).await.unwrap().is_empty());
+        assert_eq!(
+            list(&pool, None).await.unwrap().len(),
+            1,
+            "asking for no project at all still means the whole table"
         );
     }
 
@@ -2439,20 +2780,47 @@ mod tests {
             .await
             .unwrap();
 
-        // Far longer than the timeout, so which of the two fires is not a race.
+        // Far longer than the guard below, so which of the two fires is not a race.
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
-        let drain = drain_once(&pool, "alpha", &executor);
-        tokio::time::timeout(Duration::from_millis(50), drain)
-            .await
-            .expect_err("the executor is still working, so the drain cannot have finished");
+        {
+            let drain = drain_once(&pool, "alpha", &executor);
+            tokio::pin!(drain);
 
-        assert_eq!(
-            executor.calls(),
-            1,
-            "the drain was abandoned inside the operation, not before it"
-        );
-        // Dropped at the executor's await, so `finish` never ran. This is the documented cost, not a
-        // defect: the row is stranded exactly as the doc comment says it is.
+            // Polled until the executor has actually been ENTERED, and abandoned there — rather
+            // than after a fixed slice of wall clock.
+            //
+            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. The
+            // executor's 30s makes it a non-race only for the half AFTER the operation begins;
+            // before that, `drain_once` still has a reap and a claim to get through, and 50ms was a
+            // real-time budget for two SQLite writes. On a machine also compiling and running the
+            // other thousand tests that budget is occasionally missed, and the drain is then
+            // abandoned BEFORE the operation — a different scenario wearing this test's name, which
+            // is why the flake read `calls(): 0 != 1` rather than anything about jamming.
+            //
+            // `calls()` is the property this test is about, so it is what is waited on. The outer
+            // timeout is not a budget: it is reached only if the drain never arrives at all, and it
+            // is there so that failure is a message rather than a hung suite.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        _ = &mut drain => {
+                            panic!("the executor sleeps for 30s — the drain cannot have finished")
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(1)) => {
+                            if executor.calls() == 1 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the drain never reached the executor");
+        }
+
+        // Dropped at the closing brace above, which is the executor's await, so `finish` never ran.
+        // This is the documented cost, not a defect: the row is stranded exactly as the doc
+        // comment says it is.
         assert_eq!(status_of(&pool, id).await, "running");
         assert!(
             claim_next(&pool, "alpha").await.unwrap().is_none(),

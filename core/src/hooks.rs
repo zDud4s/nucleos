@@ -211,6 +211,52 @@ pub async fn pretooluse_decision(
     // The input is part of the match, not decoration: `tool_name` is "Bash" for every shell action,
     // so without it an approved `git push` authorized whatever this run tried next.
     if classification.decision.decision == "pending_approval" && is_in_flight {
+        // Already taken over by the queue (migration 0051). Answered BEFORE the grant lookup and
+        // before the pause below, because both would be wrong here: there is no grant to consume —
+        // the approval deliberately minted none — and pausing would fetch a person to approve a
+        // merge that is already queued, whose approval would queue it a second time.
+        //
+        // A `deny` rather than a pause, because the run is being told where its work went, not asked
+        // to wait. Counted against the ordinary prober allowance, and that is deliberate: a run told
+        // in its resume prompt and again in this reason that the merge is queued and must not be
+        // retried, which does it three times regardless, is not obeying. One that reads either
+        // message spends none of it.
+        match crate::proposals::matching_queued_request(
+            &state.pool,
+            payload.run_id,
+            &payload.tool_name,
+            &payload.tool_input.to_string(),
+        )
+        .await
+        {
+            Ok(Some(request_id)) => {
+                tracing::info!(
+                    run_id = payload.run_id,
+                    request_id,
+                    "pretooluse-decision: the action is already queued — refusing the retry"
+                );
+                count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: format!(
+                        "this action was handed to the daemon's git queue as request {request_id} \
+                         when it was approved, and will be carried out there — do not attempt it \
+                         again"
+                    ),
+                });
+            }
+            Ok(None) => {}
+            // Falling through to the grant lookup is the safe direction: the worst that follows is
+            // a pause and a question for a person, which is what happened before any of this.
+            Err(error) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    %error,
+                    "pretooluse-decision: could not tell whether this action is already queued"
+                );
+            }
+        }
+
         match crate::proposals::consume_matching_grant(
             &state.pool,
             payload.run_id,
@@ -1120,6 +1166,90 @@ mod tests {
         assert!(
             proposals.is_empty(),
             "stopping a prober must not mint something a human can approve"
+        );
+    }
+
+    /// A run that tries again the action the queue took over is TOLD so, not paused.
+    ///
+    /// The loop this closes: the approval queues the merge and mints no grant, so the resumed run's
+    /// retry used to be an ordinary `pending_approval` — pausing the run and putting a second
+    /// proposal in front of a person, whose approval would queue the same merge a second time. The
+    /// prompt asks the run not to retry; this is what happens when it does anyway.
+    ///
+    /// Three things are asserted because getting any one of them wrong reopens the loop: the verdict
+    /// names the request, the run is still in flight, and nothing was minted for a person to read.
+    #[tokio::test]
+    async fn an_action_the_queue_already_has_is_refused_rather_than_asked_about_again() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+        let input = r#"{"command":"git merge feature/x"}"#;
+
+        sqlx::query(
+            "INSERT INTO action_grants
+             (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+             VALUES (?, 'Bash', ?, 1, '2026-01-01T00:00:00Z', NULL, 77)",
+        )
+        .bind(run_id)
+        .bind(input)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let body = format!(r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{input}}}"#);
+        let decision = decide(&app, &body).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(
+            decision.reason.contains("request 77"),
+            "the run has to be told WHICH request has its work: {}",
+            decision.reason
+        );
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&run_id),
+            "a refusal that names the queue must not also stop the run"
+        );
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "asking a person again about a merge already queued would queue it twice"
+        );
+    }
+
+    /// The refusal is COUNTED, and that is the half that keeps the answer from being free.
+    ///
+    /// Without it the verdict would be the one thing in the system that neither pauses the run nor
+    /// spends anything: a run that ignores both the resume prompt and the reason string could retry
+    /// for ever, burning tokens against a merge that is already on its way. The test that asserts
+    /// the run survives ONE refusal cannot see that — it passes whether or not anything is counted.
+    #[tokio::test]
+    async fn a_run_that_keeps_retrying_a_queued_action_is_stopped() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+        let input = r#"{"command":"git merge feature/x"}"#;
+
+        sqlx::query(
+            "INSERT INTO action_grants
+             (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+             VALUES (?, 'Bash', ?, 1, '2026-01-01T00:00:00Z', NULL, 77)",
+        )
+        .bind(run_id)
+        .bind(input)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let body = format!(r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{input}}}"#);
+        for _ in 0..DENIAL_LIMIT {
+            assert_eq!(decide(&app, &body).await.decision, "deny");
+        }
+
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            "a run told {DENIAL_LIMIT} times where its work went, that asks again, is not obeying"
         );
     }
 

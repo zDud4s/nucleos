@@ -1605,6 +1605,61 @@ async fn create_run_with(
     Ok(id)
 }
 
+/// The merge this approval should hand to the queue instead of handing back to the run, if it is
+/// one at all.
+///
+/// **Every `None` here means "keep the behaviour this approval has always had"** — a single-use
+/// grant, and the run performs the action itself. That is deliberately the conservative direction
+/// and not a shrug. Refusing the approval outright would leave a person holding an action they have
+/// approved, no way to perform it, and nothing to read explaining why; queueing an operation we are
+/// not certain is the one they read would be worse than either.
+///
+/// So the bar is: the tool is a shell, the input parses, the command is exactly `git merge <ref>`
+/// (`vcs::merge_from_command` argues that strictness), the worktree is really there and really on a
+/// branch, and the project resolves to a repository. Anything else falls back.
+///
+/// It runs git twice and must therefore be called before the transaction opens — see the call site.
+async fn queueable_merge(
+    state: &AppState,
+    proposal: &crate::proposals::Proposal,
+    project_id: &str,
+    worktree_path: &str,
+) -> Option<(crate::vcs::ResolvedRepo, crate::vcs::Op)> {
+    if !matches!(proposal.tool_name.as_deref(), Some("Bash" | "PowerShell")) {
+        return None;
+    }
+    let input: serde_json::Value = serde_json::from_str(proposal.tool_input.as_deref()?).ok()?;
+    let command = input.get("command")?.as_str()?;
+
+    // One deadline for both calls, so a slow repository cannot spend the budget twice over.
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let branch = crate::git_exec::current_branch(std::path::Path::new(worktree_path), deadline)
+        .await
+        .map_err(|error| {
+            tracing::info!(
+                worktree = %worktree_path,
+                %error,
+                "approval: could not read the worktree's branch — authorizing the run instead of queueing"
+            );
+        })
+        .ok()?;
+    let op = crate::vcs::merge_from_command(command, &branch)?;
+    crate::vcs::resolve_repo(&state.pool, project_id)
+        .await
+        .map_err(|error| {
+            // `?` rather than `%`: `ResolveError` is a two-arm enum carrying a source, and it has no
+            // `Display` on purpose — the HTTP layer answers its arms with different statuses instead
+            // of rendering them.
+            tracing::info!(
+                project_id,
+                ?error,
+                "approval: could not resolve the project's repository — authorizing the run instead of queueing"
+            );
+        })
+        .ok()
+        .map(|repo| (repo, op))
+}
+
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     let proposal = crate::proposals::get(&state.pool, proposal_id)
         .await?
@@ -1652,9 +1707,12 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         "no live worktree for the paused run",
     ))?;
 
-    let prompt = format!(
-        "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — that one high-risk action is now authorized for this run — then finish the task."
-    );
+    // Spec decision 2, arrived at the other way round: rather than letting the run perform the merge
+    // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
+    // it runs git twice — reading the worktree's branch and identifying the repository — and holding
+    // SQLite's write lock across a subprocess would stall every other writer in the daemon.
+    let queueable = queueable_merge(state, &proposal, &wt_project_id, &wt_path).await;
+
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
 
@@ -1669,6 +1727,34 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // Admitted inside this transaction, and that is the whole reason `submit_on` exists. Queue then
+    // commit separately, either order, and one of two things can happen: a merge queued against an
+    // approval that rolls back — an irreversible publication nobody authorised, with the proposal
+    // still pending so it can be authorised again — or a run resumed and told its merge is queued
+    // when it is not.
+    //
+    // `Origin::Human` rather than `Origin::Run`, and the difference is not bookkeeping. A human just
+    // approved this, so it carries their authority and starts `queued` rather than waiting for an
+    // approval it already has. Tying it to the run instead would tie it to a row this very
+    // transaction is about to mark `superseded`, and the merge must outlive the run that asked for
+    // it — that is the point of handing it to a queue.
+    let queued_request_id = match &queueable {
+        Some((repo, op)) => {
+            Some(crate::vcs::submit_on(&mut *tx, repo, op, crate::vcs::Origin::Human).await?)
+        }
+        None => None,
+    };
+
+    // The run is told which of the two happened, because the two ask opposite things of it.
+    let prompt = match queued_request_id {
+        Some(request_id) => format!(
+            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the merge it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
+        ),
+        None => format!(
+            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — that one high-risk action is now authorized for this run — then finish the task."
+        ),
+    };
+
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
     // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
     // sits there until the four-hour ceiling retires it, with the approved work already done.
@@ -1703,17 +1789,29 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // `tool_input` rides along so the grant names the action the human actually read and approved,
-    // not merely the tool that would perform it (migration 0020).
+    // One row either way, and `queued_request_id` is what it says (migration 0051). NULL is the
+    // grant this has always minted: permission for the RUN to perform the action itself, once. Set
+    // is the opposite fact — the queue has it, the run does not — and `consume_matching_grant`
+    // excludes those rows, so recording the takeover cannot accidentally authorise the very thing it
+    // records having taken away.
+    //
+    // Written even when nothing is granted because the run has to be ABLE to be told. Without the
+    // row, a resumed run that tried its merge again would be paused and would mint a second proposal
+    // for a person to read — and approving that one would queue the merge twice.
+    //
+    // `tool_input` rides along so the row names the action the human actually read and approved, not
+    // merely the tool that would perform it (migration 0020) — and it is what `hooks.rs` matches the
+    // retry against.
     sqlx::query(
-        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at)
-         VALUES (?, ?, ?, ?, ?, NULL)",
+        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)",
     )
     .bind(resume_id)
     .bind(&tool_name)
     .bind(proposal.tool_input.as_deref())
     .bind(proposal_id)
     .bind(&now)
+    .bind(queued_request_id)
     .execute(&mut *tx)
     .await?;
     // Compare-and-set on the state this resume was authorised from, like every other writer of a
@@ -1739,7 +1837,15 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // the grant all disappear with it, so a lost race leaves nothing half-applied.
         return Err(ResumeError::ProposalNotPending);
     }
-    let note = format!("approved; resume run {resume_id}");
+    // The queued request id belongs in the audit trail, not only in the resumed run's prompt: this
+    // row is where somebody reconstructs what an approval actually did, and "approved" alone no
+    // longer says whether the action was authorised or taken over.
+    let note = match queued_request_id {
+        Some(request_id) => {
+            format!("approved; merge queued as vcs request {request_id}; resume run {resume_id}")
+        }
+        None => format!("approved; resume run {resume_id}"),
+    };
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
          VALUES (?, 'pending', 'approved', ?, ?)",
@@ -2876,6 +2982,244 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         .unwrap();
 
         (original_run_id, proposal_id, worktree_path)
+    }
+
+    /// A paused run whose worktree and project really exist on disk, because the approval path now
+    /// asks git two questions about them.
+    ///
+    /// `seed_resumable_action_approval` deliberately uses invented paths, and that keeps working:
+    /// git cannot answer about a directory that is not there, so those approvals take the fallback
+    /// and every assertion written before this feature still means what it meant. This helper is for
+    /// the other side of that branch.
+    async fn seed_real_worktree_approval(
+        state: &AppState,
+        command: &str,
+    ) -> (i64, String, tempfile::TempDir) {
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-approve-merge-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let root = root.to_string_lossy().replace('\\', "/");
+        let branch = crate::git_exec::current_branch(
+            std::path::Path::new(&root),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("the seeded repository has a branch");
+
+        let created_at = chrono::Utc::now().to_rfc3339();
+        // `mode` is NOT NULL with a CHECK; `off` is the honest value, since nothing here is driving
+        // autopilot — the row exists only because `project_root` lives on it.
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'off', ?)
+             ON CONFLICT(project_id) DO UPDATE SET project_root = excluded.project_root",
+        )
+        .bind(&root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let original_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', 'sess-1', 'worktree', ?)",
+        )
+        .bind(&root)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        // The paused run stands in the repository root itself. A linked worktree would be more
+        // lifelike and would test nothing extra here: what the approval reads is the branch of the
+        // directory this row names, and one real worktree root is as good as another.
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', ?, ?, ?, ?)",
+        )
+        .bind(original_run_id)
+        .bind(&root)
+        .bind(&root)
+        .bind(&branch)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            original_run_id,
+            Some("sess-1"),
+            Some("proj"),
+            "Bash",
+            "needs approval",
+            Some(&serde_json::json!({ "command": command }).to_string()),
+        )
+        .await
+        .unwrap();
+
+        (proposal_id, branch, container)
+    }
+
+    async fn grants_for(state: &AppState, run_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM action_grants WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A merge admitted by an approval that then fails leaves no merge behind.
+    ///
+    /// A queued merge surviving a rolled-back approval would be an irreversible publication against
+    /// an approval that did not happen — with the proposal still pending, so a person could
+    /// authorise it a second time. What is pinned is that pair: nothing queued, nothing decided.
+    ///
+    /// The failure is reached the way the code's own comment says it can be: the supersede is a
+    /// compare-and-set on `awaiting_approval`, so a run that has moved on since the proposal was
+    /// read is not superseded, and `one_open_worktree_run_per_project` then rejects the INSERT of
+    /// the resume — after the admission, which is exactly the window that matters.
+    ///
+    /// **What this test does NOT do, written down because the first version of this comment claimed
+    /// the opposite.** It does not distinguish `submit_on(&mut *tx, …)` from `submit(&pool, …)`.
+    /// Run against that mutation it still passes: the pool's INSERT blocks on the write lock the
+    /// open transaction already holds and never lands, so "errored, and nothing queued" is the
+    /// outcome either way and no assertion here can separate them.
+    ///
+    /// The mutation IS caught — by `approving_a_merge_queues_it_instead_of_letting_the_run_perform_it`,
+    /// which deadlocks and dies on the busy timeout after 30s. That is coverage by seizing up rather
+    /// than by saying anything, and it is worth knowing which of the two you have: a change that made
+    /// the admission merely SLOW instead of deadlocked would take that catcher away in silence, and
+    /// nothing here would notice.
+    #[tokio::test]
+    async fn a_merge_admitted_by_an_approval_that_fails_is_rolled_back_with_it() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "git merge feature/x").await;
+
+        // The paused run moves on after the proposal was written: the slot it holds is still this
+        // project's only one, so the resume's own INSERT cannot land.
+        sqlx::query("UPDATE runs SET status = 'running' WHERE project_id = 'proj'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            resume_approved_run(&state, proposal_id).await.is_err(),
+            "the resume cannot insert its run, so the approval cannot succeed"
+        );
+
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, 0,
+            "the merge was admitted inside the failed transaction and must have gone with it"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "nothing was decided, so nothing is decided");
+    }
+
+    /// **Decision (B).** Approving a merge hands it to the queue; it does not hand the run a pass to
+    /// perform the merge itself.
+    ///
+    /// This is the answer to the thing this pillar was built for. Before it, the sanctioned route
+    /// for an autonomous run to merge was: pause, ask a person, and on yes the RUN merges — with its
+    /// own hands, against the same refs another run might be merging into at that moment, which is
+    /// the race the queue exists to abolish. The approval was the last place still handing that out.
+    ///
+    /// The absent grant is half the assertion and the more important half: a queued merge beside a
+    /// minted grant would be both at once, and the two would race each other.
+    #[tokio::test]
+    async fn approving_a_merge_queues_it_instead_of_letting_the_run_perform_it() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git merge feature/x").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (request_id, op, args, origin, status): (i64, String, String, String, String) =
+            sqlx::query_as(
+                "SELECT id, op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("the approved merge is in the queue");
+        assert_eq!(op, "merge");
+        assert_eq!(
+            (origin.as_str(), status.as_str()),
+            ("human", "queued"),
+            "a human just approved it, so it carries their authority and waits for nothing"
+        );
+        // The command named the source; the target is the branch the run's worktree stands on,
+        // which is the half no command line carries.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            serde_json::json!({"op": "merge", "source": "feature/x", "target": branch})
+        );
+
+        // Asserted through the two queries rather than by counting rows: since migration 0051 the
+        // approval writes a row EITHER way, and what separates them is what that row answers. It
+        // must record the takeover and must not authorize anything.
+        let input = serde_json::json!({ "command": "git merge feature/x" }).to_string();
+        assert!(
+            !proposals::consume_matching_grant(&state.pool, resume_id, "Bash", &input)
+                .await
+                .unwrap(),
+            "the queue took the merge, so the run must NOT also be authorized to perform it"
+        );
+        assert_eq!(
+            proposals::matching_queued_request(&state.pool, resume_id, "Bash", &input)
+                .await
+                .unwrap(),
+            Some(request_id),
+            "and the run has to be able to be TOLD which request has its work"
+        );
+
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains("merge queued as vcs request"),
+            "the audit trail has to say what the approval actually did: {note}"
+        );
+    }
+
+    /// The other side of the branch, and the one that keeps this from being a regression: an
+    /// approved action the queue cannot perform is authorized exactly as it always was.
+    ///
+    /// `git push` is the case that matters — it is on the approval list, the queue has no executor
+    /// for it, and redirecting it would leave a run denied with nowhere to go.
+    #[tokio::test]
+    async fn approving_something_the_queue_cannot_perform_still_authorizes_the_run() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "git push origin main").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "the queue cannot push, so it must not claim to");
+        assert_eq!(
+            grants_for(&state, resume_id).await,
+            1,
+            "an action the queue does not take is still the run's to perform, once"
+        );
     }
 
     /// §6.2 of the design, and the one path where the shell offered a button that could not work.
