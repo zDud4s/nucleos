@@ -18,6 +18,13 @@ pub struct ModelsConfig {
     /// name, the same posture `local_triage_model` gives local inference.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub primary_runner: Option<String>,
+    /// Where a job's `plan` stage runs. Absent keeps it on `claude_model`, so a file written before
+    /// this key existed routes nothing anywhere.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub plan_model: Option<String>,
+    /// Where a job's `review` stage runs, on the same absent-means-unrouted posture as `plan_model`.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub review_model: Option<String>,
 }
 
 impl Default for ModelsConfig {
@@ -28,6 +35,8 @@ impl Default for ModelsConfig {
             local_triage_model: None,
             voice_cleanup_model: None,
             primary_runner: None,
+            plan_model: None,
+            review_model: None,
         }
     }
 }
@@ -745,6 +754,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_models_config(&path).unwrap().local_triage_model, None);
+    }
+
+    /// Per-role models are how a plan turn is priced apart from the implement turns that follow it.
+    /// Both keys keep the `local_triage_model` posture: absent or blank means the role is NOT routed
+    /// anywhere, so a file written before these keys existed changes nothing about what runs. The
+    /// blank case is the one worth pinning — a key left in the file with its value deleted reads as
+    /// "turn this off", and `Some("")` would instead pass an empty string to `--model`.
+    #[test]
+    fn models_config_reads_the_per_role_keys_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nplan_model: claude-opus-4-8\nreview_model: claude-haiku-4-5\n",
+        )
+        .unwrap();
+        let named = load_models_config(&path).unwrap();
+        assert_eq!(named.plan_model, Some("claude-opus-4-8".to_string()));
+        assert_eq!(named.review_model, Some("claude-haiku-4-5".to_string()));
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\n",
+        )
+        .unwrap();
+        let absent = load_models_config(&path).unwrap();
+        assert_eq!(absent.plan_model, None, "an older file routes nothing");
+        assert_eq!(absent.review_model, None, "an older file routes nothing");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-opus-4-8\ncodex_model: gpt-5.6-sol\nplan_model: \"\"\nreview_model: \"   \"\n",
+        )
+        .unwrap();
+        let blank = load_models_config(&path).unwrap();
+        assert_eq!(blank.plan_model, None, "a blanked key means off, not empty");
+        assert_eq!(
+            blank.review_model, None,
+            "a blanked key means off, not empty"
+        );
     }
 
     /// Absent and malformed must reach the SAME inert state, and neither may be an error.

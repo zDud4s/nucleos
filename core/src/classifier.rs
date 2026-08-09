@@ -72,6 +72,12 @@ const SELF_GOVERNING_DIRS: &[&str] = &[
 ///
 /// `Cargo.toml` earns its place despite being edited often: an autonomous run adding a dependency
 /// is a supply-chain change, which is precisely the sort of thing a person should see.
+///
+/// `package.json` stays on this list even though `npm test` is NOT in `SAFE_COMMAND_PREFIXES`. It
+/// costs an approval on a file an autonomous run has little reason to rewrite, and it buys the case
+/// where the runner is invoked some other way — a person, a script, a later widening. Guarding an
+/// input whose runner is not allowed is the harmless direction; the reverse is the one that hurts.
+///
 /// Lowercase: `normalize_path` case-folds, so these are compared against folded paths.
 ///
 /// The Python and Go entries arrived WITH their runners in `SAFE_COMMAND_PREFIXES` and are the
@@ -89,10 +95,18 @@ const SELF_GOVERNING_DIRS: &[&str] = &[
 ///   `pytest.ini` and `tox.ini` carry `addopts` (`-p somemodule` loads a plugin) and dependency
 ///   lists; `go.mod`/`go.sum` are what `go test` resolves against and therefore what it downloads.
 ///   Same argument as `Cargo.toml`, same acceptance that they are edited often.
+///
+/// `pyproject.toml` is the one entry the two branches that grew this list disagreed about, so the
+/// disagreement is written down rather than silently settled. The harness branch left it out: pytest
+/// READS it for settings, it does not execute it, and it is edited far too often to charge an
+/// approval prompt for a fact about configuration. It stays in, because reading it is exactly how
+/// `addopts = "-p somemodule"` loads a plugin — a setting whose content is code — and "edited often"
+/// is the argument `Cargo.toml` already lost on the line above.
 const EXECUTES_ON_NEXT_COMMAND_FILES: &[&str] = &[
     "build.rs",
     "cargo.toml",
     ".mcp.json",
+    "package.json",
     "conftest.py",
     "sitecustomize.py",
     "usercustomize.py",
@@ -206,6 +220,14 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "go test",
     "go build",
     "go vet",
+    // `npm test` and `npx vitest run` are DELIBERATELY not here, and the two branches merged into
+    // this file disagreed about it. The harness branch allowed them as the JS spelling of the
+    // `cargo test` above; `the_interpreters_under_the_test_runners_stay_pending` pins the opposite,
+    // and the opposite is what stands. `cargo test` runs a target the toolchain defines and reaches
+    // `build.rs`, which this file guards by name; `npm test` runs whatever string sits in
+    // `scripts.test`, so the command line says "run the tests" while naming nothing that was read.
+    // Restoring them is two lines here plus that test — a decision to take deliberately, not to
+    // inherit from whichever branch merged last.
     // Says something, decides something, changes nothing. `echo` writes to stdout and `test`/`[`
     // answer a question about a path — neither runs a program, neither names a file to write, and
     // the two ways they could (`>` and `$(…)`) are refused before either is reached. Both were
@@ -847,6 +869,10 @@ fn is_safe_command(command: &str) -> bool {
         && !forces_external_diff_or_textconv(command)
         && !runs_a_helper_command(command)
         && !uses_a_flag_its_program_makes_dangerous(command)
+        // Kept beside the two above rather than folded into them: both branches grew a guard for
+        // `find`, and they do not cover the same flags. Every one of these three only ever REFUSES,
+        // so an overlap costs a redundant check and a gap costs an allowed `-exec`.
+        && !find_executes_or_writes(command)
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
 }
@@ -928,6 +954,24 @@ fn forces_external_diff_or_textconv(command: &str) -> bool {
     command
         .split_whitespace()
         .any(|token| token.starts_with("--ext-diff") || token.starts_with("--textconv"))
+}
+
+/// `find`'s options that stop it being a search: `-exec`/`-execdir`/`-ok`/`-okdir` hand every hit
+/// to a command of the caller's choosing, `-delete` removes what matched, and the `-fprint` family
+/// writes the result list to a file. Allowing `find` without taking these back would allow anything
+/// they name.
+///
+/// Checked on every token of every command rather than only when the program is `find`, because
+/// nothing else in the safe set spells any of these — so a conditional form would buy no precision
+/// and would first have to decide which token IS the program, the guess `has_destructive_flags`
+/// exists precisely because `sudo`, `busybox` and `xargs` defeat.
+fn find_executes_or_writes(command: &str) -> bool {
+    const EXECUTES_OR_WRITES: &[&str] = &[
+        "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
+    ];
+    command
+        .split_whitespace()
+        .any(|token| EXECUTES_OR_WRITES.contains(&token))
 }
 
 fn matches_command_prefix(command: &str, prefixes: &[&str]) -> bool {
@@ -1345,6 +1389,76 @@ mod tests {
                 classify("Bash", &json!({"command": command}), None),
                 "allow",
                 "read-local",
+            );
+        }
+    }
+
+    /// Running the suite is the single thing an autonomous run does most, and every runner but
+    /// cargo's fell through to `pending_approval` — the gate asking a human to confirm a test run
+    /// they would confirm every time. A prompt nobody can meaningfully refuse is not a control.
+    ///
+    /// The JS runners were in this list and are not, which is the same decision as the comment
+    /// beside `npm test`'s absence from `SAFE_COMMAND_PREFIXES`: they name a string in
+    /// `package.json` rather than a target the toolchain defines, so the command line reads "run the
+    /// tests" while naming nothing that was read.
+    /// `the_interpreters_under_the_test_runners_stay_pending` holds the other side of it.
+    #[test]
+    fn test_runners_are_recognized_as_safe_commands() {
+        for command in [
+            "python -m pytest -q",
+            "python -m unittest discover",
+            "go test ./...",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// Searching and paging a file is reading it. None of these mutates anything, and each one cost
+    /// an approval prompt — the same tax as `cat`, which is already allowed.
+    #[test]
+    fn read_only_search_commands_are_recognized() {
+        for command in [
+            "grep -rn foo .",
+            "rg foo",
+            "head -20 f",
+            "tail -5 f",
+            "wc -l f",
+            "find . -name \"*.rs\"",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// `find` is the one read-only search that also runs programs and writes files: `-exec`,
+    /// `-execdir` and `-ok` hand the traversal a command to run on every hit, `-delete` removes what
+    /// it matched, and `-fprint` writes the list out. Widening the safe set to cover `find` must not
+    /// widen it to cover these — they are the payload, not the search.
+    ///
+    /// `-delete` is absent from this list and is covered by `a_recursive_force_delete_is_denied_
+    /// however_it_is_spelled` instead, which gives it the stronger verdict: `find . -delete` IS a
+    /// recursive force delete spelled as a search, so it is `deny` and never a prompt a person can
+    /// wave through. Asserting `pending_approval` for it here would have quietly pinned the weaker
+    /// of the two answers.
+    #[test]
+    fn find_that_executes_or_writes_stays_pending() {
+        for command in [
+            "find . -exec rm {} +",
+            "find . -execdir ls {} +",
+            "find . -ok ls {} +",
+            "find . -fprint out.txt",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
             );
         }
     }
@@ -1909,6 +2023,23 @@ mod tests {
         }
     }
 
+    /// `package.json` and `conftest.py` are `build.rs` for the runners: `scripts.test` is a shell
+    /// line `npm test` executes, and a `conftest.py` fixture is Python `pytest` imports and runs
+    /// before the first test. Allowing the runner without guarding its config file restores exactly
+    /// the chain `EXECUTES_ON_NEXT_COMMAND_FILES` exists to break — write the payload, then run the
+    /// allowed command that executes it, no metacharacter and no denied step anywhere.
+    #[test]
+    fn test_runner_config_files_require_approval() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for file_path in ["package.json", "conftest.py"] {
+            assert_classification(
+                classify("Write", &json!({"file_path": file_path}), cwd),
+                "pending_approval",
+                "executes-on-next-command",
+            );
+        }
+    }
+
     #[test]
     fn recognizes_self_governing_paths_in_all_supported_forms() {
         let cases = [
@@ -2015,6 +2146,106 @@ mod tests {
             "deny",
             "destructive",
         );
+    }
+
+    /// An `&&` chain reaches no command that is not written in it, and stops at the first failure.
+    /// When every segment is one the classifier already allows on its own, the chain is no more than
+    /// the sum of them — refusing it charges an approval prompt for work that is approved a segment
+    /// at a time, which is how a two-command line becomes two round trips.
+    ///
+    /// The class recorded is the strongest of the segments', not a class of its own for chains. A
+    /// chain class would be a class an approval could be granted FOR — and since a grant covers its
+    /// class for the rest of the run (migration 0055), approving one `git add && git status` would
+    /// have authorised every later chain the run cared to write, whatever was in it.
+    #[test]
+    fn an_and_chain_of_allowed_segments_is_allowed() {
+        for (command, action_class) in [
+            ("cargo fmt --check && cargo clippy", "read-local"),
+            ("git add -A && git status", "vcs-local"),
+            ("python -m pytest && cargo check", "read-local"),
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                action_class,
+            );
+        }
+    }
+
+    /// The chain is worth exactly its weakest segment: one the classifier does not recognize decides
+    /// the whole line, however safe the segments around it read.
+    #[test]
+    fn an_and_chain_with_one_unrecognized_segment_stays_pending() {
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({"command": "cargo test && ./deploy.sh"}),
+                None,
+            ),
+            "pending_approval",
+            "unrecognized",
+        );
+    }
+
+    /// A safe-looking leading segment is the exact shape the chain rule could be used to hide behind,
+    /// so the destructive verdict has to survive it — and stay `deny`, not be demoted to a prompt a
+    /// human can wave through.
+    #[test]
+    fn an_and_chain_hiding_a_destructive_segment_is_still_denied() {
+        for command in ["ls && rm -rf /important", "cargo test && rm -r -f ~/.ssh"] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "deny",
+                "destructive",
+            );
+        }
+    }
+
+    /// Same for the approval classes: a push does not become local because a test ran first.
+    #[test]
+    fn an_and_chain_hiding_a_push_still_requires_approval() {
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({"command": "cargo test && git push origin main"}),
+                None,
+            ),
+            "pending_approval",
+            "push-merge-deploy",
+        );
+    }
+
+    /// `&` is a prefix of `&&`, so a split that reads the string loosely hands over background
+    /// execution (`ls & rm`), redirection (`&>`), a pipe whose right-hand side nobody read, and
+    /// command substitution inside a segment. `&&&` is the near-miss a naive `split("&&")` turns
+    /// into two innocent-looking halves.
+    ///
+    /// Which blocking verdict each one earns is the other tests' business; what is pinned here is
+    /// that none of them is `allow`.
+    ///
+    /// `ls &&\nls` was in this list and is deliberately no longer: it was here because the rule it
+    /// guarded relaxed `&&` and nothing else, so a newline was an unread second statement. The rule
+    /// that survived the merge cuts at every separator — `&&`, `|` and `;` alike — and judges each
+    /// piece, so the newline is not a way past anything. Both pieces are `ls`, and `allow` is the
+    /// right answer rather than a gap. `ls\nrm -r -f ~/.ssh` is the case that matters, and it is
+    /// pinned where the raw-command reading is.
+    #[test]
+    fn only_double_ampersand_rides_the_chain_rule() {
+        for command in [
+            "ls & rm -r x",
+            "ls &&& ls",
+            "ls &> out",
+            "ls && $(rm -rf ~)",
+            "ls && ls | tee f",
+        ] {
+            assert_ne!(
+                classify("Bash", &json!({"command": command}), None)
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
     }
 
     /// The anchor, not the example: a command nobody taught this file about asks a person. `echo`

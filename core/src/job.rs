@@ -58,12 +58,26 @@ struct PlanFile {
 #[derive(Debug, Deserialize)]
 struct PlanItem {
     description: String,
+    /// Defaulted rather than required, because the field is younger than the plans that have to
+    /// keep parsing: every `plan.json` written before it existed omits it, and so does any planner
+    /// that takes the prompt's offer to decline. Both mean the same thing, which is nothing.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+/// One item of the queue: what to do, and where the planner guessed it lives.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlannedItem {
+    pub description: String,
+    /// Empty when the planner named nothing. A hint and not a boundary — it is where the implement
+    /// node starts looking, never the extent of what it may touch.
+    pub files: Vec<String>,
 }
 
 /// A validated work queue, plus however much of it did not fit.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlannedItems {
-    pub items: Vec<String>,
+    pub items: Vec<PlannedItem>,
     /// Items the daemon's ceiling cut. Carried rather than discarded so the feed can say what was
     /// left out — a queue silently trimmed reads downstream as the whole of what the planner found.
     pub dropped: usize,
@@ -87,11 +101,11 @@ pub fn parse_plan(contents: Option<&[u8]>, max_items: usize) -> Result<PlannedIt
         serde_json::from_slice(bytes).map_err(|error| PlanError::Unreadable(error.to_string()))?;
 
     let total = parsed.items.len();
-    let items: Vec<String> = parsed
+    let items: Vec<PlannedItem> = parsed
         .items
         .into_iter()
         .take(max_items)
-        .map(|item| item.description)
+        .map(|PlanItem { description, files }| PlannedItem { description, files })
         .collect();
 
     Ok(PlannedItems {
@@ -1222,7 +1236,9 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
          fewer, larger items to more, smaller ones.\n\n\
          {HISTORY_IS_THE_JOBS}\n\n\
          Write them to {artifacts}/plan.json and change nothing else:\n\n\
-         {{\"items\": [{{\"description\": \"...\"}}]}}\n\n\
+         {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\", \"...\"]}}]}}\n\n\
+         \"files\" is optional and best-effort — name the files you expect the item to touch if you \
+         know them, and omit the field if you do not. A wrong guess costs more than no guess.\n\n\
          That file is the only thing that is read; anything you print is discarded. If there is no \
          work to do, write {{\"items\": []}} — an empty queue is a legitimate answer and is not a \
          failure. Do not begin any of the work yourself.\n\n\
@@ -1280,13 +1296,18 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
 /// It gets the item and the queue, and no account of how the previous node reasoned — §5.4 of the
 /// design makes each node's independence structural rather than requested, by never keeping a
 /// session another node could resume.
+///
+/// `files` is the plan node's guess, appended only when it made one: a node with no hint is given
+/// the brief it has always been given, word for word, rather than a paragraph about a mechanism it
+/// has nothing to put in.
 pub fn implement_prompt(
     description: &str,
     ordinal: usize,
     total: usize,
     artifacts: &str,
+    files: &[String],
 ) -> String {
-    format!(
+    let mut prompt = format!(
         "You are item {} of {total} in an autonomous job. The working tree already holds the work \
          of the earlier items; this is the only one you do.\n\n\
          {description}\n\n\
@@ -1295,7 +1316,19 @@ pub fn implement_prompt(
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
-    )
+    );
+    if !files.is_empty() {
+        // Told where to begin, and told in the same breath that beginning is all it is. A list
+        // written before any of the earlier items ran cannot know what they moved, so a node that
+        // reads it as the edge of its work stops halfway and leaves the tree half-changed.
+        prompt.push_str(&format!(
+            "\n\nThe plan expected this item to touch {}. Start there, and treat that list as \
+             possibly incomplete or wrong — it was guessed before any of the work was done. Edit \
+             whatever the item actually needs.",
+            files.join(", ")
+        ));
+    }
+    prompt
 }
 
 /// The prompt the review node is given.
@@ -1504,14 +1537,22 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
         }
     };
 
-    for (ordinal, description) in planned.items.iter().enumerate() {
+    for (ordinal, item) in planned.items.iter().enumerate() {
+        // NULL rather than `[]`: the column that says nothing reads downstream as "the planner did
+        // not say", where an empty array would read as "the planner said no files". A hint that
+        // will not serialize is treated as one that was never given — losing a guess is cheaper
+        // than failing a plan over it.
+        let files = (!item.files.is_empty())
+            .then(|| serde_json::to_string(&item.files).ok())
+            .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status)
-             VALUES (?, ?, ?, 'pending')",
+            "INSERT INTO job_items (job_id, ordinal, description, status, files)
+             VALUES (?, ?, ?, 'pending', ?)",
         )
         .bind(job.id)
         .bind(ordinal as i64)
-        .bind(description)
+        .bind(&item.description)
+        .bind(files)
         .execute(pool)
         .await?;
     }
@@ -1713,15 +1754,23 @@ async fn open_the_next_round(
             .fetch_one(pool)
             .await?;
 
-    for (offset, description) in planned.items.iter().enumerate() {
+    for (offset, item) in planned.items.iter().enumerate() {
+        // The same NULL-rather-than-`[]` rule as the first round's ingestion, and carried here for
+        // the reason it exists there. A later round's items are planned by a node looking at the
+        // same tree, so an item of round 3 arriving without its file hint is not a different kind of
+        // item — it is the hint being dropped on the way in, silently, for every round but the first.
+        let files = (!item.files.is_empty())
+            .then(|| serde_json::to_string(&item.files).ok())
+            .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, round)
-             VALUES (?, ?, ?, 'pending', ?)",
+            "INSERT INTO job_items (job_id, ordinal, description, status, round, files)
+             VALUES (?, ?, ?, 'pending', ?, ?)",
         )
         .bind(job.id)
         .bind(next_ordinal + offset as i64)
-        .bind(description)
+        .bind(&item.description)
         .bind(round)
+        .bind(files)
         .execute(pool)
         .await?;
     }
@@ -2385,8 +2434,8 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             spawn_node(state, job, "plan", prompt, None, worktree).await
         }
         Next::SpawnImplement { ordinal } => {
-            let description: Option<String> = sqlx::query_scalar(
-                "SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?",
+            let row = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT description, files FROM job_items WHERE job_id = ? AND ordinal = ?",
             )
             .bind(job.id)
             .bind(ordinal as i64)
@@ -2394,11 +2443,18 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             .await
             .ok()
             .flatten();
-            let Some(description) = description else {
+            let Some((description, files)) = row else {
                 tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
                 return Step::Stopped;
             };
-            let prompt = implement_prompt(&description, ordinal, view.items.len(), &artifacts);
+            // A hint that will not parse is no hint. It is an optimisation for where to start
+            // reading, and refusing to run the item over it would fail the work for the sake of the
+            // advice about the work.
+            let files: Vec<String> = files
+                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+                .unwrap_or_default();
+            let prompt =
+                implement_prompt(&description, ordinal, view.items.len(), &artifacts, &files);
             spawn_node(state, job, "implement", prompt, Some(ordinal), worktree).await
         }
         Next::SpawnReview => {
@@ -3338,7 +3394,8 @@ mod tests {
     fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
         let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos");
         let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos");
-        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos");
+        // No hint, because what this pins is the paragraph every node gets regardless of one.
+        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[]);
 
         for prompt in [&plan, &replan] {
             assert!(
@@ -3398,9 +3455,44 @@ mod tests {
             parse_plan(Some(seven), 5).expect("an oversized plan is truncated, not rejected");
 
         assert_eq!(plan.items.len(), 5);
+        // The queue is items, not strings: a description with no file hint is still a whole item,
+        // and truncation cuts items rather than descriptions.
+        assert_eq!(
+            plan.items[0],
+            PlannedItem {
+                description: "a".to_owned(),
+                files: Vec::new(),
+            }
+        );
         // Reported, never silent: a queue quietly cut from seven to five reads downstream as "the
         // planner found five things", which is a different and wrong statement about the work.
         assert_eq!(plan.dropped, 2);
+    }
+
+    /// The hint is the planner's, and it is optional at both ends: a planner that names files is
+    /// believed, a planner that names none is not treated as having named an empty set of them.
+    /// The absent case is not hypothetical — every plan.json written before this column existed
+    /// looks exactly like it, and reading one has to stay a plan rather than a parse failure.
+    #[test]
+    fn parse_plan_reads_optional_file_hints_and_tolerates_their_absence() {
+        let mixed = br#"{"items":[{"description":"x","files":["a.rs","b.rs"]},
+                                  {"description":"y"}]}"#;
+        let plan = parse_plan(Some(mixed), 5).expect("a plan without hints is still a plan");
+
+        assert_eq!(
+            plan.items,
+            vec![
+                PlannedItem {
+                    description: "x".to_owned(),
+                    files: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+                },
+                PlannedItem {
+                    description: "y".to_owned(),
+                    files: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(plan.dropped, 0);
     }
 
     async fn seed_items(pool: &sqlx::SqlitePool, job_id: i64, statuses: &[&str]) {
@@ -5034,6 +5126,43 @@ mod tests {
         );
     }
 
+    /// The hint has to survive the gap between the plan node and the implement node, which is a
+    /// database row and not a process — nothing of `PlannedItems` is still in memory by the time
+    /// the item is spawned. An item with no hint stores NULL rather than `[]`: the column that says
+    /// nothing is the one that reads downstream as "the planner did not say", and an empty array
+    /// would read as "the planner said no files", which is a different claim.
+    #[tokio::test]
+    async fn planned_file_hints_are_stored_with_the_item() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_node(&pool, job_id, "plan", "completed").await;
+        write_plan(
+            worktree.path(),
+            r#"{"items":[{"description":"hinted","files":["core/src/job.rs","core/src/runs.rs"]},
+                        {"description":"unhinted"}]}"#,
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        let stored: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT files FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        let hinted: Vec<String> =
+            serde_json::from_str(stored[0].as_deref().expect("a hinted item keeps its hint"))
+                .expect("the hint is stored as a JSON array");
+        assert_eq!(hinted, vec!["core/src/job.rs", "core/src/runs.rs"]);
+        assert_eq!(stored[1], None, "no hint is NULL, not an empty array");
+    }
+
     // ---- the brakes between nodes --------------------------------------------------------------
 
     async fn set_budget(pool: &sqlx::SqlitePool, window: Option<f64>, hourly: Option<f64>) {
@@ -5377,6 +5506,82 @@ mod tests {
         assert!(prompt.contains("/wt/.nucleos/plan.json"));
         assert!(prompt.contains("at most 5"));
         assert!(prompt.contains(r#"{"items": []}"#));
+    }
+
+    /// The hint is asked for, and asked for as optional. A planner told to name files without being
+    /// told it may decline will name some for every item, and a confident wrong list is worse than
+    /// no list: the implement node is told to start there, so an invented path spends a whole
+    /// context window in the wrong place.
+    #[test]
+    fn plan_prompt_asks_for_optional_file_hints() {
+        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos");
+
+        assert!(
+            prompt.contains(r#""files""#),
+            "the shape must name the field: {prompt}"
+        );
+        let lowered = prompt.to_lowercase();
+        assert!(
+            lowered.contains("optional") || lowered.contains("if you"),
+            "naming files must be offered, not required: {prompt}"
+        );
+        assert!(
+            lowered.contains("best effort")
+                || lowered.contains("best-effort")
+                || lowered.contains("guess"),
+            "the planner must be told a partial answer is acceptable: {prompt}"
+        );
+    }
+
+    /// Two halves of one contract. With a hint the node is told where to start *and* told the list
+    /// is not a boundary — an implement node that treats a planner's guess as the full extent of the
+    /// change leaves the tree half-edited. With no hint the prompt is byte-for-byte what it has
+    /// always been, so a job planned before this existed is not silently given a different brief.
+    #[test]
+    fn implement_prompt_names_the_hinted_files_as_a_possibly_incomplete_list() {
+        let hints = [
+            "core/src/job.rs".to_owned(),
+            "core/migrations/0052.sql".to_owned(),
+        ];
+        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints);
+
+        assert!(hinted.contains("core/src/job.rs"));
+        assert!(hinted.contains("core/migrations/0052.sql"));
+        assert!(
+            hinted.to_lowercase().contains("incomplete"),
+            "the list is a hint, not a boundary: {hinted}"
+        );
+
+        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[]);
+        assert_eq!(
+            bare,
+            "You are item 1 of 3 in an autonomous job. The working tree already holds the work \
+             of the earlier items; this is the only one you do.\n\n\
+             write the thing\n\n\
+             The full queue is in /wt/.nucleos/plan.json for context. Do not start another item \
+             and do not edit that file. Your work is verified after you finish, so leave the tree \
+             building. Leave it UNCOMMITTED: the job commits for you once the gate agrees, and \
+             committing by hand stops this item to ask permission for something already arranged."
+        );
+        // Said twice on purpose: the equality above is the guarantee, and this says what it is a
+        // guarantee *of* — an unhinted node is never told about a hint mechanism it has no hint for,
+        // and never invited to wonder which files were meant.
+        let lowered = bare.to_lowercase();
+        assert!(
+            !lowered.contains("hint"),
+            "no hint, no hint paragraph: {bare}"
+        );
+        assert!(
+            !lowered.contains("incomplete"),
+            "nothing to be incomplete: {bare}"
+        );
+        assert!(
+            !lowered.contains("start with"),
+            "no files to start with: {bare}"
+        );
+
+        // The paragraph is appended, so everything the node was told before it is still there.
+        assert!(hinted.starts_with(&bare));
     }
 
     /// §5.4: the review node's independence is structural, not requested. It is never given a

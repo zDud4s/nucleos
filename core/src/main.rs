@@ -405,6 +405,8 @@ async fn main() {
     // every unrelated daemon service.
     let claude_runner = || runner::ClaudeCliRunner {
         model: models_config.claude_model.clone(),
+        plan_model: models_config.plan_model.clone(),
+        review_model: models_config.review_model.clone(),
     };
     let configured_runner = models_config.primary_runner.as_deref();
     let primary_runner: Arc<dyn runner::CommandRunner> = match configured_runner {

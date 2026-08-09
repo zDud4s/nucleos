@@ -702,6 +702,90 @@ async fn record_handoff_if_needed(
     Ok(true)
 }
 
+/// Pins a terminated run's time approximation onto the run itself, for a run that never reported a
+/// cost of its own.
+///
+/// A run killed before its `result` event recorded `$0` — the future was dropped, so there was no
+/// `RunOutcome` to read a cost from — and the ledger understated real spend by exactly the money
+/// that run burned. The budget's own approximation covered the gap only while recomputing, which
+/// made the figure move with `now` and left nothing durable behind.
+///
+/// `cost_usd IS NULL` is the whole safety of the write: a measured total is what the CLI actually
+/// charged, and a duration guess must never overwrite it. Best-effort throughout — the run IS
+/// terminated either way, and an approximation that failed to land leaves the budget exactly as it
+/// was before this existed, not the run broken.
+async fn record_time_approx_cost(pool: &sqlx::SqlitePool, id: i64) {
+    let timestamps: (String, Option<String>) =
+        match sqlx::query_as("SELECT created_at, completed_at FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(timestamps) => timestamps,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = id,
+                    %error,
+                    "could not read the terminated run's timestamps to approximate its cost"
+                );
+                return;
+            }
+        };
+
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value).map(|when| when.with_timezone(&chrono::Utc))
+    };
+    let Ok(created_at) = parse(&timestamps.0) else {
+        tracing::warn!(
+            run_id = id,
+            created_at = timestamps.0,
+            "could not parse the terminated run's start time to approximate its cost"
+        );
+        return;
+    };
+    // No `completed_at` means the terminal write lost its race or never landed; the run is over
+    // regardless, so `now` is the end of the only duration this can still measure.
+    let end = match timestamps.1.as_deref().map(parse).transpose() {
+        Ok(end) => end.unwrap_or_else(chrono::Utc::now),
+        Err(_) => {
+            tracing::warn!(
+                run_id = id,
+                "could not parse the terminated run's end time to approximate its cost"
+            );
+            return;
+        }
+    };
+
+    // The configured rate, not a constant: the budget approximates at whatever the operator set, and
+    // a stored cost computed at a different rate would disagree with every total that reads it.
+    let rate = match crate::budget::load_budget_config(pool).await {
+        Ok(config) => config.time_cost_per_hour_usd,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "could not load the budget rate to approximate the terminated run's cost"
+            );
+            return;
+        }
+    };
+
+    let approximated = crate::budget::time_approx_usd(created_at, end, rate);
+    if let Err(error) =
+        sqlx::query("UPDATE runs SET cost_usd = ? WHERE id = ? AND cost_usd IS NULL")
+            .bind(approximated)
+            .bind(id)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(
+            run_id = id,
+            %error,
+            "could not record the terminated run's approximated cost"
+        );
+    }
+}
+
 async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
@@ -820,6 +904,7 @@ async fn spawn_handoff_if_needed(
     tool_policy: crate::runner::ToolPolicy,
     run_timeout: std::time::Duration,
     classifier_governs_tools: bool,
+    model: Option<String>,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -865,6 +950,9 @@ async fn spawn_handoff_if_needed(
         // Inherited for the same reason, and it is the same tree: re-deriving would let a handoff
         // quietly change what the work is allowed to do halfway through it.
         classifier_governs_tools,
+        // Inherited: a successor is the same node continuing the same task, so it belongs on the
+        // model its predecessor's stage was routed to.
+        model,
     );
 }
 
@@ -890,6 +978,9 @@ fn spawn_run(
     steerable: bool,
     run_timeout: std::time::Duration,
     classifier_governs_tools: bool,
+    // Which model answers this run, or `None` for the runner's own. Decided by the caller, because
+    // only it knows the stage — `spawn_run` must not learn to read job nodes.
+    model: Option<String>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -939,6 +1030,10 @@ fn spawn_run(
                 steerable,
                 classifier_governs_tools,
                 messages: None,
+                // Autopilot runs pay for the ambient surface and call none of it.
+                ambient_mcp: false,
+                // Cloned rather than moved: the request is built once per attempt.
+                model: model.clone(),
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
             // be spoken to is settled where its argument vector is chosen, not by whatever later
@@ -1107,6 +1202,7 @@ fn spawn_run(
                             tool_policy,
                             run_timeout,
                             classifier_governs_tools,
+                            model.clone(),
                         ))
                         .await;
                     }
@@ -1204,6 +1300,11 @@ fn spawn_run(
                                 "could not cancel the timed-out run's queued vcs requests"
                             );
                         }
+                        // This is the run that reports no cost at all, so its spend has to be
+                        // approximated from the duration the write above just made final. Inside
+                        // the same guard: losing that CAS means another terminator owns the row,
+                        // and it is the owner's business what the run's cost and status are.
+                        record_time_approx_cost(&pool, id).await;
                         Box::pin(spawn_handoff_if_needed(
                             handoff_state.clone(),
                             runner.clone(),
@@ -1218,6 +1319,7 @@ fn spawn_run(
                             tool_policy,
                             run_timeout,
                             classifier_governs_tools,
+                            model.clone(),
                         ))
                         .await;
                     }
@@ -1600,6 +1702,11 @@ async fn create_run_with(
         steerable,
         run_timeout_for_mode(state.run_timeout, mode),
         governed_by_classifier,
+        // A job node's stage is what may be routed elsewhere; every other run names no stage and so
+        // stays on the runner's own model.
+        state
+            .runner
+            .model_for_stage(node.as_ref().map(|node| node.stage)),
     );
 
     Ok(id)
@@ -1713,6 +1820,24 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // SQLite's write lock across a subprocess would stall every other writer in the daemon.
     let queueable = queueable_merge(state, &proposal, &wt_project_id, &wt_path).await;
 
+    // The class the grant will authorize, derived before the transaction opens so a parse cannot
+    // hold SQLite's write lock. Re-derived here rather than carried on the proposal because
+    // `classify` is pure and `wt_path` is the very cwd the hook will hand it when the resume
+    // attempts the action — the same inputs, so the same answer, with nothing to keep in step.
+    // Absent or unparseable input yields no class, and a classless grant authorizes nothing.
+    //
+    // Derived even when the action was queued instead of authorized. The row is excluded from
+    // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
+    // no class would be a row that could not say what was taken over.
+    let action_class = proposal
+        .tool_input
+        .as_deref()
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+        .map(|input| {
+            crate::classifier::classify(&tool_name, &input, Some(std::path::Path::new(&wt_path)))
+                .action_class
+        });
+
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
 
@@ -1751,7 +1876,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the merge it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
         ),
         None => format!(
-            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — that one high-risk action is now authorized for this run — then finish the task."
+            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
         ),
     };
 
@@ -1789,26 +1914,32 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // One row either way, and `queued_request_id` is what it says (migration 0054). NULL is the
-    // grant this has always minted: permission for the RUN to perform the action itself, once. Set
-    // is the opposite fact — the queue has it, the run does not — and `consume_matching_grant`
-    // excludes those rows, so recording the takeover cannot accidentally authorise the very thing it
-    // records having taken away.
+    // One row either way, and it carries both keys because the two columns answer different
+    // questions about it.
+    //
+    // `action_class` is what an authorization is checked against (migration 0055); a NULL there
+    // authorizes nothing, so the resume would park again on the action just approved. `tool_input`
+    // is the record of the exact spelling the human read (migration 0020), and it is what `hooks.rs`
+    // matches a retry against when the action was taken over rather than authorized.
+    //
+    // `queued_request_id` is which of the two this row is (migration 0054). NULL is an authorization
+    // — the run may perform actions of that class for the rest of its life. Set is the opposite
+    // fact: the queue has this action, the run does not. `grant_covers_class` excludes those rows,
+    // and the class rule is what makes that exclusion load-bearing rather than tidy — a takeover row
+    // that covered its class would authorize every later merge the run attempted, off a row minted
+    // to say merging had been taken away from it.
     //
     // Written even when nothing is granted because the run has to be ABLE to be told. Without the
     // row, a resumed run that tried its merge again would be paused and would mint a second proposal
     // for a person to read — and approving that one would queue the merge twice.
-    //
-    // `tool_input` rides along so the row names the action the human actually read and approved, not
-    // merely the tool that would perform it (migration 0020) — and it is what `hooks.rs` matches the
-    // retry against.
     sqlx::query(
-        "INSERT INTO action_grants (run_id, tool_name, tool_input, proposal_id, created_at, consumed_at, queued_request_id)
-         VALUES (?, ?, ?, ?, ?, NULL, ?)",
+        "INSERT INTO action_grants (run_id, tool_name, tool_input, action_class, proposal_id, created_at, consumed_at, queued_request_id)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
     )
     .bind(resume_id)
     .bind(&tool_name)
     .bind(proposal.tool_input.as_deref())
+    .bind(action_class)
     .bind(proposal_id)
     .bind(&now)
     .bind(queued_request_id)
@@ -1924,6 +2055,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             crate::runner::ToolPolicy::Unrestricted,
             Some(std::path::Path::new(&wt_path)),
         ),
+        // The resume row carries the node's stage forward, so an approved plan node resumes on the
+        // plan model rather than dropping back to the runner's own.
+        state.runner.model_for_stage(stage.as_deref()),
     );
 
     Ok(resume_id)
@@ -2030,10 +2164,16 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             // the status write, because this is a consequence of the run ending — and best-effort,
             // because the run IS terminated either way and a queue row that outlives its run is a
             // stale request a human can cancel, not a broken run.
-            if ends_the_run(status)
-                && let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await
-            {
-                tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+            if ends_the_run(status) {
+                if let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await {
+                    tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+                }
+                // Every status that ends a run also ends its chance to report a cost: the abort
+                // above dropped the future, so `cancelled`, `failed`, `interrupted` and `timed_out`
+                // all leave the same silent `$0`. Sharing `ends_the_run` is what keeps
+                // `awaiting_approval` out — that run resumes, and the resume carries the real cost
+                // for the whole session; approximating the pause would bill the same time twice.
+                record_time_approx_cost(&state.pool, id).await;
             }
             true
         }
@@ -2936,6 +3076,9 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// The proposal carries a real approved command, not a placeholder: the grant the approval mints
+    /// records the action's CLASS, which is derived from that input. A `{}` input classifies as
+    /// `unrecognized`, so it would pin the fallback rather than the answer.
     async fn seed_resumable_action_approval(
         state: &AppState,
         session_id: Option<&str>,
@@ -2976,7 +3119,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             Some("proj"),
             "Bash",
             "push needs approval",
-            Some("{}"),
+            Some(r#"{"command":"git push origin main"}"#),
         )
         .await
         .unwrap();
@@ -3179,9 +3322,14 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         // Asserted through the two queries rather than by counting rows: since migration 0054 the
         // approval writes a row EITHER way, and what separates them is what that row answers. It
         // must record the takeover and must not authorize anything.
+        //
+        // The authorizing half is asked by CLASS, which is what a grant covers since migration 0055,
+        // and `push-merge-deploy` is the class this very command was paused under. Asking it the old
+        // way — by the exact input — would leave the test passing while the row authorized every
+        // other merge the run went on to try.
         let input = serde_json::json!({ "command": "git merge feature/x" }).to_string();
         assert!(
-            !proposals::consume_matching_grant(&state.pool, resume_id, "Bash", &input)
+            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
                 .await
                 .unwrap(),
             "the queue took the merge, so the run must NOT also be authorized to perform it"
@@ -3364,7 +3512,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     }
 
     #[tokio::test]
-    async fn approve_resumes_session_in_same_worktree_and_grants_the_action() {
+    async fn approve_resumes_session_in_same_worktree_and_grants_the_approved_actions_class() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         let (original_run_id, proposal_id, worktree_path) =
@@ -3407,14 +3555,25 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 .unwrap();
         assert_eq!(transferred_run_id, resume_run_id);
 
-        let grant = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT tool_name, consumed_at FROM action_grants WHERE run_id = ?",
+        // The class is what the grant authorizes, so it is what the approval has to write down. A
+        // NULL here authorizes nothing, and the resume would park again on the very action the user
+        // just approved. `consumed_at` is NULL at mint: the stamp records first USE, and nothing has
+        // used it yet.
+        let grant = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT tool_name, action_class, consumed_at FROM action_grants WHERE run_id = ?",
         )
         .bind(resume_run_id)
         .fetch_one(&state.pool)
         .await
         .unwrap();
-        assert_eq!(grant, ("Bash".to_owned(), None));
+        assert_eq!(
+            grant,
+            (
+                "Bash".to_owned(),
+                Some("push-merge-deploy".to_owned()),
+                None
+            )
+        );
 
         let proposal = proposals::get(&state.pool, proposal_id)
             .await
@@ -3696,6 +3855,79 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         .await
         .unwrap();
         assert_eq!(event_counts, (1, 0));
+    }
+
+    /// A run the wall clock kills never reports a cost: the future is dropped, so there is no
+    /// `RunOutcome` and no `cost_usd` to write. The budget then read that run as `cost_usd IS NULL`
+    /// and the money it spent existed only as an approximation recomputed on every check — a number
+    /// nothing durable ever held, and one that quietly moved as `now` did while the run was live.
+    ///
+    /// Pinning it at termination is what makes the spend a fact: the run ended, its duration is
+    /// final, and the approximation for that duration is written once, at the configured rate.
+    #[tokio::test]
+    async fn a_run_killed_by_the_wall_clock_records_an_approximated_cost() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44001, 'a run the wall clock cut short', 'timed_out', 'worktree', NULL,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44001).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cost = cost.expect("a run whose cost was never reported must not be recorded as free");
+        assert!(cost > 0.0, "unmeasured time is never $0, got {cost}");
+        // Ten minutes at the default `budget_time_cost_per_hour_usd` of $3/h.
+        assert!(
+            (cost - 0.5).abs() < 1e-9,
+            "ten minutes at the configured $3/h is $0.50, got {cost}"
+        );
+    }
+
+    /// The approximation is a floor for runs that reported nothing, not a correction to runs that
+    /// reported something. A measured cost is what the CLI actually charged; overwriting it with a
+    /// duration guess would replace the one real number in the budget with a made-up one.
+    #[tokio::test]
+    async fn an_approximated_cost_never_overwrites_a_real_one() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44002, 'a run that reported its own cost', 'completed', 'worktree', 0.0123,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44002).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44002")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cost,
+            Some(0.0123),
+            "a measured cost is the one the run actually incurred; an approximation must not \
+             replace it"
+        );
     }
 
     /// Barrier 1 of spec §5.5, at the seam where it is decided. A triage run reads mail written by

@@ -1,0 +1,17 @@
+-- What a human approves is a KIND of action, not one spelling of it. Keyed on the exact tool_input
+-- they read (migration 0020), an approval of `git push origin main` sent the resume back for a
+-- second approval the moment it pushed anything else -- the same decision put to the same person
+-- twice, and every re-ask is a chance to answer it wearily. The grant moves to the class the
+-- classifier already assigns, and covers that class for the rest of the run.
+--
+-- Nullable, and NULL authorizes nothing. Rows minted under the tool_name/tool_input rule cannot say
+-- WHICH class was approved, and widening them to "any" would hand every pre-0055 grant a licence no
+-- human ever gave. `action_class = ?` never matches NULL, so an old row covers no class at all --
+-- true for every class, including the ones nobody thought to enumerate.
+--
+-- Numbered 0055 at merge time, not when it was written. It was authored as 0051, skipping 0050
+-- because `master` had claimed that one -- and by the time this branch merged, `master` had reached
+-- 0054 and the gap was three migrations behind. Guessing a number a branch will still hold when it
+-- lands does not work; renumbering against the tip that is actually there does, and it is the only
+-- moment at which the answer is knowable.
+ALTER TABLE action_grants ADD COLUMN action_class TEXT;

@@ -81,11 +81,23 @@ pub struct SpendRow {
 /// zero/near-zero-duration run is never counted as $0 (spec §8.5: unmeasured cost is never free).
 const MIN_APPROX_SECONDS: i64 = 60;
 
-fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
-    let end = row.completed_at.unwrap_or(now);
-    let elapsed_seconds = (end - row.created_at).num_seconds();
+/// PURE: what a run that lasted `created_at`..`end` is assumed to have cost at `rate_per_hour`.
+///
+/// Public because the same approximation is written durably at termination (`runs.rs`) for a run
+/// that ended without reporting a cost. Two implementations of one number would drift, and the drift
+/// would show up as a total that moves the moment a stored value lands.
+pub fn time_approx_usd(created_at: DateTime<Utc>, end: DateTime<Utc>, rate_per_hour: f64) -> f64 {
+    let elapsed_seconds = (end - created_at).num_seconds();
     let seconds = elapsed_seconds.max(MIN_APPROX_SECONDS);
     (seconds as f64 / 3600.0) * rate_per_hour
+}
+
+fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
+    time_approx_usd(
+        row.created_at,
+        row.completed_at.unwrap_or(now),
+        rate_per_hour,
+    )
 }
 
 /// Total spend across `rows`, deduping resumed sessions and approximating unknown costs by time.
