@@ -1,15 +1,15 @@
 //! Removing sensitive spans from text, for two different readers.
 //!
 //! `redact_url` serves the log file. `redact_secrets` serves a model on the other side of a network
-//! boundary (`egress.rs`). They share this module because they answer the same question — what in
-//! this string must not be repeated — and keeping both here means the day a third caller needs one,
-//! there is one place to look.
+//! boundary, through `mcp_tools::filter_outgoing`. They share this module because they answer the
+//! same question — what in this string must not be repeated — and keeping both here means the day a
+//! third caller needs one, there is one place to look.
 //!
 //! Everything here is deterministic on purpose, and that is a design constraint rather than an
-//! implementation detail. `egress.rs` is allowed to REFUSE when redaction cannot run, which is a
-//! promise; a promise resting on a language model is not one, because "the model did not notice the
-//! key" is indistinguishable from "there was no key". Detectors that are arithmetic and table
-//! lookups fail in ways a test can pin down.
+//! implementation detail. The filter promises that a secret does not cross, and a promise resting
+//! on a language model is not one, because "the model did not notice the key" is indistinguishable
+//! from "there was no key". Detectors that are arithmetic and table lookups fail in ways a test can
+//! pin down.
 
 /// What a detector found, as a half-open byte range into the scanned string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,10 +379,22 @@ fn checksummed_numbers(input: &str) -> Vec<Finding> {
 
 /// Words that say a number is a card or a taxpayer id rather than a measurement.
 ///
-/// Portuguese and English, matching the trigger list the entropy rule uses, and with the same
-/// known gap: a number announced in a third language is not caught. That is a miss, and a miss is
-/// the direction this detector is allowed to fail in — the shadow pass is what will measure whether
-/// it happens enough to matter.
+/// **Only words that name the instrument.** The generic financial vocabulary — "conta", "account",
+/// "number", "numero", "número" — was here and is gone, and dropping it is what finally closes the
+/// bug this gate kept reopening. Those words are ambiguous in a way no matcher can resolve:
+/// "contas" is both the accounts and the second person of `contar`, and "accounts for 100000002
+/// bytes" is a number that belongs to nothing. They were corrupting ordinary sentences, and the
+/// only thing they bought was a card or a taxpayer id announced with a word that does not say which
+/// it is. Nobody writes "conta 4111 1111 1111 1111"; they write "cartão".
+///
+/// "iban" is gone for a different reason: it never did anything. `checksummed_numbers` exempts
+/// IBANs from needing a trigger at all, because mod-97 over a two-letter country code and two check
+/// digits in fixed positions is an anchor of its own. So the word could only ever have vouched for
+/// something ELSE near it — a nine-digit number beside the word "IBAN" being read as a taxpayer id.
+///
+/// Portuguese and English, with a known gap: a card announced in a third language is not caught.
+/// That is a miss, and a miss is the direction this detector is allowed to fail in — the shadow
+/// pass is what will measure whether it happens enough to matter.
 const NUMBER_TRIGGERS: &[&str] = &[
     "card",
     "cartao",
@@ -397,12 +409,6 @@ const NUMBER_TRIGGERS: &[&str] = &[
     "nif",
     "contribuinte",
     "vat",
-    "iban",
-    "conta",
-    "account",
-    "number",
-    "numero",
-    "número",
 ];
 
 /// How far back a trigger word may sit. Wide enough for "the card number ends ...", short enough
@@ -459,12 +465,11 @@ fn trigger_precedes(input: &str, start: usize) -> bool {
 /// Portuguese plurals that are not the singular plus `s` — "cartões", "cartoes" — are listed as
 /// triggers of their own, because this rule cannot reach them.
 ///
-/// What it does not do is tell a noun from a verb, and it cannot: "contas" is both the accounts and
-/// you count, "visas" is both the visas and you endorse, and English "accounts for" is a number
-/// that is not the account's. Those sentences still corrupt a number that passes a checksum. The
-/// ambiguity is in the trigger list itself — a word that names a card is a word — and removing it
-/// would cost the labelled card the gate exists to catch. Anything narrower than this belongs in
-/// the decision about whether the trigger gate should exist at all, not in the matcher.
+/// What it does not do is tell a noun from a verb, and it cannot. That was answered by shortening
+/// the list rather than by sharpening this: the words that were both — "conta", "account",
+/// "number" — are gone, so the ambiguity a matcher cannot resolve is no longer put to it. What
+/// remains of it is "visas", which is also the second person of `visar`; a Luhn-valid number beside
+/// that word is rare enough to be the price of catching "Visa 4111 1111 1111 1111".
 fn is_trigger_word(word: &str) -> bool {
     let stem = word.strip_suffix('s').unwrap_or(word);
     NUMBER_TRIGGERS.contains(&word) || NUMBER_TRIGGERS.contains(&stem)
@@ -795,14 +800,17 @@ mod tests {
     }
 
     /// A plural still names the number. Exact word matching was the first correction and it was too
-    /// tight the other way: "cards", "contas", "accounts" and "IBANs" all stopped counting, so a
-    /// labelled card written in the plural went out unredacted.
+    /// tight the other way: "cards", "NIFs" and "cartões" all stopped counting, so a labelled card
+    /// written in the plural went out unredacted.
+    ///
+    /// The cases that used to be here and are not — "accounts", "contas" — went with the words
+    /// themselves, which are no longer triggers at all.
     #[test]
     fn a_trigger_in_the_plural_still_vouches_for_a_number() {
         for input in [
             "please check these cards 4111 1111 1111 1111",
             "os NIFs 123456789 e outro",
-            "accounts 100000002 and more",
+            "os cartões 4111 1111 1111 1111",
         ] {
             assert_ne!(
                 redact_secrets(input),
@@ -853,6 +861,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The generic financial words are not triggers, and this is the decision rather than an
+    /// accident of the matcher. Each of these sentences was being corrupted — a byte count, a
+    /// balance, a line number turned into `[NIF]` or `[CARD]` — for the sake of catching a card
+    /// announced with a word that does not say it is a card.
+    #[test]
+    fn a_generic_financial_word_does_not_vouch_for_a_number() {
+        for input in [
+            "the gzip header accounts for 100000002 bytes of the file",
+            "a conta ficou em 100000002",
+            "number 100000002 in the queue",
+            "esta release levou 1786000000003 ms",
+        ] {
+            assert_eq!(
+                redact_secrets(input),
+                input,
+                "{input:?} was redacted by a word that does not name an instrument"
+            );
+        }
+    }
+
+    /// An IBAN needs no trigger and never did: mod-97 over a country code and two check digits in
+    /// fixed positions is its own anchor. That is why the word "IBAN" could be dropped from the
+    /// trigger list without weakening anything — it could only ever have vouched for some OTHER
+    /// number standing near it.
+    #[test]
+    fn an_iban_is_found_with_no_word_naming_it() {
+        let bare = "transfer to GB82 WEST 1234 5698 7654 32 today";
+        assert!(redact_secrets(bare).contains("[IBAN]"), "{bare:?}");
+
+        let beside_a_count = "IBAN questions: we processed 100000002 rows";
+        assert_eq!(
+            redact_secrets(beside_a_count),
+            beside_a_count,
+            "the word IBAN vouched for a number that is not one"
+        );
     }
 
     /// A verb is not a label. Allowing any one trailing character admitted the plurals it was meant

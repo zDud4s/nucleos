@@ -11,7 +11,6 @@ mod concurrency;
 mod config;
 mod contacts;
 mod daemon_client;
-mod egress;
 mod email;
 mod feed;
 mod files;

@@ -4,10 +4,6 @@ use serde::Serialize;
 
 pub struct NucleosTools {
     client: crate::daemon_client::DaemonClient,
-    /// Who the results of this server's tools are being handed to. Read once at construction
-    /// because it cannot change while the process lives: the daemon spawns one of these per turn
-    /// and stamps the audience on it.
-    audience: crate::egress::Audience,
     #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
     tool_router: ToolRouter<Self>,
 }
@@ -16,7 +12,6 @@ impl NucleosTools {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
             client: crate::daemon_client::DaemonClient::from_env()?,
-            audience: crate::egress::Audience::from_env(),
             tool_router: Self::tool_router(),
         })
     }
@@ -307,23 +302,38 @@ impl ServerHandler for NucleosTools {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = Self::tool_router().call(tcc).await?;
-        Ok(filter_outgoing(self.audience, result))
+        Ok(filter_outgoing(result))
     }
 }
 
-/// Applies the egress policy to one tool result.
+/// Removes every deterministically-detectable secret from one tool result.
+///
+/// **Unconditional, and it takes no policy argument.** It used to take an audience, read from an
+/// environment variable, on the theory that a result addressed to a model on this machine needs no
+/// filtering. That theory was right and the mechanism was wrong twice over. Nothing ever set the
+/// variable, so the branch never ran; and a filter with an off switch in the process environment is
+/// a filter that a misconfigured launcher — or anything that can put a variable in front of a
+/// subprocess — turns off silently. An escape hatch nobody uses is all cost.
+///
+/// The distinction it was reaching for is real and is already made, structurally and unmissably: a
+/// turn answered by a local model does not come through here at all. `LocalToolBox::call`
+/// dispatches to the tool methods directly, so "who is on the other end" is decided by which code
+/// path ran, which cannot be misconfigured, and everything that reaches this function is by
+/// construction on its way off this machine.
+///
+/// Not keyed on the tool's `ToolEffect` either, and that is the judgement worth keeping. The
+/// obvious design filters only `ReadsUntrusted`, since those are the tools that admit to carrying a
+/// stranger's words — but `TOOL_EFFECTS` below records that `get_run` is `ReadsOwn` "only
+/// lexically", because a triage run's stdout is a model's answer over mail. A rule keyed on that
+/// table would wave it through, and would wave through the next tool whose output quietly quotes
+/// third-party text on the day it is added. Scanning everything costs one pass over a string
+/// already in memory and makes "is this tool classified correctly?" stop being load-bearing for
+/// egress.
 ///
 /// Both carriers are filtered. `structured_content` is not decoration: a tool that returns JSON
 /// puts the same text there in parsed form, so redacting only the text blocks would leave the
 /// secret in the field a client is more likely to read programmatically.
-fn filter_outgoing(
-    audience: crate::egress::Audience,
-    mut result: rmcp::model::CallToolResult,
-) -> rmcp::model::CallToolResult {
-    if crate::egress::disposition(audience) == crate::egress::Disposition::Cross {
-        return result;
-    }
-
+fn filter_outgoing(mut result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
     for block in &mut result.content {
         if let rmcp::model::ContentBlock::Text(text) = block {
             text.text = crate::redact::redact_secrets(&text.text);
@@ -498,10 +508,6 @@ impl LocalToolBox {
             pool,
             tools: NucleosTools {
                 client: crate::daemon_client::DaemonClient::new(base_url, token),
-                // A local turn is the audience, so nothing here is redacted. Stated rather than
-                // defaulted: `Audience::from_env` would read the process environment, which belongs
-                // to the daemon and says nothing about who this particular turn is for.
-                audience: crate::egress::Audience::Local,
                 tool_router: NucleosTools::tool_router(),
             },
         }
@@ -635,7 +641,7 @@ mod tests {
             "nested": [{"also": key}],
         }));
 
-        let filtered = filter_outgoing(crate::egress::Audience::Cloud, result);
+        let filtered = filter_outgoing(result);
 
         let structured = filtered
             .structured_content
@@ -658,22 +664,6 @@ mod tests {
             "{:?}",
             text.text
         );
-    }
-
-    /// A local audience is the whole reason the filter is keyed on one: nothing is removed.
-    #[test]
-    fn a_local_audience_gets_the_result_untouched() {
-        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaaaaaa\n\
------END RSA PRIVATE KEY-----\n";
-        let mut result =
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
-                key.to_string(),
-            )]);
-        result.structured_content = Some(serde_json::json!({ "body": key }));
-
-        let filtered = filter_outgoing(crate::egress::Audience::Local, result);
-
-        assert_eq!(filtered.structured_content.unwrap()["body"], key);
     }
 
     /// The exact set, not a subset.
