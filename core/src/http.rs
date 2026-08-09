@@ -1460,7 +1460,7 @@ async fn get_email_queue(
     // `failed` sorts with the rest rather than being hidden: it is the class most likely to be
     // requeued, so it is the one that must stay findable.
     // Searching narrows this list rather than being a list of its own, so the ordering, the limit
-    // and the `inbound` filter above are stated once and hold either way. 0051 indexes only what
+    // and the `inbound` filter above are stated once and hold either way. 0058 indexes only what
     // survives triage — sender, subject, and the locally-written summary — so a search for a word
     // that was only ever in a body finds nothing, which is the correct answer once the body is gone
     // rather than a gap in the index.
@@ -4123,7 +4123,7 @@ mod tests {
         }
     }
 
-    /// 0051 indexes nothing that triage deletes. A word that lived only in the body is unfindable,
+    /// 0058 indexes nothing that triage deletes. A word that lived only in the body is unfindable,
     /// and that is the retention decision holding rather than a hole in the index — the alternative
     /// is an index that keeps a stranger's words after the row stopped storing them.
     #[tokio::test]

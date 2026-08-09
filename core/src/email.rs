@@ -732,7 +732,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        // The four `emails_fts_*` entries are FTS5's own storage for the index 0051 declares, not
+        // The four `emails_fts_*` entries are FTS5's own storage for the index 0058 declares, not
         // tables anything here writes to. They are listed rather than filtered out because this
         // assertion is a schema pin: the next person to add or drop an email table should have to
         // say so here, and that includes the day somebody decides the index is not worth its space.

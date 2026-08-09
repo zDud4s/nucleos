@@ -35,7 +35,7 @@ CREATE TRIGGER IF NOT EXISTS emails_fts_delete AFTER DELETE ON emails BEGIN
     VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.triage_summary);
 END;
 
--- Unlike 0035's, and unlike 0050's, this trigger is the one that does the real work. A message is
+-- Unlike 0035's, and unlike 0057's, this trigger is the one that does the real work. A message is
 -- INSERTed with no verdict at all and gains `triage_summary` by UPDATE, minutes or hours later —
 -- so without this, the index would hold every subject and not one summary, and the most searchable
 -- thing about a message would be the only thing missing from it.

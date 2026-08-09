@@ -23,7 +23,7 @@
 
 use serde::Deserialize;
 
-/// Columns this pass is allowed to read, matching the CHECK constraint in migration 0052.
+/// Columns this pass is allowed to read, matching the CHECK constraint in migration 0059.
 ///
 /// Duplicated between Rust and SQL deliberately: the database refuses a bad write and this refuses
 /// to attempt one, so a mistake is caught where it is made rather than as a constraint violation in
