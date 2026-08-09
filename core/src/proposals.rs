@@ -441,7 +441,7 @@ pub async fn consume_matching_grant(
 }
 
 /// The queued request that already has this action, if the approval handed it to the queue instead
-/// of back to the run (migration 0051).
+/// of back to the run (migration 0054).
 ///
 /// The mirror of `consume_matching_grant`, matched the same way and for the same reason — and it
 /// consumes NOTHING. A grant is spent because it authorises one action; this is a standing fact

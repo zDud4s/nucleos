@@ -211,7 +211,7 @@ pub async fn pretooluse_decision(
     // The input is part of the match, not decoration: `tool_name` is "Bash" for every shell action,
     // so without it an approved `git push` authorized whatever this run tried next.
     if classification.decision.decision == "pending_approval" && is_in_flight {
-        // Already taken over by the queue (migration 0051). Answered BEFORE the grant lookup and
+        // Already taken over by the queue (migration 0054). Answered BEFORE the grant lookup and
         // before the pause below, because both would be wrong here: there is no grant to consume —
         // the approval deliberately minted none — and pausing would fetch a person to approve a
         // merge that is already queued, whose approval would queue it a second time.

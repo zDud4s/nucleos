@@ -1789,7 +1789,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // One row either way, and `queued_request_id` is what it says (migration 0051). NULL is the
+    // One row either way, and `queued_request_id` is what it says (migration 0054). NULL is the
     // grant this has always minted: permission for the RUN to perform the action itself, once. Set
     // is the opposite fact — the queue has it, the run does not — and `consume_matching_grant`
     // excludes those rows, so recording the takeover cannot accidentally authorise the very thing it
@@ -3075,10 +3075,19 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     /// an approval that did not happen — with the proposal still pending, so a person could
     /// authorise it a second time. What is pinned is that pair: nothing queued, nothing decided.
     ///
-    /// The failure is reached the way the code's own comment says it can be: the supersede is a
-    /// compare-and-set on `awaiting_approval`, so a run that has moved on since the proposal was
-    /// read is not superseded, and `one_open_worktree_run_per_project` then rejects the INSERT of
-    /// the resume — after the admission, which is exactly the window that matters.
+    /// The failure has to be induced, and the way this test induced it before the merge is gone. It
+    /// moved the paused run off `awaiting_approval` so that `one_open_worktree_run_per_project`
+    /// (migration 0009) would refuse the resume's INSERT. Migration 0053 dropped that index: a run
+    /// stranded at `running` no longer blocks its whole project, it holds one numbered slot in
+    /// `project_slots`, and a resume takes over the paused run's tree rather than competing with it
+    /// for the project. There is no longer a domain state in which the resume's INSERT is refused —
+    /// that is the new concurrency model working, not a hole in it.
+    ///
+    /// So the INSERT is made impossible mechanically instead: `runs.id` is `AUTOINCREMENT`, and with
+    /// the sequence parked at `i64::MAX` SQLite has no id left to hand out and fails the statement.
+    /// The specific failure is not what is under test — it stands in for any failure between the
+    /// admission and the commit — only that the admission is inside that transaction and leaves with
+    /// it.
     ///
     /// **What this test does NOT do, written down because the first version of this comment claimed
     /// the opposite.** It does not distinguish `submit_on(&mut *tx, …)` from `submit(&pool, …)`.
@@ -3098,16 +3107,18 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         let (proposal_id, _branch, _container) =
             seed_real_worktree_approval(&state, "git merge feature/x").await;
 
-        // The paused run moves on after the proposal was written: the slot it holds is still this
-        // project's only one, so the resume's own INSERT cannot land.
-        sqlx::query("UPDATE runs SET status = 'running' WHERE project_id = 'proj'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        // After the seeding, and it has to be: every row above needs an id of its own. From here on
+        // the sequence is exhausted, so the resume's INSERT is the first one that cannot land.
+        advance_run_ids_past(&state.pool, i64::MAX).await;
 
+        // On the VARIANT, not merely on `is_err`. Every assertion below this line is also satisfied
+        // by a resume that failed BEFORE it admitted anything — `NotResumable` because the seeded
+        // worktree was not found, say — and a test that cannot tell those apart would report the
+        // rollback it never exercised. `Db` is reachable only past the admission here.
+        let failed = resume_approved_run(&state, proposal_id).await;
         assert!(
-            resume_approved_run(&state, proposal_id).await.is_err(),
-            "the resume cannot insert its run, so the approval cannot succeed"
+            matches!(failed, Err(ResumeError::Db(_))),
+            "the resume must fail on its own INSERT, past the admission: {failed:?}"
         );
 
         let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
@@ -3165,7 +3176,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             serde_json::json!({"op": "merge", "source": "feature/x", "target": branch})
         );
 
-        // Asserted through the two queries rather than by counting rows: since migration 0051 the
+        // Asserted through the two queries rather than by counting rows: since migration 0054 the
         // approval writes a row EITHER way, and what separates them is what that row answers. It
         // must record the takeover and must not authorize anything.
         let input = serde_json::json!({ "command": "git merge feature/x" }).to_string();
