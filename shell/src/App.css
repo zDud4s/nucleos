@@ -1154,6 +1154,16 @@ details.scoreboard th {
 .s-name, .b-name, .t-name { font: 400 var(--fs-sm) var(--mono); color: var(--text); }
 .s-reason, .b-meta { color: var(--muted); font-size: var(--fs-xs); margin-left: auto; }
 .backups li > .btn, .tokens li > .btn { margin-left: auto; }
+
+/* O que o sidecar disse, em linha própria por baixo do resto. A `li` é `flex` numa linha só, e uma
+   frase de erro do processo esmagaria o nome e o estado contra a margem se ficasse ao lado deles. */
+.subsystems li:has(.s-said) { flex-wrap: wrap; }
+.s-said {
+  flex-basis: 100%;
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
 .tokens li > time { color: var(--faint); font-size: var(--fs-xs); margin-left: auto; }
 
 .minted {
