@@ -44,7 +44,11 @@ pub struct AwaitingRun {
 }
 
 /// A lean run index entry. It intentionally excludes the full prompt and captured command output.
-#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+///
+/// `Deserialize` is here for the route tests rather than for production — the same asymmetry
+/// `RunStatusResponse` below already carries, and what lets `/runs` be asserted as its own type
+/// instead of as untyped JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RunSearchResult {
     pub id: i64,
     pub project_id: Option<String>,
@@ -65,6 +69,10 @@ pub struct SearchFilter {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub limit: i64,
+    /// Only what still holds a slot. A boolean rather than letting the caller write both statuses
+    /// into `status`, which takes exactly **one** exact value — and the question "what is in flight"
+    /// has two right answers.
+    pub live: bool,
 }
 
 /// Keep search results useful without turning the index into a prompt or output retrieval endpoint.
@@ -111,6 +119,17 @@ pub async fn search(
     }
     if let Some(mode) = &filter.mode {
         query.push(" AND mode = ").push_bind(mode);
+    }
+    // `live` and `status` compose with AND rather than one overriding the other. A terminal
+    // `status` together with `live=true` returns nothing, which is the honest answer to the
+    // question that was actually asked.
+    if filter.live {
+        query.push(" AND status IN (");
+        let mut statuses = query.separated(", ");
+        for status in crate::concurrency::LIVE_RUN_STATUSES {
+            statuses.push_bind(status);
+        }
+        query.push(")");
     }
     if let Some(q) = &filter.q {
         let fts = fts_query(q);
@@ -6091,6 +6110,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                         .with_timezone(&chrono::Utc),
                 ),
                 limit: 50,
+                live: false,
             },
         )
         .await
@@ -6143,6 +6163,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 since: None,
                 until: None,
                 limit: 50,
+                live: false,
             },
         )
         .await
@@ -6185,6 +6206,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 since: None,
                 until: None,
                 limit: 50,
+                live: false,
             },
         )
         .await
@@ -6250,6 +6272,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 since: None,
                 until: None,
                 limit: 50,
+                live: false,
             },
         )
         .await
@@ -6302,6 +6325,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 since: None,
                 until: None,
                 limit: 50,
+                live: false,
             },
         )
         .await
@@ -6336,6 +6360,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 since: None,
                 until: None,
                 limit: 50,
+                live: false,
             },
         )
         .await
@@ -6343,5 +6368,91 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, run_id);
+    }
+
+    /// What `get_runs` assembles when nobody asked for anything: `parse_search_limit` returns 50 by
+    /// default.
+    fn base_filter() -> SearchFilter {
+        SearchFilter {
+            project_id: None,
+            status: None,
+            mode: None,
+            q: None,
+            since: None,
+            until: None,
+            limit: 50,
+            live: false,
+        }
+    }
+
+    /// A run parked on an approval holds both its slot and its worktree, and is exempt from the
+    /// retention clock — by design it is what sits there longest. It is also the first thing the
+    /// default window of 50 hides, which would make *detail unavailable* the normal state of its
+    /// card.
+    #[tokio::test]
+    async fn the_live_filter_reaches_a_parked_run_the_default_window_would_hide() {
+        let pool = search_test_pool().await;
+        let parked = insert_search_run(
+            &pool,
+            "project-a",
+            "awaiting_approval",
+            "worktree",
+            "parked",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        for index in 0..60 {
+            insert_search_run(
+                &pool,
+                "project-b",
+                "completed",
+                "worktree",
+                "noise",
+                &format!("2026-08-0{}T00:00:0{}Z", 1 + index / 10, index % 10),
+            )
+            .await;
+        }
+
+        let default = search(&pool, &base_filter()).await.unwrap();
+        assert!(
+            !default.iter().any(|row| row.id == parked),
+            "the setup did not push the parked run out of the window"
+        );
+
+        let live = search(
+            &pool,
+            &SearchFilter {
+                live: true,
+                ..base_filter()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(live.iter().any(|row| row.id == parked));
+    }
+
+    /// Both statuses, and only those. A finished run has given its slot back.
+    #[tokio::test]
+    async fn the_live_filter_carries_both_slot_holding_statuses_and_nothing_else() {
+        let pool = search_test_pool().await;
+        let at = "2026-08-09T00:00:00Z";
+        let running = insert_search_run(&pool, "project-a", "running", "worktree", "a", at).await;
+        let parked =
+            insert_search_run(&pool, "project-a", "awaiting_approval", "worktree", "b", at).await;
+        insert_search_run(&pool, "project-a", "completed", "worktree", "c", at).await;
+        insert_search_run(&pool, "project-a", "interrupted", "worktree", "d", at).await;
+
+        let live = search(
+            &pool,
+            &SearchFilter {
+                live: true,
+                ..base_filter()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids: std::collections::HashSet<i64> = live.iter().map(|row| row.id).collect();
+        assert_eq!(ids, std::collections::HashSet::from([running, parked]));
     }
 }

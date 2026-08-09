@@ -206,13 +206,13 @@ pub async fn slot_of(pool: &SqlitePool, owner: Owner) -> sqlx::Result<Option<i64
 /// The statuses that mean a run still holds its slot. Mirrors what
 /// `one_open_worktree_run_per_project` covered, which is what this replaces.
 ///
-/// Test-only, and the asymmetry with `job::LIVE_STATUSES` is worth stating rather than hiding: that
-/// one is production truth, read by `live_jobs` and by `cancel`, so a guard against it catches drift
-/// anywhere. There is no such constant for runs — every site spells the pair into its own SQL — so
-/// this catches an edit to the sweep below and nothing wider. Making it `pub` to look symmetric
-/// would claim a guarantee it does not give.
-#[cfg(test)]
-const LIVE_RUN_STATUSES: [&str; 2] = ["running", "awaiting_approval"];
+/// It was `#[cfg(test)]` until the live listing existed, and the comment of the time said that
+/// making it public would *"claim a guarantee it does not give"* — because no production path read
+/// it, every site spelling the pair into its own SQL. `runs::search` reads it now, and can do so
+/// because it builds its query with `QueryBuilder`, which is runtime assembly and therefore does not
+/// hit the sqlx refusal that forces the sweep below to be written out by hand. The guarantee is
+/// real: an edit to this list moves the filter and the sweep at once.
+pub const LIVE_RUN_STATUSES: [&str; 2] = ["running", "awaiting_approval"];
 
 /// The ceiling of a listing filtered to live work, shared by both of them.
 ///

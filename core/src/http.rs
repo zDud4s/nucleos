@@ -482,6 +482,11 @@ struct RunsQuery {
     since: Option<String>,
     until: Option<String>,
     limit: Option<String>,
+    /// Only the runs still holding a slot. `status` takes one exact value and a slot-holding run is
+    /// `running` *or* `awaiting_approval`, so this is not something the existing filter can express.
+    ///
+    /// Absent, the answer is byte for byte today's — which is what leaves the Runs tab as it is.
+    live: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2150,6 +2155,15 @@ async fn get_runs(
     State(state): State<AppState>,
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<Vec<runs::RunSearchResult>>, StatusCode> {
+    let live = query.live == Some(true);
+    // A live listing with no explicit limit inherits the ceiling of live listings, not search's 50.
+    // Without this the daemon would promise a shared constant and hand back the search window — and
+    // the client would be the only thing guaranteeing the number, which is no guarantee at all.
+    let limit = if live && query.limit.is_none() {
+        crate::concurrency::LIVE_LIST_LIMIT
+    } else {
+        parse_search_limit(query.limit)?
+    };
     runs::search(
         &state.pool,
         &runs::SearchFilter {
@@ -2159,7 +2173,8 @@ async fn get_runs(
             q: query.q,
             since: parse_time_bound(query.since)?,
             until: parse_time_bound(query.until)?,
-            limit: parse_search_limit(query.limit)?,
+            limit,
+            live,
         },
     )
     .await
@@ -3195,6 +3210,82 @@ mod tests {
         let today = jobs_at(&app, "/jobs").await;
         assert_eq!(today.len(), 20, "without the parameter, today's ceiling holds");
         assert!(!today.iter().any(|job| job.id == old_live));
+
+        db.close().await;
+    }
+
+    async fn runs_at(app: &Router, uri: &str) -> Vec<runs::RunSearchResult> {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn seed_run_row(
+        pool: &sqlx::SqlitePool,
+        project_id: &str,
+        status: &str,
+        created_at: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES (?, 'a prompt', ?, 'worktree', ?)",
+        )
+        .bind(project_id)
+        .bind(status)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// Both halves of the parameter, and the ceiling it brings with it.
+    ///
+    /// Without `live`, search's window of 50. With `live` and no `limit`, the ceiling of the live
+    /// listings — which is what makes the constant shared in fact and not only in intent.
+    #[tokio::test]
+    async fn the_live_parameter_reaches_past_the_search_window_and_raises_its_ceiling() {
+        let (state, db) = file_test_state().await;
+        let parked = seed_run_row(
+            &state.pool,
+            "project-a",
+            "awaiting_approval",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        for index in 0..60 {
+            seed_run_row(
+                &state.pool,
+                "project-b",
+                "completed",
+                &format!("2026-08-0{}T00:00:0{}Z", 1 + index / 10, index % 10),
+            )
+            .await;
+        }
+
+        let app = Router::new()
+            .route("/runs", get(get_runs))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let today = runs_at(&app, "/runs").await;
+        assert_eq!(today.len(), 50, "without the parameter, search's window holds");
+        assert!(!today.iter().any(|run| run.id == parked));
+
+        let live = runs_at(&app, "/runs?live=true").await;
+        assert!(
+            live.iter().any(|run| run.id == parked),
+            "the live ceiling did not replace search's"
+        );
 
         db.close().await;
     }
