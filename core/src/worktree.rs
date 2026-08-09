@@ -20,6 +20,12 @@ const DEFAULT_PRESERVATION_BYTE_CEILING: u64 = 256 * 1024 * 1024;
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: String,
+    /// The commit this tree was born on.
+    ///
+    /// `Option`, and a failure to read it does **not** fail provisioning: the worktree exists and
+    /// the work can carry on. What is lost is the base collision measures against, and the reader
+    /// sees `not measured` instead of a `clean` nobody computed.
+    pub base_sha: Option<String>,
 }
 
 pub fn worktree_root(project_root: &Path) -> PathBuf {
@@ -147,7 +153,21 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
         )));
     }
 
-    Ok(WorktreeInfo { path, branch })
+    // Asked here rather than passed in from outside: this is the only place that knows where the
+    // tree branched from. Handing the sha to `record` as a parameter would make both callers find
+    // it their own way — and for jobs one already exists (`create_job` computes
+    // `current_branch_sha`) while for runs there is nothing, which would bring back at the moment
+    // of writing exactly the asymmetry the base exists to remove.
+    //
+    // `.ok()` and not `?`: the worktree exists and the work can carry on without a base. What is
+    // lost is the yardstick collision measures against, and the reader sees `not measured` rather
+    // than a `clean` nobody computed.
+    let base_sha = head_sha(&path).await.ok();
+    Ok(WorktreeInfo {
+        path,
+        branch,
+        base_sha,
+    })
 }
 
 /// Where a job's nodes hand work to each other, relative to the worktree they share.
@@ -863,11 +883,13 @@ pub async fn record(
     project_root: &str,
     path: &str,
     branch: &str,
+    base_sha: Option<&str>,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO worktrees
-         (owner_kind, owner_id, project_id, project_root, path, branch, created_at, removed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+         (owner_kind, owner_id, project_id, project_root, path, branch, base_sha,
+          created_at, removed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
     )
     .bind(owner.kind())
     .bind(owner.id())
@@ -875,6 +897,7 @@ pub async fn record(
     .bind(project_root)
     .bind(path)
     .bind(branch)
+    .bind(base_sha)
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
@@ -1467,6 +1490,7 @@ mod tests {
             repo.to_str().expect("repository path should be UTF-8"),
             info.path.to_str().expect("worktree path should be UTF-8"),
             &info.branch,
+            info.base_sha.as_deref(),
         )
         .await
         .expect("record worktree");
@@ -1729,6 +1753,61 @@ mod tests {
         remove(repo.path(), &info.path, &[])
             .await
             .expect("remove worktree");
+    }
+
+    /// Where the tree was born, asked of git while git is the only thing that knows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_new_worktree_knows_the_commit_it_branched_from() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let head = git_stdout(repo.path(), &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+
+        let info = create(repo.path(), Owner::Run(1))
+            .await
+            .expect("create worktree");
+
+        assert_eq!(info.base_sha.as_deref(), Some(head.as_str()));
+    }
+
+    /// Recorded for both owners alike. The asymmetry this removes is exactly the dangerous one: if
+    /// only jobs had a base, one live worktree run would put its whole project into *not measured*
+    /// — the warning would switch itself off precisely while somebody was working.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_base_is_recorded_for_a_run_and_for_a_job_alike() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        for owner in [Owner::Run(1), Owner::Job(1)] {
+            let info = create(repo.path(), owner).await.expect("create worktree");
+            record(
+                &pool,
+                owner,
+                "project-a",
+                repo.path().to_str().unwrap(),
+                info.path.to_str().unwrap(),
+                &info.branch,
+                info.base_sha.as_deref(),
+            )
+            .await
+            .expect("record worktree");
+
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT base_sha FROM worktrees WHERE owner_kind = ? AND owner_id = ?",
+            )
+            .bind(owner.kind())
+            .bind(owner.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, info.base_sha, "{owner:?} was left without a base");
+        }
+
+        pool.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2405,6 +2484,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-1",
             "nucleos/run-1",
+            None,
         )
         .await
         .unwrap();
@@ -2448,6 +2528,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-2",
             "nucleos/run-2",
+            None,
         )
         .await
         .unwrap();
@@ -2480,6 +2561,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-3",
             "nucleos/run-3",
+            None,
         )
         .await
         .unwrap();
@@ -2513,6 +2595,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-4",
             "nucleos/run-4",
+            None,
         )
         .await
         .unwrap();
@@ -2540,6 +2623,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-5",
             "nucleos/run-5",
+            None,
         )
         .await
         .unwrap();
@@ -2573,6 +2657,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-6",
             "nucleos/run-6",
+            None,
         )
         .await
         .unwrap();
@@ -2607,6 +2692,7 @@ mod tests {
             "/project/a",
             "/worktrees/run-1",
             "nucleos/run-1",
+            None,
         )
         .await
         .expect("record run-owned worktree");
@@ -2617,6 +2703,7 @@ mod tests {
             "/project/a",
             "/worktrees/job-1",
             "nucleos/job-1",
+            None,
         )
         .await
         .expect("record job-owned worktree");
@@ -2652,6 +2739,7 @@ mod tests {
             "/project/a",
             "/worktrees/job-1",
             "nucleos/job-1",
+            None,
         )
         .await
         .unwrap();
@@ -2707,6 +2795,7 @@ mod tests {
             "/project/a",
             "/worktrees/job-9",
             "nucleos/job-9",
+            None,
         )
         .await
         .unwrap();
@@ -2739,6 +2828,7 @@ mod tests {
             "/project/a",
             "/worktrees/job-10",
             "nucleos/job-10",
+            None,
         )
         .await
         .unwrap();

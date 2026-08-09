@@ -1,0 +1,13 @@
+-- Where the worktree branched from, so that "what has this tree touched since it was born" has an
+-- answer at all.
+--
+-- Nullable, and NULL is the honest value rather than a gap to be backfilled: every row written
+-- before this column existed branched from a commit nobody recorded, and after the fact there is no
+-- way to recover it — the branch has moved on. A NULL base reads as `not measured`, never as
+-- `clean`, which is the one wrong answer the collision warning must not give.
+--
+-- One base for runs and jobs alike. `jobs.head_sha` (0042) exists and is deliberately not reused:
+-- `runs` has no equivalent column, and a live worktree run without a base would put its whole
+-- project into `not measured` — the warning would switch itself off exactly when somebody was
+-- working.
+ALTER TABLE worktrees ADD COLUMN base_sha TEXT;

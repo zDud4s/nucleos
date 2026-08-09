@@ -1031,6 +1031,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
         request.project_root,
         &path,
         &info.branch,
+        info.base_sha.as_deref(),
     )
     .await
     {
@@ -3049,6 +3050,7 @@ mod tests {
             &path.to_string_lossy(),
             &path.to_string_lossy(),
             "nucleos/job",
+            None,
         )
         .await
         .expect("record the job's worktree");
@@ -4707,6 +4709,7 @@ mod tests {
             &root,
             &info.path.to_string_lossy(),
             &info.branch,
+            info.base_sha.as_deref(),
         )
         .await
         .expect("record the job's worktree");
