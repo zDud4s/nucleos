@@ -2575,6 +2575,11 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
         Err(error) => tracing::warn!(%error, "could not sweep orphaned concurrency slots"),
     }
 
+    // Before the jobs are driven, because the measurement is about the state the trees are in NOW
+    // and driving a job changes them. It carries a deadline of its own: a `git status` over a large
+    // tree is what this pass costs, and nothing here may delay the work the tick exists to do.
+    crate::collision::measure(&state.pool).await;
+
     let jobs = match live_jobs(&state.pool).await {
         Ok(jobs) => jobs,
         Err(error) => {

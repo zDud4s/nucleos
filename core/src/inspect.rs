@@ -13,11 +13,9 @@ const DIFF_TIMEOUT_SECS: u64 = 20;
 const DIFF_CAP: usize = 1024 * 1024;
 /// What `changed_paths` gives git before giving up. A number of its own rather than
 /// `DIFF_TIMEOUT_SECS`: this one runs on the job tick, not inside a request somebody is waiting on.
-#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
 const CHANGED_PATHS_TIMEOUT_SECS: u64 = 20;
 /// A ceiling on the output, in bytes. ~1 MiB of path names is tens of thousands of files; past
 /// that is a repository this measurement does not serve.
-#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
 const CHANGED_PATHS_CAP: usize = 1024 * 1024;
 const SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "__pycache__"];
 
@@ -286,7 +284,6 @@ pub fn diff(root: &Path) -> Result<String, InspectError> {
 ///
 /// Error rather than truncation, unlike `diff`: a truncated list loses paths and reads as `clean`
 /// for those files, which is the one outcome this measurement must not have.
-#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
 pub fn changed_paths(root: &Path, base: &str) -> Result<Vec<String>, InspectError> {
     // 40 hexadecimal characters, which is what `git rev-parse HEAD` returns under SHA-1 — and the
     // repository's `core.abbrev` does not shorten it. A repository on `--object-format=sha256`
@@ -350,7 +347,6 @@ pub fn changed_paths(root: &Path, base: &str) -> Result<Vec<String>, InspectErro
 /// A rename or copy (`R`/`C` in either column) emits a **second** NUL-terminated field right after
 /// the record: the origin path. Both count — a worktree that renames a file another one is editing
 /// has collided with it.
-#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
 fn parse_status_z(output: &[u8]) -> Vec<String> {
     let mut paths = Vec::new();
     let mut records = output
@@ -381,7 +377,6 @@ fn parse_status_z(output: &[u8]) -> Vec<String> {
 /// It is the shape `diff` already has and is not fixed here. The mitigation is on the caller's
 /// side: the tick does not wait for the measurement, and how many worktrees it measures per tick
 /// has a ceiling.
-#[cfg_attr(not(test), allow(dead_code))] // the production caller arrives in the next task
 fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, InspectError> {
     use std::io::Read;
 

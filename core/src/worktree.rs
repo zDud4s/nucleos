@@ -911,6 +911,12 @@ pub async fn mark_removed(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
         .bind(owner.id())
         .execute(pool)
         .await?;
+    // The collision measurement describes a tree that is no longer on disk. Best-effort: a row left
+    // behind is one warning too many, and failing the worktree's removal on account of it would
+    // trade a small problem for a large one.
+    if let Err(error) = crate::collision::forget(pool, owner.kind(), owner.id()).await {
+        tracing::warn!(?owner, %error, "could not clear the worktree's collision measurement");
+    }
     Ok(())
 }
 
