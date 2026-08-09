@@ -206,6 +206,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/calendar/busy", get(crate::calendar::get_busy))
         .route("/calendar/config", get(crate::calendar::get_config))
         .route("/notifications/pending", get(crate::notify::list_pending))
+        // The measurement the shadow pass exists to produce. Without somewhere to read it, the
+        // table is write-only and the pass becomes the thing it was designed not to be: data
+        // accumulating with nobody able to decide anything from it.
+        .route("/pii/observations", get(get_pii_observations))
         .route("/files", get(get_files).delete(delete_file))
         .route("/files/folder", post(post_files_folder))
         .route("/files/download", get(get_file_download))
@@ -1563,6 +1567,26 @@ async fn post_assistant_message(
         Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// What the PII shadow pass has seen, by class.
+///
+/// `none` is a class here and not an absence: it counts the summaries that were looked at and found
+/// clean, which is the denominator. A tally without it says how often personal data was found and
+/// not how often it was looked for, and only the second answers whether a class is worth enforcing.
+async fn get_pii_observations(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let tally = crate::pii_shadow::tally(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(
+        tally
+            .into_iter()
+            .map(|(class, count)| serde_json::json!({"class": class, "count": count}))
+            .collect(),
+    ))
 }
 
 async fn get_autopilot_state(

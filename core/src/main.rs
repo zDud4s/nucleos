@@ -27,6 +27,7 @@ mod logging;
 mod mailsend;
 mod mcp_tools;
 mod notify;
+mod pii_shadow;
 mod presets;
 mod priority;
 mod proposals;
@@ -646,6 +647,18 @@ async fn main() {
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor::default()),
     ));
+    // Only when a local model is already configured, and reusing the triage one rather than adding
+    // a key: this reads mail-derived text, which is the text that model was chosen for, and
+    // `web.rs` sets the precedent of one local model pinned in one place serving more than one
+    // reader. Without it the sweep simply never runs, and the observation table stays empty —
+    // which is the correct behaviour for a measurement nobody asked for.
+    if let Some(model) = models_config.local_triage_model.clone() {
+        tokio::spawn(pii_shadow::run_sweep_loop(
+            state.pool.clone(),
+            runner::OLLAMA_BASE_URL.to_string(),
+            model,
+        ));
+    }
 
     // Spawned whether or not the pillar is enabled: the loop also owns retention, and bodies
     // already stored do not stop needing to expire because polling was switched off.
