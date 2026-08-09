@@ -1095,9 +1095,9 @@ async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) 
 /// Kept beside the SQL that reads it rather than spelled out at each call site, because a status
 /// that falls out of this list stops being ticked while still holding a concurrency slot — the
 /// sweep spares exactly these statuses too — so the project goes quiet with no error anywhere,
-/// until somebody opens the database. Two tests pin the three copies together:
-/// `a_live_status_is_a_status_some_pass_would_load` here, and
-/// `every_live_status_is_a_status_the_sweep_spares` in `concurrency.rs`.
+/// until somebody opens the database. Three tests pin the four copies together:
+/// `a_live_status_is_a_status_some_pass_would_load` and `the_live_listing_names_every_live_status`
+/// here, and `every_live_status_is_a_status_the_sweep_spares` in `concurrency.rs`.
 pub const LIVE_STATUSES: [&str; 6] = [
     "planning",
     "implementing",
@@ -2632,7 +2632,11 @@ pub async fn run_job_loop(state: AppState) {
 const JOB_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One job, as the shell lists it.
-#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+///
+/// `Deserialize` is here for the route tests rather than for production: without it the shape of
+/// `/jobs` can only be asserted as untyped JSON, and a field that silently stopped being sent would
+/// go unnoticed.
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct JobSummary {
     pub id: i64,
     pub project_id: String,
@@ -2738,6 +2742,55 @@ pub async fn list(
                    ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
                  ORDER BY jobs.id DESC LIMIT ?",
             )
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+/// Spelled out rather than assembled from `LIVE_STATUSES`, because sqlx refuses SQL built at
+/// runtime — the same trade `LIVE_JOBS_SQL` makes, with the same guard:
+/// `the_live_listing_names_every_live_status` compares this text against the constant.
+const LIVE_LIST_SQL: &str =
+    "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
+            jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at, jobs.completed_at,
+            project_slots.slot AS slot
+     FROM jobs
+     LEFT JOIN project_slots
+       ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
+     WHERE jobs.status IN ('planning','implementing','gating','reviewing',
+                           'awaiting_approval','waiting')";
+
+/// The live jobs, optionally filtered to one project.
+///
+/// A separate function rather than a parameter on `list`: `list` answers *what happened in this
+/// project*, and its own comment says why it does not filter to live ones — a job that stopped for
+/// the budget is exactly what the user needs to see. This answers a different question, *what is in
+/// flight now*, and it is the only one the canvas asks.
+///
+/// `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str`. The one interpolated thing is
+/// `LIVE_LIST_SQL`, a constant of this module; the project filter is a bind parameter, so no caller
+/// value ever reaches the string. Same reasoning, and same shape, as `runs::purge`.
+pub async fn list_live(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<JobSummary>> {
+    match project_id {
+        Some(project_id) => {
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "{LIVE_LIST_SQL} AND jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?"
+            )))
+            .bind(project_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "{LIVE_LIST_SQL} ORDER BY jobs.id DESC LIMIT ?"
+            )))
             .bind(limit)
             .fetch_all(pool)
             .await
@@ -3905,6 +3958,31 @@ mod tests {
         );
     }
 
+    /// The same guard `LIVE_JOBS_SQL` already carries, for the same reason: sqlx refuses SQL
+    /// assembled at runtime, so the list is spelled out by hand in several places and nothing but a
+    /// test holds them to each other. A status missing from here would not break anything loudly —
+    /// the canvas would simply stop drawing that kind of live job.
+    #[test]
+    fn the_live_listing_names_every_live_status() {
+        for status in LIVE_STATUSES {
+            assert!(
+                LIVE_LIST_SQL.contains(&format!("'{status}'")),
+                "the live listing does not know `{status}`"
+            );
+        }
+        let named = LIVE_LIST_SQL
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| !token.is_empty())
+            .count();
+        assert_eq!(
+            named,
+            LIVE_STATUSES.len() + 1,
+            "the listing names a status nothing drives (the +1 is the join's 'job')"
+        );
+    }
+
     /// A job that ends in a status the GC does not collect keeps its worktree forever, and nothing
     /// reports it: as far as the system is concerned the job is finished and the tree is nobody's.
     /// Written after adding `stopped` opened exactly that leak.
@@ -4294,6 +4372,44 @@ mod tests {
         let listed = list(&pool, Some("project-a"), 20).await.unwrap();
 
         assert_eq!(listed[0].slot, None, "that slot is the run's, not this job's");
+    }
+
+    /// The listing's ceiling of 20 is a window onto history. A live job outside it is precisely
+    /// what the canvas needs in order to describe a slot, and precisely the case the window hides.
+    #[tokio::test]
+    async fn the_live_listing_reaches_a_live_job_the_recent_window_would_hide() {
+        let pool = test_pool().await;
+        let old_live = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        for _ in 0..25 {
+            seed_job(&pool, "project-b", "completed").await.unwrap();
+        }
+
+        let recent = list(&pool, None, 20).await.unwrap();
+        assert!(
+            !recent.iter().any(|row| row.id == old_live),
+            "the setup did not push the live job out of the window"
+        );
+
+        let live = list_live(&pool, None, crate::concurrency::LIVE_LIST_LIMIT)
+            .await
+            .unwrap();
+        assert!(live.iter().any(|row| row.id == old_live));
+    }
+
+    /// Only the live ones, and "live" is the same list the slot sweep spares.
+    #[tokio::test]
+    async fn the_live_listing_carries_nothing_terminal() {
+        let pool = test_pool().await;
+        seed_job(&pool, "project-a", "completed").await.unwrap();
+        seed_job(&pool, "project-a", "cancelled").await.unwrap();
+        let alive = seed_job(&pool, "project-a", "waiting").await.unwrap();
+
+        let live = list_live(&pool, None, crate::concurrency::LIVE_LIST_LIMIT)
+            .await
+            .unwrap();
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, alive);
     }
 
     // ---- resolving a request into a start ------------------------------------------------------

@@ -2822,16 +2822,31 @@ async fn post_proposal_reject(
 const JOB_LIST_LIMIT: i64 = 20;
 
 #[derive(serde::Deserialize)]
-struct OptionalProjectQuery {
+struct JobsQuery {
     project_id: Option<String>,
+    /// Only the work in flight, without the `JOB_LIST_LIMIT` ceiling.
+    ///
+    /// A parameter rather than a route of its own because it is the same question with a filter.
+    /// Absent, the answer is byte for byte today's — which is what leaves the Autopilot tab, which
+    /// calls this every 3 seconds, exactly as it is.
+    live: Option<bool>,
 }
 
 async fn get_jobs(
     State(state): State<AppState>,
-    Query(query): Query<OptionalProjectQuery>,
+    Query(query): Query<JobsQuery>,
 ) -> Result<Json<Vec<crate::job::JobSummary>>, StatusCode> {
-    crate::job::list(&state.pool, query.project_id.as_deref(), JOB_LIST_LIMIT)
+    let listed = if query.live == Some(true) {
+        crate::job::list_live(
+            &state.pool,
+            query.project_id.as_deref(),
+            crate::concurrency::LIVE_LIST_LIMIT,
+        )
         .await
+    } else {
+        crate::job::list(&state.pool, query.project_id.as_deref(), JOB_LIST_LIMIT).await
+    };
+    listed
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -3122,6 +3137,66 @@ mod tests {
             },
             db,
         )
+    }
+
+    async fn jobs_at(app: &Router, uri: &str) -> Vec<crate::job::JobSummary> {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// `max_rounds` is written explicitly even though the column is nullable: `insert_job` always
+    /// puts a number there (`config::rounds_allowed`), `JobSummary.max_rounds` is a plain `i64`, and
+    /// a raw insert that left it NULL would fail to decode and turn the listing into a 500.
+    async fn seed_job_row(pool: &sqlx::SqlitePool, project_id: &str, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, max_rounds, created_at)
+             VALUES (?, 'C:/somewhere', ?, 5, 1, '2026-08-08T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// Both halves of the parameter's contract in one test: with it, the old live job shows up;
+    /// without it, the answer is today's — the window of the twenty most recent, intact.
+    ///
+    /// At the route level and not the module level, because this is the join nothing else checks:
+    /// serde ignores query parameters it does not know, so a typo in the field name would make
+    /// `?live=true` fall silently back to the listing of always.
+    #[tokio::test]
+    async fn the_live_parameter_reaches_past_the_window_and_its_absence_changes_nothing() {
+        let (state, db) = file_test_state().await;
+        let old_live = seed_job_row(&state.pool, "project-a", "implementing").await;
+        for _ in 0..25 {
+            seed_job_row(&state.pool, "project-b", "completed").await;
+        }
+
+        let app = Router::new()
+            .route("/jobs", get(get_jobs))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        let live = jobs_at(&app, "/jobs?live=true").await;
+        assert!(live.iter().any(|job| job.id == old_live));
+
+        let today = jobs_at(&app, "/jobs").await;
+        assert_eq!(today.len(), 20, "without the parameter, today's ceiling holds");
+        assert!(!today.iter().any(|job| job.id == old_live));
+
+        db.close().await;
     }
 
     /// A request submitted over HTTP comes back as a ticket, and the same ticket is readable after.

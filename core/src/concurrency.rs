@@ -214,6 +214,15 @@ pub async fn slot_of(pool: &SqlitePool, owner: Owner) -> sqlx::Result<Option<i64
 #[cfg(test)]
 const LIVE_RUN_STATUSES: [&str; 2] = ["running", "awaiting_approval"];
 
+/// The ceiling of a listing filtered to live work, shared by both of them.
+///
+/// It is not "bounded by construction", and that is why it carries a number at all: the house check
+/// above is declaredly advisory and non-atomic — *"the worst case of two claims crossing is one
+/// extra slot for one tick"* — so the count of live things is small in practice without being a hard
+/// invariant. 200 leaves two orders of magnitude of slack over the house ceiling and still bounds
+/// the response.
+pub const LIVE_LIST_LIMIT: i64 = 200;
+
 /// Frees slots whose owner is no longer live, and reports how many.
 ///
 /// This is the compensation for the trade §7.4 of the spec names. Under the old index a stranded run
