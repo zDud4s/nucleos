@@ -5,10 +5,13 @@
 -- classifier already assigns, and covers that class for the rest of the run.
 --
 -- Nullable, and NULL authorizes nothing. Rows minted under the tool_name/tool_input rule cannot say
--- WHICH class was approved, and widening them to "any" would hand every pre-0051 grant a licence no
+-- WHICH class was approved, and widening them to "any" would hand every pre-0055 grant a licence no
 -- human ever gave. `action_class = ?` never matches NULL, so an old row covers no class at all --
 -- true for every class, including the ones nobody thought to enumerate.
 --
--- The number skips 0050 on purpose: this branch's newest is 0049, and `master` has already claimed
--- 0050 with `0050_job_checkpoints.sql`. Leaving the gap is what stops the merge colliding.
+-- Numbered 0055 at merge time, not when it was written. It was authored as 0051, skipping 0050
+-- because `master` had claimed that one -- and by the time this branch merged, `master` had reached
+-- 0054 and the gap was three migrations behind. Guessing a number a branch will still hold when it
+-- lands does not work; renumbering against the tip that is actually there does, and it is the only
+-- moment at which the answer is knowable.
 ALTER TABLE action_grants ADD COLUMN action_class TEXT;

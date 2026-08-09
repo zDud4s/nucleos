@@ -315,7 +315,7 @@ pub async fn grant_action(
 /// exercised. A class the grant does not cover matches no row, so an unauthorized attempt leaves
 /// even that stamp alone.
 ///
-/// `=` never matches NULL, so a pre-0051 grant — minted under the tool_input rule, unable to say
+/// `=` never matches NULL, so a pre-0055 grant — minted under the tool_input rule, unable to say
 /// which class it stood for — authorizes nothing at all.
 ///
 /// The §8.4 invariant is unchanged: this never lifts a `deny`, because the caller only reaches it

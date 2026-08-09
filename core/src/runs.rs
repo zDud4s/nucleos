@@ -1775,7 +1775,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
-    // `action_class` is what the grant is checked against (migration 0051); a NULL there authorizes
+    // `action_class` is what the grant is checked against (migration 0055); a NULL there authorizes
     // nothing, so the resume would park again on the action just approved. `tool_input` rides along
     // beside it as the record of the exact spelling the human read.
     sqlx::query(
