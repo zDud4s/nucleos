@@ -755,17 +755,65 @@ pub async fn ollama_chat(
     format: Option<serde_json::Value>,
     think: bool,
 ) -> std::io::Result<String> {
+    let message = ollama_message(
+        client,
+        base_url,
+        model,
+        vec![serde_json::json!({"role": "user", "content": prompt})],
+        options,
+        format,
+        think,
+        None,
+    )
+    .await?;
+
+    message
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| std::io::Error::other("Ollama response did not contain message.content"))
+        .map(str::to_string)
+}
+
+/// One exchange with the chat endpoint, returning the assistant message whole.
+///
+/// `ollama_chat` above answers "what did the model say"; this answers "what did the model do",
+/// which for a turn with tools is a different question — the reply that matters may carry no text
+/// at all and only a `tool_calls` array. Returning the message object rather than its content is
+/// what lets a caller tell those apart instead of reading an empty string as an empty answer.
+///
+/// `tools`, like `format`, is OMITTED from the body when `None` rather than sent as null: a model
+/// served a `tools` key it was not meant to see may answer with a tool call nobody can execute.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters are the fields of Ollama's /api/chat body, one each. A struct would \
+              put a second name on a shape the endpoint already defines, and the next field it \
+              grows would then have to be added in two places rather than one."
+)]
+pub async fn ollama_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    options: serde_json::Value,
+    format: Option<serde_json::Value>,
+    think: bool,
+    tools: Option<serde_json::Value>,
+) -> std::io::Result<serde_json::Value> {
     let mut body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": false,
         "think": think,
         "options": options
     });
+    let object = body
+        .as_object_mut()
+        .expect("body is constructed as an object literal above");
     if let Some(format) = format {
-        body.as_object_mut()
-            .expect("body is constructed as an object literal above")
-            .insert("format".to_string(), format);
+        object.insert("format".to_string(), format);
+    }
+    if let Some(tools) = tools {
+        object.insert("tools".to_string(), tools);
     }
 
     let response = client
@@ -782,10 +830,73 @@ pub async fn ollama_chat(
 
     response
         .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| std::io::Error::other("Ollama response did not contain message.content"))
-        .map(str::to_string)
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("Ollama response did not contain a message"))
+}
+
+/// The loopback chat endpoint, as the one exchange `local_agent`'s loop needs.
+///
+/// Separate from `OllamaRunner` rather than a method on it, because they are different shapes and
+/// the difference matters: a `CommandRunner` answers a prompt and is forbidden tools, while this
+/// carries a conversation and exists to offer them. Folding the second into the first would put a
+/// tool-bearing path behind a type whose whole documented promise is `ToolPolicy::None`.
+pub struct OllamaChat {
+    client: reqwest::Client,
+    base_url: String,
+    model: String,
+}
+
+/// Ceiling on one exchange with the local model.
+///
+/// A turn is up to `MAX_TOOL_ROUNDS` of these, so this is per round rather than per turn — the turn
+/// itself is bounded again by the caller. Generous because a cold model loads from disk on the
+/// first request, and a first message that times out while Ollama is still starting looks exactly
+/// like a broken bot.
+const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl OllamaChat {
+    pub fn new(base_url: String, model: String) -> Self {
+        Self {
+            // A client timeout, not a default client. `reqwest::Client::new()` waits for ever, and
+            // for ever here means the chat slot is never released and every later message in that
+            // chat is refused with 409 until the daemon restarts.
+            // `expect` rather than `unwrap_or_default`, which read like a fallback and is not one:
+            // `Client::default()` is `Client::new()`, which builds with the same settings and
+            // panics on the same failure — so the "fallback" would panic identically, one line
+            // later, with a message naming nothing. The causes are TLS backend and proxy
+            // environment problems, which are startup misconfiguration; saying so is worth more
+            // than pretending to recover.
+            client: reqwest::Client::builder()
+                .timeout(OLLAMA_EXCHANGE_TIMEOUT)
+                .build()
+                .expect("HTTP client for the local model (check TLS and proxy environment)"),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::local_agent::LocalChat for OllamaChat {
+    async fn exchange(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> std::io::Result<serde_json::Value> {
+        ollama_message(
+            &self.client,
+            &self.base_url,
+            &self.model,
+            messages,
+            // No sampling grammar, unlike triage: an answer here is prose for a person, and a
+            // grammar is also what would stop the model emitting a tool call at all.
+            serde_json::json!({"num_ctx": crate::local_agent::TURN_NUM_CTX}),
+            None,
+            false,
+            tools.map(serde_json::Value::from),
+        )
+        .await
+    }
 }
 
 #[async_trait]

@@ -70,19 +70,7 @@ pub struct SearchFilter {
 /// Keep search results useful without turning the index into a prompt or output retrieval endpoint.
 const PROMPT_EXCERPT_CHARS: i64 = 500;
 
-fn escape_like(query: &str) -> String {
-    query
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
-fn fts_query(raw: &str) -> String {
-    raw.split_whitespace()
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use crate::search::{escape_like, fts_query};
 
 pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<AwaitingRun>> {
     sqlx::query_as::<_, AwaitingRun>(
@@ -2767,6 +2755,7 @@ mod tests {
             runner: runner.clone(),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

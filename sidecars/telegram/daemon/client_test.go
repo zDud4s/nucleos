@@ -28,6 +28,12 @@ func TestClientSendAssistantMessageAndGetKill(t *testing.T) {
 			if request["chat_id"] != "chat-9" || request["text"] != "hello" {
 				t.Errorf("request = %#v, want chat_id and text", request)
 			}
+			// The daemon routes the turn on this. Dropped, every Telegram message would go
+			// back to the cloud CLI and nothing would look broken — which is why it is
+			// asserted here rather than left to be noticed.
+			if request["origin"] != "telegram" {
+				t.Errorf("origin = %q, want %q", request["origin"], "telegram")
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"turn_id":81}`))
 		case "/autopilot/kill":

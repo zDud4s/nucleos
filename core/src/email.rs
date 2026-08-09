@@ -758,7 +758,23 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables, vec!["email_attachments", "email_cursor", "emails"]);
+        // The four `emails_fts_*` entries are FTS5's own storage for the index 0058 declares, not
+        // tables anything here writes to. They are listed rather than filtered out because this
+        // assertion is a schema pin: the next person to add or drop an email table should have to
+        // say so here, and that includes the day somebody decides the index is not worth its space.
+        assert_eq!(
+            tables,
+            vec![
+                "email_attachments",
+                "email_cursor",
+                "emails",
+                "emails_fts",
+                "emails_fts_config",
+                "emails_fts_data",
+                "emails_fts_docsize",
+                "emails_fts_idx",
+            ]
+        );
     }
 
     /// The partial index is what makes the pending queue cheap to read every tick; without the

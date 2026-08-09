@@ -2946,6 +2946,7 @@ mod tests {
             runner: runner.clone(),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
