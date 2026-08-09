@@ -15,8 +15,10 @@
 //! triage sets to NULL when it is done: an excerpt of a body would outlive the body, and a
 //! measurement that quietly undoes a retention decision is worse than no measurement.
 //!
-//! It is best-effort throughout. Nothing here blocks a verdict, fails a triage run, or is retried.
-//! An observation that did not happen is a gap in a sample; a triage that did not happen is mail
+//! It is best-effort throughout. Nothing here blocks a verdict or fails a triage run. The one thing
+//! it does retry is an answer it could not read, up to `MAX_UNREADABLE_ATTEMPTS`, because that is a
+//! gap in the denominator rather than a finding — everything else is left as it fell. An
+//! observation that did not happen is a gap in a sample; a triage that did not happen is mail
 //! nobody read.
 
 use serde::Deserialize;
@@ -128,9 +130,7 @@ pub fn parse_observations(answer: &str, source: &str) -> Option<Vec<Observation>
                 "other".to_string()
             },
             excerpt: entry.excerpt.trim().to_string(),
-            confidence: entry
-                .confidence
-                .filter(|value| (0.0..=1.0).contains(value)),
+            confidence: entry.confidence.filter(|value| (0.0..=1.0).contains(value)),
         })
         .collect();
     Some(observations)
@@ -142,6 +142,32 @@ pub fn parse_observations(answer: &str, source: &str) -> Option<Vec<Observation>
 /// re-runs this pass over the same text, and the second run must not double the count that a
 /// decision will later be read off.
 pub async fn record(
+    pool: &sqlx::SqlitePool,
+    source_table: &str,
+    source_id: i64,
+    source_column: &str,
+    observations: &[Observation],
+    observed_at: &str,
+) -> sqlx::Result<u64> {
+    record_at_attempt(
+        pool,
+        source_table,
+        source_id,
+        source_column,
+        observations,
+        0,
+        observed_at,
+    )
+    .await
+}
+
+/// The same write, at a numbered attempt.
+///
+/// Private, and the reason is the unique index. `attempt` is part of it, so a caller that passes a
+/// non-zero one for a real observation quietly defeats the de-duplication that `record` exists to
+/// provide — the same finding would be recorded again under a different number every time triage
+/// re-ran. Only the retry of an unreadable answer has any business numbering a row, so only it can.
+async fn record_at_attempt(
     pool: &sqlx::SqlitePool,
     source_table: &str,
     source_id: i64,
@@ -217,12 +243,17 @@ pub async fn observe_pending(
     // Two conditions, not one. A summary that was READ is done, whatever was found. A summary the
     // model garbled is retried, up to a cap — because retrying for ever lets a deterministically
     // unreadable summary block the sweep from anything older, and not retrying at all lets one
-    // truncated answer exclude it from the denominator permanently. The count comes back so the
-    // next attempt can be numbered.
+    // truncated answer exclude it from the denominator permanently.
+    //
+    // The next attempt number comes back with it, as `MAX(attempt) + 1` and not as a count. They
+    // agree while the rows are contiguous, and only one of them survives a row going missing: a
+    // count would then re-use a number that is already taken, `INSERT OR IGNORE` would swallow the
+    // write, and the summary would be re-sent to the model every fifteen minutes for ever — the
+    // starvation the cap exists to prevent, reintroduced by the arithmetic meant to enforce it.
     let pending: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT e.id,
                 e.triage_summary,
-                (SELECT COUNT(*) FROM pii_observations o
+                (SELECT COALESCE(MAX(o.attempt) + 1, 0) FROM pii_observations o
                   WHERE o.source_table = 'emails'
                     AND o.source_id = e.id
                     AND o.source_column = 'triage_summary'
@@ -282,7 +313,7 @@ pub async fn observe_pending(
                     attempt = attempts + 1,
                     "pii shadow: answer could not be read"
                 );
-                written += record(
+                written += record_at_attempt(
                     pool,
                     "emails",
                     id,
@@ -300,6 +331,20 @@ pub async fn observe_pending(
             }
         };
 
+        // The failed attempts go, now that the summary has been read. Leaving them made `tally`
+        // count attempts where it is read as counting summaries: one summary garbled twice and then
+        // read clean appeared as two `unreadable` and one `none`, so the denominator a decision is
+        // divided by was inflated by the sweep's own flakiness, and `unreadable: 30` could mean
+        // thirty summaries nobody read or ten that eventually were.
+        sqlx::query(
+            "DELETE FROM pii_observations
+              WHERE source_table = 'emails' AND source_id = ? AND source_column = 'triage_summary'
+                AND class = 'unreadable'",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+
         // A summary with nothing in it still has to be marked as looked at, or every sweep for ever
         // reconsiders the same clean ones and never reaches the new. `none` is that mark, and it is
         // also the measurement: it is the denominator.
@@ -312,7 +357,7 @@ pub async fn observe_pending(
         } else {
             observations
         };
-        written += record(pool, "emails", id, "triage_summary", &to_write, 0, now).await?;
+        written += record(pool, "emails", id, "triage_summary", &to_write, now).await?;
     }
 
     Ok(written)
@@ -426,12 +471,26 @@ mod tests {
             confidence: Some(0.8),
         }];
 
-        let first = record(&pool, "emails", 1, "subject", &observations, 0, "2026-08-09T00:00:00Z")
-            .await
-            .unwrap();
-        let second = record(&pool, "emails", 1, "subject", &observations, 0, "2026-08-09T01:00:00Z")
-            .await
-            .unwrap();
+        let first = record(
+            &pool,
+            "emails",
+            1,
+            "subject",
+            &observations,
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let second = record(
+            &pool,
+            "emails",
+            1,
+            "subject",
+            &observations,
+            "2026-08-09T01:00:00Z",
+        )
+        .await
+        .unwrap();
 
         assert_eq!((first, second), (1, 0));
         assert_eq!(tally(&pool).await.unwrap(), vec![("name".to_string(), 1)]);
@@ -477,9 +536,15 @@ mod tests {
         triaged_email(&pool, 1, "resumo").await;
         let (base, seen) = stub_ollama_capturing("[]").await;
 
-        observe_pending(&pool, &reqwest::Client::new(), &base, "m", "2026-08-09T00:00:00Z")
-            .await
-            .unwrap();
+        observe_pending(
+            &pool,
+            &reqwest::Client::new(),
+            &base,
+            "m",
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         let body = &seen.lock().unwrap()[0];
         assert_eq!(
@@ -489,7 +554,10 @@ mod tests {
         assert_eq!(body["format"]["items"]["required"][0], "class");
         // Stated explicitly for the reason `voice.rs` records: Ollama truncates silently against
         // its own default window.
-        assert_eq!(body["options"]["num_ctx"], crate::triage::LOCAL_NUM_CTX as i64);
+        assert_eq!(
+            body["options"]["num_ctx"],
+            crate::triage::LOCAL_NUM_CTX as i64
+        );
     }
 
     async fn triaged_email(pool: &sqlx::SqlitePool, id: i64, summary: &str) {
@@ -558,7 +626,10 @@ mod tests {
             let again = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T01:00:00Z")
                 .await
                 .unwrap();
-            assert_eq!(again, 1, "sweep {sweep} did not retry an unreadable summary");
+            assert_eq!(
+                again, 1,
+                "sweep {sweep} did not retry an unreadable summary"
+            );
         }
 
         let past_the_cap = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T09:00:00Z")
@@ -568,6 +639,47 @@ mod tests {
         assert_eq!(
             tally(&pool).await.unwrap(),
             vec![("unreadable".to_string(), MAX_UNREADABLE_ATTEMPTS)]
+        );
+    }
+
+    /// A missing attempt number must not restart the counter. Deriving the next attempt from
+    /// `COUNT(*)` re-uses a number a surviving row already holds, `INSERT OR IGNORE` swallows the
+    /// write, the count never grows, and the summary sits at the head of the batch being re-sent to
+    /// the model for ever — the starvation the cap exists to prevent, caused by the arithmetic
+    /// meant to enforce it. Nothing deletes a single row today, which is exactly why this is
+    /// pinned: the invariant is invisible until something does.
+    #[tokio::test]
+    async fn a_gap_in_the_attempt_numbers_does_not_restart_the_count() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "resumo").await;
+
+        for attempt in [0, 2] {
+            sqlx::query(
+                "INSERT INTO pii_observations
+                     (source_table, source_id, source_column, class, excerpt, attempt, observed_at)
+                 VALUES ('emails', 1, 'triage_summary', 'unreadable', '', ?,
+                         '2026-08-09T00:00:00Z')",
+            )
+            .bind(attempt)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let working = stub_ollama("[]").await;
+        let written = observe_pending(
+            &pool,
+            &reqwest::Client::new(),
+            &working,
+            "m",
+            "2026-08-09T01:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            written, 0,
+            "three attempts were made and the summary was offered a fourth"
         );
     }
 
@@ -589,11 +701,14 @@ mod tests {
             .await
             .unwrap();
 
-        let mut counts = tally(&pool).await.unwrap();
-        counts.sort();
+        // One summary, one row. Keeping the failed attempt alongside the reading made `tally` count
+        // attempts while every reader of it — `get_pii_observations` calls `none` the denominator —
+        // counts summaries, so the total a class would be divided by grew with the sweep's own
+        // flakiness rather than with the mailbox.
         assert_eq!(
-            counts,
-            vec![("none".to_string(), 1), ("unreadable".to_string(), 1)]
+            tally(&pool).await.unwrap(),
+            vec![("none".to_string(), 1)],
+            "a summary that eventually read is still counted as unread"
         );
 
         // And it is finished: a summary that was read is not offered again, whatever was found.
@@ -649,7 +764,6 @@ mod tests {
                 excerpt: "Rita".to_string(),
                 confidence: None,
             }],
-            0,
             "2026-08-09T00:00:00Z",
         )
         .await
@@ -692,7 +806,10 @@ mod tests {
             .bind(column)
             .execute(&pool)
             .await;
-            assert!(accepted.is_ok(), "{column} is allowed in Rust and not in SQL");
+            assert!(
+                accepted.is_ok(),
+                "{column} is allowed in Rust and not in SQL"
+            );
         }
     }
 

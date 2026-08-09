@@ -4080,13 +4080,7 @@ mod tests {
             .collect()
     }
 
-    async fn insert_triaged(
-        state: &AppState,
-        uid: i64,
-        subject: &str,
-        body: &str,
-        summary: &str,
-    ) {
+    async fn insert_triaged(state: &AppState, uid: i64, subject: &str, body: &str, summary: &str) {
         sqlx::query(
             "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, from_name,
                                  subject, body_text, received_at, ingested_at, direction,

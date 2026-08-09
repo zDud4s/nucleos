@@ -126,7 +126,9 @@ pub async fn run_turn(
     let mut executed = 0;
 
     for _ in 0..MAX_TOOL_ROUNDS {
-        let message = chat.exchange(messages.clone(), Some(schemas.clone())).await?;
+        let message = chat
+            .exchange(messages.clone(), Some(schemas.clone()))
+            .await?;
         let calls = tool_calls(&message);
 
         if calls.is_empty() {

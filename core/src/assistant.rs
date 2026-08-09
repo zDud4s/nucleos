@@ -834,7 +834,10 @@ mod tests {
             history,
             vec![
                 ("what is running?".to_string(), "two runs".to_string()),
-                ("and the second?".to_string(), "the calendar one".to_string()),
+                (
+                    "and the second?".to_string(),
+                    "the calendar one".to_string()
+                ),
             ]
         );
     }
@@ -1080,9 +1083,14 @@ mod tests {
         });
         let chat_id = "assistant-no-result-event-chat";
 
-        let id = send_message(&state, chat_id, "Le me o ultimo mail que recebi", Origin::Shell)
-            .await
-            .unwrap();
+        let id = send_message(
+            &state,
+            chat_id,
+            "Le me o ultimo mail que recebi",
+            Origin::Shell,
+        )
+        .await
+        .unwrap();
 
         let mut row = None;
         for _ in 0..500 {
@@ -1268,7 +1276,9 @@ mod tests {
         let pool = state.pool.clone();
         let chat_id = "assistant-send-test-chat";
 
-        let id = send_message(&state, chat_id, "hello", Origin::Shell).await.unwrap();
+        let id = send_message(&state, chat_id, "hello", Origin::Shell)
+            .await
+            .unwrap();
         let mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
             .bind(id)
             .fetch_one(&pool)

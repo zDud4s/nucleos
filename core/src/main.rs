@@ -457,9 +457,7 @@ async fn main() {
                 .await
             {
                 Ok(response) => match response.text().await {
-                    Ok(body) => {
-                        runner::interpret_context_probe(&body, local_agent::TURN_NUM_CTX)
-                    }
+                    Ok(body) => runner::interpret_context_probe(&body, local_agent::TURN_NUM_CTX),
                     Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
                         "could not read the local assistant probe response: {error}"
                     ))),

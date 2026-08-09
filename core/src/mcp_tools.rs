@@ -329,16 +329,35 @@ fn filter_outgoing(
             text.text = crate::redact::redact_secrets(&text.text);
         }
     }
-    if let Some(structured) = result.structured_content.take() {
-        let rendered = structured.to_string();
-        let redacted = crate::redact::redact_secrets(&rendered);
-        // Re-parsed rather than walked field by field: the markers contain no JSON metacharacters,
-        // so a redacted document still parses, and a walk would have to know every shape every tool
-        // returns. If it ever does not parse, the structured copy is dropped instead of being
-        // handed over unfiltered — the text blocks still carry the answer.
-        result.structured_content = serde_json::from_str(&redacted).ok();
+    if let Some(structured) = &mut result.structured_content {
+        redact_json_strings(structured);
     }
     result
+}
+
+/// Applies the filter to every string in a JSON document, in place.
+///
+/// The document was previously rendered with `to_string()`, filtered as one flat string and
+/// re-parsed, which was wrong in a way that only one detector noticed. In a rendered document a
+/// newline is the two characters `\` and `n`, and `pem_blocks` anchors on the newline that closes a
+/// PEM header — so a private key in a tool's JSON result matched nothing and crossed intact, while
+/// the same key in the sibling text block was redacted. The two carriers disagreed, and the one
+/// that leaked is the one a client parses programmatically.
+///
+/// Walking the values needs no knowledge of what any tool returns — a `Value` is a `Value` — and it
+/// also removes the re-parse, which could drop a whole structured result if a redaction ever landed
+/// somewhere that changed the document's shape.
+fn redact_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = crate::redact::redact_secrets(text);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
+        serde_json::Value::Object(fields) => {
+            fields.values_mut().for_each(redact_json_strings);
+        }
+        _ => {}
+    }
 }
 
 /// The tools a turn answered by a model on this machine may be offered.
@@ -599,6 +618,64 @@ pub async fn run_stdio() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A private key in the structured half of a result, which is where a tool that returns JSON
+    /// puts its answer. It used to cross intact: the document was filtered as a rendered string, in
+    /// which a newline is the two characters `\` and `n`, and the PEM detector anchors on a real
+    /// one. The text block beside it was redacted correctly, so the two carriers disagreed.
+    #[test]
+    fn a_key_in_the_structured_half_is_redacted_like_one_in_the_text_half() {
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaaaaaa\n\
+-----END RSA PRIVATE KEY-----\n";
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                key.to_string(),
+            )]);
+        result.structured_content = Some(serde_json::json!({
+            "body": key,
+            "nested": [{"also": key}],
+        }));
+
+        let filtered = filter_outgoing(crate::egress::Audience::Cloud, result);
+
+        let structured = filtered
+            .structured_content
+            .expect("structured half was dropped");
+        assert!(
+            !structured.to_string().contains("MIIEowIBAAKCAQEA"),
+            "{structured}"
+        );
+        assert!(
+            structured["nested"][0]["also"]
+                .as_str()
+                .is_some_and(|text| text.contains("[SECRET:private-key]")),
+            "a key nested inside an array was not reached: {structured}"
+        );
+        let rmcp::model::ContentBlock::Text(text) = &filtered.content[0] else {
+            panic!("the text block is gone");
+        };
+        assert!(
+            text.text.contains("[SECRET:private-key]"),
+            "{:?}",
+            text.text
+        );
+    }
+
+    /// A local audience is the whole reason the filter is keyed on one: nothing is removed.
+    #[test]
+    fn a_local_audience_gets_the_result_untouched() {
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaaaaaa\n\
+-----END RSA PRIVATE KEY-----\n";
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                key.to_string(),
+            )]);
+        result.structured_content = Some(serde_json::json!({ "body": key }));
+
+        let filtered = filter_outgoing(crate::egress::Audience::Local, result);
+
+        assert_eq!(filtered.structured_content.unwrap()["body"], key);
+    }
+
     /// The exact set, not a subset.
     ///
     /// This is what an agent can reach, and the mail tools make the list load-bearing rather than
@@ -719,15 +796,11 @@ mod tests {
 
         // Pointed at a port nothing listens on: a dispatched call fails to CONNECT, which is a
         // different error from "no local dispatch" and is what tells the two apart without a daemon.
-        let toolbox = LocalToolBox::new(
-            "http://127.0.0.1:1".to_string(),
-            "unused".to_string(),
-            {
-                let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-                sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-                pool
-            },
-        );
+        let toolbox = LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), {
+            let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            pool
+        });
 
         for name in LOCAL_TOOLS {
             let answer = toolbox.call(name, &serde_json::json!({})).await;

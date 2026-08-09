@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS pii_observations (
     -- Constrained rather than free text: the constraint IS the retention guarantee. Adding a column
     -- here is the moment to check that it is one the source keeps.
     source_column TEXT NOT NULL CHECK (source_column IN ('subject', 'from_name', 'triage_summary')),
-    -- name | address | health | financial | other
+    -- What the model found: name | address | health | financial | other. Plus two the sweep writes
+    -- itself and the model cannot — `none`, which marks a summary read with nothing in it and is
+    -- therefore the denominator, and `unreadable`, which marks an answer nobody could parse.
+    -- `parse_observations` maps anything else the model says to `other`, so these two stay the
+    -- sweep's alone.
     class         TEXT NOT NULL,
     excerpt       TEXT NOT NULL,
     -- The model's own confidence, kept so a later decision can be made at a threshold rather than
@@ -45,7 +49,9 @@ CREATE TABLE IF NOT EXISTS pii_observations (
 -- The query this table exists to answer is "what did we see, by class", so that is the index.
 CREATE INDEX IF NOT EXISTS idx_pii_observations_class ON pii_observations (class, observed_at);
 
--- One observation pass per source row: re-running triage on a message must not double-count it.
+-- One observation per source row per finding: re-running triage on a message must not double-count
+-- it. `attempt` is in the key, so that guarantee holds only while callers pass a consistent number
+-- — which is why `record` pins it to 0 and the numbered variant is private to the retry path.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pii_observations_unique
     ON pii_observations (source_table, source_id, source_column, class, excerpt, attempt);
 

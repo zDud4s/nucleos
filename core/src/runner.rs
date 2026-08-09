@@ -748,6 +748,12 @@ pub async fn ollama_chat(
 ///
 /// `tools`, like `format`, is OMITTED from the body when `None` rather than sent as null: a model
 /// served a `tools` key it was not meant to see may answer with a tool call nobody can execute.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters are the fields of Ollama's /api/chat body, one each. A struct would \
+              put a second name on a shape the endpoint already defines, and the next field it \
+              grows would then have to be added in two places rather than one."
+)]
 pub async fn ollama_message(
     client: &reqwest::Client,
     base_url: &str,

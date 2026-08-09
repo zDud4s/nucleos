@@ -101,7 +101,16 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
         // A truncated block — pasted without its footer, or cut by a length limit — is still a key,
         // and used to pass through whole. Falling back to the body's own extent covers it without
         // swallowing the rest of the message: the body ends where the base64 stops.
-        let end = match input[start..].find(END_MARK) {
+        //
+        // The footer has to be this block's own. Searching the whole remainder let a footerless key
+        // borrow the `-----END CERTIFICATE-----` of an unrelated block further down and redact
+        // every word in between — a sentence, an attachment note, a whole message swallowed by one
+        // truncated paste. A `-----BEGIN ` before the footer means the footer belongs to something
+        // else, so this block has none.
+        let searchable = input[start + BEGIN.len()..]
+            .find(BEGIN)
+            .map_or(input.len(), |offset| start + BEGIN.len() + offset);
+        let end = match input[start..searchable].find(END_MARK) {
             Some(end_relative) => {
                 let after_end = start + end_relative;
                 input[after_end + END_MARK.len()..]
@@ -140,10 +149,26 @@ fn base64_body_len(input: &str) -> usize {
     const MIN_BODY_LINE: usize = 16;
 
     let mut consumed = 0;
+    let mut body_started = false;
     for line in input.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        // The header's own trailing newline is consumed before any body line is examined.
-        if consumed == 0 && trimmed.is_empty() {
+        // Trimmed at both ends, not just of its newline. A mailer that reflows text leaves a
+        // trailing space on a wrapped line, and comparing without trimming made that one invisible
+        // character end the body and leave the rest of the key in the message.
+        let trimmed = line.trim();
+
+        // The header's own trailing newline, and the blank line RFC 1421 puts between an encrypted
+        // key's headers and its body. Only before the body starts: once it has, a blank line is
+        // where the body ends.
+        if !body_started && trimmed.is_empty() {
+            consumed += line.len();
+            continue;
+        }
+
+        // `Proc-Type: 4,ENCRYPTED` and `DEK-Info: AES-128-CBC,...`, which is what `openssl` writes
+        // above the body of a passphrase-protected key. They are not base64, and stopping at them
+        // left the whole key in the text beneath a marker announcing it had been removed — a leak
+        // that reads as a redaction, which is worse than never matching the block.
+        if !body_started && is_pem_key_header(trimmed) {
             consumed += line.len();
             continue;
         }
@@ -156,18 +181,35 @@ fn base64_body_len(input: &str) -> usize {
         // three was tried and two are wrong. Length alone eats a sign-off, because "Cumprimentos"
         // is a punctuation-free word. Length AND a digit breaks a real body, because a full-width
         // base64 line can be all letters. Length alone also stops at a body's LAST line, which is
-        // short by construction — leaving the tail of a key in the text, which is the failure that
-        // matters most here.
+        // short by construction — leaving the tail of a key in the text.
+        //
+        // The character set here matches `charset_ok`'s non-alphanumerics exactly, base64url
+        // included. It did not, and a `-`/`_` tail therefore got no benefit from the rescue at all.
+        //
+        // What survives: a short last line of nothing but base64 letters. It is a fragment of a key
+        // whose body is otherwise gone, and closing it means eating any punctuation-free word that
+        // follows a key — corrupting a message to remove something unusable. That trade is made
+        // deliberately and is the reason this is a bound and not a proof.
         let looks_encoded = trimmed
             .chars()
-            .any(|c| c.is_ascii_digit() || matches!(c, '+' | '/' | '='));
+            .any(|c| c.is_ascii_digit() || matches!(c, '+' | '/' | '=' | '-' | '_'));
 
         if !charset_ok || (trimmed.len() < MIN_BODY_LINE && !looks_encoded) {
             break;
         }
+        body_started = true;
         consumed += line.len();
     }
     consumed
+}
+
+/// PURE: whether a line is an RFC 1421 key header — `Name: value`, with an unspaced name.
+fn is_pem_key_header(line: &str) -> bool {
+    let Some((name, _)) = line.split_once(": ") else {
+        return false;
+    };
+    name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Credentials whose issuer stamped a recognisable prefix on them.
@@ -345,8 +387,8 @@ const NUMBER_TRIGGERS: &[&str] = &[
     "card",
     "cartao",
     "cartão",
-    // Portuguese plurals that are not the singular plus one character, so the rule in
-    // `is_trigger_word` cannot reach them.
+    // Portuguese plurals that are not the singular plus `s`, so the rule in `is_trigger_word`
+    // cannot reach them.
     "cartoes",
     "cartões",
     "visa",
@@ -382,27 +424,50 @@ fn trigger_precedes(input: &str, start: usize) -> bool {
         .last()
         .map_or(0, |(index, _)| index);
 
+    // Snapped forward past a word the window cut in half. The offset is a raw character count, so
+    // it lands wherever it lands, and the fragment left behind is read as a word like any other:
+    // "descontas" clipped to "contas" vouched for a number nothing in the sentence named, and
+    // moving the number one character changed the answer. Only when the window actually cut — at
+    // offset zero the text begins there and no word was broken.
+    let window_start = if window_start == 0 {
+        0
+    } else {
+        before[window_start..]
+            .find(|character: char| !character.is_alphanumeric())
+            .map_or(before.len(), |offset| window_start + offset)
+    };
+
     before[window_start..]
         .to_lowercase()
         .split(|character: char| !character.is_alphanumeric())
         .any(is_trigger_word)
 }
 
-/// Whether one word is a trigger, allowing one trailing character for a plural.
+/// Whether one word is a trigger, in the singular or the plural.
 ///
-/// Exact equality was the first correction and it was too tight: "cards", "contas", "accounts",
-/// "numbers" and "IBANs" all stopped counting, so a labelled card written in the plural went out
-/// unredacted. A bare prefix test is too loose in the other direction — "contains" starts with
-/// "conta", which is how the substring version let a byte count be read as a taxpayer id.
+/// The plural is a trailing `s` and nothing else, which is narrow on purpose. Three rules were
+/// tried here and two let a number be corrupted:
 ///
-/// One character is the whole difference between the two, and it is enough for the plural in both
-/// languages while excluding every longer word that happens to begin with a trigger.
+/// - A substring test let "contains" vouch for a byte count, because it ends in "conta".
+/// - Any one trailing character let "contar", "contam" and "visar" do the same. Those are ordinary
+///   Portuguese verbs, and a sentence about counting things is exactly where a count appears — so
+///   the aperture was smaller than the substring version and pointed at more common words.
+/// - Exact equality alone dropped "cards", "contas", "accounts", "numbers" and "IBANs", so a card
+///   labelled in the plural went out unredacted.
+///
+/// A trailing `s` is every plural the trigger list actually forms, in both languages. The
+/// Portuguese plurals that are not the singular plus `s` — "cartões", "cartoes" — are listed as
+/// triggers of their own, because this rule cannot reach them.
+///
+/// What it does not do is tell a noun from a verb, and it cannot: "contas" is both the accounts and
+/// you count, "visas" is both the visas and you endorse, and English "accounts for" is a number
+/// that is not the account's. Those sentences still corrupt a number that passes a checksum. The
+/// ambiguity is in the trigger list itself — a word that names a card is a word — and removing it
+/// would cost the labelled card the gate exists to catch. Anything narrower than this belongs in
+/// the decision about whether the trigger gate should exist at all, not in the matcher.
 fn is_trigger_word(word: &str) -> bool {
-    NUMBER_TRIGGERS.iter().any(|trigger| {
-        word.len() >= trigger.len()
-            && word.len() <= trigger.len() + 1
-            && word.starts_with(trigger)
-    })
+    let stem = word.strip_suffix('s').unwrap_or(word);
+    NUMBER_TRIGGERS.contains(&word) || NUMBER_TRIGGERS.contains(&stem)
 }
 
 /// PURE: what a compacted, space-free run of characters proves itself to be, if anything.
@@ -594,7 +659,10 @@ mod tests {
                 "[SECRET:github]",
             ),
             ("AKIAIOSFODNN7EXAMPLE", "[SECRET:aws]"),
-            ("key sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "[SECRET:anthropic]"),
+            (
+                "key sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+                "[SECRET:anthropic]",
+            ),
             ("AIzaSyD-abcdefghijklmnopqrstuvwxyz01234", "[SECRET:google]"),
         ] {
             let redacted = redact_secrets(input);
@@ -719,7 +787,8 @@ mod tests {
     /// end of the message along with the end of the key.
     #[test]
     fn a_footerless_key_does_not_swallow_the_sign_off() {
-        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nDuarte";
+        let input =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nDuarte";
         let redacted = redact_secrets(input);
 
         assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
@@ -768,9 +837,11 @@ mod tests {
             "the account was 100000002",
         ] {
             let redacted = redact_secrets(input);
+            // The oracle is the function under test, not a second copy of its rule. A duplicate
+            // matcher here would have to be kept equal to the real one by hand, and the first
+            // divergence — the plural, say — makes the test fail on correct behaviour.
             let vouched = input.to_lowercase().split_whitespace().any(|word| {
-                super::NUMBER_TRIGGERS
-                    .contains(&word.trim_matches(|c: char| !c.is_alphanumeric()))
+                super::is_trigger_word(word.trim_matches(|c: char| !c.is_alphanumeric()))
             });
             if vouched {
                 assert_ne!(
@@ -778,9 +849,95 @@ mod tests {
                     "{input:?} names the number and was not redacted"
                 );
             } else {
-                assert_eq!(redacted, input, "{input:?} was redacted by a substring match");
+                assert_eq!(
+                    redacted, input,
+                    "{input:?} was redacted by a substring match"
+                );
             }
         }
+    }
+
+    /// A verb is not a label. Allowing any one trailing character admitted the plurals it was meant
+    /// to and also "contar", "contam" and "visar" — ordinary Portuguese verbs, next to which an
+    /// ordinary count was read as a taxpayer id. That is the substring bug again, on a smaller
+    /// vocabulary.
+    #[test]
+    fn a_word_that_only_begins_with_a_trigger_does_not_vouch_for_a_number() {
+        for input in [
+            "vamos contar 100000002 bytes",
+            "as linhas contam 100000002 no total",
+            "visar 100000002 registos",
+        ] {
+            assert_eq!(
+                redact_secrets(input),
+                input,
+                "{input:?} was redacted by a word that merely begins with a trigger"
+            );
+        }
+    }
+
+    /// An encrypted key carries RFC 1421 headers above its body, and they are not base64. Stopping
+    /// at the first of them left the entire key in the text — under a marker saying it had been
+    /// removed, which is worse than not matching the block at all.
+    #[test]
+    fn the_headers_of_an_encrypted_key_do_not_end_its_body() {
+        let input = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+DEK-Info: AES-128-CBC,9A1B2C3D4E5F60718293A4B5C6D7E8F9\n\n\
+MIIEowIBAAKCAQEAaaaaaaaaaaaaaaaaaaaaaaaa\n\nObrigado";
+        let redacted = redact_secrets(input);
+
+        assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
+        assert!(!redacted.contains("DEK-Info"), "{redacted:?}");
+        assert!(redacted.ends_with("Obrigado"), "{redacted:?}");
+    }
+
+    /// A mailer that reflows text adds a trailing space, and the body was compared without being
+    /// trimmed — so one invisible character left the rest of the key in the message.
+    #[test]
+    fn a_trailing_space_on_a_body_line_does_not_end_the_body() {
+        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaa \nMIIEowIBAAKCAQEAbbbbbbbbbbbb\n\nObrigado";
+        let redacted = redact_secrets(input);
+
+        assert!(!redacted.contains("MIIEowIBAAKCAQEAbbbb"), "{redacted:?}");
+        assert!(redacted.ends_with("Obrigado"), "{redacted:?}");
+    }
+
+    /// A key with no footer used to borrow the footer of an unrelated block further down, and
+    /// redact everything in between — a whole message swallowed by one truncated paste.
+    #[test]
+    fn a_footerless_key_does_not_borrow_a_later_blocks_footer() {
+        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaa\n\n\
+A fatura de julho segue em anexo.\n\n\
+-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\ntchau";
+        let redacted = redact_secrets(input);
+
+        assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
+        assert!(
+            redacted.contains("A fatura de julho segue em anexo."),
+            "the sentence between two blocks was redacted as key material: {redacted:?}"
+        );
+        assert!(redacted.ends_with("tchau"), "{redacted:?}");
+    }
+
+    /// `charset_ok` accepts base64url and the rescue that keeps a short last line did not, so a key
+    /// encoded for a URL got no benefit from it.
+    #[test]
+    fn a_base64url_tail_counts_as_encoded() {
+        let input =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaa\nAbCd-_Ef\n\nObrigado";
+        let redacted = redact_secrets(input);
+
+        assert!(!redacted.contains("AbCd-_Ef"), "{redacted:?}");
+        assert!(redacted.ends_with("Obrigado"), "{redacted:?}");
+    }
+
+    /// The 40-character window is cut at a raw offset, so it can start in the middle of a word. The
+    /// fragment left behind must not be read as a trigger: "descontas" clipped to "contas" vouched
+    /// for a number that nothing in the sentence named.
+    #[test]
+    fn a_word_the_window_cut_in_half_is_not_a_trigger() {
+        let input = "descontas foi um erro grave aqui mesmo xxx 100000002";
+        assert_eq!(redact_secrets(input), input);
     }
 
     /// A malformed block used to `break`, abandoning the scan — so one bad header disarmed the
