@@ -287,6 +287,9 @@ describe("JobsPanel", () => {
       max_items: 5,
       created_at: "2026-07-30T03:00:00Z",
       completed_at: null,
+      slot: 0,
+      round: 0,
+      max_rounds: 1,
       ...over,
     };
   }

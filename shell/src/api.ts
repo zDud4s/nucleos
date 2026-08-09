@@ -162,6 +162,77 @@ export interface Job {
   max_items: number;
   created_at: string;
   completed_at: string | null;
+  /** The slot this job holds, or null once it has given it back. */
+  slot: number | null;
+  /**
+   * The round it is on, counted from zero, and how many it may run.
+   *
+   * The daemon has always sent them (`core/src/job.rs`) and the TypeScript never declared them. The
+   * slot card renders them, so without this `tsc -b` fails on `detail.job.round`.
+   */
+  round: number;
+  max_rounds: number;
+}
+
+/**
+ * The ceiling of the live-filtered listings, the same number the daemon uses
+ * (`concurrency::LIVE_LIST_LIMIT`).
+ *
+ * Duplicated on purpose rather than asked of the daemon: the shell needs it to decide whether a
+ * list came back whole, and a list arriving exactly at the ceiling may have been cut. If the two
+ * numbers ever diverge, the worst that happens is the shell saying *detail unavailable* where it
+ * could have said *slot awaiting reconciliation* — the safe direction.
+ */
+export const LIVE_LIST_LIMIT = 200;
+
+/** One taken slot, as `GET /concurrency` describes it. */
+export interface HeldSlot {
+  project_id: string;
+  slot: number;
+  owner_kind: "run" | "job";
+  owner_id: number;
+  claimed_at: string;
+}
+
+export interface OwnerRef {
+  kind: string;
+  id: number;
+}
+
+/** A coincidence between two trees, and the paths where it happens. */
+export interface Overlap {
+  a: OwnerRef;
+  b: OwnerRef;
+  paths: string[];
+}
+
+/**
+ * One of the two sources of the collision warning.
+ *
+ * `not_measured` is **never** read as `clean`. It is the state that exists so the other is never
+ * said in vain: somebody trusting a `clean` nobody computed lets two jobs run at the same file.
+ */
+export interface CollisionSource {
+  state: "collide" | "clean" | "not_measured";
+  overlaps: Overlap[];
+}
+
+/** Both sources, and never merged: one says "this will collide", the other "this collided". */
+export interface Collisions {
+  declared: CollisionSource;
+  observed: CollisionSource;
+}
+
+export interface ProjectConcurrency {
+  project_id: string;
+  limit: number;
+  slots: HeldSlot[];
+  collision: Collisions;
+}
+
+export interface Concurrency {
+  house: { limit: number; held: number };
+  projects: ProjectConcurrency[];
 }
 
 export interface JobItem {
@@ -187,12 +258,55 @@ export interface JobDetail extends Job {
 export async function getJobs(
   token: string,
   projectId?: string,
+  options?: { live?: boolean },
 ): Promise<Job[] | null> {
-  const path = projectId === undefined
-    ? "/jobs"
-    : `/jobs?project_id=${encodeURIComponent(projectId)}`;
+  // `URLSearchParams` in place of the `encodeURIComponent` this used to do, which is the form
+  // `runsQuery` in this same file already uses. Not an equivalence: a `project_id` with a space now
+  // encodes as `+` rather than `%20`. Both are accepted on the other side.
+  const params = new URLSearchParams();
+  if (projectId !== undefined) params.set("project_id", projectId);
+  if (options?.live === true) params.set("live", "true");
+  const query = params.toString();
+  const path = query === "" ? "/jobs" : `/jobs?${query}`;
   try {
     const res = await fetch(`${DAEMON_URL}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * How much work fits, and what is inside it.
+ *
+ * The canvas's authority. `null` for any failure — the caller keeps the last good reading and marks
+ * the view stale, because a blank capacity reads as "there is room".
+ */
+export async function getConcurrency(token: string): Promise<Concurrency | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/concurrency`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The runs still holding a slot: `running` or `awaiting_approval`.
+ *
+ * A function of its own rather than a field on `getRuns`'s filter because `runsQuery` emits its
+ * parameters in a fixed order, and the canvas wants a predictable URL. The returned type is the one
+ * that already existed.
+ */
+export async function getLiveRuns(token: string): Promise<RunSearchResult[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs?live=true&limit=${LIVE_LIST_LIMIT}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
@@ -1657,16 +1771,26 @@ export async function createRun(
   }
 }
 
-/** 404 here means the run already ended — a race with its own completion, not a failure. */
-export async function cancelRun(token: string, id: number): Promise<boolean> {
+/**
+ * 404 here means the run already ended — a race with its own completion, not a failure.
+ *
+ * `ApiResult` rather than a bare boolean, because the two ways of not succeeding call for opposite
+ * answers on screen. A refusal the daemon gave (404, 409) is about that run and nothing else; a
+ * dead socket says nothing about the run and everything about the connection, and a caller that
+ * removed the card on both would hide live work whenever the network hiccupped.
+ */
+export async function cancelRun(token: string, id: number): Promise<ApiResult<null>> {
   try {
     const res = await fetch(`${DAEMON_URL}/runs/${id}/cancel`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
     });
-    return res.ok;
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
   } catch {
-    return false;
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
 
