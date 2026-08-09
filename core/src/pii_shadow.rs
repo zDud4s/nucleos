@@ -147,6 +147,7 @@ pub async fn record(
     source_id: i64,
     source_column: &str,
     observations: &[Observation],
+    attempt: i64,
     observed_at: &str,
 ) -> sqlx::Result<u64> {
     debug_assert!(
@@ -158,8 +159,9 @@ pub async fn record(
     for observation in observations {
         let result = sqlx::query(
             "INSERT OR IGNORE INTO pii_observations
-                 (source_table, source_id, source_column, class, excerpt, confidence, observed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (source_table, source_id, source_column, class, excerpt, confidence, attempt,
+                  observed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(source_table)
         .bind(source_id)
@@ -167,6 +169,7 @@ pub async fn record(
         .bind(&observation.class)
         .bind(&observation.excerpt)
         .bind(observation.confidence)
+        .bind(attempt)
         .bind(observed_at)
         .execute(pool)
         .await?;
@@ -181,6 +184,14 @@ pub async fn record(
 /// backfilled would occupy the local model for hours, and the local model is also what answers
 /// triage and, when configured, the chat.
 const SWEEP_BATCH: i64 = 20;
+
+/// How many times a summary the model garbled is offered to it again.
+///
+/// Three, because the two failure modes are on either side of this number. Zero retries means one
+/// truncated answer removes a summary from the denominator for ever. Unlimited retries means a
+/// summary the model garbles deterministically — a prompt it always refuses, say — is reconsidered
+/// every fifteen minutes and blocks the batch from ever reaching older mail.
+const MAX_UNREADABLE_ATTEMPTS: i64 = 3;
 
 /// How often a sweep runs. Slow on purpose — this is measurement, and nothing waits for it.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
@@ -203,24 +214,38 @@ pub async fn observe_pending(
     // Only summaries, and only ones not yet observed. `triage_summary` is written by a local model
     // over a body that is then deleted, which makes it the one retained field where a stranger's
     // personal data plausibly survives — and therefore the one worth measuring.
-    let pending: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT e.id, e.triage_summary
+    // Two conditions, not one. A summary that was READ is done, whatever was found. A summary the
+    // model garbled is retried, up to a cap — because retrying for ever lets a deterministically
+    // unreadable summary block the sweep from anything older, and not retrying at all lets one
+    // truncated answer exclude it from the denominator permanently. The count comes back so the
+    // next attempt can be numbered.
+    let pending: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT e.id,
+                e.triage_summary,
+                (SELECT COUNT(*) FROM pii_observations o
+                  WHERE o.source_table = 'emails'
+                    AND o.source_id = e.id
+                    AND o.source_column = 'triage_summary'
+                    AND o.class = 'unreadable') AS attempts
            FROM emails e
           WHERE e.triage_summary IS NOT NULL
             AND e.triage_summary <> ''
             AND NOT EXISTS (SELECT 1 FROM pii_observations o
                              WHERE o.source_table = 'emails'
                                AND o.source_id = e.id
-                               AND o.source_column = 'triage_summary')
+                               AND o.source_column = 'triage_summary'
+                               AND o.class <> 'unreadable')
+            AND attempts < ?
           ORDER BY e.id DESC
           LIMIT ?",
     )
+    .bind(MAX_UNREADABLE_ATTEMPTS)
     .bind(SWEEP_BATCH)
     .fetch_all(pool)
     .await?;
 
     let mut written = 0;
-    for (id, summary) in pending {
+    for (id, summary, attempts) in pending {
         let answer = crate::runner::ollama_chat(
             client,
             base_url,
@@ -252,7 +277,11 @@ pub async fn observe_pending(
         let observations = match observations {
             Some(observations) => observations,
             None => {
-                tracing::warn!(email_id = id, "pii shadow: answer could not be read");
+                tracing::warn!(
+                    email_id = id,
+                    attempt = attempts + 1,
+                    "pii shadow: answer could not be read"
+                );
                 written += record(
                     pool,
                     "emails",
@@ -263,6 +292,7 @@ pub async fn observe_pending(
                         excerpt: String::new(),
                         confidence: None,
                     }],
+                    attempts,
                     now,
                 )
                 .await?;
@@ -282,7 +312,7 @@ pub async fn observe_pending(
         } else {
             observations
         };
-        written += record(pool, "emails", id, "triage_summary", &to_write, now).await?;
+        written += record(pool, "emails", id, "triage_summary", &to_write, 0, now).await?;
     }
 
     Ok(written)
@@ -396,10 +426,10 @@ mod tests {
             confidence: Some(0.8),
         }];
 
-        let first = record(&pool, "emails", 1, "subject", &observations, "2026-08-09T00:00:00Z")
+        let first = record(&pool, "emails", 1, "subject", &observations, 0, "2026-08-09T00:00:00Z")
             .await
             .unwrap();
-        let second = record(&pool, "emails", 1, "subject", &observations, "2026-08-09T01:00:00Z")
+        let second = record(&pool, "emails", 1, "subject", &observations, 0, "2026-08-09T01:00:00Z")
             .await
             .unwrap();
 
@@ -521,11 +551,56 @@ mod tests {
             "an unread summary must not be counted as clean"
         );
 
-        // And the sweep moves on rather than reconsidering it for ever.
-        let again = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T01:00:00Z")
+        // Retried, because one truncated answer must not remove a summary from the denominator for
+        // ever — but only up to the cap, because a summary the model garbles every time would
+        // otherwise block the batch from reaching anything older.
+        for sweep in 1..MAX_UNREADABLE_ATTEMPTS {
+            let again = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T01:00:00Z")
+                .await
+                .unwrap();
+            assert_eq!(again, 1, "sweep {sweep} did not retry an unreadable summary");
+        }
+
+        let past_the_cap = observe_pending(&pool, &client, &garbled, "m", "2026-08-09T09:00:00Z")
             .await
             .unwrap();
-        assert_eq!(again, 0, "the sweep is stuck on a summary it cannot read");
+        assert_eq!(past_the_cap, 0, "the sweep retries past its own cap");
+        assert_eq!(
+            tally(&pool).await.unwrap(),
+            vec![("unreadable".to_string(), MAX_UNREADABLE_ATTEMPTS)]
+        );
+    }
+
+    /// A summary that failed once and then succeeded is counted for what it is, not left as a
+    /// permanent `unreadable` — which is the whole point of retrying at all.
+    #[tokio::test]
+    async fn a_summary_that_reads_on_a_later_sweep_is_counted_properly() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "resumo").await;
+        let client = reqwest::Client::new();
+
+        let garbled = stub_ollama("not json").await;
+        observe_pending(&pool, &client, &garbled, "m", "2026-08-09T00:00:00Z")
+            .await
+            .unwrap();
+
+        let working = stub_ollama("[]").await;
+        observe_pending(&pool, &client, &working, "m", "2026-08-09T01:00:00Z")
+            .await
+            .unwrap();
+
+        let mut counts = tally(&pool).await.unwrap();
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![("none".to_string(), 1), ("unreadable".to_string(), 1)]
+        );
+
+        // And it is finished: a summary that was read is not offered again, whatever was found.
+        let after = observe_pending(&pool, &client, &working, "m", "2026-08-09T02:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(after, 0);
     }
 
     /// The sweep must reach older summaries even when the newest ones cannot be read. Without a
@@ -574,6 +649,7 @@ mod tests {
                 excerpt: "Rita".to_string(),
                 confidence: None,
             }],
+            0,
             "2026-08-09T00:00:00Z",
         )
         .await

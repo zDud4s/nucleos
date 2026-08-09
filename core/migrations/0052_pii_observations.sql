@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS pii_observations (
     -- The model's own confidence, kept so a later decision can be made at a threshold rather than
     -- on every hit. A 4B is wrong often enough that "it found something" is not a measurement.
     confidence    REAL,
+    -- Which attempt this row records, and it exists only for `unreadable`.
+    --
+    -- A summary the model garbles must be retried, or one truncated answer excludes it from the
+    -- denominator for ever; and it must not be retried indefinitely, or a summary it garbles
+    -- deterministically blocks the sweep from reaching anything older. Counting the attempts is
+    -- what allows both. A real observation is always attempt 0.
+    attempt       INTEGER NOT NULL DEFAULT 0,
     observed_at   TEXT NOT NULL
 );
 
@@ -40,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_pii_observations_class ON pii_observations (class
 
 -- One observation pass per source row: re-running triage on a message must not double-count it.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pii_observations_unique
-    ON pii_observations (source_table, source_id, source_column, class, excerpt);
+    ON pii_observations (source_table, source_id, source_column, class, excerpt, attempt);
 
 -- Observations go when their subject goes. Without this the table would outlive the mail it
 -- describes, which is the exact failure the column constraint above exists to prevent.

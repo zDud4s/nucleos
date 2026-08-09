@@ -152,11 +152,17 @@ fn base64_body_len(input: &str) -> usize {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'));
 
-        // Length is the whole discriminator, and it is enough: the words that ended a message and
-        // were being eaten — Obrigado, Cumprimentos, Duarte — are all shorter than this, while PEM
-        // wraps at 64. Requiring a digit or padding character as well was tried and is wrong: a
-        // short base64 line legitimately has neither.
-        if trimmed.len() < MIN_BODY_LINE || !charset_ok {
+        // Long OR encoded-looking, not long AND encoded-looking, and not long alone. Each of the
+        // three was tried and two are wrong. Length alone eats a sign-off, because "Cumprimentos"
+        // is a punctuation-free word. Length AND a digit breaks a real body, because a full-width
+        // base64 line can be all letters. Length alone also stops at a body's LAST line, which is
+        // short by construction — leaving the tail of a key in the text, which is the failure that
+        // matters most here.
+        let looks_encoded = trimmed
+            .chars()
+            .any(|c| c.is_ascii_digit() || matches!(c, '+' | '/' | '='));
+
+        if !charset_ok || (trimmed.len() < MIN_BODY_LINE && !looks_encoded) {
             break;
         }
         consumed += line.len();
@@ -339,6 +345,10 @@ const NUMBER_TRIGGERS: &[&str] = &[
     "card",
     "cartao",
     "cartão",
+    // Portuguese plurals that are not the singular plus one character, so the rule in
+    // `is_trigger_word` cannot reach them.
+    "cartoes",
+    "cartões",
     "visa",
     "mastercard",
     "amex",
@@ -375,7 +385,24 @@ fn trigger_precedes(input: &str, start: usize) -> bool {
     before[window_start..]
         .to_lowercase()
         .split(|character: char| !character.is_alphanumeric())
-        .any(|word| NUMBER_TRIGGERS.contains(&word))
+        .any(is_trigger_word)
+}
+
+/// Whether one word is a trigger, allowing one trailing character for a plural.
+///
+/// Exact equality was the first correction and it was too tight: "cards", "contas", "accounts",
+/// "numbers" and "IBANs" all stopped counting, so a labelled card written in the plural went out
+/// unredacted. A bare prefix test is too loose in the other direction — "contains" starts with
+/// "conta", which is how the substring version let a byte count be read as a taxpayer id.
+///
+/// One character is the whole difference between the two, and it is enough for the plural in both
+/// languages while excluding every longer word that happens to begin with a trigger.
+fn is_trigger_word(word: &str) -> bool {
+    NUMBER_TRIGGERS.iter().any(|trigger| {
+        word.len() >= trigger.len()
+            && word.len() <= trigger.len() + 1
+            && word.starts_with(trigger)
+    })
 }
 
 /// PURE: what a compacted, space-free run of characters proves itself to be, if anything.
@@ -698,6 +725,35 @@ mod tests {
         assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
         assert!(redacted.contains("Obrigado"), "{redacted:?}");
         assert!(redacted.ends_with("Duarte"), "{redacted:?}");
+    }
+
+    /// A plural still names the number. Exact word matching was the first correction and it was too
+    /// tight the other way: "cards", "contas", "accounts" and "IBANs" all stopped counting, so a
+    /// labelled card written in the plural went out unredacted.
+    #[test]
+    fn a_trigger_in_the_plural_still_vouches_for_a_number() {
+        for input in [
+            "please check these cards 4111 1111 1111 1111",
+            "os NIFs 123456789 e outro",
+            "accounts 100000002 and more",
+        ] {
+            assert_ne!(
+                redact_secrets(input),
+                input,
+                "{input:?} names the number in the plural and was not redacted"
+            );
+        }
+    }
+
+    /// The tail of a key is still key material. A minimum line length alone stopped at a body's
+    /// last line, which is short by construction, and left it in the text.
+    #[test]
+    fn the_short_last_line_of_a_key_body_is_redacted_with_the_rest() {
+        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaa\nAbCdEf12==\n\nObrigado";
+        let redacted = redact_secrets(input);
+
+        assert!(!redacted.contains("AbCdEf12"), "{redacted:?}");
+        assert!(redacted.ends_with("Obrigado"), "{redacted:?}");
     }
 
     /// The substring bug this gate had at first: "contains" ends in "conta", "discarded" contains
