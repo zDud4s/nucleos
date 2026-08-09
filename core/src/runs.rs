@@ -1845,8 +1845,14 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // when the proposal was read, and a release or a cancel can have finalised it since. No rows
     // means one of those got there first, so the supersede is a no-op rather than a status this
     // resume is entitled to overwrite — the live-worktree lookup above is what actually stops a
-    // resume onto a discarded worktree, and a run left `awaiting_approval` holds a slot that
-    // rejects the INSERT below if the slot is still held.
+    // resume onto a discarded worktree.
+    //
+    // It used to say, here, that a run left `awaiting_approval` holds a slot which rejects the
+    // INSERT below. That stopped being true at migration 0053, which dropped the index the claim was
+    // really made of; a stranded run holds a numbered slot now and blocks nothing. Nothing below
+    // depends on the refusal — the slot is HANDED OVER further down rather than competed for — but
+    // the sentence outlived the mechanism, which is how a guard comes to be believed in and not
+    // written.
     sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'")
         .bind(&now)
         .bind(original_run_id)
@@ -1902,6 +1908,24 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // to this one node would let the GC collect it the moment that node finished — with the rest of
     // the queue still to run in it. Filtering on `owner_kind = 'run'` is what makes that so.
     sqlx::query("UPDATE worktrees SET owner_id=? WHERE owner_kind='run' AND owner_id=?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
+    // The slot follows the tree, and is a no-op for a job's for the same reason — hence the same
+    // `owner_kind = 'run'` filter.
+    //
+    // Handed over rather than claimed anew, and the difference is not style. A claim is per owner:
+    // the resume would ask for a SECOND slot while its own predecessor still held the first, so a
+    // project at its ceiling would refuse an approval a human had already given — the resume denied
+    // a slot by the very run it replaces. Handing it over keeps one piece of work to one slot.
+    //
+    // Left out entirely, which is what happened until now, the row keeps pointing at the run
+    // `superseded` a few lines above. `reconcile_orphaned_slots` frees any slot whose owner is not
+    // live and runs on every job tick, so it collects this one out from under a run still working in
+    // the tree — and the project, reading one fewer in flight than it has, starts another. Two
+    // worktrees in one repository is precisely what `project_slots` exists to prevent.
+    sqlx::query("UPDATE project_slots SET owner_id=? WHERE owner_kind='run' AND owner_id=?")
         .bind(resume_id)
         .bind(original_run_id)
         .execute(&mut *tx)
@@ -3278,6 +3302,66 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             .await
             .unwrap();
         assert_eq!(status, "pending", "nothing was decided, so nothing is decided");
+    }
+
+    /// The resume takes over the slot its paused run was holding, exactly as it takes over the tree.
+    ///
+    /// A slot is claimed by an OWNER, and this approval retires one owner and creates another over
+    /// the same piece of work. Left on the retired one, the row is not merely untidy: the paused run
+    /// is `superseded` in the same transaction, `reconcile_orphaned_slots` frees any slot whose
+    /// owner is no longer live, and it runs on every job tick. So the slot is collected out from
+    /// under a run that is still working — and the project, now reading one fewer slot in flight
+    /// than it has work in flight, starts another. What that permits is the thing `project_slots`
+    /// exists to prevent: two worktrees writing one repository.
+    ///
+    /// The sweep is run here rather than described, because the bookkeeping assertion alone passes
+    /// against a transfer that puts the row on any live id at all.
+    ///
+    /// Filtered to `owner_kind = 'run'` for the same reason the worktree hand-over is: a job's slot
+    /// belongs to the JOB, which outlives this node and every other node in its queue.
+    #[tokio::test]
+    async fn an_approved_resume_takes_over_the_slot_the_paused_run_held() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        // Not a merge: this pins what happens to the SLOT, and the queueing path would only add a
+        // second thing for the test to be about.
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused: i64 =
+            sqlx::query_scalar("SELECT id FROM runs WHERE status = 'awaiting_approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        // The seeded row claims nothing by itself — `create_run_inner` is what claims — so the
+        // paused run is given the slot it would have been holding.
+        crate::concurrency::claim(&state.pool, "proj", crate::worktree::Owner::Run(paused))
+            .await
+            .expect("the paused run holds a slot");
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let holder: Option<i64> =
+            sqlx::query_scalar("SELECT owner_id FROM project_slots WHERE owner_kind = 'run'")
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            holder,
+            Some(resume_id),
+            "the slot follows the work, as the worktree does"
+        );
+
+        crate::concurrency::reconcile_orphaned_slots(&state.pool)
+            .await
+            .unwrap();
+        let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_slots")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            held, 1,
+            "the resume is running, so the sweep has nothing to collect"
+        );
     }
 
     /// **Decision (B).** Approving a merge hands it to the queue; it does not hand the run a pass to
