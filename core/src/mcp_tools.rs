@@ -372,10 +372,17 @@ fn redact_json_strings(value: &mut serde_json::Value) {
 
 /// The tools a turn answered by a model on this machine may be offered.
 ///
-/// Every `ReadsOwn` tool, plus `create_run` and `create_job`. The read half is not a judgement call
-/// — it is the `ToolEffect` partition below, which already means "own state, no stranger's words",
-/// and a local turn that reads only that has nothing to leak because nothing it touches came from
-/// outside.
+/// Every `ReadsOwn` tool, the two mail reads, plus `create_run` and `create_job`.
+///
+/// The mail reads are here because being asked what arrived is half of what a chat on a phone is
+/// for, and they are the reason `local_agent.rs` carries a barrier rather than a fixed list. A turn
+/// that reads mail has a stranger's words in its context, and from that moment `run_turn` refuses
+/// every `Acts` tool for the rest of the turn — the rule `ToolEffect::ReadsUntrusted` already
+/// states and that `hooks.rs` already enforces for a cloud run. Without it, "read this mail" and
+/// "start a job" in one turn would let a sender write the job.
+///
+/// `list_files` is `ReadsUntrusted` too and is deliberately NOT here: a filename is a poor thing to
+/// answer a chat with, and every untrusted tool added widens the surface for no gain.
 ///
 /// The write half is the judgement, and it stops short of two things. `approve_proposal`,
 /// `reject_proposal`, `cancel_run` and `set_kill` are absent because a local turn is a chat window
@@ -387,6 +394,8 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "create_job",
     "create_run",
     "get_budget",
+    "get_email",
+    "get_email_queue",
     "get_kill",
     "get_run",
     "list_projects",
@@ -537,6 +546,20 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             .collect()
     }
 
+    /// Answered from `TOOL_EFFECTS`, not from a second list beside it. The classification already
+    /// exists and `hooks.rs` already enforces it for a cloud run; a local turn asking the same
+    /// question of the same table is what keeps the two from drifting into different answers about
+    /// the same tool.
+    fn brings_untrusted_text(&self, name: &str) -> bool {
+        tool_effect(name) == ToolEffect::ReadsUntrusted
+    }
+
+    /// An unknown name resolves to `Acts` in `tool_effect`, so it is refused here — the fail-closed
+    /// direction, and the same one the cloud path takes.
+    fn permitted_after_untrusted(&self, name: &str) -> bool {
+        tool_effect(name) != ToolEffect::Acts
+    }
+
     async fn call(&self, name: &str, arguments: &serde_json::Value) -> String {
         // A name outside the offered set is refused here rather than dispatched, because the model
         // is the only thing that chose it: `LOCAL_TOOLS` is what was advertised, and anything else
@@ -560,6 +583,8 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "get_budget" => self.tools.get_budget().await,
             "get_kill" => self.tools.get_kill().await,
             "get_run" => self.tools.get_run(Parameters(parsed!(IdParams))).await,
+            "get_email_queue" => self.tools.get_email_queue().await,
+            "get_email" => self.tools.get_email(Parameters(parsed!(IdParams))).await,
             "vcs_ticket" => {
                 self.tools
                     .vcs_ticket(Parameters(parsed!(VcsTicketParams)))
@@ -816,17 +841,53 @@ mod tests {
         assert!(!LOCAL_TOOLS.contains(&"approve_proposal"));
     }
 
-    /// Every read a local turn can do is over the daemon's own state. That is what makes the turn
-    /// leak-free rather than merely local: no tool here brings a stranger's words into it.
+    /// The mail reads are offered, and they are the only untrusted ones that are.
+    ///
+    /// This replaced a test asserting that NO untrusted tool was reachable locally. That was the
+    /// earlier decision and it was reversed deliberately: being asked what arrived is half of what
+    /// a chat on a phone is for. What makes the reversal safe is the barrier below, not the absence
+    /// of the tools — so the list is pinned here and the barrier is pinned there, and neither
+    /// stands alone.
     #[test]
-    fn a_local_turn_reads_nothing_untrusted() {
-        for name in LOCAL_TOOLS {
-            assert_ne!(
-                tool_effect(name),
-                ToolEffect::ReadsUntrusted,
-                "{name} brings third-party text into a turn and must not be offered locally"
-            );
+    fn the_only_untrusted_reads_offered_locally_are_the_mail_ones() {
+        let untrusted: Vec<&&str> = LOCAL_TOOLS
+            .iter()
+            .filter(|name| tool_effect(name) == ToolEffect::ReadsUntrusted)
+            .collect();
+
+        assert_eq!(untrusted, [&"get_email", &"get_email_queue"]);
+        assert!(
+            !LOCAL_TOOLS.contains(&"list_files"),
+            "a filename is a poor thing to answer a chat with, and every untrusted tool added \
+             widens the surface for no gain"
+        );
+        assert!(!LOCAL_TOOLS.contains(&"web_read") && !LOCAL_TOOLS.contains(&"web_search"));
+    }
+
+    /// The barrier that makes the mail reads safe to offer, asked of the tool box the loop actually
+    /// consults rather than of the table underneath it.
+    #[tokio::test]
+    async fn reading_mail_taints_a_turn_and_shuts_the_acting_tools() {
+        use crate::local_agent::ToolBox;
+
+        let toolbox = LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), {
+            sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap()
+        });
+
+        for name in ["get_email", "get_email_queue"] {
+            assert!(toolbox.brings_untrusted_text(name), "{name}");
         }
+        for name in ["create_run", "create_job"] {
+            assert!(!toolbox.permitted_after_untrusted(name), "{name}");
+        }
+        // A read of the daemon's own state is still answerable afterwards: the turn has to be able
+        // to finish saying what it found.
+        for name in ["get_run", "list_projects", "get_budget"] {
+            assert!(toolbox.permitted_after_untrusted(name), "{name}");
+            assert!(!toolbox.brings_untrusted_text(name), "{name}");
+        }
+        // Fail-closed on a name that is not a tool at all.
+        assert!(!toolbox.permitted_after_untrusted("no_such_tool"));
     }
 
     #[test]

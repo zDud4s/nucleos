@@ -412,6 +412,23 @@ async fn spawn_local_turn(
                         "local turn ended without an answer of its own"
                     );
                 }
+                // Written BEFORE the status, so a turn that read mail is never visible as finished
+                // while still looking clean. The loop's own barrier governed this turn; this row is
+                // what governs the ones after it — `recent_exchanges` stops handing this chat's
+                // history across it, and `get_session` refuses to resume the session.
+                //
+                // A failure here is logged and not propagated, for the reason `read_untrusted_context`
+                // spells out: its readers treat a missing answer as tainted, so the direction this
+                // falls in is the refusing one.
+                if turn.read_untrusted
+                    && let Err(error) = crate::runs::mark_untrusted_context(&pool, id).await
+                {
+                    tracing::error!(
+                        run_id = id,
+                        %error,
+                        "could not mark a local turn as having read untrusted text"
+                    );
+                }
                 sqlx::query(
                     "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
