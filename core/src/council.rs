@@ -1659,6 +1659,90 @@ pub async fn reconcile(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
     Ok(reconciled.len() as u64)
 }
 
+/// The statuses that mean a council is over.
+///
+/// A positive list rather than `<> 'running'`, and the difference is which way the mistake falls. A
+/// status added later and forgotten here simply never ages out — a row too many. Spelled as the
+/// negative, the same oversight would delete councils in a state nobody had thought about yet.
+pub const TERMINAL_COUNCIL_STATUSES: [&str; 3] = [STATUS_DONE, STATUS_ERROR, STATUS_CANCELLED];
+
+/// How long a finished council stays in the record.
+///
+/// Ninety days, matching the FEED rather than the thirty a run keeps its transcript, and the gap
+/// between the two windows is the point. A council's bulk was never in these tables: the answers
+/// live in the transcripts of the `runs` rows the seats opened, and those are emptied on their own
+/// window by `runs::prune_transcripts`. So a council past a month is ALREADY a question, a
+/// leaderboard and a set of seats whose `answer` reads `null` — one short line about a deliberation
+/// that happened, which is what a feed entry is and why it gets a feed entry's window.
+///
+/// A bound at all, because this was the one table that grew with use and freed nothing: every
+/// council ever asked, plus a row per seat, kept for as long as the install exists.
+pub const DEFAULT_COUNCIL_RETENTION_DAYS: i64 = 90;
+
+/// The window, overridable the way `runs`, `feed` and `worktree` allow theirs to be.
+pub(crate) fn retention_days() -> i64 {
+    std::env::var("NUCLEOS_COUNCIL_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_COUNCIL_RETENTION_DAYS)
+}
+
+/// Removes finished councils past the window, and their seats with them. Returns how many went.
+///
+/// The row is DELETED, which is where this parts company with `runs::prune_transcripts` — that one
+/// keeps the row and empties the transcript, because a feed entry, a job item or a proposal still
+/// points at a run. NOTHING points at a council. A council stripped of its content would be a row
+/// that answers every question with `null` for ever, which is worse than its absence.
+///
+/// Only terminal councils. A row still `running` is one a driver may be part-way through writing,
+/// and deleting it would leave `set_stage` and `finish` updating nothing while the seats went on
+/// answering. Councils abandoned by a stopped daemon are settled by [`reconcile`] at startup, so
+/// they reach this sweep as `error` — the reconciliation is what makes "only terminal" safe rather
+/// than a way for a crashed council to become immortal.
+///
+/// The seats go through the `council_seats_follow_councils` trigger rather than a second statement
+/// here. `a_finished_council_and_its_seats_go_past_the_window` is what proves the cascade fires for
+/// a multi-row delete and not only for the single-row one `seats_do_not_outlive_their_council`
+/// exercises.
+pub async fn prune(
+    pool: &sqlx::SqlitePool,
+    retain_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<u64> {
+    if retain_days <= 0 {
+        // Zero would delete every council on the machine at the next sweep, which is not a retention
+        // policy but a typo with a plausible-looking value. The reading `feed::prune` and
+        // `runs::prune_transcripts` both make.
+        return Ok(0);
+    }
+
+    // RFC 3339 built in Rust and not SQLite's `datetime('now', '-N days')`, for the reason
+    // `web::prune` sets out at length and `runs::prune_transcripts` repeats: `created_at` is
+    // `2026-05-10T12:00:00+00:00`, `datetime()` returns `2026-05-10 12:00:00`, and TEXT comparison
+    // puts `T` (0x54) after the space (0x20) — so within the cutoff's own day a council hours too
+    // old compares as newer and survives every sweep for ever.
+    // `council_retention_is_exact_at_the_boundary` is the test that fails if this is ever changed
+    // back; the coarse one beside it would not notice.
+    let cutoff = (now - chrono::Duration::days(retain_days)).to_rfc3339();
+
+    // Aged from `created_at` because a council has no `completed_at` and does not earn a column for
+    // one: the whole deliberation is bounded by `timeout_seconds`, so start and end differ by
+    // minutes against a window measured in months.
+    //
+    // `AssertSqlSafe` because sqlx otherwise takes only `&'static str`. The one interpolated thing
+    // is a row of `?` generated from a constant's length — every status and the cutoff are bound —
+    // so nothing caller-supplied reaches the SQL text (the justification `runs::prune_transcripts`
+    // and `vcs::reap_requests_of_ended_runs` give).
+    let placeholders = vec!["?"; TERMINAL_COUNCIL_STATUSES.len()].join(", ");
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM council_runs WHERE status IN ({placeholders}) AND created_at < ?"
+    )));
+    for status in TERMINAL_COUNCIL_STATUSES {
+        delete = delete.bind(status);
+    }
+    Ok(delete.bind(&cutoff).execute(pool).await?.rows_affected())
+}
+
 // ── HTTP ─────────────────────────────────────────────────────────────────────────────────────
 //
 // The handlers, and nothing about transport beyond them: `http.rs` owns the router, as it owns
@@ -3273,6 +3357,123 @@ mod tests {
             .unwrap();
 
         assert!(get_seat_rows(&pool, "c1").await.unwrap().is_empty());
+        pool.close().await;
+    }
+
+    fn at(stamp: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// A council stamped at a chosen moment and in a chosen state, neither of which `insert_council`
+    /// takes — it stamps `now` and starts `running`, both correctly.
+    async fn aged_council(pool: &sqlx::SqlitePool, id: &str, status: &str, created_at: &str) {
+        insert_council(
+            pool,
+            id,
+            "why?",
+            &seat(SeatKind::Cloud, "m"),
+            &[seat(SeatKind::Cloud, "m")],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE council_runs SET created_at = ?, status = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The sweep, and the cascade under a delete that takes more than one row.
+    #[tokio::test]
+    async fn a_finished_council_and_its_seats_go_past_the_window() {
+        let pool = test_pool().await;
+        aged_council(&pool, "old", STATUS_DONE, "2026-01-01T00:00:00+00:00").await;
+        aged_council(&pool, "recent", STATUS_DONE, "2026-08-07T00:00:00+00:00").await;
+
+        assert_eq!(
+            prune(&pool, 90, at("2026-08-08T12:00:00+00:00"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert!(get_council_row(&pool, "old").await.unwrap().is_none());
+        assert!(
+            get_seat_rows(&pool, "old").await.unwrap().is_empty(),
+            "the trigger has to fire inside a bulk delete, not only the single-row one"
+        );
+        assert!(get_council_row(&pool, "recent").await.unwrap().is_some());
+        assert_eq!(get_seat_rows(&pool, "recent").await.unwrap().len(), 1);
+
+        pool.close().await;
+    }
+
+    /// A `running` row may still be being written by its driver. `reconcile` is what settles the
+    /// ones a stopped daemon abandoned, and only after that may they age out — so "only terminal"
+    /// costs nothing and is not a way for a crashed council to become immortal.
+    #[tokio::test]
+    async fn a_running_council_is_never_pruned() {
+        let pool = test_pool().await;
+        aged_council(&pool, "stuck", STATUS_RUNNING, "2020-01-01T00:00:00+00:00").await;
+
+        assert_eq!(
+            prune(&pool, 90, at("2026-08-08T12:00:00+00:00"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(get_council_row(&pool, "stuck").await.unwrap().is_some());
+
+        reconcile(&pool).await.unwrap();
+        assert_eq!(
+            prune(&pool, 90, at("2026-08-08T12:00:00+00:00"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        pool.close().await;
+    }
+
+    /// Copied from `runs::transcript_retention_is_exact_at_the_boundary`, and for its reason:
+    /// `created_at` is RFC 3339 and SQLite's `datetime()` is not, and the two are compared as TEXT.
+    /// Inside the cutoff's own day `T` sorts after the space, so a `datetime()` cutoff spares a
+    /// day's worth of councils on every sweep, for ever. The coarse test above would not notice.
+    #[tokio::test]
+    async fn council_retention_is_exact_at_the_boundary() {
+        let pool = test_pool().await;
+        // One second either side of a 90-day cutoff taken from 2026-08-08T12:00:00Z.
+        aged_council(&pool, "past", STATUS_DONE, "2026-05-10T11:59:59+00:00").await;
+        aged_council(&pool, "inside", STATUS_DONE, "2026-05-10T12:00:01+00:00").await;
+
+        assert_eq!(
+            prune(&pool, 90, at("2026-08-08T12:00:00+00:00"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert!(get_council_row(&pool, "past").await.unwrap().is_none());
+        assert!(get_council_row(&pool, "inside").await.unwrap().is_some());
+
+        pool.close().await;
+    }
+
+    /// Zero is not a retention policy, it is a typo that empties the council history on the machine.
+    #[tokio::test]
+    async fn a_zero_or_negative_window_prunes_no_council() {
+        let pool = test_pool().await;
+        aged_council(&pool, "ancient", STATUS_DONE, "2020-01-01T00:00:00+00:00").await;
+
+        let now = at("2026-08-08T12:00:00+00:00");
+        assert_eq!(prune(&pool, 0, now).await.unwrap(), 0);
+        assert_eq!(prune(&pool, -1, now).await.unwrap(), 0);
+        assert!(get_council_row(&pool, "ancient").await.unwrap().is_some());
+
         pool.close().await;
     }
 }
