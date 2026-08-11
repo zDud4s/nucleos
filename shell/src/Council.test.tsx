@@ -136,6 +136,50 @@ describe("the council", () => {
   });
 
   /**
+   * The state EVERY council reaches at a month old, now that the record outlives the transcripts it
+   * reads out of: the seats and the leaderboard are kept ninety days, the answers thirty. A seat
+   * that ended `ok` with nothing to show has to say the text expired — rendering nothing made it
+   * look like a seat nobody asked, and "did not answer" would blame the model for the calendar.
+   */
+  it("says an answer expired rather than drawing a seat that answered as empty", async () => {
+    await show(
+      [summary({ status: "done" })],
+      council({
+        status: "done",
+        stage: 3,
+        synthesis: null,
+        seats: [seat({ seat_idx: 0, ref: "answered-long-ago", stage1_status: "ok", answer: null })],
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("why does it do that?"));
+    });
+
+    expect(screen.getByText(/Answered\. The text has since expired\./)).toBeTruthy();
+    expect(screen.queryByText(/Did not answer/)).toBeNull();
+    // `done` is reached only when the chairman's own seat ended `ok`, so it DID write one. Saying
+    // "produced nothing" here would be a false statement about a council that worked.
+    expect(screen.getByText(/The chairman wrote one, and the text has since expired/)).toBeTruthy();
+    expect(screen.queryByText(/produced nothing/)).toBeNull();
+  });
+
+  /** And a chairman that really did fail still says so — the inference above must not swallow it. */
+  it("keeps a chairman that produced nothing apart from one that expired", async () => {
+    await show(
+      [summary({ status: "error" })],
+      council({ status: "error", stage: 3, synthesis: null }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("why does it do that?"));
+    });
+
+    expect(screen.getByText(/The chairman produced nothing\./)).toBeTruthy();
+    expect(screen.queryByText(/has since expired/)).toBeNull();
+  });
+
+  /**
    * The timer is the one thing in this tab that can go wrong quietly. A council that settled and
    * kept being fetched every two seconds would poll the daemon for as long as the tab stayed open,
    * and nothing on screen would say so.

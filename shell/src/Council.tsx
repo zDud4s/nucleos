@@ -37,6 +37,22 @@ function StatusBadge({ status }: { status: string }) {
  * same reason the daemon keeps them apart: a refusal, a wall clock and a cancellation say different
  * things about a model, and only one of them is worth trying again.
  */
+/**
+ * A seat's answer, or why there is none to show.
+ *
+ * A seat that ended `ok` wrote something, by definition — so an absent answer here means one thing
+ * only: the run transcript it lives in has passed ITS retention window, which is shorter than the
+ * council's. Thirty days against ninety, so this is not an edge case but the ordinary state of every
+ * council older than a month. Rendering nothing at all, as this did, made a seat that answered look
+ * like a seat that was never asked; saying "did not answer" would have blamed a model for the
+ * passage of time.
+ */
+function SeatAnswer({ status, answer }: { status: string; answer: string | null }) {
+  if (status !== "ok") return null;
+  if (answer === null) return <p className="faint">Answered. The text has since expired.</p>;
+  return <pre className="council-answer">{answer}</pre>;
+}
+
 function SeatEnding({ status, error }: { status: string; error: string | null }) {
   if (status === "ok") return null;
   const said =
@@ -204,7 +220,7 @@ export default function Council({ token, connection }: CouncilProps) {
                   {seat.ref} <small>{seat.kind === "local" ? "on this machine" : "cloud"}</small>
                 </span>
                 <SeatEnding status={seat.stage1_status} error={seat.stage1_error} />
-                {seat.answer !== null && <pre className="council-answer">{seat.answer}</pre>}
+                <SeatAnswer status={seat.stage1_status} answer={seat.answer} />
               </li>
             ))}
           </ul>
@@ -237,7 +253,11 @@ export default function Council({ token, connection }: CouncilProps) {
             <p className="faint">
               {open.status === "running"
                 ? "The chairman has not written it yet."
-                : "The chairman produced nothing."}
+                : open.status === "done"
+                  ? /* A council only reaches `done` when the chairman's own seat ended `ok`, so it
+                       DID write one. The only way the text is gone is expiry. */
+                    "The chairman wrote one, and the text has since expired — answers are kept for thirty days, the council itself for ninety."
+                  : "The chairman produced nothing."}
             </p>
           ) : (
             <pre className="council-answer">{open.synthesis}</pre>
