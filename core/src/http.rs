@@ -99,8 +99,9 @@ pub fn build_router(state: AppState) -> Router {
         // that has no node in flight: parked for budget, waiting for the slot, or between nodes.
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/assistant/message", post(post_assistant_message))
-        // Static segment ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
+        // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
+        .route("/assistant/chats", get(list_chats).post(create_chat))
         .route("/assistant/chats/{chat_id}", get(get_assistant_chat))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
@@ -2673,6 +2674,46 @@ async fn get_assistant_chat(
     })?;
     turns.reverse();
     Ok(Json(turns))
+}
+
+/// The conversations the app opened, most recently active first.
+///
+/// The Telegram sidecar's chats are absent from this, and no line here says so. They are absent
+/// because nothing ever created a row for them — the only door into `chats` is `create_chat` below.
+/// A filter naming Telegram would have to be kept correct as clients are added; an absence needs no
+/// maintenance.
+async fn list_chats(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::chats::ChatSummary>>, StatusCode> {
+    crate::chats::list(&state.pool).await.map(Json).map_err(|error| {
+        tracing::warn!(%error, "listing chats failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct CreateChatRequest {
+    /// Absent means cloud, matching the column default and every caller written before this.
+    brain: Option<String>,
+}
+
+/// Opens a conversation, and answers with the id it was given.
+///
+/// The id is minted by the daemon rather than accepted from the body: `chat_id` reaches a filename
+/// in `assistant.rs`'s temporary MCP config, and while that path encodes what it is handed, there is
+/// no reason to open a second door for arbitrary strings when this one can simply not exist.
+async fn create_chat(
+    State(state): State<AppState>,
+    Json(body): Json<CreateChatRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let brain = crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud"));
+    crate::chats::create(&state.pool, brain)
+        .await
+        .map(|chat_id| Json(serde_json::json!({ "chat_id": chat_id })))
+        .map_err(|error| {
+            tracing::warn!(%error, "opening a chat failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn get_proposals(
@@ -5422,6 +5463,90 @@ mod tests {
         let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // An array, not the single run object `/assistant/{turn_id}` would have answered with.
         assert_eq!(turns.as_array().unwrap().len(), 1);
+    }
+
+    /// Reads a response body as JSON, which every chat-route test below needs.
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn posting_a_chat_creates_one_the_list_then_returns() {
+        let app = build_router(test_state().await);
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"brain":"cloud"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let chat_id = json_body(created).await["chat_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+
+        // An array, not the single object `/assistant/chats/{id}` answers with — the two routes sit
+        // one segment apart and this is what says they were not confused for each other.
+        let body = json_body(listed).await;
+        let ids: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|chat| chat["chat_id"].as_str().unwrap())
+            .collect();
+        // A conversation you can open and have not yet used: it is listed before it has one turn.
+        assert!(ids.contains(&chat_id.as_str()));
+    }
+
+    /// A chat opened with no `brain` at all is a cloud chat, matching the column default and every
+    /// caller written before the field existed.
+    #[tokio::test]
+    async fn a_chat_opened_without_saying_which_model_is_a_cloud_one() {
+        let state = test_state().await;
+        let created = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let chat_id = json_body(created).await["chat_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            crate::chats::brain_of(&state.pool, &chat_id).await.unwrap(),
+            Some(crate::chats::Brain::Cloud)
+        );
     }
 
     async fn set_sender_verdict(state: AppState, body: serde_json::Value) -> StatusCode {
