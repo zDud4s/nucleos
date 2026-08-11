@@ -816,14 +816,38 @@ pub async fn ollama_message(
         object.insert("tools".to_string(), tools);
     }
 
+    // The error a caller gets back says WHICH failure this was, because two of them mean opposite
+    // things to a caller that runs in a loop. A timeout is about this one request and the next may
+    // well succeed; a refusal to connect is about the endpoint and every request after it will fail
+    // the same way. `pii_shadow`'s sweep reads exactly that distinction to decide between moving
+    // past one field and abandoning the pass.
     let response = client
         .post(format!("{base_url}/api/chat"))
         .json(&body)
         .send()
         .await
-        .map_err(std::io::Error::other)?
-        .error_for_status()
-        .map_err(std::io::Error::other)?
+        .map_err(|error| {
+            if error.is_timeout() {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+            } else {
+                std::io::Error::other(error)
+            }
+        })?;
+
+    // The BODY, not just the status. `error_for_status` throws it away, and it is where Ollama says
+    // what was wrong — "this model does not support thinking", say. Without it a configuration
+    // mistake is indistinguishable from a network one in the log, and the caller that wants to tell
+    // an operator which of the two it is has nothing to read.
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(std::io::Error::other(format!(
+            "Ollama returned {status}: {}",
+            detail.trim()
+        )));
+    }
+
+    let response = response
         .json::<serde_json::Value>()
         .await
         .map_err(std::io::Error::other)?;

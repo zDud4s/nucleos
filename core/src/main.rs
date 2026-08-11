@@ -8,6 +8,7 @@ mod budget;
 mod calendar;
 mod chats;
 mod classifier;
+mod collision;
 mod concurrency;
 mod config;
 mod contacts;

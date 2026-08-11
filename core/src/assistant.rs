@@ -801,7 +801,11 @@ mod tests {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 Vec::new()
             }
-            async fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            async fn call(
+                &self,
+                _name: &str,
+                _arguments: &serde_json::Value,
+            ) -> crate::local_agent::ToolAnswer {
                 unreachable!("this assistant answers without calling tools")
             }
         }
@@ -810,6 +814,90 @@ mod tests {
             Box::new(OneLiner(answer)),
             Box::new(NoTools),
         ))
+    }
+
+    /// A local assistant whose turn reads mail and then fails at the endpoint.
+    ///
+    /// The shape that matters: the taint happens, and then there is no `Turn` to carry it. It is
+    /// why the flag became an `AtomicBool` the caller owns, and it had no test.
+    fn local_assistant_that_reads_mail_then_dies() -> Arc<crate::local_agent::LocalAssistant> {
+        struct CallsThenDies;
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for CallsThenDies {
+            async fn exchange(
+                &self,
+                messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                // First exchange: ask for the mail. Second: the model is gone.
+                if messages.iter().any(|m| m["role"] == "tool") {
+                    return Err(std::io::Error::other("ollama went away"));
+                }
+                Ok(serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "get_email", "arguments": {"id": 1}}}]
+                }))
+            }
+        }
+
+        struct MailBox;
+        #[async_trait::async_trait]
+        impl crate::local_agent::ToolBox for MailBox {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                vec![serde_json::json!({
+                    "type": "function",
+                    "function": {"name": "get_email", "description": "read", "parameters": {}}
+                })]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                _arguments: &serde_json::Value,
+            ) -> crate::local_agent::ToolAnswer {
+                crate::local_agent::ToolAnswer {
+                    text: serde_json::json!({"body": "olá"}).to_string(),
+                    untrusted: true,
+                }
+            }
+        }
+
+        Arc::new(crate::local_agent::LocalAssistant::new(
+            Box::new(CallsThenDies),
+            Box::new(MailBox),
+        ))
+    }
+
+    /// A turn that read mail and then died is still marked as having read it.
+    ///
+    /// The flag used to ride on the returned `Turn`, which a transport error destroys — so the run
+    /// row said clean, `recent_exchanges` would hand the next turn a history containing a
+    /// stranger's words, and that turn's barrier would start open.
+    #[tokio::test]
+    async fn a_turn_that_read_mail_and_then_failed_is_still_marked() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(local_assistant_that_reads_mail_then_dies());
+
+        let id = send_message(
+            &state,
+            "tg-taint-survives",
+            "que mail chegou?",
+            Origin::Telegram,
+        )
+        .await
+        .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+
+        assert_eq!(status, "failed");
+        let marked: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            marked, 1,
+            "the turn read mail and the row does not say so, so the next turn inherits it clean"
+        );
     }
 
     /// Polls until the turn leaves `running`, the way every other test in this module waits for a
@@ -1163,7 +1251,7 @@ mod tests {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 Vec::new()
             }
-            async fn call(&self, _: &str, _: &serde_json::Value) -> String {
+            async fn call(&self, _: &str, _: &serde_json::Value) -> crate::local_agent::ToolAnswer {
                 unreachable!()
             }
         }

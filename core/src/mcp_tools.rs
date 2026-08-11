@@ -546,34 +546,42 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             .collect()
     }
 
-    /// Answered by `effect_of_call`, the same function `hooks.rs` asks. Asking the bare table
-    /// instead was a real hole and not a tidiness point: `get_run` is `ReadsOwn` by name, the cloud
-    /// path upgrades it when the id names a triage run — whose stdout is a model's answer over a
-    /// stranger's mail — and the local path did not. A chat could read that, stay unmarked, and
-    /// then start work.
-    async fn brings_untrusted_text(&self, name: &str, arguments: &serde_json::Value) -> bool {
-        effect_of_call(&self.pool, name, arguments).await == ToolEffect::ReadsUntrusted
-    }
-
     /// An unknown name resolves to `Acts` in `tool_effect`, so it is refused here — the fail-closed
     /// direction, and the same one the cloud path takes.
     fn permitted_after_untrusted(&self, name: &str) -> bool {
         tool_effect(name) != ToolEffect::Acts
     }
 
-    async fn call(&self, name: &str, arguments: &serde_json::Value) -> String {
+    async fn call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> crate::local_agent::ToolAnswer {
         // A name outside the offered set is refused here rather than dispatched, because the model
         // is the only thing that chose it: `LOCAL_TOOLS` is what was advertised, and anything else
         // is a hallucinated name or a tool this turn was deliberately not given.
         if !LOCAL_TOOLS.contains(&name) {
-            return error_json(format!("{name} is not a tool this conversation can use"));
+            return crate::local_agent::ToolAnswer::own(error_json(format!(
+                "{name} is not a tool this conversation can use"
+            )));
         }
+
+        // Classified ONCE, before the tool runs, and the same answer gates both the filtering below
+        // and the turn's latch. It used to be asked twice — once here for redaction and once by the
+        // loop afterwards for the taint — against a `runs` row that can be deleted in between, so
+        // the two could disagree and leave a triage run's stdout in a turn that still counted clean.
+        let effect = effect_of_call(&self.pool, name, arguments).await;
 
         macro_rules! parsed {
             ($type:ty) => {
                 match serde_json::from_value::<$type>(arguments.clone()) {
                     Ok(value) => value,
-                    Err(error) => return error_json(format!("bad arguments for {name}: {error}")),
+                    Err(error) => {
+                        return crate::local_agent::ToolAnswer {
+                            text: error_json(format!("bad arguments for {name}: {error}")),
+                            untrusted: effect == ToolEffect::ReadsUntrusted,
+                        };
+                    }
                 }
             };
         }
@@ -595,7 +603,9 @@ impl crate::local_agent::ToolBox for LocalToolBox {
                 if let Err(reason) = self.spend_is_permitted().await {
                     // Answered as a tool result rather than as a failure, so the model can tell the
                     // person WHY nothing started instead of falling silent or trying again.
-                    return error_json(format!("no work can start right now: {reason}"));
+                    return crate::local_agent::ToolAnswer::own(error_json(format!(
+                        "no work can start right now: {reason}"
+                    )));
                 }
                 match name {
                     "create_run" => self.tools.create_run(Parameters(parsed!(RunParams))).await,
@@ -607,20 +617,31 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             other => error_json(format!("{other} has no local dispatch")),
         };
 
-        // Filtered here, and only what a stranger wrote. The local turn does not pass through
-        // `filter_outgoing`, on the argument that a model on this machine is not a network
-        // boundary — which was true while this box read only the daemon's own state and stopped
-        // being true when it was given the mailbox. The model is local; its ANSWER is relayed to
-        // Telegram's servers, so an IBAN quoted out of a mail body leaves the machine, while the
-        // same body read through MCP would have been redacted. Two paths to the same text, one of
-        // them filtered, is not a policy.
+        // Filtered exactly as `filter_outgoing` filters the MCP path: every result, and through the
+        // PARSED document rather than its rendered form.
         //
-        // Only the untrusted results, so the owner's own run ids, project names and budget figures
-        // reach them intact.
-        if effect_of_call(&self.pool, name, arguments).await == ToolEffect::ReadsUntrusted {
-            return crate::redact::redact_secrets(&answer);
+        // Both halves of that sentence were wrong here a commit ago, in the two ways this file
+        // already documents elsewhere. Filtering only the untrusted results left `get_run` handing
+        // a whole run row — stdout included, where a transcript can carry a token it echoed — to a
+        // model whose answer is relayed to Telegram; the cloud path makes no such exception.
+        // And redacting `answer`, which is `serde_json::to_string` output, meant a mail body's
+        // newlines were the two characters `\` and `n`, so `pem_blocks` — which anchors on the
+        // newline closing a PEM header — matched nothing at all. That is the same bug
+        // `redact_json_strings` was written to fix on the other path, reintroduced on this one.
+        let text = match serde_json::from_str::<serde_json::Value>(&answer) {
+            Ok(mut document) => {
+                redact_json_strings(&mut document);
+                document.to_string()
+            }
+            // Every arm above produces JSON, so this is unreachable in practice — and if it ever
+            // is not, the flat pass is still better than none.
+            Err(_) => crate::redact::redact_secrets(&answer),
+        };
+
+        crate::local_agent::ToolAnswer {
+            text,
+            untrusted: effect == ToolEffect::ReadsUntrusted,
         }
-        answer
     }
 }
 
@@ -883,7 +904,7 @@ mod tests {
         for name in LOCAL_TOOLS {
             let answer = toolbox.call(name, &serde_json::json!({})).await;
             assert!(
-                !answer.contains("has no local dispatch"),
+                !answer.text.contains("has no local dispatch"),
                 "{name} is in LOCAL_TOOLS and has no arm in LocalToolBox::call"
             );
         }
@@ -918,7 +939,16 @@ mod tests {
             .filter(|name| tool_effect(name) == ToolEffect::ReadsUntrusted)
             .collect();
 
+        // By NAME. The list is not the whole answer and saying so here is the point: `get_run` is
+        // a third untrusted read whenever its id names a triage run, which only `effect_of_call`
+        // can tell — and asking the bare table is exactly the mistake that let a chat read a triage
+        // run's stdout unmarked. `reading_mail_taints_a_turn_and_shuts_the_acting_tools` is what
+        // covers that one; this covers the surface a reader can see from the list alone.
         assert_eq!(untrusted, [&"get_email", &"get_email_queue"]);
+        assert!(
+            LOCAL_TOOLS.contains(&"get_run"),
+            "the conditional case below has to remain reachable to be worth testing"
+        );
         assert!(
             !LOCAL_TOOLS.contains(&"list_files"),
             "a filename is a poor thing to answer a chat with, and every untrusted tool added \
@@ -950,8 +980,9 @@ mod tests {
         for name in ["get_email", "get_email_queue"] {
             assert!(
                 toolbox
-                    .brings_untrusted_text(name, &serde_json::json!({"id": 1}))
-                    .await,
+                    .call(name, &serde_json::json!({"id": 1}))
+                    .await
+                    .untrusted,
                 "{name}"
             );
         }
@@ -966,19 +997,21 @@ mod tests {
         // work with a sender's text in context.
         assert!(
             toolbox
-                .brings_untrusted_text("get_run", &serde_json::json!({"id": 1}))
-                .await,
+                .call("get_run", &serde_json::json!({"id": 1}))
+                .await
+                .untrusted,
             "a triage run's output is a stranger's words"
         );
         assert!(
             !toolbox
-                .brings_untrusted_text("get_run", &serde_json::json!({"id": 2}))
+                .call("get_run", &serde_json::json!({"id": 2}))
                 .await
+                .untrusted
         );
         // No id, or an id of the wrong shape, is "I could not tell" — which is not "no".
         for arguments in [serde_json::json!({}), serde_json::json!({"id": "seven"})] {
             assert!(
-                toolbox.brings_untrusted_text("get_run", &arguments).await,
+                toolbox.call("get_run", &arguments).await.untrusted,
                 "{arguments} was read as a safe call"
             );
         }
@@ -990,9 +1023,7 @@ mod tests {
         }
         for name in ["list_projects", "get_budget"] {
             assert!(
-                !toolbox
-                    .brings_untrusted_text(name, &serde_json::json!({}))
-                    .await,
+                !toolbox.call(name, &serde_json::json!({})).await.untrusted,
                 "{name}"
             );
         }

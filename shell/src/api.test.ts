@@ -563,8 +563,10 @@ describe("runs, presets and the assistant", () => {
       .mockResolvedValueOnce({ ok: true, status: 200 })
       .mockResolvedValueOnce(nonOk(404));
 
-    await expect(api.cancelRun(TOKEN, 4)).resolves.toBe(true);
-    await expect(api.cancelRun(TOKEN, 4)).resolves.toBe(false);
+    await expect(api.cancelRun(TOKEN, 4)).resolves.toEqual({ ok: true, value: null });
+    await expect(api.cancelRun(TOKEN, 4)).resolves.toEqual({
+      ok: false, fault: "failed", status: 404,
+    });
   });
 
   it("carries a duplicate preset name back as a 409 rather than a bare failure", async () => {
@@ -950,5 +952,36 @@ describe("moving an occurrence, reading the web, and the dictations", () => {
 
     await expect(api.listVoiceDictations(TOKEN)).resolves.toEqual([]);
     expectGetCall(1, `${DAEMON_URL}/voice/dictations`);
+  });
+
+  it("asks the daemon for capacity, and reads a failure as absent rather than as empty", async () => {
+    const readout = { house: { limit: 3, held: 1 }, projects: [] };
+    fetchMock.mockResolvedValueOnce(okJson(readout));
+
+    await expect(api.getConcurrency(TOKEN)).resolves.toEqual(readout);
+    expectGetCall(1, `${DAEMON_URL}/concurrency`);
+
+    fetchMock.mockResolvedValueOnce(nonOk(500));
+    await expect(api.getConcurrency(TOKEN)).resolves.toBeNull();
+  });
+
+  it("asks for live work without the recency window", async () => {
+    fetchMock.mockResolvedValue(okJson([]));
+
+    await api.getJobs(TOKEN, undefined, { live: true });
+    await api.getLiveRuns(TOKEN);
+
+    expectGetCall(1, `${DAEMON_URL}/jobs?live=true`);
+    expectGetCall(2, `${DAEMON_URL}/runs?live=true&limit=${api.LIVE_LIST_LIMIT}`);
+  });
+
+  it("keeps the old job listing byte for byte when nothing asks for live", async () => {
+    fetchMock.mockResolvedValue(okJson([]));
+
+    await api.getJobs(TOKEN);
+    await api.getJobs(TOKEN, "alpha");
+
+    expectGetCall(1, `${DAEMON_URL}/jobs`);
+    expectGetCall(2, `${DAEMON_URL}/jobs?project_id=alpha`);
   });
 });

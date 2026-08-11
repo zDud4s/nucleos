@@ -67,21 +67,17 @@ pub trait ToolBox: Send + Sync {
     /// description, parameters}}`.
     fn schemas(&self) -> Vec<Value>;
 
-    /// Runs one tool and returns its result as the text the model will read. Errors are values
-    /// here, not `Err`: a tool that failed is something the model must be told about so it can try
-    /// something else, not something that ends the turn.
-    async fn call(&self, name: &str, arguments: &Value) -> String;
-
-    /// Whether this CALL puts words a third party wrote into the turn.
+    /// Runs one tool and reports what it returned AND whether that was a stranger's words. Errors
+    /// are values here, not `Err`: a tool that failed is something the model must be told about so
+    /// it can try something else, not something that ends the turn.
     ///
-    /// The loop tracks it and never un-tracks it, because a turn cannot un-read a mail body.
-    ///
-    /// Takes the arguments, and is async, for one tool: `get_run` is own-state by name and a
-    /// stranger's words by content when the id names a triage run, and answering that needs the
-    /// database. Getting it from the name alone is exactly the hole this signature closed.
-    async fn brings_untrusted_text(&self, _name: &str, _arguments: &Value) -> bool {
-        false
-    }
+    /// The two answers come back together because they are one decision. They used to be two calls
+    /// — `call`, then `brings_untrusted_text` — and that was wrong twice over. The classification
+    /// ran AFTER the content was already in the conversation, and it ran a second time inside the
+    /// box to decide redaction; for `get_run` both answers depend on a database row that can be
+    /// deleted in between, so the redaction pass could see a triage run and the taint pass could see
+    /// nothing, leaving a stranger's words in a turn that still counted as clean.
+    async fn call(&self, name: &str, arguments: &Value) -> ToolAnswer;
 
     /// Whether this tool may still run once the turn has read third-party text.
     ///
@@ -89,6 +85,27 @@ pub trait ToolBox: Send + Sync {
     /// asked for. The real one answers from `ToolEffect`.
     fn permitted_after_untrusted(&self, _name: &str) -> bool {
         true
+    }
+}
+
+/// What one tool call produced, and whether it brought a stranger's words with it.
+#[derive(Debug, Clone)]
+pub struct ToolAnswer {
+    /// The text the model will read. Already filtered by whatever policy the box applies.
+    pub text: String,
+    /// Set when this call put words a third party wrote into the turn. The loop latches it and
+    /// never clears it, because a turn cannot un-read a mail body.
+    pub untrusted: bool,
+}
+
+impl ToolAnswer {
+    /// A result carrying nothing a stranger wrote — the common case, and the one a test fake means
+    /// unless it says otherwise.
+    pub fn own(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            untrusted: false,
+        }
     }
 }
 
@@ -202,15 +219,19 @@ pub async fn run_turn(
             // result rather than by ending the turn, so the model can say why nothing started —
             // and counted as a failure, so asking a second time stops the loop instead of spending
             // every remaining round on the same refusal.
-            // Only a tool that was actually OFFERED can be refused by the barrier. A name the model
-            // invented resolves to `Acts` — the fail-closed default for an unknown tool — and would
-            // otherwise be told "this turn has read mail", which is not why it failed. Sending it to
-            // `call` instead gets it the true answer, and is safe because dispatch is a whitelist:
-            // a name that is not on the list runs nothing whatever the turn has read.
+            // Refused on the name's own classification, and NOT on whether the name appears in the
+            // schemas. Gating on that was an attempt to fix the refusal's wording and it moved a
+            // security decision onto a presentation list: `schemas()` is the router's names filtered
+            // by `LOCAL_TOOLS`, and a tool renamed in one place and not the other would vanish from
+            // the schemas while still dispatching — which would have made it exempt from the
+            // barrier. `permitted_after_untrusted` is fail-closed on an unknown name, and that is
+            // the property worth keeping.
+            //
+            // The wording problem is solved where it belongs: in the wording.
+            let refused = untrusted && !tools.permitted_after_untrusted(&name);
             let offered = schemas
                 .iter()
                 .any(|schema| schema["function"]["name"] == name.as_str());
-            let refused = offered && untrusted && !tools.permitted_after_untrusted(&name);
             let result = if refused {
                 // Built with `json!` and not with `format!`. `name` is whatever the model emitted,
                 // and a name carrying a quote produced a string `serde_json` could not parse — so
@@ -223,21 +244,27 @@ pub async fn run_turn(
                 // and a 4B relayed that as "reading mail must be the first action" — the opposite
                 // instruction. A sentence a model has to paraphrase has to survive being
                 // paraphrased.
-                serde_json::json!({
-                    "error": format!(
+                let reason = if offered {
+                    format!(
                         "{name} cannot run now. This turn has read mail, and text written by \
                          someone else must not be able to start work. Tell the owner to ask for it \
                          again in a new message that does not read mail."
                     )
-                })
-                .to_string()
+                } else {
+                    // Refused all the same, because an unrecognised name is treated as an action.
+                    // Told the truth about WHY, because the model relays this to a person and
+                    // "this turn has read mail" would send them looking for a mail they never
+                    // mentioned.
+                    format!("{name} is not a tool this conversation can use.")
+                };
+                serde_json::json!({ "error": reason }).to_string()
             } else {
-                let result = tools.call(&name, &arguments).await;
-                if tools.brings_untrusted_text(&name, &arguments).await {
+                let answer = tools.call(&name, &arguments).await;
+                if answer.untrusted {
                     untrusted = true;
                     taint.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                result
+                answer.text
             };
             // Only calls that RAN are counted. `tool_calls` is read as "how much work did this turn
             // do", to explain a slow one, and a refusal costs nothing — counting it made a turn
@@ -418,12 +445,12 @@ mod tests {
             })]
         }
 
-        async fn call(&self, name: &str, arguments: &Value) -> String {
+        async fn call(&self, name: &str, arguments: &Value) -> ToolAnswer {
             self.calls
                 .lock()
                 .unwrap()
                 .push((name.to_string(), arguments.clone()));
-            self.answer.to_string()
+            ToolAnswer::own(self.answer)
         }
     }
 
@@ -436,9 +463,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolBox for GovernedTools {
-        /// Both tools are advertised, because the barrier only refuses a tool that was OFFERED —
-        /// an invented name gets sent to `call` to be told it does not exist. A fake with no
-        /// schemas would make every barrier test below pass for the wrong reason.
+        /// Both tools are advertised, so the refusal can tell an offered tool from an invented one
+        /// when it words itself. A fake with no schemas would make every barrier test below pass
+        /// for the wrong reason.
         fn schemas(&self) -> Vec<Value> {
             ["read_mail", "start_work"]
                 .into_iter()
@@ -451,17 +478,28 @@ mod tests {
                 .collect()
         }
 
-        async fn call(&self, name: &str, _arguments: &Value) -> String {
+        /// A whitelist, like the real one: a name that is not offered runs nothing and says so. The
+        /// fake used to accept any name and report success, which made the test about invented
+        /// tools assert the opposite of its own premise.
+        async fn call(&self, name: &str, _arguments: &Value) -> ToolAnswer {
+            if !["read_mail", "start_work"].contains(&name) {
+                return ToolAnswer::own(
+                    serde_json::json!({"error": format!("{name} is not a tool")}).to_string(),
+                );
+            }
             self.calls.lock().unwrap().push(name.to_string());
-            serde_json::json!({"ok": name}).to_string()
+            ToolAnswer {
+                text: serde_json::json!({"ok": name}).to_string(),
+                untrusted: name == "read_mail",
+            }
         }
 
-        async fn brings_untrusted_text(&self, name: &str, _arguments: &Value) -> bool {
-            name == "read_mail"
-        }
-
+        /// Fail-closed on anything it does not recognise, which is the shape the real box has:
+        /// `tool_effect` resolves an unknown name to `Acts`. Written as `!= "start_work"` at first,
+        /// which permitted every invented name and quietly moved the barrier test onto a path the
+        /// production code does not take.
         fn permitted_after_untrusted(&self, name: &str) -> bool {
-            name != "start_work"
+            name == "read_mail"
         }
     }
 
@@ -585,23 +623,27 @@ mod tests {
             .await
             .unwrap();
 
-        // Dispatched rather than refused by the barrier — safe because the tool box's own dispatch
-        // is a whitelist, so a name that is not on it runs nothing.
-        assert_eq!(
-            *tools.calls.lock().unwrap(),
-            ["read_mail", "delete_everything"]
-        );
+        // Refused, not dispatched. An unrecognised name resolves to `Acts`, and after a mail read
+        // an action is refused — that is the fail-closed default and it stays. Gating the barrier
+        // on whether the name was advertised was tried, to fix the wording, and it moved the
+        // decision onto a presentation list: a tool renamed in one place and not another would
+        // disappear from the schemas and become exempt.
+        assert_eq!(*tools.calls.lock().unwrap(), ["read_mail"]);
+
         let last = chat.seen.lock().unwrap().last().unwrap().clone();
         let answer = last
             .iter()
             .find(|message| message["tool_name"] == "delete_everything")
             .expect("the invented call got no tool result");
+        let content = answer["content"].as_str().unwrap();
+        // The wording is fixed where the wording lives.
         assert!(
-            !answer["content"]
-                .as_str()
-                .unwrap()
-                .contains("has read mail"),
-            "an invented tool was blamed on the mail barrier: {answer}"
+            content.contains("is not a tool this conversation can use"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("has read mail"),
+            "an invented tool was blamed on the mail barrier: {content}"
         );
     }
 

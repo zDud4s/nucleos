@@ -10,6 +10,7 @@ import Chats from "./Chats";
 import type { Turn } from "./chat/turns";
 import Contacts from "./Contacts";
 import Files from "./Files";
+import Fleet from "./Fleet";
 import Home from "./Home";
 import Mail from "./Mail";
 import Projects from "./Projects";
@@ -23,11 +24,15 @@ import "./App.css";
 import "./calendar.css";
 
 type Tab =
-  | "home" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
+  | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
   | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
+  // Between Home and Autopilot, and not after it: the `approvals` comment below says that tab comes
+  // "straight after Autopilot because it is the same subject seen from the other side", and putting
+  // anything between the two would make that sentence false.
+  { key: "fleet", label: "Fleet" },
   { key: "autopilot", label: "Autopilot" },
   // Straight after Autopilot because it is the same subject seen from the other side: Autopilot is
   // what the machine is doing, this is what it stopped doing and is waiting on you for. Ahead of
@@ -268,7 +273,7 @@ function App() {
         <span className="wordmark">NucleOS</span>
         {/*
           The chats take the window. A conversation is read a column at a time and the tab strip is
-          thirteen competing doors above it, so inside that page the strip stands down and leaves one
+          fourteen competing doors above it, so inside that page the strip stands down and leaves one
           way out. The right-hand side of the header stays: "no tab bar" was the ask, "no emergency
           stop" was not.
         */}
@@ -365,6 +370,14 @@ function App() {
               status={status}
               killEngaged={killEngaged}
               onOpenAutopilot={() => setTab("autopilot")}
+            />
+          )}
+          {tab === "fleet" && (
+            <Fleet
+              token={token}
+              connection={connection}
+              killEngaged={killEngaged}
+              onOpenRuns={() => setTab("runs")}
             />
           )}
           {tab === "autopilot" && (
