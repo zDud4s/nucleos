@@ -235,9 +235,14 @@ pub async fn send_message(
     // purpose. The session is what the NEXT turn resumes, and this module drops it whenever a turn
     // read third-party text — so a conversation that has read mail once is spread across several
     // sessions, and no amount of joining on `session_id` reassembles it. The chat is the thread.
+    //
+    // `answered_by` alongside them, written at INSERT for the same reason `session_id` is: a turn
+    // that is cancelled before it produces a word still has to say who was answering it. It is a
+    // literal here rather than a parameter because everything that reaches this line is on the CLI
+    // path — the branch above is where the other answer is given.
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, 'cloud', ?)",
     )
     .bind(text)
     .bind(&session_id)
@@ -357,8 +362,8 @@ async fn spawn_local_turn(
 
     let session_id = crate::auth::generate_uuid_v4();
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, 'local', ?)",
     )
     .bind(&text)
     .bind(&session_id)
@@ -824,6 +829,41 @@ mod tests {
             Some(CLI_FAKE_REPLY),
             "a configured local model must not move the shell's chat onto it"
         );
+    }
+
+    async fn answered_by(pool: &SqlitePool, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT answered_by FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Written when the row is BORN, not when the turn ends: a turn that is cancelled still has to
+    /// say who was answering it, and the transcript draws its memory cut from this column.
+    #[tokio::test]
+    async fn a_cloud_turn_records_that_the_cloud_answered_it() {
+        let state = test_state().await;
+
+        let id = send_message(&state, "who-answered", "hello", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("cloud"));
+    }
+
+    /// The half that closes a hole predating this work: until now a Telegram turn answered on this
+    /// machine was indistinguishable from a cloud one in the runs table.
+    #[tokio::test]
+    async fn a_local_turn_records_that_the_local_model_answered_it() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("aqui mesmo"));
+
+        let id = send_message(&state, "tg-who-answered", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+
+        assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("local"));
     }
 
     /// A local turn holds the chat's one slot like any other, and releases it. Without this the
