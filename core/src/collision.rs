@@ -333,7 +333,7 @@ fn source_state(found: &[Overlap], complete: bool) -> State {
 /// of those failures is a way of not having measured, and none of them is `clean`.
 ///
 /// **One worktree poisons the whole project, and old ones have no cure.** A tree created before
-/// migration `0057` has `base_sha = NULL`, is never measured, and therefore never has a row — which
+/// migration `0060` has `base_sha = NULL`, is never measured, and therefore never has a row — which
 /// puts its project into `not_measured` for as long as it lives. That is the correct behaviour
 /// (where it branched from is unknown and unrecoverable after the fact), and this is where the
 /// consequence shows up.
