@@ -242,6 +242,7 @@ fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
         Scope::Control => true,
         Scope::Run(_) => method == Method::POST && path == HOOK_ROUTE,
         Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
+        Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => route_is_listed(READ_ONLY_ROUTES, method, path),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
             route_is_listed(READ_ONLY_ROUTES, method, path)
@@ -289,16 +290,58 @@ pub fn mint_api_token(name: &str) -> (String, String) {
     (format!("api:{name}.{secret}"), secret)
 }
 
-/// A sidecar the daemon launches, and which therefore gets a key of its own.
+/// Every route a council seat's tools reach, and nothing else.
 ///
-/// Only the email sidecar is here. The telegram sidecar deliberately keeps the control token: it is
-/// the user's remote control — it approves proposals, works the kill switch and cancels runs, the
-/// same surface the shell has — so an allowlist for it would be all of Control minus a handful of
-/// routes, which reads like a boundary without being one. Narrowing it means first deciding what a
-/// chat message is allowed to do, and that is a product decision, not a plumbing one.
+/// This is the third of three independent reasons a seat cannot act, and the only one that holds
+/// without anybody's cooperation. `ToolPolicy::McpOnly` is the CLI refusing itself every tool but
+/// this server's; `hooks.rs` is the daemon refusing every name outside `mcp_tools::COUNCIL_TOOLS`
+/// — and that second one is COOPERATIVE, because the `PreToolUse` hook fires only if the
+/// `.claude/settings.json` resolved from the run's working directory registers it. A seat runs with
+/// no working directory of its own. So the question "what if the hook never fires" has to have an
+/// answer, and this table is it: with this key, `POST /runs` is 403 whatever the model decided.
+///
+/// It is why a seat gets a key of its own rather than the control token an orchestrator turn
+/// carries. That turn holds the controls because approving a proposal on the owner's word is its
+/// JOB; a council answers a question, and the design's third decision — reads only, never acts — is
+/// a promise this list is what actually keeps.
+///
+/// Every entry is a GET of the owner's own state, which is the same content
+/// `mcp_tools::COUNCIL_TOOLS` advertises. `GET /vcs/requests/{id}/wait` is absent for the reason
+/// `READ_ONLY_ROUTES` gives for excluding it, and so is `vcs_ticket` from the tool list: it is the
+/// read-back half of `vcs_request`, and a seat that cannot queue an operation has nothing to read
+/// back.
+const COUNCIL_ROUTES: &[(Method, &str)] = &[
+    (Method::GET, "/projects"),
+    (Method::GET, "/runs/{id}"),
+    (Method::GET, "/proposals"),
+    // Both are administrative for an API key and reachable here, and the difference is who is
+    // asking: an API key is a credential somebody pasted into a script, while this one is minted at
+    // startup, never leaves the daemon's own subprocesses, and reads back to the owner's own
+    // question. What a council costs and whether autonomy is switched off are two of the things a
+    // person convenes one to ask about.
+    (Method::GET, "/autopilot/budget"),
+    (Method::GET, "/autopilot/kill"),
+    (Method::GET, "/email/queue"),
+    (Method::GET, "/email/{id}"),
+    (Method::GET, "/files"),
+];
+
+/// A process the daemon launches and hands a key of its own, rather than the control token.
+///
+/// The telegram sidecar deliberately keeps the control token: it is the user's remote control — it
+/// approves proposals, works the kill switch and cancels runs, the same surface the shell has — so
+/// an allowlist for it would be all of Control minus a handful of routes, which reads like a
+/// boundary without being one. Narrowing it means first deciding what a chat message is allowed to
+/// do, and that is a product decision, not a plumbing one.
+///
+/// `Council` is not a sidecar and belongs here anyway, because what this enum actually enumerates is
+/// "a subprocess of ours that must not hold the controls". A council seat is an agent CLI the daemon
+/// spawns, and the argument for scoping its key is stronger than the email sidecar's: there are up
+/// to eight of them at once, each one a model deciding what to call next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {
     Email,
+    Council,
 }
 
 impl Service {
@@ -307,12 +350,14 @@ impl Service {
     fn name(self) -> &'static str {
         match self {
             Service::Email => "email",
+            Service::Council => "council",
         }
     }
 
     fn from_name(name: &str) -> Option<Self> {
         match name {
             "email" => Some(Service::Email),
+            "council" => Some(Service::Council),
             _ => None,
         }
     }
@@ -488,6 +533,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

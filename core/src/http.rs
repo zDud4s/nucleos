@@ -210,6 +210,18 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/calendar/busy", get(crate::calendar::get_busy))
         .route("/calendar/config", get(crate::calendar::get_config))
+        // The council. In no scope table in `auth.rs`, which leaves it to Admin and the control
+        // token — the fail-closed default that module documents, and the right one for a route
+        // whose POST spends money across up to nine model invocations.
+        .route(
+            "/council",
+            get(crate::council::list_councils).post(crate::council::post_council),
+        )
+        .route("/council/{id}", get(crate::council::get_council))
+        .route(
+            "/council/{id}/cancel",
+            post(crate::council::post_council_cancel),
+        )
         .route("/notifications/pending", get(crate::notify::list_pending))
         // The measurement the shadow pass exists to produce. Without somewhere to read it, the
         // table is write-only and the pass becomes the thing it was designed not to be: data
@@ -3200,6 +3212,7 @@ mod tests {
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+                council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
                 progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             },
@@ -3547,6 +3560,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -3699,6 +3713,70 @@ mod tests {
         .await
         .unwrap();
         token
+    }
+
+    /// Every council route sits behind the bearer, and none of them is in a scope table — so a
+    /// read-only key is refused as firmly as no key at all.
+    ///
+    /// The POST is the reason that matters: it spends money across up to nine model invocations,
+    /// which is not something a key minted for reading should be able to set off. Asserting the
+    /// GETs too because a scope table is a thing people ADD to, and a test that only covered the
+    /// write would let the reads be widened without anybody noticing.
+    #[tokio::test]
+    async fn council_routes_require_the_bearer_token() {
+        let state = test_state().await;
+        let reader = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        for (method, path) in [
+            ("POST", "/council"),
+            ("GET", "/council"),
+            ("GET", "/council/abc"),
+            ("POST", "/council/abc/cancel"),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(r#"{"question":"why?"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with no bearer"
+            );
+
+            let response = api_token_request(
+                state.clone(),
+                method,
+                path,
+                &reader,
+                Some(serde_json::json!({"question": "why?"})),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} with a read-only key"
+            );
+        }
+
+        // And the control token reaches them: a route nothing can call is not a boundary, it is an
+        // outage. 503 because this test daemon has no council configured, which is the answer
+        // `without_configuration_the_routes_say_so` pins.
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/council",
+            "test-token",
+            Some(serde_json::json!({"question": "why?"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -5654,6 +5732,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };

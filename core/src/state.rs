@@ -243,6 +243,9 @@ pub struct AppState {
     /// and a `Default` that means "UTC, ordinary office hours" so no test that ignores calendars
     /// has to know this field exists.
     pub calendar: Arc<crate::calendar::CalendarRuntime>,
+    /// The council: the roster, the per-seat clock, and the scoped key its seats reach the daemon
+    /// with. `Default` means there is no council, which is the shipped state.
+    pub council: Arc<crate::council::CouncilRuntime>,
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns
     /// (`runs::create_run`), removed when it completes/times out/is cancelled.
     pub run_handles: RunHandles,
