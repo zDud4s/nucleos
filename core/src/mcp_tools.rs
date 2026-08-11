@@ -330,19 +330,51 @@ impl ServerHandler for NucleosTools {
 /// already in memory and makes "is this tool classified correctly?" stop being load-bearing for
 /// egress.
 ///
-/// Both carriers are filtered. `structured_content` is not decoration: a tool that returns JSON
-/// puts the same text there in parsed form, so redacting only the text blocks would leave the
-/// secret in the field a client is more likely to read programmatically.
+/// Both carriers are filtered, and the one that matters here is the text block. Every tool on this
+/// server returns `String`; rmcp's `IntoContents for String` makes that one text block and leaves
+/// `structured_content` at `None`. So the structured arm below has never run in this process, while
+/// the arm that runs on every single result took a flat pass over a rendered JSON document — which
+/// is precisely the blindness `redact_json_strings` was written to fix, sitting in the carrier all
+/// six reviews read past. A tool result's TEXT is the rendered document. It is filtered as one now.
+///
+/// The structured arm stays. The day a tool returns `Json<T>` it begins carrying the same secrets
+/// in the field a client is more likely to read programmatically, and nothing should have to
+/// remember to come back here.
 fn filter_outgoing(mut result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
     for block in &mut result.content {
         if let rmcp::model::ContentBlock::Text(text) = block {
-            text.text = crate::redact::redact_secrets(&text.text);
+            text.text = redact_rendered(&text.text);
         }
     }
     if let Some(structured) = &mut result.structured_content {
         redact_json_strings(structured);
     }
     result
+}
+
+/// Filters one string that may be a rendered JSON document.
+///
+/// A secret that spans lines — a PEM block above all — survives `redact_secrets` when the newlines
+/// separating its body are the two characters `\` and `n`, because `pem_blocks` anchors on the
+/// newline that closes the header. Parsing first turns them back into newlines, so the detectors
+/// see the text a sender wrote rather than the text `serde_json` printed.
+///
+/// One function rather than one per caller, and that is the actual fix. This rule was written twice
+/// — once for the MCP path, once for the local one — and the two disagreed at every revision: the
+/// structured half was corrected while the text half was not, then the local half was corrected
+/// while the MCP text half was not, each time with a comment claiming the paths already matched. A
+/// rule that lives in two places is a rule that is wrong in one of them, and no amount of reviewing
+/// the copies fixes that.
+fn redact_rendered(text: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(mut document) => {
+            redact_json_strings(&mut document);
+            document.to_string()
+        }
+        // Not everything crossing here is JSON — a transport-level error string is not — and for
+        // those the flat pass is the right one: they have no escaping to undo.
+        Err(_) => crate::redact::redact_secrets(text),
+    }
 }
 
 /// Applies the filter to every string in a JSON document, in place.
@@ -617,26 +649,12 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             other => error_json(format!("{other} has no local dispatch")),
         };
 
-        // Filtered exactly as `filter_outgoing` filters the MCP path: every result, and through the
-        // PARSED document rather than its rendered form.
-        //
-        // Both halves of that sentence were wrong here a commit ago, in the two ways this file
-        // already documents elsewhere. Filtering only the untrusted results left `get_run` handing
-        // a whole run row — stdout included, where a transcript can carry a token it echoed — to a
-        // model whose answer is relayed to Telegram; the cloud path makes no such exception.
-        // And redacting `answer`, which is `serde_json::to_string` output, meant a mail body's
-        // newlines were the two characters `\` and `n`, so `pem_blocks` — which anchors on the
-        // newline closing a PEM header — matched nothing at all. That is the same bug
-        // `redact_json_strings` was written to fix on the other path, reintroduced on this one.
-        let text = match serde_json::from_str::<serde_json::Value>(&answer) {
-            Ok(mut document) => {
-                redact_json_strings(&mut document);
-                document.to_string()
-            }
-            // Every arm above produces JSON, so this is unreachable in practice — and if it ever
-            // is not, the flat pass is still better than none.
-            Err(_) => crate::redact::redact_secrets(&answer),
-        };
+        // Filtered by the same function `filter_outgoing` uses on the MCP path — not by a second
+        // copy of its rule, which is how the two paths came to disagree twice in a row. Every
+        // result goes through it, untrusted or not: `get_run` hands back a whole run row, stdout
+        // included, where a transcript can carry a token it echoed, and the answer reaches Telegram
+        // either way.
+        let text = redact_rendered(&answer);
 
         crate::local_agent::ToolAnswer {
             text,
@@ -771,6 +789,55 @@ mod tests {
         assert!(
             text.text.contains("[SECRET:private-key]"),
             "{:?}",
+            text.text
+        );
+    }
+
+    /// The shape this server actually emits, which is not the one the test above builds.
+    ///
+    /// Every tool here returns `String`, and rmcp's `IntoCallToolResult` turns that into a single
+    /// text block holding a RENDERED document, with no structured half at all. So the test above
+    /// puts a raw key somewhere production never puts one, and passed for days while the only
+    /// carrier that exists handed the whole key over. Built through `into_call_tool_result` rather
+    /// than by hand, so that the day rmcp changes what a `String` becomes, this fails here instead
+    /// of in someone's mailbox.
+    #[test]
+    fn a_key_in_a_rendered_result_does_not_cross() {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaaaaaa\n\
+-----END RSA PRIVATE KEY-----\n";
+        let answer = json_result(Ok(serde_json::json!({
+            "subject": "the key you asked for",
+            "body": key,
+        })));
+        assert!(
+            answer.contains("\\n") && !answer.contains('\n'),
+            "the fixture is not a rendered document, so it would prove nothing: {answer}"
+        );
+        let result = answer
+            .into_call_tool_result()
+            .expect("a String is never an error result");
+        assert!(
+            result.structured_content.is_none(),
+            "rmcp now fills the structured half for a String, so the text block is no longer the \
+             only carrier and this test no longer covers the whole result"
+        );
+
+        let filtered = filter_outgoing(result);
+
+        let rmcp::model::ContentBlock::Text(text) = &filtered.content[0] else {
+            panic!("the text block is gone");
+        };
+        assert!(
+            !text.text.contains("MIIEowIBAAKCAQEA"),
+            "a key inside a rendered document crossed intact: {}",
+            text.text
+        );
+        assert!(text.text.contains("[SECRET:private-key]"), "{}", text.text);
+        assert!(
+            text.text.contains("the key you asked for"),
+            "the redaction ate the rest of the document: {}",
             text.text
         );
     }
