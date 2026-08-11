@@ -489,7 +489,10 @@ mod tests {
     async fn a_turn_that_read_mail_cannot_start_work_afterwards() {
         let chat = ScriptedChat::new(vec![
             calls("read_mail", serde_json::json!({"id": 1})),
-            calls("start_work", serde_json::json!({"project_id": "p", "prompt": "do it"})),
+            calls(
+                "start_work",
+                serde_json::json!({"project_id": "p", "prompt": "do it"}),
+            ),
             says("li o mail; nao posso comecar trabalho no mesmo turno"),
         ]);
         let tools = GovernedTools {
@@ -527,7 +530,10 @@ mod tests {
             .find(|message| message["tool_name"] == "start_work")
             .expect("the refusal was not delivered as a tool result");
         assert!(
-            refusal["content"].as_str().unwrap().contains("has read mail"),
+            refusal["content"]
+                .as_str()
+                .unwrap()
+                .contains("has read mail"),
             "{refusal}"
         );
     }
@@ -546,9 +552,16 @@ mod tests {
         };
 
         let taint = clean();
-        run_turn(&chat, &tools, "you are nucleos", &[], "comeca e depois le", &taint)
-            .await
-            .unwrap();
+        run_turn(
+            &chat,
+            &tools,
+            "you are nucleos",
+            &[],
+            "comeca e depois le",
+            &taint,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(*tools.calls.lock().unwrap(), ["start_work", "read_mail"]);
         assert!(taint.load(std::sync::atomic::Ordering::SeqCst));
@@ -574,14 +587,20 @@ mod tests {
 
         // Dispatched rather than refused by the barrier — safe because the tool box's own dispatch
         // is a whitelist, so a name that is not on it runs nothing.
-        assert_eq!(*tools.calls.lock().unwrap(), ["read_mail", "delete_everything"]);
+        assert_eq!(
+            *tools.calls.lock().unwrap(),
+            ["read_mail", "delete_everything"]
+        );
         let last = chat.seen.lock().unwrap().last().unwrap().clone();
         let answer = last
             .iter()
             .find(|message| message["tool_name"] == "delete_everything")
             .expect("the invented call got no tool result");
         assert!(
-            !answer["content"].as_str().unwrap().contains("has read mail"),
+            !answer["content"]
+                .as_str()
+                .unwrap()
+                .contains("has read mail"),
             "an invented tool was blamed on the mail barrier: {answer}"
         );
     }
@@ -597,9 +616,16 @@ mod tests {
         let tools = FakeTools::answering("{\"status\":\"completed\"}");
 
         let taint = clean();
-        run_turn(&chat, &tools, "you are nucleos", &[], "como esta a 7?", &taint)
-            .await
-            .unwrap();
+        run_turn(
+            &chat,
+            &tools,
+            "you are nucleos",
+            &[],
+            "como esta a 7?",
+            &taint,
+        )
+        .await
+        .unwrap();
 
         assert!(!taint.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -609,9 +635,16 @@ mod tests {
         let chat = ScriptedChat::new(vec![says("three runs are going")]);
         let tools = FakeTools::answering("{}");
 
-        let turn = run_turn(&chat, &tools, "you are nucleos", &[], "what is running?", &clean())
-            .await
-            .unwrap();
+        let turn = run_turn(
+            &chat,
+            &tools,
+            "you are nucleos",
+            &[],
+            "what is running?",
+            &clean(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(turn.answer, "three runs are going");
         assert_eq!(turn.ending, Ending::Answered);
@@ -657,7 +690,9 @@ mod tests {
             let chat = ScriptedChat::new(vec![calls("get_run", arguments), says("done")]);
             let tools = FakeTools::answering("{}");
 
-            run_turn(&chat, &tools, "system", &[], "go", &clean()).await.unwrap();
+            run_turn(&chat, &tools, "system", &[], "go", &clean())
+                .await
+                .unwrap();
 
             assert_eq!(
                 tools.calls.lock().unwrap()[0].1,
@@ -677,7 +712,9 @@ mod tests {
         ]);
         let tools = FakeTools::answering(r#"{"error":"unknown run"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", &[], "go", &clean()).await.unwrap();
+        let turn = run_turn(&chat, &tools, "system", &[], "go", &clean())
+            .await
+            .unwrap();
 
         assert_eq!(turn.ending, Ending::RepeatedAFailedCall);
         assert_eq!(turn.answer, NO_ANSWER);
@@ -698,7 +735,9 @@ mod tests {
         ]);
         let tools = FakeTools::answering(r#"{"status":"running"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", &[], "go", &clean()).await.unwrap();
+        let turn = run_turn(&chat, &tools, "system", &[], "go", &clean())
+            .await
+            .unwrap();
 
         assert_eq!(turn.ending, Ending::Answered);
         assert_eq!(turn.tool_calls, 2);
@@ -719,7 +758,9 @@ mod tests {
             let chat = ScriptedChat::new(vec![reply.clone()]);
             let tools = FakeTools::answering("{}");
 
-            let turn = run_turn(&chat, &tools, "system", &[], "go", &clean()).await.unwrap();
+            let turn = run_turn(&chat, &tools, "system", &[], "go", &clean())
+                .await
+                .unwrap();
 
             assert_eq!(turn.ending, Ending::SaidNothing, "{reply}");
             assert_eq!(turn.answer, NO_ANSWER, "{reply}");
@@ -734,7 +775,9 @@ mod tests {
         let chat = ScriptedChat::new(replies);
         let tools = FakeTools::answering(r#"{"status":"running"}"#);
 
-        let turn = run_turn(&chat, &tools, "system", &[], "go", &clean()).await.unwrap();
+        let turn = run_turn(&chat, &tools, "system", &[], "go", &clean())
+            .await
+            .unwrap();
 
         assert_eq!(turn.ending, Ending::RoundsExhausted);
         assert_eq!(turn.answer, NO_ANSWER);
@@ -771,7 +814,9 @@ mod tests {
         ]);
         let tools = FakeTools::answering("{}");
 
-        run_turn(&chat, &tools, "system", &[], "go", &clean()).await.unwrap();
+        run_turn(&chat, &tools, "system", &[], "go", &clean())
+            .await
+            .unwrap();
 
         // Withdrawing the tools after the first round would leave the model unable to follow up,
         // and the symptom — a confident answer built on one lookup — looks like a smarter model

@@ -1996,11 +1996,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let owner_of_attachment: i64 =
-            sqlx::query_scalar("SELECT email_id FROM email_attachments")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let owner_of_attachment: i64 = sqlx::query_scalar("SELECT email_id FROM email_attachments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             owner_of_attachment, email_id,
             "the attachment must hang off the mail, not off the contact created beside it"

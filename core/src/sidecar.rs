@@ -708,7 +708,10 @@ mod tests {
             "kept {} bytes, ceiling is {MAX_LINE_BYTES}",
             kept.len()
         );
-        assert!(kept.ends_with('…'), "a cut line must say it was cut: {kept}");
+        assert!(
+            kept.ends_with('…'),
+            "a cut line must say it was cut: {kept}"
+        );
     }
 
     /// Cutting mid-character would panic on the slice. Multi-byte output is ordinary here — the
