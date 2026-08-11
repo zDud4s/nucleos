@@ -202,13 +202,39 @@ pub async fn send_message(
     let slot = ChatSlot::acquire(chat_id)
         .ok_or("a turn is already in progress for this chat".to_string())?;
 
-    // The one branch this feature turns on, and both halves must hold: the client asked to be
-    // answered here, and startup proved a model on this machine can do it. Either alone leaves the
-    // turn on the path it has always taken.
-    if origin == Origin::Telegram
-        && let Some(assistant) = state.local_assistant.clone()
-    {
-        return spawn_local_turn(state, slot, text.to_string(), assistant).await;
+    // Who answers this conversation. The chat's own row decides when there is one; when there is
+    // none — every Telegram conversation, and everything that predates the `chats` table — the
+    // origin rule that has always been here decides, unchanged.
+    //
+    // Precedence and not a combination, because the two facts are not the same kind of fact. A row
+    // is a choice somebody made about THIS conversation; the origin is a guess about the sender,
+    // and a guess must not outrank a choice.
+    let chosen = crate::chats::brain_of(&state.pool, chat_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let wants_local = match chosen {
+        Some(crate::chats::Brain::Local) => true,
+        Some(crate::chats::Brain::Cloud) => false,
+        None => origin == Origin::Telegram,
+    };
+
+    if wants_local {
+        match state.local_assistant.clone() {
+            Some(assistant) => {
+                return spawn_local_turn(state, slot, text.to_string(), assistant).await;
+            }
+            // A conversation that SAYS `local` and has no local model refuses. Falling through to
+            // the cloud would be the worst possible way to find that out: on the bill, for a chat
+            // that said it was staying on the machine. The refusal comes before any row is
+            // inserted, so nothing was spent and nothing has to be explained away afterwards.
+            None if chosen == Some(crate::chats::Brain::Local) => {
+                return Err("this chat is set to the local model and none is configured".to_string());
+            }
+            // The origin path keeps its old shape on purpose: a Telegram chat with no local model
+            // has always simply gone to the cloud, and has never claimed otherwise. Refusing here
+            // would take the bot off the air to enforce a promise nobody made.
+            None => {}
+        }
     }
 
     let resume = get_session(&state.pool, chat_id)
@@ -864,6 +890,106 @@ mod tests {
             .unwrap();
 
         assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("local"));
+    }
+
+    #[tokio::test]
+    async fn a_chat_marked_local_is_answered_locally_even_from_the_shell() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell).await.unwrap();
+
+        assert_eq!(
+            answered_by(&state.pool, turn).await.as_deref(),
+            Some("local")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_marked_cloud_is_answered_in_the_cloud_even_from_telegram() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("never asked"));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Telegram)
+            .await
+            .unwrap();
+
+        // The chat's own row wins over the sender. Anything else would make the app unable to say
+        // "answer this one in the cloud" for a conversation it opened.
+        assert_eq!(
+            answered_by(&state.pool, turn).await.as_deref(),
+            Some("cloud")
+        );
+    }
+
+    /// The guard on this whole change. No `chats` row anywhere is every Telegram conversation, and
+    /// every conversation that predates the table — the old rule, unchanged.
+    #[tokio::test]
+    async fn a_conversation_with_no_row_routes_exactly_as_it_did_before() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("na máquina"));
+
+        let from_telegram = send_message(&state, "-100200300", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        let from_shell = send_message(&state, "no-row-shell", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answered_by(&state.pool, from_telegram).await.as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            answered_by(&state.pool, from_shell).await.as_deref(),
+            Some("cloud")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_chat_with_no_local_model_refuses_instead_of_quietly_costing_money() {
+        // No local model configured: `state.local_assistant` is None.
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+            .await
+            .unwrap();
+
+        let outcome = send_message(&state, &id, "olá", Origin::Shell).await;
+
+        assert!(
+            outcome.is_err(),
+            "a chat that says local must not fall through to the cloud"
+        );
+        // And it must not have spent anything trying: no row, no bill.
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    /// The other side of the refusal above, and the reason it is stated on the CHAT and not on the
+    /// origin: a Telegram conversation with no local model has always simply gone to the cloud, and
+    /// has never claimed otherwise. Breaking that would take the bot off the air.
+    #[tokio::test]
+    async fn a_telegram_conversation_with_no_local_model_still_falls_through_to_the_cloud() {
+        let state = test_state().await;
+
+        let turn = send_message(&state, "-100200301", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answered_by(&state.pool, turn).await.as_deref(),
+            Some("cloud")
+        );
     }
 
     /// A local turn holds the chat's one slot like any other, and releases it. Without this the
