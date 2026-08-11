@@ -1422,6 +1422,10 @@ impl Driver {
             let result_tx = result_tx;
             let tool_box: &dyn crate::local_agent::ToolBox =
                 if with_tools { &tools } else { &no_tools };
+            // Owned out here rather than read off the returned `Turn`, for the reason `run_turn`
+            // gives: a wall-clock timeout drops that future and a transport error propagates past
+            // it, and in both cases a seat that HAS read mail would be written down clean.
+            let taint = std::sync::atomic::AtomicBool::new(false);
             let turn = tokio::time::timeout(
                 timeout,
                 crate::local_agent::run_turn(
@@ -1430,10 +1434,23 @@ impl Driver {
                     crate::local_agent::SYSTEM_PROMPT,
                     &[],
                     &prompt,
+                    &taint,
                 ),
             )
             .await;
             let completed_at = chrono::Utc::now().to_rfc3339();
+            // A seat can never act, so the latch cannot stop anything here the way it stops a chat
+            // turn — but the row is what the REST of the system reads, and a council seat that read
+            // mail must be as legible as any other run that did.
+            if taint.load(std::sync::atomic::Ordering::SeqCst)
+                && let Err(error) = crate::runs::mark_untrusted_context(&pool, run_id).await
+            {
+                tracing::warn!(
+                    run_id,
+                    %error,
+                    "could not mark a council seat as having read third-party text"
+                );
+            }
 
             let seat_outcome = match turn {
                 Err(_) => {
@@ -1513,8 +1530,18 @@ impl crate::local_agent::ToolBox for NoTools {
         Vec::new()
     }
 
-    async fn call(&self, name: &str, _arguments: &serde_json::Value) -> String {
-        serde_json::json!({"error": format!("{name} is not a tool this turn can use")}).to_string()
+    /// `ToolAnswer::own`, and it is not a formality: an empty box advertises nothing, so the only
+    /// way to reach this is a name the model invented — and an invented name brings no stranger's
+    /// words into the turn, because no tool ran.
+    async fn call(
+        &self,
+        name: &str,
+        _arguments: &serde_json::Value,
+    ) -> crate::local_agent::ToolAnswer {
+        crate::local_agent::ToolAnswer::own(
+            serde_json::json!({"error": format!("{name} is not a tool this turn can use")})
+                .to_string(),
+        )
     }
 }
 

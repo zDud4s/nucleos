@@ -7,6 +7,7 @@ mod backup;
 mod budget;
 mod calendar;
 mod classifier;
+mod collision;
 mod concurrency;
 mod config;
 mod contacts;

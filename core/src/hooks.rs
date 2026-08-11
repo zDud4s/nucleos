@@ -388,19 +388,10 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
         });
     };
 
-    let effect = match crate::mcp_tools::tool_effect(tool) {
-        // `get_run` is `ReadsOwn` by name and not always by content: a triage run's stdout is a
-        // model's answer over mail a stranger wrote. The parse that bounds a verdict to a class and
-        // 200 stripped characters runs AFTER the raw stream is stored, so what comes back through
-        // this tool was never put through it.
-        crate::mcp_tools::ToolEffect::ReadsOwn
-            if tool == "get_run"
-                && get_run_names_a_triage_run(state, &payload.tool_input).await =>
-        {
-            crate::mcp_tools::ToolEffect::ReadsUntrusted
-        }
-        effect => effect,
-    };
+    // The `get_run`-names-a-triage-run rule lives in `mcp_tools::effect_of_call` rather than here,
+    // because a second dispatcher needed the same answer and got a different one from the bare
+    // table. One implementation is the only way two callers cannot disagree.
+    let effect = crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input).await;
 
     match effect {
         crate::mcp_tools::ToolEffect::ReadsUntrusted => {
@@ -479,8 +470,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
 /// launched by one sentence rather than one turn a person is watching.
 ///
 /// Almost pure. The list is a membership test that cannot fail; the one stateful question is which
-/// run a `get_run` names, and that one fails closed for the reason `get_run_names_a_triage_run`
-/// gives about its own.
+/// run a `get_run` names, and that one fails closed.
 async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
     // Whole segment, not a prefix, for the reason `assistant_decision` records: an MCP server named
     // `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test.
@@ -551,34 +541,6 @@ async fn get_run_names_a_council_run(state: &AppState, tool_input: &Value) -> bo
                 run_id = id,
                 %error,
                 "pretooluse-decision: could not resolve the mode of the run a seat asked for — refusing it"
-            );
-            true
-        }
-    }
-}
-
-/// Whether a `get_run` call names a triage run.
-///
-/// Fails closed on every shape it cannot read — an absent id, an id that is not a number, a
-/// database that will not answer — because the question being decided is whether a stranger's words
-/// are about to enter the turn, and "I could not tell" is not "no". A run that does not exist is
-/// the one honest `false`: the tool returns an error and nothing is read.
-async fn get_run_names_a_triage_run(state: &AppState, tool_input: &Value) -> bool {
-    let Some(id) = tool_input.get("id").and_then(Value::as_i64) else {
-        return true;
-    };
-    match sqlx::query_scalar::<_, String>("SELECT mode FROM runs WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(Some(mode)) => mode == crate::email::TRIAGE_MODE,
-        Ok(None) => false,
-        Err(error) => {
-            tracing::warn!(
-                run_id = id,
-                %error,
-                "pretooluse-decision: could not resolve the mode of the run being read — treating it as third-party content"
             );
             true
         }

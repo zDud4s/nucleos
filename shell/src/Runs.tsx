@@ -284,7 +284,7 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
     setFailed(null);
     const stopped = await cancelRun(token, runId);
     setBusy(false);
-    if (!stopped) {
+    if (!stopped.ok) {
       // 404 is the common case and is not really a failure: the run finished between the page
       // drawing the button and the click reaching the daemon.
       setFailed("Nothing to cancel — the run had already ended.");

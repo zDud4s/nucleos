@@ -9,6 +9,7 @@ import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
 import Contacts from "./Contacts";
 import Files from "./Files";
+import Fleet from "./Fleet";
 import Home from "./Home";
 import Mail from "./Mail";
 import Projects from "./Projects";
@@ -23,11 +24,15 @@ import "./App.css";
 import "./calendar.css";
 
 type Tab =
-  | "home" | "autopilot" | "approvals" | "runs" | "projects" | "assistant"
+  | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "assistant"
   | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "council" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
+  // Between Home and Autopilot, and not after it: the `approvals` comment below says that tab comes
+  // "straight after Autopilot because it is the same subject seen from the other side", and putting
+  // anything between the two would make that sentence false.
+  { key: "fleet", label: "Fleet" },
   { key: "autopilot", label: "Autopilot" },
   // Straight after Autopilot because it is the same subject seen from the other side: Autopilot is
   // what the machine is doing, this is what it stopped doing and is waiting on you for. Ahead of
@@ -296,6 +301,14 @@ function App() {
               status={status}
               killEngaged={killEngaged}
               onOpenAutopilot={() => setTab("autopilot")}
+            />
+          )}
+          {tab === "fleet" && (
+            <Fleet
+              token={token}
+              connection={connection}
+              killEngaged={killEngaged}
+              onOpenRuns={() => setTab("runs")}
             />
           )}
           {tab === "autopilot" && (

@@ -736,6 +736,7 @@ describe("jobs", () => {
     ordinal: 0,
     description: "an item",
     status: "pending",
+    round: 0,
     run_id: null,
     gate_status: null,
     ...over,

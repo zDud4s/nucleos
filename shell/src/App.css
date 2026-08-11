@@ -1535,3 +1535,134 @@ details.scoreboard th {
 
 .council-row__question { display: block; font-size: var(--fs-sm); font-weight: 500; }
 .council-row__meta { display: block; font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
+
+/* ── A frota ─────────────────────────────────────────────
+   Uma coluna por projeto, um cartão por slot. As colunas rolam na horizontal em vez de
+   encolherem: um cartão espremido deixa de ser legível, e esta vista existe para se poder ver
+   o que cada slot está a fazer. */
+
+.fleet { display: grid; gap: var(--sp-4); }
+
+.fleet-meter {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-4);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+.fleet-house { color: var(--text); }
+/* O aviso de vista desactualizada leva `role="status"`; a cor é a segunda pista e nunca a única,
+   porque o texto diz `Stale` por extenso. */
+.fleet-stale { color: var(--gold); }
+
+.fleet-columns {
+  display: flex;
+  gap: var(--sp-4);
+  overflow-x: auto;
+  align-items: flex-start;
+  padding-bottom: var(--sp-2);
+}
+.fleet-column {
+  flex: 0 0 320px;
+  display: grid;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+.fleet-column > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.fleet-column h2 { margin: 0; font-size: var(--fs-sm); }
+/* `n/limit` conta os slots que o núcleo diz existirem, não os cartões desenhados. */
+.fleet-count { font-size: var(--fs-xs); color: var(--muted); }
+
+.fleet-new-job { display: grid; gap: var(--sp-2); }
+.fleet-new-job input { width: 100%; }
+
+.slot-card {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+}
+.slot-card > header {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+.slot-card p { margin: 0; }
+.slot-number { font-variant-numeric: tabular-nums; }
+.slot-prompt { color: var(--muted); overflow-wrap: anywhere; }
+/* Um slot cujo dono nenhuma listagem descreveu é normal, não anomalia: esbate-se em vez de alarmar. */
+.slot-card.is-unknown { border-style: dashed; color: var(--faint); }
+/* Um dono que não está vivo é sinal de defeito, não de latência — outra cor e outra palavra. */
+.slot-card.is-orphaned { border-color: var(--gold-line); background: var(--gold-tint); }
+
+/* As duas fontes têm de se distinguir SEM cor: cada badge traz o rótulo `observed` ou `predicted`
+   por extenso, e a cor é a segunda pista. */
+.collide-badge {
+  font-size: var(--fs-xs);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  overflow-wrap: anywhere;
+}
+.collide-source {
+  text-transform: uppercase;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.04em;
+}
+.collide-badge.is-observed { background: var(--red-tint); border: 1px solid var(--red-line); }
+.collide-badge.is-predicted { background: var(--gold-tint); border: 1px solid var(--gold-line); }
+/* `não medido` não é colisão nem é limpo: fica esbatido, e nunca em silêncio. */
+.collide-badge.is-unmeasured {
+  background: none;
+  border: 1px dashed var(--line);
+  color: var(--faint);
+}
+
+/* ── O zoom 2: a cadeia de itens de um job ────────────── */
+
+.item-chain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+}
+.item-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: var(--sp-2);
+  align-items: baseline;
+}
+.item-row__ordinal { color: var(--faint); font-variant-numeric: tabular-nums; }
+.item-row__what { overflow-wrap: anywhere; }
+.item-row__reading { color: var(--muted); white-space: nowrap; }
+/* Fora da grelha de três colunas de propósito: cai para a linha seguinte em vez de espremer a
+   descrição, que é o que se está a ler. */
+.item-row__run { grid-column: 3; color: var(--faint); }
+
+/* A marca de ronda separa "pediu oito de uma vez" de "pediu cinco e replaneou" — e é a única coisa
+   que o faz, porque os ordinais continuam entre rondas em vez de recomeçarem. */
+.item-round {
+  margin: var(--sp-2) 0 0;
+  padding-top: var(--sp-1);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.item-why, .item-note { margin: 0; color: var(--muted); overflow-wrap: anywhere; }

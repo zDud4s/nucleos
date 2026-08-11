@@ -4,10 +4,16 @@
 -- that produced them, and a seat keeps only that row's id. Copying the text into a column beside it
 -- would put the same answer in two places, and two places is where they eventually disagree.
 --
--- Numbered 0062 rather than the 0060 the design named. Both 0060 and 0061 were taken between the
--- design being written and this being cut — 0060 by an untracked file in the main checkout, 0061 by
--- `feat/canvas-da-frota` — and this repository has already lost a reserved number twice. Past every
--- number any branch claims is the rule; the design's number was a snapshot of one afternoon.
+-- Numbered 0064, having been cut as 0062 and having been wrong twice before that.
+--
+-- The design named 0060; by the time this branch was cut, 0060 was an untracked file in the main
+-- checkout and 0061 was on `feat/canvas-da-frota`, so it went out as 0062. Master then landed that
+-- branch with its two renumbered to 0062 and 0063, and the collision was invisible to git — two
+-- files with different names and the same version, which only `sqlx::migrate!` would have caught.
+--
+-- The rule this repository keeps: the BRANCH gives way, master's lineage stands. Twice before under
+-- the same heading ("give 0060 up to the reset that is landing on master"). A number is not
+-- reserved by being written down, only by being on master.
 
 -- One deliberation.
 CREATE TABLE IF NOT EXISTS council_runs (

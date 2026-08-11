@@ -1,0 +1,21 @@
+-- Throws away every observation taken before the model was allowed to think.
+--
+-- The shadow pass shipped with `think: false`, copied from triage where it is there for speed. On
+-- this machine that produced fifty-nine consecutive `none` rows — including one over "Rafael
+-- responde às tuas dúvidas sobre PADLE Leitura", where the name is the first word of the text.
+-- Asked the identical prompt with the identical schema, the same model answers `[]` without
+-- thinking and finds "Rafael" with it.
+--
+-- Those rows have to go rather than stay, and the reason is what the table is FOR. Its whole
+-- purpose is to answer, months from now, "would redacting class X have cost anything?" — and a row
+-- saying `none` is indistinguishable from a row saying "looked, found nothing" no matter which
+-- detector wrote it. Worse, `observe_pending` never revisits a field that has a non-`unreadable`
+-- row, so leaving them means those fields are never looked at again by the fixed detector. A
+-- measurement taken with a broken instrument is not partial data; it is data pointing the wrong way.
+--
+-- Deleting rather than adding a "detector version" column, because there is exactly one version
+-- worth keeping and nothing has read this table yet. The sweep refills it slowly — a handful of
+-- fields every fifteen minutes, since each one now costs a reasoning pass — so a large mailbox
+-- takes days rather than hours to be looked at again. `SWEEP_BATCH` in `pii_shadow.rs` is the
+-- number, and it is deliberately small: the local model is also what answers triage and the chat.
+DELETE FROM pii_observations;

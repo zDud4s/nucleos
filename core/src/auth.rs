@@ -139,6 +139,10 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/backups"),
     (Method::GET, "/autopilot/state"),
     (Method::GET, "/projects"),
+    // How much work fits and what is in flight. A state that changes nothing, and `/projects`'
+    // companion — but written in by hand, because this table is not "every GET" and the comment
+    // above says why.
+    (Method::GET, "/concurrency"),
     (Method::GET, "/projects/{id}/ls"),
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),
@@ -1032,6 +1036,19 @@ mod tests {
             StatusCode::FORBIDDEN,
             "waiting is a read, but not one worth handing the weakest key a 45s connection for"
         );
+    }
+
+    /// Reading capacity is a read; touching the budget is not.
+    ///
+    /// The two travel together on the canvas — the header shows occupancy and budget side by side —
+    /// and that is why it is worth saying they are not the same grade. `GET /autopilot/budget` is
+    /// outside this table on purpose, together with reading the kill switch, because the package
+    /// treats the control commands as one family.
+    #[test]
+    fn reading_capacity_is_a_read_and_reading_the_budget_is_not() {
+        let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        assert!(permits(&scope, &Method::GET, "/concurrency"));
+        assert!(!permits(&scope, &Method::GET, "/autopilot/budget"));
     }
 
     #[tokio::test]
