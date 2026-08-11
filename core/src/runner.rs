@@ -821,18 +821,24 @@ pub async fn ollama_message(
     // well succeed; a refusal to connect is about the endpoint and every request after it will fail
     // the same way. `pii_shadow`'s sweep reads exactly that distinction to decide between moving
     // past one field and abandoning the pass.
+    // One classification, applied to every await that can expire, rather than to the first one. The
+    // client's timeout covers the body read as well as the request, and a timeout surfacing there
+    // used to be reported as `Other` — which this function's own contract, three lines up, says
+    // means the endpoint is gone. The caller would have abandoned its pass over a slow answer.
+    fn classify(error: reqwest::Error) -> std::io::Error {
+        if error.is_timeout() {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+        } else {
+            std::io::Error::other(error)
+        }
+    }
+
     let response = client
         .post(format!("{base_url}/api/chat"))
         .json(&body)
         .send()
         .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, error)
-            } else {
-                std::io::Error::other(error)
-            }
-        })?;
+        .map_err(classify)?;
 
     // The BODY, not just the status. `error_for_status` throws it away, and it is where Ollama says
     // what was wrong — "this model does not support thinking", say. Without it a configuration
@@ -850,7 +856,7 @@ pub async fn ollama_message(
     let response = response
         .json::<serde_json::Value>()
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(classify)?;
 
     response
         .get("message")
