@@ -217,6 +217,13 @@ async fn record_at_attempt(
 /// things that are actually waiting on it. The mailbox is caught up more slowly and that costs
 /// nothing: this is a measurement, and the only thing a slower one delays is a decision that is
 /// months away.
+///
+/// Migration `0060` still says twenty, and has to. Its comment is what an operator reads to decide
+/// whether deleting the table was safe, so the wrong number there is worth correcting — but the
+/// file had already been applied, and `sqlx` checksums applied migrations and refuses to start
+/// against one whose bytes have changed. Editing the prose cost a `VersionMismatch` panic at the
+/// next launch, which is a strictly worse outcome than a stale sentence. An applied migration is
+/// immutable including its comments; this is the place the number is allowed to be right.
 const SWEEP_BATCH: i64 = 6;
 
 /// Whether the model reasons before answering, and it is the difference between measuring and not.

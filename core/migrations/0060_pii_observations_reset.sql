@@ -14,8 +14,6 @@
 -- measurement taken with a broken instrument is not partial data; it is data pointing the wrong way.
 --
 -- Deleting rather than adding a "detector version" column, because there is exactly one version
--- worth keeping and nothing has read this table yet. The sweep refills it slowly — a handful of
--- fields every fifteen minutes, since each one now costs a reasoning pass — so a large mailbox
--- takes days rather than hours to be looked at again. `SWEEP_BATCH` in `pii_shadow.rs` is the
--- number, and it is deliberately small: the local model is also what answers triage and the chat.
+-- worth keeping and nothing has read this table yet. The sweep refills it at twenty fields per
+-- fifteen minutes.
 DELETE FROM pii_observations;
