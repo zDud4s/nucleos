@@ -1597,11 +1597,15 @@ async fn post_assistant_message(
     }
 }
 
-/// What the PII shadow pass has seen, by class.
+/// What the PII shadow pass has seen, by column and class.
 ///
-/// `none` is a class here and not an absence: it counts the summaries that were looked at and found
+/// `none` is a class here and not an absence: it counts the fields that were looked at and found
 /// clean, which is the denominator. A tally without it says how often personal data was found and
 /// not how often it was looked for, and only the second answers whether a class is worth enforcing.
+///
+/// The column comes with it because the three are not one population. A `name` in `from_name` is
+/// nearly a certainty and a `name` in a subject line is a finding; added together they answer
+/// nothing, and the denominator would mix three base rates into one meaningless total.
 async fn get_pii_observations(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
@@ -1612,7 +1616,9 @@ async fn get_pii_observations(
     Ok(Json(
         tally
             .into_iter()
-            .map(|(class, count)| serde_json::json!({"class": class, "count": count}))
+            .map(|(column, class, count)| {
+                serde_json::json!({"column": column, "class": class, "count": count})
+            })
             .collect(),
     ))
 }
