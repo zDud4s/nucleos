@@ -546,12 +546,13 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             .collect()
     }
 
-    /// Answered from `TOOL_EFFECTS`, not from a second list beside it. The classification already
-    /// exists and `hooks.rs` already enforces it for a cloud run; a local turn asking the same
-    /// question of the same table is what keeps the two from drifting into different answers about
-    /// the same tool.
-    fn brings_untrusted_text(&self, name: &str) -> bool {
-        tool_effect(name) == ToolEffect::ReadsUntrusted
+    /// Answered by `effect_of_call`, the same function `hooks.rs` asks. Asking the bare table
+    /// instead was a real hole and not a tidiness point: `get_run` is `ReadsOwn` by name, the cloud
+    /// path upgrades it when the id names a triage run — whose stdout is a model's answer over a
+    /// stranger's mail — and the local path did not. A chat could read that, stay unmarked, and
+    /// then start work.
+    async fn brings_untrusted_text(&self, name: &str, arguments: &serde_json::Value) -> bool {
+        effect_of_call(&self.pool, name, arguments).await == ToolEffect::ReadsUntrusted
     }
 
     /// An unknown name resolves to `Acts` in `tool_effect`, so it is refused here — the fail-closed
@@ -577,7 +578,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             };
         }
 
-        match name {
+        let answer = match name {
             "list_projects" => self.tools.list_projects().await,
             "list_proposals" => self.tools.list_proposals().await,
             "get_budget" => self.tools.get_budget().await,
@@ -604,7 +605,22 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             // Unreachable while this match covers `LOCAL_TOOLS`, which
             // `every_local_tool_can_be_dispatched` is what proves.
             other => error_json(format!("{other} has no local dispatch")),
+        };
+
+        // Filtered here, and only what a stranger wrote. The local turn does not pass through
+        // `filter_outgoing`, on the argument that a model on this machine is not a network
+        // boundary — which was true while this box read only the daemon's own state and stopped
+        // being true when it was given the mailbox. The model is local; its ANSWER is relayed to
+        // Telegram's servers, so an IBAN quoted out of a mail body leaves the machine, while the
+        // same body read through MCP would have been redacted. Two paths to the same text, one of
+        // them filtered, is not a policy.
+        //
+        // Only the untrusted results, so the owner's own run ids, project names and budget figures
+        // reach them intact.
+        if effect_of_call(&self.pool, name, arguments).await == ToolEffect::ReadsUntrusted {
+            return crate::redact::redact_secrets(&answer);
         }
+        answer
     }
 }
 
@@ -621,6 +637,53 @@ pub fn tool_effect(tool: &str) -> ToolEffect {
     match TOOL_EFFECTS.iter().find(|(name, _)| *name == tool) {
         Some((_, effect)) => *effect,
         None => ToolEffect::Acts,
+    }
+}
+
+/// What one CALL does — the name, plus the one case where the arguments change the answer.
+///
+/// `tool_effect` above is a table lookup and cannot see that `get_run` is `ReadsOwn` by name and
+/// not always by content: a triage run's stdout is a model's answer over mail a stranger wrote, and
+/// the parse that bounds a verdict to a class and 200 stripped characters runs AFTER the raw stream
+/// is stored. So what comes back through that tool was never put through it.
+///
+/// This exists because there were two dispatchers and one of them knew that. `hooks.rs` had this
+/// rule inline and `LocalToolBox` answered from the table alone, so a local chat turn could pull a
+/// triage run's stdout — a stranger's words — without the turn being marked, and then start work.
+/// One function, both callers, and the drift is not expressible.
+///
+/// Fails closed on every shape it cannot read — an absent id, an id that is not a number, a
+/// database that will not answer — because the question is whether a stranger's words are about to
+/// enter the turn, and "I could not tell" is not "no". A run that does not exist is the one honest
+/// `false`: the tool returns an error and nothing is read.
+pub(crate) async fn effect_of_call(
+    pool: &sqlx::SqlitePool,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> ToolEffect {
+    let effect = tool_effect(tool);
+    if effect != ToolEffect::ReadsOwn || tool != "get_run" {
+        return effect;
+    }
+
+    let Some(id) = arguments.get("id").and_then(serde_json::Value::as_i64) else {
+        return ToolEffect::ReadsUntrusted;
+    };
+    match sqlx::query_scalar::<_, String>("SELECT mode FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(mode)) if mode == crate::email::TRIAGE_MODE => ToolEffect::ReadsUntrusted,
+        Ok(Some(_)) | Ok(None) => ToolEffect::ReadsOwn,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "could not resolve the mode of the run being read — treating it as third-party content"
+            );
+            ToolEffect::ReadsUntrusted
+        }
     }
 }
 
@@ -870,21 +933,68 @@ mod tests {
     async fn reading_mail_taints_a_turn_and_shuts_the_acting_tools() {
         use crate::local_agent::ToolBox;
 
-        let toolbox = LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), {
-            sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap()
-        });
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
+                    (2, 'ordinary', 'completed', 'assistant', '2026-08-11T00:00:00Z')",
+        )
+        .bind(crate::email::TRIAGE_MODE)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let toolbox =
+            LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), pool);
 
         for name in ["get_email", "get_email_queue"] {
-            assert!(toolbox.brings_untrusted_text(name), "{name}");
+            assert!(
+                toolbox
+                    .brings_untrusted_text(name, &serde_json::json!({"id": 1}))
+                    .await,
+                "{name}"
+            );
         }
         for name in ["create_run", "create_job"] {
             assert!(!toolbox.permitted_after_untrusted(name), "{name}");
         }
+
+        // `get_run` is the tool the barrier missed, and the reason it is worth its own case: it is
+        // own-state by name and a stranger's words by content. Run 1 is a triage run, whose stdout
+        // is a model's answer over somebody's mail; run 2 is not. Answering from the effect table
+        // alone made both of them clean, so a chat could read the first, stay unmarked, and start
+        // work with a sender's text in context.
+        assert!(
+            toolbox
+                .brings_untrusted_text("get_run", &serde_json::json!({"id": 1}))
+                .await,
+            "a triage run's output is a stranger's words"
+        );
+        assert!(
+            !toolbox
+                .brings_untrusted_text("get_run", &serde_json::json!({"id": 2}))
+                .await
+        );
+        // No id, or an id of the wrong shape, is "I could not tell" — which is not "no".
+        for arguments in [serde_json::json!({}), serde_json::json!({"id": "seven"})] {
+            assert!(
+                toolbox.brings_untrusted_text("get_run", &arguments).await,
+                "{arguments} was read as a safe call"
+            );
+        }
+
         // A read of the daemon's own state is still answerable afterwards: the turn has to be able
         // to finish saying what it found.
         for name in ["get_run", "list_projects", "get_budget"] {
             assert!(toolbox.permitted_after_untrusted(name), "{name}");
-            assert!(!toolbox.brings_untrusted_text(name), "{name}");
+        }
+        for name in ["list_projects", "get_budget"] {
+            assert!(
+                !toolbox
+                    .brings_untrusted_text(name, &serde_json::json!({}))
+                    .await,
+                "{name}"
+            );
         }
         // Fail-closed on a name that is not a tool at all.
         assert!(!toolbox.permitted_after_untrusted("no_such_tool"));
