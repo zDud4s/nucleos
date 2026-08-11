@@ -22,6 +22,7 @@ NucleOS does try to prevent these failures:
 5. Mail the user wrote being sent to a model or shown back to them as though it needed attention.
 6. A web page causing a tool call, and in particular causing one that governs autonomy.
 7. The web sidecar being used to reach this machine's own services or the network it sits on.
+8. A council seat acting, or reading a peer's answer before it is shown one to rank.
 
 ## Tool allowlist by trigger class
 
@@ -34,8 +35,9 @@ Spec §9 requires a tool allowlist derived from trigger confidence: externally s
 | email (triage) | Email content chosen by a stranger | Untrusted | `ToolPolicy::None` — no tools at all | No — no tool can be invoked |
 | telegram / assistant | Paired owner over a network | Semi-trusted | `ToolPolicy::McpOnly` — NucleOS MCP tools only; built-ins denied | No — `hooks.rs` allows only sanctioned NucleOS MCP tools and bypasses the classifier |
 | manual (`POST /runs`) | Owner action | Trusted | `ToolPolicy::Unrestricted` for `real`, `shadow`, and `worktree`; `ToolPolicy::None` when the submitted mode is `email_triage` | For unrestricted modes, when `classifier.rs` returns `pending_approval`; no for `email_triage`, which has no tools |
+| council (`POST /council`) | The owner's question in phase 1; other models' answers in phases 2 and 3 | Trusted at the door, model-generated thereafter | Phase 1: `ToolPolicy::McpOnly` narrowed to `mcp_tools::COUNCIL_TOOLS`. Phases 2 and 3: `ToolPolicy::None` | No — nothing on that list acts, and the classifier never sees a seat |
 
-The scheduler (`core/src/scheduler.rs`) creates cron runs through `runs::create_run_inner`. The repository trigger (`core/src/repo_trigger.rs`) fires runs the same way. Email triage (`core/src/triage.rs` and `core/src/email.rs`) uses `ToolPolicy::None`. Assistant turns from `core/src/assistant.rs` use `ToolPolicy::McpOnly`. `POST /runs` in `core/src/runs.rs` passes its submitted mode to `create_run_inner`, which selects `ToolPolicy::None` only for `email_triage` and `ToolPolicy::Unrestricted` otherwise.
+The scheduler (`core/src/scheduler.rs`) creates cron runs through `runs::create_run_inner`. The repository trigger (`core/src/repo_trigger.rs`) fires runs the same way. Email triage (`core/src/triage.rs` and `core/src/email.rs`) uses `ToolPolicy::None`. Assistant turns from `core/src/assistant.rs` use `ToolPolicy::McpOnly`. `POST /runs` in `core/src/runs.rs` passes its submitted mode to `create_run_inner`, which selects `ToolPolicy::None` only for `email_triage` and `ToolPolicy::Unrestricted` otherwise. Council seats are launched by `core/src/council.rs` and do not go through `create_run_inner` at all: `run_cloud_seat` and `run_local_seat` build the request themselves, so the policy above is set at the seat rather than inherited from a mode.
 
 ## Mail the user wrote
 
@@ -140,6 +142,66 @@ sessions is a different threat model, and the University of Washington's July 20
 browsers letting attackers bypass the same-origin policy. The seam is in `sidecars/web/serve/serve.go` and
 `web_client::fetch`.
 
+## The council
+
+A council is the first trigger that fans ONE owner sentence into up to nine model invocations, and
+the first whose later phases feed one model's output into another model's prompt. Both facts are why
+its tool posture is narrower than the assistant's rather than a copy of it.
+
+**Three barriers, because the middle one is cooperative.** Barrier 1 is `ToolPolicy::McpOnly` in
+`core/src/runner.rs`: the CLI denies every built-in and drops every ambient MCP server on its own.
+Barrier 2 is the `PreToolUse` hook, which `core/src/hooks.rs` answers for `mode = 'council'` against
+a named allow-list. Barrier 3 is `auth::Service::Council` and its `COUNCIL_ROUTES` table.
+
+The third is not belt-and-braces. Barrier 2 fires only when the `.claude/settings.json` resolved from
+the run's working directory registers the hook — and a seat runs with `cwd: None`, because a council
+has no worktree and no project. Without a key that cannot reach a writing route, "a seat only reads"
+would have been an intention rather than a property. `the_councils_key_reads_and_cannot_start_anything`
+is what fixes it.
+
+**The tool list is named, not derived.** `mcp_tools::COUNCIL_TOOLS` holds eight verbs and
+`every_council_tool_only_reads` holds every one of them to `ReadsOwn` or `ReadsUntrusted` in
+`TOOL_EFFECTS`, so reclassifying a tool as `Acts` without removing it here fails the gate. Three
+absences are not explained by effect and so could only come from a list:
+
+- `web_search` and `web_read` are `ReadsUntrusted`, not `Acts`. A council multiplies the egress of
+  asking a question by eight, and a `kind: local` seat holding either would put the question on the
+  network anyway — which would stop an all-local roster from being a statement about where the
+  question goes.
+- `get_run` reads any run by its id, and run ids are sequential integers. A seat that guessed a
+  sibling's id would read that sibling's answer, and phase 1's independence is the only thing that
+  makes phase 2 measure anything. `hooks.rs` refuses it by the named run's mode, failing closed.
+- `vcs_ticket` is the read-back half of `vcs_request`; a seat that cannot queue an operation has
+  nothing of its own to read back.
+
+**Phases 2 and 3 hold no tools at all**, cloud or local. What a ranking seat reads is other models'
+prose, and what the chairman reads is all of it — model-generated text is the input, so the phases
+that consume it are the phases that can call nothing. This is the same answer email triage gives to a
+stranger's words, reached from the other direction.
+
+**A seat never holds the daemon's control token.** `run_cloud_seat` builds its environment from
+`runs::run_env(&self.token, …)`, where `self.token` is the council's own scoped key, minted in
+`main.rs` only when a roster exists.
+
+**Anonymity is a measurement device, not a secret.** The phase-2 shuffle in `council::anonymize`
+stops a seat from ranking itself and from ranking the model rather than the argument. It is not a
+confidentiality boundary: phase 3 deliberately un-anonymises, because the chairman needs to know that
+two agreeing answers came from two models rather than from one model asked twice.
+
+**Spend is decided once, at the door.** `council::start` checks `budget.rs` before the first seat and
+never again, and `'council'` is in the autonomy mode list. A council refused halfway has paid for
+every answer and produced no synthesis, so it is refused whole or run whole. The accepted cost is
+that one council started under a nearly-spent window can overshoot it.
+
+**Starting one is an owner action.** `POST /council`, `GET /council/{id}` and `POST /council/{id}/cancel`
+appear in no scope table in `core/src/auth.rs`, so only Admin and the control token reach them — the
+closed default that module documents, and the right one for a route that spends in up to nine model
+invocations. The pillar is off until `.ai/council.yaml` names a roster: absent, unreadable or invalid
+yields `None` and `POST /council` answers `503`, because a roster nobody chose is a list of models
+nobody agreed to pay for. The reads stay open — a council already run is still readable after its
+roster is removed — and `config::load_council_config` warns and falls back rather than erroring, so a
+typo in a list of model names cannot stop the daemon and take mail, autopilot and the API with it.
+
 ## Existing barriers
 
 - `core/src/classifier.rs` is a pure deterministic lexical classifier. `CLASSIFIER_VERSION = 2`; it returns `allow`, `deny`, or `pending_approval` together with an `action_class`. It performs no I/O, makes no database access, and has no knowledge of run state.
@@ -166,3 +228,5 @@ browsers letting attackers bypass the same-origin policy. The seam is in `sideca
 8. `trusted_hosts` is judged by host and nothing else, so an allowlisted host that serves user-published content grants `Raw` to whoever published it. The shipped list is two curated documentation sites for this reason, and the rule for adding one is written in `.ai/web.yaml`: the allowlist does not say "this site will not attack me", it says "summarising this costs fidelity AND I asked for it". A forum, a wiki or a code-hosting domain is the worst candidate precisely when it is otherwise trustworthy.
 9. The search query leaves the machine. Brave is the shipped provider partly because it does not log API queries, but the query is still data, and a pillar searching on its own would send a correspondent's name to a third party. `pillar_search_enabled` exists in `.ai/web.yaml` for that reason and is off; nothing consumes it yet, so no pillar can search today.
 10. Nothing in the web pillar has been exercised against a real server. There is no provider key on this machine and no test leaves it, deliberately. The first `enabled: true` is the first contact.
+11. A stranger's words can reach a council's synthesis. A phase-1 seat holds `get_email`, `get_email_queue` and `list_files`, so it can read mail somebody else wrote; its answer then enters the ranking seats' prompts in phase 2 and the chairman's in phase 3. The turn-marking rule (`ReadsUntrusted` then no `Acts`) is redundant inside a council rather than protective — there is no `Acts` on `COUNCIL_TOOLS` for it to refuse — so what bounds this is the absence of any acting tool in the whole pillar, not the taint. **The residual is influence on text the owner reads, never a tool call**, which is a smaller claim than the one email triage makes and is stated here rather than in a comment. Narrowing it further means removing the mail tools from the list, which would also remove the reason somebody would ask a council about their own correspondence.
+12. Nothing in the council has been exercised against a real model. Every integration test drives a scripted `CommandRunner`, and a local seat is proved only as far as landing its `runs` row — no seat, cloud or local, has produced an answer. There is no `.ai/council.yaml` on this machine, so the pillar is dark; the first roster written is the first contact, and the phase-2 and phase-3 prompts are the part with no evidence behind them yet.
