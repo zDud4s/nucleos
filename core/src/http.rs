@@ -110,6 +110,7 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(delete_chat),
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
+        .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
@@ -2901,6 +2902,40 @@ async fn post_chat_title(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Records that this conversation has been read.
+///
+/// Its own route rather than a field on `PATCH`, and the reason is the 409 that one answers. A
+/// model cannot move under a live turn, so `PATCH` refuses while a chat is busy — and reading a
+/// conversation while it is mid-turn is the ordinary case: you sent the message and you are
+/// watching it. Folded together, the answer you were looking straight at would come back marked
+/// unread.
+///
+/// Takes no body. Where the watermark lands is `chats::mark_seen`'s to decide, because a client
+/// naming its own could mark a turn it has not drawn yet — a list read that overtook the transcript
+/// would silently swallow the very answer it was meant to announce.
+async fn post_chat_seen(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    // Answered before anything is written, for the reason `patch_chat` gives: `204` over an UPDATE
+    // that matched no row is the API saying "done" about something it did not do.
+    if crate::chats::get(&state.pool, &chat_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_none()
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    crate::chats::mark_seen(&state.pool, &chat_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(%error, "marking a chat read failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// Takes a conversation off the list, and leaves every turn of it in place.
@@ -5886,6 +5921,93 @@ mod tests {
                 .unwrap(),
             Some("a-session".to_string())
         );
+    }
+
+    async fn mark_seen_request(state: AppState, chat_id: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{chat_id}/seen"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The one thing this route must do that `PATCH` deliberately refuses.
+    ///
+    /// Reading a conversation while it is mid-turn is the ordinary case — you sent the message and
+    /// you are watching. If marking it read were folded into `PATCH`, it would answer 409 there and
+    /// the answer you were looking straight at would come back marked unread.
+    #[tokio::test]
+    async fn a_conversation_can_be_marked_read_while_it_is_still_answering() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(ParkedRunner);
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        record_turn(&state, &id, "quanto sobra?", "cerca de 200").await;
+        crate::assistant::send_message(&state, &id, "e agora?", crate::assistant::Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"brain":"local"}"#).await,
+            StatusCode::CONFLICT,
+            "the guard this route exists to sidestep"
+        );
+        assert_eq!(
+            mark_seen_request(state.clone(), &id).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let chat = crate::chats::get(&state.pool, &id).await.unwrap().unwrap();
+        assert_eq!(chat.waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn marking_a_chat_that_was_never_opened_says_so() {
+        let state = test_state().await;
+
+        assert_eq!(
+            mark_seen_request(state, "never-opened").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The number the window draws its mark from. Without it on the way out, every conversation
+    /// looks equally quiet and the whole thing is invisible.
+    #[tokio::test]
+    async fn the_listing_carries_how_many_answers_are_waiting() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        record_turn(&state, &id, "quanto sobra?", "cerca de 200").await;
+
+        let listed = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(listed).await;
+        let mine = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|chat| chat["chat_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(mine["waiting"], 1);
     }
 
     /// `204 No Content` for an UPDATE that matched no row is the API saying "done" about something

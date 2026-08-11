@@ -45,6 +45,13 @@ pub struct ChatSummary {
     /// cannot go stale.
     pub first_message: Option<String>,
     pub last_activity: Option<String>,
+    /// How many answers landed in this conversation since it was last opened.
+    ///
+    /// Waiting for YOU, not for the model: a turn still being written is the chat waiting on the
+    /// model, and the list already has its own word for that. Counted at read time from the
+    /// watermark rather than stored, so it is right after a crash without anything having been
+    /// written when the turn ended.
+    pub waiting: i64,
 }
 
 /// Opens a conversation. The id is minted HERE, not accepted from the caller.
@@ -80,7 +87,16 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
                 (SELECT r.created_at FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
-                  ORDER BY r.id DESC LIMIT 1) AS last_activity
+                  ORDER BY r.id DESC LIMIT 1) AS last_activity,
+                -- Answers that landed since this chat was last opened. `status NOT IN` and not
+                -- `= 'completed'`: a turn that failed, timed out or was cancelled has stopped
+                -- moving and is something to come back to, and `runs.status` is free-form TEXT
+                -- (0002) — naming the two live states is the list that stays right when a new
+                -- terminal one is added.
+                (SELECT COUNT(*) FROM runs r
+                  WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
+                    AND r.status NOT IN ('running', 'pending')
+                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS waiting
            FROM chats c
           WHERE c.archived_at IS NULL
           ORDER BY COALESCE(last_activity, c.created_at) DESC",
@@ -126,6 +142,36 @@ pub async fn set_brain(pool: &SqlitePool, chat_id: &str, brain: Brain) -> sqlx::
         .execute(pool)
         .await
         .map(|_| ())
+}
+
+/// Records that this conversation has been read up to its last turn that had LANDED.
+///
+/// The watermark is chosen here rather than accepted from the caller, and it is the last SETTLED
+/// turn rather than simply the last one. Both halves matter:
+///
+/// A client that named its own watermark could mark a turn it had not drawn yet — a list read that
+/// overtook the transcript would silently swallow the answer it was meant to announce. And taking
+/// the last turn of any kind would swallow one still being written: opening a chat mid-turn would
+/// mark the answer seen seconds before it arrived, which is exactly the case this whole thing is
+/// for.
+///
+/// `MAX(id)` over no rows is NULL, and `COALESCE` keeps that from clearing a watermark already set —
+/// a chat whose turns were all still live would otherwise be marked back to unread by being opened.
+pub async fn mark_seen(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE chats
+            SET last_seen_turn_id = COALESCE(
+                  (SELECT MAX(r.id) FROM runs r
+                    WHERE r.chat_id = chats.chat_id
+                      AND r.mode = 'assistant'
+                      AND r.status NOT IN ('running', 'pending')),
+                  last_seen_turn_id)
+          WHERE chat_id = ?",
+    )
+    .bind(chat_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// Names a conversation. A blank name clears it rather than storing whitespace, putting the
@@ -269,6 +315,93 @@ mod tests {
         // Clearing a name is a real intention, not a validation error — it puts the fallback back.
         rename(&pool, &id, Some("   ")).await.unwrap();
         assert_eq!(get(&pool, &id).await.unwrap().unwrap().title, None);
+    }
+
+    /// Records a turn in a chat and answers with its id, so a test can talk about "up to here".
+    async fn turn_in(pool: &SqlitePool, chat_id: &str, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('olá', ?, 'assistant', ?, '2026-08-11T10:00:00+00:00')",
+        )
+        .bind(status)
+        .bind(chat_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn waiting_in(pool: &SqlitePool, chat_id: &str) -> i64 {
+        get(pool, chat_id).await.unwrap().unwrap().waiting
+    }
+
+    #[tokio::test]
+    async fn a_turn_still_thinking_is_not_something_to_come_back_to() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud).await.unwrap();
+
+        turn_in(&pool, &id, "running").await;
+
+        // "Waiting" means waiting for YOU. A turn still being written is the chat waiting on the
+        // model, which the list already says with its own word.
+        assert_eq!(waiting_in(&pool, &id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_landed_is_waiting_until_the_chat_is_opened() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud).await.unwrap();
+        turn_in(&pool, &id, "completed").await;
+
+        assert_eq!(waiting_in(&pool, &id).await, 1);
+
+        mark_seen(&pool, &id).await.unwrap();
+
+        assert_eq!(waiting_in(&pool, &id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_failed_is_waiting_too() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud).await.unwrap();
+        turn_in(&pool, &id, "failed").await;
+
+        // Knowing the answer never came matters at least as much as knowing it did — and a failed
+        // turn is a billed run either way.
+        assert_eq!(waiting_in(&pool, &id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn only_what_landed_after_the_last_look_counts() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud).await.unwrap();
+        turn_in(&pool, &id, "completed").await;
+        mark_seen(&pool, &id).await.unwrap();
+
+        turn_in(&pool, &id, "completed").await;
+        turn_in(&pool, &id, "completed").await;
+
+        assert_eq!(waiting_in(&pool, &id).await, 2);
+    }
+
+    /// The mark is a watermark over turns that have LANDED, so a turn still in flight cannot be
+    /// swallowed by opening the chat while it is being written.
+    #[tokio::test]
+    async fn opening_a_chat_mid_turn_does_not_mark_the_answer_still_coming() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud).await.unwrap();
+        turn_in(&pool, &id, "completed").await;
+        let live = turn_in(&pool, &id, "running").await;
+
+        mark_seen(&pool, &id).await.unwrap();
+        // The live turn now lands.
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(live)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(waiting_in(&pool, &id).await, 1);
     }
 
     #[tokio::test]
