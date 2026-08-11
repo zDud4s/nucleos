@@ -201,6 +201,13 @@ impl Origin {
     }
 }
 
+/// Why a turn was refused before it cost anything: the chat says `local` and this machine has none.
+///
+/// A named constant rather than a sentence written twice, because `http.rs` turns it into the one
+/// status code that tells this apart from a daemon that broke. Matched exactly there — a refusal
+/// recognised by a substring is a refusal that stops being recognised when someone edits the words.
+pub const NO_LOCAL_MODEL: &str = "this chat is set to the local model and none is configured";
+
 pub async fn send_message(
     state: &crate::state::AppState,
     chat_id: &str,
@@ -238,7 +245,7 @@ pub async fn send_message(
             // that said it was staying on the machine. The refusal comes before any row is
             // inserted, so nothing was spent and nothing has to be explained away afterwards.
             None if chosen == Some(crate::chats::Brain::Local) => {
-                return Err("this chat is set to the local model and none is configured".to_string());
+                return Err(NO_LOCAL_MODEL.to_string());
             }
             // The origin path keeps its old shape on purpose: a Telegram chat with no local model
             // has always simply gone to the cloud, and has never claimed otherwise. Refusing here

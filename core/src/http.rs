@@ -1590,6 +1590,12 @@ async fn post_assistant_message(
     match outcome {
         Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
         Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
+        // Not a 500: nothing broke. The conversation asked to be answered on this machine and this
+        // machine has nothing that can — a fact about how it is configured, which the caller can
+        // act on by choosing the other model. A 500 would send them looking for a crash.
+        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => {
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -5914,6 +5920,33 @@ mod tests {
             .map(|turn| turn["answered_by"].as_str().unwrap())
             .collect();
         assert_eq!(by, vec!["cloud", "local"]);
+    }
+
+    /// A 500 would send the reader looking for a crash. Nothing broke: the conversation asked for a
+    /// model this machine does not have, which is something they can change.
+    #[tokio::test]
+    async fn a_message_to_a_local_chat_with_no_local_model_is_not_reported_as_a_broken_daemon() {
+        let state = test_state().await; // no local model
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "chat_id": id, "text": "olá" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
