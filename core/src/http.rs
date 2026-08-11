@@ -105,7 +105,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
-            get(get_assistant_chat).patch(patch_chat).delete(delete_chat),
+            get(get_assistant_chat)
+                .patch(patch_chat)
+                .delete(delete_chat),
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/{turn_id}", get(get_run))
@@ -1593,9 +1595,7 @@ async fn post_assistant_message(
         // Not a 500: nothing broke. The conversation asked to be answered on this machine and this
         // machine has nothing that can — a fact about how it is configured, which the caller can
         // act on by choosing the other model. A 500 would send them looking for a crash.
-        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => {
-            Err(StatusCode::SERVICE_UNAVAILABLE)
-        }
+        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -2715,10 +2715,13 @@ async fn get_local_model(State(state): State<AppState>) -> Json<serde_json::Valu
 async fn list_chats(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::chats::ChatSummary>>, StatusCode> {
-    crate::chats::list(&state.pool).await.map(Json).map_err(|error| {
-        tracing::warn!(%error, "listing chats failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    crate::chats::list(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing chats failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 #[derive(serde::Deserialize)]
@@ -5775,9 +5778,14 @@ mod tests {
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
             .await
             .unwrap();
-        crate::assistant::upsert_session(&state.pool, &id, "a-session", "2026-08-11T10:00:00+00:00")
-            .await
-            .unwrap();
+        crate::assistant::upsert_session(
+            &state.pool,
+            &id,
+            "a-session",
+            "2026-08-11T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
 
         let status = patch_chat_request(state.clone(), &id, r#"{"brain":"cloud"}"#).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -5791,7 +5799,9 @@ mod tests {
         // transcript. Done HERE and not left to the caller: a client that forgets this step poisons
         // the conversation for the next model, and the shell will not be the only client.
         assert_eq!(
-            crate::assistant::get_session(&state.pool, &id).await.unwrap(),
+            crate::assistant::get_session(&state.pool, &id)
+                .await
+                .unwrap(),
             None
         );
     }
@@ -5803,9 +5813,14 @@ mod tests {
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
             .await
             .unwrap();
-        crate::assistant::send_message(&state, &id, "take your time", crate::assistant::Origin::Shell)
-            .await
-            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &id,
+            "take your time",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
 
         let status = patch_chat_request(state.clone(), &id, r#"{"brain":"local"}"#).await;
 
@@ -5826,11 +5841,17 @@ mod tests {
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
             .await
             .unwrap();
-        crate::assistant::upsert_session(&state.pool, &id, "a-session", "2026-08-11T10:00:00+00:00")
-            .await
-            .unwrap();
+        crate::assistant::upsert_session(
+            &state.pool,
+            &id,
+            "a-session",
+            "2026-08-11T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
 
-        let status = patch_chat_request(state.clone(), &id, r#"{"title":"sobre o orçamento"}"#).await;
+        let status =
+            patch_chat_request(state.clone(), &id, r#"{"title":"sobre o orçamento"}"#).await;
 
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
@@ -5843,7 +5864,9 @@ mod tests {
             Some("sobre o orçamento")
         );
         assert_eq!(
-            crate::assistant::get_session(&state.pool, &id).await.unwrap(),
+            crate::assistant::get_session(&state.pool, &id)
+                .await
+                .unwrap(),
             Some("a-session".to_string())
         );
     }

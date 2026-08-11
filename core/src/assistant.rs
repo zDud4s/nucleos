@@ -917,7 +917,9 @@ mod tests {
             .await
             .unwrap();
 
-        let turn = send_message(&state, &id, "olá", Origin::Shell).await.unwrap();
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
 
         assert_eq!(
             answered_by(&state.pool, turn).await.as_deref(),
