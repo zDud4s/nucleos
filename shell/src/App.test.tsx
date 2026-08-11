@@ -181,7 +181,7 @@ describe("App navigation and presence", () => {
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
     ).toEqual([
       "Home", "Autopilot", "Waiting", "Runs", "Projects", "Assistant",
-      "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "System",
+      "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "Council", "System",
     ]);
   });
 

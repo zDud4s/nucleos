@@ -1479,3 +1479,59 @@ details.scoreboard th {
   font-size: var(--fs-sm);
   color: var(--muted);
 }
+
+/* ── Council ──────────────────────────────────────────────────────────────────────────────── */
+
+.council-seats,
+.council-board,
+.council-list { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.council-board { list-style: decimal inside; }
+
+.council-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.council-seats li {
+  display: block;
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.council-seats li:first-child,
+.council-list li:first-child { border-top: 0; }
+
+.council-seat__model { display: block; font-size: var(--fs-sm); font-weight: 500; }
+.council-seat__model small { color: var(--faint); font-weight: 400; margin-left: var(--sp-2); }
+
+/* `pre` pela razão de `.web-body`: é a resposta de um modelo, chega com as quebras de linha que tem,
+   e nada a deve re-fluir. Com tecto de altura porque são várias por ecrã — uma resposta longa não
+   pode empurrar as outras para fora da vista. */
+.council-answer {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  margin: var(--sp-2) 0 0;
+  max-height: 24vh;
+  overflow-y: auto;
+}
+
+.council-row {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.council-row:hover .council-row__question { color: var(--gold); }
+.council-row:focus-visible { outline: 2px solid var(--gold-line); outline-offset: 2px; }
+
+.council-row__question { display: block; font-size: var(--fs-sm); font-weight: 500; }
+.council-row__meta { display: block; font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
