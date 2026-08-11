@@ -215,6 +215,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/calendar/busy", get(crate::calendar::get_busy))
         .route("/calendar/config", get(crate::calendar::get_config))
         .route("/notifications/pending", get(crate::notify::list_pending))
+        // The measurement the shadow pass exists to produce. Without somewhere to read it, the
+        // table is write-only and the pass becomes the thing it was designed not to be: data
+        // accumulating with nobody able to decide anything from it.
+        .route("/pii/observations", get(get_pii_observations))
         .route("/files", get(get_files).delete(delete_file))
         .route("/files/folder", post(post_files_folder))
         .route("/files/download", get(get_file_download))
@@ -508,6 +512,11 @@ struct GrepQuery {
 struct AssistantMessageRequest {
     chat_id: String,
     text: String,
+    /// Which client is asking, so the daemon routes the turn without inferring it from the shape of
+    /// `chat_id`. Absent means the shell, which is what every caller written before this field
+    /// existed means too.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -685,7 +694,21 @@ async fn post_email_incoming(
         )
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        // Logged, not discarded. `|_|` here made a failed ingest into a 500 with an empty body and
+        // no line anywhere: the sidecar reported `daemon returned 500:` on every cycle, the cursor
+        // stayed put, and the mailbox went eight days unread with nothing in the log to say why.
+        // The message names the mailbox and the batch, because the two things worth knowing next
+        // are which mailbox stalled and whether it is one message or the whole batch that cannot
+        // land. It never names what a message SAYS — see `redact.rs`.
+        .map_err(|error| {
+            tracing::warn!(
+                mailbox = %body.mailbox,
+                batch = body.messages.len(),
+                %error,
+                "email ingest failed — the cursor stays put and the sidecar will retry"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
     })
     .await?
 }
@@ -1440,8 +1463,14 @@ async fn post_email_attachment_save(
 }
 
 /// The mail the pillar knows about: what is waiting, and what it most recently said.
+#[derive(Deserialize)]
+struct EmailQueueQuery {
+    q: Option<String>,
+}
+
 async fn get_email_queue(
     State(state): State<AppState>,
+    Query(query): Query<EmailQueueQuery>,
 ) -> Result<Json<Vec<QueuedEmail>>, StatusCode> {
     // Newest arrival first — the order a mailbox is read in. Deliberately NOT by triage time: a
     // verdict landing now would otherwise drag a week-old message to the top, and a list that
@@ -1458,18 +1487,50 @@ async fn get_email_queue(
     //
     // `failed` sorts with the rest rather than being hidden: it is the class most likely to be
     // requeued, so it is the one that must stay findable.
-    let mut queue = sqlx::query_as::<_, QueuedEmail>(
+    // Searching narrows this list rather than being a list of its own, so the ordering, the limit
+    // and the `inbound` filter above are stated once and hold either way. 0058 indexes only what
+    // survives triage — sender, subject, and the locally-written summary — so a search for a word
+    // that was only ever in a body finds nothing, which is the correct answer once the body is gone
+    // rather than a gap in the index.
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(|q| (q.to_string(), crate::search::fts_query(q)));
+
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
                 triaged_at, has_attachments, NULL AS sender_verdict
            FROM emails
-          WHERE direction = 'inbound'
-          ORDER BY received_at DESC, id DESC
-          LIMIT ?",
-    )
-    .bind(EMAIL_QUEUE_LIMIT)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+          WHERE direction = 'inbound'",
+    );
+    if let Some((raw, fts)) = &search {
+        builder
+            .push(" AND (subject LIKE ")
+            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
+            .push(" ESCAPE '\\' OR from_addr LIKE ")
+            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
+            .push(" ESCAPE '\\'");
+        if fts.is_empty() {
+            builder.push(" OR 0");
+        } else {
+            builder
+                .push(" OR id IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ")
+                .push_bind(fts)
+                .push(")");
+        }
+        builder.push(")");
+    }
+    builder
+        .push(" ORDER BY received_at DESC, id DESC LIMIT ")
+        .push_bind(EMAIL_QUEUE_LIMIT);
+
+    let mut queue = builder
+        .build_query_as::<QueuedEmail>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Filled in afterwards rather than joined in SQL, because matching `emails.from_addr` to a
     // contact means applying `contacts::normalize_address` — which strips a display name's angle
@@ -1524,7 +1585,8 @@ async fn post_assistant_message(
     // reports it running forever and `/cancel` answers 404. The Telegram sidecar is the caller, and
     // it gives up on a turn after a timeout, so the disconnect is routine rather than theoretical.
     let outcome = uncancellable(async move {
-        crate::assistant::send_message(&state, &body.chat_id, &body.text).await
+        let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
+        crate::assistant::send_message(&state, &body.chat_id, &body.text, origin).await
     })
     .await?;
 
@@ -1533,6 +1595,26 @@ async fn post_assistant_message(
         Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// What the PII shadow pass has seen, by class.
+///
+/// `none` is a class here and not an absence: it counts the summaries that were looked at and found
+/// clean, which is the denominator. A tally without it says how often personal data was found and
+/// not how often it was looked for, and only the second answers whether a class is worth enforcing.
+async fn get_pii_observations(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let tally = crate::pii_shadow::tally(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(
+        tally
+            .into_iter()
+            .map(|(class, count)| serde_json::json!({"class": class, "count": count}))
+            .collect(),
+    ))
 }
 
 async fn get_autopilot_state(
@@ -3154,6 +3236,7 @@ mod tests {
                 runner: Arc::new(FakeCommandRunner::default()),
                 triage_runner: None,
                 local_triage_disabled: None,
+                local_assistant: None,
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
@@ -3644,6 +3727,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
@@ -4234,6 +4318,117 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn search_queue(state: AppState, q: &str) -> Vec<serde_json::Value> {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/email/queue?q={}", urlencoding(q)))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn urlencoding(raw: &str) -> String {
+        raw.bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    async fn insert_triaged(state: &AppState, uid: i64, subject: &str, body: &str, summary: &str) {
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, from_name,
+                                 subject, body_text, received_at, ingested_at, direction,
+                                 triage_class, triage_summary)
+             VALUES (?, 'INBOX', 1, ?, 'remetente@example.com', 'Rita Sousa', ?, ?,
+                     '2026-07-28T11:00:00+00:00', '2026-07-28T11:00:00+00:00', 'inbound',
+                     'info', ?)",
+        )
+        .bind(format!("<{uid}@contact>"))
+        .bind(uid)
+        .bind(subject)
+        .bind(body)
+        .bind(summary)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// The index is fed by an UPDATE as much as by an INSERT — a message arrives with no verdict and
+    /// gains its summary later — so a search by a word that only ever appeared in the summary is the
+    /// case that proves the update trigger works.
+    #[tokio::test]
+    async fn mail_is_found_by_its_subject_sender_or_summary() {
+        let state = test_state().await;
+        insert_triaged(&state, 1, "Fatura de julho", "corpo", "pedido de pagamento").await;
+        insert_triaged(&state, 2, "Almoço", "corpo", "convite social").await;
+
+        for (q, expected) in [
+            ("Fatura", 1),
+            ("pagamento", 1),
+            ("Rita", 2),
+            ("convite", 1),
+            ("inexistente", 0),
+        ] {
+            assert_eq!(
+                search_queue(state.clone(), q).await.len(),
+                expected,
+                "{q:?} returned the wrong number of messages"
+            );
+        }
+    }
+
+    /// 0058 indexes nothing that triage deletes. A word that lived only in the body is unfindable,
+    /// and that is the retention decision holding rather than a hole in the index — the alternative
+    /// is an index that keeps a stranger's words after the row stopped storing them.
+    #[tokio::test]
+    async fn a_word_only_ever_in_the_body_is_not_searchable() {
+        let state = test_state().await;
+        insert_triaged(&state, 1, "Assunto", "aardvark", "resumo").await;
+
+        assert!(search_queue(state.clone(), "aardvark").await.is_empty());
+    }
+
+    /// Searching narrows the queue; it does not become a different query with its own rules. The
+    /// user's own sent mail stays out of it.
+    #[tokio::test]
+    async fn searching_still_excludes_the_users_own_sent_mail() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, direction)
+             VALUES ('<sent@user>', 'Sent', 1, 5, 'utilizador@example.com', 'Fatura de julho',
+                     '2026-07-28T10:00:00+00:00', '2026-07-28T10:00:00+00:00', 'outbound')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        assert!(search_queue(state.clone(), "Fatura").await.is_empty());
+    }
+
+    /// A query of nothing but punctuation reaches `MATCH` as the empty string, which errors rather
+    /// than matching nothing, so the handler has to answer instead of returning a 500.
+    #[tokio::test]
+    async fn a_search_with_no_searchable_words_is_answered() {
+        let state = test_state().await;
+        insert_triaged(&state, 1, "Assunto", "corpo", "resumo").await;
+
+        assert!(search_queue(state.clone(), "\"\"\"").await.is_empty());
     }
 
     #[tokio::test]
@@ -5654,6 +5849,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

@@ -283,7 +283,125 @@ impl NucleosTools {
 }
 
 #[tool_handler(name = "nucleos", instructions = "NucleOS daemon control")]
-impl ServerHandler for NucleosTools {}
+impl ServerHandler for NucleosTools {
+    /// Every tool result leaves through here, and that is the entire point of writing it by hand.
+    ///
+    /// `#[tool_handler]` generates this method only when the impl does not already define one, so
+    /// providing it costs nothing and takes ownership of the one path every call returns through.
+    /// The alternative — calling a filter at the end of each `#[tool]` body — is a rule enforced by
+    /// remembering, and the tool that forgets it is the tool nobody notices, because a missing
+    /// redaction looks exactly like text that had nothing to redact.
+    ///
+    /// The router is built by `Self::tool_router()` here for the same reason the macro does it:
+    /// that is the expression the generated body uses, and diverging from it would mean this
+    /// method dispatches against a different router than `list_tools` advertises.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = Self::tool_router().call(tcc).await?;
+        Ok(filter_outgoing(result))
+    }
+}
+
+/// Removes every deterministically-detectable secret from one tool result.
+///
+/// **Unconditional, and it takes no policy argument.** It used to take an audience, read from an
+/// environment variable, on the theory that a result addressed to a model on this machine needs no
+/// filtering. That theory was right and the mechanism was wrong twice over. Nothing ever set the
+/// variable, so the branch never ran; and a filter with an off switch in the process environment is
+/// a filter that a misconfigured launcher — or anything that can put a variable in front of a
+/// subprocess — turns off silently. An escape hatch nobody uses is all cost.
+///
+/// The distinction it was reaching for is real and is already made, structurally and unmissably: a
+/// turn answered by a local model does not come through here at all. `LocalToolBox::call`
+/// dispatches to the tool methods directly, so "who is on the other end" is decided by which code
+/// path ran, which cannot be misconfigured, and everything that reaches this function is by
+/// construction on its way off this machine.
+///
+/// Not keyed on the tool's `ToolEffect` either, and that is the judgement worth keeping. The
+/// obvious design filters only `ReadsUntrusted`, since those are the tools that admit to carrying a
+/// stranger's words — but `TOOL_EFFECTS` below records that `get_run` is `ReadsOwn` "only
+/// lexically", because a triage run's stdout is a model's answer over mail. A rule keyed on that
+/// table would wave it through, and would wave through the next tool whose output quietly quotes
+/// third-party text on the day it is added. Scanning everything costs one pass over a string
+/// already in memory and makes "is this tool classified correctly?" stop being load-bearing for
+/// egress.
+///
+/// Both carriers are filtered. `structured_content` is not decoration: a tool that returns JSON
+/// puts the same text there in parsed form, so redacting only the text blocks would leave the
+/// secret in the field a client is more likely to read programmatically.
+fn filter_outgoing(mut result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
+    for block in &mut result.content {
+        if let rmcp::model::ContentBlock::Text(text) = block {
+            text.text = crate::redact::redact_secrets(&text.text);
+        }
+    }
+    if let Some(structured) = &mut result.structured_content {
+        redact_json_strings(structured);
+    }
+    result
+}
+
+/// Applies the filter to every string in a JSON document, in place.
+///
+/// The document was previously rendered with `to_string()`, filtered as one flat string and
+/// re-parsed, which was wrong in a way that only one detector noticed. In a rendered document a
+/// newline is the two characters `\` and `n`, and `pem_blocks` anchors on the newline that closes a
+/// PEM header — so a private key in a tool's JSON result matched nothing and crossed intact, while
+/// the same key in the sibling text block was redacted. The two carriers disagreed, and the one
+/// that leaked is the one a client parses programmatically.
+///
+/// Walking the values needs no knowledge of what any tool returns — a `Value` is a `Value` — and it
+/// also removes the re-parse, which could drop a whole structured result if a redaction ever landed
+/// somewhere that changed the document's shape.
+fn redact_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = crate::redact::redact_secrets(text);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
+        serde_json::Value::Object(fields) => {
+            fields.values_mut().for_each(redact_json_strings);
+        }
+        _ => {}
+    }
+}
+
+/// The tools a turn answered by a model on this machine may be offered.
+///
+/// Every `ReadsOwn` tool, the two mail reads, plus `create_run` and `create_job`.
+///
+/// The mail reads are here because being asked what arrived is half of what a chat on a phone is
+/// for, and they are the reason `local_agent.rs` carries a barrier rather than a fixed list. A turn
+/// that reads mail has a stranger's words in its context, and from that moment `run_turn` refuses
+/// every `Acts` tool for the rest of the turn — the rule `ToolEffect::ReadsUntrusted` already
+/// states and that `hooks.rs` already enforces for a cloud run. Without it, "read this mail" and
+/// "start a job" in one turn would let a sender write the job.
+///
+/// `list_files` is `ReadsUntrusted` too and is deliberately NOT here: a filename is a poor thing to
+/// answer a chat with, and every untrusted tool added widens the surface for no gain.
+///
+/// The write half is the judgement, and it stops short of two things. `approve_proposal`,
+/// `reject_proposal`, `cancel_run` and `set_kill` are absent because a local turn is a chat window
+/// on a phone and those are the controls somebody reaches for when something is going wrong; they
+/// stay where the person can see what they are agreeing to. `vcs_request` is absent for the reason
+/// stated below it in `TOOL_EFFECTS`: it is the only effect on this server that outlives the daemon
+/// and that its owner cannot take back from here.
+pub const LOCAL_TOOLS: &[&str] = &[
+    "create_job",
+    "create_run",
+    "get_budget",
+    "get_email",
+    "get_email_queue",
+    "get_kill",
+    "get_run",
+    "list_projects",
+    "list_proposals",
+    "vcs_ticket",
+];
 
 /// What calling one NucleOS tool does to the turn that called it.
 ///
@@ -357,6 +475,139 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("web_search", ToolEffect::ReadsUntrusted),
 ];
 
+/// The `LOCAL_TOOLS` subset of this server, reachable by the in-process loop in `local_agent.rs`.
+///
+/// It holds a `NucleosTools` and calls the very same methods the MCP subprocess exposes, rather
+/// than reimplementing them against `DaemonClient`. The tool bodies are small, but they are where
+/// `create_run` resolves a project name and `vcs_ticket` decides what waiting means, and a second
+/// copy of those would be a second set of answers to the same questions.
+///
+/// It reaches the daemon over loopback HTTP even though it runs INSIDE the daemon. That looks
+/// wasteful and is the point: it is the same request the MCP subprocess makes, through the same
+/// handler, with the same authorisation — so a local turn and a cloud turn cannot diverge in what a
+/// tool does, only in which tools they are offered.
+pub struct LocalToolBox {
+    tools: NucleosTools,
+    /// Read directly, not through a tool, because the budget check below has to HAPPEN rather than
+    /// be requested. See `spend_is_permitted`.
+    pool: sqlx::SqlitePool,
+}
+
+impl LocalToolBox {
+    /// Whether a tool that starts work may run.
+    ///
+    /// This is a precondition in the daemon and not an instruction in the prompt, and the
+    /// difference is the whole point. The obvious design tells the model to call `get_budget`
+    /// before `create_run` — but nothing can make a model call a tool, so that is a hope with the
+    /// shape of a rule. `job.rs` already gates autonomous work on this exact function; a chat that
+    /// can start a run is autonomous work with a person's sentence in front of it.
+    ///
+    /// It guards only the local path because that is the path this change adds. A cloud turn can
+    /// still start a run without passing here, which is the behaviour it has today and a separate
+    /// decision to change — one that would affect the desktop app, where somebody is watching.
+    async fn spend_is_permitted(&self) -> Result<(), String> {
+        match crate::budget::budget_permits_new_run(&self.pool, chrono::Utc::now()).await {
+            crate::budget::BudgetDecision::Allow => Ok(()),
+            crate::budget::BudgetDecision::Pause { reason, .. } => Err(reason),
+        }
+    }
+
+    pub fn new(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
+        Self {
+            pool,
+            tools: NucleosTools {
+                client: crate::daemon_client::DaemonClient::new(base_url, token),
+                tool_router: NucleosTools::tool_router(),
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::local_agent::ToolBox for LocalToolBox {
+    /// Derived from the router's own list, so a tool's description and schema reach a local model
+    /// exactly as they reach a cloud one. Writing them out by hand here is how the two would come
+    /// to disagree about what `create_job` is for.
+    fn schemas(&self) -> Vec<serde_json::Value> {
+        NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|tool| LOCAL_TOOLS.contains(&tool.name.as_ref()))
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description.unwrap_or_default(),
+                        "parameters": tool.input_schema,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Answered from `TOOL_EFFECTS`, not from a second list beside it. The classification already
+    /// exists and `hooks.rs` already enforces it for a cloud run; a local turn asking the same
+    /// question of the same table is what keeps the two from drifting into different answers about
+    /// the same tool.
+    fn brings_untrusted_text(&self, name: &str) -> bool {
+        tool_effect(name) == ToolEffect::ReadsUntrusted
+    }
+
+    /// An unknown name resolves to `Acts` in `tool_effect`, so it is refused here — the fail-closed
+    /// direction, and the same one the cloud path takes.
+    fn permitted_after_untrusted(&self, name: &str) -> bool {
+        tool_effect(name) != ToolEffect::Acts
+    }
+
+    async fn call(&self, name: &str, arguments: &serde_json::Value) -> String {
+        // A name outside the offered set is refused here rather than dispatched, because the model
+        // is the only thing that chose it: `LOCAL_TOOLS` is what was advertised, and anything else
+        // is a hallucinated name or a tool this turn was deliberately not given.
+        if !LOCAL_TOOLS.contains(&name) {
+            return error_json(format!("{name} is not a tool this conversation can use"));
+        }
+
+        macro_rules! parsed {
+            ($type:ty) => {
+                match serde_json::from_value::<$type>(arguments.clone()) {
+                    Ok(value) => value,
+                    Err(error) => return error_json(format!("bad arguments for {name}: {error}")),
+                }
+            };
+        }
+
+        match name {
+            "list_projects" => self.tools.list_projects().await,
+            "list_proposals" => self.tools.list_proposals().await,
+            "get_budget" => self.tools.get_budget().await,
+            "get_kill" => self.tools.get_kill().await,
+            "get_run" => self.tools.get_run(Parameters(parsed!(IdParams))).await,
+            "get_email_queue" => self.tools.get_email_queue().await,
+            "get_email" => self.tools.get_email(Parameters(parsed!(IdParams))).await,
+            "vcs_ticket" => {
+                self.tools
+                    .vcs_ticket(Parameters(parsed!(VcsTicketParams)))
+                    .await
+            }
+            "create_run" | "create_job" => {
+                if let Err(reason) = self.spend_is_permitted().await {
+                    // Answered as a tool result rather than as a failure, so the model can tell the
+                    // person WHY nothing started instead of falling silent or trying again.
+                    return error_json(format!("no work can start right now: {reason}"));
+                }
+                match name {
+                    "create_run" => self.tools.create_run(Parameters(parsed!(RunParams))).await,
+                    _ => self.tools.create_job(Parameters(parsed!(JobParams))).await,
+                }
+            }
+            // Unreachable while this match covers `LOCAL_TOOLS`, which
+            // `every_local_tool_can_be_dispatched` is what proves.
+            other => error_json(format!("{other} has no local dispatch")),
+        }
+    }
+}
+
 /// PURE: what one tool name does, by name alone.
 ///
 /// A name absent from the table resolves to `Acts`, which is the fail-closed direction for a tool
@@ -397,6 +648,48 @@ pub async fn run_stdio() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private key in the structured half of a result, which is where a tool that returns JSON
+    /// puts its answer. It used to cross intact: the document was filtered as a rendered string, in
+    /// which a newline is the two characters `\` and `n`, and the PEM detector anchors on a real
+    /// one. The text block beside it was redacted correctly, so the two carriers disagreed.
+    #[test]
+    fn a_key_in_the_structured_half_is_redacted_like_one_in_the_text_half() {
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaaaaaa\n\
+-----END RSA PRIVATE KEY-----\n";
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                key.to_string(),
+            )]);
+        result.structured_content = Some(serde_json::json!({
+            "body": key,
+            "nested": [{"also": key}],
+        }));
+
+        let filtered = filter_outgoing(result);
+
+        let structured = filtered
+            .structured_content
+            .expect("structured half was dropped");
+        assert!(
+            !structured.to_string().contains("MIIEowIBAAKCAQEA"),
+            "{structured}"
+        );
+        assert!(
+            structured["nested"][0]["also"]
+                .as_str()
+                .is_some_and(|text| text.contains("[SECRET:private-key]")),
+            "a key nested inside an array was not reached: {structured}"
+        );
+        let rmcp::model::ContentBlock::Text(text) = &filtered.content[0] else {
+            panic!("the text block is gone");
+        };
+        assert!(
+            text.text.contains("[SECRET:private-key]"),
+            "{:?}",
+            text.text
+        );
+    }
 
     /// The exact set, not a subset.
     ///
@@ -489,6 +782,114 @@ mod tests {
     /// leave the turn unmarked — so the `approve_proposal` after it would still be allowed. Nothing
     /// about that failure looks like a failure. Asserting the partition against the router's own
     /// list is what turns it into a test that fails on the day the tool is added.
+    /// `LOCAL_TOOLS` names tools that must exist. A rename on the server would otherwise leave a
+    /// local turn quietly short of a tool, and the symptom — "it says it cannot check the budget" —
+    /// points at the model rather than at the list.
+    #[test]
+    fn every_local_tool_is_a_tool_this_server_has() {
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        for name in LOCAL_TOOLS {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is offered to local turns and is not registered on this server"
+            );
+        }
+    }
+
+    /// The dispatch in `LocalToolBox::call` is a second list of names beside `LOCAL_TOOLS`, and two
+    /// lists that must agree are two lists that will not. This is what makes them agree: a tool
+    /// added to `LOCAL_TOOLS` and forgotten in the match fails here rather than at runtime, where it
+    /// would look like the model choosing badly.
+    #[tokio::test]
+    async fn every_local_tool_can_be_dispatched() {
+        use crate::local_agent::ToolBox;
+
+        // Pointed at a port nothing listens on: a dispatched call fails to CONNECT, which is a
+        // different error from "no local dispatch" and is what tells the two apart without a daemon.
+        let toolbox = LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), {
+            let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            pool
+        });
+
+        for name in LOCAL_TOOLS {
+            let answer = toolbox.call(name, &serde_json::json!({})).await;
+            assert!(
+                !answer.contains("has no local dispatch"),
+                "{name} is in LOCAL_TOOLS and has no arm in LocalToolBox::call"
+            );
+        }
+    }
+
+    /// The two exclusions that were decided rather than defaulted, pinned so removing either is a
+    /// deliberate edit to a test that says why.
+    #[test]
+    fn a_local_turn_cannot_move_a_branch_or_touch_the_kill_switch() {
+        assert!(
+            !LOCAL_TOOLS.contains(&"vcs_request"),
+            "vcs_request outlives the daemon and cannot be undone from here"
+        );
+        assert!(
+            !LOCAL_TOOLS.contains(&"set_kill"),
+            "the kill switch stays where the person can see what they are agreeing to"
+        );
+        assert!(!LOCAL_TOOLS.contains(&"approve_proposal"));
+    }
+
+    /// The mail reads are offered, and they are the only untrusted ones that are.
+    ///
+    /// This replaced a test asserting that NO untrusted tool was reachable locally. That was the
+    /// earlier decision and it was reversed deliberately: being asked what arrived is half of what
+    /// a chat on a phone is for. What makes the reversal safe is the barrier below, not the absence
+    /// of the tools — so the list is pinned here and the barrier is pinned there, and neither
+    /// stands alone.
+    #[test]
+    fn the_only_untrusted_reads_offered_locally_are_the_mail_ones() {
+        let untrusted: Vec<&&str> = LOCAL_TOOLS
+            .iter()
+            .filter(|name| tool_effect(name) == ToolEffect::ReadsUntrusted)
+            .collect();
+
+        assert_eq!(untrusted, [&"get_email", &"get_email_queue"]);
+        assert!(
+            !LOCAL_TOOLS.contains(&"list_files"),
+            "a filename is a poor thing to answer a chat with, and every untrusted tool added \
+             widens the surface for no gain"
+        );
+        assert!(!LOCAL_TOOLS.contains(&"web_read") && !LOCAL_TOOLS.contains(&"web_search"));
+    }
+
+    /// The barrier that makes the mail reads safe to offer, asked of the tool box the loop actually
+    /// consults rather than of the table underneath it.
+    #[tokio::test]
+    async fn reading_mail_taints_a_turn_and_shuts_the_acting_tools() {
+        use crate::local_agent::ToolBox;
+
+        let toolbox = LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), {
+            sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap()
+        });
+
+        for name in ["get_email", "get_email_queue"] {
+            assert!(toolbox.brings_untrusted_text(name), "{name}");
+        }
+        for name in ["create_run", "create_job"] {
+            assert!(!toolbox.permitted_after_untrusted(name), "{name}");
+        }
+        // A read of the daemon's own state is still answerable afterwards: the turn has to be able
+        // to finish saying what it found.
+        for name in ["get_run", "list_projects", "get_budget"] {
+            assert!(toolbox.permitted_after_untrusted(name), "{name}");
+            assert!(!toolbox.brings_untrusted_text(name), "{name}");
+        }
+        // Fail-closed on a name that is not a tool at all.
+        assert!(!toolbox.permitted_after_untrusted("no_such_tool"));
+    }
+
     #[test]
     fn every_registered_tool_is_classified() {
         let mut classified: Vec<&str> = TOOL_EFFECTS.iter().map(|(name, _)| *name).collect();

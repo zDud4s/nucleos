@@ -168,15 +168,48 @@ pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
     })
 }
 
+/// Which client sent a chat message, as the client states it.
+///
+/// Stated rather than inferred, and that is why this type exists at all. A Telegram group id is
+/// negative, so the origin is guessable from the shape of `chat_id` — and guessing would make a
+/// routing decision depend on a numbering scheme Telegram owns and can change without telling
+/// anybody. A client that says nothing is `Shell`, which keeps every existing caller where it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Shell,
+    Telegram,
+}
+
+impl Origin {
+    /// An unknown spelling resolves to `Shell` for the same reason absence does: this is a
+    /// ship-dark feature, so anything not explicitly asking for the new path gets the old one.
+    pub fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("telegram") => Self::Telegram,
+            _ => Self::Shell,
+        }
+    }
+}
+
 pub async fn send_message(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
+    origin: Origin,
 ) -> Result<i64, String> {
     // Held from here on: every early return, error, and dropped future below releases the chat by
     // dropping this, which is why none of them needs a cleanup statement of its own.
     let slot = ChatSlot::acquire(chat_id)
         .ok_or("a turn is already in progress for this chat".to_string())?;
+
+    // The one branch this feature turns on, and both halves must hold: the client asked to be
+    // answered here, and startup proved a model on this machine can do it. Either alone leaves the
+    // turn on the path it has always taken.
+    if origin == Origin::Telegram
+        && let Some(assistant) = state.local_assistant.clone()
+    {
+        return spawn_local_turn(state, slot, text.to_string(), assistant).await;
+    }
 
     let resume = get_session(&state.pool, chat_id)
         .await
@@ -224,6 +257,204 @@ pub async fn send_message(
         session_id,
         mcp_path,
     );
+    Ok(id)
+}
+
+/// How many past exchanges a local turn is shown.
+///
+/// Small, and bounded again by characters below, because every one of these is re-sent on every
+/// round of the tool loop — so a generous history is multiplied by `MAX_TOOL_ROUNDS` before it
+/// reaches `TURN_NUM_CTX`. Six is enough for "and the second one?" and for the follow-up after that.
+const HISTORY_TURNS: i64 = 6;
+
+/// The character budget for replayed history, counted newest-first.
+///
+/// A ceiling on turns alone is not a ceiling: one pasted stack trace answered by a long reply is a
+/// single exchange and thousands of characters. What overflows the window is length, so length is
+/// what is bounded.
+const HISTORY_CHARS: usize = 6_000;
+
+/// The exchanges a local turn may be shown, oldest first.
+///
+/// The `id >` clause is the same barrier `get_session` applies to the CLI path, stated for a path
+/// that has no session to refuse. `hooks.rs` stops a turn acting after it has read third-party
+/// text; without this, a local turn would be handed that text as history — and a local turn can
+/// call `create_run`. So a conversation resumes only from the point after anything read mail, which
+/// is exactly what "a chat that has read mail is spread across several sessions" already means on
+/// the other path.
+///
+/// Only `completed` turns, and only ones with a reply: a failed turn's row has no answer, and
+/// replaying a question that was never answered invites the model to answer it now, out of order.
+pub(crate) async fn recent_exchanges(
+    pool: &SqlitePool,
+    chat_id: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    let mut rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT prompt, stdout FROM runs
+          WHERE chat_id = ?
+            AND mode = 'assistant'
+            AND status = 'completed'
+            AND stdout IS NOT NULL
+            AND stdout <> ''
+            AND id > (SELECT COALESCE(MAX(id), 0) FROM runs
+                       WHERE chat_id = ? AND read_untrusted = 1)
+          ORDER BY id DESC
+          LIMIT ?",
+    )
+    .bind(chat_id)
+    .bind(chat_id)
+    .bind(HISTORY_TURNS)
+    .fetch_all(pool)
+    .await?;
+
+    // Trimmed newest-first, then flipped, so the exchanges that survive a tight budget are the
+    // recent ones. Dropping from the other end would keep the oldest and answer a question about
+    // "the second one" with the conversation from an hour ago.
+    let mut budget = HISTORY_CHARS;
+    rows.retain(|(asked, answered)| {
+        let cost = asked.chars().count() + answered.chars().count();
+        match budget.checked_sub(cost) {
+            Some(left) => {
+                budget = left;
+                true
+            }
+            None => false,
+        }
+    });
+    rows.reverse();
+    Ok(rows)
+}
+
+/// Records and drives a turn answered by the model on this machine.
+///
+/// Deliberately NOT a variant inside `spawn_assistant_turn`. That body is almost entirely about
+/// things a local turn does not have — an MCP config written to disk, a CLI session id arriving on
+/// a channel, a resumable session, a cost in dollars, a stderr stream that explains an exit code.
+/// Threading `Option`s through all of it to skip each in turn would make the CLI path harder to
+/// read in order to describe a path that shares three lines with it.
+///
+/// History is replayed rather than resumed. There is no session to resume — Ollama's chat endpoint
+/// has no session protocol — so `recent_exchanges` rebuilds the conversation from the run rows the
+/// turns already wrote, under the same barrier `get_session` applies on the other path.
+async fn spawn_local_turn(
+    state: &crate::state::AppState,
+    slot: ChatSlot,
+    text: String,
+    assistant: std::sync::Arc<crate::local_agent::LocalAssistant>,
+) -> Result<i64, String> {
+    // A session id even though nothing resumes it, because `budget.rs` keys spend on this column
+    // and a run row that is the one kind without one is a special case every reader downstream has
+    // to know about. It costs a uuid.
+    // Read BEFORE this turn's own row is inserted, so the turn cannot appear in its own history.
+    // An empty history on a database error, not a failure: a bot that answers without remembering
+    // is worse than one that remembers, and better than one that refuses to answer.
+    let history = recent_exchanges(&state.pool, &slot.chat_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read chat history; answering without it");
+            Vec::new()
+        });
+
+    let session_id = crate::auth::generate_uuid_v4();
+    let id = sqlx::query(
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, ?)",
+    )
+    .bind(&text)
+    .bind(&session_id)
+    .bind(&slot.chat_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .last_insert_rowid();
+
+    let pool = state.pool.clone();
+    let run_timeout = state.run_timeout;
+    crate::runs::spawn_registered(state, id, async move {
+        // Holds the chat for the length of the turn and releases it however this ends, including by
+        // being aborted mid-await — the same guarantee `TurnGuard` gives the CLI path.
+        let _slot = slot;
+        // Wrapped for the same reason the CLI path is: the slot is released by this task ending,
+        // so a turn that never ends is a chat that answers nothing ever again — every later message
+        // refused with 409 until the daemon restarts. The HTTP client has its own per-exchange
+        // timeout; this one bounds the whole turn, including a loop that keeps making progress
+        // slowly.
+        let outcome = tokio::time::timeout(run_timeout, assistant.answer(&history, &text)).await;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+
+        // Guarded on `status = 'running'` for the reason the CLI path sets out: a `/cancel` that
+        // already wrote its status can still be followed by one last wake-up here, and an unguarded
+        // write would report a completed turn for one that was killed.
+        let written = match outcome {
+            // `timed_out`, not `failed`, matching the CLI path below. A wall-clock kill is a
+            // distinct ending there and anything filtering runs by it would simply not see a local
+            // turn — the status is what the rest of the system reads, so it has to mean the same
+            // thing whichever runner produced it.
+            Err(_) => {
+                tracing::warn!(run_id = id, "local turn exceeded the wall clock");
+                sqlx::query(
+                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+            }
+            Ok(Ok(turn)) => {
+                if turn.ending != crate::local_agent::Ending::Answered {
+                    // Worth a log line and not worth an error: the person gets a usable sentence
+                    // either way, and this is the only place recording WHY it was that sentence.
+                    tracing::warn!(
+                        run_id = id,
+                        ending = ?turn.ending,
+                        tool_calls = turn.tool_calls,
+                        "local turn ended without an answer of its own"
+                    );
+                }
+                // Written BEFORE the status, so a turn that read mail is never visible as finished
+                // while still looking clean. The loop's own barrier governed this turn; this row is
+                // what governs the ones after it — `recent_exchanges` stops handing this chat's
+                // history across it, and `get_session` refuses to resume the session.
+                //
+                // A failure here is logged and not propagated, for the reason `read_untrusted_context`
+                // spells out: its readers treat a missing answer as tainted, so the direction this
+                // falls in is the refusing one.
+                if turn.read_untrusted
+                    && let Err(error) = crate::runs::mark_untrusted_context(&pool, id).await
+                {
+                    tracing::error!(
+                        run_id = id,
+                        %error,
+                        "could not mark a local turn as having read untrusted text"
+                    );
+                }
+                sqlx::query(
+                    "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&turn.answer)
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+            }
+            // Transport failure: Ollama stopped, or the model was pulled out from under us. The
+            // chat is told rather than handed a silence it cannot interpret.
+            Ok(Err(error)) => {
+                tracing::warn!(run_id = id, %error, "local turn failed");
+                sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(error.to_string())
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+            }
+        };
+        crate::runs::warn_on_terminal_write_err(&written, id, "completed");
+    });
+
     Ok(id)
 }
 
@@ -470,6 +701,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            local_assistant: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
@@ -479,6 +711,288 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    /// A local assistant that answers one fixed sentence and calls no tools.
+    fn fake_local_assistant(answer: &'static str) -> Arc<crate::local_agent::LocalAssistant> {
+        struct OneLiner(&'static str);
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for OneLiner {
+            async fn exchange(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                Ok(serde_json::json!({"role": "assistant", "content": self.0}))
+            }
+        }
+
+        struct NoTools;
+        #[async_trait::async_trait]
+        impl crate::local_agent::ToolBox for NoTools {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            async fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+                unreachable!("this assistant answers without calling tools")
+            }
+        }
+
+        Arc::new(crate::local_agent::LocalAssistant::new(
+            Box::new(OneLiner(answer)),
+            Box::new(NoTools),
+        ))
+    }
+
+    /// Polls until the turn leaves `running`, the way every other test in this module waits for a
+    /// spawned turn, and returns its status and reply.
+    async fn settled_turn(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
+        for _ in 0..100 {
+            let row: (String, Option<String>) =
+                sqlx::query_as("SELECT status, stdout FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if row.0 != "running" {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("turn {id} never left running");
+    }
+
+    /// What `FakeCommandRunner::default` answers, so a test can say "this went down the CLI path"
+    /// without asserting on a string whose meaning is not obvious at the call site.
+    const CLI_FAKE_REPLY: &str = "fake output";
+
+    #[test]
+    fn only_an_explicit_telegram_origin_is_telegram() {
+        assert_eq!(Origin::from_wire(Some("telegram")), Origin::Telegram);
+        // Everything else is the shell, which is what makes this ship dark: a client that has not
+        // been taught the field keeps the behaviour it has today.
+        for value in [None, Some("shell"), Some("Telegram"), Some(""), Some("tg")] {
+            assert_eq!(Origin::from_wire(value), Origin::Shell, "{value:?}");
+        }
+    }
+
+    /// The ship-dark guarantee, and the test most likely to be needed later: with no model
+    /// configured, a Telegram turn is answered exactly as it was before any of this existed.
+    #[tokio::test]
+    async fn a_telegram_turn_uses_the_cli_when_no_local_model_is_configured() {
+        let state = test_state().await;
+        assert!(state.local_assistant.is_none());
+
+        let id = send_message(&state, "tg-no-local", "hello", Origin::Telegram)
+            .await
+            .unwrap();
+        let (status, reply) = settled_turn(&state.pool, id).await;
+        assert_eq!(status, "completed");
+        assert_eq!(
+            reply.as_deref(),
+            Some(CLI_FAKE_REPLY),
+            "expected the CLI fake's reply, so this turn took the CLI path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_telegram_turn_is_answered_on_this_machine_when_a_model_is_configured() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("três corridas a andar"));
+
+        let id = send_message(&state, "tg-local", "o que está a correr?", Origin::Telegram)
+            .await
+            .unwrap();
+        let (status, reply) = settled_turn(&state.pool, id).await;
+        assert_eq!(status, "completed");
+        assert_eq!(reply.as_deref(), Some("três corridas a andar"));
+    }
+
+    /// The other half of the routing rule. Configuring a local model must not quietly move the
+    /// desktop app's chat onto it — the shell is where the long, tool-heavy conversations happen.
+    #[tokio::test]
+    async fn a_shell_turn_stays_on_the_cli_even_with_a_local_model_configured() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("never asked"));
+
+        let id = send_message(&state, "shell-with-local", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        let (_, reply) = settled_turn(&state.pool, id).await;
+        assert_eq!(
+            reply.as_deref(),
+            Some(CLI_FAKE_REPLY),
+            "a configured local model must not move the shell's chat onto it"
+        );
+    }
+
+    /// A local turn holds the chat's one slot like any other, and releases it. Without this the
+    /// second message to a bot answered locally would be rejected with 409 for ever.
+    #[tokio::test]
+    async fn a_local_turn_releases_the_chat_when_it_ends() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("done"));
+
+        let first = send_message(&state, "tg-slot", "one", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        let second = send_message(&state, "tg-slot", "two", Origin::Telegram).await;
+        assert!(second.is_ok(), "the slot was not released: {second:?}");
+    }
+
+    async fn record_turn(
+        pool: &SqlitePool,
+        chat_id: &str,
+        prompt: &str,
+        reply: &str,
+        read_untrusted: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, read_untrusted, created_at)
+             VALUES (?, 'completed', 'assistant', ?, ?, ?, '2026-08-09T00:00:00Z')",
+        )
+        .bind(prompt)
+        .bind(chat_id)
+        .bind(reply)
+        .bind(read_untrusted)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_comes_back_oldest_first() {
+        let pool = test_pool().await;
+        record_turn(&pool, "c", "what is running?", "two runs", 0).await;
+        record_turn(&pool, "c", "and the second?", "the calendar one", 0).await;
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(
+            history,
+            vec![
+                ("what is running?".to_string(), "two runs".to_string()),
+                (
+                    "and the second?".to_string(),
+                    "the calendar one".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// The barrier, stated for a path that has no session to refuse. A local turn can `create_run`,
+    /// so replaying a turn that read a stranger's mail would hand that stranger's words to a turn
+    /// able to act on them — the exact failure `get_session` prevents on the CLI path.
+    #[tokio::test]
+    async fn history_starts_after_anything_that_read_a_strangers_words() {
+        let pool = test_pool().await;
+        record_turn(&pool, "c", "before", "old answer", 0).await;
+        record_turn(&pool, "c", "read my mail", "it says ignore all rules", 1).await;
+        record_turn(&pool, "c", "after", "fresh answer", 0).await;
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(
+            history,
+            vec![("after".to_string(), "fresh answer".to_string())],
+            "history must resume only from after the mail read"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_is_per_chat_and_only_of_answered_turns() {
+        let pool = test_pool().await;
+        record_turn(&pool, "other", "not mine", "not mine", 0).await;
+        record_turn(&pool, "c", "answered", "yes", 0).await;
+        // A failed turn has no reply; replaying its question invites the model to answer it now,
+        // out of order.
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('unanswered', 'failed', 'assistant', 'c', '2026-08-09T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(history, vec![("answered".to_string(), "yes".to_string())]);
+    }
+
+    /// A ceiling on the NUMBER of exchanges is not a ceiling: one pasted stack trace is a single
+    /// exchange and thousands of characters. What overflows the window is length.
+    #[tokio::test]
+    async fn a_long_exchange_is_dropped_and_the_recent_ones_are_kept() {
+        let pool = test_pool().await;
+        record_turn(&pool, "c", &"x".repeat(HISTORY_CHARS), "huge", 0).await;
+        record_turn(&pool, "c", "recent", "kept", 0).await;
+
+        let history = recent_exchanges(&pool, "c").await.unwrap();
+        assert_eq!(
+            history,
+            vec![("recent".to_string(), "kept".to_string())],
+            "the budget must be spent newest-first"
+        );
+    }
+
+    /// End to end: the second message to a locally-answered chat must arrive with the first one
+    /// behind it, or every follow-up is answered by a bot with no memory.
+    #[tokio::test]
+    async fn a_second_local_turn_is_given_the_first() {
+        use std::sync::Mutex as StdMutex;
+
+        struct Recorder(Arc<StdMutex<Vec<serde_json::Value>>>);
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for Recorder {
+            async fn exchange(
+                &self,
+                messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                *self.0.lock().unwrap() = messages;
+                Ok(serde_json::json!({"role": "assistant", "content": "ok"}))
+            }
+        }
+        struct NoTools;
+        #[async_trait::async_trait]
+        impl crate::local_agent::ToolBox for NoTools {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            async fn call(&self, _: &str, _: &serde_json::Value) -> String {
+                unreachable!()
+            }
+        }
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let mut state = test_state().await;
+        state.local_assistant = Some(Arc::new(crate::local_agent::LocalAssistant::new(
+            Box::new(Recorder(seen.clone())),
+            Box::new(NoTools),
+        )));
+
+        let first = send_message(&state, "tg-memory", "primeira", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let second = send_message(&state, "tg-memory", "segunda", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        let messages = seen.lock().unwrap().clone();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                crate::local_agent::SYSTEM_PROMPT.to_string(),
+                "primeira".to_string(),
+                "ok".to_string(),
+                "segunda".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -673,9 +1187,14 @@ mod tests {
         });
         let chat_id = "assistant-no-result-event-chat";
 
-        let id = send_message(&state, chat_id, "Le me o ultimo mail que recebi")
-            .await
-            .unwrap();
+        let id = send_message(
+            &state,
+            chat_id,
+            "Le me o ultimo mail que recebi",
+            Origin::Shell,
+        )
+        .await
+        .unwrap();
 
         let mut row = None;
         for _ in 0..500 {
@@ -723,7 +1242,7 @@ mod tests {
         state.runner = runner.clone();
         let chat_id = "assistant-forget-after-mail-chat";
 
-        let first = send_message(&state, chat_id, "what is in my mail?")
+        let first = send_message(&state, chat_id, "what is in my mail?", Origin::Shell)
             .await
             .unwrap();
 
@@ -763,7 +1282,7 @@ mod tests {
         );
 
         *runner.last_resume.lock().unwrap() = Some("not-cleared".to_string());
-        send_message(&state, chat_id, "approve proposal 4")
+        send_message(&state, chat_id, "approve proposal 4", Origin::Shell)
             .await
             .unwrap();
         for _ in 0..500 {
@@ -835,7 +1354,7 @@ mod tests {
         let state = test_state().await;
         let chat_id = "assistant-dropped-request-chat";
 
-        let mut request = Box::pin(send_message(&state, chat_id, "hello"));
+        let mut request = Box::pin(send_message(&state, chat_id, "hello", Origin::Shell));
 
         // One poll is all it takes to claim the chat; the future then parks on the session lookup.
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -861,7 +1380,9 @@ mod tests {
         let pool = state.pool.clone();
         let chat_id = "assistant-send-test-chat";
 
-        let id = send_message(&state, chat_id, "hello").await.unwrap();
+        let id = send_message(&state, chat_id, "hello", Origin::Shell)
+            .await
+            .unwrap();
         let mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
             .bind(id)
             .fetch_one(&pool)
@@ -921,7 +1442,7 @@ mod tests {
         state.runner = runner.clone();
         let pool = state.pool.clone();
 
-        let id = send_message(&state, "assistant-first-turn-chat", "hello")
+        let id = send_message(&state, "assistant-first-turn-chat", "hello", Origin::Shell)
             .await
             .unwrap();
 
@@ -966,7 +1487,7 @@ mod tests {
         let runner = Arc::new(FakeCommandRunner::default());
         state.runner = runner.clone();
 
-        send_message(&state, "assistant-tool-policy-chat", "hello")
+        send_message(&state, "assistant-tool-policy-chat", "hello", Origin::Shell)
             .await
             .unwrap();
         for _ in 0..500 {
@@ -997,7 +1518,7 @@ mod tests {
         state.runner = runner.clone();
         let chat_id = "assistant-finalised-status-chat";
 
-        let id = send_message(&state, chat_id, "take your time")
+        let id = send_message(&state, chat_id, "take your time", Origin::Shell)
             .await
             .unwrap();
         // The fake runner counts the call before it sleeps, so this parks the turn inside the CLI
@@ -1098,7 +1619,7 @@ mod tests {
         let chat_id = "assistant-cancel-test-chat";
         let mcp_path = mcp_config_path(chat_id);
 
-        let id = send_message(&state, chat_id, "take your time")
+        let id = send_message(&state, chat_id, "take your time", Origin::Shell)
             .await
             .unwrap();
         // Wait until the CLI is actually under way; cancelling a turn still queued would exercise a

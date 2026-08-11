@@ -88,6 +88,18 @@ pub struct SidecarState {
     pub last_failure_at: Option<String>,
     /// How many times this sidecar has been restarted since the daemon started.
     pub restarts: u32,
+    /// The last line this sidecar printed, and when it printed it.
+    ///
+    /// The field that closes the gap this module was already half-way through: `last_failure` says
+    /// how a child *ended*, and a sidecar whose every poll fails while the process stays up never
+    /// ends. The email poller is the case that made it matter — it logs `email: poll failed: …` and
+    /// keeps running, so the panel read `running` for eight days while no mail arrived.
+    ///
+    /// One line rather than a buffer. What a reader needs here is "is it still saying something
+    /// wrong"; the history is in the log file, which now has these lines too. A ring buffer in
+    /// process-wide state would be a second, worse log.
+    pub last_line: Option<String>,
+    pub last_line_at: Option<String>,
     /// The kind of the error that stopped it STARTING, when that is what went wrong.
     ///
     /// `last_failure` above is for a person and carries the message; this is for `health.rs`, which
@@ -143,9 +155,105 @@ fn record(name: &str, update: impl FnOnce(&mut SidecarState)) {
             last_failure: None,
             last_failure_at: None,
             restarts: 0,
+            last_line: None,
+            last_line_at: None,
             spawn_error: None,
         });
     update(entry);
+}
+
+/// The longest line kept from a sidecar's output.
+///
+/// A ceiling rather than a guess about line length: this text is now written to a log file that has
+/// retention but no per-line limit, and one child printing a megabyte on a loop would fill the disk
+/// through a path nothing else guards. Generous enough that a Go stack trace's first line survives.
+const MAX_LINE_BYTES: usize = 2_000;
+
+/// PURE: one line of a sidecar's output, made safe to keep.
+///
+/// Two jobs, both of which have to happen before the line reaches a log file or the shell:
+///
+/// - **Credentials come out.** A sidecar's environment holds the daemon token and, for email, the
+///   IMAP password; the ordinary way those escape is a connection error quoting the URL it failed on
+///   (`imaps://user:hunter2@host`). Until now that output only ever reached a console nobody kept.
+///   Writing it to a file that rotates daily and is read later is a different proposition, so
+///   `redact_url` is applied on the way in.
+/// - **Length is bounded**, on a character boundary so the result is still a `String`.
+///
+/// `redact_url` is applied per whitespace-separated token, not to the line. It was written for a
+/// string that IS a URL: given `dial imaps://u:p@host failed` it finds `://`, reads the scheme as
+/// `dial imaps`, rejects it for the space, and hands the line back untouched — password included.
+/// Splitting first is what puts a real URL in front of it.
+///
+/// The consequence is that the redactor also eats a bare `someone@example.com` down to its domain,
+/// because that is what `redact_url` does with anything carrying userinfo. That is the right
+/// direction to err in for this particular text: it is a mail sidecar's output, it now persists in
+/// a file, and `redact.rs` already forbids logging what a message says.
+///
+/// Returns `None` for a line that is only whitespace: Go's `log` and a flushing writer both emit
+/// those, and a panel that shows the sidecar's "last line" as an empty string reads as a bug.
+fn keepable_line(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_end_matches(['\r', '\n']).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let redacted = trimmed
+        .split_whitespace()
+        .map(crate::redact::redact_url)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if redacted.len() <= MAX_LINE_BYTES {
+        return Some(redacted);
+    }
+    // `floor_char_boundary` is unstable, so the cut is found by walking back to one.
+    let mut cut = MAX_LINE_BYTES;
+    while cut > 0 && !redacted.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(format!("{}…", &redacted[..cut]))
+}
+
+/// Forwards one of a child's output streams to the log and to its `SidecarState`.
+///
+/// Runs as its own task so it cannot delay `child.wait()`, and ends by itself: the read hits EOF
+/// when the child closes the pipe, which is exactly when there is nothing left to say.
+///
+/// `stderr` is logged at WARN and `stdout` at INFO, because that is what the Go sidecars mean by
+/// them — the standard library's `log` writes to stderr, so every `email: poll failed: …` arrives
+/// on that stream. Both are recorded as the last line: what a reader wants is the last thing the
+/// process said, not the last thing it said on one particular pipe.
+async fn pump<R>(name: String, stream: &'static str, reader: R)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(raw)) => {
+                let Some(line) = keepable_line(&raw) else {
+                    continue;
+                };
+                if stream == "stderr" {
+                    tracing::warn!(sidecar = %name, stream, output = %line, "sidecar output");
+                } else {
+                    tracing::info!(sidecar = %name, stream, output = %line, "sidecar output");
+                }
+                let at = chrono::Utc::now().to_rfc3339();
+                record(&name, |entry| {
+                    entry.last_line = Some(line);
+                    entry.last_line_at = Some(at);
+                });
+            }
+            // EOF: the child closed this pipe, which for a dying process is the ordinary ending.
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(sidecar = %name, stream, %error, "could not read sidecar output");
+                break;
+            }
+        }
+    }
 }
 
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
@@ -159,8 +267,23 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         // A sidecar's environment holds the daemon token, and for email the IMAP password too.
         // Without this, shutting the daemon down left the process running with both.
         cmd.kill_on_drop(true);
+        // Piped rather than inherited, which is what it was. Inheriting sent every sidecar's output
+        // to the daemon's own console and nowhere else: not the log file, not `/sidecars`, not the
+        // health readout. A poller that logged a failure on every cycle and stayed up was therefore
+        // reported as `running` with no failure at all, which is the one shape this registry exists
+        // to make impossible.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
         match cmd.spawn() {
             Ok(mut child) => {
+                // Taken before `wait()`, which needs the child mutably and would otherwise hold the
+                // handles for as long as the process lives.
+                if let Some(stdout) = child.stdout.take() {
+                    tokio::spawn(pump(name.clone(), "stdout", stdout));
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    tokio::spawn(pump(name.clone(), "stderr", stderr));
+                }
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let launched = std::time::Instant::now();
                 let restarts = attempts;
@@ -536,5 +659,64 @@ mod tests {
             env.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
             Some("bot")
         );
+    }
+
+    /// The reason this line is kept at all: a poller that fails on every cycle and stays up.
+    ///
+    /// Its output used to go to the daemon's console and nowhere a person or the shell would look,
+    /// so `state` read `running`, `last_failure` read `None`, and the Mail tab looked like a quiet
+    /// mailbox — which is what an empty inbox looks like too.
+    #[test]
+    fn a_failing_poller_line_survives_intact() {
+        assert_eq!(
+            keepable_line("email: poll failed: inbound mailbox \"INBOX\": dial tcp: timeout\n"),
+            Some("email: poll failed: inbound mailbox \"INBOX\": dial tcp: timeout".to_string()),
+        );
+    }
+
+    /// Inherited output reached a console nobody kept. A log file that rotates daily and is read
+    /// afterwards is a different proposition, so credentials come out on the way in.
+    #[test]
+    fn credentials_in_a_connection_error_do_not_reach_the_log() {
+        let line = keepable_line("dial imaps://duarte:hunter2@imap.gmail.com:993 failed")
+            .expect("a line with a URL is still a line");
+        assert!(
+            !line.contains("hunter2"),
+            "the IMAP password must not survive into the log: {line}"
+        );
+        assert!(
+            line.contains("imap.gmail.com"),
+            "the host is what makes the error readable and must survive: {line}"
+        );
+    }
+
+    /// Whitespace-only output is not a thing the sidecar said. A panel showing an empty "last line"
+    /// reads as a rendering bug rather than as silence.
+    #[test]
+    fn blank_output_is_not_recorded_as_something_said() {
+        assert_eq!(keepable_line(""), None);
+        assert_eq!(keepable_line("   \r\n"), None);
+        assert_eq!(keepable_line("\n"), None);
+    }
+
+    /// One child printing without bound must not fill a disk through the one path with no limit.
+    #[test]
+    fn a_runaway_line_is_cut_to_the_ceiling() {
+        let kept = keepable_line(&"x".repeat(MAX_LINE_BYTES * 3)).expect("a long line is a line");
+        assert!(
+            kept.len() <= MAX_LINE_BYTES + '…'.len_utf8(),
+            "kept {} bytes, ceiling is {MAX_LINE_BYTES}",
+            kept.len()
+        );
+        assert!(kept.ends_with('…'), "a cut line must say it was cut: {kept}");
+    }
+
+    /// Cutting mid-character would panic on the slice. Multi-byte output is ordinary here — the
+    /// sidecars log in whatever language the OS answers in, which on this machine is Portuguese.
+    #[test]
+    fn a_runaway_line_of_multibyte_characters_is_cut_on_a_boundary() {
+        let kept = keepable_line(&"ç".repeat(MAX_LINE_BYTES)).expect("a long line is a line");
+        assert!(kept.ends_with('…'));
+        assert!(kept.len() <= MAX_LINE_BYTES + '…'.len_utf8());
     }
 }

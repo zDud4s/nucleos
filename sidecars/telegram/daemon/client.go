@@ -58,9 +58,14 @@ func (c *Client) do(method, path string, body any) ([]byte, int, error) {
 }
 
 func (c *Client) SendAssistantMessage(chatID, text string) (int64, error) {
+	// The daemon routes a turn on this, so it is stated rather than left to be inferred from the
+	// shape of chatID. A Telegram group id is negative, which makes it guessable — and would make
+	// the routing depend on a numbering scheme Telegram owns and can change. An older daemon that
+	// does not know the field ignores it, so this is safe to send before the other side ships.
 	body, status, err := c.do(http.MethodPost, "/assistant/message", map[string]string{
 		"chat_id": chatID,
 		"text":    text,
+		"origin":  "telegram",
 	})
 	if err != nil {
 		return 0, fmt.Errorf("send assistant message: %w", err)
