@@ -1204,6 +1204,74 @@ mod tests {
         );
     }
 
+    /// The barrier that holds when the other two do not.
+    ///
+    /// A council seat is refused every action three times over, and two of those refusals depend on
+    /// something cooperating: `ToolPolicy::McpOnly` on the CLI enforcing its own restriction, and
+    /// the `PreToolUse` hook firing at all — which it only does if the `.claude/settings.json`
+    /// resolved from the run's working directory registers it, and a seat has no working directory.
+    /// This one depends on nothing. With this key, `POST /runs` is 403 whatever the model decided
+    /// and whatever the CLI did or did not enforce.
+    #[tokio::test]
+    async fn the_councils_key_reads_and_cannot_start_anything() {
+        let state = test_state("control-token").await;
+        let token = mint_service_token(&state.pool, Service::Council)
+            .await
+            .unwrap();
+        let app = protected_router(state);
+
+        // What `mcp_tools::COUNCIL_TOOLS` advertises, and it must actually work — a tool that
+        // always 403s costs a seat a round and tells it something is broken.
+        for path in [
+            "/projects",
+            "/proposals",
+            "/autopilot/budget",
+            "/autopilot/kill",
+            "/email/queue",
+            "/runs/7",
+            "/files",
+        ] {
+            assert_ne!(
+                status_of(&app, "GET", path, &token).await,
+                StatusCode::FORBIDDEN,
+                "a seat must be able to read {path}"
+            );
+        }
+
+        // And nothing that acts, changes or costs money.
+        for (method, path) in [
+            ("POST", "/runs"),
+            ("POST", "/jobs"),
+            ("POST", "/council"),
+            ("POST", "/proposals/7/approve"),
+            ("POST", "/autopilot/kill"),
+            ("POST", "/vcs/requests"),
+            ("POST", "/email/send"),
+            ("POST", "/email/triage"),
+            ("POST", "/web/read"),
+            ("POST", "/web/search"),
+            ("DELETE", "/files"),
+        ] {
+            assert_eq!(
+                status_of(&app, method, path, &token).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+        }
+
+        // The gate answers runs, not services — a seat's tool decisions come through its run token.
+        assert_eq!(
+            status_of(&app, "POST", HOOK_ROUTE, &token).await,
+            StatusCode::FORBIDDEN
+        );
+        // A council cannot convene a council. Nothing in the design wants recursion, and no brake
+        // in this house counts it.
+        assert_eq!(
+            status_of(&app, "GET", "/council", &token).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
     /// A fresh daemon replaces the key, so the one a previous daemon's sidecar still holds is dead.
     #[tokio::test]
     async fn minting_a_service_key_again_retires_the_previous_one() {

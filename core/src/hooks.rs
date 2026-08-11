@@ -145,7 +145,7 @@ pub async fn pretooluse_decision(
     // and no proposal to resume into, so a `pending_approval` here would terminate the seat and
     // mint an approval nothing could ever satisfy.
     if mode == crate::council::COUNCIL_MODE {
-        return council_decision(&payload);
+        return council_decision(&state, &payload).await;
     }
 
     let classification = classifier::classify(
@@ -478,19 +478,37 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
 /// direction matters more here than for the orchestrator, because a council is up to eight agents
 /// launched by one sentence rather than one turn a person is watching.
 ///
-/// PURE — no state is read, so there is nothing to fail closed ABOUT. The orchestrator's branch has
-/// to ask the database whether the turn has read third-party text, and every way that read can fail
-/// is a way its answer can be wrong; this one is a list membership test and cannot be.
-fn council_decision(payload: &PreToolUsePayload) -> Json<Decision> {
+/// Almost pure. The list is a membership test that cannot fail; the one stateful question is which
+/// run a `get_run` names, and that one fails closed for the reason `get_run_names_a_triage_run`
+/// gives about its own.
+async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
     // Whole segment, not a prefix, for the reason `assistant_decision` records: an MCP server named
     // `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test.
-    let permitted = payload
+    let tool = payload
         .tool_name
         .strip_prefix("mcp__nucleos__")
         .filter(|tool| !tool.contains("__"))
-        .is_some_and(|tool| crate::mcp_tools::COUNCIL_TOOLS.contains(&tool));
+        .filter(|tool| crate::mcp_tools::COUNCIL_TOOLS.contains(tool));
 
-    if permitted {
+    if let Some(tool) = tool {
+        // `get_run` reads any run by id, and run ids are sequential integers — so a seat could
+        // read the row next to its own and find a sibling's answer before writing its own. Phase 1
+        // is supposed to be N independent answers, and one seat that waited would be answering
+        // with the others' work in front of it.
+        //
+        // The same shape as the orchestrator's `get_run` check above, and for a related reason:
+        // that one asks whether the named run holds a stranger's words, this one whether it holds
+        // a peer's. Both fail closed, because "I could not tell" is not "no".
+        if tool == "get_run" && get_run_names_a_council_run(state, &payload.tool_input).await {
+            tracing::debug!(
+                run_id = payload.run_id,
+                "pretooluse-decision: refused a council seat a look at another seat's run"
+            );
+            return Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "a council seat may not read another seat's run".to_owned(),
+            });
+        }
         return Json(Decision {
             decision: "allow".to_owned(),
             reason: "council seats may read NucleOS state".to_owned(),
@@ -509,6 +527,34 @@ fn council_decision(payload: &PreToolUsePayload) -> Json<Decision> {
         decision: "deny".to_owned(),
         reason: "a council seat may only read NucleOS state".to_owned(),
     })
+}
+
+/// Whether a `get_run` call names another council seat's run.
+///
+/// Fails closed on every shape it cannot read, exactly as its triage sibling does, and for a reason
+/// that is weaker but points the same way: what is lost by refusing is one lookup, and what is lost
+/// by allowing wrongly is the independence phase 1 exists to have. A run that does not exist is the
+/// one honest `false` — the tool returns an error and nothing is read.
+async fn get_run_names_a_council_run(state: &AppState, tool_input: &Value) -> bool {
+    let Some(id) = tool_input.get("id").and_then(Value::as_i64) else {
+        return true;
+    };
+    match sqlx::query_scalar::<_, String>("SELECT mode FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(mode)) => mode == crate::council::COUNCIL_MODE,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "pretooluse-decision: could not resolve the mode of the run a seat asked for — refusing it"
+            );
+            true
+        }
+    }
 }
 
 /// Whether a `get_run` call names a triage run.
@@ -2807,19 +2853,61 @@ mod tests {
     async fn a_council_turn_allows_a_reads_own_tool() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        // A `worktree` run, so `get_run` below names something that is not a peer.
+        let other = in_flight_run(&state, "worktree", None, None, None).await;
         let app = test_router(state);
 
-        for tool in [
-            "list_projects",
-            "list_proposals",
-            "get_budget",
-            "get_kill",
-            "get_run",
-        ] {
-            let decision =
-                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+        for tool in ["list_projects", "list_proposals", "get_budget", "get_kill"] {
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
             assert_eq!(decision.decision, "allow", "{tool}");
         }
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "get_run", serde_json::json!({"id": other}))
+                .await
+                .decision,
+            "allow"
+        );
+    }
+
+    /// Phase 1 is N INDEPENDENT answers, and run ids are sequential integers — so without this a
+    /// seat could read the row next to its own and find a sibling's answer before writing its own.
+    /// The seat that waited would then be answering with the others' work in front of it, and the
+    /// ranking that follows would be measuring the wait.
+    #[tokio::test]
+    async fn a_council_seat_cannot_read_another_seats_run() {
+        let state = test_state().await;
+        let seat = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let sibling = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state);
+
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": sibling}))
+                .await
+                .decision,
+            "deny"
+        );
+        // Its own row is a council run too, and the same rule refuses it. Nothing is lost: a seat
+        // knows what it was asked, and the row holds nothing the seat did not write.
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": seat}))
+                .await
+                .decision,
+            "deny"
+        );
+        // Fails closed on a shape it cannot read, like its triage sibling: an absent id, and an id
+        // that is not a number, are both "I could not tell" rather than "no".
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({}))
+                .await
+                .decision,
+            "deny"
+        );
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": "nine"}))
+                .await
+                .decision,
+            "deny"
+        );
     }
 
     /// The half that makes a seat worth asking. Half the questions somebody puts to a council are
