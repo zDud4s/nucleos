@@ -11,6 +11,7 @@ function chat(overrides: Partial<ChatRow> & { chat_id: string }): ChatRow {
     created_at: "2026-08-11T10:00:00+00:00",
     first_message: null,
     last_activity: null,
+    waiting: 0,
     ...overrides,
   };
 }
@@ -80,6 +81,60 @@ describe("ChatList", () => {
     );
 
     expect(screen.getAllByText("thinking…")).toHaveLength(1);
+  });
+
+  it("says which conversations answered while you were elsewhere", () => {
+    render(
+      <ChatList
+        chats={[
+          chat({ chat_id: "answered", title: "the one that answered", waiting: 2 }),
+          chat({ chat_id: "quiet", title: "the quiet one" }),
+        ]}
+        selected={null}
+        busy={new Set()}
+        onSelect={noop}
+        onNew={noop}
+        onArchive={noop}
+      />,
+    );
+
+    expect(screen.getAllByText(/answered/i).length).toBeGreaterThan(0);
+    // The count, not just a dot: two answers landed and the number says how much there is to read.
+    expect(screen.getByText("2")).toBeTruthy();
+    expect(screen.getByLabelText(/2 answers waiting/i)).toBeTruthy();
+  });
+
+  it("says nothing about a conversation with nothing new in it", () => {
+    render(
+      <ChatList
+        chats={[chat({ chat_id: "quiet", title: "the quiet one" })]}
+        selected={null}
+        busy={new Set()}
+        onSelect={noop}
+        onNew={noop}
+        onArchive={noop}
+      />,
+    );
+
+    expect(screen.queryByLabelText(/waiting/i)).toBeNull();
+  });
+
+  it("does not call a conversation waiting while it is still being answered", () => {
+    // The two are different states and they can be true at once — the daemon counts only turns that
+    // LANDED, so a chat mid-turn with an older unread answer says both, and each says its own thing.
+    render(
+      <ChatList
+        chats={[chat({ chat_id: "a", title: "mid-turn", waiting: 0 })]}
+        selected={null}
+        busy={new Set(["a"])}
+        onSelect={noop}
+        onNew={noop}
+        onArchive={noop}
+      />,
+    );
+
+    expect(screen.getByText("thinking…")).toBeTruthy();
+    expect(screen.queryByLabelText(/waiting/i)).toBeNull();
   });
 
   it("opens a new conversation on request", () => {

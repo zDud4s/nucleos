@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  archiveChat, createChat, getAssistantChat, getAssistantTurn, getLocalModelAvailable, listChats,
-  patchChat, sendAssistantMessage, titleChatLocally,
+  archiveChat, createChat, getAssistantChat, getAssistantTurn, getLocalModelAvailable,
+  markChatSeen, patchChat, sendAssistantMessage, titleChatLocally,
   type ApiResult, type Brain, type ChatRow, type ConnectionState,
 } from "./api";
 import { runIsLive } from "./derive";
@@ -34,6 +34,13 @@ interface ChatsProps {
    */
   selected: string | null;
   onSelect: (chatId: string | null) => void;
+  /**
+   * The conversations, owned by `App` — because the tab strip draws the waiting count while this
+   * page is unmounted, which is exactly when that number matters.
+   */
+  chats: ChatRow[] | null;
+  /** Reads the list again now, instead of at `App`'s next 3-second tick. */
+  refreshChats: () => Promise<void>;
 }
 
 /**
@@ -47,28 +54,14 @@ interface ChatsProps {
  * and not merely a tab switch.
  */
 function Chats({
-  token, connection, turnsByChat, setTurnsForChat, selected, onSelect,
+  token, connection, turnsByChat, setTurnsForChat, selected, onSelect, chats, refreshChats,
 }: ChatsProps) {
-  const [chats, setChats] = useState<ChatRow[] | null>(null);
   /** The conversations whose transcript has been read back at least once. */
   const [read, setRead] = useState<Set<string>>(new Set());
   const [localAvailable, setLocalAvailable] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
 
   const ready = connection === "connected" && token !== null;
-
-  const refreshChats = useCallback(async () => {
-    if (token === null) return;
-    const listed = await listChats(token);
-    // Only on success. A failed read leaves what is on screen alone rather than replacing the list
-    // with an empty one, which would look exactly like every conversation having been lost.
-    if (listed !== null) setChats(listed);
-  }, [token]);
-
-  useEffect(() => {
-    if (!ready) return;
-    void refreshChats();
-  }, [ready, refreshChats]);
 
   useEffect(() => {
     if (!ready || token === null) return;
@@ -98,6 +91,31 @@ function Chats({
       cancelled = true;
     };
   }, [ready, selected, setTurnsForChat, token]);
+
+  /**
+   * Records that the open conversation has been read, whenever it has anything unread.
+   *
+   * One rule covering both moments, rather than one call when you open a chat and another when a
+   * turn lands in it: what matters is that the conversation IN FRONT OF YOU never claims to be
+   * waiting. Written as a condition on the state rather than as two events, so a turn that lands
+   * while you are looking at it is covered by the same line that covers opening a stale one.
+   *
+   * It terminates: marking sets the count to zero, the refresh brings the zero back, and the guard
+   * below returns. A turn landing in between raises it again and the next pass clears that too.
+   */
+  useEffect(() => {
+    if (!ready || token === null || selected === null) return;
+    const current = chats?.find((chat) => chat.chat_id === selected);
+    if (current === undefined || current.waiting === 0) return;
+    let cancelled = false;
+    void (async () => {
+      await markChatSeen(token, selected);
+      if (!cancelled) await refreshChats();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [chats, ready, refreshChats, selected, token]);
 
   /**
    * Every turn still in flight, across every conversation, DERIVED from the transcripts.

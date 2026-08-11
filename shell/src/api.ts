@@ -1955,6 +1955,14 @@ export interface ChatRow {
    */
   first_message: string | null;
   last_activity: string | null;
+  /**
+   * How many answers landed here since the conversation was last opened.
+   *
+   * Waiting for YOU, not for the model — a turn still being written is the chat waiting on the
+   * model, which the list says with its own word. Counted by the daemon from a watermark on the
+   * row, so it survives closing the app.
+   */
+  waiting: number;
 }
 
 /**
@@ -2052,6 +2060,28 @@ export async function titleChatLocally(token: string, chatId: string): Promise<A
     return { ok: true, value: null };
   } catch {
     return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Records that a conversation has been read.
+ *
+ * Its own call and not a field on `patchChat`, because that one answers 409 while a turn is in
+ * flight — and reading a conversation mid-turn is the ordinary case: you sent the message and you
+ * are watching it land.
+ *
+ * Sends no watermark. Where it lands is the daemon's to decide: a client naming its own could mark
+ * a turn it had not drawn yet and swallow the answer it was meant to announce.
+ */
+export async function markChatSeen(token: string, chatId: string): Promise<void> {
+  try {
+    await fetch(`${DAEMON_URL}/assistant/chats/${encodeURIComponent(chatId)}/seen`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch {
+    // Deliberately silent. Failing to record that you read something is not worth an error in front
+    // of you: the mark simply stays, and the next time the chat is open it is written again.
   }
 }
 

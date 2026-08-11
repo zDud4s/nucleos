@@ -57,6 +57,24 @@ function ChatList({ chats, selected, busy, onSelect, onNew, onArchive }: ChatLis
                 <span className="cl-meta">
                   <span className="b-run">{chat.brain}</span>
                   {busy.has(chat.chat_id) && <span className="cl-busy">thinking…</span>}
+                  {/*
+                    Both can be true at once, and they say different things: the daemon counts only
+                    turns that LANDED, so a conversation mid-turn with an older unread answer is
+                    thinking AND waiting. Collapsing them into one badge would drop whichever
+                    happened second.
+
+                    The count and not a dot, because "one answer" and "six answers while you were
+                    away" are a different amount of reading. `aria-label` carries the noun the
+                    number alone cannot.
+                  */}
+                  {chat.waiting > 0 && (
+                    <span
+                      className="cl-waiting"
+                      aria-label={`${chat.waiting} ${chat.waiting === 1 ? "answer" : "answers"} waiting`}
+                    >
+                      {chat.waiting}
+                    </span>
+                  )}
                 </span>
               </button>
               {/*

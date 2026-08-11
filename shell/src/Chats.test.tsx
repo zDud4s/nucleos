@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import Chats from "./Chats";
+import { listChats, type ChatRow } from "./api";
 import type { Turn } from "./chat/turns";
 
 const fetchMock = vi.fn();
@@ -14,6 +15,7 @@ interface DaemonChat {
   brain?: "cloud" | "local";
   first_message?: string | null;
   last_activity?: string | null;
+  waiting?: number;
 }
 
 /** A daemon holding the given conversations, with no transcript for any of them. */
@@ -24,6 +26,7 @@ function daemon(chats: DaemonChat[], overrides: Record<string, unknown> = {}) {
     created_at: "2026-08-11T10:00:00+00:00",
     first_message: null,
     last_activity: null,
+    waiting: 0,
     ...chat,
   }));
   return async (url: string, init?: RequestInit) => {
@@ -32,6 +35,15 @@ function daemon(chats: DaemonChat[], overrides: Record<string, unknown> = {}) {
     }
     if (url.endsWith("/assistant/local-model")) {
       return { ok: true, status: 200, json: async () => ({ available: false }) };
+    }
+    // Before the transcript read below, which its URL would otherwise match.
+    if (url.endsWith("/seen")) {
+      const parts = url.split("/");
+      const chatId = parts[parts.length - 2];
+      const row = rows.find((candidate) => candidate.chat_id === chatId);
+      // What the daemon does: the watermark moves to the last turn that had landed.
+      if (row !== undefined) row.waiting = 0;
+      return { ok: true, status: 204, json: async () => ({}) };
     }
     if (url.endsWith("/assistant/chats")) {
       if (init?.method === "POST") {
@@ -42,6 +54,7 @@ function daemon(chats: DaemonChat[], overrides: Record<string, unknown> = {}) {
           created_at: "2026-08-11T12:00:00+00:00",
           first_message: null,
           last_activity: null,
+          waiting: 0,
         });
         return { ok: true, status: 200, json: async () => ({ chat_id: "brand-new" }) };
       }
@@ -60,14 +73,22 @@ async function settle() {
 }
 
 /**
- * The page with its selection held outside it, the way `App` holds it.
+ * The page with its selection and its list held outside it, the way `App` holds them.
  *
- * A stub that only records would make every click a no-op, so this re-renders with the new
- * selection — which is what the real owner does.
+ * A stub that only recorded would make every click a no-op, so this is a small stand-in for the
+ * real owner: it re-renders on selection, and it re-reads the list from the same fake daemon.
  */
 function renderChats(turnsByChat: Record<string, Turn[]> = {}) {
   function Host() {
     const [selected, setSelected] = useState<string | null>(null);
+    const [chats, setChats] = useState<ChatRow[] | null>(null);
+    const refreshChats = useCallback(async () => {
+      const listed = await listChats("daemon-token");
+      if (listed !== null) setChats(listed);
+    }, []);
+    useEffect(() => {
+      void refreshChats();
+    }, [refreshChats]);
     return (
       <Chats
         token="daemon-token"
@@ -76,6 +97,8 @@ function renderChats(turnsByChat: Record<string, Turn[]> = {}) {
         setTurnsForChat={() => {}}
         selected={selected}
         onSelect={setSelected}
+        chats={chats}
+        refreshChats={refreshChats}
       />
     );
   }
@@ -164,6 +187,28 @@ describe("Chats", () => {
     expect(screen.getByRole("textbox")).toHaveProperty("disabled", true);
   });
 
+  it("stops calling a conversation waiting once you open it", async () => {
+    fetchMock.mockImplementation(
+      daemon([
+        { chat_id: "stale", title: "the one that answered", waiting: 3 },
+        { chat_id: "other", title: "the other one", waiting: 1 },
+      ]),
+    );
+    renderChats();
+    await settle();
+
+    expect(screen.getByLabelText(/3 answers waiting/i)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("the one that answered"));
+    });
+
+    // The conversation in front of you must never claim to be waiting for you.
+    expect(screen.queryByLabelText(/3 answers waiting/i)).toBeNull();
+    // And only that one: opening a chat says nothing about the others.
+    expect(screen.getByLabelText(/1 answer waiting/i)).toBeTruthy();
+  });
+
   it("does not offer to name a conversation when no local model can write one", async () => {
     // The daemon refuses this with a 503, and a button that always fails is worse than no button.
     fetchMock.mockImplementation(daemon([{ chat_id: "a", title: "the one" }]));
@@ -186,6 +231,8 @@ describe("Chats", () => {
         setTurnsForChat={() => {}}
         selected={null}
         onSelect={() => {}}
+        chats={null}
+        refreshChats={async () => {}}
       />,
     );
 

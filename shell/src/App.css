@@ -1150,8 +1150,26 @@ details.scoreboard th {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.cl-meta { display: flex; gap: var(--sp-2); font: 400 var(--fs-2xs) var(--mono); }
+.cl-meta { display: flex; align-items: center; gap: var(--sp-2); font: 400 var(--fs-2xs) var(--mono); }
 .cl-busy { color: var(--gold); }
+
+/* A pastilha do que está por ler. Verde e não dourada, de propósito: o dourado nesta shell é
+   «pendente, à espera da máquina» (`.cl-busy`, o `--gold` dos avisos), e isto é o contrário —
+   a máquina já respondeu e agora a espera é tua. Duas cores para dois sentidos. */
+.cl-waiting,
+.tab-waiting {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  padding: 0 5px;
+  border-radius: var(--r-full);
+  background: var(--green);
+  color: var(--bg);
+  font: 600 var(--fs-2xs) var(--mono);
+  line-height: 1.5;
+}
+.tab-waiting { margin-left: 6px; }
 
 .brain-picker { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); }
 .bp-label {

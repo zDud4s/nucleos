@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  checkHealth, getKillSwitch, getStatus, sendAttentionHeartbeat, setKillSwitch,
-  type ConnectionState,
+  checkHealth, getKillSwitch, getStatus, listChats, sendAttentionHeartbeat, setKillSwitch,
+  type ChatRow, type ConnectionState,
 } from "./api";
 import Approvals from "./Approvals";
 import Autopilot from "./Autopilot";
@@ -87,12 +87,33 @@ function App() {
   const [turnsByChat, setTurnsByChat] = useState<Record<string, Turn[]>>({});
   /** Which conversation is open, held here for the same reason — see the comment above. */
   const [openChat, setOpenChat] = useState<string | null>(null);
+  /**
+   * The conversations, and how many answers each has waiting.
+   *
+   * Held here and not in the page for a reason the transcripts do not have: the tab strip shows how
+   * many conversations are waiting, and it is drawn while the chats page is UNMOUNTED. A list owned
+   * by that page would be unreadable at exactly the moment the number matters — you are on Mail,
+   * something answered, and nothing anywhere says so.
+   */
+  const [chats, setChats] = useState<ChatRow[] | null>(null);
   const setTurnsForChat = useCallback(
     (chatId: string, update: (current: Turn[]) => Turn[]) => {
       setTurnsByChat((current) => ({ ...current, [chatId]: update(current[chatId] ?? []) }));
     },
     [],
   );
+  /**
+   * Reads the list again now, rather than at the next 3-second tick.
+   *
+   * The poll above is what keeps the tab's number honest while you are elsewhere; this is for the
+   * moments where waiting three seconds would show a stale answer to something you just did —
+   * opening a conversation, archiving one, renaming one.
+   */
+  const refreshChats = useCallback(async () => {
+    if (token === null) return;
+    const listed = await listChats(token);
+    if (listed !== null) setChats(listed);
+  }, [token]);
   const tokenRequest = useRef<Promise<string> | null>(null);
   const polling = useRef(false);
 
@@ -144,9 +165,10 @@ function App() {
         if (cancelled) return;
         setToken(daemonToken);
 
-        const [nextStatus, nextKill] = await Promise.all([
+        const [nextStatus, nextKill, nextChats] = await Promise.all([
           getStatus(daemonToken),
           getKillSwitch(daemonToken),
+          listChats(daemonToken),
         ]);
         if (cancelled) return;
         if (!nextStatus.ok && nextStatus.fault === "unauthorized") {
@@ -166,6 +188,9 @@ function App() {
         setBlocked(null);
         setStatus(nextStatus.ok ? nextStatus.value : null);
         setKillEngaged(nextKill);
+        // Only on success. A failed read leaves the list alone rather than replacing it with an
+        // empty one, which on this tick would read as every conversation having been archived.
+        if (nextChats !== null) setChats(nextChats);
       } finally {
         polling.current = false;
       }
@@ -223,6 +248,15 @@ function App() {
     [token],
   );
 
+  /**
+   * How many CONVERSATIONS have something waiting, not how many answers.
+   *
+   * The number stands next to a door, and what it has to tell you is how many places you have to
+   * go — six answers in one conversation is one visit. The per-conversation counts are in the list,
+   * where you are choosing between them.
+   */
+  const waitingChats = (chats ?? []).filter((chat) => chat.waiting > 0).length;
+
   const connected = connection === "connected";
   // Reachable is not the same as usable: without a token the daemon controls
   // below would all fail, so they are not offered.
@@ -255,6 +289,19 @@ function App() {
                 onClick={() => setTab(entry.key)}
               >
                 {entry.label}
+                {/*
+                  Drawn here rather than folded into `TABS`, so that array stays a list of views and
+                  does not become a place where state leaks into a constant. Absent at zero: a badge
+                  reading "0" is something to look at that says nothing.
+                */}
+                {entry.key === "chats" && waitingChats > 0 && (
+                  <span
+                    className="tab-waiting"
+                    aria-label={`${waitingChats} ${waitingChats === 1 ? "conversation" : "conversations"} waiting`}
+                  >
+                    {waitingChats}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
@@ -340,6 +387,8 @@ function App() {
               setTurnsForChat={setTurnsForChat}
               selected={openChat}
               onSelect={setOpenChat}
+              chats={chats}
+              refreshChats={refreshChats}
             />
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}

@@ -234,6 +234,7 @@ describe("the assistant transcript survives a tab switch", () => {
     created_at: "2026-08-11T10:00:00+00:00",
     first_message: null,
     last_activity: null,
+    waiting: 0,
   };
 
   /** A daemon that takes a message as turn 501 and reports whatever `status` currently says. */
@@ -340,6 +341,40 @@ describe("the assistant transcript survives a tab switch", () => {
 
     expect(screen.getByText("what did I ask before?")).toBeTruthy();
     expect(screen.getByText("this")).toBeTruthy();
+  });
+
+  /// The number stands next to a door, so it counts places to go, not things to read.
+  it("counts conversations on the tab, not answers", async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/assistant/chats")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            { ...THE_CHAT, chat_id: "a", waiting: 4 },
+            { ...THE_CHAT, chat_id: "b", waiting: 1 },
+            { ...THE_CHAT, chat_id: "c", waiting: 0 },
+          ],
+        };
+      }
+      return healthyDaemon()(url);
+    });
+
+    render(<App />);
+    await settle();
+
+    // Five answers across two conversations: two visits to make, which is the decision in hand.
+    expect(screen.getByLabelText("2 conversations waiting")).toBeTruthy();
+  });
+
+  it("says nothing on the tab when nothing is waiting", async () => {
+    // A badge reading "0" is something to look at that says nothing.
+    fetchMock.mockImplementation(assistantDaemon(() => ({ status: "running", stdout: null })));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.queryByLabelText(/waiting/)).toBeNull();
   });
 
   it("hides the tab bar inside the chats and keeps the emergency stop", async () => {
