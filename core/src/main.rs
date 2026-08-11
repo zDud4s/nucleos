@@ -6,6 +6,7 @@ mod autostart;
 mod backup;
 mod budget;
 mod calendar;
+mod chats;
 mod classifier;
 mod concurrency;
 mod config;
