@@ -380,8 +380,30 @@ async fn spawn_local_turn(
         // refused with 409 until the daemon restarts. The HTTP client has its own per-exchange
         // timeout; this one bounds the whole turn, including a loop that keeps making progress
         // slowly.
-        let outcome = tokio::time::timeout(run_timeout, assistant.answer(&history, &text)).await;
+        // Outside the future on purpose. A wall-clock timeout DROPS the turn and a transport error
+        // propagates out of it, and in both cases the turn may already have read a mail body with
+        // no `Turn` left to say so — so the run row would be written clean and the next turn in this
+        // chat would start with a stranger's words in its history and an open latch.
+        let taint = std::sync::atomic::AtomicBool::new(false);
+        let outcome =
+            tokio::time::timeout(run_timeout, assistant.answer(&history, &text, &taint)).await;
         let completed_at = chrono::Utc::now().to_rfc3339();
+
+        // Marked before any status is written, whatever the ending. `hooks.rs` refuses the READ
+        // when this fails, which is not available here — the reading already happened — so the
+        // fail-closed move left is to refuse the ANSWER: the turn is recorded as failed and its
+        // text is dropped rather than stored and handed to the next turn as history.
+        let mut unmarked = false;
+        if taint.load(std::sync::atomic::Ordering::SeqCst)
+            && let Err(error) = crate::runs::mark_untrusted_context(&pool, id).await
+        {
+            tracing::error!(
+                run_id = id,
+                %error,
+                "could not mark a local turn as having read untrusted text — dropping its answer"
+            );
+            unmarked = true;
+        }
 
         // Guarded on `status = 'running'` for the reason the CLI path sets out: a `/cancel` that
         // already wrote its status can still be followed by one last wake-up here, and an unguarded
@@ -412,31 +434,29 @@ async fn spawn_local_turn(
                         "local turn ended without an answer of its own"
                     );
                 }
-                // Written BEFORE the status, so a turn that read mail is never visible as finished
-                // while still looking clean. The loop's own barrier governed this turn; this row is
-                // what governs the ones after it — `recent_exchanges` stops handing this chat's
-                // history across it, and `get_session` refuses to resume the session.
-                //
-                // A failure here is logged and not propagated, for the reason `read_untrusted_context`
-                // spells out: its readers treat a missing answer as tainted, so the direction this
-                // falls in is the refusing one.
-                if turn.read_untrusted
-                    && let Err(error) = crate::runs::mark_untrusted_context(&pool, id).await
-                {
-                    tracing::error!(
-                        run_id = id,
-                        %error,
-                        "could not mark a local turn as having read untrusted text"
-                    );
+                // The turn read mail and the row could not be made to say so, so the answer is not
+                // stored. Anything else writes a chat message quoting a stranger's words onto a run
+                // marked clean, which `recent_exchanges` would then hand to the next turn with the
+                // latch open — the one state every refusal in this file assumes does not exist.
+                if unmarked {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind("this turn read third-party text and the daemon could not record that; its answer was dropped rather than stored unmarked")
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                } else {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(&turn.answer)
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
                 }
-                sqlx::query(
-                    "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, completed_at = ? WHERE id = ? AND status = 'running'",
-                )
-                .bind(&turn.answer)
-                .bind(&completed_at)
-                .bind(id)
-                .execute(&pool)
-                .await
             }
             // Transport failure: Ollama stopped, or the model was pulled out from under us. The
             // chat is told rather than handed a silence it cannot interpret.
