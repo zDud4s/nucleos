@@ -249,6 +249,25 @@ const THINK: bool = true;
 /// every fifteen minutes and blocks the batch from ever reaching older mail.
 const MAX_UNREADABLE_ATTEMPTS: i64 = 3;
 
+/// How many timeouts in a row mean the endpoint is gone rather than the field being slow.
+///
+/// Treating a timeout as a fact about the field was half right, and the wrong half is what a hung
+/// endpoint does to this table. `SWEEP_REQUEST_TIMEOUT` exists to catch a generation that stalled;
+/// an Ollama that is blackholed rather than refusing stalls on EVERY field, and each one then got an
+/// `unreadable` attempt recorded without the model having seen it. Three sweeps of that and a cohort
+/// of fields is past `MAX_UNREADABLE_ATTEMPTS` and excluded for ever — rows that only a successful
+/// read deletes, and the successful read can never come. The measurement would have been silently,
+/// permanently wrong in the one table whose entire purpose is measurement.
+///
+/// So a timeout is held rather than written, and only becomes an attempt once some later field in
+/// the same sweep comes back — which is the endpoint proving it is alive. Two in a row without that
+/// proof end the sweep with nothing recorded, exactly as a refused connection does.
+///
+/// Two, not three, and the asymmetry with `MAX_UNREADABLE_ATTEMPTS` is deliberate: being wrong here
+/// costs one sweep that is retried in fifteen minutes, and being wrong the other way costs data
+/// that no later pass repairs.
+const MAX_CONSECUTIVE_TIMEOUTS: usize = 2;
+
 /// How often a sweep runs. Slow on purpose — this is measurement, and nothing waits for it.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
 
@@ -410,6 +429,10 @@ async fn observe_column(
 
     let mut written = 0;
     let mut spent = 0;
+    // Timed-out fields waiting to learn whether the endpoint was alive. Emptied by the first field
+    // that comes back, which is what turns them into honest attempts; see `MAX_CONSECUTIVE_TIMEOUTS`.
+    // Its length IS the consecutive count, because a success drains it.
+    let mut deferred_timeouts: Vec<(i64, i64)> = Vec::new();
     for (id, summary, attempts) in pending {
         // Checked per field, not only per column: one column's share can outlast the whole period
         // on its own if the model is slow.
@@ -445,20 +468,16 @@ async fn observe_column(
                     attempt = attempts + 1,
                     "pii shadow: the model did not answer in time for this field"
                 );
-                written += record_at_attempt(
-                    pool,
-                    "emails",
-                    id,
-                    column,
-                    &[Observation {
-                        class: "unreadable".to_string(),
-                        excerpt: String::new(),
-                        confidence: None,
-                    }],
-                    attempts,
-                    now,
-                )
-                .await?;
+                deferred_timeouts.push((id, attempts));
+                if deferred_timeouts.len() >= MAX_CONSECUTIVE_TIMEOUTS {
+                    tracing::warn!(
+                        column,
+                        timeouts = deferred_timeouts.len(),
+                        "pii shadow: nothing has come back at all, so this is the endpoint and not \
+                         the fields — ending the sweep without recording them"
+                    );
+                    return Ok((written, spent, true));
+                }
                 continue;
             }
 
@@ -486,6 +505,26 @@ async fn observe_column(
                 return Ok((written, spent, true));
             }
         };
+
+        // The endpoint answered, so it was alive, so the fields that timed out before it really were
+        // slow fields. Only now do they become attempts — a garbled answer counts as proof of life
+        // just as a good one does, because the question this settles is whether anything came back.
+        for (timed_out, timed_out_attempts) in deferred_timeouts.drain(..) {
+            written += record_at_attempt(
+                pool,
+                "emails",
+                timed_out,
+                column,
+                &[Observation {
+                    class: "unreadable".to_string(),
+                    excerpt: String::new(),
+                    confidence: None,
+                }],
+                timed_out_attempts,
+                now,
+            )
+            .await?;
+        }
 
         // An answer nobody could read is recorded as `unreadable`, which is neither a finding nor a
         // clean reading — it is its own outcome and its own measurement.
@@ -550,6 +589,10 @@ async fn observe_column(
         written += record(pool, "emails", id, column, &to_write, now).await?;
     }
 
+    // Anything still deferred is dropped rather than written, and that is the conservative end of
+    // the trade. A column whose last field timed out ends without proof the endpoint was alive, so
+    // the attempt is not recorded and that field is simply offered again next sweep. The cost is one
+    // retry; the cost of guessing the other way is a permanent hole in the denominator.
     Ok((written, spent, false))
 }
 
@@ -1083,6 +1126,107 @@ mod tests {
             counts,
             vec![("triage_summary".to_string(), "unreadable".to_string(), 2)],
             "both summaries must have been looked at in one sweep"
+        );
+    }
+
+    /// Answers nothing for the first `hang` requests, then answers normally.
+    ///
+    /// The sleep is far longer than any timeout a test configures, so the caller gives up rather
+    /// than the server refusing — which is the distinction the sweep now turns on, and the one a
+    /// stopped listener cannot reproduce.
+    async fn stub_ollama_hanging_first(hang: usize, answer: &'static str) -> String {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(_): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": answer}
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn impatient_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("a client with a timeout should build")
+    }
+
+    /// A hung endpoint must not be written down as fields the model read and could not parse.
+    ///
+    /// This is the direction that cannot be undone. An `unreadable` row is only ever deleted by a
+    /// later successful read of the same field, so observations invented while Ollama was blackholed
+    /// push fields past `MAX_UNREADABLE_ATTEMPTS` and out of the sweep permanently — a hole in the
+    /// denominator of the one table whose entire purpose is to be a denominator.
+    #[tokio::test]
+    async fn an_endpoint_that_never_answers_records_nothing() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "o mais antigo").await;
+        triaged_email(&pool, 2, "o mais recente").await;
+        let hung = stub_ollama_hanging_first(usize::MAX, "[]").await;
+
+        observe_pending(
+            &pool,
+            &impatient_client(),
+            &hung,
+            "m",
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tally(&pool).await.unwrap(),
+            vec![],
+            "a hung endpoint was recorded as though the model had looked and failed"
+        );
+    }
+
+    /// And the stall stays fixed: one slow field must still be counted, not retried for ever.
+    ///
+    /// The two tests are a pair and neither is meaningful alone — the first says a timeout is not
+    /// evidence, this one says it becomes evidence as soon as the endpoint proves it was alive.
+    /// Without this one, "record nothing on a timeout" passes the first test and reinstates the
+    /// deadlock where the newest field times out, is offered first again, and blocks everything
+    /// older for ever.
+    #[tokio::test]
+    async fn a_field_that_times_out_is_counted_once_the_endpoint_answers() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "o mais antigo").await;
+        triaged_email(&pool, 2, "o mais recente").await;
+        let slow_once = stub_ollama_hanging_first(1, "[]").await;
+
+        observe_pending(
+            &pool,
+            &impatient_client(),
+            &slow_once,
+            "m",
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let mut counts = tally(&pool).await.unwrap();
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![
+                ("triage_summary".to_string(), "none".to_string(), 1),
+                ("triage_summary".to_string(), "unreadable".to_string(), 1),
+            ],
+            "the slow field should be an attempt and the one behind it should have been read"
         );
     }
 

@@ -783,6 +783,13 @@ pub(crate) async fn effect_of_call(
         .await
     {
         Ok(Some(mode)) if mode == crate::email::TRIAGE_MODE => ToolEffect::ReadsUntrusted,
+        // `Ok(None)` is the one gap left, and it is left knowingly. A run that does not exist when
+        // this asks, but exists as a triage run by the time the tool reads it, is classified own.
+        // Closing it means holding a transaction across the loopback call, which trades a race the
+        // model would have to win by naming an id that has not been issued yet for a lock held
+        // across HTTP. The race it replaced was the real one — classification used to run twice,
+        // after the content was already in the conversation, so a row deleted in between made a
+        // stranger's words a clean turn — and that one is gone.
         Ok(Some(_)) | Ok(None) => ToolEffect::ReadsOwn,
         Err(error) => {
             tracing::warn!(
