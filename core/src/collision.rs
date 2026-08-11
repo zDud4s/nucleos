@@ -143,14 +143,6 @@ const MEASURE_CAP: usize = 16;
 /// `inspect::diff`).
 const MEASURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// When a measurement stops counting.
-///
-/// Ten ticks. Not a condition the spec enumerates — it is this plan's addition, because without it
-/// a git that stopped answering freezes the last good value and the screen carries on saying
-/// `clean` about a measurement no longer being taken. Age reads as `not_measured`, never as
-/// `clean`.
-const MEASUREMENT_TTL: chrono::Duration = chrono::Duration::minutes(5);
-
 #[derive(sqlx::FromRow)]
 struct LiveTree {
     owner_kind: String,
@@ -230,8 +222,9 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
     };
 
     if tokio::time::timeout(MEASURE_BUDGET, drain).await.is_err() {
-        // The ones never drained keep their previous answer, which `MEASUREMENT_TTL` eventually
-        // invalidates. The tick waits no longer than this.
+        // The ones never drained keep their previous answer, which is the last true thing observed
+        // about those trees and stands until the next pass replaces it. The tick waits no longer
+        // than this.
         //
         // Dropping the future releases the remaining `JoinHandle`s, which DETACHES them — it does
         // not cancel them. A `git` hung without writing anything stays stuck inside
@@ -362,17 +355,17 @@ async fn observed_sets(
         .map(|(kind, id, paths, at)| ((kind, id), (paths, at)))
         .collect();
 
-    let fresh_enough = chrono::Utc::now() - MEASUREMENT_TTL;
     let mut sets = Vec::new();
     let mut complete = true;
     for (kind, id, born) in live {
         let usable = by_owner
             .get(&(kind.clone(), id))
             .and_then(|(paths, at)| {
+                // Identity, not freshness: a measurement predating the tree describes a different
+                // tree that happened to reuse the id. Age on its own disqualifies nothing.
                 let measured_at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
                 let born_at = chrono::DateTime::parse_from_rfc3339(&born).ok()?;
-                (measured_at >= born_at && measured_at.with_timezone(&chrono::Utc) >= fresh_enough)
-                    .then_some(paths)
+                (measured_at >= born_at).then_some(paths)
             })
             // Malformed reads as absent, never as an empty set.
             .and_then(|paths| serde_json::from_str::<Vec<String>>(paths).ok());
@@ -701,9 +694,22 @@ mod tests {
         db.close().await;
     }
 
-    /// A measurement past its shelf life stops counting. (This plan's addition to the spec.)
+    /// An old measurement still counts: age alone does not disqualify one.
+    ///
+    /// There used to be a five-minute shelf life here, and it was this plan's addition rather than
+    /// anything the spec asked for. It was vetoed, because what it actually bought was worse than
+    /// what it cost. A measurement is only ever taken of a LIVE worktree, and a live worktree that
+    /// has stopped being measured is one the daemon stopped measuring — the daemon being down, or
+    /// the pass overrunning its budget. In both of those the last measurement is still the last
+    /// true thing anybody observed about that tree, and discarding it replaces a true answer with
+    /// no answer. Meanwhile the cost was concrete: stop the daemon, and five minutes later the
+    /// whole fleet reads `not measured` even though nothing is running and nothing can collide.
+    ///
+    /// What still disqualifies a measurement is the check below it: one taken BEFORE the tree was
+    /// born describes a different tree that happened to reuse the id. That rule is about identity,
+    /// not freshness, and it stays.
     #[tokio::test]
-    async fn a_measurement_past_its_shelf_life_stops_counting() {
+    async fn a_measurement_taken_long_ago_still_counts() {
         let db = crate::storage::TempDb::new().await;
         seed_worktree_row(
             &db.pool,
@@ -714,12 +720,12 @@ mod tests {
             Some(&"a".repeat(40)),
         )
         .await;
-        let stale = (chrono::Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
-        seed_measurement_at(&db.pool, "job", 1, "project-a", &["a.rs"], &stale).await;
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(6)).to_rfc3339();
+        seed_measurement_at(&db.pool, "job", 1, "project-a", &["a.rs"], &long_ago).await;
 
         let collisions = for_project(&db.pool, "project-a").await.unwrap();
 
-        assert_eq!(collisions.observed.state, State::NotMeasured);
+        assert_eq!(collisions.observed.state, State::Clean);
         db.close().await;
     }
 
