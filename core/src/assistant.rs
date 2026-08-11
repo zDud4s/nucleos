@@ -37,6 +37,16 @@ impl Drop for ChatSlot {
     }
 }
 
+/// Whether a turn is in flight for this chat.
+///
+/// Reads the same set the slot is taken from, so it answers about the LIVE turn rather than about
+/// what the database happened to record. Asking `runs` instead would be wrong in both directions: a
+/// row still marked `running` after the daemon was killed says busy when nothing is, and the window
+/// between `ChatSlot::acquire` and the INSERT says free when the chat is already taken.
+pub fn is_busy(chat_id: &str) -> bool {
+    BUSY_CHATS.lock().unwrap().contains(chat_id)
+}
+
 /// Owns a turn's chat slot and its temp MCP config for the length of the turn, releasing both when
 /// it ends — by completing, by failing, or by being aborted.
 struct TurnGuard {

@@ -102,7 +102,10 @@ pub fn build_router(state: AppState) -> Router {
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
         .route("/assistant/chats", get(list_chats).post(create_chat))
-        .route("/assistant/chats/{chat_id}", get(get_assistant_chat))
+        .route(
+            "/assistant/chats/{chat_id}",
+            get(get_assistant_chat).patch(patch_chat).delete(delete_chat),
+        )
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
@@ -2712,6 +2715,75 @@ async fn create_chat(
         .map(|chat_id| Json(serde_json::json!({ "chat_id": chat_id })))
         .map_err(|error| {
             tracing::warn!(%error, "opening a chat failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct PatchChatRequest {
+    title: Option<String>,
+    brain: Option<String>,
+}
+
+/// Renames a conversation, changes which model answers it, or both.
+///
+/// The two halves are deliberately not symmetric. A rename touches nothing but the row; a model
+/// change also drops the chat's resumable session, because the model taking over has not seen the
+/// turns the other one answered and resuming across that gap would hand it a context missing them.
+/// That is done here rather than asked of the caller: a client that forgets the step poisons the
+/// conversation for the next model, and the shell will not be the only client.
+async fn patch_chat(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<PatchChatRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(brain) = body.brain.as_deref() {
+        // `answered_by` is written when a turn's row is born, so moving the brain under a live turn
+        // would make that column lie about who answered it. 409 rather than a queue: the same
+        // answer `POST /assistant/message` gives for the same reason.
+        if crate::assistant::is_busy(&chat_id) {
+            return Err(StatusCode::CONFLICT);
+        }
+        crate::chats::set_brain(&state.pool, &chat_id, crate::chats::Brain::from_wire(brain))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing a chat's model failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        crate::assistant::forget_session(&state.pool, &chat_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "forgetting a chat's session failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(title) = body.title.as_deref() {
+        crate::chats::rename(&state.pool, &chat_id, Some(title))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "renaming a chat failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Takes a conversation off the list, and leaves every turn of it in place.
+///
+/// Archive rather than delete, because every turn is a billed run: removing the rows would hide
+/// money spent from the table that records it. The transcript stays readable to anything that asks
+/// for the chat by id.
+async fn delete_chat(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    crate::chats::archive(&state.pool, &chat_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(%error, "archiving a chat failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -5547,6 +5619,144 @@ mod tests {
             crate::chats::brain_of(&state.pool, &chat_id).await.unwrap(),
             Some(crate::chats::Brain::Cloud)
         );
+    }
+
+    /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.
+    ///
+    /// Parked rather than slow, for the reason `LiveContextFillRunner` gives further down: a delay
+    /// long enough to be reliable is a delay long enough to make the suite slow.
+    struct ParkedRunner;
+
+    #[async_trait::async_trait]
+    impl crate::runner::CommandRunner for ParkedRunner {
+        async fn run_prompt(
+            &self,
+            _request: crate::runner::RunRequest,
+            _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+        ) -> std::io::Result<crate::runner::RunOutcome> {
+            std::future::pending::<()>().await;
+            unreachable!("a parked run never resolves")
+        }
+    }
+
+    async fn patch_chat_request(state: AppState, chat_id: &str, body: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/assistant/chats/{chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn changing_the_brain_forgets_the_session_the_other_model_left_behind() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(&state.pool, &id, "a-session", "2026-08-11T10:00:00+00:00")
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"brain":"cloud"}"#).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            crate::chats::brain_of(&state.pool, &id).await.unwrap(),
+            Some(crate::chats::Brain::Cloud)
+        );
+        // Resuming across the switch would hand the cloud a context with a hole in it — every turn
+        // the local model answered in between is missing from that session and present in the
+        // transcript. Done HERE and not left to the caller: a client that forgets this step poisons
+        // the conversation for the next model, and the shell will not be the only client.
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &id).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_brain_cannot_be_changed_under_a_running_turn() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(ParkedRunner);
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        crate::assistant::send_message(&state, &id, "take your time", crate::assistant::Origin::Shell)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"brain":"local"}"#).await;
+
+        // `answered_by` is written when the row is born. Swapping the brain under a live turn would
+        // make that column lie about who answered it.
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            crate::chats::brain_of(&state.pool, &id).await.unwrap(),
+            Some(crate::chats::Brain::Cloud)
+        );
+    }
+
+    /// A rename is not a model change, and must not drag one along: forgetting the session on every
+    /// PATCH would make naming a conversation quietly cost it its memory.
+    #[tokio::test]
+    async fn renaming_a_chat_keeps_the_session_it_was_in_the_middle_of() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(&state.pool, &id, "a-session", "2026-08-11T10:00:00+00:00")
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"title":"sobre o orçamento"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::get(&state.pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("sobre o orçamento")
+        );
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &id).await.unwrap(),
+            Some("a-session".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_a_chat_takes_it_off_the_list() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assistant/chats/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let listed = crate::chats::list(&state.pool).await.unwrap();
+        assert!(listed.iter().all(|chat| chat.chat_id != id));
     }
 
     async fn set_sender_verdict(state: AppState, body: serde_json::Value) -> StatusCode {
