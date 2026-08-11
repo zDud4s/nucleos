@@ -101,6 +101,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
+        .route("/assistant/local-model", get(get_local_model))
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -2682,6 +2683,21 @@ async fn get_assistant_chat(
     })?;
     turns.reverse();
     Ok(Json(turns))
+}
+
+/// Whether this machine has a model that can answer a conversation.
+///
+/// Exists so a client can offer the choice honestly. Without it the window would show "local" as an
+/// option, take the switch, and only discover on the next message that nothing on this machine can
+/// answer — leaving the conversation set to a model that does not exist. An option that is not
+/// there and an option that is unavailable today are different facts, and only one of them is
+/// something the user can act on.
+///
+/// Reports what STARTUP resolved, not a live probe: `local_assistant` is `Some` only if the daemon
+/// managed to build one, and a probe here would be a second, differently-timed opinion about the
+/// same thing.
+async fn get_local_model(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "available": state.local_assistant.is_some() }))
 }
 
 /// The conversations the app opened, most recently active first.
@@ -5898,6 +5914,35 @@ mod tests {
             .map(|turn| turn["answered_by"].as_str().unwrap())
             .collect();
         assert_eq!(by, vec!["cloud", "local"]);
+    }
+
+    #[tokio::test]
+    async fn the_daemon_says_whether_a_local_model_can_answer_at_all() {
+        let without = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/local-model")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(without).await["available"], false);
+
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("aqui"));
+        let with = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/local-model")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(with).await["available"], true);
     }
 
     /// A local assistant that answers one fixed sentence and calls no tools.
