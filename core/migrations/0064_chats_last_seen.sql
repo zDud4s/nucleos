@@ -1,0 +1,20 @@
+-- How far the app has read each conversation.
+--
+-- The list says which chats are thinking; nothing said which had finished thinking while you were
+-- looking elsewhere. A turn lands, the window has no reason to mention it, and the answer waits in a
+-- conversation that looks exactly like the ones with nothing in them.
+--
+-- A turn ID and not a timestamp, for the reason `get_assistant_chat` gives about its own ordering:
+-- two turns of one conversation can share `created_at` to the second, and a mark that depends on
+-- which of them SQLite happens to return first is a mark that is wrong occasionally rather than
+-- never. `runs.id` is AUTOINCREMENT, so "later" is a fact rather than a comparison of two strings.
+--
+-- NULL means this conversation has never been opened, which is why the column is nullable rather
+-- than defaulting to 0. They behave identically today — everything is unread either way — and they
+-- are still different facts, and only one of them can be stated honestly at creation time.
+--
+-- Deliberately NOT a boolean written when a turn ends. That would put the same fact in two places
+-- and make the daemon responsible for keeping them agreed, on every one of the five paths a turn can
+-- end by — including the one that runs no code at all, the daemon being killed underneath it. A
+-- watermark compared at READ time is right after a crash without anybody having written anything.
+ALTER TABLE chats ADD COLUMN last_seen_turn_id INTEGER;

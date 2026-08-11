@@ -4,16 +4,21 @@
 -- that produced them, and a seat keeps only that row's id. Copying the text into a column beside it
 -- would put the same answer in two places, and two places is where they eventually disagree.
 --
--- Numbered 0064, having been cut as 0062 and having been wrong twice before that.
+-- Numbered 0065, having been 0064, having been cut as 0062, and having been wrong twice before that.
 --
 -- The design named 0060; by the time this branch was cut, 0060 was an untracked file in the main
 -- checkout and 0061 was on `feat/canvas-da-frota`, so it went out as 0062. Master then landed that
--- branch with its two renumbered to 0062 and 0063, and the collision was invisible to git — two
--- files with different names and the same version, which only `sqlx::migrate!` would have caught.
+-- branch with its two renumbered to 0062 and 0063, so this became 0064. Master then landed
+-- `feat/tab-de-chats`, which brought `0061_chats.sql` and `0064_chats_last_seen.sql` — and 0064 was
+-- taken a second time.
 --
--- The rule this repository keeps: the BRANCH gives way, master's lineage stands. Twice before under
--- the same heading ("give 0060 up to the reset that is landing on master"). A number is not
--- reserved by being written down, only by being on master.
+-- BOTH collisions were invisible to git: two files with different names and the same version merge
+-- clean and report nothing, and only `sqlx::migrate!` would have found them, at daemon startup.
+-- Nothing detects this but looking, which is why the number is re-checked at every merge and not
+-- only when the file is written.
+--
+-- The rule this repository keeps: the BRANCH gives way, master's lineage stands. Three times now
+-- under the same heading. A number is not reserved by being written down, only by being on master.
 
 -- One deliberation.
 CREATE TABLE IF NOT EXISTS council_runs (

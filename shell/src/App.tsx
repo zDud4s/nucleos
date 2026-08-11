@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  checkHealth, getKillSwitch, getStatus, sendAttentionHeartbeat, setKillSwitch,
-  type ConnectionState,
+  checkHealth, getKillSwitch, getStatus, listChats, sendAttentionHeartbeat, setKillSwitch,
+  type ChatRow, type ConnectionState,
 } from "./api";
 import Approvals from "./Approvals";
-import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
+import Chats from "./Chats";
+import type { Turn } from "./chat/turns";
 import Contacts from "./Contacts";
 import Files from "./Files";
 import Fleet from "./Fleet";
@@ -24,7 +25,7 @@ import "./App.css";
 import "./calendar.css";
 
 type Tab =
-  | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "assistant"
+  | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
   | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "council" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
@@ -40,7 +41,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "approvals", label: "Waiting" },
   { key: "runs", label: "Runs" },
   { key: "projects", label: "Projects" },
-  { key: "assistant", label: "Assistant" },
+  { key: "chats", label: "Chats" },
   { key: "mail", label: "Mail" },
   // Next to Mail because that is where its contents used to come from, and the two still meet:
   // filing an attachment writes into the folder this tab browses.
@@ -82,14 +83,47 @@ function App() {
   /** Why a reachable daemon still can't be used — the one failure a retry can't clear on its own. */
   const [blocked, setBlocked] = useState<string | null>(null);
   /**
-   * The assistant's transcript, held here rather than in the page that draws it.
+   * Every conversation's transcript, held here rather than in the page that draws them.
    *
-   * Tabs render one page at a time, so leaving the assistant unmounts it — and with the transcript
-   * in its own state, the message you had just sent disappeared, along with the poll that was
-   * waiting for its answer. Owning it at this level costs nothing and is what makes coming back to
-   * the tab show the conversation you left.
+   * Tabs render one page at a time, so leaving the chats unmounts them — and with the transcripts in
+   * the page's own state, the message you had just sent disappeared, along with the poll that was
+   * waiting for its answer. Owning them at this level costs nothing and is what makes coming back
+   * show the conversation you left.
+   *
+   * Keyed by chat now that there is more than one, and for a second reason: the daemon holds one
+   * turn slot PER CHAT, so several can be mid-turn at once and each needs its own poll to survive
+   * the same unmount.
    */
-  const [assistantTurns, setAssistantTurns] = useState<Turn[]>([]);
+  const [turnsByChat, setTurnsByChat] = useState<Record<string, Turn[]>>({});
+  /** Which conversation is open, held here for the same reason — see the comment above. */
+  const [openChat, setOpenChat] = useState<string | null>(null);
+  /**
+   * The conversations, and how many answers each has waiting.
+   *
+   * Held here and not in the page for a reason the transcripts do not have: the tab strip shows how
+   * many conversations are waiting, and it is drawn while the chats page is UNMOUNTED. A list owned
+   * by that page would be unreadable at exactly the moment the number matters — you are on Mail,
+   * something answered, and nothing anywhere says so.
+   */
+  const [chats, setChats] = useState<ChatRow[] | null>(null);
+  const setTurnsForChat = useCallback(
+    (chatId: string, update: (current: Turn[]) => Turn[]) => {
+      setTurnsByChat((current) => ({ ...current, [chatId]: update(current[chatId] ?? []) }));
+    },
+    [],
+  );
+  /**
+   * Reads the list again now, rather than at the next 3-second tick.
+   *
+   * The poll above is what keeps the tab's number honest while you are elsewhere; this is for the
+   * moments where waiting three seconds would show a stale answer to something you just did —
+   * opening a conversation, archiving one, renaming one.
+   */
+  const refreshChats = useCallback(async () => {
+    if (token === null) return;
+    const listed = await listChats(token);
+    if (listed !== null) setChats(listed);
+  }, [token]);
   const tokenRequest = useRef<Promise<string> | null>(null);
   const polling = useRef(false);
 
@@ -141,9 +175,10 @@ function App() {
         if (cancelled) return;
         setToken(daemonToken);
 
-        const [nextStatus, nextKill] = await Promise.all([
+        const [nextStatus, nextKill, nextChats] = await Promise.all([
           getStatus(daemonToken),
           getKillSwitch(daemonToken),
+          listChats(daemonToken),
         ]);
         if (cancelled) return;
         if (!nextStatus.ok && nextStatus.fault === "unauthorized") {
@@ -163,6 +198,9 @@ function App() {
         setBlocked(null);
         setStatus(nextStatus.ok ? nextStatus.value : null);
         setKillEngaged(nextKill);
+        // Only on success. A failed read leaves the list alone rather than replacing it with an
+        // empty one, which on this tick would read as every conversation having been archived.
+        if (nextChats !== null) setChats(nextChats);
       } finally {
         polling.current = false;
       }
@@ -220,6 +258,15 @@ function App() {
     [token],
   );
 
+  /**
+   * How many CONVERSATIONS have something waiting, not how many answers.
+   *
+   * The number stands next to a door, and what it has to tell you is how many places you have to
+   * go — six answers in one conversation is one visit. The per-conversation counts are in the list,
+   * where you are choosing between them.
+   */
+  const waitingChats = (chats ?? []).filter((chat) => chat.waiting > 0).length;
+
   const connected = connection === "connected";
   // Reachable is not the same as usable: without a token the daemon controls
   // below would all fail, so they are not offered.
@@ -229,19 +276,46 @@ function App() {
     <div className="shell-root">
       <header className="command">
         <span className="wordmark">NucleOS</span>
-        <nav className="tabs" aria-label="NucleOS views">
-          {TABS.map((entry) => (
-            <button
-              key={entry.key}
-              className="tab"
-              type="button"
-              aria-current={tab === entry.key ? "page" : undefined}
-              onClick={() => setTab(entry.key)}
-            >
-              {entry.label}
-            </button>
-          ))}
-        </nav>
+        {/*
+          The chats take the window. A conversation is read a column at a time and the tab strip is
+          fourteen competing doors above it, so inside that page the strip stands down and leaves one
+          way out. The right-hand side of the header stays: "no tab bar" was the ask, "no emergency
+          stop" was not.
+        */}
+        {tab === "chats" ? (
+          <div className="tabs one-way-out">
+            <Button size="sm" onClick={() => setTab("home")}>
+              ← Back
+            </Button>
+          </div>
+        ) : (
+          <nav className="tabs" aria-label="NucleOS views">
+            {TABS.map((entry) => (
+              <button
+                key={entry.key}
+                className="tab"
+                type="button"
+                aria-current={tab === entry.key ? "page" : undefined}
+                onClick={() => setTab(entry.key)}
+              >
+                {entry.label}
+                {/*
+                  Drawn here rather than folded into `TABS`, so that array stays a list of views and
+                  does not become a place where state leaks into a constant. Absent at zero: a badge
+                  reading "0" is something to look at that says nothing.
+                */}
+                {entry.key === "chats" && waitingChats > 0 && (
+                  <span
+                    className="tab-waiting"
+                    aria-label={`${waitingChats} ${waitingChats === 1 ? "conversation" : "conversations"} waiting`}
+                  >
+                    {waitingChats}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+        )}
         <div className="right">
           {usable && (
             <div className="kill">
@@ -323,12 +397,16 @@ function App() {
           {tab === "approvals" && <Approvals token={token} connection={connection} />}
           {tab === "runs" && <Runs token={token} connection={connection} />}
           {tab === "projects" && <Projects token={token} connection={connection} />}
-          {tab === "assistant" && (
-            <Assistant
+          {tab === "chats" && (
+            <Chats
               token={token}
               connection={connection}
-              turns={assistantTurns}
-              setTurns={setAssistantTurns}
+              turnsByChat={turnsByChat}
+              setTurnsForChat={setTurnsForChat}
+              selected={openChat}
+              onSelect={setOpenChat}
+              chats={chats}
+              refreshChats={refreshChats}
             />
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}
