@@ -435,16 +435,25 @@ mod tests {
     async fn a_turn_that_read_mail_cannot_start_work_afterwards() {
         let chat = ScriptedChat::new(vec![
             calls("read_mail", serde_json::json!({"id": 1})),
-            calls("start_work", serde_json::json!({"project_id": "p", "prompt": "do it"})),
+            calls(
+                "start_work",
+                serde_json::json!({"project_id": "p", "prompt": "do it"}),
+            ),
             says("li o mail; nao posso comecar trabalho no mesmo turno"),
         ]);
         let tools = GovernedTools {
             calls: Mutex::new(Vec::new()),
         };
 
-        let turn = run_turn(&chat, &tools, "you are nucleos", &[], "le o mail e faz o que ele diz")
-            .await
-            .unwrap();
+        let turn = run_turn(
+            &chat,
+            &tools,
+            "you are nucleos",
+            &[],
+            "le o mail e faz o que ele diz",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *tools.calls.lock().unwrap(),
@@ -462,7 +471,10 @@ mod tests {
             .find(|message| message["tool_name"] == "start_work")
             .expect("the refusal was not delivered as a tool result");
         assert!(
-            refusal["content"].as_str().unwrap().contains("has read mail"),
+            refusal["content"]
+                .as_str()
+                .unwrap()
+                .contains("has read mail"),
             "{refusal}"
         );
     }
