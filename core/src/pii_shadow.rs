@@ -208,9 +208,16 @@ async fn record_at_attempt(
 ///
 /// Bounded because each one is a model call: an unbounded sweep on a mailbox that has just been
 /// backfilled would occupy the local model for hours, and the local model is also what answers
-/// triage and, when configured, the chat. Each call now reasons before it answers, so this is also
-/// what keeps a sweep comfortably inside its own interval.
-const SWEEP_BATCH: i64 = 20;
+/// triage and, when configured, the chat.
+///
+/// Six, not twenty, and the number comes from a measurement rather than a guess. A reasoning pass
+/// over one field takes about forty seconds here, so twenty of them is thirteen minutes out of
+/// every fifteen — the earlier comment claimed that fitted "comfortably inside its own interval",
+/// which was arithmetic nobody had done. Six is four minutes, leaving the model free for the
+/// things that are actually waiting on it. The mailbox is caught up more slowly and that costs
+/// nothing: this is a measurement, and the only thing a slower one delays is a decision that is
+/// months away.
+const SWEEP_BATCH: i64 = 6;
 
 /// Whether the model reasons before answering, and it is the difference between measuring and not.
 ///
@@ -240,10 +247,15 @@ const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// How long one field may occupy the model before the sweep gives up on it.
 ///
-/// Generous, because a reasoning pass over a 2000-character subject is not fast, and short enough
-/// that a stalled generation cannot cost the whole interval. Twenty of these is the worst case a
-/// sweep can take, which is what keeps `SWEEP_BATCH` honest about fitting inside `SWEEP_INTERVAL`.
-const SWEEP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+/// This is a hang detector, not a budget, and the first version confused the two. It was set to 40
+/// seconds in the same commit that turned reasoning on, and a reasoning pass over a single subject
+/// line on this machine measures 36 to 43 seconds — so roughly half of them expired, and since a
+/// failed request stops the whole sweep, the sweep simply never completed. A timeout added to stop
+/// the table silently not filling was what stopped it filling.
+///
+/// Three minutes is far above anything observed and still finite, which is all it needs to be: the
+/// thing it exists to catch is a generation that has stalled, not one that is slow.
+const SWEEP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Observes the summaries triage has written and not yet been looked at.
 ///
