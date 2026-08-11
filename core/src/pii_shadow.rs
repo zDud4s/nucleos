@@ -315,7 +315,10 @@ async fn observe_column(
     // `debug_assert` compiles to nothing in release — so the audit `AssertSqlSafe` below rests on
     // would have been absent from the only build that matters.
     if !OBSERVABLE_COLUMNS.contains(&column) {
-        tracing::error!(column, "pii shadow: refusing to sweep a column this pass may not read");
+        tracing::error!(
+            column,
+            "pii shadow: refusing to sweep a column this pass may not read"
+        );
         return Ok((0, 0, false));
     }
 
@@ -723,9 +726,15 @@ mod tests {
         .unwrap();
 
         let stub = stub_ollama("[]").await;
-        observe_pending(&pool, &reqwest::Client::new(), &stub, "m", "2026-08-09T00:00:00Z")
-            .await
-            .unwrap();
+        observe_pending(
+            &pool,
+            &reqwest::Client::new(),
+            &stub,
+            "m",
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         let mut seen: Vec<String> =
             sqlx::query_scalar("SELECT source_column FROM pii_observations ORDER BY source_column")
@@ -733,8 +742,7 @@ mod tests {
                 .await
                 .unwrap();
         seen.dedup();
-        let mut expected: Vec<String> =
-            OBSERVABLE_COLUMNS.iter().map(|c| c.to_string()).collect();
+        let mut expected: Vec<String> = OBSERVABLE_COLUMNS.iter().map(|c| c.to_string()).collect();
         expected.sort();
         assert_eq!(seen, expected, "a column the table permits was never read");
     }
@@ -769,10 +777,15 @@ mod tests {
         }
 
         let stub = stub_ollama("[]").await;
-        let written =
-            observe_pending(&pool, &reqwest::Client::new(), &stub, "m", "2026-08-11T00:00:00Z")
-                .await
-                .unwrap();
+        let written = observe_pending(
+            &pool,
+            &reqwest::Client::new(),
+            &stub,
+            "m",
+            "2026-08-11T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(written, SWEEP_BATCH as u64, "the sweep exceeded its budget");
 
