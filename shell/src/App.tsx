@@ -5,8 +5,9 @@ import {
   type ConnectionState,
 } from "./api";
 import Approvals from "./Approvals";
-import Assistant, { type Turn } from "./Assistant";
 import Autopilot from "./Autopilot";
+import Chats from "./Chats";
+import type { Turn } from "./chat/turns";
 import Contacts from "./Contacts";
 import Files from "./Files";
 import Home from "./Home";
@@ -22,7 +23,7 @@ import "./App.css";
 import "./calendar.css";
 
 type Tab =
-  | "home" | "autopilot" | "approvals" | "runs" | "projects" | "assistant"
+  | "home" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
   | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
@@ -34,7 +35,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "approvals", label: "Waiting" },
   { key: "runs", label: "Runs" },
   { key: "projects", label: "Projects" },
-  { key: "assistant", label: "Assistant" },
+  { key: "chats", label: "Chats" },
   { key: "mail", label: "Mail" },
   // Next to Mail because that is where its contents used to come from, and the two still meet:
   // filing an attachment writes into the folder this tab browses.
@@ -72,14 +73,26 @@ function App() {
   /** Why a reachable daemon still can't be used — the one failure a retry can't clear on its own. */
   const [blocked, setBlocked] = useState<string | null>(null);
   /**
-   * The assistant's transcript, held here rather than in the page that draws it.
+   * Every conversation's transcript, held here rather than in the page that draws them.
    *
-   * Tabs render one page at a time, so leaving the assistant unmounts it — and with the transcript
-   * in its own state, the message you had just sent disappeared, along with the poll that was
-   * waiting for its answer. Owning it at this level costs nothing and is what makes coming back to
-   * the tab show the conversation you left.
+   * Tabs render one page at a time, so leaving the chats unmounts them — and with the transcripts in
+   * the page's own state, the message you had just sent disappeared, along with the poll that was
+   * waiting for its answer. Owning them at this level costs nothing and is what makes coming back
+   * show the conversation you left.
+   *
+   * Keyed by chat now that there is more than one, and for a second reason: the daemon holds one
+   * turn slot PER CHAT, so several can be mid-turn at once and each needs its own poll to survive
+   * the same unmount.
    */
-  const [assistantTurns, setAssistantTurns] = useState<Turn[]>([]);
+  const [turnsByChat, setTurnsByChat] = useState<Record<string, Turn[]>>({});
+  /** Which conversation is open, held here for the same reason — see the comment above. */
+  const [openChat, setOpenChat] = useState<string | null>(null);
+  const setTurnsForChat = useCallback(
+    (chatId: string, update: (current: Turn[]) => Turn[]) => {
+      setTurnsByChat((current) => ({ ...current, [chatId]: update(current[chatId] ?? []) }));
+    },
+    [],
+  );
   const tokenRequest = useRef<Promise<string> | null>(null);
   const polling = useRef(false);
 
@@ -219,19 +232,33 @@ function App() {
     <div className="shell-root">
       <header className="command">
         <span className="wordmark">NucleOS</span>
-        <nav className="tabs" aria-label="NucleOS views">
-          {TABS.map((entry) => (
-            <button
-              key={entry.key}
-              className="tab"
-              type="button"
-              aria-current={tab === entry.key ? "page" : undefined}
-              onClick={() => setTab(entry.key)}
-            >
-              {entry.label}
-            </button>
-          ))}
-        </nav>
+        {/*
+          The chats take the window. A conversation is read a column at a time and the tab strip is
+          thirteen competing doors above it, so inside that page the strip stands down and leaves one
+          way out. The right-hand side of the header stays: "no tab bar" was the ask, "no emergency
+          stop" was not.
+        */}
+        {tab === "chats" ? (
+          <div className="tabs one-way-out">
+            <Button size="sm" onClick={() => setTab("home")}>
+              ← Back
+            </Button>
+          </div>
+        ) : (
+          <nav className="tabs" aria-label="NucleOS views">
+            {TABS.map((entry) => (
+              <button
+                key={entry.key}
+                className="tab"
+                type="button"
+                aria-current={tab === entry.key ? "page" : undefined}
+                onClick={() => setTab(entry.key)}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </nav>
+        )}
         <div className="right">
           {usable && (
             <div className="kill">
@@ -305,12 +332,14 @@ function App() {
           {tab === "approvals" && <Approvals token={token} connection={connection} />}
           {tab === "runs" && <Runs token={token} connection={connection} />}
           {tab === "projects" && <Projects token={token} connection={connection} />}
-          {tab === "assistant" && (
-            <Assistant
+          {tab === "chats" && (
+            <Chats
               token={token}
               connection={connection}
-              turns={assistantTurns}
-              setTurns={setAssistantTurns}
+              turnsByChat={turnsByChat}
+              setTurnsForChat={setTurnsForChat}
+              selected={openChat}
+              onSelect={setOpenChat}
             />
           )}
           {tab === "mail" && <Mail token={token} connection={connection} />}

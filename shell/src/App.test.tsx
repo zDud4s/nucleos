@@ -180,7 +180,7 @@ describe("App navigation and presence", () => {
     expect(
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
     ).toEqual([
-      "Home", "Autopilot", "Waiting", "Runs", "Projects", "Assistant",
+      "Home", "Autopilot", "Waiting", "Runs", "Projects", "Chats",
       "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "System",
     ]);
   });
@@ -226,11 +226,31 @@ describe("App navigation and presence", () => {
  * its answer died with it, so the turn could never finish even after the daemon had answered.
  */
 describe("the assistant transcript survives a tab switch", () => {
+  /** The one conversation these tests talk in. */
+  const THE_CHAT = {
+    chat_id: "c1",
+    title: "the one",
+    brain: "cloud" as const,
+    created_at: "2026-08-11T10:00:00+00:00",
+    first_message: null,
+    last_activity: null,
+  };
+
   /** A daemon that takes a message as turn 501 and reports whatever `status` currently says. */
   function assistantDaemon(status: () => { status: string; stdout: string | null }) {
     return async (url: string) => {
       if (url.endsWith("/assistant/message")) {
         return { ok: true, status: 200, json: async () => ({ turn_id: 501 }) };
+      }
+      if (url.endsWith("/assistant/local-model")) {
+        return { ok: true, status: 200, json: async () => ({ available: false }) };
+      }
+      // Checked before the bare `/assistant/chats`, which is a suffix of this one.
+      if (url.includes("/assistant/chats/")) {
+        return { ok: true, status: 200, json: async () => [] };
+      }
+      if (url.endsWith("/assistant/chats")) {
+        return { ok: true, status: 200, json: async () => [THE_CHAT] };
       }
       if (url.endsWith("/assistant/501")) {
         const now = status();
@@ -252,6 +272,20 @@ describe("the assistant transcript survives a tab switch", () => {
 
   function go(tab: string) {
     fireEvent.click(screen.getByRole("button", { name: tab }));
+  }
+
+  /** Enters the chats and opens the one conversation the daemon above is holding. */
+  async function openTheChat() {
+    go("Chats");
+    await settle();
+    fireEvent.click(screen.getByText("the one"));
+    await settle();
+  }
+
+  /** The one way out of the chats: inside them the tab strip stands down. */
+  async function back() {
+    fireEvent.click(screen.getByRole("button", { name: "← Back" }));
+    await settle();
   }
 
   async function ask(what: string) {
@@ -280,26 +314,58 @@ describe("the assistant transcript survives a tab switch", () => {
    */
   it("loads the conversation from the daemon rather than starting empty", async () => {
     fetchMock.mockImplementation(async (url: string) => {
-      if (String(url).endsWith("/assistant/chats/shell")) {
+      if (String(url).endsWith("/assistant/local-model")) {
+        return { ok: true, status: 200, json: async () => ({ available: false }) };
+      }
+      if (String(url).includes("/assistant/chats/")) {
         return {
           ok: true,
           status: 200,
           json: async () => [
             { id: 41, asked: "what did I ask before?", answer: "this", error: null,
-              status: "completed", cost_usd: 0.01, created_at: "2026-07-30T10:00:00Z" },
+              status: "completed", cost_usd: 0.01, answered_by: "cloud",
+              created_at: "2026-07-30T10:00:00Z" },
           ],
         };
+      }
+      if (String(url).endsWith("/assistant/chats")) {
+        return { ok: true, status: 200, json: async () => [THE_CHAT] };
       }
       return healthyDaemon()(url);
     });
 
     render(<App />);
     await settle();
-    go("Assistant");
-    await settle();
+    await openTheChat();
 
     expect(screen.getByText("what did I ask before?")).toBeTruthy();
     expect(screen.getByText("this")).toBeTruthy();
+  });
+
+  it("hides the tab bar inside the chats and keeps the emergency stop", async () => {
+    // "No tab bar" is the ask. "No emergency stop" is not — and the right side of the header is
+    // where the kill switch lives.
+    fetchMock.mockImplementation(assistantDaemon(() => ({ status: "running", stdout: null })));
+
+    render(<App />);
+    await settle();
+    go("Chats");
+    await settle();
+
+    expect(screen.queryByLabelText("NucleOS views")).toBeNull();
+    expect(screen.getByRole("button", { name: "Kill switch" })).toBeTruthy();
+  });
+
+  it("comes back to the bar through ← Back", async () => {
+    fetchMock.mockImplementation(assistantDaemon(() => ({ status: "running", stdout: null })));
+
+    render(<App />);
+    await settle();
+    go("Chats");
+    await settle();
+    await back();
+
+    expect(screen.getByLabelText("NucleOS views")).toBeTruthy();
   });
 
   it("keeps a turn the daemon has not caught up with yet", async () => {
@@ -310,13 +376,13 @@ describe("the assistant transcript survives a tab switch", () => {
 
     render(<App />);
     await settle();
-    go("Assistant");
-    await settle();
+    await openTheChat();
     await ask("acabei de escrever isto");
 
+    await back();
     go("Runs");
     await settle();
-    go("Assistant");
+    go("Chats");
     await settle();
 
     expect(screen.getByText("acabei de escrever isto")).toBeTruthy();
@@ -327,20 +393,21 @@ describe("the assistant transcript survives a tab switch", () => {
 
     render(<App />);
     await settle();
-    go("Assistant");
-    await settle();
+    await openTheChat();
     await ask("olá núcleo");
 
     expect(screen.getByText("olá núcleo")).toBeTruthy();
 
+    await back();
     go("Runs");
     await settle();
     expect(screen.queryByText("olá núcleo")).toBeNull();
 
-    go("Assistant");
+    go("Chats");
     await settle();
 
-    // The whole point: the question is still on screen, not lost with the unmounted page.
+    // The whole point, twice over: the question is still on screen, and the conversation it belongs
+    // to is still the open one — both are owned above the page that draws them.
     expect(screen.getByText("olá núcleo")).toBeTruthy();
   });
 
@@ -356,17 +423,17 @@ describe("the assistant transcript survives a tab switch", () => {
 
     render(<App />);
     await settle();
-    go("Assistant");
-    await settle();
+    await openTheChat();
     await ask("estás aí?");
 
+    await back();
     go("Runs");
     await settle();
     // The turn finishes in the daemon while nothing is watching it.
     finished = true;
     await tick(6000);
 
-    go("Assistant");
+    go("Chats");
     await settle();
     // Remounting derives the pending turn back out of the transcript, so the poll restarts and
     // finds the answer. Held as separate state, this stayed on "Working…" forever.

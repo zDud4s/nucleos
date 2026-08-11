@@ -27,6 +27,13 @@ interface ChatsProps {
    */
   turnsByChat: Record<string, Turn[]>;
   setTurnsForChat: (chatId: string, update: (current: Turn[]) => Turn[]) => void;
+  /**
+   * Which conversation is open, owned by `App` for the same reason the transcripts are: leaving the
+   * tab unmounts this page, and a selection kept here came back null — so you returned to a column
+   * of names rather than to the conversation you were having.
+   */
+  selected: string | null;
+  onSelect: (chatId: string | null) => void;
 }
 
 /**
@@ -39,9 +46,10 @@ interface ChatsProps {
  * run row records which chat it belonged to — which is what makes a conversation outlive a restart
  * and not merely a tab switch.
  */
-function Chats({ token, connection, turnsByChat, setTurnsForChat }: ChatsProps) {
+function Chats({
+  token, connection, turnsByChat, setTurnsForChat, selected, onSelect,
+}: ChatsProps) {
   const [chats, setChats] = useState<ChatRow[] | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
   /** The conversations whose transcript has been read back at least once. */
   const [read, setRead] = useState<Set<string>>(new Set());
   const [localAvailable, setLocalAvailable] = useState(false);
@@ -164,7 +172,7 @@ function Chats({ token, connection, turnsByChat, setTurnsForChat }: ChatsProps) 
       return;
     }
     await refreshChats();
-    setSelected(created.value);
+    onSelect(created.value);
   }
 
   async function send(text: string): Promise<ApiResult<number>> {
@@ -230,7 +238,7 @@ function Chats({ token, connection, turnsByChat, setTurnsForChat }: ChatsProps) 
       setFailed("The daemon did not archive the conversation.");
       return;
     }
-    if (chatId === selected) setSelected(null);
+    if (chatId === selected) onSelect(null);
     await refreshChats();
   }
 
@@ -255,7 +263,7 @@ function Chats({ token, connection, turnsByChat, setTurnsForChat }: ChatsProps) 
         chats={chats ?? []}
         selected={selected}
         busy={busy}
-        onSelect={setSelected}
+        onSelect={onSelect}
         onNew={() => void openChat()}
         onArchive={(chatId) => void archive(chatId)}
       />

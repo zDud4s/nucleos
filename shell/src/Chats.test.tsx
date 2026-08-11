@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
@@ -58,15 +59,27 @@ async function settle() {
   await act(async () => {});
 }
 
+/**
+ * The page with its selection held outside it, the way `App` holds it.
+ *
+ * A stub that only records would make every click a no-op, so this re-renders with the new
+ * selection — which is what the real owner does.
+ */
 function renderChats(turnsByChat: Record<string, Turn[]> = {}) {
-  return render(
-    <Chats
-      token="daemon-token"
-      connection="connected"
-      turnsByChat={turnsByChat}
-      setTurnsForChat={() => {}}
-    />,
-  );
+  function Host() {
+    const [selected, setSelected] = useState<string | null>(null);
+    return (
+      <Chats
+        token="daemon-token"
+        connection="connected"
+        turnsByChat={turnsByChat}
+        setTurnsForChat={() => {}}
+        selected={selected}
+        onSelect={setSelected}
+      />
+    );
+  }
+  return render(<Host />);
 }
 
 describe("Chats", () => {
@@ -171,6 +184,8 @@ describe("Chats", () => {
         connection="disconnected"
         turnsByChat={{}}
         setTurnsForChat={() => {}}
+        selected={null}
+        onSelect={() => {}}
       />,
     );
 
