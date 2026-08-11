@@ -106,6 +106,7 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/chats/{chat_id}",
             get(get_assistant_chat).patch(patch_chat).delete(delete_chat),
         )
+        .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/{turn_id}", get(get_run))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
@@ -2638,6 +2639,10 @@ struct AssistantTurn {
     error: Option<String>,
     status: String,
     cost_usd: Option<f64>,
+    /// Which model answered. Null on turns from before the column existed, and the window must keep
+    /// that distinction: it is what stops a "changed model here" mark being drawn against a turn
+    /// nothing knows the model of.
+    answered_by: Option<String>,
     created_at: String,
 }
 
@@ -2661,7 +2666,7 @@ async fn get_assistant_chat(
 ) -> Result<Json<Vec<AssistantTurn>>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                created_at
+                answered_by, created_at
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -2737,6 +2742,17 @@ async fn patch_chat(
     Path(chat_id): Path<String>,
     Json(body): Json<PatchChatRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    // Answered before anything is written. Without it a PATCH against a chat that was never opened
+    // — or was archived — reports `204 No Content` for an UPDATE that matched no row, which is the
+    // API saying "done" about something it did not do.
+    if crate::chats::get(&state.pool, &chat_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_none()
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     if let Some(brain) = body.brain.as_deref() {
         // `answered_by` is written when a turn's row is born, so moving the brain under a live turn
         // would make that column lie about who answered it. 409 rather than a queue: the same
@@ -2767,6 +2783,81 @@ async fn patch_chat(
             })?;
     }
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// How much of a model's answer may become a title.
+///
+/// A model asked for five words can answer with a paragraph, and the answer goes straight into a
+/// sidebar. Cut here rather than in CSS: what is stored is what other clients will read, and a
+/// paragraph in that column is a paragraph everywhere.
+const TITLE_LIMIT: usize = 80;
+
+/// The first thing the model said that could be a name, bounded.
+fn title_from(reply: &str) -> String {
+    reply
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(TITLE_LIMIT)
+        .collect()
+}
+
+/// Names a conversation using the local model.
+///
+/// Local only, and 503 rather than a cloud fallback when there is none: a title is decoration, and
+/// decoration is not worth a billed cloud call — every turn on the other path is a run with a price
+/// on it. The same 503 covers a model that answered with nothing usable, because from the caller's
+/// side "the local model could not name this" is one fact either way.
+///
+/// The history comes from `recent_exchanges`, so this reads the conversation under the same barrier
+/// a local turn does: nothing from before the last turn that read third-party text. A title drawn
+/// from a stranger's mail would be that mail choosing what this conversation is called.
+async fn post_chat_title(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let assistant = state
+        .local_assistant
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let history = crate::assistant::recent_exchanges(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a chat before naming it failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    // Nothing has been said, so there is nothing to name it after. Asking anyway would be the model
+    // guessing about a conversation that has not happened.
+    if history.is_empty() {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let turn = assistant
+        .answer(
+            &history,
+            "Name this conversation in at most five words, in the language it is being had in. \
+             Answer with the name alone, on one line, and call no tools — everything you need is \
+             already above.",
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "the local model could not name a chat");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    let title = title_from(&turn.answer);
+    if title.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    crate::chats::rename(&state.pool, &chat_id, Some(&title))
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "storing a chat's name failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5735,6 +5826,17 @@ mod tests {
         );
     }
 
+    /// `204 No Content` for an UPDATE that matched no row is the API saying "done" about something
+    /// it did not do — and the caller would go on showing a model this chat is not set to.
+    #[tokio::test]
+    async fn patching_a_chat_that_was_never_opened_says_so() {
+        let state = test_state().await;
+
+        let status = patch_chat_request(state, "never-opened", r#"{"brain":"local"}"#).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn archiving_a_chat_takes_it_off_the_list() {
         let state = test_state().await;
@@ -5757,6 +5859,181 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let listed = crate::chats::list(&state.pool).await.unwrap();
         assert!(listed.iter().all(|chat| chat.chat_id != id));
+    }
+
+    /// Without this column on the way out, the window has no way to see that a conversation changed
+    /// model, and the mark it draws to say so simply never appears. The failure is silent, which is
+    /// why it is asserted here rather than left to the page's own tests.
+    #[tokio::test]
+    async fn a_transcript_says_which_model_answered_each_turn() {
+        let state = test_state().await;
+        for (prompt, answered_by) in [("primeira", "cloud"), ("segunda", "local")] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, answered_by, created_at)
+                 VALUES (?, 'completed', 'assistant', 'mixed', 'ok', ?, '2026-08-11T10:00:00+00:00')",
+            )
+            .bind(prompt)
+            .bind(answered_by)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/mixed")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        let by: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|turn| turn["answered_by"].as_str().unwrap())
+            .collect();
+        assert_eq!(by, vec!["cloud", "local"]);
+    }
+
+    /// A local assistant that answers one fixed sentence and calls no tools.
+    fn fake_local_assistant(answer: &'static str) -> Arc<crate::local_agent::LocalAssistant> {
+        struct OneLiner(&'static str);
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for OneLiner {
+            async fn exchange(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                Ok(serde_json::json!({"role": "assistant", "content": self.0}))
+            }
+        }
+
+        struct NoTools;
+        #[async_trait::async_trait]
+        impl crate::local_agent::ToolBox for NoTools {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            async fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+                unreachable!("this assistant answers without calling tools")
+            }
+        }
+
+        Arc::new(crate::local_agent::LocalAssistant::new(
+            Box::new(OneLiner(answer)),
+            Box::new(NoTools),
+        ))
+    }
+
+    async fn ask_for_a_title(state: AppState, chat_id: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{chat_id}/title"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Records a finished exchange the way a turn would, so there is something to name.
+    async fn record_turn(state: &AppState, chat_id: &str, prompt: &str, reply: &str) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, answered_by, created_at)
+             VALUES (?, 'completed', 'assistant', ?, ?, 'cloud', '2026-08-11T10:00:00+00:00')",
+        )
+        .bind(prompt)
+        .bind(chat_id)
+        .bind(reply)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_title_without_a_local_model_says_so_instead_of_paying_for_one() {
+        let state = test_state().await; // no local model
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        record_turn(&state, &id, "quanto custa?", "depende").await;
+
+        // Titles are decoration. Decoration billed to the cloud is not a trade this makes silently.
+        assert_eq!(
+            ask_for_a_title(state, &id).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_with_nothing_said_in_it_cannot_be_named_from_its_contents() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("um título qualquer"));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+
+        // Nothing was asked yet, so there is nothing to name it after. Inventing one would be the
+        // model guessing about a conversation that has not happened.
+        assert_eq!(ask_for_a_title(state, &id).await, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn the_local_model_names_the_conversation() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("  O orçamento de Setembro\n"));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        record_turn(&state, &id, "quanto sobra este mês?", "cerca de 200").await;
+
+        assert_eq!(
+            ask_for_a_title(state.clone(), &id).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::chats::get(&state.pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("O orçamento de Setembro")
+        );
+    }
+
+    /// A model asked for five words can answer with a paragraph, and the answer goes straight into
+    /// a sidebar. The list is not the place to discover that.
+    #[tokio::test]
+    async fn a_title_that_runs_on_is_cut_rather_than_stored_whole() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant(
+            "Um título\nseguido de uma explicação que ninguém pediu e que continua bastante para lá do que cabe numa lista lateral",
+        ));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        record_turn(&state, &id, "olá", "olá").await;
+
+        ask_for_a_title(state.clone(), &id).await;
+
+        let title = crate::chats::get(&state.pool, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title
+            .unwrap();
+        assert_eq!(title, "Um título");
     }
 
     async fn set_sender_verdict(state: AppState, body: serde_json::Value) -> StatusCode {

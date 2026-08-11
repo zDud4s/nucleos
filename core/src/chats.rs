@@ -89,6 +89,11 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
     .await
 }
 
+/// One conversation, or `None` when it is not one of the app's — never opened here, or archived.
+///
+/// Read through `list` rather than with a query of its own, so there is exactly one definition of
+/// what a listed chat is and of where its fallback title comes from. A second SELECT saying almost
+/// the same thing is how the two drift.
 pub async fn get(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<ChatSummary>> {
     Ok(list(pool)
         .await?
