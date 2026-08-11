@@ -322,11 +322,12 @@ fn source_state(found: &[Overlap], complete: bool) -> State {
 /// The observed sets, and whether they are complete.
 ///
 /// Complete means: **every** live worktree of the project has a row, that row is later than the
-/// birth of the tree it claims to describe, it is within its shelf life, and its JSON parses. Each
-/// of those failures is a way of not having measured, and none of them is `clean`.
+/// birth of the tree it claims to describe, and its JSON parses. Each of those failures is a way of
+/// not having measured, and none of them is `clean`. Age is not one of them: see
+/// `a_measurement_taken_long_ago_still_counts`.
 ///
 /// **One worktree poisons the whole project, and old ones have no cure.** A tree created before
-/// migration `0060` has `base_sha = NULL`, is never measured, and therefore never has a row — which
+/// migration `0062` has `base_sha = NULL`, is never measured, and therefore never has a row — which
 /// puts its project into `not_measured` for as long as it lives. That is the correct behaviour
 /// (where it branched from is unknown and unrecoverable after the fact), and this is where the
 /// consequence shows up.
