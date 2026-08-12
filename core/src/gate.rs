@@ -143,6 +143,7 @@ pub async fn run_gate(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::process_tree::spawn_in_own_group(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -153,10 +154,10 @@ pub async fn run_gate(
         }
     };
 
-    // `runner::TreeKiller` is private to that module. Keep the same lifetime invariant here:
-    // declare the guard after the child so it drops first, while the process handle still pins the
-    // pid, and terminate the whole tree because a shell may have spawned the actual gate process.
-    let mut tree_killer = child.id().map(TreeKiller::new);
+    // Declared after the child so it drops first, while the process handle still pins the pid — the
+    // invariant `process_tree::TreeKiller` documents. The tree rather than the child because a gate
+    // command is whatever the project put in it, and a shell may have spawned the actual work.
+    let mut tree_killer = child.id().map(crate::process_tree::TreeKiller::new);
 
     let output = Arc::new(Mutex::new(TailBuffer::default()));
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -323,54 +324,6 @@ where
         }
         output.lock().await.extend(&bytes[..read]);
     }
-}
-
-struct TreeKiller {
-    pid: u32,
-    armed: bool,
-}
-
-impl TreeKiller {
-    fn new(pid: u32) -> Self {
-        Self { pid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn kill_now(&mut self) {
-        if self.armed {
-            terminate_process_tree(self.pid);
-            self.armed = false;
-        }
-    }
-}
-
-impl Drop for TreeKiller {
-    fn drop(&mut self) {
-        if self.armed {
-            terminate_process_tree(self.pid);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn terminate_process_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(windows))]
-fn terminate_process_tree(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 #[rustfmt::skip]

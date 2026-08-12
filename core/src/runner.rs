@@ -458,47 +458,10 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
     usage
 }
 
-/// Kills a spawned CLI's whole process TREE when a run is dropped mid-flight.
-///
-/// `kill_on_drop` reaches the direct child and stops there, but `claude` is a supervisor: it spawns
-/// bash, cargo, git and node to do the actual work. Terminating only the parent orphans those, and
-/// an orphaned `cargo build` keeps file locks inside the worktree that the run was supposed to
-/// release — which is what makes `git worktree remove` fail through its entire backoff and leaves
-/// the GC reporting the same failure every half hour.
-///
-/// Sound only while the `Child` is still alive, because the open process handle is what stops
-/// Windows reusing the pid. Hence `disarm()` the moment the child is reaped, and hence the killer
-/// is declared AFTER the child so it drops FIRST.
-struct TreeKiller {
-    pid: u32,
-    armed: bool,
-}
-
-impl TreeKiller {
-    fn new(pid: u32) -> Self {
-        Self { pid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TreeKiller {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Best effort by definition: this runs while a future is being dropped, so it cannot await
-        // and cannot report. `/T` is the whole point (the tree), `/F` because a cancelled run is
-        // not being asked politely.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &self.pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
+// The `TreeKiller` this module used to define lives in `process_tree.rs` now, together with the
+// spawn contract that makes it correct off Windows. This copy was the one whose `Drop` called
+// `taskkill` with no `cfg` at all — a silent no-op on every other platform.
+use crate::process_tree::TreeKiller;
 
 /// Why an Ollama model cannot safely accept the local triage prompt.
 ///
@@ -832,18 +795,24 @@ pub async fn ollama_message(
     // well succeed; a refusal to connect is about the endpoint and every request after it will fail
     // the same way. `pii_shadow`'s sweep reads exactly that distinction to decide between moving
     // past one field and abandoning the pass.
+    // One classification, applied to every await that can expire, rather than to the first one. The
+    // client's timeout covers the body read as well as the request, and a timeout surfacing there
+    // used to be reported as `Other` — which this function's own contract, three lines up, says
+    // means the endpoint is gone. The caller would have abandoned its pass over a slow answer.
+    fn classify(error: reqwest::Error) -> std::io::Error {
+        if error.is_timeout() {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+        } else {
+            std::io::Error::other(error)
+        }
+    }
+
     let response = client
         .post(format!("{base_url}/api/chat"))
         .json(&body)
         .send()
         .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, error)
-            } else {
-                std::io::Error::other(error)
-            }
-        })?;
+        .map_err(classify)?;
 
     // The BODY, not just the status. `error_for_status` throws it away, and it is where Ollama says
     // what was wrong — "this model does not support thinking", say. Without it a configuration
@@ -861,7 +830,7 @@ pub async fn ollama_message(
     let response = response
         .json::<serde_json::Value>()
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(classify)?;
 
     response
         .get("message")
@@ -1108,6 +1077,9 @@ impl CommandRunner for ClaudeCliRunner {
         // kill_on_drop turns an aborted awaiting-task (cancel/timeout, Task 4) into the OS `claude`
         // process actually dying. DO NOT drop this line — Chunk 5 Task 1 adds `--model` and preserves it.
         cmd.kill_on_drop(true);
+        // The other half of the `TreeKiller` below: off Windows, killing a tree means killing a
+        // process GROUP, and the child has to lead one before it can be named.
+        crate::process_tree::spawn_in_own_group(&mut cmd);
 
         // The ONLY `?` from here on. Everything below turns a failure into a failed RunOutcome
         // instead of an `Err`, because `runs::spawn_run` reads `Err` as "the CLI never ran, so a
@@ -1541,6 +1513,7 @@ impl CommandRunner for CodexCliRunner {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        crate::process_tree::spawn_in_own_group(&mut cmd);
 
         // The ONLY `?` from here on, for the reason spelled out in `ClaudeCliRunner`: past the spawn
         // a failure becomes a failed `RunOutcome`, because an `Err` claims no work was done.

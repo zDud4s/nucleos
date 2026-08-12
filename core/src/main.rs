@@ -12,6 +12,7 @@ mod collision;
 mod concurrency;
 mod config;
 mod contacts;
+mod council;
 mod daemon_client;
 mod email;
 mod feed;
@@ -32,6 +33,7 @@ mod notify;
 mod pii_shadow;
 mod presets;
 mod priority;
+mod process_tree;
 mod proposals;
 mod recurrence;
 mod redact;
@@ -250,6 +252,20 @@ async fn main() {
             %error,
             "vcs request reconciliation failed — a repository may stay queue-locked, and nothing retries before the next startup"
         ),
+    }
+
+    // After the run reconciliations, and that order is the whole of this pass's correctness: they
+    // mark every run left `running` as `interrupted`, so by now no council has a live seat and
+    // "still running" needs no further test to mean "abandoned". A council left that way is stuck
+    // at a phase that will never advance, with nothing to advance it.
+    match council::reconcile(&pool).await {
+        Ok(reconciled) if reconciled > 0 => {
+            tracing::warn!(
+                "reconciled {reconciled} council(s) left deliberating by a previous crash -> 'error'"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "council reconciliation failed"),
     }
 
     // After the run reconciliations above, so nothing from a previous life still counts as live.
@@ -510,6 +526,28 @@ async fn main() {
         None => None,
     };
 
+    // Read after the local model has been probed, because whether a `kind: local` seat is runnable
+    // is not something a config file can assert — startup PROVES it, and a roster naming a local
+    // seat this daemon cannot answer with is refused rather than quietly re-routed to the cloud.
+    let council_config = config::load_council_config(
+        std::path::Path::new(".ai/council.yaml"),
+        local_assistant.is_some(),
+    );
+    // Minted only when there is a council to use it, and never the control token: a seat is an
+    // agent CLI deciding what to call next, and `auth::COUNCIL_ROUTES` is what it can reach. A
+    // failure to mint leaves `None`, and `council::start` refuses — a seat with a key that
+    // authenticates nothing is a council that costs money to answer badly.
+    let council_token = match council_config.as_ref() {
+        Some(_) => match auth::mint_service_token(&pool, auth::Service::Council).await {
+            Ok(token) => Some(token),
+            Err(error) => {
+                tracing::error!(%error, "could not mint the council's key; the council stays off");
+                None
+            }
+        },
+        None => None,
+    };
+
     let state = AppState {
         token: Token(token_value),
         pool,
@@ -528,6 +566,7 @@ async fn main() {
             voice_cleanup_model,
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
+        council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,
             trusted_hosts: web_config.trusted_hosts.clone(),
