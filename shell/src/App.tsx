@@ -4,6 +4,7 @@ import {
   checkHealth, getKillSwitch, getStatus, listChats, sendAttentionHeartbeat, setKillSwitch,
   type ChatRow, type ConnectionState,
 } from "./api";
+import Agents from "./Agents";
 import Approvals from "./Approvals";
 import Autopilot from "./Autopilot";
 import Chats from "./Chats";
@@ -26,7 +27,8 @@ import "./calendar.css";
 
 type Tab =
   | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
-  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "council" | "system";
+  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "agents" | "council"
+  | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -52,6 +54,10 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "voice", label: "Voice" },
   { key: "calendar", label: "Calendar" },
   { key: "web", label: "Web" },
+  // Immediately before Council because it is the piece Council stands on: a seat is an agent
+  // borrowed for one question. Nothing here runs or spends — it is a catalogue — which is also why
+  // it does not break the sentence below about Council being the tab that spends on purpose.
+  { key: "agents", label: "Agents" },
   // Last before System, because it is the only tab that spends money on purpose: a council is up to
   // nine model invocations from one sentence. Ahead of System only because System is not a place you
   // do work.
@@ -415,6 +421,7 @@ function App() {
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "calendar" && <Calendar token={token} connection={connection} />}
           {tab === "web" && <Web token={token} connection={connection} />}
+          {tab === "agents" && <Agents token={token} connection={connection} />}
           {tab === "council" && <Council token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
         </main>
