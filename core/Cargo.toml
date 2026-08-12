@@ -35,5 +35,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # wrong at least once.
 url = "2.5"
 
+# `process_tree.rs` only, and only for job objects — the one Windows primitive that reaches a
+# grandchild whose parent link the MSYS `fork` emulation severed (measured; see that module). Already
+# in the lock file as tokio's own dependency, so this declares what is already built rather than
+# adding a tree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
