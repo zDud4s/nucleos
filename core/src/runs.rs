@@ -2416,11 +2416,11 @@ pub async fn prune_transcripts(
 /// otherwise never reach a sweep at all — the lesson `triage::run_triage_loop` already learned.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Retention for everything a finished run leaves behind: its transcript, its events, and in time
-/// its entries in the activity feed.
+/// Retention for everything finished work leaves behind: a run's transcript, its events, its
+/// entries in the activity feed, and the councils that are over.
 ///
-/// One loop rather than three, because they are the same sweep at different windows and splitting
-/// them would mean three tasks waking on the same hour to take the same write lock. Every failure
+/// One loop rather than four, because they are the same sweep at different windows and splitting
+/// them would mean four tasks waking on the same hour to take the same write lock. Every failure
 /// is best-effort and logged: a sweep that could not run is a fuller disk later, not a reason to
 /// take a daemon down now.
 pub async fn run_retention_loop(state: AppState) {
@@ -2441,6 +2441,16 @@ pub async fn run_retention_loop(state: AppState) {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "feed: entries past the retention window"),
             Err(error) => tracing::warn!(%error, "feed: retention sweep failed"),
+        }
+        // Unconditional, unlike the pillar's other work: a council is deleted whether or not
+        // `.ai/council.yaml` still names a roster. Gating the sweep on the pillar being configured
+        // would make a roster somebody removed the way their history stops being collected.
+        match crate::council::prune(&state.pool, crate::council::retention_days(), now).await {
+            Ok(0) => {}
+            Ok(pruned) => {
+                tracing::info!(pruned, "council: deliberations past the retention window")
+            }
+            Err(error) => tracing::warn!(%error, "council: retention sweep failed"),
         }
     }
 }
@@ -2788,6 +2798,7 @@ mod tests {
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout,
         };

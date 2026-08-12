@@ -435,6 +435,51 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "vcs_ticket",
 ];
 
+/// The tools a council seat may be offered, whichever machine answers it.
+///
+/// Named rather than computed, and the difference is what the list is for. "Everything that is not
+/// `Acts`" would be shorter and would hand a council every tool added to this server from now on,
+/// decided by whoever added it. A seat is a agent answering somebody's question with N siblings
+/// running beside it, so the surface it gets is a decision taken here, once, in writing.
+///
+/// It is what this machine already knows, and NOTHING that acts. A seat reads runs, proposals, the
+/// budget, the kill switch, the VCS queue, the mail and the files folder; it starts no work, lifts
+/// no approval and touches no switch. `create_run` and `create_job` are on `LOCAL_TOOLS` and
+/// deliberately absent here: a chat is one turn a person is watching, and a council is up to eight
+/// agents launched by one sentence.
+///
+/// `list_files` IS here where it is absent from `LOCAL_TOOLS`, and the asymmetry is deliberate: a
+/// filename is a poor thing to answer a chat with, and a good thing to answer "what has arrived
+/// about X" with when the seat can then read the mail it came from.
+///
+/// **`web_search` and `web_read` are absent, and they are the interesting absence** — both are
+/// `ReadsUntrusted` rather than `Acts`, so no rule below excludes them and this list is the only
+/// thing that does. Two reasons, and the second is the one that settles it. A council fans one
+/// question into up to eight agents, so a network door on each multiplies the egress of asking a
+/// question by eight. And an all-local roster is meant to be the way a question stays on this
+/// machine — a `kind: local` seat holding `web_search` would put the question on the network anyway,
+/// which makes the roster stop being the statement of where the question goes. If a seat ever needs
+/// the web, that is a decision to take once, here, with the owner having asked for it.
+///
+/// The taint rule (`ReadsUntrusted` then no `Acts`) still applies on top and is redundant here by
+/// construction — there is no `Acts` on this list for it to refuse. Two independent reasons for the
+/// same refusal is what one wants at a boundary like this.
+/// `every_council_tool_only_reads` holds this list to `TOOL_EFFECTS`, so reclassifying a tool as
+/// `Acts` without removing it from here fails the gate.
+///
+/// `vcs_ticket` is absent for a different reason from either: it is the read-back half of
+/// `vcs_request`, and a seat that cannot queue an operation has nothing of its own to read back.
+pub const COUNCIL_TOOLS: &[&str] = &[
+    "get_budget",
+    "get_email",
+    "get_email_queue",
+    "get_kill",
+    "get_run",
+    "list_files",
+    "list_projects",
+    "list_proposals",
+];
+
 /// What calling one NucleOS tool does to the turn that called it.
 ///
 /// This partition exists because an orchestrator turn is the only agent that both reads a
@@ -523,6 +568,14 @@ pub struct LocalToolBox {
     /// Read directly, not through a tool, because the budget check below has to HAPPEN rather than
     /// be requested. See `spend_is_permitted`.
     pool: sqlx::SqlitePool,
+    /// Which names this box advertises and will dispatch: `LOCAL_TOOLS` for a chat turn,
+    /// `COUNCIL_TOOLS` for a council seat.
+    ///
+    /// A field rather than a second type, because everything else about the two is identical — the
+    /// same router, the same dispatch, the same budget gate — and a second type would be a copy of
+    /// all of it kept in step by hand. What differs between a chat and a seat is exactly one list,
+    /// so exactly one list is what varies.
+    allowed: &'static [&'static str],
 }
 
 impl LocalToolBox {
@@ -544,9 +597,25 @@ impl LocalToolBox {
         }
     }
 
+    /// A chat turn's box: `LOCAL_TOOLS`.
     pub fn new(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
+        Self::with_tools(base_url, token, pool, LOCAL_TOOLS)
+    }
+
+    /// A council seat's box: `COUNCIL_TOOLS`, which carries nothing that acts.
+    pub fn for_council(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
+        Self::with_tools(base_url, token, pool, COUNCIL_TOOLS)
+    }
+
+    fn with_tools(
+        base_url: String,
+        token: String,
+        pool: sqlx::SqlitePool,
+        allowed: &'static [&'static str],
+    ) -> Self {
         Self {
             pool,
+            allowed,
             tools: NucleosTools {
                 client: crate::daemon_client::DaemonClient::new(base_url, token),
                 tool_router: NucleosTools::tool_router(),
@@ -564,7 +633,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         NucleosTools::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| LOCAL_TOOLS.contains(&tool.name.as_ref()))
+            .filter(|tool| self.allowed.contains(&tool.name.as_ref()))
             .map(|tool| {
                 serde_json::json!({
                     "type": "function",
@@ -590,9 +659,9 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         arguments: &serde_json::Value,
     ) -> crate::local_agent::ToolAnswer {
         // A name outside the offered set is refused here rather than dispatched, because the model
-        // is the only thing that chose it: `LOCAL_TOOLS` is what was advertised, and anything else
+        // is the only thing that chose it: `self.allowed` is what was advertised, and anything else
         // is a hallucinated name or a tool this turn was deliberately not given.
-        if !LOCAL_TOOLS.contains(&name) {
+        if !self.allowed.contains(&name) {
             return crate::local_agent::ToolAnswer::own(error_json(format!(
                 "{name} is not a tool this conversation can use"
             )));
@@ -1124,6 +1193,48 @@ mod tests {
             registered, classified,
             "every tool this server exposes must be classified, and nothing else"
         );
+    }
+
+    /// Nothing a council seat may call can act.
+    ///
+    /// `COUNCIL_TOOLS` is written out rather than derived, which is what makes this test necessary
+    /// and is also the reason the list is worth having: the list survives a tool being added to the
+    /// server, and this survives a tool on the list being reclassified. Between them there is no
+    /// single edit that gives a council an action.
+    #[test]
+    fn every_council_tool_only_reads() {
+        for name in COUNCIL_TOOLS {
+            assert_ne!(
+                tool_effect(name),
+                ToolEffect::Acts,
+                "{name} is on the council's list and acts"
+            );
+        }
+
+        // And the name has to be a real one. `tool_effect` answers `Acts` for anything it does not
+        // know, so a misspelling would have passed the loop above by being refused — silently
+        // costing a council the tool somebody meant to give it.
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        for name in COUNCIL_TOOLS {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is on the council's list and is not a tool this server exposes"
+            );
+        }
+
+        // The two the list leaves out on purpose. Neither is `Acts`, so nothing but the list itself
+        // keeps them away from a seat — see the comment on `COUNCIL_TOOLS` for why a roster of local
+        // seats holding `web_search` would stop being a local council.
+        for name in ["web_search", "web_read"] {
+            assert!(
+                !COUNCIL_TOOLS.contains(&name),
+                "{name} reaches off this machine and a council fans out by eight"
+            );
+        }
     }
 
     /// The three that carry a stranger's text, named one by one rather than derived from the table,

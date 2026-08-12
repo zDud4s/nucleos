@@ -19,13 +19,14 @@ import System from "./System";
 import Voice from "./Voice";
 import Calendar from "./Calendar";
 import Web from "./Web";
+import Council from "./Council";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
 import "./calendar.css";
 
 type Tab =
   | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
-  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "system";
+  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "council" | "system";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "home", label: "Home" },
@@ -51,6 +52,10 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "voice", label: "Voice" },
   { key: "calendar", label: "Calendar" },
   { key: "web", label: "Web" },
+  // Last before System, because it is the only tab that spends money on purpose: a council is up to
+  // nine model invocations from one sentence. Ahead of System only because System is not a place you
+  // do work.
+  { key: "council", label: "Council" },
   { key: "system", label: "System" },
 ];
 
@@ -410,6 +415,7 @@ function App() {
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "calendar" && <Calendar token={token} connection={connection} />}
           {tab === "web" && <Web token={token} connection={connection} />}
+          {tab === "council" && <Council token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
         </main>
       )}

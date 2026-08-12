@@ -136,6 +136,18 @@ pub async fn pretooluse_decision(
         return assistant_decision(&state, &payload).await;
     }
 
+    // A council seat reads in order to answer a question, and does nothing else. Same shape as the
+    // branch above and a strictly narrower list: `mcp_tools::COUNCIL_TOOLS` carries no `Acts` at
+    // all, so there is no ordering rule to apply and nothing a seat can do that the owner would
+    // have to undo.
+    //
+    // Like the orchestrator's, this returns BEFORE the classifier — a council run has no worktree
+    // and no proposal to resume into, so a `pending_approval` here would terminate the seat and
+    // mint an approval nothing could ever satisfy.
+    if mode == crate::council::COUNCIL_MODE {
+        return council_decision(&state, &payload).await;
+    }
+
     let classification = classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
@@ -446,6 +458,92 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             decision: "allow".to_owned(),
             reason: "orchestrator NucleOS tool".to_owned(),
         }),
+    }
+}
+
+/// What a council seat may call: the named list, and nothing else.
+///
+/// An ALLOW-list, written out, rather than "deny the `Acts` ones". The two are the same today and
+/// stop being the same the moment somebody adds a tool to the MCP server: a deny-list hands a
+/// council every future tool by default, and this hands it none of them until somebody decides. The
+/// direction matters more here than for the orchestrator, because a council is up to eight agents
+/// launched by one sentence rather than one turn a person is watching.
+///
+/// Almost pure. The list is a membership test that cannot fail; the one stateful question is which
+/// run a `get_run` names, and that one fails closed.
+async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
+    // Whole segment, not a prefix, for the reason `assistant_decision` records: an MCP server named
+    // `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test.
+    let tool = payload
+        .tool_name
+        .strip_prefix("mcp__nucleos__")
+        .filter(|tool| !tool.contains("__"))
+        .filter(|tool| crate::mcp_tools::COUNCIL_TOOLS.contains(tool));
+
+    if let Some(tool) = tool {
+        // `get_run` reads any run by id, and run ids are sequential integers — so a seat could
+        // read the row next to its own and find a sibling's answer before writing its own. Phase 1
+        // is supposed to be N independent answers, and one seat that waited would be answering
+        // with the others' work in front of it.
+        //
+        // The same shape as the orchestrator's `get_run` check above, and for a related reason:
+        // that one asks whether the named run holds a stranger's words, this one whether it holds
+        // a peer's. Both fail closed, because "I could not tell" is not "no".
+        if tool == "get_run" && get_run_names_a_council_run(state, &payload.tool_input).await {
+            tracing::debug!(
+                run_id = payload.run_id,
+                "pretooluse-decision: refused a council seat a look at another seat's run"
+            );
+            return Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "a council seat may not read another seat's run".to_owned(),
+            });
+        }
+        return Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "council seats may read NucleOS state".to_owned(),
+        });
+    }
+
+    // Not warned about. A seat reaching for `create_run` is a model being a model, not a symptom of
+    // anything — where an orchestrator refused an action after reading mail is a line somebody
+    // should read. A log level is a claim about who should look at it.
+    tracing::debug!(
+        run_id = payload.run_id,
+        tool = %payload.tool_name,
+        "pretooluse-decision: refused a tool a council seat may not call"
+    );
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: "a council seat may only read NucleOS state".to_owned(),
+    })
+}
+
+/// Whether a `get_run` call names another council seat's run.
+///
+/// Fails closed on every shape it cannot read, exactly as its triage sibling does, and for a reason
+/// that is weaker but points the same way: what is lost by refusing is one lookup, and what is lost
+/// by allowing wrongly is the independence phase 1 exists to have. A run that does not exist is the
+/// one honest `false` — the tool returns an error and nothing is read.
+async fn get_run_names_a_council_run(state: &AppState, tool_input: &Value) -> bool {
+    let Some(id) = tool_input.get("id").and_then(Value::as_i64) else {
+        return true;
+    };
+    match sqlx::query_scalar::<_, String>("SELECT mode FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(mode)) => mode == crate::council::COUNCIL_MODE,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "pretooluse-decision: could not resolve the mode of the run a seat asked for — refusing it"
+            );
+            true
+        }
     }
 }
 
@@ -905,6 +1003,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -2708,6 +2807,194 @@ mod tests {
                 .await
                 .unwrap();
         assert!(consumed_at.is_none());
+    }
+
+    /// A seat's whole job is to read this machine's state and answer, so the reads have to work or
+    /// the tools are decoration.
+    #[tokio::test]
+    async fn a_council_turn_allows_a_reads_own_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        // A `worktree` run, so `get_run` below names something that is not a peer.
+        let other = in_flight_run(&state, "worktree", None, None, None).await;
+        let app = test_router(state);
+
+        for tool in ["list_projects", "list_proposals", "get_budget", "get_kill"] {
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "get_run", serde_json::json!({"id": other}))
+                .await
+                .decision,
+            "allow"
+        );
+    }
+
+    /// Phase 1 is N INDEPENDENT answers, and run ids are sequential integers — so without this a
+    /// seat could read the row next to its own and find a sibling's answer before writing its own.
+    /// The seat that waited would then be answering with the others' work in front of it, and the
+    /// ranking that follows would be measuring the wait.
+    #[tokio::test]
+    async fn a_council_seat_cannot_read_another_seats_run() {
+        let state = test_state().await;
+        let seat = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let sibling = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state);
+
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": sibling}))
+                .await
+                .decision,
+            "deny"
+        );
+        // Its own row is a council run too, and the same rule refuses it. Nothing is lost: a seat
+        // knows what it was asked, and the row holds nothing the seat did not write.
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": seat}))
+                .await
+                .decision,
+            "deny"
+        );
+        // Fails closed on a shape it cannot read, like its triage sibling: an absent id, and an id
+        // that is not a number, are both "I could not tell" rather than "no".
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({}))
+                .await
+                .decision,
+            "deny"
+        );
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": "nine"}))
+                .await
+                .decision,
+            "deny"
+        );
+    }
+
+    /// The half that makes a seat worth asking. Half the questions somebody puts to a council are
+    /// about what arrived, and a seat that cannot read mail answers those from what it half-recalls.
+    ///
+    /// Safe here in a way it is not for the orchestrator, and for a structural reason rather than a
+    /// hopeful one: the taint rule exists to stop a stranger's words from reaching a tool that ACTS,
+    /// and no tool a seat may call acts.
+    #[tokio::test]
+    async fn a_council_turn_allows_a_reads_untrusted_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        for tool in ["get_email_queue", "get_email", "list_files"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+
+        // And having read them changes nothing afterwards, because there was never anything to
+        // withdraw: a seat could not act before the mail and cannot act after it.
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "create_run", serde_json::json!({}))
+                .await
+                .decision,
+            "deny"
+        );
+    }
+
+    /// The brake itself. Every `Acts` tool refused, the run left alone, and no proposal minted —
+    /// a council has no worktree to resume into, so an approval for one could never be satisfied.
+    #[tokio::test]
+    async fn a_council_turn_denies_an_acts_tool_and_creates_no_proposal() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        for tool in [
+            "create_run",
+            "create_job",
+            "approve_proposal",
+            "reject_proposal",
+            "cancel_run",
+            "set_kill",
+            "triage_email",
+            "vcs_request",
+            // Not an action, and refused all the same: `web_search` and `web_read` reach off this
+            // machine, and a roster of local seats holding either would stop being a local council.
+            "web_search",
+            "web_read",
+            // The read-back half of `vcs_request`. A seat that cannot queue an operation has
+            // nothing of its own to read back.
+            "vcs_ticket",
+        ] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_eq!(decision.decision, "deny", "{tool}");
+        }
+
+        // Tools outside this server too: a seat is not an ordinary run and does not get Bash by
+        // falling through to the classifier.
+        for tool in ["Bash", "Write", "Read", "mcp__other__anything"] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": tool,
+                    "tool_input": {"command": "git push"}
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(decision.decision, "deny", "{tool}");
+        }
+
+        // The prefix trap `assistant_decision` records: a server called `nucleos__x` would produce
+        // this name, and a prefix test would have inherited the council's allow.
+        assert_eq!(
+            decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": "mcp__nucleos__x__get_budget",
+                    "tool_input": {}
+                })
+                .to_string(),
+            )
+            .await
+            .decision,
+            "deny"
+        );
+
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running", "a refusal must not terminate the seat");
+    }
+
+    /// The property the mode branches are written to preserve: a mode nobody has written a branch
+    /// for does not inherit an unconditional allow.
+    ///
+    /// It falls through to the classifier, where an MCP tool name is `unrecognized` and therefore
+    /// `pending_approval` — which is a stop, not a grant. Asserted as "not allow" rather than as the
+    /// exact verdict, because the value of this test is the direction and pinning the spelling would
+    /// make a later refinement of the classifier read as a regression here.
+    #[tokio::test]
+    async fn an_unknown_mode_gets_no_acts_by_default() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "a-mode-invented-later", None, None, None).await;
+        let app = test_router(state);
+
+        for tool in ["create_run", "set_kill", "vcs_request"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_ne!(decision.decision, "allow", "{tool}");
+        }
     }
 
     #[tokio::test]

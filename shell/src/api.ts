@@ -3120,3 +3120,113 @@ export async function readWebPage(
     return { ok: false, fault: "unreachable", status: 0 };
   }
 }
+
+/** One seat of a council, as the daemon reports it. */
+export interface CouncilSeatView {
+  seat_idx: number;
+  kind: string;
+  ref: string;
+  /** pending | ok | error | timeout | cancelled. */
+  stage1_status: string;
+  stage1_error: string | null;
+  /** The seat's answer. `null` while it is working, and after a failure that produced none. */
+  answer: string | null;
+  /** The same set plus `skipped`, which is every seat when there was nothing to rank. */
+  stage2_status: string;
+  stage2_error: string | null;
+  rankings: { anon: string; rank: number }[];
+}
+
+export interface CouncilLeaderboardEntry {
+  seat_idx: number;
+  avg_rank: number;
+  /** How many peers ranked this seat. An average over one vote is not the claim five make. */
+  n: number;
+}
+
+export interface CouncilView {
+  id: string;
+  created_at: string;
+  question: string;
+  /** running | done | error | cancelled. */
+  status: string;
+  stage: number;
+  error: string | null;
+  chairman_kind: string;
+  chairman_ref: string;
+  synthesis: string | null;
+  anon_map: Record<string, number>;
+  leaderboard: CouncilLeaderboardEntry[];
+  seats: CouncilSeatView[];
+}
+
+export interface CouncilSummary {
+  id: string;
+  created_at: string;
+  question: string;
+  status: string;
+  stage: number;
+}
+
+export async function listCouncils(token: string): Promise<CouncilSummary[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CouncilSummary[];
+  } catch {
+    return null;
+  }
+}
+
+export async function getCouncil(token: string, id: string): Promise<CouncilView | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CouncilView;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convenes a council.
+ *
+ * Reports HOW it failed, unlike the two getters above, because every refusal here is something a
+ * person can act on: 503 means there is no roster to convene, 429 means the budget window is spent,
+ * and 400 means the question was empty. Flattened to `null` all three would read as "it did not
+ * work", which is the one answer that suggests nothing to do about it.
+ */
+export async function createCouncil(
+  token: string,
+  question: string,
+): Promise<ApiResult<{ id: string }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { id: string } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function cancelCouncil(token: string, id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
