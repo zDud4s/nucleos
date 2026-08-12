@@ -9,6 +9,7 @@
 use crate::vcs::Outcome;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The budget for one whole queued operation — every git command it runs, added together.
@@ -31,6 +32,17 @@ pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How much of a command's output is kept for the row.
 const OUTPUT_TAIL_BYTES: usize = 8 * 1024;
+
+/// How long a *finished* git command is given to finish emptying its pipes.
+///
+/// Its own budget rather than a share of the operation's, for the reason `gate.rs` gives about the
+/// identical situation: EOF arrives only when EVERY holder of the write end has closed it, and a
+/// `push` hands that handle to ssh and to a credential helper. `child.wait()` returning says the
+/// direct child is gone, not that its pipes are. Bounded at five seconds because git's own output is
+/// bounded by the size of the change and is already written by the time the process exits — anything
+/// still holding the pipe after that is a leftover with nothing left to say, and the `TreeKiller`
+/// takes it down rather than this waiting for it.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// `Debug` because the deadline test's `expect_err` needs the `Ok` side printable, and every
 /// caller of `run_git` is a `Result` whose failure a test will want to read.
@@ -70,24 +82,86 @@ impl CommandResult {
 /// for as long as it likes, while a git command's output is bounded by the size of the change. The
 /// two are different shapes, so this is a second implementation rather than a duplicate.
 ///
-/// On a deadline the command future is dropped, and `kill_on_drop` takes the direct child down with
-/// it. There is deliberately no third copy of `TreeKiller` (`gate.rs:328`, `runner.rs:422`, both
-/// private to their modules): git spawns children — hooks, credential helpers, ssh — but nothing
-/// here hands it a shell, and a third copy of a subtle process-lifetime guard is a worse bet than
-/// the fourth copy problem it would solve. If a hook-spawned grandchild ever does hold this past its
-/// deadline, the fix is to extract the shared one, not to paste it again.
+/// **A deadline takes the whole process TREE down, not just git.** This used to say the opposite, and
+/// said it for a defensible reason: a third copy of a subtle process-lifetime guard was a worse bet
+/// than the fourth-copy problem it would solve, and nothing here handed git a shell. `Op`'s own doc
+/// comment recorded that the sentence would become wrong the day a network operation landed, without
+/// anybody editing it — `push` hands git an ssh and a credential helper, and a fetch against a dead
+/// network is the exact case spec §7's hung-command row was written about. So the copies were
+/// extracted instead (`process_tree.rs`), which is what that comment said the fix would be.
+///
+/// Two things follow from that, and both are load-bearing rather than incidental:
+///
+/// - The child is spawned through `process_tree::spawn_in_own_group`, because off Windows killing a
+///   tree means killing a process GROUP and a child has to lead one before it can be named.
+/// - The draining of the pipes gets its OWN budget (`DRAIN_GRACE`) after the child is reaped. EOF
+///   arrives only when every holder of the write end has closed it, and ssh inherited that handle.
+///
+/// `GIT_TERMINAL_PROMPT=0` and a closed stdin are the other half of the same problem, from the other
+/// end. A credential prompt in a process nobody is watching is not a slow command — it is a command
+/// that never finishes, holding the repository's only slot until the deadline. With this, the
+/// commonest case (HTTPS asking for a username) fails immediately and readably instead. **What it
+/// does not cover, stated rather than implied:** an ssh key with a passphrase and no agent still
+/// blocks, because that prompt is ssh's rather than git's — it fails at the deadline instead of at
+/// once, which is survivable precisely because the tree-kill above now reaches the ssh. Forcing
+/// `BatchMode=yes` would fix that case and clobber any `core.sshCommand` the user configured, which
+/// is a trade for whoever has the failing key to make, not this module.
 pub async fn run_git(
     repo: &Path,
     args: &[&OsStr],
     timeout: Duration,
 ) -> Result<CommandResult, String> {
     let mut command = crate::worktree::git();
-    command.arg("-C").arg(repo).args(args).kill_on_drop(true);
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    crate::process_tree::spawn_in_own_group(&mut command);
 
-    let output = match tokio::time::timeout(timeout, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return Err(format!("could not run git: {error}")),
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not run git: {error}"))?;
+
+    // Declared AFTER the child so it drops FIRST, while tokio's handle still pins the pid — the
+    // invariant `TreeKiller` documents, and the only thing that keeps the pid it names ours.
+    let mut killer = child.id().map(crate::process_tree::TreeKiller::new);
+
+    let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stdout_task = tokio::spawn(drain_pipe(
+        child.stdout.take().expect("stdout was piped"),
+        Arc::clone(&stdout_bytes),
+    ));
+    let stderr_task = tokio::spawn(drain_pipe(
+        child.stderr.take().expect("stderr was piped"),
+        Arc::clone(&stderr_bytes),
+    ));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        // Deliberately NOT disarming here, for the reason `gate.rs` gives at the same point: the
+        // direct child exiting says nothing about whether its pipes are closed.
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            if let Some(killer) = killer.as_mut() {
+                killer.kill_now();
+            }
+            return Err(format!("could not run git: {error}"));
+        }
         Err(_) => {
+            // The tree goes down HERE rather than at drop, because `child` is still alive at this
+            // point and its handle is what stops the pid being reused under the killer.
+            if let Some(killer) = killer.as_mut() {
+                killer.kill_now();
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(format!(
                 "git {} timed out after {timeout:?}",
                 rendered(args)
@@ -95,11 +169,62 @@ pub async fn run_git(
         }
     };
 
+    let drained = async {
+        for task in [stdout_task, stderr_task] {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(format!("could not read git's output: {error}")),
+                Err(error) => return Err(format!("git's output task failed: {error}")),
+            }
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(DRAIN_GRACE, drained).await {
+        Ok(Ok(())) => {
+            if let Some(killer) = killer.as_mut() {
+                killer.disarm();
+            }
+        }
+        Ok(Err(reason)) => return Err(reason),
+        // The exit code survives a stuck drain: git ran and said how it ended, and only the tail is
+        // short. `gate.rs` makes the same call about the same situation. The killer stays ARMED, so
+        // dropping it takes the leftover holder of the pipe down on the way out.
+        Err(_) => tracing::warn!(
+            command = %rendered(args),
+            "git's output did not finish draining; reporting the result with a truncated tail"
+        ),
+    }
+
+    let stdout = std::mem::take(&mut *stdout_bytes.lock().expect("output buffer is not poisoned"));
+    let stderr = std::mem::take(&mut *stderr_bytes.lock().expect("output buffer is not poisoned"));
     Ok(CommandResult {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        output_tail: tail(&output.stdout, &output.stderr),
+        exit_code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        output_tail: tail(&stdout, &stderr),
     })
+}
+
+/// Reads one pipe to EOF into a buffer the caller keeps, so a drain that has to be abandoned still
+/// leaves behind what it managed to read.
+///
+/// A `std::sync::Mutex` rather than tokio's, and never held across the `await`: the lock is taken per
+/// chunk and released before the next read, which is what keeps a blocking lock correct in an async
+/// task.
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    into: Arc<Mutex<Vec<u8>>>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        into.lock()
+            .expect("output buffer is not poisoned")
+            .extend_from_slice(&chunk[..read]);
+    }
 }
 
 /// The argv as a human reads it, for a message about a command that produced no output because it
@@ -944,9 +1069,9 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                 output_tail: String::new(),
             };
         }
-        // Deliberately exhaustive with no `_` arm: Chunk 4 adds variants, and a wildcard here would
-        // let one ship with no executor and no compile error — a request that queues, claims the
-        // repository, and reports success having done nothing.
+        // Deliberately exhaustive with no `_` arm: a wildcard here would let a variant ship with no
+        // executor and no compile error — a request that queues, claims the repository, and reports
+        // success having done nothing.
         match &request.op {
             crate::vcs::Op::Merge { source, target } => {
                 match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
@@ -958,7 +1083,72 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                     Err(outcome) => outcome,
                 }
             }
+            crate::vcs::Op::Push { remote, branch } => {
+                push(project_root, remote.as_str(), branch.as_str(), deadline).await
+            }
         }
+    }
+}
+
+/// Publishes `branch` to `remote`, by object id rather than by name.
+///
+/// **The sha is resolved first and then pushed as `<sha>:refs/heads/<branch>`, which is the whole
+/// design of this function rather than a flourish.** Pushing the NAME would publish whatever the
+/// branch points at in the instant git gets round to reading it, which is not necessarily what it
+/// pointed at when the operation was admitted — the queue exists precisely because other things are
+/// moving refs. Pushing the id makes the row's `result_sha` a statement about what is on the remote
+/// instead of a guess, and it is what lets a human read the queue backwards afterwards.
+///
+/// A branch that does not exist fails at the `rev-parse`, before anything reaches the network, with a
+/// message naming the ref rather than git's `src refspec … does not match any`.
+///
+/// **`--end-of-options` is here rather than argued away, and NO TEST CAN SEE IT — measured, not
+/// assumed.** `Merge`'s arguments survive without one by a chain of accidents `Op` documents; none of
+/// that chain is about `push`, whose argv is a different shape, so the flag was written rather than
+/// reasoned around. Deleting it leaves every push test green, and that is not a coverage gap to be
+/// filled: `Remote` and `Branch` both refuse a leading dash and the third argument is hexadecimal, so
+/// there is no input that reaches here and needs it. It is the second lock on a door whose first lock
+/// cannot be picked — worth having for the day a third argv shape arrives with a looser type, and
+/// worth labelling as unobservable so nobody later mistakes its survival for dead weight.
+///
+/// **A rejected push is `Failed`, never `Blocked`.** `Blocked` is terminal and means the user's own
+/// work is in the way here and now; a non-fast-forward means the remote moved, which is fixed by
+/// bringing it in and resubmitting — and which the next queued operation may already be about to do.
+/// `publish_by_fast_forward` makes the same call for the same reason: `Blocked` is the wrong way to
+/// be wrong, because it needs a human to notice before anything can proceed.
+async fn push(
+    project_root: &Path,
+    remote: &str,
+    branch: &str,
+    deadline: std::time::Instant,
+) -> Outcome {
+    let reference = format!("refs/heads/{branch}");
+    let sha = match revision(project_root, &reference, deadline).await {
+        Ok(sha) => sha,
+        Err(outcome) => return outcome,
+    };
+
+    let refspec = format!("{sha}:{reference}");
+    let pushed = match git(
+        project_root,
+        &["push", "--end-of-options", remote, &refspec],
+        deadline,
+    )
+    .await
+    {
+        Ok(pushed) => pushed,
+        Err(outcome) => return outcome,
+    };
+    if !pushed.succeeded() {
+        return failed(
+            format!("pushing {branch} to {remote} failed; git's output says why"),
+            &pushed,
+        );
+    }
+
+    Outcome::Succeeded {
+        sha,
+        output_tail: pushed.output_tail,
     }
 }
 
@@ -2503,6 +2693,219 @@ pub(crate) mod tests {
         assert!(
             error.contains("ran out of time"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// A bare repository beside `repo`, registered as `origin`.
+    ///
+    /// A real remote on the filesystem rather than a fake: the point of these tests is that the argv
+    /// this module builds is one git accepts and that the refs move where they should, and a stub
+    /// would answer neither question. Bare because a push to a non-bare checkout's current branch is
+    /// refused by git itself, which would make every test below fail for a reason none of them is
+    /// about.
+    fn remote_beside(container: &Path, repo: &Path) -> PathBuf {
+        let remote = container.join("remote.git");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&remote)
+                .status()
+                .expect("git should start")
+                .success()
+        );
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("origin"),
+                remote.as_os_str()
+            ]
+        ));
+        remote
+    }
+
+    /// The push end to end, through `execute` the way the daemon runs it.
+    ///
+    /// **The assertion is on the REMOTE's ref, not on the exit code**, and that is the difference
+    /// between testing that git was run and testing that the operation happened. A refspec built
+    /// wrong — the two halves swapped, `refs/heads/` missing, the sha resolved from the wrong side —
+    /// leaves git exiting 0 in several of those spellings while the remote's `master` sits where it
+    /// was or moves somewhere nobody asked for.
+    ///
+    /// The reported sha is checked against the LOCAL branch as well, because the row's `result_sha`
+    /// is what a human reads the queue backwards from: a push that reported the remote's previous
+    /// value, or an empty string, would be green on the ref assertion alone.
+    #[tokio::test]
+    async fn a_push_moves_the_remote_ref_to_the_sha_it_reports() {
+        use crate::vcs::VcsExecutor;
+
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-push-");
+        let remote = remote_beside(container.path(), &repo);
+        let local = sha_of(&repo, "refs/heads/master");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Push {
+                    remote: "origin".into(),
+                    branch: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        let sha = match outcome {
+            Outcome::Succeeded { sha, .. } => sha,
+            other => panic!("expected a published push, got {other:?}"),
+        };
+        assert_eq!(sha, local, "the row reports the sha it sent");
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            local,
+            "and the remote's branch is at it"
+        );
+        // The branch NAMED is the one pushed, and nothing else went with it. `feat/x` exists locally
+        // and a refspec built from the wrong end — or a `--all` creeping in — would carry it too.
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&remote)
+                .args(["rev-parse", "--verify", "refs/heads/feat/x"])
+                .output()
+                .expect("git should start")
+                .status
+                .success(),
+            "only the branch the operation named may be published"
+        );
+    }
+
+    /// A branch that is not there fails before anything reaches the network, naming the ref.
+    ///
+    /// The message is the assertion: git's own answer to a push of a missing branch is `src refspec
+    /// … does not match any`, which says nothing about which of the two halves of the refspec was
+    /// wrong. Resolving the sha first turns that into a sentence naming the branch — and it is what
+    /// keeps a typo from costing a network round trip while holding the repository's only slot.
+    #[tokio::test]
+    async fn pushing_a_branch_that_does_not_exist_fails_before_the_network() {
+        use crate::vcs::VcsExecutor;
+
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-push-missing-");
+        let _remote = remote_beside(container.path(), &repo);
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Push {
+                    remote: "origin".into(),
+                    branch: "no-such-branch".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match outcome {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("no-such-branch"),
+                "the message must name the ref that could not be resolved: {reason}"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// **A remote that moved refuses the push, and the row is `Failed` rather than `Blocked`.**
+    ///
+    /// Both halves matter and neither implies the other. That git refuses a non-fast-forward is git's
+    /// business; that this module records the refusal as retryable is the decision — `Blocked` is
+    /// terminal and means a human must intervene, and what actually fixes this is bringing the remote
+    /// in and resubmitting, possibly by an operation already queued behind this one.
+    ///
+    /// The divergence is built by pushing from a second clone, which is exactly how it happens in
+    /// life: somebody else got there first.
+    #[tokio::test]
+    async fn a_remote_that_moved_refuses_the_push_and_the_row_stays_retryable() {
+        use crate::vcs::VcsExecutor;
+
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-push-behind-");
+        let remote = remote_beside(container.path(), &repo);
+        // Seed the remote from this repository, then move it on from somewhere else, so the local
+        // `master` is genuinely behind rather than merely unrelated.
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("push"),
+                OsStr::new("origin"),
+                OsStr::new("master")
+            ]
+        ));
+        let other = container.path().join("other");
+        assert!(
+            Command::new("git")
+                .arg("clone")
+                .arg(&remote)
+                .arg(&other)
+                .status()
+                .expect("git should start")
+                .success()
+        );
+        assert!(git_ok(
+            &other,
+            &[
+                OsStr::new("config"),
+                OsStr::new("user.email"),
+                OsStr::new("test@x")
+            ]
+        ));
+        assert!(git_ok(
+            &other,
+            &[
+                OsStr::new("config"),
+                OsStr::new("user.name"),
+                OsStr::new("test")
+            ]
+        ));
+        std::fs::write(other.join("theirs.txt"), "theirs\n").expect("write");
+        assert!(git_ok(&other, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &other,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("theirs")]
+        ));
+        assert!(git_ok(&other, &[OsStr::new("push")]));
+        let theirs = sha_of(&remote, "refs/heads/master");
+
+        // Now put a commit on the local side too, so the two have genuinely diverged.
+        std::fs::write(repo.join("ours.txt"), "ours\n").expect("write");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("ours")]
+        ));
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Push {
+                    remote: "origin".into(),
+                    branch: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match &outcome {
+            Outcome::Failed { output_tail, .. } => assert!(
+                !output_tail.is_empty(),
+                "git's own refusal is the only diagnostic the row carries"
+            ),
+            other => panic!("a rejected push is a retryable failure, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            theirs,
+            "and nothing of theirs was overwritten — this queue never forces"
         );
     }
 }
