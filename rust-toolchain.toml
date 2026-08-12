@@ -7,5 +7,22 @@
 # needs no external Windows SDK or Visual Studio install at all. Revisit if a
 # working MSVC toolchain is ever set up and there's a concrete reason to prefer
 # it (e.g. an MSVC-only dependency).
+
+# Pinned to an exact version, not to "stable", because "stable" is a MOVING target and rustfmt is
+# not stable across it. Twice in two days a tree that was green when it was committed went red on
+# `cargo fmt --check` without anyone touching it — once in three files this repo had not changed for
+# weeks, once in code another branch had committed hours earlier. Every branch open at that moment
+# pays the same toll independently, and the diff it produces is noise that has to be committed
+# before anything real can land.
+#
+# The cost of pinning is deliberate and small: a new toolchain does not arrive until someone changes
+# this line, so the upgrade becomes one commit, reviewed once, that reformats whatever the new
+# rustfmt wants. That is the trade — reformatting on a schedule the repo chooses rather than on the
+# release schedule of a channel it does not control.
+#
+# `components` is spelled out rather than left to the default profile: a version pin makes rustup
+# fetch a toolchain the machine may not have, and a fresh one without these two fails the gate on
+# its first `cargo fmt`/`cargo clippy` rather than on anything the person wrote.
 [toolchain]
-channel = "stable-x86_64-pc-windows-gnu"
+channel = "1.97.1-x86_64-pc-windows-gnu"
+components = ["clippy", "rustfmt"]
