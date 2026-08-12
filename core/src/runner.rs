@@ -21,6 +21,12 @@ pub struct RunUsage {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
+    /// Tokens billed to WRITE the cache, at 1.25x or 2x base input depending on the TTL asked for.
+    ///
+    /// Separate from `cache_read_tokens` because the two are opposite verdicts about the same run.
+    /// Reads mean the prefix was found; writes mean it was paid for so a later run could find it.
+    /// A run with neither read nor wrote anything — which is the only shape worth complaining about.
+    pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
 }
 
@@ -38,6 +44,7 @@ pub struct RunOutcome {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
 }
 
@@ -439,6 +446,10 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
                 cache_read_tokens: value
                     .get("usage")
                     .and_then(|result_usage| result_usage.get("cache_read_input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
+                cache_creation_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("cache_creation_input_tokens"))
                     .and_then(serde_json::Value::as_i64),
                 num_turns: value.get("num_turns").and_then(serde_json::Value::as_i64),
             };
@@ -1009,6 +1020,7 @@ impl CommandRunner for OllamaRunner {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             });
         }
@@ -1022,6 +1034,7 @@ impl CommandRunner for OllamaRunner {
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         })
     }
@@ -1321,6 +1334,7 @@ impl CommandRunner for ClaudeCliRunner {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
         })
     }
@@ -1384,9 +1398,9 @@ pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<St
 /// the ceiling with nothing to pause on.
 ///
 /// A plain-text transcript and a structured event carrying no `usage` object are the same silence:
-/// unknown in both, and unknown is not zero. `num_turns` has no counterpart in this stream and stays
-/// `None` for that reason — counting the events that happened to be read is not the tool reporting a
-/// turn count.
+/// unknown in both, and unknown is not zero. `num_turns` and `cache_creation_tokens` have no
+/// counterpart in this stream and stay `None` for that reason — counting the events that happened to
+/// be read is not the tool reporting a turn count.
 pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
@@ -1408,6 +1422,10 @@ pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
                 cache_read_tokens: reported
                     .and_then(|reported| reported.get("cached_input_tokens"))
                     .and_then(serde_json::Value::as_i64),
+                // Codex reports what it read from the cache and never what it wrote there. Unknown,
+                // not zero — and unknown is what disqualifies a Codex run from the cache signal
+                // rather than making every one of them look like a miss.
+                cache_creation_tokens: None,
                 num_turns: None,
             };
         }
@@ -1634,6 +1652,7 @@ impl CommandRunner for CodexCliRunner {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
         })
     }
@@ -1744,6 +1763,7 @@ impl CommandRunner for FakeCommandRunner {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })
         };
@@ -2011,6 +2031,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             ..Default::default()
@@ -2084,6 +2105,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             last_plan_only: std::sync::Mutex::new(None),
@@ -2119,6 +2141,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             // The fake releases one canned event per interval. The complete run therefore lasts
@@ -2238,6 +2261,32 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(500));
         assert_eq!(usage.cache_read_tokens, None);
         assert_eq!(usage.num_turns, Some(12));
+    }
+
+    #[test]
+    fn extract_usage_reads_cache_creation() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","num_turns":3,"usage":{"input_tokens":40,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":12000}}"#;
+
+        let usage = extract_usage(stdout);
+
+        // The run that pays to fill the cache reads nothing back, and this is the shape that proves
+        // the two are different facts: without the second number it is indistinguishable from a run
+        // that missed the prefix entirely.
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert_eq!(usage.cache_creation_tokens, Some(12000));
+    }
+
+    #[test]
+    fn absent_cache_creation_stays_unknown() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":1000,"cache_read_input_tokens":9000}}"#;
+
+        let usage = extract_usage(stdout);
+
+        // Not `Some(0)`. A transcript that never mentioned cache creation has not reported writing
+        // nothing — it has reported nothing, and a detector must be able to tell those apart.
+        assert_eq!(usage.cache_creation_tokens, None);
     }
 
     #[test]

@@ -1474,6 +1474,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             ..Default::default()
@@ -1728,6 +1729,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             ..Default::default()

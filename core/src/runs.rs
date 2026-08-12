@@ -1128,7 +1128,7 @@ fn spawn_run(
                         None => (None, None, None),
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, context_fill = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, context_fill = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -1139,6 +1139,7 @@ fn spawn_run(
                     .bind(o.input_tokens)
                     .bind(o.output_tokens)
                     .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
                     .bind(o.num_turns)
                     .bind(context_fill)
                     .bind(&completed_at)
@@ -1212,6 +1213,28 @@ fn spawn_run(
                             model.clone(),
                         ))
                         .await;
+                    }
+
+                    // Judged from the row the terminal write just put there, so it is gated on the
+                    // same CAS: losing the race means the numbers in `runs` belong to whoever won,
+                    // and reading them here would count another attempt's spending as this one's.
+                    //
+                    // LAST on this arm, deliberately. `let _ =` swallows an `Err` but not a panic,
+                    // and a panic here unwinds through `spawn_registered` — where the supervisor's
+                    // recovery write is `WHERE status = 'running'` and therefore matches nothing,
+                    // this arm having already written `completed`. Ahead of the completion feed row
+                    // and the handoff, that would cost the run both; behind them, it can only cost
+                    // the observation, which is what nothing depends on. It also has to run after
+                    // `spawn_handoff_if_needed` for a second reason: `successor_run_id` is what
+                    // tells `ContextSwelling` the handoff already happened.
+                    if terminal_write_won
+                        && let Err(error) = crate::token_efficiency::observe_run(&pool, id).await
+                    {
+                        // Warned rather than swallowed, like every other best-effort call on this
+                        // arm. A lock held past the busy timeout is the realistic failure, and a
+                        // detector that goes quiet without saying so is indistinguishable from one
+                        // that has nothing to report.
+                        tracing::warn!(%error, run_id = id, "token efficiency not observed");
                     }
                     break;
                 }
@@ -2766,6 +2789,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             delay: std::sync::Mutex::new(delay),
@@ -3876,6 +3900,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: Some(1000),
             output_tokens: Some(500),
             cache_read_tokens: Some(20_000),
+            cache_creation_tokens: Some(3_000),
             num_turns: Some(12),
         });
         let pool = state.pool.clone();
@@ -3885,15 +3910,32 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         for _ in 0..20 {
             let parsed = get_run_status(&app, created.id).await;
             if parsed.status == "completed" {
-                let usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
-                    "SELECT input_tokens, output_tokens, cache_read_tokens, num_turns
-                         FROM runs WHERE id = ?",
-                )
-                .bind(created.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                assert_eq!(usage, (Some(1000), Some(500), Some(20_000), Some(12)));
+                // Named because clippy counts the tuple's arms, and the fifth column is exactly the
+                // one this test exists to cover.
+                type PersistedUsage = (
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                );
+                let usage: PersistedUsage =
+                    sqlx::query_as(
+                        "SELECT input_tokens, output_tokens, cache_read_tokens,
+                                cache_creation_tokens, num_turns
+                             FROM runs WHERE id = ?",
+                    )
+                    .bind(created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                // `cache_creation_tokens` is asserted here rather than in a test of its own: it is
+                // the same round trip through the same UPDATE, and a near-copy of this test would
+                // only make the fifth column look like a separate mechanism from the other four.
+                assert_eq!(
+                    usage,
+                    (Some(1000), Some(500), Some(20_000), Some(3_000), Some(12))
+                );
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3918,6 +3960,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         });
         let pool = state.pool.clone();
@@ -5708,6 +5751,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         });
         let pool = state.pool.clone();
@@ -5781,6 +5825,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         });
         let pool = state.pool.clone();
