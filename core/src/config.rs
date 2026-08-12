@@ -405,6 +405,185 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     }
 }
 
+/// How many seats one council may hold.
+///
+/// Eight, from the Python orchestrator this pillar was ported out of, where it was the parallelism
+/// cap. Here it is the roster cap and the parallelism cap at once, because the roster IS the
+/// parallelism: every seat of phase 1 is launched together, so a ninth seat would be a ninth agent
+/// process and a ninth cloud bill for one question. A number in this file may lower the fan-out and
+/// may not raise it, exactly as `MAX_ITEMS_CEILING` may not — `.ai/` is gitignored, so nobody
+/// reviews what is written here.
+pub const MAX_COUNCIL_SEATS: usize = 8;
+
+/// The wall clock one seat gets, when the file does not say.
+///
+/// 600 seconds, the same default the Python council ran on. It is per SEAT and not per council: the
+/// seats of phase 1 run concurrently, so a council of eight is still bounded by one of these plus
+/// phase 2 plus phase 3.
+pub const DEFAULT_COUNCIL_TIMEOUT_SECONDS: u64 = 600;
+
+/// The ceiling on that clock, whatever the file asks for.
+///
+/// A council holds no worktree and takes no concurrency slot (that is decision 7 of the design), so
+/// nothing else in the daemon would ever end one. The clock is therefore the only thing that does,
+/// and an unbounded one is a council that stays `running` for as long as the daemon lives.
+pub const MAX_COUNCIL_TIMEOUT_SECONDS: u64 = 3_600;
+
+/// Where one seat's answer comes from.
+///
+/// Two variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole
+/// reason a mixed roster is a feature, and a variant that decided it for the operator would make
+/// the roster stop being the statement of that.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SeatKind {
+    /// An agent CLI, through `runner.rs`.
+    Cloud,
+    /// A model on this machine, through `local_agent.rs`.
+    Local,
+}
+
+impl SeatKind {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            SeatKind::Cloud => "cloud",
+            SeatKind::Local => "local",
+        }
+    }
+}
+
+/// One seat of a roster: where it runs and which model answers.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilSeat {
+    pub kind: SeatKind,
+    /// Spelled `ref` in the file, because that is what the design and the Python it came from call
+    /// it, and `model_ref` in Rust, because `ref` is a keyword.
+    #[serde(rename = "ref")]
+    pub model_ref: String,
+}
+
+/// `.ai/council.yaml`. Absent means there is no council — this pillar has no useful default,
+/// because a roster nobody chose is a list of models nobody agreed to pay for.
+///
+/// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
+/// would otherwise parse into a council with no seats, which is a council that answers every
+/// question with the chairman's own opinion while looking like it deliberated.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilConfig {
+    #[serde(default = "default_council_timeout")]
+    pub timeout_seconds: u64,
+    pub chairman: CouncilSeat,
+    pub members: Vec<CouncilSeat>,
+}
+
+fn default_council_timeout() -> u64 {
+    DEFAULT_COUNCIL_TIMEOUT_SECONDS
+}
+
+impl CouncilConfig {
+    /// Everything wrong with a roster, said as one list rather than as the first thing noticed.
+    ///
+    /// An operator editing this file by hand is going to get more than one thing wrong at once, and
+    /// a loader that reports only the first turns a single correction into three restarts.
+    fn faults(&self, local_available: bool) -> Vec<String> {
+        let mut faults = Vec::new();
+
+        if self.members.is_empty() {
+            faults.push("the roster has no members".to_string());
+        }
+        if self.members.len() > MAX_COUNCIL_SEATS {
+            faults.push(format!(
+                "the roster has {} members, above the ceiling of {MAX_COUNCIL_SEATS}",
+                self.members.len()
+            ));
+        }
+        for (index, seat) in self.seats().enumerate() {
+            let who = if index == 0 {
+                "the chairman".to_string()
+            } else {
+                format!("seat {}", index - 1)
+            };
+            if seat.model_ref.trim().is_empty() {
+                faults.push(format!("{who} names no model"));
+            }
+            // Refused rather than quietly re-routed to the cloud. An operator who wrote `local`
+            // asked for a question that does not leave this machine, and answering it in the cloud
+            // anyway is the one failure this check exists to prevent.
+            if seat.kind == SeatKind::Local && !local_available {
+                faults.push(format!(
+                    "{who} asks for a local model and no local model is configured"
+                ));
+            }
+        }
+
+        faults
+    }
+
+    /// The chairman first, then the members, which is the order `faults` numbers them in.
+    fn seats(&self) -> impl Iterator<Item = &CouncilSeat> {
+        std::iter::once(&self.chairman).chain(self.members.iter())
+    }
+
+    fn validated(mut self) -> Self {
+        if self.timeout_seconds == 0 {
+            tracing::warn!(
+                "council config: timeout_seconds must be above zero; using {DEFAULT_COUNCIL_TIMEOUT_SECONDS}"
+            );
+            self.timeout_seconds = DEFAULT_COUNCIL_TIMEOUT_SECONDS;
+        }
+        if self.timeout_seconds > MAX_COUNCIL_TIMEOUT_SECONDS {
+            tracing::warn!(
+                timeout_seconds = self.timeout_seconds,
+                "council config: timeout_seconds is capped at {MAX_COUNCIL_TIMEOUT_SECONDS}"
+            );
+            self.timeout_seconds = MAX_COUNCIL_TIMEOUT_SECONDS;
+        }
+        self
+    }
+}
+
+/// Reads `.ai/council.yaml`. Absent, unreadable, malformed or invalid → `None`, with a warning.
+///
+/// This follows `load_web_config` and NOT `load_models_config`, and the direction was chosen rather
+/// than inherited. Erroring would stop the daemon — mail, autopilot, voice and the API with it —
+/// over a typo in a list of model names, and the fallback here is the feature being OFF rather than
+/// a permissive one. A council nobody can start costs the operator a council; a daemon that will
+/// not boot costs them everything else.
+///
+/// `local_available` is passed in rather than read, because whether this machine can answer locally
+/// is not configuration — startup PROVES it by probing the model, and only `main.rs` holds that
+/// answer.
+pub fn load_council_config(path: &Path, local_available: bool) -> Option<CouncilConfig> {
+    if !path.exists() {
+        return None;
+    }
+    let config = match std::fs::read_to_string(path).map(|text| serde_yaml::from_str(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "council config: could not be parsed; there is no council");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "council config: could not be read; there is no council");
+            return None;
+        }
+    };
+
+    let faults = CouncilConfig::faults(&config, local_available);
+    if !faults.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            faults = %faults.join("; "),
+            "council config: the roster is not usable; there is no council"
+        );
+        return None;
+    }
+
+    Some(config.validated())
+}
+
 /// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
 /// `schedule:` for `schedules:` parses cleanly into an empty ruleset, and all autonomy for that
 /// project silently stops. That direction is fail-closed, which is precisely why nobody notices —
@@ -706,6 +885,149 @@ mod tests {
         assert_eq!(
             email_config_from("retain_bodies_days: 0\n").retain_bodies_days,
             0
+        );
+    }
+
+    fn council_config_from(yaml: &str, local_available: bool) -> Option<CouncilConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("council.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        load_council_config(&path, local_available)
+    }
+
+    const A_GOOD_ROSTER: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }\n\
+                                 members:\n\
+                                 \x20\x20- { kind: cloud, ref: claude-opus-4-8 }\n\
+                                 \x20\x20- { kind: cloud, ref: gpt-5.6-terra }\n";
+
+    #[test]
+    fn a_council_roster_parses_with_its_default_clock() {
+        let config = council_config_from(A_GOOD_ROSTER, false).expect("a cloud-only roster loads");
+        assert_eq!(config.timeout_seconds, DEFAULT_COUNCIL_TIMEOUT_SECONDS);
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.chairman.kind, SeatKind::Cloud);
+        assert_eq!(config.members[1].model_ref, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn an_absent_council_config_means_there_is_no_council() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_council_config(&dir.path().join("council.yaml"), true).is_none());
+    }
+
+    /// Absent and malformed reach the same inert state, and neither is an error.
+    ///
+    /// The direction is the one `load_web_config` takes and not `load_models_config`'s: erroring
+    /// would stop the daemon — mail, autopilot, voice and the API with it — over a typo in a list of
+    /// model names. The `member:` case is the one worth pinning, because `deny_unknown_fields` is
+    /// the only thing standing between that typo and a council that answers every question with the
+    /// chairman's own opinion while looking like it deliberated.
+    #[test]
+    fn a_malformed_council_yaml_leaves_the_feature_off() {
+        assert!(council_config_from("chairman: [this is not a seat", true).is_none());
+        assert!(council_config_from("", true).is_none());
+        assert!(
+            council_config_from(
+                "chairman: { kind: cloud, ref: m }\nmember:\n  - { kind: cloud, ref: m }\n",
+                true
+            )
+            .is_none(),
+            "`member:` for `members:` must not parse into a seatless council"
+        );
+        assert!(
+            council_config_from("chairman: { kind: sideways, ref: m }\nmembers: []\n", true)
+                .is_none(),
+            "a `kind` that is neither cloud nor local is not a seat"
+        );
+    }
+
+    /// An operator who wrote `local` asked for a question that does not leave this machine.
+    /// Answering it in the cloud anyway is the one failure this check exists to prevent, so the
+    /// council is refused rather than re-routed.
+    #[test]
+    fn a_local_seat_without_a_local_model_is_refused() {
+        const MIXED: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }\n\
+                             members:\n\
+                             \x20\x20- { kind: cloud, ref: claude-opus-4-8 }\n\
+                             \x20\x20- { kind: local, ref: qwen3.5:4b }\n";
+
+        assert!(council_config_from(MIXED, false).is_none());
+        assert_eq!(
+            council_config_from(MIXED, true)
+                .expect("the same roster loads once a local model exists")
+                .members
+                .len(),
+            2
+        );
+
+        // The chairman is a seat too, and is checked on the same rule.
+        assert!(
+            council_config_from(
+                "chairman: { kind: local, ref: qwen3.5:4b }\nmembers:\n  - { kind: cloud, ref: m }\n",
+                false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_roster_that_is_empty_or_oversized_is_refused() {
+        assert!(
+            council_config_from("chairman: { kind: cloud, ref: m }\nmembers: []\n", true).is_none(),
+            "a council with no members is the chairman talking to itself"
+        );
+
+        let mut oversized = "chairman: { kind: cloud, ref: m }\nmembers:\n".to_string();
+        for _ in 0..=MAX_COUNCIL_SEATS {
+            oversized.push_str("  - { kind: cloud, ref: m }\n");
+        }
+        assert!(council_config_from(&oversized, true).is_none());
+
+        let mut at_the_ceiling = "chairman: { kind: cloud, ref: m }\nmembers:\n".to_string();
+        for _ in 0..MAX_COUNCIL_SEATS {
+            at_the_ceiling.push_str("  - { kind: cloud, ref: m }\n");
+        }
+        assert_eq!(
+            council_config_from(&at_the_ceiling, true)
+                .expect("the ceiling itself is allowed")
+                .members
+                .len(),
+            MAX_COUNCIL_SEATS
+        );
+    }
+
+    #[test]
+    fn a_seat_that_names_no_model_is_refused() {
+        assert!(
+            council_config_from(
+                "chairman: { kind: cloud, ref: m }\nmembers:\n  - { kind: cloud, ref: \"  \" }\n",
+                true
+            )
+            .is_none()
+        );
+    }
+
+    /// Nothing else in the daemon would ever end a council — it holds no worktree and takes no
+    /// concurrency slot — so the clock is the only thing that does, and an unbounded one is a
+    /// council that stays `running` for as long as the daemon lives.
+    #[test]
+    fn the_seat_clock_is_bounded_at_both_ends() {
+        let long = format!("timeout_seconds: 99999\n{A_GOOD_ROSTER}");
+        assert_eq!(
+            council_config_from(&long, true).unwrap().timeout_seconds,
+            MAX_COUNCIL_TIMEOUT_SECONDS
+        );
+
+        let zero = format!("timeout_seconds: 0\n{A_GOOD_ROSTER}");
+        assert_eq!(
+            council_config_from(&zero, true).unwrap().timeout_seconds,
+            DEFAULT_COUNCIL_TIMEOUT_SECONDS
+        );
+
+        let chosen = format!("timeout_seconds: 120\n{A_GOOD_ROSTER}");
+        assert_eq!(
+            council_config_from(&chosen, true).unwrap().timeout_seconds,
+            120
         );
     }
 

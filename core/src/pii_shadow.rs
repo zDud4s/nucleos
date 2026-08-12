@@ -217,6 +217,13 @@ async fn record_at_attempt(
 /// things that are actually waiting on it. The mailbox is caught up more slowly and that costs
 /// nothing: this is a measurement, and the only thing a slower one delays is a decision that is
 /// months away.
+///
+/// Migration `0060` still says twenty, and has to. Its comment is what an operator reads to decide
+/// whether deleting the table was safe, so the wrong number there is worth correcting — but the
+/// file had already been applied, and `sqlx` checksums applied migrations and refuses to start
+/// against one whose bytes have changed. Editing the prose cost a `VersionMismatch` panic at the
+/// next launch, which is a strictly worse outcome than a stale sentence. An applied migration is
+/// immutable including its comments; this is the place the number is allowed to be right.
 const SWEEP_BATCH: i64 = 6;
 
 /// Whether the model reasons before answering, and it is the difference between measuring and not.
@@ -242,8 +249,36 @@ const THINK: bool = true;
 /// every fifteen minutes and blocks the batch from ever reaching older mail.
 const MAX_UNREADABLE_ATTEMPTS: i64 = 3;
 
+/// How many timeouts in a row mean the endpoint is gone rather than the field being slow.
+///
+/// Treating a timeout as a fact about the field was half right, and the wrong half is what a hung
+/// endpoint does to this table. `SWEEP_REQUEST_TIMEOUT` exists to catch a generation that stalled;
+/// an Ollama that is blackholed rather than refusing stalls on EVERY field, and each one then got an
+/// `unreadable` attempt recorded without the model having seen it. Three sweeps of that and a cohort
+/// of fields is past `MAX_UNREADABLE_ATTEMPTS` and excluded for ever — rows that only a successful
+/// read deletes, and the successful read can never come. The measurement would have been silently,
+/// permanently wrong in the one table whose entire purpose is measurement.
+///
+/// So a timeout is held rather than written, and only becomes an attempt once some later field in
+/// the same sweep comes back — which is the endpoint proving it is alive. Two in a row without that
+/// proof end the sweep with nothing recorded, exactly as a refused connection does.
+///
+/// Two, not three, and the asymmetry with `MAX_UNREADABLE_ATTEMPTS` is deliberate: being wrong here
+/// costs one sweep that is retried in fifteen minutes, and being wrong the other way costs data
+/// that no later pass repairs.
+const MAX_CONSECUTIVE_TIMEOUTS: usize = 2;
+
 /// How often a sweep runs. Slow on purpose — this is measurement, and nothing waits for it.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// How long one whole sweep may run before it stops and waits for the next tick.
+///
+/// The batch count alone bounds nothing: six fields at the per-request timeout is eighteen minutes
+/// against a fifteen-minute period, because the batch was sized from the forty seconds a call
+/// typically takes rather than from the ceiling the code actually enforces. Two thirds of the
+/// period leaves the local model free for triage and the chat even when every field is slow, and
+/// what does not get looked at simply waits — this is a measurement, and nothing is behind it.
+const SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long one field may occupy the model before the sweep gives up on it.
 ///
@@ -277,16 +312,35 @@ pub async fn observe_pending(
     //
     // Serving them in order was the first version and it starves the very column this table was
     // built for. `subject` has a row for every message ever ingested, so on a backfilled mailbox it
-    // takes the whole budget every sweep: the first live run of it spent all twenty on subjects and
-    // reached neither the sender names nor the summaries. At two thousand messages that is weeks
+    // takes the whole budget every sweep: the first live run of it spent the whole batch on subjects
+    // and reached neither the sender names nor the summaries. At two thousand messages that is weeks
     // before the second column is touched. An equal share bounds it; the remainder goes to whoever
     // still has work, so a caught-up column costs nothing.
+    //
+    // Bounded in TIME as well as in count, because the count alone does not bound anything. Six
+    // fields at the per-request timeout is eighteen minutes against a fifteen-minute period — the
+    // batch was sized from the forty seconds a call measures, which is the typical case and not the
+    // one the code enforces. `MissedTickBehavior::Delay` stops a burst of missed ticks; only a
+    // deadline stops one sweep from running into the next.
+    let deadline = tokio::time::Instant::now() + SWEEP_DEADLINE;
+    let local = LocalModel {
+        client,
+        base_url,
+        model,
+    };
     let mut written = 0;
     let share = (SWEEP_BATCH / OBSERVABLE_COLUMNS.len() as i64).max(1);
     let mut spare = SWEEP_BATCH - share * OBSERVABLE_COLUMNS.len() as i64;
     for column in OBSERVABLE_COLUMNS {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::info!(
+                written,
+                "pii shadow: sweep hit its deadline; the remaining columns wait for the next one"
+            );
+            break;
+        }
         let (rows, spent, model_is_out) =
-            observe_column(pool, client, base_url, model, column, share + spare, now).await?;
+            observe_column(pool, &local, column, share + spare, deadline, now).await?;
         written += rows;
         if model_is_out {
             break;
@@ -296,19 +350,28 @@ pub async fn observe_pending(
     Ok(written)
 }
 
+/// Where the local model is and which one it is — the three things every request needs and none of
+/// them a decision. Bundled because they always travel together and separating them is what pushed
+/// `observe_column` past the point where its signature said anything.
+struct LocalModel<'a> {
+    client: &'a reqwest::Client,
+    base_url: &'a str,
+    model: &'a str,
+}
+
 /// One column's share of a sweep. Returns what it wrote and how much of the budget it spent.
 ///
 /// Split out when the sweep stopped being about one column. The column name is interpolated into
 /// the SQL rather than bound, which is safe for exactly one reason and it is worth naming: it comes
 /// from `OBSERVABLE_COLUMNS`, a const list in this file, and never from anything a caller chose.
-/// The `debug_assert` is what keeps that true if a caller ever appears.
+/// The check at the top of the body is what keeps that true if a caller ever appears — a real one,
+/// not a `debug_assert`, because a guard that compiles out of release is not a guard.
 async fn observe_column(
     pool: &sqlx::SqlitePool,
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
+    local: &LocalModel<'_>,
     column: &str,
     budget: i64,
+    deadline: tokio::time::Instant,
     now: &str,
 ) -> sqlx::Result<(u64, i64, bool)> {
     // A real check, not a `debug_assert`. This one guards a column name interpolated into SQL, and
@@ -333,7 +396,7 @@ async fn observe_column(
     // write, and the summary would be re-sent to the model every fifteen minutes for ever — the
     // starvation the cap exists to prevent, reintroduced by the arithmetic meant to enforce it.
     // `AssertSqlSafe` is the audit sqlx demands for a query string it cannot see is constant, and
-    // the audit is the `debug_assert` above plus this: `column` is an element of
+    // the audit is the check above plus this: `column` is an element of
     // `OBSERVABLE_COLUMNS`, a const list of three identifiers in this file. It is never a caller's
     // string, never a row's contents, and never anything that crossed the network. Everything that
     // varies with data — the column NAME as a value, the cap, the budget — is bound below.
@@ -366,12 +429,21 @@ async fn observe_column(
 
     let mut written = 0;
     let mut spent = 0;
+    // Timed-out fields waiting to learn whether the endpoint was alive. Emptied by the first field
+    // that comes back, which is what turns them into honest attempts; see `MAX_CONSECUTIVE_TIMEOUTS`.
+    // Its length IS the consecutive count, because a success drains it.
+    let mut deferred_timeouts: Vec<(i64, i64)> = Vec::new();
     for (id, summary, attempts) in pending {
+        // Checked per field, not only per column: one column's share can outlast the whole period
+        // on its own if the model is slow.
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         spent += 1;
         let answer = crate::runner::ollama_chat(
-            client,
-            base_url,
-            model,
+            local.client,
+            local.base_url,
+            local.model,
             &prompt_for(column, &summary),
             serde_json::json!({"num_ctx": crate::triage::LOCAL_NUM_CTX}),
             Some(answer_schema()),
@@ -381,17 +453,46 @@ async fn observe_column(
 
         let observations = match answer {
             Ok(answer) => parse_observations(&answer, &summary),
+
+            // A timeout is about THIS field and not about the endpoint, and telling the two apart
+            // is what stops one field from stopping everything. A subject the model chews on past
+            // the deadline used to abort the sweep with nothing recorded — and since the query is
+            // `ORDER BY id DESC` and `subject` is swept first, that same field came back first on
+            // the next sweep and aborted that one too, for ever, with the other two columns never
+            // reached. Recorded as an attempt instead, so the same cap that governs an answer
+            // nobody could parse moves this one along as well.
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                tracing::warn!(
+                    email_id = id,
+                    column,
+                    attempt = attempts + 1,
+                    "pii shadow: the model did not answer in time for this field"
+                );
+                deferred_timeouts.push((id, attempts));
+                if deferred_timeouts.len() >= MAX_CONSECUTIVE_TIMEOUTS {
+                    tracing::warn!(
+                        column,
+                        timeouts = deferred_timeouts.len(),
+                        "pii shadow: nothing has come back at all, so this is the endpoint and not \
+                         the fields — ending the sweep without recording them"
+                    );
+                    return Ok((written, spent, true));
+                }
+                continue;
+            }
+
             Err(error) => {
                 // Named rather than guessed. "Unreachable" was the only diagnosis this branch could
                 // give, and the likeliest cause of a permanent failure here is not a stopped Ollama
                 // — it is `THINK` being sent to a model that has no thinking mode, which the
-                // endpoint refuses. A sweep failing for ever under a log line blaming the network
-                // is a measurement that reads as absent data when it is a configuration mistake.
+                // endpoint refuses. `ollama_message` carries the response body out for this: it
+                // used to call `error_for_status`, whose message is only the status line, so this
+                // branch could never fire and a configuration mistake was logged as a network one.
                 let text = error.to_string();
                 if text.contains("think") || text.contains("Think") {
                     tracing::error!(
                         %error,
-                        model,
+                        model = local.model,
                         "pii shadow: this model has no thinking mode, and without one it finds \
                          nothing — name a model that reasons, or this pass cannot measure anything"
                     );
@@ -405,13 +506,33 @@ async fn observe_column(
             }
         };
 
+        // The endpoint answered, so it was alive, so the fields that timed out before it really were
+        // slow fields. Only now do they become attempts — a garbled answer counts as proof of life
+        // just as a good one does, because the question this settles is whether anything came back.
+        for (timed_out, timed_out_attempts) in deferred_timeouts.drain(..) {
+            written += record_at_attempt(
+                pool,
+                "emails",
+                timed_out,
+                column,
+                &[Observation {
+                    class: "unreadable".to_string(),
+                    excerpt: String::new(),
+                    confidence: None,
+                }],
+                timed_out_attempts,
+                now,
+            )
+            .await?;
+        }
+
         // An answer nobody could read is recorded as `unreadable`, which is neither a finding nor a
         // clean reading — it is its own outcome and its own measurement.
         //
         // Leaving it unrecorded to be retried was the first attempt and it deadlocks the sweep:
-        // the query takes the twenty newest unobserved summaries, so twenty the model garbles
-        // deterministically are twenty it garbles again every fifteen minutes, and everything older
-        // is never reached. A frozen denominator is worse than an honest gap in it.
+        // the query takes the newest unobserved fields in batch order, so a batch the model garbles
+        // deterministically is one it garbles again every fifteen minutes, and everything older is
+        // never reached. A frozen denominator is worse than an honest gap in it.
         let observations = match observations {
             Some(observations) => observations,
             None => {
@@ -468,6 +589,10 @@ async fn observe_column(
         written += record(pool, "emails", id, column, &to_write, now).await?;
     }
 
+    // Anything still deferred is dropped rather than written, and that is the conservative end of
+    // the trade. A column whose last field timed out ends without proof the endpoint was alive, so
+    // the attempt is not recorded and that field is simply offered again next sweep. The cost is one
+    // retry; the cost of guessing the other way is a permanent hole in the denominator.
     Ok((written, spent, false))
 }
 
@@ -477,10 +602,15 @@ pub async fn run_sweep_loop(pool: sqlx::SqlitePool, base_url: String, model: Str
     // line — "`reqwest::Client::new()` waits for ever" — and reasoning mode is what makes it bite: a
     // 4B can stall mid-trace, and a request that never returns is a sweep loop that never ticks
     // again, filling nothing and warning about nothing.
+    // `expect`, not a fallback, for the reason `runner.rs::OllamaChat::new` sets out at this exact
+    // line: the fallback here was `Client::new()`, which has no timeout — so the downgrade path
+    // silently produced the very thing the timeout exists to prevent, and nothing logged it. The
+    // causes of a builder failure are TLS backend and proxy misconfiguration, which are startup
+    // problems and should look like one.
     let client = reqwest::Client::builder()
         .timeout(SWEEP_REQUEST_TIMEOUT)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("HTTP client for the shadow sweep (check TLS and proxy environment)");
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     // A sweep that overruns its period must not be followed by a burst of the ticks it missed,
     // which is `interval`'s default. Twenty reasoning calls can outlast fifteen minutes on a cold
@@ -498,11 +628,23 @@ pub async fn run_sweep_loop(pool: sqlx::SqlitePool, base_url: String, model: Str
     }
 }
 
-/// What the observation window has seen, by class. The report the table exists to produce.
-pub async fn tally(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<(String, i64)>> {
-    sqlx::query_as("SELECT class, COUNT(*) FROM pii_observations GROUP BY class ORDER BY 2 DESC")
-        .fetch_all(pool)
-        .await
+/// What the observation window has seen, by column and class. The report the table exists to
+/// produce.
+///
+/// Broken down by column, not summed across them, and that is the difference between a measurement
+/// and a number. `from_name` is a person's name often enough that a `name` finding there is nearly
+/// structural; `subject` and `triage_summary` are where the question "is there personal data here?"
+/// is a real one. Summed together, the answer to "would redacting class `name` have cost anything?"
+/// is dominated by the column where the answer is trivially yes, and the `none` denominator mixes
+/// three populations with completely different base rates.
+pub async fn tally(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<(String, String, i64)>> {
+    sqlx::query_as(
+        "SELECT source_column, class, COUNT(*) FROM pii_observations
+          GROUP BY source_column, class
+          ORDER BY source_column, 3 DESC",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 #[cfg(test)]
@@ -613,7 +755,10 @@ mod tests {
         .unwrap();
 
         assert_eq!((first, second), (1, 0));
-        assert_eq!(tally(&pool).await.unwrap(), vec![("name".to_string(), 1)]);
+        assert_eq!(
+            tally(&pool).await.unwrap(),
+            vec![("subject".to_string(), "name".to_string(), 1)]
+        );
     }
 
     type SeenBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
@@ -677,6 +822,15 @@ mod tests {
         assert_eq!(
             body["options"]["num_ctx"],
             crate::triage::LOCAL_NUM_CTX as i64
+        );
+        // The flag that decides whether this pass can see anything at all. With it false the same
+        // model, prompt and grammar answered `[]` to a sentence beginning with a person's name, and
+        // 59 fields in a row were recorded clean — a wrong value here costs a migration to undo and
+        // is invisible until somebody reads the table months later. Nothing else in the suite would
+        // notice it flipping back.
+        assert_eq!(
+            body["think"], true,
+            "the sweep stopped asking the model to reason; {body}"
         );
     }
 
@@ -756,7 +910,7 @@ mod tests {
     /// work than it can do for the assertion to mean anything.
     ///
     /// The starvation half is not hypothetical: the first live sweep after this change spent all
-    /// twenty calls on `subject` and never reached the sender names or the summaries.
+    /// its whole batch on `subject` and never reached the sender names or the summaries.
     #[tokio::test]
     async fn the_batch_is_a_budget_shared_across_columns() {
         let pool = test_pool().await;
@@ -820,15 +974,18 @@ mod tests {
             .unwrap();
 
         assert_eq!((first, second), (1, 0), "a clean reading is written once");
-        assert_eq!(tally(&pool).await.unwrap(), vec![("none".to_string(), 1)]);
+        assert_eq!(
+            tally(&pool).await.unwrap(),
+            vec![("triage_summary".to_string(), "none".to_string(), 1)]
+        );
     }
 
     /// A garbled answer is its own outcome, neither a finding nor a clean reading.
     ///
     /// Recording it as `none` would permanently count an unread summary as clean. Recording nothing
     /// at all — the first attempt at this fix — deadlocks the sweep instead: the query takes the
-    /// twenty newest unobserved summaries, so twenty the model garbles deterministically are twenty
-    /// it garbles again every fifteen minutes, and everything older is never reached.
+    /// newest unobserved fields, so a batch the model garbles deterministically is one it garbles
+    /// again every fifteen minutes, and everything older is never reached.
     #[tokio::test]
     async fn a_summary_the_model_garbled_is_recorded_as_unreadable_not_as_clean() {
         let pool = test_pool().await;
@@ -843,7 +1000,7 @@ mod tests {
         assert_eq!(written, 1);
         assert_eq!(
             tally(&pool).await.unwrap(),
-            vec![("unreadable".to_string(), 1)],
+            vec![("triage_summary".to_string(), "unreadable".to_string(), 1)],
             "an unread summary must not be counted as clean"
         );
 
@@ -866,7 +1023,11 @@ mod tests {
         assert_eq!(past_the_cap, 0, "the sweep retries past its own cap");
         assert_eq!(
             tally(&pool).await.unwrap(),
-            vec![("unreadable".to_string(), MAX_UNREADABLE_ATTEMPTS)]
+            vec![(
+                "triage_summary".to_string(),
+                "unreadable".to_string(),
+                MAX_UNREADABLE_ATTEMPTS
+            )]
         );
     }
 
@@ -935,7 +1096,7 @@ mod tests {
         // flakiness rather than with the mailbox.
         assert_eq!(
             tally(&pool).await.unwrap(),
-            vec![("none".to_string(), 1)],
+            vec![("triage_summary".to_string(), "none".to_string(), 1)],
             "a summary that eventually read is still counted as unread"
         );
 
@@ -963,8 +1124,109 @@ mod tests {
         let counts = tally(&pool).await.unwrap();
         assert_eq!(
             counts,
-            vec![("unreadable".to_string(), 2)],
+            vec![("triage_summary".to_string(), "unreadable".to_string(), 2)],
             "both summaries must have been looked at in one sweep"
+        );
+    }
+
+    /// Answers nothing for the first `hang` requests, then answers normally.
+    ///
+    /// The sleep is far longer than any timeout a test configures, so the caller gives up rather
+    /// than the server refusing — which is the distinction the sweep now turns on, and the one a
+    /// stopped listener cannot reproduce.
+    async fn stub_ollama_hanging_first(hang: usize, answer: &'static str) -> String {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(_): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": answer}
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn impatient_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("a client with a timeout should build")
+    }
+
+    /// A hung endpoint must not be written down as fields the model read and could not parse.
+    ///
+    /// This is the direction that cannot be undone. An `unreadable` row is only ever deleted by a
+    /// later successful read of the same field, so observations invented while Ollama was blackholed
+    /// push fields past `MAX_UNREADABLE_ATTEMPTS` and out of the sweep permanently — a hole in the
+    /// denominator of the one table whose entire purpose is to be a denominator.
+    #[tokio::test]
+    async fn an_endpoint_that_never_answers_records_nothing() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "o mais antigo").await;
+        triaged_email(&pool, 2, "o mais recente").await;
+        let hung = stub_ollama_hanging_first(usize::MAX, "[]").await;
+
+        observe_pending(
+            &pool,
+            &impatient_client(),
+            &hung,
+            "m",
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tally(&pool).await.unwrap(),
+            vec![],
+            "a hung endpoint was recorded as though the model had looked and failed"
+        );
+    }
+
+    /// And the stall stays fixed: one slow field must still be counted, not retried for ever.
+    ///
+    /// The two tests are a pair and neither is meaningful alone — the first says a timeout is not
+    /// evidence, this one says it becomes evidence as soon as the endpoint proves it was alive.
+    /// Without this one, "record nothing on a timeout" passes the first test and reinstates the
+    /// deadlock where the newest field times out, is offered first again, and blocks everything
+    /// older for ever.
+    #[tokio::test]
+    async fn a_field_that_times_out_is_counted_once_the_endpoint_answers() {
+        let pool = test_pool().await;
+        triaged_email(&pool, 1, "o mais antigo").await;
+        triaged_email(&pool, 2, "o mais recente").await;
+        let slow_once = stub_ollama_hanging_first(1, "[]").await;
+
+        observe_pending(
+            &pool,
+            &impatient_client(),
+            &slow_once,
+            "m",
+            "2026-08-09T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let mut counts = tally(&pool).await.unwrap();
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![
+                ("triage_summary".to_string(), "none".to_string(), 1),
+                ("triage_summary".to_string(), "unreadable".to_string(), 1),
+            ],
+            "the slow field should be an attempt and the one behind it should have been read"
         );
     }
 

@@ -1102,10 +1102,109 @@ details.scoreboard th {
   overflow-wrap: anywhere;
 }
 
-/* ── Assistant ──────────────────────────────────────────── */
+/* ── Chats ──────────────────────────────────────────────── */
 
-.assistant { padding-bottom: var(--sp-6); }
-.chat { display: grid; gap: var(--sp-4); max-height: 34rem; overflow-y: auto; }
+/* Duas colunas: a lista à esquerda, a conversa aberta à direita.
+
+   `minmax(0, 1fr)` na segunda e não `1fr`: o mínimo de uma pista `fr` é `auto`, e o transcript
+   contém `<pre>` com linhas que nada obriga a partir — um caminho longo, um stack trace colado.
+   Sem isto a pista cresce com o conteúdo e a página passa a ter scroll horizontal. */
+.chats {
+  display: grid;
+  grid-template-columns: 16rem minmax(0, 1fr);
+  gap: var(--sp-6);
+  padding-bottom: var(--sp-6);
+}
+.chat-open { display: grid; align-content: start; gap: var(--sp-3); min-width: 0; }
+
+.chat-list { display: grid; align-content: start; gap: var(--sp-3); }
+.chat-list ul { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-1); }
+
+.cl-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  border-radius: var(--r-sm);
+  padding: var(--sp-1) var(--sp-2);
+}
+.cl-row:hover { background: var(--wash); }
+.cl-row.is-open { background: var(--wash-strong); }
+/* O botão ocupa a linha toda para que a área de clique seja a linha, e não só o texto. */
+.cl-open {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  background: none;
+  border: none;
+  padding: var(--sp-1) 0;
+  text-align: left;
+  color: inherit;
+}
+.cl-name {
+  color: var(--text);
+  font-size: var(--fs-sm);
+  /* Um título escrito por um modelo cabe em 80 caracteres; o primeiro turno de uma conversa não
+     cabe em nada. A coluna corta, e o `title` do elemento não é substituto de a abrir. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cl-meta { display: flex; align-items: center; gap: var(--sp-2); font: 400 var(--fs-2xs) var(--mono); }
+.cl-busy { color: var(--gold); }
+
+/* A pastilha do que está por ler. Verde e não dourada, de propósito: o dourado nesta shell é
+   «pendente, à espera da máquina» (`.cl-busy`, o `--gold` dos avisos), e isto é o contrário —
+   a máquina já respondeu e agora a espera é tua. Duas cores para dois sentidos. */
+.cl-waiting,
+.tab-waiting {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  padding: 0 5px;
+  border-radius: var(--r-full);
+  background: var(--green);
+  color: var(--bg);
+  font: 600 var(--fs-2xs) var(--mono);
+  line-height: 1.5;
+}
+.tab-waiting { margin-left: 6px; }
+
+.brain-picker { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); }
+.bp-label {
+  font: 500 var(--fs-2xs) var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--faint);
+}
+.bp-option { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
+.bp-option input:disabled + * { color: var(--faint); }
+
+/* A marca de mudança de modelo. Uma linha atravessada, porque o que ela diz é que daqui para cima
+   e daqui para baixo são duas memórias diferentes — não é uma nota sobre o turno seguinte. */
+.brain-cut {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: var(--sp-2) 0;
+  font: 400 var(--fs-xs) var(--mono);
+  color: var(--muted);
+}
+.brain-cut::before,
+.brain-cut::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* Dentro dos chats a barra de tabs recolhe-se e deixa uma só saída. */
+.tabs.one-way-out { display: flex; }
+
+/* Sem `max-height` fixo: a conversa aberta é a página inteira agora, e uma caixa de 34rem no meio
+   de um ecrã cheio dava dois scrolls encaixados um no outro. */
+.chat { display: grid; gap: var(--sp-4); }
 .turn { display: grid; gap: var(--sp-2); }
 .bubble { display: grid; gap: var(--sp-1); }
 .bubble.asked { justify-items: start; }
@@ -1479,6 +1578,62 @@ details.scoreboard th {
   font-size: var(--fs-sm);
   color: var(--muted);
 }
+
+/* ── Council ──────────────────────────────────────────────────────────────────────────────── */
+
+.council-seats,
+.council-board,
+.council-list { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.council-board { list-style: decimal inside; }
+
+.council-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.council-seats li {
+  display: block;
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.council-seats li:first-child,
+.council-list li:first-child { border-top: 0; }
+
+.council-seat__model { display: block; font-size: var(--fs-sm); font-weight: 500; }
+.council-seat__model small { color: var(--faint); font-weight: 400; margin-left: var(--sp-2); }
+
+/* `pre` pela razão de `.web-body`: é a resposta de um modelo, chega com as quebras de linha que tem,
+   e nada a deve re-fluir. Com tecto de altura porque são várias por ecrã — uma resposta longa não
+   pode empurrar as outras para fora da vista. */
+.council-answer {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  margin: var(--sp-2) 0 0;
+  max-height: 24vh;
+  overflow-y: auto;
+}
+
+.council-row {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.council-row:hover .council-row__question { color: var(--gold); }
+.council-row:focus-visible { outline: 2px solid var(--gold-line); outline-offset: 2px; }
+
+.council-row__question { display: block; font-size: var(--fs-sm); font-weight: 500; }
+.council-row__meta { display: block; font: 400 var(--fs-xs) var(--mono); color: var(--faint); }
 
 /* ── A frota ─────────────────────────────────────────────
    Uma coluna por projeto, um cartão por slot. As colunas rolam na horizontal em vez de

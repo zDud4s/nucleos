@@ -37,6 +37,16 @@ impl Drop for ChatSlot {
     }
 }
 
+/// Whether a turn is in flight for this chat.
+///
+/// Reads the same set the slot is taken from, so it answers about the LIVE turn rather than about
+/// what the database happened to record. Asking `runs` instead would be wrong in both directions: a
+/// row still marked `running` after the daemon was killed says busy when nothing is, and the window
+/// between `ChatSlot::acquire` and the INSERT says free when the chat is already taken.
+pub fn is_busy(chat_id: &str) -> bool {
+    BUSY_CHATS.lock().unwrap().contains(chat_id)
+}
+
 /// Owns a turn's chat slot and its temp MCP config for the length of the turn, releasing both when
 /// it ends — by completing, by failing, or by being aborted.
 struct TurnGuard {
@@ -191,6 +201,13 @@ impl Origin {
     }
 }
 
+/// Why a turn was refused before it cost anything: the chat says `local` and this machine has none.
+///
+/// A named constant rather than a sentence written twice, because `http.rs` turns it into the one
+/// status code that tells this apart from a daemon that broke. Matched exactly there — a refusal
+/// recognised by a substring is a refusal that stops being recognised when someone edits the words.
+pub const NO_LOCAL_MODEL: &str = "this chat is set to the local model and none is configured";
+
 pub async fn send_message(
     state: &crate::state::AppState,
     chat_id: &str,
@@ -202,13 +219,39 @@ pub async fn send_message(
     let slot = ChatSlot::acquire(chat_id)
         .ok_or("a turn is already in progress for this chat".to_string())?;
 
-    // The one branch this feature turns on, and both halves must hold: the client asked to be
-    // answered here, and startup proved a model on this machine can do it. Either alone leaves the
-    // turn on the path it has always taken.
-    if origin == Origin::Telegram
-        && let Some(assistant) = state.local_assistant.clone()
-    {
-        return spawn_local_turn(state, slot, text.to_string(), assistant).await;
+    // Who answers this conversation. The chat's own row decides when there is one; when there is
+    // none — every Telegram conversation, and everything that predates the `chats` table — the
+    // origin rule that has always been here decides, unchanged.
+    //
+    // Precedence and not a combination, because the two facts are not the same kind of fact. A row
+    // is a choice somebody made about THIS conversation; the origin is a guess about the sender,
+    // and a guess must not outrank a choice.
+    let chosen = crate::chats::brain_of(&state.pool, chat_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let wants_local = match chosen {
+        Some(crate::chats::Brain::Local) => true,
+        Some(crate::chats::Brain::Cloud) => false,
+        None => origin == Origin::Telegram,
+    };
+
+    if wants_local {
+        match state.local_assistant.clone() {
+            Some(assistant) => {
+                return spawn_local_turn(state, slot, text.to_string(), assistant).await;
+            }
+            // A conversation that SAYS `local` and has no local model refuses. Falling through to
+            // the cloud would be the worst possible way to find that out: on the bill, for a chat
+            // that said it was staying on the machine. The refusal comes before any row is
+            // inserted, so nothing was spent and nothing has to be explained away afterwards.
+            None if chosen == Some(crate::chats::Brain::Local) => {
+                return Err(NO_LOCAL_MODEL.to_string());
+            }
+            // The origin path keeps its old shape on purpose: a Telegram chat with no local model
+            // has always simply gone to the cloud, and has never claimed otherwise. Refusing here
+            // would take the bot off the air to enforce a promise nobody made.
+            None => {}
+        }
     }
 
     let resume = get_session(&state.pool, chat_id)
@@ -235,9 +278,14 @@ pub async fn send_message(
     // purpose. The session is what the NEXT turn resumes, and this module drops it whenever a turn
     // read third-party text — so a conversation that has read mail once is spread across several
     // sessions, and no amount of joining on `session_id` reassembles it. The chat is the thread.
+    //
+    // `answered_by` alongside them, written at INSERT for the same reason `session_id` is: a turn
+    // that is cancelled before it produces a word still has to say who was answering it. It is a
+    // literal here rather than a parameter because everything that reaches this line is on the CLI
+    // path — the branch above is where the other answer is given.
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, 'cloud', ?)",
     )
     .bind(text)
     .bind(&session_id)
@@ -357,8 +405,8 @@ async fn spawn_local_turn(
 
     let session_id = crate::auth::generate_uuid_v4();
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, 'local', ?)",
     )
     .bind(&text)
     .bind(&session_id)
@@ -728,6 +776,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -753,7 +802,11 @@ mod tests {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 Vec::new()
             }
-            async fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            async fn call(
+                &self,
+                _name: &str,
+                _arguments: &serde_json::Value,
+            ) -> crate::local_agent::ToolAnswer {
                 unreachable!("this assistant answers without calling tools")
             }
         }
@@ -762,6 +815,90 @@ mod tests {
             Box::new(OneLiner(answer)),
             Box::new(NoTools),
         ))
+    }
+
+    /// A local assistant whose turn reads mail and then fails at the endpoint.
+    ///
+    /// The shape that matters: the taint happens, and then there is no `Turn` to carry it. It is
+    /// why the flag became an `AtomicBool` the caller owns, and it had no test.
+    fn local_assistant_that_reads_mail_then_dies() -> Arc<crate::local_agent::LocalAssistant> {
+        struct CallsThenDies;
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for CallsThenDies {
+            async fn exchange(
+                &self,
+                messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                // First exchange: ask for the mail. Second: the model is gone.
+                if messages.iter().any(|m| m["role"] == "tool") {
+                    return Err(std::io::Error::other("ollama went away"));
+                }
+                Ok(serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "get_email", "arguments": {"id": 1}}}]
+                }))
+            }
+        }
+
+        struct MailBox;
+        #[async_trait::async_trait]
+        impl crate::local_agent::ToolBox for MailBox {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                vec![serde_json::json!({
+                    "type": "function",
+                    "function": {"name": "get_email", "description": "read", "parameters": {}}
+                })]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                _arguments: &serde_json::Value,
+            ) -> crate::local_agent::ToolAnswer {
+                crate::local_agent::ToolAnswer {
+                    text: serde_json::json!({"body": "olá"}).to_string(),
+                    untrusted: true,
+                }
+            }
+        }
+
+        Arc::new(crate::local_agent::LocalAssistant::new(
+            Box::new(CallsThenDies),
+            Box::new(MailBox),
+        ))
+    }
+
+    /// A turn that read mail and then died is still marked as having read it.
+    ///
+    /// The flag used to ride on the returned `Turn`, which a transport error destroys — so the run
+    /// row said clean, `recent_exchanges` would hand the next turn a history containing a
+    /// stranger's words, and that turn's barrier would start open.
+    #[tokio::test]
+    async fn a_turn_that_read_mail_and_then_failed_is_still_marked() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(local_assistant_that_reads_mail_then_dies());
+
+        let id = send_message(
+            &state,
+            "tg-taint-survives",
+            "que mail chegou?",
+            Origin::Telegram,
+        )
+        .await
+        .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+
+        assert_eq!(status, "failed");
+        let marked: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            marked, 1,
+            "the turn read mail and the row does not say so, so the next turn inherits it clean"
+        );
     }
 
     /// Polls until the turn leaves `running`, the way every other test in this module waits for a
@@ -843,6 +980,143 @@ mod tests {
             reply.as_deref(),
             Some(CLI_FAKE_REPLY),
             "a configured local model must not move the shell's chat onto it"
+        );
+    }
+
+    async fn answered_by(pool: &SqlitePool, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT answered_by FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Written when the row is BORN, not when the turn ends: a turn that is cancelled still has to
+    /// say who was answering it, and the transcript draws its memory cut from this column.
+    #[tokio::test]
+    async fn a_cloud_turn_records_that_the_cloud_answered_it() {
+        let state = test_state().await;
+
+        let id = send_message(&state, "who-answered", "hello", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("cloud"));
+    }
+
+    /// The half that closes a hole predating this work: until now a Telegram turn answered on this
+    /// machine was indistinguishable from a cloud one in the runs table.
+    #[tokio::test]
+    async fn a_local_turn_records_that_the_local_model_answered_it() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("aqui mesmo"));
+
+        let id = send_message(&state, "tg-who-answered", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+
+        assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("local"));
+    }
+
+    #[tokio::test]
+    async fn a_chat_marked_local_is_answered_locally_even_from_the_shell() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answered_by(&state.pool, turn).await.as_deref(),
+            Some("local")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_marked_cloud_is_answered_in_the_cloud_even_from_telegram() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("never asked"));
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Telegram)
+            .await
+            .unwrap();
+
+        // The chat's own row wins over the sender. Anything else would make the app unable to say
+        // "answer this one in the cloud" for a conversation it opened.
+        assert_eq!(
+            answered_by(&state.pool, turn).await.as_deref(),
+            Some("cloud")
+        );
+    }
+
+    /// The guard on this whole change. No `chats` row anywhere is every Telegram conversation, and
+    /// every conversation that predates the table — the old rule, unchanged.
+    #[tokio::test]
+    async fn a_conversation_with_no_row_routes_exactly_as_it_did_before() {
+        let mut state = test_state().await;
+        state.local_assistant = Some(fake_local_assistant("na máquina"));
+
+        let from_telegram = send_message(&state, "-100200300", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        let from_shell = send_message(&state, "no-row-shell", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answered_by(&state.pool, from_telegram).await.as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            answered_by(&state.pool, from_shell).await.as_deref(),
+            Some("cloud")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_chat_with_no_local_model_refuses_instead_of_quietly_costing_money() {
+        // No local model configured: `state.local_assistant` is None.
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+            .await
+            .unwrap();
+
+        let outcome = send_message(&state, &id, "olá", Origin::Shell).await;
+
+        assert!(
+            outcome.is_err(),
+            "a chat that says local must not fall through to the cloud"
+        );
+        // And it must not have spent anything trying: no row, no bill.
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    /// The other side of the refusal above, and the reason it is stated on the CHAT and not on the
+    /// origin: a Telegram conversation with no local model has always simply gone to the cloud, and
+    /// has never claimed otherwise. Breaking that would take the bot off the air.
+    #[tokio::test]
+    async fn a_telegram_conversation_with_no_local_model_still_falls_through_to_the_cloud() {
+        let state = test_state().await;
+
+        let turn = send_message(&state, "-100200301", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answered_by(&state.pool, turn).await.as_deref(),
+            Some("cloud")
         );
     }
 
@@ -978,7 +1252,7 @@ mod tests {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 Vec::new()
             }
-            async fn call(&self, _: &str, _: &serde_json::Value) -> String {
+            async fn call(&self, _: &str, _: &serde_json::Value) -> crate::local_agent::ToolAnswer {
                 unreachable!()
             }
         }

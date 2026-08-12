@@ -2035,6 +2035,14 @@ export interface AssistantTurnRow {
   error: string | null;
   status: string;
   cost_usd: number | null;
+  /**
+   * Which model answered this turn.
+   *
+   * Null on turns from before the daemon recorded it, and that has to stay distinguishable from a
+   * known model: the transcript marks where a conversation changed model, and a mark drawn against
+   * a turn nothing knows the model of would be an invented claim.
+   */
+  answered_by: "cloud" | "local" | null;
   created_at: string;
 }
 
@@ -2058,6 +2066,170 @@ export async function getAssistantChat(
     return (await res.json()) as AssistantTurnRow[];
   } catch {
     return null;
+  }
+}
+
+/** Which model a conversation is answered by. */
+export type Brain = "cloud" | "local";
+
+/** A conversation as the list shows it. `title` null means nobody has named it yet. */
+export interface ChatRow {
+  chat_id: string;
+  title: string | null;
+  brain: Brain;
+  created_at: string;
+  /**
+   * The fallback name. Read from the turns rather than copied into `title` when the chat is opened,
+   * so it cannot go stale one message later.
+   */
+  first_message: string | null;
+  last_activity: string | null;
+  /**
+   * How many answers landed here since the conversation was last opened.
+   *
+   * Waiting for YOU, not for the model — a turn still being written is the chat waiting on the
+   * model, which the list says with its own word. Counted by the daemon from a watermark on the
+   * row, so it survives closing the app.
+   */
+  waiting: number;
+}
+
+/**
+ * The conversations this app opened.
+ *
+ * The Telegram sidecar's chats are not in here, and nothing in this call filters them out: the
+ * daemon's list is the chats a client created, and the sidecar never creates one.
+ */
+export async function listChats(token: string): Promise<ChatRow[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/chats`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as ChatRow[];
+  } catch {
+    return null;
+  }
+}
+
+/** Opens a conversation and answers with the id the daemon minted for it. */
+export async function createChat(token: string, brain: Brain = "cloud"): Promise<ApiResult<string>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/chats`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ brain }),
+    });
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    const data = (await res.json()) as { chat_id: string };
+    return { ok: true, value: data.chat_id };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Renames a conversation, changes which model answers it, or both.
+ *
+ * A 409 means a turn is in flight and the model cannot move under it. The status is carried out
+ * rather than collapsed into a boolean, because that is the one refusal the user can do something
+ * about — wait, and try again.
+ */
+export async function patchChat(
+  token: string,
+  chatId: string,
+  patch: { title?: string; brain?: Brain },
+): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/chats/${encodeURIComponent(chatId)}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Takes a conversation off the list.
+ *
+ * Archive, not delete: every turn is a billed run, and the daemon keeps them where the money is
+ * recorded. This only stops the conversation being listed.
+ */
+export async function archiveChat(token: string, chatId: string): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/chats/${encodeURIComponent(chatId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Asks the local model to name a conversation.
+ *
+ * Local only by the daemon's design — a title is decoration, and decoration billed to the cloud is
+ * not a trade it makes silently. A 503 therefore means "no local model", and a 409 means there is
+ * nothing said in this conversation yet to name it after.
+ */
+export async function titleChatLocally(token: string, chatId: string): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/assistant/chats/${encodeURIComponent(chatId)}/title`,
+      { method: "POST", headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Records that a conversation has been read.
+ *
+ * Its own call and not a field on `patchChat`, because that one answers 409 while a turn is in
+ * flight — and reading a conversation mid-turn is the ordinary case: you sent the message and you
+ * are watching it land.
+ *
+ * Sends no watermark. Where it lands is the daemon's to decide: a client naming its own could mark
+ * a turn it had not drawn yet and swallow the answer it was meant to announce.
+ */
+export async function markChatSeen(token: string, chatId: string): Promise<void> {
+  try {
+    await fetch(`${DAEMON_URL}/assistant/chats/${encodeURIComponent(chatId)}/seen`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch {
+    // Deliberately silent. Failing to record that you read something is not worth an error in front
+    // of you: the mark simply stays, and the next time the chat is open it is written again.
+  }
+}
+
+/**
+ * Whether this machine has a model that can answer a conversation.
+ *
+ * Asked so the model picker can offer the choice honestly rather than take a switch it cannot
+ * honour. Unreachable reads as false: an option that cannot be confirmed is not one to offer.
+ */
+export async function getLocalModelAvailable(token: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/local-model`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { available: boolean };
+    return data.available;
+  } catch {
+    return false;
   }
 }
 
@@ -2946,5 +3118,115 @@ export async function readWebPage(
     return { ok: true, value: (await res.json()) as WebReadView };
   } catch {
     return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/** One seat of a council, as the daemon reports it. */
+export interface CouncilSeatView {
+  seat_idx: number;
+  kind: string;
+  ref: string;
+  /** pending | ok | error | timeout | cancelled. */
+  stage1_status: string;
+  stage1_error: string | null;
+  /** The seat's answer. `null` while it is working, and after a failure that produced none. */
+  answer: string | null;
+  /** The same set plus `skipped`, which is every seat when there was nothing to rank. */
+  stage2_status: string;
+  stage2_error: string | null;
+  rankings: { anon: string; rank: number }[];
+}
+
+export interface CouncilLeaderboardEntry {
+  seat_idx: number;
+  avg_rank: number;
+  /** How many peers ranked this seat. An average over one vote is not the claim five make. */
+  n: number;
+}
+
+export interface CouncilView {
+  id: string;
+  created_at: string;
+  question: string;
+  /** running | done | error | cancelled. */
+  status: string;
+  stage: number;
+  error: string | null;
+  chairman_kind: string;
+  chairman_ref: string;
+  synthesis: string | null;
+  anon_map: Record<string, number>;
+  leaderboard: CouncilLeaderboardEntry[];
+  seats: CouncilSeatView[];
+}
+
+export interface CouncilSummary {
+  id: string;
+  created_at: string;
+  question: string;
+  status: string;
+  stage: number;
+}
+
+export async function listCouncils(token: string): Promise<CouncilSummary[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CouncilSummary[];
+  } catch {
+    return null;
+  }
+}
+
+export async function getCouncil(token: string, id: string): Promise<CouncilView | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CouncilView;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convenes a council.
+ *
+ * Reports HOW it failed, unlike the two getters above, because every refusal here is something a
+ * person can act on: 503 means there is no roster to convene, 429 means the budget window is spent,
+ * and 400 means the question was empty. Flattened to `null` all three would read as "it did not
+ * work", which is the one answer that suggests nothing to do about it.
+ */
+export async function createCouncil(
+  token: string,
+  question: string,
+): Promise<ApiResult<{ id: string }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { id: string } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function cancelCouncil(token: string, id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }

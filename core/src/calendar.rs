@@ -1362,6 +1362,7 @@ mod tests {
                 working_hours: WorkingHours::default(),
                 propose_for_actions: propose,
             }),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

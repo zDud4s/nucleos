@@ -212,12 +212,37 @@ type RawRow = (
     Option<String>,
 );
 
+/// The modes that count as autonomy spend, and this list IS the definition of the phrase.
+///
+/// `assistant` is deliberately absent: a chat turn is one message a person typed and is waiting on,
+/// and pausing it because the night's jobs were expensive would silence the remote control rather
+/// than restrain the agent.
+///
+/// `council` is deliberately PRESENT, and it is the closer call of the two. A council is also
+/// something a person asked for and is watching — but the voice pillar is exempt because it spends
+/// nothing, and a chat is exempt because it is one turn; a council is up to eight cloud invocations
+/// plus a chairman from one sentence, which is the shape of spend this ceiling exists to bound.
+/// `council::start` checks the ceiling ONCE before the first seat, so the money it counts here is
+/// money already spent rather than money it might refuse midway.
+/// Every run that counts as autonomy spend. The mode list in the query IS the definition of the
+/// phrase, so what is left out of it is as much a decision as what is in.
+///
+/// `assistant` is deliberately absent: a chat turn is one message a person typed and is waiting on,
+/// and pausing it because the night's jobs were expensive would silence the remote control rather
+/// than restrain the agent.
+///
+/// `council` is deliberately present, and it is the closer call of the two. A council is also
+/// something a person asked for and is watching — but a chat is exempt because it is ONE turn, and
+/// a council is up to eight cloud invocations plus a chairman from one sentence, which is exactly
+/// the shape of spend this ceiling exists to bound. `council::start` reads the ceiling once, before
+/// the first seat, so what this counts is money already spent rather than money it might refuse
+/// halfway through.
 async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
                 created_at, completed_at
          FROM runs
-         WHERE mode IN ('shadow', 'worktree', 'email_triage')",
+         WHERE mode IN ('shadow', 'worktree', 'email_triage', 'council')",
     )
     .fetch_all(pool)
     .await?;
@@ -771,6 +796,48 @@ mod tests {
         .await; // excluded: before window
 
         approx(window_spend(&pool, now).await.unwrap(), 1.5);
+    }
+
+    /// A council is up to eight cloud invocations plus a chairman, all from one sentence, and that
+    /// is the shape of spend the window ceiling exists to bound.
+    ///
+    /// `assistant` beside it in this test is the contrast that makes the inclusion a decision rather
+    /// than an oversight: a chat turn is also asked for by a person and is also watched by one, and
+    /// it stays out because it is ONE turn — pausing it over the night's jobs would silence the
+    /// remote control rather than restrain the agent.
+    #[tokio::test]
+    async fn council_runs_count_towards_the_window() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z");
+        insert_run(
+            &pool,
+            "council",
+            Some("seat-a"),
+            Some(0.7),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "council",
+            Some("chairman"),
+            Some(0.3),
+            "2026-07-10T09:11:00Z",
+            Some("2026-07-10T09:12:00Z"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "assistant",
+            Some("chat"),
+            Some(4.0),
+            "2026-07-12T09:00:00Z",
+            Some("2026-07-12T09:01:00Z"),
+        )
+        .await;
+
+        approx(window_spend(&pool, now).await.unwrap(), 1.0);
     }
 
     #[tokio::test]

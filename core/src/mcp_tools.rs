@@ -330,19 +330,51 @@ impl ServerHandler for NucleosTools {
 /// already in memory and makes "is this tool classified correctly?" stop being load-bearing for
 /// egress.
 ///
-/// Both carriers are filtered. `structured_content` is not decoration: a tool that returns JSON
-/// puts the same text there in parsed form, so redacting only the text blocks would leave the
-/// secret in the field a client is more likely to read programmatically.
+/// Both carriers are filtered, and the one that matters here is the text block. Every tool on this
+/// server returns `String`; rmcp's `IntoContents for String` makes that one text block and leaves
+/// `structured_content` at `None`. So the structured arm below has never run in this process, while
+/// the arm that runs on every single result took a flat pass over a rendered JSON document — which
+/// is precisely the blindness `redact_json_strings` was written to fix, sitting in the carrier all
+/// six reviews read past. A tool result's TEXT is the rendered document. It is filtered as one now.
+///
+/// The structured arm stays. The day a tool returns `Json<T>` it begins carrying the same secrets
+/// in the field a client is more likely to read programmatically, and nothing should have to
+/// remember to come back here.
 fn filter_outgoing(mut result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
     for block in &mut result.content {
         if let rmcp::model::ContentBlock::Text(text) = block {
-            text.text = crate::redact::redact_secrets(&text.text);
+            text.text = redact_rendered(&text.text);
         }
     }
     if let Some(structured) = &mut result.structured_content {
         redact_json_strings(structured);
     }
     result
+}
+
+/// Filters one string that may be a rendered JSON document.
+///
+/// A secret that spans lines — a PEM block above all — survives `redact_secrets` when the newlines
+/// separating its body are the two characters `\` and `n`, because `pem_blocks` anchors on the
+/// newline that closes the header. Parsing first turns them back into newlines, so the detectors
+/// see the text a sender wrote rather than the text `serde_json` printed.
+///
+/// One function rather than one per caller, and that is the actual fix. This rule was written twice
+/// — once for the MCP path, once for the local one — and the two disagreed at every revision: the
+/// structured half was corrected while the text half was not, then the local half was corrected
+/// while the MCP text half was not, each time with a comment claiming the paths already matched. A
+/// rule that lives in two places is a rule that is wrong in one of them, and no amount of reviewing
+/// the copies fixes that.
+fn redact_rendered(text: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(mut document) => {
+            redact_json_strings(&mut document);
+            document.to_string()
+        }
+        // Not everything crossing here is JSON — a transport-level error string is not — and for
+        // those the flat pass is the right one: they have no escaping to undo.
+        Err(_) => crate::redact::redact_secrets(text),
+    }
 }
 
 /// Applies the filter to every string in a JSON document, in place.
@@ -401,6 +433,51 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "list_projects",
     "list_proposals",
     "vcs_ticket",
+];
+
+/// The tools a council seat may be offered, whichever machine answers it.
+///
+/// Named rather than computed, and the difference is what the list is for. "Everything that is not
+/// `Acts`" would be shorter and would hand a council every tool added to this server from now on,
+/// decided by whoever added it. A seat is a agent answering somebody's question with N siblings
+/// running beside it, so the surface it gets is a decision taken here, once, in writing.
+///
+/// It is what this machine already knows, and NOTHING that acts. A seat reads runs, proposals, the
+/// budget, the kill switch, the VCS queue, the mail and the files folder; it starts no work, lifts
+/// no approval and touches no switch. `create_run` and `create_job` are on `LOCAL_TOOLS` and
+/// deliberately absent here: a chat is one turn a person is watching, and a council is up to eight
+/// agents launched by one sentence.
+///
+/// `list_files` IS here where it is absent from `LOCAL_TOOLS`, and the asymmetry is deliberate: a
+/// filename is a poor thing to answer a chat with, and a good thing to answer "what has arrived
+/// about X" with when the seat can then read the mail it came from.
+///
+/// **`web_search` and `web_read` are absent, and they are the interesting absence** — both are
+/// `ReadsUntrusted` rather than `Acts`, so no rule below excludes them and this list is the only
+/// thing that does. Two reasons, and the second is the one that settles it. A council fans one
+/// question into up to eight agents, so a network door on each multiplies the egress of asking a
+/// question by eight. And an all-local roster is meant to be the way a question stays on this
+/// machine — a `kind: local` seat holding `web_search` would put the question on the network anyway,
+/// which makes the roster stop being the statement of where the question goes. If a seat ever needs
+/// the web, that is a decision to take once, here, with the owner having asked for it.
+///
+/// The taint rule (`ReadsUntrusted` then no `Acts`) still applies on top and is redundant here by
+/// construction — there is no `Acts` on this list for it to refuse. Two independent reasons for the
+/// same refusal is what one wants at a boundary like this.
+/// `every_council_tool_only_reads` holds this list to `TOOL_EFFECTS`, so reclassifying a tool as
+/// `Acts` without removing it from here fails the gate.
+///
+/// `vcs_ticket` is absent for a different reason from either: it is the read-back half of
+/// `vcs_request`, and a seat that cannot queue an operation has nothing of its own to read back.
+pub const COUNCIL_TOOLS: &[&str] = &[
+    "get_budget",
+    "get_email",
+    "get_email_queue",
+    "get_kill",
+    "get_run",
+    "list_files",
+    "list_projects",
+    "list_proposals",
 ];
 
 /// What calling one NucleOS tool does to the turn that called it.
@@ -491,6 +568,14 @@ pub struct LocalToolBox {
     /// Read directly, not through a tool, because the budget check below has to HAPPEN rather than
     /// be requested. See `spend_is_permitted`.
     pool: sqlx::SqlitePool,
+    /// Which names this box advertises and will dispatch: `LOCAL_TOOLS` for a chat turn,
+    /// `COUNCIL_TOOLS` for a council seat.
+    ///
+    /// A field rather than a second type, because everything else about the two is identical — the
+    /// same router, the same dispatch, the same budget gate — and a second type would be a copy of
+    /// all of it kept in step by hand. What differs between a chat and a seat is exactly one list,
+    /// so exactly one list is what varies.
+    allowed: &'static [&'static str],
 }
 
 impl LocalToolBox {
@@ -512,9 +597,25 @@ impl LocalToolBox {
         }
     }
 
+    /// A chat turn's box: `LOCAL_TOOLS`.
     pub fn new(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
+        Self::with_tools(base_url, token, pool, LOCAL_TOOLS)
+    }
+
+    /// A council seat's box: `COUNCIL_TOOLS`, which carries nothing that acts.
+    pub fn for_council(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
+        Self::with_tools(base_url, token, pool, COUNCIL_TOOLS)
+    }
+
+    fn with_tools(
+        base_url: String,
+        token: String,
+        pool: sqlx::SqlitePool,
+        allowed: &'static [&'static str],
+    ) -> Self {
         Self {
             pool,
+            allowed,
             tools: NucleosTools {
                 client: crate::daemon_client::DaemonClient::new(base_url, token),
                 tool_router: NucleosTools::tool_router(),
@@ -532,7 +633,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         NucleosTools::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| LOCAL_TOOLS.contains(&tool.name.as_ref()))
+            .filter(|tool| self.allowed.contains(&tool.name.as_ref()))
             .map(|tool| {
                 serde_json::json!({
                     "type": "function",
@@ -546,34 +647,42 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             .collect()
     }
 
-    /// Answered by `effect_of_call`, the same function `hooks.rs` asks. Asking the bare table
-    /// instead was a real hole and not a tidiness point: `get_run` is `ReadsOwn` by name, the cloud
-    /// path upgrades it when the id names a triage run — whose stdout is a model's answer over a
-    /// stranger's mail — and the local path did not. A chat could read that, stay unmarked, and
-    /// then start work.
-    async fn brings_untrusted_text(&self, name: &str, arguments: &serde_json::Value) -> bool {
-        effect_of_call(&self.pool, name, arguments).await == ToolEffect::ReadsUntrusted
-    }
-
     /// An unknown name resolves to `Acts` in `tool_effect`, so it is refused here — the fail-closed
     /// direction, and the same one the cloud path takes.
     fn permitted_after_untrusted(&self, name: &str) -> bool {
         tool_effect(name) != ToolEffect::Acts
     }
 
-    async fn call(&self, name: &str, arguments: &serde_json::Value) -> String {
+    async fn call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> crate::local_agent::ToolAnswer {
         // A name outside the offered set is refused here rather than dispatched, because the model
-        // is the only thing that chose it: `LOCAL_TOOLS` is what was advertised, and anything else
+        // is the only thing that chose it: `self.allowed` is what was advertised, and anything else
         // is a hallucinated name or a tool this turn was deliberately not given.
-        if !LOCAL_TOOLS.contains(&name) {
-            return error_json(format!("{name} is not a tool this conversation can use"));
+        if !self.allowed.contains(&name) {
+            return crate::local_agent::ToolAnswer::own(error_json(format!(
+                "{name} is not a tool this conversation can use"
+            )));
         }
+
+        // Classified ONCE, before the tool runs, and the same answer gates both the filtering below
+        // and the turn's latch. It used to be asked twice — once here for redaction and once by the
+        // loop afterwards for the taint — against a `runs` row that can be deleted in between, so
+        // the two could disagree and leave a triage run's stdout in a turn that still counted clean.
+        let effect = effect_of_call(&self.pool, name, arguments).await;
 
         macro_rules! parsed {
             ($type:ty) => {
                 match serde_json::from_value::<$type>(arguments.clone()) {
                     Ok(value) => value,
-                    Err(error) => return error_json(format!("bad arguments for {name}: {error}")),
+                    Err(error) => {
+                        return crate::local_agent::ToolAnswer {
+                            text: error_json(format!("bad arguments for {name}: {error}")),
+                            untrusted: effect == ToolEffect::ReadsUntrusted,
+                        };
+                    }
                 }
             };
         }
@@ -595,7 +704,9 @@ impl crate::local_agent::ToolBox for LocalToolBox {
                 if let Err(reason) = self.spend_is_permitted().await {
                     // Answered as a tool result rather than as a failure, so the model can tell the
                     // person WHY nothing started instead of falling silent or trying again.
-                    return error_json(format!("no work can start right now: {reason}"));
+                    return crate::local_agent::ToolAnswer::own(error_json(format!(
+                        "no work can start right now: {reason}"
+                    )));
                 }
                 match name {
                     "create_run" => self.tools.create_run(Parameters(parsed!(RunParams))).await,
@@ -607,20 +718,17 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             other => error_json(format!("{other} has no local dispatch")),
         };
 
-        // Filtered here, and only what a stranger wrote. The local turn does not pass through
-        // `filter_outgoing`, on the argument that a model on this machine is not a network
-        // boundary — which was true while this box read only the daemon's own state and stopped
-        // being true when it was given the mailbox. The model is local; its ANSWER is relayed to
-        // Telegram's servers, so an IBAN quoted out of a mail body leaves the machine, while the
-        // same body read through MCP would have been redacted. Two paths to the same text, one of
-        // them filtered, is not a policy.
-        //
-        // Only the untrusted results, so the owner's own run ids, project names and budget figures
-        // reach them intact.
-        if effect_of_call(&self.pool, name, arguments).await == ToolEffect::ReadsUntrusted {
-            return crate::redact::redact_secrets(&answer);
+        // Filtered by the same function `filter_outgoing` uses on the MCP path — not by a second
+        // copy of its rule, which is how the two paths came to disagree twice in a row. Every
+        // result goes through it, untrusted or not: `get_run` hands back a whole run row, stdout
+        // included, where a transcript can carry a token it echoed, and the answer reaches Telegram
+        // either way.
+        let text = redact_rendered(&answer);
+
+        crate::local_agent::ToolAnswer {
+            text,
+            untrusted: effect == ToolEffect::ReadsUntrusted,
         }
-        answer
     }
 }
 
@@ -675,6 +783,13 @@ pub(crate) async fn effect_of_call(
         .await
     {
         Ok(Some(mode)) if mode == crate::email::TRIAGE_MODE => ToolEffect::ReadsUntrusted,
+        // `Ok(None)` is the one gap left, and it is left knowingly. A run that does not exist when
+        // this asks, but exists as a triage run by the time the tool reads it, is classified own.
+        // Closing it means holding a transaction across the loopback call, which trades a race the
+        // model would have to win by naming an id that has not been issued yet for a lock held
+        // across HTTP. The race it replaced was the real one — classification used to run twice,
+        // after the content was already in the conversation, so a row deleted in between made a
+        // stranger's words a clean turn — and that one is gone.
         Ok(Some(_)) | Ok(None) => ToolEffect::ReadsOwn,
         Err(error) => {
             tracing::warn!(
@@ -750,6 +865,55 @@ mod tests {
         assert!(
             text.text.contains("[SECRET:private-key]"),
             "{:?}",
+            text.text
+        );
+    }
+
+    /// The shape this server actually emits, which is not the one the test above builds.
+    ///
+    /// Every tool here returns `String`, and rmcp's `IntoCallToolResult` turns that into a single
+    /// text block holding a RENDERED document, with no structured half at all. So the test above
+    /// puts a raw key somewhere production never puts one, and passed for days while the only
+    /// carrier that exists handed the whole key over. Built through `into_call_tool_result` rather
+    /// than by hand, so that the day rmcp changes what a `String` becomes, this fails here instead
+    /// of in someone's mailbox.
+    #[test]
+    fn a_key_in_a_rendered_result_does_not_cross() {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAaaaaaaaaaaaaaaaa\n\
+-----END RSA PRIVATE KEY-----\n";
+        let answer = json_result(Ok(serde_json::json!({
+            "subject": "the key you asked for",
+            "body": key,
+        })));
+        assert!(
+            answer.contains("\\n") && !answer.contains('\n'),
+            "the fixture is not a rendered document, so it would prove nothing: {answer}"
+        );
+        let result = answer
+            .into_call_tool_result()
+            .expect("a String is never an error result");
+        assert!(
+            result.structured_content.is_none(),
+            "rmcp now fills the structured half for a String, so the text block is no longer the \
+             only carrier and this test no longer covers the whole result"
+        );
+
+        let filtered = filter_outgoing(result);
+
+        let rmcp::model::ContentBlock::Text(text) = &filtered.content[0] else {
+            panic!("the text block is gone");
+        };
+        assert!(
+            !text.text.contains("MIIEowIBAAKCAQEA"),
+            "a key inside a rendered document crossed intact: {}",
+            text.text
+        );
+        assert!(text.text.contains("[SECRET:private-key]"), "{}", text.text);
+        assert!(
+            text.text.contains("the key you asked for"),
+            "the redaction ate the rest of the document: {}",
             text.text
         );
     }
@@ -883,7 +1047,7 @@ mod tests {
         for name in LOCAL_TOOLS {
             let answer = toolbox.call(name, &serde_json::json!({})).await;
             assert!(
-                !answer.contains("has no local dispatch"),
+                !answer.text.contains("has no local dispatch"),
                 "{name} is in LOCAL_TOOLS and has no arm in LocalToolBox::call"
             );
         }
@@ -918,7 +1082,16 @@ mod tests {
             .filter(|name| tool_effect(name) == ToolEffect::ReadsUntrusted)
             .collect();
 
+        // By NAME. The list is not the whole answer and saying so here is the point: `get_run` is
+        // a third untrusted read whenever its id names a triage run, which only `effect_of_call`
+        // can tell — and asking the bare table is exactly the mistake that let a chat read a triage
+        // run's stdout unmarked. `reading_mail_taints_a_turn_and_shuts_the_acting_tools` is what
+        // covers that one; this covers the surface a reader can see from the list alone.
         assert_eq!(untrusted, [&"get_email", &"get_email_queue"]);
+        assert!(
+            LOCAL_TOOLS.contains(&"get_run"),
+            "the conditional case below has to remain reachable to be worth testing"
+        );
         assert!(
             !LOCAL_TOOLS.contains(&"list_files"),
             "a filename is a poor thing to answer a chat with, and every untrusted tool added \
@@ -950,8 +1123,9 @@ mod tests {
         for name in ["get_email", "get_email_queue"] {
             assert!(
                 toolbox
-                    .brings_untrusted_text(name, &serde_json::json!({"id": 1}))
-                    .await,
+                    .call(name, &serde_json::json!({"id": 1}))
+                    .await
+                    .untrusted,
                 "{name}"
             );
         }
@@ -966,19 +1140,21 @@ mod tests {
         // work with a sender's text in context.
         assert!(
             toolbox
-                .brings_untrusted_text("get_run", &serde_json::json!({"id": 1}))
-                .await,
+                .call("get_run", &serde_json::json!({"id": 1}))
+                .await
+                .untrusted,
             "a triage run's output is a stranger's words"
         );
         assert!(
             !toolbox
-                .brings_untrusted_text("get_run", &serde_json::json!({"id": 2}))
+                .call("get_run", &serde_json::json!({"id": 2}))
                 .await
+                .untrusted
         );
         // No id, or an id of the wrong shape, is "I could not tell" — which is not "no".
         for arguments in [serde_json::json!({}), serde_json::json!({"id": "seven"})] {
             assert!(
-                toolbox.brings_untrusted_text("get_run", &arguments).await,
+                toolbox.call("get_run", &arguments).await.untrusted,
                 "{arguments} was read as a safe call"
             );
         }
@@ -990,9 +1166,7 @@ mod tests {
         }
         for name in ["list_projects", "get_budget"] {
             assert!(
-                !toolbox
-                    .brings_untrusted_text(name, &serde_json::json!({}))
-                    .await,
+                !toolbox.call(name, &serde_json::json!({})).await.untrusted,
                 "{name}"
             );
         }
@@ -1019,6 +1193,48 @@ mod tests {
             registered, classified,
             "every tool this server exposes must be classified, and nothing else"
         );
+    }
+
+    /// Nothing a council seat may call can act.
+    ///
+    /// `COUNCIL_TOOLS` is written out rather than derived, which is what makes this test necessary
+    /// and is also the reason the list is worth having: the list survives a tool being added to the
+    /// server, and this survives a tool on the list being reclassified. Between them there is no
+    /// single edit that gives a council an action.
+    #[test]
+    fn every_council_tool_only_reads() {
+        for name in COUNCIL_TOOLS {
+            assert_ne!(
+                tool_effect(name),
+                ToolEffect::Acts,
+                "{name} is on the council's list and acts"
+            );
+        }
+
+        // And the name has to be a real one. `tool_effect` answers `Acts` for anything it does not
+        // know, so a misspelling would have passed the loop above by being refused — silently
+        // costing a council the tool somebody meant to give it.
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        for name in COUNCIL_TOOLS {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is on the council's list and is not a tool this server exposes"
+            );
+        }
+
+        // The two the list leaves out on purpose. Neither is `Acts`, so nothing but the list itself
+        // keeps them away from a seat — see the comment on `COUNCIL_TOOLS` for why a roster of local
+        // seats holding `web_search` would stop being a local council.
+        for name in ["web_search", "web_read"] {
+            assert!(
+                !COUNCIL_TOOLS.contains(&name),
+                "{name} reaches off this machine and a council fans out by eight"
+            );
+        }
     }
 
     /// The three that carry a stranger's text, named one by one rather than derived from the table,
