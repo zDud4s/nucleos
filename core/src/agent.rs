@@ -212,6 +212,23 @@ pub async fn update(
 }
 
 pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError> {
+    // Asked before the DELETE even though the foreign keys already refuse it — measured, not
+    // assumed: without this the same call comes back as
+    // `Db(SqliteError { code: 787, "FOREIGN KEY constraint failed" })`, which reaches the owner as
+    // a 500 naming nothing. This turns the identical refusal into a 409 that says which side is
+    // standing on the agent. It does not replace the constraint; it explains it.
+    let in_use: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM teams WHERE director_agent_id = ?)
+             OR EXISTS (SELECT 1 FROM team_members WHERE agent_id = ?)",
+    )
+    .bind(id)
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    if in_use {
+        return Err(AgentError::InUse);
+    }
+
     let result = sqlx::query("DELETE FROM agents WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -350,5 +367,55 @@ mod tests {
             create(&pool, request("head-of-content")).await,
             Err(AgentError::DuplicateName)
         ));
+    }
+
+    async fn team_with(pool: &sqlx::SqlitePool, director: &str, member: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES ('marketing', 'Marketing', 'sells', ?, 4, 2, ?, ?)",
+        )
+        .bind(director)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO team_members (team_id, agent_id) VALUES ('marketing', ?)")
+            .bind(member)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_director_cannot_be_deleted() {
+        let pool = pool().await;
+        let director = create(&pool, request("head")).await.unwrap();
+        let member = create(&pool, request("copywriter")).await.unwrap();
+        team_with(&pool, &director.id, &member.id).await;
+        let outcome = delete(&pool, &director.id).await;
+        assert!(matches!(outcome, Err(AgentError::InUse)), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_member_cannot_be_deleted() {
+        let pool = pool().await;
+        let director = create(&pool, request("head")).await.unwrap();
+        let member = create(&pool, request("copywriter")).await.unwrap();
+        team_with(&pool, &director.id, &member.id).await;
+        let outcome = delete(&pool, &member.id).await;
+        assert!(matches!(outcome, Err(AgentError::InUse)), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_in_no_team_still_deletes() {
+        let pool = pool().await;
+        let director = create(&pool, request("head")).await.unwrap();
+        let member = create(&pool, request("copywriter")).await.unwrap();
+        let spare = create(&pool, request("analyst")).await.unwrap();
+        team_with(&pool, &director.id, &member.id).await;
+        delete(&pool, &spare.id).await.unwrap();
     }
 }
