@@ -1274,7 +1274,21 @@ impl Driver {
             session_id: Some(session_id),
             fork_session: false,
             include_partial_messages: false,
-            steerable: false,
+            // Not because a seat is ever steered — `messages` is `None` and no second turn is ever
+            // sent — but because this is the only way to keep the prompt OFF the command line.
+            // `cli_args` pushes the prompt as a positional argument unless this is set, and Windows
+            // caps a command line at 32 767 characters; a phase-2 prompt carries every peer's whole
+            // answer, so it passes that ceiling on any question worth asking. The first real council
+            // died exactly there: phase 1 succeeded on all three seats (62 KB and 57 KB from the two
+            // cloud models), and every cloud seat then failed phase 2 and phase 3 with
+            // `ERROR_FILENAME_EXCED_RANGE` — os error 206, whose name says filename and whose
+            // meaning is argv. No test could have found it: they all drive a scripted runner that
+            // never builds an argv.
+            //
+            // `steerable: true` with `messages: None` is a documented state, not a borrowed one —
+            // the writer task ends after the opening turn and closes stdin, which `run_prompt`'s own
+            // comment calls "the one-turn run the argv path performs".
+            steerable: true,
             // The classifier never sees a seat: `hooks.rs` answers before it, because a
             // `pending_approval` would terminate the seat and mint an approval that resumes into a
             // worktree a council does not have.
@@ -2565,6 +2579,8 @@ mod tests {
         tool_policy: crate::runner::ToolPolicy,
         mcp_config: Option<std::path::PathBuf>,
         token: Option<String>,
+        /// Whether the prompt travelled on stdin rather than on the command line.
+        steerable: bool,
     }
 
     impl ScriptedRunner {
@@ -2609,6 +2625,7 @@ mod tests {
                     .iter()
                     .find(|(key, _)| key == "NUCLEOS_DAEMON_TOKEN")
                     .map(|(_, value)| value.clone()),
+                steerable: request.steerable,
             });
 
             let blank = crate::runner::RunOutcome {
@@ -2980,6 +2997,52 @@ mod tests {
             .expect("phase 1 asks the question as written");
         assert_eq!(answering.tool_policy, crate::runner::ToolPolicy::McpOnly);
         assert!(answering.mcp_config.is_some());
+    }
+
+    /// The regression guard for the defect the FIRST real council died of.
+    ///
+    /// A phase-2 prompt carries every peer's whole answer, and `cli_args` puts the prompt on the
+    /// command line unless the request is steerable. Windows caps a command line at 32 767
+    /// characters, so two cloud seats answering at 62 KB and 57 KB took every later phase over it
+    /// and each one failed with os error 206 — `ERROR_FILENAME_EXCED_RANGE`, which names a filename
+    /// and means an argv.
+    ///
+    /// This asserts the FLAG and not the length, because the length is not the property: a prompt
+    /// on stdin has no ceiling to be under, and a test that merely checked a size would pass right
+    /// up until somebody asked a longer question. `messages` stays `None` — nothing steers a seat,
+    /// and the writer task closing stdin after the opening turn IS the one-turn run.
+    #[tokio::test]
+    async fn no_seat_carries_its_prompt_on_the_command_line() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        // Long enough that the real thing would have been refused by the operating system.
+        let long = "x".repeat(40_000);
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers(long.clone()),
+            Scripted::Answers(long.clone()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1".into()),
+            Scripted::Answers("A: 1".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE);
+
+        let seen = runner.seen.lock().unwrap();
+        assert!(
+            seen.len() >= 3,
+            "phase 1, phase 2 and the chairman all launched"
+        );
+        for request in seen.iter() {
+            assert!(
+                request.steerable,
+                "a seat whose prompt goes on the command line dies at 32 767 characters"
+            );
+        }
     }
 
     /// Refused before the first seat, never between phases. A council stopped after phase 1 has
