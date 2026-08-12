@@ -44,6 +44,7 @@ mod runs;
 mod scheduler;
 mod search;
 mod secrets;
+mod sessions;
 mod shadow;
 mod sidecar;
 mod state;
