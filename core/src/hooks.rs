@@ -133,6 +133,14 @@ pub async fn pretooluse_decision(
     // can never satisfy (a resume expects a worktree run). Allow the sanctioned MCP tools, block
     // everything else, and never create a proposal or terminate the turn.
     if mode == "assistant" {
+        // ...unless the turn is ROOTED: one continuing a session had in the IDE, spoken to from the
+        // machine, in a directory that registers this hook. That turn was launched
+        // `ToolPolicy::Unrestricted` precisely so it can touch the code the conversation is about,
+        // and the branch below would deny every one of those calls — leaving it holding tools it can
+        // never use, which is worse than not having them.
+        if let Some(root) = rooted_turn(&state, payload.run_id).await {
+            return rooted_decision(&state, &payload, &root).await;
+        }
         return assistant_decision(&state, &payload).await;
     }
 
@@ -372,6 +380,120 @@ pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
 /// act while nothing third-party has entered the turn — but not both, and not in that order. It is
 /// deliberately not a hard split of the tool set, because reading mail from a phone is the feature,
 /// and the ordering costs the owner one extra message rather than the tool.
+/// The directory a turn is rooted in, or `None` when it is an ordinary orchestrator turn.
+///
+/// Read from the CHAT and not from the run, because it is a property of the conversation: every
+/// turn of a continued conversation runs in the same place, and a run column would be a second copy
+/// free to disagree with the one `assistant.rs` launches from.
+async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT c.cwd FROM runs r JOIN chats c ON c.chat_id = r.chat_id WHERE r.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// What the owner is told when a rooted turn asks for something that would need approving.
+pub(crate) const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and a conversation is not where that happens — do it in the window, or \
+     say what you want and let it start a run";
+
+/// A rooted turn's tool call: the NucleOS tools as ever, and the machine through the classifier.
+///
+/// **The MCP tools keep their own door.** Anything `mcp__nucleos__*` goes to `assistant_decision`
+/// unchanged, so the untrusted-read marking and the barrier that follows it are one implementation
+/// and not two.
+///
+/// **A built-in goes through the classifier**, with the run's ROOT as its workspace — which is what
+/// makes `writes outside the run's workspace are denied` mean something here: the conversation may
+/// touch the project it is about and not the rest of the disk.
+///
+/// **`pending_approval` is answered with a refusal, not with a parked proposal.** This is the whole
+/// reason the orchestrator branch existed: parking mints a proposal that expects a worktree run to
+/// resume into, and a chat turn has none, so the turn would die owing an approval nobody can grant.
+/// Refusing is not a lesser version of that — it is the right answer HERE. Elevation requires
+/// `Origin::Shell`, which means the owner is sitting at this window; parking exists for work nobody
+/// is watching, and the useful reply to somebody who is watching is to say so and let them answer.
+///
+/// The turn survives either way, which is the property the orchestrator branch was protecting: the
+/// hook never terminates a conversation and never leaves a proposal behind it.
+async fn rooted_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    root: &str,
+) -> Json<Decision> {
+    if payload.tool_name.starts_with("mcp__") {
+        return assistant_decision(state, payload).await;
+    }
+
+    let classification = crate::classifier::classify(
+        &payload.tool_name,
+        &payload.tool_input,
+        Some(Path::new(root)),
+    );
+    if classification.decision.decision == "deny" {
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: classification.reason,
+        });
+    }
+
+    // The read-untrusted barrier, extended to the tools this turn now has.
+    //
+    // Without it the barrier would hold on the MCP side and be walked around on the other: a turn
+    // that read a mail body could not `approve_proposal`, and could run `Bash`.
+    //
+    // Keyed on `classifier::only_reads` and NOT on `action_class == "read-local"`, which was the
+    // first attempt and was wrong in the direction that matters: that class is about approval, and
+    // it covers ordinary in-workspace writes too, so `Write` sailed through the barrier. An
+    // allow-list of tools that cannot change anything, rather than a deny-list of the classes that
+    // can — because the second hands every future class through by default.
+    if !crate::classifier::only_reads(&payload.tool_name) {
+        match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool = %payload.tool_name,
+                    "pretooluse-decision: refused a rooted turn's action after it read third-party content"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool = %payload.tool_name,
+                    %error,
+                    "pretooluse-decision: could not tell whether the rooted turn has read third-party content — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not tell whether this turn has read third-party content"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+
+    if classification.decision.decision == "allow" {
+        return Json(Decision {
+            decision: "allow".to_owned(),
+            reason: classification.reason,
+        });
+    }
+
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: ROOTED_APPROVAL_DENY_REASON.to_owned(),
+    })
+}
+
 async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
     // Whole segment, not a prefix. MCP tool names are `mcp__<server>__<tool>`, so a server called
     // `nucleos__x` produced `mcp__nucleos__x__...`, which passed a prefix test and inherited the
@@ -2310,6 +2432,147 @@ mod tests {
             status, "skipped",
             "a job with no worktree still must not be left holding a running item"
         );
+    }
+
+    /// An in-flight turn of a conversation ROOTED in `root` — one continuing a session had in the
+    /// IDE. Returns the run id.
+    async fn rooted_turn_run(state: &AppState, root: &str) -> i64 {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, Some(root))
+            .await
+            .unwrap();
+        let run_id = in_flight_run(state, "assistant", None, None, None).await;
+        sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
+            .bind(&chat_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    /// The whole point of the rooted branch: an ordinary orchestrator turn is denied a `Read`, and
+    /// this one is not. Asserted as a PAIR, because the interesting claim is the difference — either
+    /// alone would still pass if the branch stopped being reached.
+    #[tokio::test]
+    async fn only_a_rooted_turn_may_read_the_machine() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let plain = in_flight_run(&state, "assistant", None, None, None).await;
+        let rooted = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let read = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Read","tool_input":{{"file_path":"a.rs"}}}}"#
+            )
+        };
+        assert_eq!(decide(&app, &read(plain)).await.decision, "deny");
+        assert_eq!(decide(&app, &read(rooted)).await.decision, "allow");
+    }
+
+    /// The NucleOS tools keep the door they always had, so there is one implementation of the
+    /// untrusted-read marking and not two.
+    #[tokio::test]
+    async fn a_rooted_turn_still_reaches_the_nucleos_tools_the_same_way() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"mcp__nucleos__list_runs","tool_input":{{}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+    }
+
+    /// A conversation may touch the project it is about, and not the rest of the disk. The
+    /// classifier already enforces this — what this fixes is that it is now given a workspace to
+    /// enforce it against.
+    #[tokio::test]
+    async fn a_rooted_turn_may_not_write_outside_the_project_it_continues() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Write","tool_input":{{"file_path":"C:/Windows/System32/drivers/etc/hosts","content":"x"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+    }
+
+    /// Refused, and NOT parked. Parking mints a proposal that expects a worktree run to resume into,
+    /// and a conversation has none — the turn would die owing an approval nobody can grant. It is
+    /// also the right answer on its own terms: a rooted turn requires `Origin::Shell`, so the owner
+    /// is at the window while this is being asked.
+    #[tokio::test]
+    async fn a_rooted_turn_is_refused_rather_than_parked_when_something_needs_approving() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"frobnicate --hard"}}}}"#
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "running",
+            "the conversation was terminated by a refusal"
+        );
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(proposals, 0, "a refusal left a proposal nobody can resume");
+    }
+
+    /// The barrier follows the tools. Without this the rule would hold on the MCP side and be walked
+    /// around on the other: no `approve_proposal` after reading mail, but `Bash` all you like.
+    #[tokio::test]
+    async fn a_rooted_turn_that_read_third_party_text_may_still_read_and_may_do_nothing_else() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        crate::runs::mark_untrusted_context(&state.pool, run_id)
+            .await
+            .unwrap();
+
+        let reading = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Read","tool_input":{{"file_path":"a.rs"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            reading.decision, "allow",
+            "reading this machine is still allowed"
+        );
+
+        let writing = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Write","tool_input":{{"file_path":"C:/Projects/nucleos/a.rs","content":"x"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(writing.decision, "deny");
+        assert_eq!(writing.reason, UNTRUSTED_CONTEXT_DENY_REASON);
     }
 
     #[tokio::test]
