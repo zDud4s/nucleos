@@ -100,10 +100,126 @@ fn validate(request: &AgentRequest) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// PURE: the id a name earns, ONCE.
+///
+/// Derived here rather than accepted from the caller, so creating an agent cannot smuggle in an id
+/// that collides with one a team already references. It is computed at creation and then frozen:
+/// `update` never recomputes it, so after a rename the id and the name DO disagree, by design. The
+/// id is what `team_members`, `teams.director_agent_id` and `team_items.agent_id` point at, and a
+/// reference that changes when somebody edits a label is a reference that breaks in silence.
+fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_dash = false;
+    for character in name.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            out.extend(character.to_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !out.is_empty() {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_owned()
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|database_error| database_error.is_unique_violation())
+}
+
 pub async fn create(pool: &sqlx::SqlitePool, request: AgentRequest) -> Result<Agent, AgentError> {
     validate(&request)?;
-    let _ = pool;
-    todo!("Task 3")
+    let id = slug(&request.name);
+    if id.is_empty() {
+        return Err(AgentError::Invalid("name must contain a letter or a digit"));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO agents (id, name, speciality, prompt, engine, model, tool_policy,
+                             created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&request.name)
+    .bind(&request.speciality)
+    .bind(&request.prompt)
+    .bind(&request.engine)
+    .bind(&request.model)
+    .bind(&request.tool_policy)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(_) => get(pool, &id).await?.ok_or(AgentError::NotFound),
+        Err(error) if is_unique_violation(&error) => Err(AgentError::DuplicateName),
+        Err(error) => Err(AgentError::Db(error)),
+    }
+}
+
+pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<Agent>, AgentError> {
+    sqlx::query_as(
+        "SELECT id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at
+         FROM agents ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(AgentError::Db)
+}
+
+pub async fn get(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<Agent>, AgentError> {
+    sqlx::query_as(
+        "SELECT id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at
+         FROM agents WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AgentError::Db)
+}
+
+/// The id is deliberately NOT recomputed from the new name: it is a reference, and
+/// `team_members`, `teams.director_agent_id` and `team_items.agent_id` point at it.
+pub async fn update(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    request: AgentRequest,
+) -> Result<Agent, AgentError> {
+    validate(&request)?;
+    let result = sqlx::query(
+        "UPDATE agents
+         SET name = ?, speciality = ?, prompt = ?, engine = ?, model = ?, tool_policy = ?,
+             updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&request.name)
+    .bind(&request.speciality)
+    .bind(&request.prompt)
+    .bind(&request.engine)
+    .bind(&request.model)
+    .bind(&request.tool_policy)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(result) if result.rows_affected() == 0 => Err(AgentError::NotFound),
+        Ok(_) => get(pool, id).await?.ok_or(AgentError::NotFound),
+        Err(error) if is_unique_violation(&error) => Err(AgentError::DuplicateName),
+        Err(error) => Err(AgentError::Db(error)),
+    }
+}
+
+pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError> {
+    let result = sqlx::query("DELETE FROM agents WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AgentError::NotFound);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -170,6 +286,69 @@ mod tests {
         assert!(matches!(
             create(&pool, asked).await,
             Err(AgentError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_list_get_update_and_delete_round_trip() {
+        let pool = pool().await;
+        let first = create(&pool, request("copywriter")).await.unwrap();
+        let second = create(&pool, request("analyst")).await.unwrap();
+
+        let listed = list(&pool).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|agent| &agent.name).collect::<Vec<_>>(),
+            ["analyst", "copywriter"]
+        );
+        assert_eq!(get(&pool, &first.id).await.unwrap(), Some(first.clone()));
+
+        let mut changed = request("renamed");
+        changed.speciality = "writes long copy".to_owned();
+        let updated = update(&pool, &first.id, changed).await.unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.speciality, "writes long copy");
+        assert_eq!(updated.id, first.id);
+        assert_eq!(second.engine, "claude");
+
+        delete(&pool, &first.id).await.unwrap();
+        assert_eq!(get(&pool, &first.id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn duplicate_names_are_a_typed_conflict() {
+        let pool = pool().await;
+        create(&pool, request("copywriter")).await.unwrap();
+        assert!(matches!(
+            create(&pool, request("copywriter")).await,
+            Err(AgentError::DuplicateName)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unknown_id_is_reported() {
+        assert!(matches!(
+            delete(&pool().await, "nobody").await,
+            Err(AgentError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_id_is_a_slug_of_the_name() {
+        let pool = pool().await;
+        let created = create(&pool, request("Head of Content")).await.unwrap();
+        assert_eq!(created.id, "head-of-content");
+    }
+
+    /// Two names the `UNIQUE` on `name` lets coexist, that the slug collapses into one id. Worth a
+    /// test because it is the only surprising thing in this slice: the row is refused for a reason
+    /// the owner did not type.
+    #[tokio::test]
+    async fn two_names_that_slug_the_same_are_a_conflict() {
+        let pool = pool().await;
+        create(&pool, request("Head of Content")).await.unwrap();
+        assert!(matches!(
+            create(&pool, request("head-of-content")).await,
+            Err(AgentError::DuplicateName)
         ));
     }
 }
