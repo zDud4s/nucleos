@@ -602,8 +602,10 @@ export function ApprovalQueuePanel({ proposals, loading, token, refresh, isKill,
   }
   async function approve(proposalId: number) {
     startAction(proposalId);
-    const resumedRunId = await approveProposal(token, proposalId);
-    if (resumedRunId !== null) { await refresh(); } else { setErrors((current) => ({ ...current, [proposalId]: "Could not approve this proposal." })); }
+    // The daemon's own sentence rather than one written here: its 409 means either "somebody
+    // already decided this" or "this can never resume", and only it knows which.
+    const outcome = await approveProposal(token, proposalId);
+    if (outcome.ok) { await refresh(); } else { setErrors((current) => ({ ...current, [proposalId]: outcome.reason })); }
     finishAction(proposalId);
   }
   async function reject(proposalId: number) {
