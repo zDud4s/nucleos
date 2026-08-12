@@ -1746,7 +1746,7 @@ async fn create_run_with(
     Ok(id)
 }
 
-/// The merge this approval should hand to the queue instead of handing back to the run, if it is
+/// The operation this approval should hand to the queue instead of handing back to the run, if it is
 /// one at all.
 ///
 /// **Every `None` here means "keep the behaviour this approval has always had"** — a single-use
@@ -1755,13 +1755,17 @@ async fn create_run_with(
 /// approved, no way to perform it, and nothing to read explaining why; queueing an operation we are
 /// not certain is the one they read would be worse than either.
 ///
-/// So the bar is: the tool is a shell, the input parses, the command is `git merge <ref>` with at
-/// most a `--no-ff` on it (`vcs::merge_from_command` argues both the strictness and why that one
-/// flag is inside it rather than beside it), the worktree is really there and really on a branch,
-/// and the project resolves to a repository. Anything else falls back.
+/// So the bar is: the tool is a shell, the input parses, the command is one the queue can execute —
+/// `git merge <ref>` with at most a `--no-ff`, or `git push <remote> [<branch>]`, each argued in its
+/// own function in `vcs.rs` — the worktree is really there and really on a branch, and the project
+/// resolves to a repository. Anything else falls back.
+///
+/// **The two are tried in order and the order cannot matter**, which is worth stating rather than
+/// relying on: each parser insists on its own subcommand, so a command is at most one of them. The
+/// `or_else` is a sequence and not a precedence.
 ///
 /// It runs git twice and must therefore be called before the transaction opens — see the call site.
-async fn queueable_merge(
+async fn queueable_operation(
     state: &AppState,
     proposal: &crate::proposals::Proposal,
     project_id: &str,
@@ -1775,6 +1779,11 @@ async fn queueable_merge(
 
     // One deadline for both calls, so a slow repository cannot spend the budget twice over.
     let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    // Read for BOTH parsers, and for different jobs in each: a merge's target is the branch the
+    // worktree stands on, while a push only falls back to it when the command did not name one. It
+    // is asked for unconditionally because it is also the liveness check on the worktree — a path
+    // that has been removed answers with the enclosing checkout's branch or with an error, and
+    // `current_branch`'s own `--show-toplevel` guard is what tells those apart.
     let branch = crate::git_exec::current_branch(std::path::Path::new(worktree_path), deadline)
         .await
         .map_err(|error| {
@@ -1785,7 +1794,8 @@ async fn queueable_merge(
             );
         })
         .ok()?;
-    let op = crate::vcs::merge_from_command(command, &branch)?;
+    let op = crate::vcs::merge_from_command(command, &branch)
+        .or_else(|| crate::vcs::push_from_command(command, &branch))?;
     crate::vcs::resolve_repo(&state.pool, project_id)
         .await
         .map_err(|error| {
@@ -1853,7 +1863,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
     // it runs git twice — reading the worktree's branch and identifying the repository — and holding
     // SQLite's write lock across a subprocess would stall every other writer in the daemon.
-    let queueable = queueable_merge(state, &proposal, &wt_project_id, &wt_path).await;
+    let queueable = queueable_operation(state, &proposal, &wt_project_id, &wt_path).await;
 
     // The class the grant will authorize, derived before the transaction opens so a parse cannot
     // hold SQLite's write lock. Re-derived here rather than carried on the proposal because
@@ -1911,12 +1921,23 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         None => None,
     };
 
-    // The run is told which of the two happened, because the two ask opposite things of it.
-    let prompt = match queued_request_id {
-        Some(request_id) => format!(
-            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the merge it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
-        ),
-        None => format!(
+    // The run is told which of the two happened, because the two ask opposite things of it. Named by
+    // `kind()` rather than by the word "merge", which is what it said while merge was the only thing
+    // the queue could do: a run told its *merge* was queued after asking for a push would read that
+    // as the daemon having misunderstood it, and go looking for what it had misfiled.
+    let prompt = match (queued_request_id, &queueable) {
+        (Some(request_id), Some((_, op))) => {
+            let kind = op.kind();
+            format!(
+                "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the {kind} it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
+            )
+        }
+        // `queued_request_id` is `Some` exactly when `queueable` is, and they are matched together
+        // rather than one of them being unwrapped inside the other's arm — so the impossible pairing
+        // has to be written out, and what it does is fall back to authorizing. A run told to proceed
+        // is the safe half of this decision: the grant is single-use and the action is one a human
+        // just approved.
+        _ => format!(
             "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
         ),
     };
@@ -2030,11 +2051,12 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // The queued request id belongs in the audit trail, not only in the resumed run's prompt: this
     // row is where somebody reconstructs what an approval actually did, and "approved" alone no
     // longer says whether the action was authorised or taken over.
-    let note = match queued_request_id {
-        Some(request_id) => {
-            format!("approved; merge queued as vcs request {request_id}; resume run {resume_id}")
+    let note = match (queued_request_id, &queueable) {
+        (Some(request_id), Some((_, op))) => {
+            let kind = op.kind();
+            format!("approved; {kind} queued as vcs request {request_id}; resume run {resume_id}")
         }
-        None => format!("approved; resume run {resume_id}"),
+        _ => format!("approved; resume run {resume_id}"),
     };
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
@@ -3490,14 +3512,19 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// The other side of the branch, and the one that keeps this from being a regression: an
     /// approved action the queue cannot perform is authorized exactly as it always was.
     ///
-    /// `git push` is the case that matters — it is on the approval list, the queue has no executor
-    /// for it, and redirecting it would leave a run denied with nowhere to go.
+    /// **The subject used to be `git push origin main`, and this is what it cost to change it.** That
+    /// command is now queued, so the test as written would have gone red — which is the correct
+    /// signal, and the wrong fix would have been to delete it. The property is not about push; it is
+    /// that a run whose approved action has no executor still gets to perform it, and losing that
+    /// leaves a person holding an approval with nowhere to go. `--force-with-lease` is the sharpest
+    /// remaining case precisely BECAUSE it is a push: `vcs::push_from_command` sees the right verb
+    /// and refuses on the flag, so this exercises the refusal rather than the absence of a parser.
     #[tokio::test]
     async fn approving_something_the_queue_cannot_perform_still_authorizes_the_run() {
         let (state, _runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         let (proposal_id, _branch, _container) =
-            seed_real_worktree_approval(&state, "git push origin main").await;
+            seed_real_worktree_approval(&state, "git push --force-with-lease origin main").await;
 
         let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
 
@@ -3505,11 +3532,64 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(queued, 0, "the queue cannot push, so it must not claim to");
+        assert_eq!(
+            queued, 0,
+            "the queue does not force-push, so it must not claim to"
+        );
         assert_eq!(
             grants_for(&state, resume_id).await,
             1,
             "an action the queue does not take is still the run's to perform, once"
+        );
+    }
+
+    /// The push counterpart of `approving_a_merge_queues_it_instead_of_letting_the_run_perform_it`,
+    /// and it is not a copy of it: it pins the two halves that are push's own.
+    ///
+    /// The command names only the remote, so the BRANCH has to come from the worktree — the same
+    /// half no push command line carries that a merge's target does. And the audit note has to say
+    /// `push`, because that sentence was hard-coded to the word "merge" for as long as merge was the
+    /// only thing the queue could do; a trail that calls every operation a merge is a trail nobody
+    /// can reconstruct an approval from.
+    #[tokio::test]
+    async fn approving_a_push_queues_it_and_records_which_operation_it_was() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git push origin").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (op, args, origin, status): (String, String, String, String) =
+            sqlx::query_as("SELECT op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .expect("the approved push is in the queue");
+        assert_eq!(op, "push");
+        assert_eq!((origin.as_str(), status.as_str()), ("human", "queued"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            serde_json::json!({"op": "push", "remote": "origin", "branch": branch}),
+            "the command named the remote; the branch is the one the worktree stands on"
+        );
+
+        assert!(
+            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                .await
+                .unwrap(),
+            "the queue took the push, so the run must NOT also be authorized to perform it"
+        );
+
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains("push queued as vcs request"),
+            "the trail must name the operation it queued, not the one it used to be: {note}"
         );
     }
 

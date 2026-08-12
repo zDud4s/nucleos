@@ -28,26 +28,48 @@ use serde::{Deserialize, Serialize};
 /// Typed rather than a command string on purpose: a string would have to be parsed, and parsing
 /// shell is the surface `classifier.rs` exists to keep closed. The daemon builds every argv.
 ///
-/// **Whoever adds the next variant here owes two things that `Merge` did not.**
+/// **Whoever adds the next variant here owes three things that `Merge` did not — and `Push` is what
+/// paying them looks like, so it is worth reading as the worked example rather than as prose.**
 ///
-/// 1. `git_exec::run_git` justifies having no process-tree kill with "nothing here hands git a
-///    shell". That is true of `merge`, and it stops being true the day `Fetch` or `Push` lands and
-///    git starts spawning ssh and credential helpers — which is the exact case spec §7's hung-command
-///    row was written about, a fetch against a dead network. That comment will become wrong without
-///    anybody editing it, so the obligation is recorded here, where the change has to be made.
+/// 1. `git_exec::run_git` justified having no process-tree kill with "nothing here hands git a
+///    shell". That was true of `merge`, and it stopped being true the moment `Push` landed and git
+///    started spawning ssh and credential helpers — the exact case spec §7's hung-command row was
+///    written about. That comment would have become wrong without anybody editing it, which is why
+///    the obligation was recorded here, where the change had to be made. **Paid:** `process_tree.rs`
+///    now holds the one `TreeKiller`, and `run_git` spawns through it.
 /// 2. `Merge`'s `source`/`target` reach argv without a `--end-of-options`, and get away with it by
 ///    accident rather than design: a dashed string can set an option but cannot also name a commit,
 ///    HEAD in the integration worktree is always detached so `merge`'s upstream fallback dies, and
 ///    `update-ref` rejects a dashed ref name. A variant with a different argv shape does not inherit
 ///    any of that. `Branch` is that accident turned into a rule for the two fields `Merge` has; a
-///    variant carrying a name of some other kind owes its own type.
+///    variant carrying a name of some other kind owes its own type. **Paid:** `Push` names its remote
+///    with `Remote`, and its argv carries an explicit `--end-of-options` rather than an argument
+///    about why it does not need one.
 /// 3. The operation names in `from_request` are matched as `&str`, so adding a variant here does NOT
 ///    fail to compile there. Whoever adds one must also take its name out of the "not yet" arm by
 ///    hand, or the queue will go on refusing an operation it has learned to perform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    Merge { source: Branch, target: Branch },
+    Merge {
+        source: Branch,
+        target: Branch,
+    },
+    /// **The first operation that leaves the machine, and the only one so far that a human cannot
+    /// undo by reaching for the reflog.** A merge the queue got wrong is a local ref somebody moves
+    /// back; a push the queue got wrong is on a server other people have already fetched from. That
+    /// is the argument for it needing at least what a merge needs by way of consent, never less —
+    /// and `runs::queueable_operation` gives it exactly the merge's route, where a human's approval
+    /// IS the queueing.
+    ///
+    /// `branch` rather than a refspec, and no force of any kind. The queue builds
+    /// `<sha>:refs/heads/<branch>` itself from the sha the branch names when the operation runs, so
+    /// what is published is a value the row records rather than whatever the ref drifted to; a
+    /// non-fast-forward is then the remote's refusal to record, not ours to overrule.
+    Push {
+        remote: Remote,
+        branch: Branch,
+    },
 }
 
 /// A branch name the daemon is willing to put on a git command line.
@@ -78,29 +100,79 @@ pub struct Branch(String);
 
 impl Branch {
     pub fn new(value: &str) -> Result<Self, String> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err("a branch name may not be empty".to_owned());
-        }
-        if value.starts_with('-') {
-            return Err(format!("a branch name may not start with '-': {value}"));
-        }
-        if value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-        {
-            // Both halves are named, because the message is what a caller reads: told only
-            // "whitespace" about a name carrying an ESC it would go looking for a space that is
-            // not there.
-            return Err(format!(
-                "a branch name may not contain whitespace or control characters: {value}"
-            ));
-        }
-        Ok(Self(value.to_owned()))
+        argv_safe(value, "branch name").map(Self)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// PURE: the whole of the argv rule, shared by every name the queue puts on a git command line.
+///
+/// Shared as a function rather than by making one type serve two roles, and the difference is what a
+/// reader can conclude: `Branch` and `Remote` happen to be checked for the same three properties
+/// today, and nothing says they must stay that way — a remote is a config key and a branch is a ref,
+/// and they answer to different authorities. One type would have made "the queue accepts this
+/// remote" and "the queue accepts this branch" literally the same sentence.
+fn argv_safe(value: &str, what: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("a {what} may not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!("a {what} may not start with '-': {value}"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        // Both halves are named, because the message is what a caller reads: told only "whitespace"
+        // about a name carrying an ESC it would go looking for a space that is not there.
+        return Err(format!(
+            "a {what} may not contain whitespace or control characters: {value}"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+/// A remote the daemon is willing to name on a git command line.
+///
+/// Its own type because `Op`'s doc comment says a variant carrying a name of some other kind owes
+/// one, and for the reason `argv_safe` gives about not collapsing two roles into one.
+///
+/// **An argv guard, not a remote validator.** `origin`, `upstream`, and equally a name no `git
+/// remote` in the repository has ever heard of, all pass here — git is the authority on which
+/// remotes exist, and a push to one that does not is a failed row carrying git's own message. What
+/// this refuses is a name that could act as an option. A URL passes too, and that is worth saying
+/// out loud rather than discovering: `git push https://…` is legal, so a caller can push to a
+/// destination the repository never configured. It is exactly as legal as the command the caller
+/// could have run by hand, and the queue's job here is serialization rather than policy — `wip.rs`
+/// and `proposals.rs` are where "may this actor ask for this" is decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Remote(String);
+
+impl Remote {
+    pub fn new(value: &str) -> Result<Self, String> {
+        argv_safe(value, "remote name").map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Remote {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Remote::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The `Branch` counterpart, and it exists for the same reason: tests build remotes from literals.
+#[cfg(test)]
+impl From<&str> for Remote {
+    fn from(value: &str) -> Self {
+        Remote::new(value).expect("a test used an invalid remote name literal")
     }
 }
 
@@ -120,17 +192,26 @@ impl From<&str> for Branch {
 }
 
 /// PURE: a caller-supplied branch name for one named role, or why it is not usable as one.
-fn named_branch(value: Option<&str>, which: &str) -> Result<Branch, String> {
+fn named_branch(value: Option<&str>, operation: &str, which: &str) -> Result<Branch, String> {
     let Some(value) = value else {
-        return Err(format!("a merge needs a {which} branch"));
+        return Err(format!("a {operation} needs a {which} branch"));
     };
     Branch::new(value).map_err(|reason| format!("{which}: {reason}"))
+}
+
+/// PURE: the same, for the one role that names a remote.
+fn named_remote(value: Option<&str>, operation: &str, which: &str) -> Result<Remote, String> {
+    let Some(value) = value else {
+        return Err(format!("a {operation} needs a {which} remote"));
+    };
+    Remote::new(value).map_err(|reason| format!("{which}: {reason}"))
 }
 
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::Merge { .. } => "merge",
+            Op::Push { .. } => "push",
         }
     }
 
@@ -142,8 +223,14 @@ impl Op {
     ///
     /// Every rejection names what is wrong, and the rejection for an operation the SPEC lists but
     /// the executor cannot perform yet is deliberately different from the one for a word that is not
-    /// an operation at all. A caller told "unknown operation: push" would go looking for a typo in
-    /// its own request; a caller told "push is not queued yet" knows to wait or do something else.
+    /// an operation at all. A caller told "unknown operation: rebase" would go looking for a typo in
+    /// its own request; a caller told "rebase is not queued yet" knows to wait or do something else.
+    ///
+    /// **`source` and `target` mean the same two things for both operations, and that is why the
+    /// push arm reads backwards at first glance.** `source` is what is being moved and `target` is
+    /// where it goes: for a merge, a branch into a branch; for a push, a branch to a remote. Naming
+    /// the fields after the operation instead would give the tool description two vocabularies for
+    /// one pair of parameters, which is the thing this flat shape exists to avoid.
     pub fn from_request(
         operation: &str,
         source: Option<&str>,
@@ -151,16 +238,26 @@ impl Op {
     ) -> Result<Self, String> {
         match operation.trim().to_ascii_lowercase().as_str() {
             "merge" => Ok(Op::Merge {
-                source: named_branch(source, "source")?,
-                target: named_branch(target, "target")?,
+                source: named_branch(source, "merge", "source")?,
+                target: named_branch(target, "merge", "target")?,
             }),
-            other @ ("rebase" | "push" | "pull" | "fetch" | "tag" | "branch-delete"
-            | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
-                "{other} is not yet queued by this daemon — merge is the only operation the queue \
-                 can execute today"
+            "push" => Ok(Op::Push {
+                branch: named_branch(source, "push", "source")?,
+                remote: named_remote(target, "push", "target")?,
+            }),
+            // `pr-merge` is the one on this list that is NOT waiting its turn, and saying so here is
+            // the point of the comment: it is the only operation of the nine that is not git. It
+            // would put a second binary with its own authentication, its own network failures and
+            // its own release cadence inside the executor — and it would buy none of what this queue
+            // is made of, since a merge that happens on GitHub's servers is not serialised by a lock
+            // held on this machine. Whoever wants it wants a different pillar, not a tenth variant.
+            other @ ("rebase" | "pull" | "fetch" | "tag" | "branch-delete" | "worktree-add"
+            | "worktree-remove" | "pr-merge") => Err(format!(
+                "{other} is not yet queued by this daemon — merge and push are the operations the \
+                 queue can execute today"
             )),
             other => Err(format!(
-                "unknown operation: {other} — the queue understands merge"
+                "unknown operation: {other} — the queue understands merge and push"
             )),
         }
     }
@@ -379,6 +476,53 @@ pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     Some(Op::Merge {
         source: Branch::new(source).ok()?,
         target: Branch::new(current_branch).ok()?,
+    })
+}
+
+/// PURE: the push a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`git push <remote>` and `git push <remote> <branch>`, and nothing else** — the same strictness
+/// posture `merge_from_command` argues at length, applied to an operation where being wrong is worse
+/// because it is public. What that list leaves out is the interesting part, and each exclusion is a
+/// different KIND of thing rather than a longer list of the same one:
+///
+/// - `git push` alone is refused, and it is the one that looks safest. It has no argv of its own —
+///   what it does is read out of `push.default`, `branch.<name>.remote` and the upstream, in a
+///   repository the daemon does not control. The queue would have to guess a destination, and the
+///   spelling that means "the usual place" to the person who typed it means whatever their config
+///   says to us.
+/// - `-u` / `--set-upstream` is refused because the queue's argv would not do it. The push would
+///   succeed, the upstream would not be set, and the row would say `succeeded` — a silent partial
+///   execution, which is worse than a refusal that hands the command back.
+/// - `--force`, `--force-with-lease`, `--delete`, `--tags`, `--all`, `--mirror` are refused because
+///   each is a different operation, in the sense `merge_from_command` uses the word: they destroy or
+///   move things this one only adds to. There is no `--no-ff`-shaped case here — no flag that is
+///   merely a literal spelling of what the executor already does — so nothing is admitted beside the
+///   bare shapes.
+///
+/// The branch is the command's own second word when it has one, and otherwise the branch the
+/// worktree is standing on. `git push origin feature` from a worktree on `master` is a perfectly
+/// ordinary thing to write and does not touch any worktree, so there is no reason to require the two
+/// to agree — but `HEAD` is refused in both routes, whether it arrived from a detached worktree or
+/// was typed, because a queued row naming `HEAD` names nothing by the time it runs.
+pub fn push_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let (program, subcommand, remote, branch) = match tokens.as_slice() {
+        [program, subcommand, remote] => (program, subcommand, remote, current_branch.trim()),
+        [program, subcommand, remote, branch] => (program, subcommand, remote, *branch),
+        _ => return None,
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("push") {
+        return None;
+    }
+    // Both routes, deliberately: `rev-parse --abbrev-ref` says `HEAD` for a detached worktree, and a
+    // caller may equally have typed it. Neither is a branch this queue can push a week later.
+    if branch == "HEAD" {
+        return None;
+    }
+    Some(Op::Push {
+        remote: Remote::new(remote).ok()?,
+        branch: Branch::new(branch).ok()?,
     })
 }
 
@@ -2073,6 +2217,105 @@ mod tests {
         assert_eq!(merge_from_command("git merge feature", ""), None);
     }
 
+    /// The two shapes a push may take, and the half the command line does not carry.
+    ///
+    /// `git push origin` names no branch, so the branch is the one the worktree stands on — the same
+    /// role the worktree's branch plays as a merge's TARGET, in the opposite position. The two cases
+    /// are asserted against different worktree branches on purpose: with both on `main`, an
+    /// implementation that ignored the command's second word would pass.
+    #[test]
+    fn a_push_takes_its_branch_from_the_command_or_from_the_worktree() {
+        assert_eq!(
+            push_from_command("git push origin", "feat/x"),
+            Some(Op::Push {
+                remote: "origin".into(),
+                branch: "feat/x".into()
+            })
+        );
+        assert_eq!(
+            push_from_command("git push origin main", "feat/x"),
+            Some(Op::Push {
+                remote: "origin".into(),
+                branch: "main".into()
+            }),
+            "an explicit branch is the one asked for, even from a worktree standing elsewhere"
+        );
+        // Folded for comparison, and the NAMES are not — git is case-sensitive about both a branch
+        // and a remote, and a queued push to `Origin` is not a push to `origin`.
+        assert_eq!(
+            push_from_command("GIT PUSH Origin Main", "feat/x"),
+            Some(Op::Push {
+                remote: "Origin".into(),
+                branch: "Main".into()
+            })
+        );
+    }
+
+    /// Everything the strictest reading leaves out. Each row is a different KIND of exclusion, which
+    /// is why they are listed with what they are rather than as a bag of strings.
+    #[test]
+    fn only_a_bare_git_push_to_a_named_remote_becomes_a_queued_operation() {
+        for command in [
+            // No argv of its own: what this does is read out of config the daemon does not control.
+            "git push",
+            // The queue's argv would not set the upstream, so queueing it would succeed at less than
+            // was asked and report success.
+            "git push -u origin main",
+            "git push --set-upstream origin main",
+            // Different operations: each destroys or moves what this one only adds to.
+            "git push --force origin main",
+            "git push --force-with-lease origin main",
+            "git push -f origin main",
+            "git push --delete origin main",
+            "git push --tags origin",
+            "git push --all origin",
+            "git push --mirror origin",
+            // Shape, not flags: a third positional is a second refspec.
+            "git push origin main extra",
+            // The verb is the verb. A flag in its place is not one.
+            "git --no-verify push origin main",
+            "gh push origin main",
+        ] {
+            assert_eq!(push_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// **`HEAD` is refused on BOTH routes into the branch, and only two assertions can tell that.**
+    ///
+    /// One arrives from the worktree (`rev-parse --abbrev-ref` says `HEAD` for a detached checkout)
+    /// and the other was typed. `git push origin HEAD` is a perfectly ordinary thing for a person to
+    /// write and means "whatever I am standing on right now" — which is a sentence with no meaning
+    /// left by the time a queued row runs, possibly several operations later.
+    #[test]
+    fn a_push_never_queues_the_word_head() {
+        assert_eq!(push_from_command("git push origin", "HEAD"), None);
+        assert_eq!(push_from_command("git push origin", ""), None);
+        assert_eq!(push_from_command("git push origin HEAD", "master"), None);
+    }
+
+    /// The argv guard is what refuses a dashed name that reached an argument position, exactly as it
+    /// does for a merge — and it is `Remote` doing it for the remote, which is the field a `String`
+    /// would have let straight through.
+    #[test]
+    fn a_dashed_name_in_a_push_is_stopped_by_the_type_rather_than_the_shape() {
+        assert_eq!(
+            push_from_command("git push --receive-pack=touch", "master"),
+            None
+        );
+        assert_eq!(
+            push_from_command("git push origin --exec=x", "master"),
+            None
+        );
+    }
+
+    /// The two parsers are tried one after the other in `runs::queueable_operation`, and this is why
+    /// that order cannot matter: each insists on its own subcommand, so no command is both.
+    #[test]
+    fn a_command_is_never_both_a_merge_and_a_push() {
+        assert!(merge_from_command("git push origin main", "master").is_none());
+        assert!(push_from_command("git merge feature", "master").is_none());
+    }
+
     /// A listing narrowed to a project shows the whole repository that project shares.
     ///
     /// The thing being pinned is that a reader asking "what is queued for alpha" is not shown a
@@ -3742,7 +3985,7 @@ mod tests {
 
     /// The door's whole vocabulary, stated as a table.
     #[test]
-    fn the_queue_speaks_merge_and_says_so_about_everything_else() {
+    fn the_queue_speaks_merge_and_push_and_says_so_about_everything_else() {
         assert_eq!(
             Op::from_request("merge", Some("feature"), Some("master")).unwrap(),
             Op::Merge {
@@ -3750,13 +3993,22 @@ mod tests {
                 target: "master".into()
             }
         );
+        // `source` is the thing that moves and `target` is where it goes, for BOTH operations — so a
+        // push is a branch to a remote, in that order.
+        assert_eq!(
+            Op::from_request("push", Some("main"), Some("origin")).unwrap(),
+            Op::Push {
+                remote: "origin".into(),
+                branch: "main".into()
+            }
+        );
 
         // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
-        // missing — "unknown operation: push" would send a caller looking for a typo.
-        let error = Op::from_request("push", Some("origin"), Some("master")).unwrap_err();
+        // missing — "unknown operation: rebase" would send a caller looking for a typo.
+        let error = Op::from_request("rebase", Some("feature"), Some("master")).unwrap_err();
         assert!(error.contains("not yet"), "unexpected error: {error}");
         assert!(
-            error.contains("merge"),
+            error.contains("merge") && error.contains("push"),
             "the error must name what the queue CAN do: {error}"
         );
 
@@ -3775,6 +4027,59 @@ mod tests {
                 .unwrap_err()
                 .contains("source")
         );
+        // The push arm's own two, because it reaches `named_branch`/`named_remote` with different
+        // arguments and a swapped pair would still compile.
+        assert!(
+            Op::from_request("push", Some("main"), None)
+                .unwrap_err()
+                .contains("remote")
+        );
+        assert!(
+            Op::from_request("push", None, Some("origin"))
+                .unwrap_err()
+                .contains("branch")
+        );
         assert!(Op::from_request(" Merge ", Some("feature"), Some("master")).is_ok());
+        assert!(Op::from_request(" PUSH ", Some("main"), Some("origin")).is_ok());
+    }
+
+    /// A remote is checked as an argv token, exactly as a branch is, and by its OWN type.
+    ///
+    /// The second half is the one worth a test: `Op` derives `Deserialize`, so a raw
+    /// `POST /vcs/requests` body reaches `Remote` without passing `Op::from_request` at all — the
+    /// route `a_dashed_branch_cannot_arrive_as_json_either` exists for, on the field it does not
+    /// cover. Giving `Push` a `String` remote would leave every assertion in the flat-builder test
+    /// above green.
+    #[test]
+    fn a_remote_is_an_argv_token_on_every_route_in() {
+        assert_eq!(Remote::new("  origin  ").unwrap().as_str(), "origin");
+        for bad in ["", "  ", "--upload-pack=x", "-o", "a b", "a\u{1b}b"] {
+            assert!(Remote::new(bad).is_err(), "{bad:?} was accepted");
+        }
+
+        let raw = r#"{"op":"push","remote":"--receive-pack=touch x","branch":"main"}"#;
+        assert!(serde_json::from_str::<Op>(raw).is_err());
+        assert!(
+            Op::from_stored("push", r#"{"op":"push","remote":"-o","branch":"main"}"#).is_err(),
+            "a hand-edited row is not trusted either"
+        );
+    }
+
+    /// The storage round trip for the second variant. `kind()` and the serde tag are written apart
+    /// and `from_stored` compares them, so a variant whose two spellings disagree stores rows it can
+    /// never read back — and the merge-only version of this test could not see that.
+    #[test]
+    fn a_push_round_trips_through_storage_too() {
+        let op = Op::Push {
+            remote: "origin".into(),
+            branch: "feat/x".into(),
+        };
+
+        assert_eq!(op.kind(), "push");
+        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
+        assert!(
+            Op::from_stored("merge", &op.to_args()).is_err(),
+            "the column and the payload must be checked against each other"
+        );
     }
 }
