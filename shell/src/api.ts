@@ -2221,6 +2221,14 @@ export async function getAssistantTurn(
 export interface AssistantTurnRow {
   id: number;
   asked: string;
+  /**
+   * The CLI session this turn ran in. Null on turns from before the daemon recorded one.
+   *
+   * Optional here, not merely nullable: a daemon older than the field sends no key at all, and the
+   * transcript treating that as "no session" is right — it cannot claim a restart it has no evidence
+   * of either way.
+   */
+  session_id?: string | null;
   /** The reply, or null while the turn is still running or if it produced nothing. */
   answer: string | null;
   /** What it failed with, when it failed. Shown rather than left as an empty bubble. */
@@ -2277,6 +2285,14 @@ export interface ChatRow {
   first_message: string | null;
   last_activity: string | null;
   /**
+   * Where this conversation's turns run, or null for the daemon's own directory.
+   *
+   * Set only on conversations continuing a session that was had in the IDE. The window shows it
+   * because it is the only thing separating two conversations continued out of two worktrees of the
+   * same repository.
+   */
+  cwd: string | null;
+  /**
    * How many answers landed here since the conversation was last opened.
    *
    * Waiting for YOU, not for the model — a turn still being written is the chat waiting on the
@@ -2304,13 +2320,47 @@ export async function listChats(token: string): Promise<ChatRow[] | null> {
   }
 }
 
-/** Opens a conversation and answers with the id the daemon minted for it. */
-export async function createChat(token: string, brain: Brain = "cloud"): Promise<ApiResult<string>> {
+/** A conversation already had in the IDE, which the daemon could continue. */
+export interface IdeSession {
+  session_id: string;
+  /** Where it was had, and therefore where it will be resumed from. */
+  cwd: string;
+  /** The first thing its owner said in it, or null when nothing quotable was said. */
+  title: string | null;
+  last_activity: string;
+}
+
+/** The IDE conversations this daemon can still pick up. */
+export async function listIdeSessions(token: string): Promise<IdeSession[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/ide-sessions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as IdeSession[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Opens a conversation and answers with the id the daemon minted for it.
+ *
+ * `continueSession` names a session already had in the IDE. Only the id travels: the directory it
+ * runs in is looked up by the daemon from the transcript, never sent from here.
+ */
+export async function createChat(
+  token: string,
+  brain: Brain = "cloud",
+  continueSession?: string,
+): Promise<ApiResult<string>> {
   try {
     const res = await fetch(`${DAEMON_URL}/assistant/chats`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ brain }),
+      body: JSON.stringify(
+        continueSession === undefined ? { brain } : { brain, continue_session: continueSession },
+      ),
     });
     if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
     const data = (await res.json()) as { chat_id: string };

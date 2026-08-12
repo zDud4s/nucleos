@@ -4,7 +4,7 @@ import { render, screen } from "@testing-library/react";
 import Transcript from "./Transcript";
 import type { Turn } from "./turns";
 
-function turn(id: number, answeredBy: Turn["answeredBy"]): Turn {
+function turn(id: number, answeredBy: Turn["answeredBy"], sessionId: string | null = null): Turn {
   return {
     id,
     asked: `asked ${id}`,
@@ -13,6 +13,7 @@ function turn(id: number, answeredBy: Turn["answeredBy"]): Turn {
     cost_usd: null,
     failed: false,
     answeredBy,
+    sessionId,
   };
 }
 
@@ -57,5 +58,39 @@ describe("Transcript", () => {
 
     expect(container.querySelector("img")).toBeNull();
     expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeTruthy();
+  });
+
+  /**
+   * The daemon drops a session that has passed its context ceiling, and the next turn runs in a
+   * fresh one with no memory of anything above it. That used to happen in silence — which bites
+   * hardest on a conversation picked up from the IDE, because it arrives with somebody else's
+   * context already filling the window.
+   */
+  it("says where a conversation started over", () => {
+    render(
+      <Transcript
+        turns={[turn(1, "cloud", "s-one"), turn(2, "cloud", "s-one"), turn(3, "cloud", "s-two")]}
+        loaded
+      />,
+    );
+
+    expect(screen.getAllByText(/started over|restarted here/i)).toHaveLength(1);
+  });
+
+  it("claims no restart on turns that never said which session they ran in", () => {
+    render(<Transcript turns={[turn(1, "cloud"), turn(2, "cloud")]} loaded />);
+
+    expect(screen.queryByText(/restarted here/i)).toBeNull();
+  });
+
+  /**
+   * One line, not two. A model change already says "no memory of what is above" and always comes
+   * with a new session, so drawing both would report one event as two.
+   */
+  it("does not stack a restart on top of a model change", () => {
+    render(<Transcript turns={[turn(1, "local", "s-one"), turn(2, "cloud", "s-two")]} loaded />);
+
+    expect(screen.getAllByText(/no memory of what is above/i)).toHaveLength(1);
+    expect(screen.queryByText(/restarted here/i)).toBeNull();
   });
 });

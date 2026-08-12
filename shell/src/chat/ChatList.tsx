@@ -1,4 +1,5 @@
 import type { ChatRow } from "../api";
+import { projectName } from "./projectName";
 import { Button, ConfirmButton } from "../ui";
 
 interface ChatListProps {
@@ -14,6 +15,8 @@ interface ChatListProps {
   busy: Set<string>;
   onSelect: (chatId: string) => void;
   onNew: () => void;
+  /** Opens the picker of conversations already had in the IDE. */
+  onContinueFromIde: () => void;
   onArchive: (chatId: string) => void;
 }
 
@@ -33,15 +36,24 @@ function chatLabel(chat: ChatRow): { text: string; unused: boolean } {
 }
 
 /** The conversations this app opened, and the door to a new one. */
-function ChatList({ chats, selected, busy, onSelect, onNew, onArchive }: ChatListProps) {
+function ChatList({
+  chats, selected, busy, onSelect, onNew, onContinueFromIde, onArchive,
+}: ChatListProps) {
   return (
     <nav className="chat-list" aria-label="Conversations">
       <Button variant="approve" size="sm" onClick={onNew}>
         New conversation
       </Button>
+      <Button size="sm" onClick={onContinueFromIde}>
+        Continue one from the IDE
+      </Button>
       <ul>
         {chats.map((chat) => {
           const label = chatLabel(chat);
+          // `== null` on purpose, catching undefined as well: a daemon older than the column sends
+          // no `cwd` at all, and the window losing one chip is a better answer to that than the
+          // window failing to draw.
+          const where = chat.cwd == null ? null : projectName(chat.cwd);
           return (
             <li
               key={chat.chat_id}
@@ -55,6 +67,12 @@ function ChatList({ chats, selected, busy, onSelect, onNew, onArchive }: ChatLis
               >
                 <span className={label.unused ? "cl-name a-note" : "cl-name"}>{label.text}</span>
                 <span className="cl-meta">
+                  {/*
+                    The project, on the conversations that have one. It is what separates two
+                    conversations picked up from two worktrees of the same repository — which will
+                    otherwise open with the same first message and the same name.
+                  */}
+                  {where !== null && <span className="cl-where">{where}</span>}
                   <span className="b-run">{chat.brain}</span>
                   {busy.has(chat.chat_id) && <span className="cl-busy">thinking…</span>}
                   {/*
