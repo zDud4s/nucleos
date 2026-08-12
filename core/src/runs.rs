@@ -873,6 +873,27 @@ async fn prepare_handoff_successor(
     .execute(pool)
     .await?;
 
+    // And the slot with it, for the same reason and with the same filter. The tree moving without
+    // the slot leaves the two rows disagreeing about who is working in that checkout, and
+    // `reconcile_orphaned_slots` settles it the wrong way: it frees any slot whose owner is not
+    // live, the predecessor is finished by then, and the project — reading one fewer in flight than
+    // it has — starts a second run in the same repository.
+    //
+    // `owner_kind = 'run'` is load-bearing here exactly as it is above: a job node holds no slot of
+    // its own (only the standalone arm of `create_run_with` claims one), so for a node this matches
+    // nothing and must, because the slot belongs to the job and moving it to one node would free it
+    // when that node finished, with the rest of the queue still to run.
+    //
+    // A handover, not a claim — the difference `resume_approved_run` also depends on. A claim is per
+    // owner, so the successor would ask for a SECOND slot while its predecessor still held the
+    // first, and a project at its ceiling would refuse to continue work already admitted. Moving the
+    // row cannot fail that way, because it does not change how many are held.
+    sqlx::query("UPDATE project_slots SET owner_id = ? WHERE owner_kind = 'run' AND owner_id = ?")
+        .bind(successor_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+
     Ok(Some(HandoffSuccessor {
         id: successor_id,
         session_id,
@@ -3617,9 +3638,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     /// matters is that `resume_approved_run` does not **re-record** the worktree, and that is only
     /// provable by exercising it. Hence the three assertions: one row, a new owner, the same base.
     ///
-    /// The twin for the handoff path is deliberately unwritten. That path creates its successor
-    /// with a raw `INSERT INTO runs`, and the defect around it is unconfirmed; a test written now
-    /// would either pass by accident or fail for a reason that is not this one.
+    /// The twin for the handoff path is `a_handed_off_run_takes_the_slot_of_the_run_it_continues`,
+    /// below. It was left unwritten while the defect there was unconfirmed; it is confirmed now.
     #[tokio::test]
     async fn a_resumed_run_keeps_the_base_of_the_tree_it_inherited() {
         let (state, _runner) =
@@ -3645,6 +3665,123 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             rows,
             vec![("run".to_owned(), resume_run_id, Some("ba5eba5e".to_owned()))],
             "the resume re-recorded the tree instead of taking the row over"
+        );
+    }
+
+    /// A context handoff carries the slot across, like the approval resume above it.
+    ///
+    /// The two paths continue one piece of work in one checkout, and the slot is what says that
+    /// checkout is occupied. The handoff already moves the `worktrees` row to the successor; leaving
+    /// `project_slots` pointing at the predecessor makes the two disagree about who is working in
+    /// the tree, and `reconcile_orphaned_slots` settles that argument the wrong way — it frees any
+    /// slot whose owner is not live, and the predecessor is `completed` by then. The project reads
+    /// one fewer in flight than it has and starts another run in the same repository, which is the
+    /// single thing `project_slots` exists to prevent.
+    ///
+    /// Handed over rather than claimed, for the reason spelled out at the resume: a claim is per
+    /// owner, so the successor would ask for a SECOND slot while the predecessor still held the
+    /// first, and a project at its ceiling would refuse to continue work it had already admitted.
+    /// A handover cannot fail on a full project, because it does not change how many are held.
+    #[tokio::test]
+    async fn a_handed_off_run_takes_the_slot_of_the_run_it_continues() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43001, 'project-a', 'a long one', 'running', 'real', ?, '2026-08-12T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let held = crate::concurrency::claim(
+            &pool,
+            "project-a",
+            crate::worktree::Owner::Run(43001),
+        )
+        .await
+        .unwrap();
+        let crate::concurrency::ClaimOutcome::Claimed(slot) = held else {
+            panic!("the predecessor could not take a slot to hand over");
+        };
+
+        let successor = prepare_handoff_successor(&pool, 43001)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Run(successor.id))
+                .await
+                .unwrap(),
+            Some(slot),
+            "the successor is working in the tree without holding its slot"
+        );
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Run(43001))
+                .await
+                .unwrap(),
+            None,
+            "the predecessor kept a slot it is no longer working in"
+        );
+    }
+
+    /// The other half of that filter: a node's handoff must not move its JOB's slot.
+    ///
+    /// A job holds one slot for the whole chain, and its nodes hold none. Were the update above
+    /// keyed on the owner id alone, a node handing off would carry the job's slot to itself — and
+    /// the job would lose it the moment that one node finished, with the rest of the queue still to
+    /// run. The same trap the `worktrees` update next to it names, one table over.
+    #[tokio::test]
+    async fn a_node_handing_off_leaves_its_jobs_slot_where_it_is() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (7, 'project-a', 'C:/somewhere', 'implementing', 5, '2026-08-12T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, job_id, created_at)
+             VALUES (43101, 'project-a', 'a node', 'running', 'real', ?, 7, '2026-08-12T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The job owns the slot, exactly as `create_run_with` leaves it: the node claimed nothing.
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(7))
+            .await
+            .unwrap();
+
+        let successor = prepare_handoff_successor(&pool, 43101)
+            .await
+            .unwrap()
+            .expect("the node was over the threshold and had no successor yet");
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Job(7))
+                .await
+                .unwrap(),
+            Some(0),
+            "the node's handoff took the slot out from under its own job"
+        );
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Run(successor.id))
+                .await
+                .unwrap(),
+            None,
+            "a node was given a slot of its own, so the job now costs two"
         );
     }
 
