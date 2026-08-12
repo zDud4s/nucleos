@@ -1734,9 +1734,10 @@ async fn create_run_with(
 /// approved, no way to perform it, and nothing to read explaining why; queueing an operation we are
 /// not certain is the one they read would be worse than either.
 ///
-/// So the bar is: the tool is a shell, the input parses, the command is exactly `git merge <ref>`
-/// (`vcs::merge_from_command` argues that strictness), the worktree is really there and really on a
-/// branch, and the project resolves to a repository. Anything else falls back.
+/// So the bar is: the tool is a shell, the input parses, the command is `git merge <ref>` with at
+/// most a `--no-ff` on it (`vcs::merge_from_command` argues both the strictness and why that one
+/// flag is inside it rather than beside it), the worktree is really there and really on a branch,
+/// and the project resolves to a repository. Anything else falls back.
 ///
 /// It runs git twice and must therefore be called before the transaction opens — see the call site.
 async fn queueable_merge(

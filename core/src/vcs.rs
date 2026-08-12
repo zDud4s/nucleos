@@ -329,12 +329,22 @@ pub async fn resolve_repo(
 /// the integration worktree and moves the holder's worktree afterwards when the holder is the one
 /// standing on `B`, which is the case this whole pillar was written around.
 ///
-/// **The strictest possible reading: exactly `git merge <ref>`, three tokens, nothing else.** Not
-/// because more could not be parsed, but because everything else is a DIFFERENT operation.
-/// `--no-ff` asks for a merge commit and `publish` is `--ff-only`; `--squash` does not merge at all;
-/// `--abort` unwinds one; a second ref is an octopus merge. A caller whose spelling is not this one
-/// keeps exactly the behaviour it has always had, rather than having the queue perform something
-/// adjacent to what it wrote.
+/// **The strictest reading that still admits what the queue performs: `git merge <ref>`, with an
+/// optional `--no-ff` on either side of the ref, and nothing else.** Not because more could not be
+/// parsed, but because everything else is a DIFFERENT operation: `--squash` does not merge at all;
+/// `--abort` unwinds one; a second ref is an octopus merge; `--ff` and `--ff-only` both ask for a
+/// fast-forward where this queue always writes a merge commit. A caller whose spelling is not one of
+/// these keeps exactly the behaviour it has always had, rather than having the queue perform
+/// something adjacent to what it wrote.
+///
+/// **`--no-ff` was in that rejected list, and it was there on a false premise** — worth recording,
+/// because the sentence read true and the mistake cost the pillar its whole point for that spelling.
+/// It said `--no-ff` wants a merge commit while `publish` is `--ff-only`, which conflates two
+/// different things: `compute_merge` runs `git merge --no-ff` unconditionally, so the commit this
+/// queue publishes is ALWAYS a merge commit, and `publish`'s `--ff-only` fast-forwards the holder's
+/// checkout ONTO that already-computed commit. `--no-ff` is therefore not adjacent to what the queue
+/// does — it is a literal spelling of it. Refusing it sent the merge back to be performed by the
+/// agent's own hand, which is the one outcome this pillar exists to abolish.
 ///
 /// **This is not the shell parsing `classifier.rs` exists to keep closed, and the difference is
 /// where the output goes.** Nothing here reaches an argv: both names pass through `Branch` — the
@@ -348,8 +358,17 @@ pub async fn resolve_repo(
 /// own HEAD is always detached, so publishing "into HEAD" names nothing.
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let [program, subcommand, source] = tokens.as_slice() else {
-        return None;
+    // Matched as whole shapes rather than by filtering the flag out of the token list, and the
+    // difference is what a caller can smuggle: a filter would turn `git --no-ff merge feature` —
+    // which git itself refuses — into a queued merge, performing something nobody could have run.
+    // Here the flag is only ever recognised in argument position, where it is the only thing it can
+    // be. A `source` left holding `--no-ff` (`git merge --no-ff`) falls through to `Branch`, which
+    // refuses a leading dash; that guard is load-bearing here and not merely nearby.
+    let [program, subcommand, source] = match tokens.as_slice() {
+        [program, subcommand, source]
+        | [program, subcommand, "--no-ff", source]
+        | [program, subcommand, source, "--no-ff"] => [program, subcommand, source],
+        _ => return None,
     };
     if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("merge") {
         return None;
@@ -1960,13 +1979,54 @@ mod tests {
         assert_eq!(retired.finished_at, None);
     }
 
-    /// The one spelling that becomes a queued merge, and its neighbours that must not.
+    /// `--no-ff` is queued, and it is the only flag that is, because it is the only one that asks
+    /// for what this queue performs anyway.
+    ///
+    /// `compute_merge` runs `git merge --no-ff` unconditionally, so the commit the queue publishes
+    /// is always a merge commit. Refusing this spelling handed the merge back to the agent to
+    /// perform by hand — the exact outcome the pillar exists to abolish — in exchange for nothing.
+    ///
+    /// Accepted on either side of the ref because both orders spell the same operation, and refused
+    /// anywhere else by shape: a flag cannot stand where the program or the subcommand goes, and a
+    /// `source` that ends up holding `--no-ff` is stopped by `Branch`, the argv guard, rather than
+    /// by this reader.
+    #[test]
+    fn a_no_ff_merge_is_queued_because_it_is_what_the_queue_already_does() {
+        let expected = Some(Op::Merge {
+            source: "feature".into(),
+            target: "master".into(),
+        });
+        assert_eq!(
+            merge_from_command("git merge --no-ff feature", "master"),
+            expected
+        );
+        assert_eq!(
+            merge_from_command("git merge feature --no-ff", "master"),
+            expected
+        );
+
+        // The flag is recognised in argument position only. `git --no-ff merge feature` is not a
+        // command git would run, and a reader that "helpfully" queued it would be performing
+        // something the caller could not have written.
+        assert_eq!(
+            merge_from_command("git --no-ff merge feature", "master"),
+            None
+        );
+        // Left holding the flag as a ref, the argv guard is what refuses — not the shape.
+        assert_eq!(merge_from_command("git merge --no-ff", "master"), None);
+        assert_eq!(
+            merge_from_command("git merge --no-ff --no-ff", "master"),
+            None
+        );
+    }
+
+    /// The spellings that become a queued merge, and their neighbours that must not.
     ///
     /// Each rejection is a different operation wearing a similar command line, and queueing any of
-    /// them would perform something the caller did not write: `--no-ff` wants a merge commit where
-    /// `publish` fast-forwards, `--squash` does not merge, `--abort` unwinds, two refs is an
-    /// octopus. `-X` is there to pin that `Branch` — the argv guard — is actually applied, and not
-    /// merely available.
+    /// them would perform something the caller did not write: `--squash` does not merge, `--abort`
+    /// unwinds, two refs is an octopus, and `--ff`/`--ff-only` both ask for a fast-forward where
+    /// this queue always writes a merge commit. `-X` is there to pin that `Branch` — the argv guard
+    /// — is actually applied, and not merely available.
     #[test]
     fn only_a_bare_git_merge_becomes_a_queued_operation() {
         assert_eq!(
@@ -1987,13 +2047,19 @@ mod tests {
         );
 
         for command in [
-            "git merge --no-ff feature",
             "git merge --squash feature",
             "git merge --abort",
             "git merge feature other",
             "git merge",
             "git status",
             "git merge -X",
+            // Both ask for a fast-forward when one is possible; `compute_merge` writes a merge
+            // commit either way, so queueing these would answer a different question.
+            "git merge --ff feature",
+            "git merge --ff-only feature",
+            // The one accepted flag does not make its compounds acceptable.
+            "git merge --no-ff --squash feature",
+            "git merge --no-ff feature other",
         ] {
             assert_eq!(merge_from_command(command, "master"), None, "{command}");
         }
