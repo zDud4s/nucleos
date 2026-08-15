@@ -2518,6 +2518,15 @@ pub async fn run_retention_loop(state: AppState) {
             }
             Err(error) => tracing::warn!(%error, "council: retention sweep failed"),
         }
+        // The fourth window, and the one that empties rather than deletes: a queued operation's row
+        // is what `action_grants.queued_request_id` points at, so only what git printed goes.
+        match crate::vcs::prune_output_tails(&state.pool, crate::vcs::output_retention_days(), now)
+            .await
+        {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "vcs: outputs past the retention window"),
+            Err(error) => tracing::warn!(%error, "vcs: retention sweep failed"),
+        }
     }
 }
 

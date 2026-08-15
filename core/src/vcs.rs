@@ -528,9 +528,15 @@ pub fn push_from_command(command: &str, current_branch: &str) -> Option<Op> {
 
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
-/// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
-/// into `queued`, or `rejected` — belongs to Chunk 4 alongside the `proposals.rs` wiring that
-/// grants it; this function only ever writes the initial state.
+/// autonomous and start `awaiting_approval`.
+///
+/// **Nothing writes the transition out of `awaiting_approval`, and that is settled rather than
+/// pending.** This said it belonged to Chunk 4 "alongside the `proposals.rs` wiring that grants it".
+/// Chunk 4 landed and took the other road, the one `auth.rs` had already argued for: a run may not
+/// queue on its own behalf at all (*"Queueing is Admin's"*), so `resume_approved_run` admits an
+/// approved action directly as `Origin::Human` and no row ever starts at `awaiting_approval` in
+/// production. `drain_once` carries the full account. This function still only writes the initial
+/// state, and the `Run`/`Job` arm is the shape the day a scope exists that may ask for itself.
 ///
 /// The repository arrives resolved rather than as fields to be trusted — see `ResolvedRepo`.
 pub async fn submit(
@@ -983,6 +989,28 @@ pub const DEFAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(45)
 /// `VcsExecutor` staying a plain trait rather than a channel.
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// The statuses a request can no longer leave.
+///
+/// A positive list rather than `NOT IN ('queued','running','awaiting_approval')`, and
+/// `council::prune` argues which way that mistake falls: a status added later and forgotten here
+/// simply never ages out and never ends a wait early — a caller kept waiting and a row too many,
+/// rather than a row swept while something was still writing to it.
+///
+/// **`rejected` is in this list and nothing writes it**, which is the one entry worth arguing.
+/// `Ticket`'s doc comment records that it is in the `status` column's CHECK constraint and that
+/// `cancelled` sat in exactly that position until `cancel_for_run` arrived. Both readers of this
+/// list want it there before that happens: a wait on a rejected row would otherwise run to the
+/// deadline on a row that can never change, and its tail would never age out. Neither is observable
+/// today, and both become wrong silently on the day the status is first written.
+pub const TERMINAL_STATUSES: [&str; 6] = [
+    "succeeded",
+    "failed",
+    "blocked",
+    "rejected",
+    "cancelled",
+    "interrupted",
+];
+
 /// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
 /// comes first — and returns a `Ticket` either way.
 ///
@@ -1016,10 +1044,13 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// missing row is not "hasn't arrived yet" — it cannot ever arrive — and polling it out to the
 /// deadline would just be quietly burning the caller's wait on a request that does not exist.
 ///
-/// The hedge is deliberate: that is a claim about the whole module, not about this function, and the
-/// first retention or cleanup pass added anywhere in `vcs.rs` invalidates it silently — the failure
-/// would be a caller told "no such request" about one that merely aged out. Whoever adds pruning
-/// owns revisiting this.
+/// The hedge was deliberate: that is a claim about the whole module, not about this function, and
+/// the first retention or cleanup pass added anywhere in `vcs.rs` would invalidate it silently — the
+/// failure being a caller told "no such request" about one that merely aged out. **Pruning has since
+/// arrived and the claim still holds**, because `prune_output_tails` empties `output_tail` and keeps
+/// the row rather than deleting it — a shape it was pushed into by `action_grants.queued_request_id`
+/// having no foreign key, and which happens to discharge this obligation for free. The hedge stays
+/// written down because the next cleanup pass inherits it.
 ///
 /// Reads before it ever sleeps, and every subsequent iteration does the same: the terminal check
 /// runs on freshly read data, not on whatever the previous iteration saw, so a row that finishes
@@ -1042,10 +1073,7 @@ pub async fn wait_for(
             return Err(sqlx::Error::RowNotFound);
         };
 
-        let terminal = matches!(
-            status.as_str(),
-            "succeeded" | "failed" | "blocked" | "interrupted" | "cancelled"
-        );
+        let terminal = TERMINAL_STATUSES.contains(&status.as_str());
         if terminal || started.elapsed() >= deadline {
             return Ok(Ticket {
                 id,
@@ -1253,6 +1281,83 @@ pub async fn reap_requests_of_ended_runs(
     Ok(reaped.len() as u64)
 }
 
+/// How long a finished request keeps what git printed.
+///
+/// Thirty days, the same window `runs::prune_transcripts` gives a run's transcript, because it is
+/// the same kind of thing: the tail is what a subprocess said, kept so a person can read why an
+/// operation ended the way it did, and nobody reads that a month later. What people DO read months
+/// later is the metadata — which operation, against which repository, which sha came out — and that
+/// is a couple of hundred bytes.
+///
+/// The bulk is real rather than theoretical: `git_exec::OUTPUT_TAIL_BYTES` caps one tail at 8 KiB,
+/// and a conflicted merge in a large repository reaches it.
+pub const DEFAULT_OUTPUT_RETENTION_DAYS: i64 = 30;
+
+/// The window, overridable for an operator who wants a different one — the shape
+/// `runs::transcript_retention_days` uses, for the reason it gives.
+pub fn output_retention_days() -> i64 {
+    std::env::var("NUCLEOS_VCS_OUTPUT_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_OUTPUT_RETENTION_DAYS)
+}
+
+/// Empties the output of every finished request past the window, leaving the row.
+///
+/// **The row survives, and here that is not merely the tidier choice — it is the only correct one.**
+/// `runs::prune_transcripts` keeps its rows because a feed entry, a job item or a proposal still
+/// points at them. This table has a sharper version of the same fact: `action_grants.queued_request_id`
+/// (migration 0054) names a request by id and carries **no foreign key** — checked, it is a bare
+/// `INTEGER`. So a DELETE would not fail and would not cascade; it would leave a takeover grant
+/// pointing at nothing, and `proposals::matching_queued_request` would go on telling a run that
+/// request 7 holds its work.
+///
+/// It also discharges, rather than merely dodging, the obligation `wait_for` records: that function
+/// answers `RowNotFound` immediately because a missing row *cannot ever arrive*, and its doc comment
+/// says the first pruning pass in this module invalidates that silently. Emptying instead of
+/// deleting keeps it true by construction.
+///
+/// `COALESCE(finished_at, created_at)` because a terminal row with no finish stamp is possible —
+/// `reconcile_interrupted` writes one, but a hand-edited or half-written row need not — and ageing
+/// such a row from nothing would exempt it for ever.
+///
+/// The cutoff is RFC 3339 built in Rust and never SQLite's `datetime('now','-N days')`, for the
+/// reason `web::prune` sets out in full and the other three sweeps repeat: the two spellings are
+/// compared as TEXT and `T` (0x54) sorts after the space (0x20), so within the cutoff's own day a
+/// row hours too old compares as newer and survives every sweep for ever.
+pub async fn prune_output_tails(
+    pool: &sqlx::SqlitePool,
+    retain_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<u64> {
+    if retain_days <= 0 {
+        // Zero would strip every tail on the machine at the next sweep, which is not a retention
+        // policy but a typo with a plausible-looking value. The reading all three existing sweeps
+        // make.
+        return Ok(0);
+    }
+
+    let cutoff = (now - chrono::Duration::days(retain_days)).to_rfc3339();
+    // `AssertSqlSafe` because sqlx only trusts `&'static str` and this is built at runtime. The one
+    // interpolation is a row of `?` derived from a compile-time constant's length; every status and
+    // the cutoff are bound. The same audit `reap_requests_of_ended_runs` writes out above.
+    let placeholders = vec!["?"; TERMINAL_STATUSES.len()].join(", ");
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE vcs_requests
+            SET output_tail = NULL
+          WHERE status IN ({placeholders})
+            AND COALESCE(finished_at, created_at) < ?
+            AND output_tail IS NOT NULL"
+    )));
+    for status in TERMINAL_STATUSES {
+        update = update.bind(status);
+    }
+    // `output_tail IS NOT NULL` above is what makes the count mean something: without it every
+    // eligible row is rewritten on every hourly sweep for ever, and the log would report the same
+    // number until the end of time instead of the number of tails this pass actually dropped.
+    Ok(update.bind(&cutoff).execute(pool).await?.rows_affected())
+}
+
 /// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
 /// decides *when* an operation may run and records how it ended, and this trait is the only thing
 /// that knows how to actually perform one. Chunk 1 has only the test double below, which is why
@@ -1393,13 +1498,21 @@ pub async fn drain_once(
         // `#[cfg(test)] mod tests`. So `run_id` is NULL on every row this table holds, claimable or
         // not, and this `None` throws nothing away.
         //
-        // Two separate things have to land before that stops being true, and Chunk 4 brings both:
-        // the route opening to a run scope, and the `awaiting_approval` → `queued` transition
-        // `proposals.rs` grants — without the second a `Run` request would still never be claimable,
-        // since that is the status `submit` gives it. When they do land, nothing here breaks: a
-        // merge a run asked for appears in the feed with no run attached, which costs the person
-        // reading it the link back and costs the queue nothing. Chunk 4 is where threading it earns
-        // its keep.
+        // **This paragraph used to promise that Chunk 4 would open the route to a run scope, and
+        // that promise contradicted `auth.rs`.** Chunk 4 has since landed and did the opposite, on
+        // purpose: `auth.rs` argues at length that `POST /vcs/requests` is a sibling of
+        // `/email/send` rather than of `/runs` — *"Queueing is Admin's"* — and `Scope::Run` still
+        // reaches exactly one route. What Chunk 4 opened instead is the door a human already stood
+        // at: `runs::resume_approved_run` translates an approved action and admits it in the same
+        // transaction, as `Origin::Human`, because a person just authorised it.
+        //
+        // So `run_id` is NULL on every row in production and this `None` still throws nothing away.
+        // Two consequences worth stating rather than leaving to be rediscovered: `Origin::Run`,
+        // `needs_approval`, `cancel_for_run` and `reap_requests_of_ended_runs` are correct and
+        // DORMANT — they have nothing to match, because no production row carries a `run_id` — and
+        // they are kept rather than deleted because they are what the design needs the day a scope
+        // is invented that may queue on its own behalf. Whoever invents it changes `auth.rs` first,
+        // and this comment second.
         // (`reconcile_interrupted` and `reap_requests_of_ended_runs` do attach one, because they
         // read whole rows rather than a claim.)
         Ok(()) => {
@@ -2523,6 +2636,220 @@ mod tests {
             output_tail_of(&pool, id).await.as_deref(),
             Some("Merge made by the 'ort' strategy.")
         );
+    }
+
+    /// Ages a request by writing its stamps directly. The queue writes `finished_at` itself and has
+    /// no way to be told a different one, which is the same reason `runs::prune_transcripts`'s tests
+    /// backdate rather than wait.
+    async fn backdate(pool: &sqlx::SqlitePool, id: i64, days: i64) {
+        let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        sqlx::query("UPDATE vcs_requests SET created_at = ?, finished_at = ? WHERE id = ?")
+            .bind(&when)
+            .bind(&when)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A finished request past the window loses what git printed and keeps everything else.
+    ///
+    /// **Both halves are asserted, and the second is the one that matters.** Emptying the tail is
+    /// what the sweep is for; keeping the row is what the shape was chosen for —
+    /// `action_grants.queued_request_id` names these rows by id with no foreign key behind it, so a
+    /// DELETE would leave a takeover grant pointing at nothing and `matching_queued_request` would
+    /// go on telling a run that a request holds its work. A test that only checked the tail was gone
+    /// would pass against exactly that.
+    #[tokio::test]
+    async fn a_finished_request_loses_what_git_printed_and_keeps_the_row() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, id, 31).await;
+
+        let pruned = prune_output_tails(&pool, 30, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(pruned, 1);
+        assert_eq!(output_tail_of(&pool, id).await, None);
+        let (status, sha): (String, Option<String>) =
+            sqlx::query_as("SELECT status, result_sha FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), sha.as_deref()),
+            ("succeeded", Some("abc123")),
+            "the row and what it published survive; only the diagnostic ages out"
+        );
+    }
+
+    /// The three things the sweep must not touch, in one test because each is a different reason.
+    ///
+    /// A row inside the window is the ordinary case. A row that is still `running` is the dangerous
+    /// one — something is writing to it — and it is what a `NOT IN ('queued','running',…)` spelling
+    /// would get wrong the day a status is added. And `retain_days <= 0` is the typo guard every
+    /// other sweep in this crate carries: it must refuse rather than strip the whole table.
+    #[tokio::test]
+    async fn the_sweep_leaves_alone_what_is_recent_still_running_or_covered_by_a_zero_window() {
+        let pool = test_pool().await;
+        let recent = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            recent,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+                output_tail: "recent".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, recent, 29).await;
+
+        let running = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        sqlx::query("UPDATE vcs_requests SET output_tail = 'in flight' WHERE id = ?")
+            .bind(running)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate(&pool, running, 400).await;
+        // `backdate` also rewrites `finished_at`, which a running row would not have. Put it back,
+        // so what keeps this row is its STATUS and not a missing stamp — otherwise the assertion
+        // below passes against a sweep with no status filter at all.
+        sqlx::query("UPDATE vcs_requests SET status = 'running', finished_at = NULL WHERE id = ?")
+            .bind(running)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prune_output_tails(&pool, 30, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            output_tail_of(&pool, recent).await.as_deref(),
+            Some("recent")
+        );
+        assert_eq!(
+            output_tail_of(&pool, running).await.as_deref(),
+            Some("in flight")
+        );
+
+        // A window of zero is a typo with a plausible-looking value, not an instruction to empty
+        // every row on the machine.
+        backdate(&pool, recent, 400).await;
+        assert_eq!(
+            prune_output_tails(&pool, 0, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            output_tail_of(&pool, recent).await.as_deref(),
+            Some("recent")
+        );
+    }
+
+    /// The sweep reports what it did, not what it could have done.
+    ///
+    /// Run twice over one aged row: the second pass must report nothing. Without the
+    /// `output_tail IS NOT NULL` filter the UPDATE matches the same row every hour for ever, and the
+    /// log reports a constant instead of a count — which reads as a sweep that never converges.
+    #[tokio::test]
+    async fn a_second_sweep_over_the_same_rows_reports_nothing() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, id, 31).await;
+
+        assert_eq!(
+            prune_output_tails(&pool, 30, chrono::Utc::now())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            prune_output_tails(&pool, 30, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0,
+            "there is nothing left to drop, so the sweep must say so"
+        );
+    }
+
+    /// **The trap the other three sweeps each pay for in their own doc comment**, pinned here on the
+    /// boundary rather than by a coarse test that could not see it.
+    ///
+    /// `finished_at` is RFC 3339 (`2026-08-01T12:00:00+00:00`); SQLite's `datetime('now','-30 days')`
+    /// would produce `2026-07-13 12:00:00`. Compared as TEXT, `T` (0x54) sorts after the space
+    /// (0x20) — so within the cutoff's OWN day a row hours too old compares as newer and survives
+    /// every sweep for ever. A row aged exactly to the boundary is the only input that tells the two
+    /// spellings apart.
+    #[tokio::test]
+    async fn the_retention_boundary_is_exact_rather_than_to_the_day() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: "abc123".into(),
+                output_tail: "on the boundary".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Thirty days and one hour old: past a window of thirty by an hour, and inside the cutoff's
+        // own calendar day, which is where the two spellings disagree.
+        let now = chrono::Utc::now();
+        let when = (now - chrono::Duration::days(30) - chrono::Duration::hours(1)).to_rfc3339();
+        sqlx::query("UPDATE vcs_requests SET finished_at = ? WHERE id = ?")
+            .bind(&when)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(prune_output_tails(&pool, 30, now).await.unwrap(), 1);
+        assert_eq!(output_tail_of(&pool, id).await, None);
     }
 
     #[tokio::test]

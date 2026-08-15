@@ -980,10 +980,25 @@ export async function getProposals(
   }
 }
 
+/**
+ * Why an approval did not go through, in the daemon's own words.
+ *
+ * The same shape as `CreateJobOutcome` and for the same reason: `409` is both "somebody already
+ * decided this" and "this approval can never resume — the run has no worktree", and those have
+ * opposite remedies. Collapsing them to `null` gave the panel one sentence for both, which is the
+ * sentence a person reads before deciding whether to click again.
+ *
+ * `resumeRunId` is nullable on the success side because the approvals that start no run — a contact
+ * merge, a calendar event — come back through this same door with a body of their own.
+ */
+export type ApproveOutcome =
+  | { ok: true; resumeRunId: number | null }
+  | { ok: false; status: number; reason: string };
+
 export async function approveProposal(
   token: string,
   id: number,
-): Promise<number | null> {
+): Promise<ApproveOutcome> {
   try {
     const res = await fetch(`${DAEMON_URL}/proposals/${id}/approve`, {
       method: "POST",
@@ -992,11 +1007,23 @@ export async function approveProposal(
         "Content-Type": "application/json",
       },
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // Plain text, as `createJob` reads it. The fallback covers a status raised by the middleware
+      // rather than the handler, which writes no body.
+      const reason = (await res.text()).trim();
+      return {
+        ok: false,
+        status: res.status,
+        reason:
+          reason === ""
+            ? "The daemon refused this approval and gave no reason."
+            : reason,
+      };
+    }
     const data = await res.json();
-    return data.resume_run_id;
+    return { ok: true, resumeRunId: data.resume_run_id ?? null };
   } catch {
-    return null;
+    return { ok: false, status: 0, reason: "The daemon is not reachable." };
   }
 }
 

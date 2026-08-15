@@ -3058,29 +3058,58 @@ async fn post_proposal_dismiss(
 /// The conflict is a 409 with a body, not a bare status: it is the one refusal here that names
 /// something the person can go and change, and a status code cannot say which two instructions
 /// disagree.
+///
+/// **That sentence was written before the body was, and described the opposite of what the code
+/// did** — every arm returned a bare `StatusCode`, which axum renders with no body at all. Recorded
+/// rather than quietly corrected, because a comment promising a guarantee the code does not keep is
+/// the exact failure this whole handler was changed to end, and `post_proposal_approve` below was
+/// carrying its own version of it.
 fn merge_decision_response(
     outcome: Result<crate::contacts::MergeOutcome, crate::contacts::DecisionError>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match outcome {
         Ok(crate::contacts::MergeOutcome::Merged) => {
             Ok(Json(serde_json::json!({ "merged": true })))
         }
         Ok(crate::contacts::MergeOutcome::RefusedConflictingVerdicts { keep, absorb }) => {
             tracing::info!(%keep, %absorb, "refused a contact merge with conflicting verdicts");
-            Err(StatusCode::CONFLICT)
+            Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "these two people carry standing decisions that disagree — {keep} against {absorb}; settle one of them and decide this again"
+                ),
+            ))
         }
-        Err(crate::contacts::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+        Err(crate::contacts::DecisionError::NotPending) => Err((
+            StatusCode::CONFLICT,
+            "this suggestion has already been decided".to_owned(),
+        )),
         Err(crate::contacts::DecisionError::Db(error)) => {
             tracing::warn!(%error, "deciding a contact merge failed");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decision could not be recorded".to_owned(),
+            ))
         }
     }
 }
 
+/// **Every refusal here carries a sentence, and that is the whole reason this returns a tuple.**
+///
+/// This route can answer 409 for two reasons that mean opposite things to the person who clicked:
+/// the proposal is no longer pending (somebody already decided it, and the right response is to
+/// stop) or the approval cannot resume (the run's worktree is gone, and the right response is to
+/// start the work again). A status code cannot tell them apart, and the `NotResumable` arm below
+/// used to say so in a comment while logging the reason server-side and sending nothing —
+/// `create_job` had already settled the shape this follows.
+///
+/// The case that made it worth doing is real rather than hypothetical: `mode: "real"` is the API's
+/// DEFAULT and creates no worktree, so approving a merge in such a run is refused by a mechanism
+/// nobody can see, and the refusal is indistinguishable from a button that did not fire.
 async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Two kinds of proposal share this table and this door, and they are decided by entirely
     // different machinery: an action approval resumes a paused run, a contact merge joins two
     // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
@@ -3090,9 +3119,12 @@ async fn post_proposal_approve(
         .await
         .map_err(|error| {
             tracing::warn!(proposal_id = id, %error, "reading a proposal to approve failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the proposal could not be read".to_owned(),
+            )
         })?
-        .ok_or(StatusCode::NOT_FOUND)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("there is no proposal {id}")))?
         .kind;
     if kind == "contact-merge" {
         // Uncancellable for the same reason the resume below is: the decision commits, and a
@@ -3100,7 +3132,8 @@ async fn post_proposal_approve(
         let state = state.clone();
         let outcome =
             uncancellable(async move { crate::contacts::approve_merge(&state.pool, id).await })
-                .await?;
+                .await
+                .map_err(|status| (status, "the merge task did not finish".to_owned()))?;
         return merge_decision_response(outcome);
     }
     if kind == "calendar-event" {
@@ -3112,44 +3145,72 @@ async fn post_proposal_approve(
             uncancellable(
                 async move { crate::calendar::approve_proposed_event(&state.pool, id).await },
             )
-            .await?;
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
         return match created {
             Ok(event_id) => Ok(Json(serde_json::json!({ "event_id": event_id }))),
-            Err(crate::calendar::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
-            Err(crate::calendar::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::calendar::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::calendar::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
             Err(crate::calendar::DecisionError::Malformed) => {
                 tracing::warn!(
                     proposal_id = id,
                     "a calendar proposal carried no usable event"
                 );
-                Err(StatusCode::UNPROCESSABLE_ENTITY)
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this proposal carries no usable event, so there is nothing to create"
+                        .to_owned(),
+                ))
             }
             Err(crate::calendar::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "approving a calendar proposal failed");
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the event could not be written".to_owned(),
+                ))
             }
         };
     }
 
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
-    match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await }).await? {
+    match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?
+    {
         Ok(resume_id) => Ok(Json(serde_json::json!({ "resume_run_id": resume_id }))),
-        Err(crate::runs::ResumeError::ProposalNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(crate::runs::ResumeError::ProposalNotPending) => Err(StatusCode::CONFLICT),
-        // A 409 alone cannot say which precondition failed, and these are the ones a human has to
-        // act on — an approval that will not resume looks identical to one nobody clicked.
+        Err(crate::runs::ResumeError::ProposalNotFound) => {
+            Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+        }
+        Err(crate::runs::ResumeError::ProposalNotPending) => Err((
+            StatusCode::CONFLICT,
+            "this proposal has already been decided".to_owned(),
+        )),
+        // The two 409s above and below mean opposite things — "somebody already answered this" and
+        // "this can never be answered" — and the reason is the only thing that separates them. It
+        // was already being built and was going only to the log.
         Err(crate::runs::ResumeError::NotResumable(reason)) => {
             tracing::warn!(
                 proposal_id = id,
                 reason,
                 "approved proposal is not resumable"
             );
-            Err(StatusCode::CONFLICT)
+            Err((
+                StatusCode::CONFLICT,
+                format!("this approval cannot resume the run: {reason}"),
+            ))
         }
         Err(crate::runs::ResumeError::Db(error)) => {
             tracing::warn!(proposal_id = id, %error, "approving a proposal failed");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the approval could not be recorded".to_owned(),
+            ))
         }
     }
 }
@@ -9038,6 +9099,68 @@ mod tests {
         assert!(parsed["resume_run_id"].is_number());
         let proposal = proposals::get(&pool, proposal_id).await.unwrap().unwrap();
         assert_eq!(proposal.status, "approved");
+    }
+
+    /// **An approval that cannot resume says so, in the body, rather than answering a bare 409.**
+    ///
+    /// The subject is the one that cost a whole session to diagnose: a run with no worktree. It is
+    /// not an exotic state — `mode: "real"` is the API's DEFAULT and creates no worktree at all, so
+    /// every merge approval in a run started the ordinary way lands here.
+    ///
+    /// **The status is asserted AND the body is, and the body half is the whole test.** The 409 was
+    /// already correct and already returned; what nobody could get at was WHICH precondition failed,
+    /// since `ProposalNotPending` — "somebody already decided this" — answers with the same number
+    /// and means the opposite. A test on the status alone passes against the defect.
+    #[tokio::test]
+    async fn an_approval_that_cannot_resume_says_why_instead_of_answering_a_bare_409() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        // Deliberately NO `worktrees` row: this is `mode: "real"`'s shape, where there is nothing
+        // for the resume to take over.
+        let original_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', 'C:/repos/proj', 'x', 'awaiting_approval', 'sess-a', 'real', ?)",
+        )
+        .bind(&created_at)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = proposals::create_action_approval(
+            &pool,
+            original_run_id,
+            Some("sess-a"),
+            Some("proj"),
+            "Bash",
+            "merge needs approval",
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{proposal_id}/approve"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let said = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            said.contains("worktree"),
+            "the refusal must name what is missing, which is the only thing that separates it from \
+             a proposal somebody already decided; got: {said:?}"
+        );
     }
 
     #[tokio::test]
