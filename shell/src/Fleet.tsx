@@ -64,9 +64,11 @@ function ownerKey(slot: HeldSlot): string {
  * slot too, so a column that counted jobs would say `0/2` about a project that is going to refuse
  * the next one with a 409 — and would offer the button that asks for it.
  *
- * The only component at this level that fetches. Five calls per 3-second tick, four of which other
+ * The only component at this level that fetches. Seven calls per 3-second tick, four of which other
  * tabs already make; if it ever hurts, the answer is for `GET /concurrency` to absorb the others,
- * not a new `/fleet`.
+ * not a new `/fleet`. The last two are the exclusions — the rules in force and the requests still
+ * waiting — and they are two calls rather than one because they are two different things, and the
+ * screen draws them differently.
  */
 export default function Fleet({ token, connection, killEngaged, onOpenRuns }: FleetProps) {
   const [concurrency, setConcurrency] = useState<Concurrency | null>(null);
