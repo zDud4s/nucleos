@@ -91,6 +91,10 @@ pub fn build_router(state: AppState) -> Router {
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
+        // Beside the run it belongs to. Reads no table: the tail lives in `AppState`, because
+        // `run_events` is not written until the run ends and there is nothing durable to read while
+        // the thing is actually happening.
+        .route("/runs/{id}/tail", get(crate::runs::get_run_tail))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route(
             "/runs/{id}/message",
@@ -3599,6 +3603,7 @@ mod tests {
                 local_assistant: None,
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                run_tails: Default::default(),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -4091,6 +4096,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -4326,6 +4332,73 @@ mod tests {
         let response = api_token_request(state, "GET", "/concurrency", &token, None).await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    /// Reading a run's live output is a READ, and the weakest key reaches it through the real
+    /// router. Same join as the test above, for the same reason: the route line and the table line
+    /// agreeing is not something either file can check alone.
+    #[tokio::test]
+    async fn a_read_only_key_can_tail_a_run() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        state.run_tails.lock().unwrap().insert(
+            1,
+            std::sync::Arc::new(std::sync::Mutex::new("olá\n".into())),
+        );
+
+        let response = api_token_request(state, "GET", "/runs/1/tail", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    /// A run with no live tail answers 204, never 404.
+    ///
+    /// The distinction is the contract, not politeness. `404` says *there is no such run*, which is
+    /// a different and usually false claim: the ordinary case is a run that finished, or one this
+    /// daemon did not start, and both of those have a durable transcript in `runs.stdout`. A client
+    /// told `404` concludes the id is wrong and stops asking; told `204` it knows to read the
+    /// recorded copy instead.
+    #[tokio::test]
+    async fn a_run_with_nothing_live_answers_no_content_rather_than_not_found() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        let response = api_token_request(state, "GET", "/runs/4242/tail", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        db.close().await;
+    }
+
+    /// The offset comes back so the next poll starts where this one stopped, and it counts BYTES.
+    ///
+    /// Pinned because the whole no-flicker property rests on it: a shell that redraws from zero
+    /// every three seconds is what this field exists to prevent, and a `next` computed in characters
+    /// would drift the moment any output is not ASCII — which, for a tool that logs paths and
+    /// prompts, is the normal case and not the exotic one.
+    #[tokio::test]
+    async fn the_tail_reports_where_the_next_read_should_start() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        state.run_tails.lock().unwrap().insert(
+            5,
+            std::sync::Arc::new(std::sync::Mutex::new("três\n".into())),
+        );
+
+        let response = api_token_request(state, "GET", "/runs/5/tail?since=0", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["text"], "três\n");
+        assert_eq!(
+            json["next"], 6,
+            "`next` counted characters instead of bytes"
+        );
+        assert_eq!(json["live"], true);
         db.close().await;
     }
 
@@ -6941,6 +7014,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
