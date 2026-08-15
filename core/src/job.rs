@@ -2637,12 +2637,17 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 pool,
                 job,
                 "job_stopped",
+                // "Unfinished" is asked of `claimable_as` rather than spelled out as a list of
+                // states, because that function is already the one place saying which states are
+                // work the queue still owes a run — including `GateRetriable`, an item whose gate
+                // went red with a retry left. Listing the states here would be the same rule in a
+                // second dialect, agreeing only until one of them was edited.
                 &format!(
                     "job {} stopped with {} item(s) unfinished: {detail}",
                     job.id,
                     view.items
                         .iter()
-                        .filter(|item| **item == ItemState::Pending)
+                        .filter(|item| item.claimable_as().is_some())
                         .count()
                 ),
             )
@@ -5869,6 +5874,51 @@ mod tests {
 
         assert_eq!(job_status(&pool, job_id).await, STATUS_STOPPED);
         assert!(feed_kinds(&pool).await.contains(&"job_stopped".to_owned()));
+    }
+
+    /// The number in that line is what the night left behind, and a retriable item is work.
+    ///
+    /// An item whose gate went red with a retry still to spend is one the queue owed another
+    /// implement run. Counting only `Pending` reports one item fewer than was really left, and the
+    /// item it drops is precisely the one that had already cost money.
+    #[tokio::test]
+    async fn a_stopped_job_counts_a_retriable_item_among_the_unfinished() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The row a red gate with a retry left behind, written the way `record_gate` writes it: the
+        // status still says `gate_failed`, and it is the attempt count read beside the job's budget
+        // that makes the item retriable rather than finished with.
+        seed_items(&pool, job_id, &["gate_failed", "pending"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The window ceiling, because it is the brake that stops rather than parks.
+        set_budget(&pool, Some(0.0), None).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(job_status(&pool, job_id).await, STATUS_STOPPED);
+        let summary: String =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'job_stopped'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            summary.contains("2 item(s) unfinished"),
+            "the retriable item is work the queue still owed a run: {summary}"
+        );
     }
 
     /// Decision 10. The brake used to be a check made once at admission, so a job admitted at 03:00
