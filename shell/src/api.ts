@@ -1103,7 +1103,20 @@ export async function getProposals(
  * merge, a calendar event — come back through this same door with a body of their own.
  */
 export type ApproveOutcome =
-  | { ok: true; resumeRunId: number | null }
+  | {
+      ok: true;
+      resumeRunId: number | null;
+      /**
+       * What the approval turned out to mean, when it was not simply "done".
+       *
+       * The daemon writes this on the one 200 that changes nothing: an exclusion whose two jobs both
+       * ended while the request waited is dismissed with a note instead of becoming a rule. It is a
+       * success — the person answered and the answer was recorded — so it cannot travel as a
+       * refusal, and without a field of its own the screen would show the request vanishing with no
+       * account of why.
+       */
+      closed: string | null;
+    }
   | { ok: false; status: number; reason: string };
 
 export async function approveProposal(
@@ -1132,7 +1145,11 @@ export async function approveProposal(
       };
     }
     const data = await res.json();
-    return { ok: true, resumeRunId: data.resume_run_id ?? null };
+    return {
+      ok: true,
+      resumeRunId: data.resume_run_id ?? null,
+      closed: typeof data.closed === "string" ? data.closed : null,
+    };
   } catch {
     return { ok: false, status: 0, reason: "The daemon is not reachable." };
   }

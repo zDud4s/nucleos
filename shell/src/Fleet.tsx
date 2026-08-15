@@ -313,6 +313,9 @@ export function ProjectColumn({
   // jobs and a card only knows one — this is the drag of the future canvas, without the canvas.
   const [pairing, setPairing] = useState<number | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  // Kept apart from `failed`, and drawn apart: the one thing it says is that an approval succeeded
+  // and wrote no rule, which is not a failure and must not wear a failure's colours.
+  const [closed, setClosed] = useState<string | null>(null);
 
   const cards = drawn.map((slot) => ({ slot, detail: slotDetail(slot, jobs, runs) }));
   const jobCards = cards.filter((card) => card.detail.kind === "job");
@@ -349,9 +352,14 @@ export function ProjectColumn({
    */
   async function decide(proposalId: number, yes: boolean) {
     setFailed(null);
+    setClosed(null);
     if (yes) {
       const outcome = await approveProposal(token, proposalId);
       if (!outcome.ok) setFailed(outcome.reason);
+      // An approval that wrote no rule, because both jobs ended while the request waited. Said out
+      // loud: the edge is about to disappear, and an edge that vanishes on the click that approved
+      // it reads as a rule that was made, not as one that was no longer worth making.
+      else if (outcome.closed !== null) setClosed(outcome.closed);
     } else if (!(await rejectProposal(token, proposalId))) {
       setFailed("That request could not be refused — it may already have been decided.");
     }
@@ -377,6 +385,7 @@ export function ProjectColumn({
         </p>
       )}
       {failed !== null && <ErrorNote>{failed}</ErrorNote>}
+      {closed !== null && <p className="fleet-closed">{closed}</p>}
       {cards.map(({ slot, detail }) => {
         const jobId = detail.kind === "job" ? detail.job.id : null;
         return (

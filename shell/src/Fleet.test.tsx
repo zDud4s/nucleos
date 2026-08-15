@@ -330,6 +330,35 @@ it("answers a request from the card that drew it", async () => {
 });
 
 /**
+ * An approval that wrote no rule says so, and does not say it in red.
+ *
+ * Both jobs can end while the request waits, and a finished job never holds a slot again — so the
+ * daemon dismisses the request with a note and answers 200 with a null `exclusion_id`. It is a
+ * success: the person answered, and the answer was recorded. Swallowing the sentence would show the
+ * edge vanishing on the click that approved it, which reads as a rule that was made.
+ */
+it("says when an approval wrote no rule, without calling it a failure", async () => {
+  respondWith({
+    ...TWO_JOBS,
+    "/fleet/exclusions/requests": [REQUEST],
+    "POST /proposals/9/approve": {
+      exclusion_id: null,
+      closed: "the jobs it named have ended, so no rule was written",
+    },
+  });
+  renderFleet();
+  await settle();
+
+  fireEvent.click(screen.getAllByRole("button", { name: /^approve$/i })[0]);
+  await settle();
+
+  expect(screen.getByText(/no rule was written/i)).toBeTruthy();
+  // `ErrorNote` is the only `role="alert"` on this screen. Nothing here is an error, so nothing is
+  // announced as one — which is the half a screen reader would otherwise get wrong.
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+/**
  * A rule in force reads differently at its two ends, and can be lifted.
  *
  * Only the higher id waits, so the same edge says "this one waits" on one card and "that one waits"

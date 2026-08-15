@@ -1753,6 +1753,13 @@ details.scoreboard th {
 .exclude-edge.is-active { border: 1px solid var(--line); background: var(--code-bg); }
 .exclude-edge.is-pending { border: 1px dashed var(--line); color: var(--faint); }
 
+/* Uma aprovação que não escreveu regra. Não é erro — não leva as cores de um. */
+.fleet-closed {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  padding: var(--sp-1) var(--sp-2);
+}
+
 /* O modo de escolher o par. Vive no topo da coluna e não no cartão: o cartão de onde se começou pode
    sair da coluna a meio da escolha, e a saída tem de sobreviver a isso. */
 .fleet-pairing {
