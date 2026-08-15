@@ -2328,6 +2328,35 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
         }
     }
 
+    // Somebody asked that this job and another not run at the same time, and the other one is
+    // running. `Park` and never `Stop`: the reason lifts by itself the moment the partner ends, and
+    // stopping would throw away a job for a wait measured in minutes.
+    //
+    // Placed after the budget and before the attention check, and the order is what the person
+    // reads. Two of these can be true at once — the owner at the keyboard AND a partner holding a
+    // slot — and "job 42 holds a slot and the two are excluded" is the more useful of the two,
+    // because it names something that will resolve on its own and says what to watch for.
+    //
+    // Fails CLOSED like its neighbours, and the choice is nearly moot: a pool that cannot answer
+    // this could not answer the kill switch at the top of the chain either, so the job would already
+    // be parked before reaching here.
+    match crate::exclusion::blocking_partner(&state.pool, job.id).await {
+        Ok(None) => {}
+        Ok(Some(partner)) => {
+            return Brake::Park {
+                reason: "excluded",
+                detail: format!("job {partner} holds a slot and the two are excluded"),
+            };
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read this job's exclusions");
+            return Brake::Park {
+                reason: "excluded",
+                detail: format!("this job's exclusions could not be read: {error}"),
+            };
+        }
+    }
+
     // Decision 10, and the whole of what it adds: the brake was a check made once at admission, and
     // a job admitted at 03:00 could otherwise keep starting nodes at 08:00 with the owner at the
     // keyboard. The item in flight is never killed — its gate has already run or is about to — so
@@ -5424,6 +5453,106 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         assert_eq!(job.budget_usd, None);
         assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
+    }
+
+    async fn exclude(pool: &sqlx::SqlitePool, project_id: &str, low: i64, high: i64) {
+        sqlx::query(
+            "INSERT INTO fleet_exclusions
+                 (project_id, job_low, job_high, proposal_id, created_at)
+             VALUES (?, ?, ?, 1, '2026-08-15T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(low)
+        .bind(high)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// One of the two waits, and it is always the same one.
+    ///
+    /// The asymmetry is the deadlock argument, not a detail of the query: the low id is never parked
+    /// by this brake, so of any two excluded jobs at least one is always free to run. Were the
+    /// tie-break decided at read time, two reads that disagreed would park both — and two jobs
+    /// somebody asked to SERIALISE, stopped forever on each other, is the one failure this feature
+    /// must not be able to produce.
+    #[tokio::test]
+    async fn the_higher_job_waits_for_its_partner_and_the_lower_one_never_does() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        exclude(&pool, "project-a", low, high).await;
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+
+        let high_row = load_job(&pool, high).await.unwrap();
+        let Brake::Park { reason, detail } = brakes(&state, &high_row, Utc::now()).await else {
+            panic!("the higher job must wait while its partner holds a slot");
+        };
+        assert_eq!(reason, "excluded");
+        assert!(
+            detail.contains(&format!("job {low}")),
+            "the reason has to name what to wait for, got: {detail}"
+        );
+
+        // The other side of the same rule, at the same moment: never parked by it.
+        let low_row = load_job(&pool, low).await.unwrap();
+        assert!(matches!(
+            brakes(&state, &low_row, Utc::now()).await,
+            Brake::Go
+        ));
+    }
+
+    /// The brake lifts by itself, which is why it is a `Park` and not a `Stop`.
+    ///
+    /// Two ways for it to lift, and both are tested here because they fail differently: the partner
+    /// gives its slot back, or somebody revokes the rule. A brake that needed a person to restart
+    /// the job would make serialising two fronts of work cost more attention than doing them by
+    /// hand.
+    #[tokio::test]
+    async fn the_wait_ends_when_the_slot_goes_back_or_the_rule_is_revoked() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        exclude(&pool, "project-a", low, high).await;
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        let high_row = load_job(&pool, high).await.unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Park { .. }
+        ));
+
+        crate::concurrency::release(&pool, crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Go
+        ));
+
+        // And with the slot taken again, revoking the rule releases it just the same.
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Park { .. }
+        ));
+        sqlx::query("UPDATE fleet_exclusions SET revoked_at = '2026-08-15T01:00:00Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Go
+        ));
     }
 
     /// Decision 9, and the whole reason `PauseKind` exists. The hourly brake lifts by itself, so

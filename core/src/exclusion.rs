@@ -155,6 +155,32 @@ pub async fn live_rule_for(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Resu
     .await
 }
 
+/// The partner whose slot is keeping this job waiting, if there is one.
+///
+/// **Only the higher id ever waits, and that is the whole of the deadlock argument.** The query asks
+/// about `job_high` alone: a job that is the low side of every rule it appears in can never be
+/// parked by this brake, so of any two excluded jobs at least one is always free to run. A
+/// tie-break decided at read time — who asked first, who has less left to do — could park both if
+/// the two reads disagreed, and two jobs a person asked to SERIALISE deadlocking on each other is
+/// the one outcome this feature must not be able to produce.
+///
+/// "Holds a slot" and not "is live": a live job that is waiting for a slot is not running anything,
+/// so there is nothing for the other one to run at the same time as.
+pub async fn blocking_partner(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT fleet_exclusions.job_low
+           FROM fleet_exclusions
+           JOIN project_slots
+             ON project_slots.owner_kind = 'job'
+            AND project_slots.owner_id = fleet_exclusions.job_low
+          WHERE fleet_exclusions.job_high = ? AND fleet_exclusions.revoked_at IS NULL
+          LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Whether this pair already has a request waiting on a person.
 ///
 /// Without it, drawing the same edge twice mints two proposals, and approving both would meet the
