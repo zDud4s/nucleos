@@ -147,6 +147,9 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // read-only key in `stdout`, only sooner — so withholding it would protect nothing and would
     // make the live view the one thing a reader had to be an admin to see.
     (Method::GET, "/runs/{id}/tail"),
+    // The rules in force, beside `/concurrency` for the same reason it is here: it describes the
+    // shape of the fleet and changes nothing. Asking for one is Admin's; reading which exist is not.
+    (Method::GET, "/fleet/exclusions"),
     (Method::GET, "/projects/{id}/ls"),
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),

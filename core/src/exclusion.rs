@@ -197,6 +197,68 @@ async fn pending_request_for(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Re
     Ok(found.is_some())
 }
 
+/// One rule in force, as the canvas draws it.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct Exclusion {
+    pub id: i64,
+    pub project_id: String,
+    pub job_low: i64,
+    pub job_high: i64,
+    /// The request that authorised it, so the screen can show who agreed and when.
+    pub proposal_id: i64,
+    pub paths: Option<String>,
+    pub created_at: String,
+}
+
+/// The rules in force, newest first.
+///
+/// Two whole statements rather than one with a filter appended: sqlx 0.9 only trusts
+/// `&'static str`, and the alternative is `AssertSqlSafe` over a string built at runtime — a
+/// heavier tool than one WHERE clause deserves. The columns are written twice; the test below
+/// reads both back, so a column added to one and not the other fails rather than drifts.
+pub async fn live(pool: &SqlitePool, project_id: Option<&str>) -> sqlx::Result<Vec<Exclusion>> {
+    match project_id {
+        Some(project_id) => {
+            sqlx::query_as::<_, Exclusion>(
+                "SELECT id, project_id, job_low, job_high, proposal_id, paths, created_at
+                 FROM fleet_exclusions
+                 WHERE revoked_at IS NULL AND project_id = ?
+                 ORDER BY id DESC",
+            )
+            .bind(project_id)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, Exclusion>(
+                "SELECT id, project_id, job_low, job_high, proposal_id, paths, created_at
+                 FROM fleet_exclusions
+                 WHERE revoked_at IS NULL
+                 ORDER BY id DESC",
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+/// Lifts a rule, keeping it readable.
+///
+/// Revoked and not deleted: the decision stays legible after it stops applying — somebody will ask
+/// why two jobs were serialised last Tuesday — and the partial unique index means the same pair can
+/// be asked about again afterwards.
+pub async fn revoke(pool: &SqlitePool, id: i64) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let lifted = sqlx::query(
+        "UPDATE fleet_exclusions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+    )
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(lifted.rows_affected() == 1)
+}
+
 /// Why a decision on an exclusion request could not be taken.
 #[derive(Debug)]
 pub enum DecisionError {
@@ -614,6 +676,46 @@ mod tests {
         .unwrap();
         assert_eq!(status, "dismissed");
         assert_eq!(note.as_deref(), Some("the jobs it named have ended"));
+    }
+
+    /// The listing carries every column the canvas draws, and a revoked rule leaves it.
+    ///
+    /// Both spellings of the query are read back here, filtered and unfiltered, because the column
+    /// list is written out twice: one of them gaining a column the other lacks is the way this
+    /// drifts, and it would show up as a field that is null on some screens and not others.
+    #[tokio::test]
+    async fn the_listing_shows_live_rules_and_forgets_revoked_ones() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        let proposal_id = propose(&pool, low, high, &["src/shared.rs".to_owned()])
+            .await
+            .unwrap();
+        let Approved::Written(exclusion_id) = approve(&pool, proposal_id).await.unwrap() else {
+            panic!("two live jobs must yield a rule");
+        };
+
+        for listed in [
+            live(&pool, None).await.unwrap(),
+            live(&pool, Some("alpha")).await.unwrap(),
+        ] {
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].id, exclusion_id);
+            assert_eq!(listed[0].project_id, "alpha");
+            assert_eq!((listed[0].job_low, listed[0].job_high), (low, high));
+            assert_eq!(listed[0].proposal_id, proposal_id);
+            assert!(listed[0].paths.as_deref().unwrap().contains("shared.rs"));
+        }
+        assert!(live(&pool, Some("beta")).await.unwrap().is_empty());
+
+        assert!(revoke(&pool, exclusion_id).await.unwrap());
+        assert!(live(&pool, None).await.unwrap().is_empty());
+        // Lifting a rule that is already lifted is reported, not silently accepted: the screen that
+        // asked would otherwise redraw the edge as gone twice and never say which click did it.
+        assert!(!revoke(&pool, exclusion_id).await.unwrap());
+
+        // And the pair can be asked about again, which is what the partial index is for.
+        propose(&pool, low, high, &[]).await.unwrap();
     }
 
     /// The two decisions refuse anything that is not a pending exclusion, by kind and by status.

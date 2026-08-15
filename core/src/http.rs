@@ -3,7 +3,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -73,7 +73,11 @@ pub fn build_router(state: AppState) -> Router {
         // this one asks that two of the things inside it not be there at once. Admin by default, by
         // being in no table in `auth.rs` — it files a request that changes how the fleet schedules,
         // which is not something a read-only key buys.
-        .route("/fleet/exclusions", post(post_fleet_exclusion))
+        .route(
+            "/fleet/exclusions",
+            get(get_fleet_exclusions).post(post_fleet_exclusion),
+        )
+        .route("/fleet/exclusions/{id}", delete(delete_fleet_exclusion))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
@@ -2038,6 +2042,48 @@ struct ExclusionRequest {
     /// rather than acted on — see the migration.
     #[serde(default)]
     paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ExclusionQuery {
+    /// Absent means every project, which is what the canvas asks for.
+    project_id: Option<String>,
+}
+
+/// The rules in force, for the canvas to draw.
+///
+/// Only the live ones. A revoked rule is kept in the table so the decision stays readable, but a
+/// screen that drew it would be showing a constraint that is not constraining anything.
+async fn get_fleet_exclusions(
+    State(state): State<AppState>,
+    Query(query): Query<ExclusionQuery>,
+) -> Result<Json<Vec<crate::exclusion::Exclusion>>, StatusCode> {
+    crate::exclusion::live(&state.pool, query.project_id.as_deref())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the fleet exclusions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Lifts a rule.
+///
+/// 409 and not 404 when it is already revoked: the row is there, and the difference between "no such
+/// rule" and "somebody lifted this before you" is the difference between a stale screen and a wrong
+/// id.
+async fn delete_fleet_exclusion(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::exclusion::revoke(&state.pool, id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(exclusion_id = id, %error, "revoking an exclusion failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Asks that two jobs of one project not run at the same time.
