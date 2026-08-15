@@ -1737,6 +1737,35 @@ details.scoreboard th {
   color: var(--faint);
 }
 
+/* As arestas: "estes dois não correm ao mesmo tempo". Pedida e em vigor são dois desenhos, e a
+   diferença é tracejado contra cheio — a mesma distinção que `is-unmeasured` faz acima, porque é a
+   mesma ideia: ainda não é um facto. */
+.exclude-edge {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  overflow-wrap: anywhere;
+}
+.exclude-edge.is-active { border: 1px solid var(--line); background: var(--code-bg); }
+.exclude-edge.is-pending { border: 1px dashed var(--line); color: var(--faint); }
+
+/* O modo de escolher o par. Vive no topo da coluna e não no cartão: o cartão de onde se começou pode
+   sair da coluna a meio da escolha, e a saída tem de sobreviver a isso. */
+.fleet-pairing {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  padding: var(--sp-2);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+}
+
 /* ── O zoom 2: a cadeia de itens de um job ────────────── */
 
 .item-chain {

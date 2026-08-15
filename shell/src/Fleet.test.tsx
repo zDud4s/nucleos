@@ -223,6 +223,153 @@ it("opens a job's card into its items", async () => {
   expect(screen.queryByText("an item")).toBeNull();
 });
 
+/** Two job cards in one column, which is what pairing needs. */
+const TWO_JOBS = {
+  [CONCURRENCY]: readout([
+    column({
+      slots: [
+        { project_id: "alpha", slot: 0, owner_kind: "job" as const, owner_id: 41, claimed_at: "t" },
+        { project_id: "alpha", slot: 1, owner_kind: "job" as const, owner_id: 42, claimed_at: "t" },
+      ],
+    }),
+  ]),
+  [JOBS]: [job(), job({ id: 42, slot: 1 })],
+};
+
+function exclusionCalls(method: string) {
+  return fetchMock.mock.calls.filter(
+    ([url, init]) =>
+      String(url).includes("/fleet/exclusions") &&
+      ((init as RequestInit | undefined)?.method ?? "GET") === method,
+  );
+}
+
+/**
+ * Asking takes two clicks because it names two jobs, and a card only knows one.
+ *
+ * This is the drag of the coming canvas without the canvas: arm one node, pick the other. What it
+ * must NOT do is report the rule as made — the daemon answers with a proposal, and nothing about
+ * scheduling changes until somebody approves it.
+ */
+it("asks for an exclusion by picking two cards, and says it is only a request", async () => {
+  respondWith({ ...TWO_JOBS, "POST /fleet/exclusions": { proposal_id: 9 } });
+  renderFleet();
+  await settle();
+
+  fireEvent.click(screen.getAllByRole("button", { name: /not at the same time as…/i })[0]);
+  expect(screen.getByText(/pick the job that must not run/i)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /…as this one/i }));
+  await settle();
+
+  const [, init] = exclusionCalls("POST")[0];
+  expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+    job_a: 41,
+    job_b: 42,
+    paths: [],
+  });
+
+  // The next tick brings the request back as a proposal, and it is drawn as a question.
+  respondWith({
+    ...TWO_JOBS,
+    "/proposals": [
+      {
+        id: 9,
+        kind: "fleet-exclusion",
+        status: "pending",
+        run_id: null,
+        session_id: null,
+        project_id: "alpha",
+        tool_name: null,
+        reasoning: "they both touch it",
+        tool_input: JSON.stringify({ pair: "41:42", job_low: 41, job_high: 42 }),
+        created_at: "t",
+        decided_at: null,
+      },
+    ],
+  });
+  advance(3000);
+  await settle();
+
+  expect(screen.getAllByText(/waiting for approval/i).length).toBe(2);
+});
+
+/**
+ * A rule in force reads differently at its two ends, and can be lifted.
+ *
+ * Only the higher id waits, so the same edge says "this one waits" on one card and "that one waits"
+ * on the other. Saying the same thing at both ends would describe a deadlock the daemon cannot
+ * produce.
+ */
+it("draws which end of a rule waits, and lifts it", async () => {
+  respondWith({
+    ...TWO_JOBS,
+    "/fleet/exclusions": [
+      {
+        id: 3,
+        project_id: "alpha",
+        job_low: 41,
+        job_high: 42,
+        proposal_id: 9,
+        paths: null,
+        created_at: "t",
+      },
+    ],
+  });
+  renderFleet();
+  await settle();
+
+  expect(screen.getByText(/not at the same time as job 42 — that one waits/i)).toBeTruthy();
+  expect(screen.getByText(/not at the same time as job 41 — this one waits/i)).toBeTruthy();
+
+  fireEvent.click(screen.getAllByRole("button", { name: /^lift$/i })[0]);
+  await settle();
+
+  expect(exclusionCalls("DELETE").length).toBe(1);
+  expect(String(exclusionCalls("DELETE")[0][0])).toMatch(/\/fleet\/exclusions\/3$/);
+});
+
+/**
+ * The daemon's own sentence, not a status code the shell reinterprets.
+ *
+ * Its two 409s mean opposite things — wait for the approval, or stop clicking because the rule is
+ * already in force — and only the sentence separates them.
+ */
+it("shows the daemon's own words when the ask is refused", async () => {
+  respondWith(TWO_JOBS);
+  fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    if (String(url).includes("/fleet/exclusions") && init?.method === "POST") {
+      return {
+        ok: false,
+        status: 409,
+        text: async () => "these two jobs already have a request waiting for a decision",
+      };
+    }
+    const body = String(url).includes(CONCURRENCY)
+      ? TWO_JOBS[CONCURRENCY]
+      : String(url).includes(JOBS)
+        ? TWO_JOBS[JOBS]
+        : [];
+    return { ok: true, status: 200, json: async () => body };
+  });
+  renderFleet();
+  await settle();
+
+  fireEvent.click(screen.getAllByRole("button", { name: /not at the same time as…/i })[0]);
+  fireEvent.click(screen.getByRole("button", { name: /…as this one/i }));
+  await settle();
+
+  expect(screen.getByText(/already have a request waiting for a decision/i)).toBeTruthy();
+});
+
+/** One job in a column has nothing to be paired with, and a run is not a job at all. */
+it("offers the pairing action only where it can be used", async () => {
+  respondWith({ [CONCURRENCY]: readout([column()]), [JOBS]: [job()] });
+  renderFleet();
+  await settle();
+
+  expect(screen.queryByRole("button", { name: /not at the same time as…/i })).toBeNull();
+});
+
 /**
  * A run's card has no graph: it has a way through to the Runs tab.
  *

@@ -133,6 +133,98 @@ export interface Proposal {
   decided_at: string | null;
 }
 
+/**
+ * A rule in force: two jobs of one project that may not run at the same time.
+ *
+ * `job_low` is not decoration. The daemon parks the HIGHER id and never the lower one, so the pair's
+ * order is also which of the two waits — a screen that showed the edge without it could not say
+ * which card is the one being held.
+ */
+export interface FleetExclusion {
+  id: number;
+  project_id: string;
+  job_low: number;
+  job_high: number;
+  /** The request that authorised it. */
+  proposal_id: number;
+  /** What motivated it, as JSON, when the asker named files. Recorded, not acted on. */
+  paths: string | null;
+  created_at: string;
+}
+
+export async function getExclusions(token: string): Promise<FleetExclusion[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as FleetExclusion[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Why an exclusion could not be asked for, in the daemon's own words.
+ *
+ * The same shape as `CreateJobOutcome`, for the same reason: `409` is both "you already asked about
+ * this pair" and "these two are already excluded", and the remedies are opposite — wait for the
+ * approval, or stop clicking because it is done.
+ */
+export type ProposeExclusionOutcome =
+  | { ok: true; proposalId: number }
+  | { ok: false; status: number; reason: string };
+
+/**
+ * Asks that two jobs not run at the same time.
+ *
+ * Answers with a PROPOSAL, never a rule: nothing about scheduling changes until somebody approves it
+ * on the Autopilot tab. A screen that reported this as done would be describing an effect that has
+ * not happened.
+ */
+export async function proposeExclusion(
+  token: string,
+  jobA: number,
+  jobB: number,
+  paths: string[] = [],
+): Promise<ProposeExclusionOutcome> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ job_a: jobA, job_b: jobB, paths }),
+    });
+    if (!res.ok) {
+      const reason = (await res.text()).trim();
+      return {
+        ok: false,
+        status: res.status,
+        reason: reason === "" ? `the daemon refused with ${res.status}` : reason,
+      };
+    }
+    const data = (await res.json()) as { proposal_id: number };
+    return { ok: true, proposalId: data.proposal_id };
+  } catch {
+    return { ok: false, status: 0, reason: "the daemon could not be reached" };
+  }
+}
+
+/** Lifts a rule. `false` covers both "already lifted" and "the call failed" — neither changed it. */
+export async function revokeExclusion(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions/${id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export interface ScopedKill {
   scope_type: string;
   scope_id: string;
