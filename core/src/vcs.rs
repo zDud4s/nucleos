@@ -132,6 +132,32 @@ pub enum Op {
     BranchDelete {
         branch: Branch,
     },
+    /// Replaying `branch` onto `onto`, and **the only operation here that this pillar's publish
+    /// model cannot carry all the way.**
+    ///
+    /// The model is: compute where nobody is standing, then publish with a command that REFUSES
+    /// rather than destroys. `compute_merge` earns the second half by construction — `--no-ff` makes
+    /// the old tip the merge's first parent, so `publish` is always a fast-forward, and
+    /// `merge --ff-only` in the holder's worktree declines on its own if anything is in the way.
+    ///
+    /// A rebase breaks that by definition. The rebased tip and the old tip are divergent, so no
+    /// fast-forward exists, and there is no git command that moves a checkout across a divergence
+    /// while refusing to destroy: `reset --hard` never refuses, and `checkout` refuses but does not
+    /// move the branch. **So when somebody holds the branch, this operation is `Blocked` rather than
+    /// implemented with a reset.** That is not a gap to be filled later — a queue that hard-resets a
+    /// directory a person may be standing in is a different promise from the one this pillar makes,
+    /// and `worktree.rs` guards its own deletes with `is_dangerous_removal_path` on exactly that
+    /// reasoning.
+    ///
+    /// What is left is the case that is both safe and common enough to be worth having: a branch
+    /// nobody has open, computed in the integration worktree and published by the compare-and-swap
+    /// `publish_by_update_ref` already performs. A run's own branch, held by its own paused
+    /// worktree, is refused — and refusing it is right rather than merely safe, since rewriting a
+    /// branch under a paused run is what would corrupt its state on resume.
+    Rebase {
+        branch: Branch,
+        onto: Branch,
+    },
 }
 
 /// A branch name the daemon is willing to put on a git command line.
@@ -325,6 +351,7 @@ impl Op {
             Op::Tag { .. } => "tag",
             Op::Fetch { .. } => "fetch",
             Op::BranchDelete { .. } => "branch-delete",
+            Op::Rebase { .. } => "rebase",
         }
     }
 
@@ -377,6 +404,12 @@ impl Op {
             "branch-delete" => Ok(Op::BranchDelete {
                 branch: named_branch(source, "branch-delete", "source")?,
             }),
+            // `source`/`target` as everywhere else, and a rebase is the case where the pair is least
+            // obvious: what MOVES is the branch's commits, and where they GO is on top of `onto`.
+            "rebase" => Ok(Op::Rebase {
+                branch: named_branch(source, "rebase", "source")?,
+                onto: named_branch(target, "rebase", "target")?,
+            }),
             // **What is left on the spec's list of nine is NOT a backlog, and this arm no longer
             // pretends it is.** Every name below has been decided against, each on its own grounds,
             // and the message says so — a caller told "not yet" waits for a version that is never
@@ -400,21 +433,16 @@ impl Op {
             //   would quietly make this module a co-owner of a lifecycle it has no business in" — and
             //   executing the other two here would be that same mistake, made deliberately.
             //
-            // `rebase` is deliberately NOT on this list: it is the one still open, and it is open
-            // because its publish step is a reset rather than a fast-forward, which is new machinery
-            // rather than a new argv.
+            // Nothing is deferred any more: the spec's nine are six this queue performs and three it
+            // has decided against, each on its own grounds.
             other @ ("pull" | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
                 "{other} is not an operation this queue performs, and will not become one — see \
-                 `Op::from_request` for why. It understands merge, push, tag, fetch and \
-                 branch-delete"
-            )),
-            other @ "rebase" => Err(format!(
-                "{other} is not yet queued by this daemon — merge, push, tag, fetch and \
-                 branch-delete are the operations the queue can execute today"
+                 `Op::from_request` for why. It understands merge, push, tag, fetch, branch-delete \
+                 and rebase"
             )),
             other => Err(format!(
-                "unknown operation: {other} — the queue understands merge, push, tag, fetch and \
-                 branch-delete"
+                "unknown operation: {other} — the queue understands merge, push, tag, fetch, \
+                 branch-delete and rebase"
             )),
         }
     }
@@ -723,6 +751,37 @@ pub fn tag_from_command(command: &str, current_branch: &str) -> Option<Op> {
     Some(Op::Tag {
         name: TagName::new(name).ok()?,
         at: Branch::new(at).ok()?,
+    })
+}
+
+/// PURE: the rebase a shell command asks for, in the queue's own terms, or `None`.
+///
+/// `git rebase X`, in a worktree whose HEAD is on `B`, means "replay B onto X" — which is
+/// `Rebase { branch: B, onto: X }`, the mirror of how `merge_from_command` reads its own two halves.
+///
+/// **Everything with a flag is refused, and unlike the other parsers there is no accepted one.**
+/// `-i` opens an editor, which is a human sitting at a terminal that does not exist here.
+/// `--continue`, `--abort` and `--skip` operate on a rebase already in progress — a state this queue
+/// never leaves behind, since a conflicted compute aborts before the row is written. `--onto` takes a
+/// third ref and means something the two-field shape cannot hold. `--exec` runs an arbitrary command
+/// per commit, which is a shell by another name.
+///
+/// Bare `git rebase` is refused for `git push`'s reason: it replays onto the configured upstream, in
+/// a repository the daemon does not control.
+pub fn rebase_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, onto] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("rebase") {
+        return None;
+    }
+    if current_branch.trim() == "HEAD" {
+        return None;
+    }
+    Some(Op::Rebase {
+        branch: Branch::new(current_branch).ok()?,
+        onto: Branch::new(onto).ok()?,
     })
 }
 
@@ -2703,6 +2762,7 @@ mod tests {
             "git tag v1 main",
             "git fetch origin",
             "git branch -d feature",
+            "git rebase master",
         ] {
             let matched = [
                 merge_from_command(command, "master"),
@@ -2710,6 +2770,7 @@ mod tests {
                 tag_from_command(command, "master"),
                 fetch_from_command(command),
                 branch_delete_from_command(command),
+                rebase_from_command(command, "master"),
             ]
             .into_iter()
             .flatten()
@@ -2721,9 +2782,9 @@ mod tests {
     /// **What is left of the spec's nine is a set of refusals, not a backlog**, and the message has
     /// to say which — a caller told "not yet" waits for a release that is never coming.
     ///
-    /// `rebase` is the one genuinely still open, so it keeps the "not yet" wording and is asserted
-    /// apart from the four that are closed. Whoever implements it finds out here that they also have
-    /// to move its name.
+    /// **Nothing is deferred any more**, and the absence of a "not yet" anywhere is the assertion.
+    /// The spec's nine are now six this queue performs and three it has decided against; a caller
+    /// told "not yet" would be waiting for a release that is never coming.
     #[test]
     fn the_operations_this_queue_will_never_perform_say_so_rather_than_saying_not_yet() {
         for closed in ["pull", "worktree-add", "worktree-remove", "pr-merge"] {
@@ -2735,11 +2796,72 @@ mod tests {
             assert!(!error.contains("not yet"), "{closed}: {error}");
         }
 
-        let open = Op::from_request("rebase", Some("a"), Some("b")).unwrap_err();
-        assert!(
-            open.contains("not yet"),
-            "rebase is the one still open: {open}"
+        // And the whole vocabulary is reachable, which is what says none of the nine is left in
+        // limbo: six build, three refuse with a reason, and no name falls through to "unknown".
+        for (operation, source, target) in [
+            ("merge", Some("feature"), Some("master")),
+            ("push", Some("main"), Some("origin")),
+            ("tag", Some("main"), Some("v1.0")),
+            ("fetch", None, Some("origin")),
+            ("branch-delete", Some("feature"), None),
+            ("rebase", Some("feature"), Some("master")),
+        ] {
+            assert!(
+                Op::from_request(operation, source, target).is_ok(),
+                "{operation} must be one the queue performs"
+            );
+        }
+    }
+
+    /// `git rebase <onto>` reads its two halves the way `merge_from_command` reads its own: the
+    /// branch is the one the worktree stands on, and the command names what it goes on top of.
+    #[test]
+    fn a_rebase_replays_the_worktrees_branch_onto_what_the_command_names() {
+        assert_eq!(
+            rebase_from_command("git rebase master", "feat/x"),
+            Some(Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into()
+            })
         );
+        assert_eq!(
+            rebase_from_command("GIT REBASE Master", "feat/x"),
+            Some(Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "Master".into()
+            })
+        );
+        // Same guard, same reason as everywhere else: a detached worktree names no branch to replay.
+        assert_eq!(rebase_from_command("git rebase master", "HEAD"), None);
+        assert_eq!(rebase_from_command("git rebase master", ""), None);
+    }
+
+    /// **The one parser with no accepted flag at all**, and each refusal is a different kind.
+    #[test]
+    fn only_a_bare_git_rebase_onto_one_ref_becomes_a_queued_operation() {
+        for command in [
+            // Replays onto the configured upstream, in a repository the daemon does not control.
+            "git rebase",
+            // Opens an editor, for a human at a terminal that does not exist here.
+            "git rebase -i master",
+            "git rebase --interactive master",
+            // Operate on a rebase already in progress — a state this queue never leaves behind.
+            "git rebase --continue",
+            "git rebase --abort",
+            "git rebase --skip",
+            // Takes a third ref, which the two-field shape cannot hold.
+            "git rebase --onto master feature",
+            // Runs an arbitrary command per commit: a shell by another name.
+            "git rebase --exec make master",
+            // Rewrites every commit rather than replaying them.
+            "git rebase --root",
+            // Shape, and the verb.
+            "git rebase master extra",
+            "git --no-verify rebase master",
+            "gh rebase master",
+        ] {
+            assert_eq!(rebase_from_command(command, "feat/x"), None, "{command}");
+        }
     }
 
     /// `git fetch <remote>` exactly, and every neighbouring spelling is a different operation.
@@ -2946,6 +3068,10 @@ mod tests {
             Op::BranchDelete {
                 branch: "feature".into(),
             },
+            Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into(),
+            },
         ];
 
         for op in &all {
@@ -2973,7 +3099,7 @@ mod tests {
         let kinds: Vec<&str> = all.iter().map(Op::kind).collect();
         assert_eq!(
             kinds,
-            ["merge", "push", "tag", "fetch", "branch-delete"],
+            ["merge", "push", "tag", "fetch", "branch-delete", "rebase"],
             "the `op` column's vocabulary is the one the door speaks"
         );
     }
@@ -4892,12 +5018,16 @@ mod tests {
             }
         );
 
-        // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
-        // missing — "unknown operation: rebase" would send a caller looking for a typo.
-        let error = Op::from_request("rebase", Some("feature"), Some("master")).unwrap_err();
-        assert!(error.contains("not yet"), "unexpected error: {error}");
+        // An operation the spec lists but this queue has decided against must say WHICH thing is
+        // wrong — "unknown operation: pull" would send a caller looking for a typo in its own
+        // request, when what it needs to know is to ask for two operations instead of one.
+        let error = Op::from_request("pull", Some("feature"), Some("origin")).unwrap_err();
         assert!(
-            error.contains("merge") && error.contains("push") && error.contains("tag"),
+            error.contains("will not become one"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("merge") && error.contains("push") && error.contains("rebase"),
             "the error must name what the queue CAN do: {error}"
         );
 

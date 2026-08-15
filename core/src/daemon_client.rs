@@ -518,7 +518,9 @@ mod tests {
     /// so without a round trip, and the daemon never sees a request it would only reject.
     #[test]
     fn an_operation_the_queue_does_not_have_never_reaches_the_daemon() {
-        assert!(vcs_submit_body("nucleos", "rebase", Some("feature"), Some("master")).is_err());
+        // One the queue has decided against, rather than one it has not got to: nothing is deferred
+        // any more, so a name that fails here fails for a reason the caller can act on.
+        assert!(vcs_submit_body("nucleos", "pull", Some("feature"), Some("origin")).is_err());
         assert!(vcs_submit_body("nucleos", "tag", Some("main"), Some("-d")).is_err());
         assert!(vcs_submit_body("nucleos", "merge", Some("-f"), Some("master")).is_err());
         // The same guard on the operation the queue DID learn, because a second variant is a second

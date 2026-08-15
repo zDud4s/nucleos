@@ -1823,7 +1823,8 @@ async fn queueable_operation(
         // The two that need no worktree branch, so they take none. A fetch names its remote and a
         // deletion names its branch; neither has a half the command line leaves out.
         .or_else(|| crate::vcs::fetch_from_command(command))
-        .or_else(|| crate::vcs::branch_delete_from_command(command))?;
+        .or_else(|| crate::vcs::branch_delete_from_command(command))
+        .or_else(|| crate::vcs::rebase_from_command(command, &branch))?;
     crate::vcs::resolve_repo(&state.pool, project_id)
         .await
         .map_err(|error| {
