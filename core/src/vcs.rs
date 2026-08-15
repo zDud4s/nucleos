@@ -768,6 +768,17 @@ pub fn tag_from_command(command: &str, current_branch: &str) -> Option<Op> {
 ///
 /// Bare `git rebase` is refused for `git push`'s reason: it replays onto the configured upstream, in
 /// a repository the daemon does not control.
+///
+/// **Every rebase that arrives through this parser blocks, and that is structural rather than
+/// incidental.** The branch is the worktree's own — this function has no other one to name — and a
+/// run's worktree is precisely what holds it, so `GitExecutor`'s holder check finds the caller
+/// itself and refuses. Measured end to end: an approved `git rebase master` in a run's worktree
+/// wrote `blocked`, naming that worktree, and the takeover grant left the run unable to perform it
+/// by hand either. That is the correct answer and not a gap — the branch the queue would rewrite is
+/// the one the paused run resumes onto, and rewriting it underneath is what would corrupt the run.
+/// The publishing half is reached from `POST /vcs/requests`, where a caller names a branch nobody
+/// has open; that half is proven too, and moves the ref through `publish_by_update_ref`'s
+/// compare-and-swap rather than through the rebase.
 pub fn rebase_from_command(command: &str, current_branch: &str) -> Option<Op> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let [program, subcommand, onto] = tokens.as_slice() else {
