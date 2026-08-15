@@ -69,6 +69,11 @@ pub fn build_router(state: AppState) -> Router {
         // because it answers about the same set — the roster — seen through capacity rather than
         // through mode.
         .route("/concurrency", get(get_concurrency))
+        // Beside `/concurrency` because it is about the same picture: that route says how much fits,
+        // this one asks that two of the things inside it not be there at once. Admin by default, by
+        // being in no table in `auth.rs` — it files a request that changes how the fleet schedules,
+        // which is not something a read-only key buys.
+        .route("/fleet/exclusions", post(post_fleet_exclusion))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
@@ -2023,6 +2028,67 @@ async fn get_project_rules(
         open_proposals,
         queue_full: crate::wip::queue_full(open_proposals, wip_limit),
     }))
+}
+
+#[derive(Deserialize)]
+struct ExclusionRequest {
+    job_a: i64,
+    job_b: i64,
+    /// The files that motivated the request, as `collision.rs` reported them. Optional, and kept
+    /// rather than acted on — see the migration.
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+/// Asks that two jobs of one project not run at the same time.
+///
+/// It answers 201 with a PROPOSAL id, not with a rule id, and the difference is the design. Drawing
+/// this edge changes nothing about how the fleet schedules until somebody approves it in the same
+/// queue every other decision passes through. An edge that took effect on being drawn would be a way
+/// to change scheduling without passing through approval, which is exactly the property this
+/// pillar's canvas was meant not to copy from october.dev.
+///
+/// Every refusal carries a sentence, following `post_proposal_approve`: three of the five mean
+/// different things a person can act on — a pair already asked about, a pair already excluded, and
+/// two jobs that share no project — and a bare 409 tells them apart from nothing.
+async fn post_fleet_exclusion(
+    State(state): State<AppState>,
+    Json(body): Json<ExclusionRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    use crate::exclusion::ProposeError;
+    match crate::exclusion::propose(&state.pool, body.job_a, body.job_b, &body.paths).await {
+        Ok(proposal_id) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "proposal_id": proposal_id })),
+        )),
+        Err(ProposeError::SameJob) => Err((
+            StatusCode::BAD_REQUEST,
+            "a job cannot be excluded from itself".to_owned(),
+        )),
+        Err(ProposeError::UnknownJob(id)) => {
+            Err((StatusCode::NOT_FOUND, format!("there is no job {id}")))
+        }
+        Err(ProposeError::DifferentProjects) => Err((
+            StatusCode::BAD_REQUEST,
+            "these jobs belong to different projects, so they share no slots to serialise"
+                .to_owned(),
+        )),
+        Err(ProposeError::AlreadyAsked) => Err((
+            StatusCode::CONFLICT,
+            "these two jobs already have a request waiting for a decision".to_owned(),
+        )),
+        Err(ProposeError::AlreadyExcluded) => Err((
+            StatusCode::CONFLICT,
+            "these two jobs are already excluded from running at the same time".to_owned(),
+        )),
+        Err(ProposeError::Db(error)) => {
+            tracing::warn!(%error, "asking for a fleet exclusion failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the request could not be recorded".to_owned(),
+            ))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -4127,6 +4193,88 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    async fn add_job(pool: &sqlx::SqlitePool, project_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES (?, ?, 'implementing', 5, '2026-08-15T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(format!("C:/projects/{project_id}"))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// The route answers with the PROPOSAL, because that is all it made.
+    ///
+    /// A 201 naming a rule id would be the wrong promise in the one place a caller reads to find out
+    /// what happened: nothing about scheduling has changed yet, and what the caller now owns is a
+    /// question sitting in the same queue as every other decision.
+    #[tokio::test]
+    async fn asking_for_an_exclusion_files_a_proposal_and_no_rule() {
+        let state = test_state().await;
+        let low = add_job(&state.pool, "alpha").await;
+        let high = add_job(&state.pool, "alpha").await;
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/fleet/exclusions",
+            "test-token",
+            Some(serde_json::json!({ "job_a": high, "job_b": low })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["proposal_id"].as_i64().is_some(), "got: {json}");
+
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_exclusions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rules, 0);
+    }
+
+    /// The second ask is a 409 that says which of the two 409s it is.
+    #[tokio::test]
+    async fn asking_twice_about_one_pair_is_refused_in_words() {
+        let state = test_state().await;
+        let low = add_job(&state.pool, "alpha").await;
+        let high = add_job(&state.pool, "alpha").await;
+        let body = serde_json::json!({ "job_a": low, "job_b": high });
+
+        api_token_request(
+            state.clone(),
+            "POST",
+            "/fleet/exclusions",
+            "test-token",
+            Some(body.clone()),
+        )
+        .await;
+        let again = api_token_request(
+            state.clone(),
+            "POST",
+            "/fleet/exclusions",
+            "test-token",
+            Some(body),
+        )
+        .await;
+
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        let said = axum::body::to_bytes(again.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&said).contains("waiting for a decision"),
+            "a bare 409 does not tell 'already asked' from 'already excluded'"
+        );
     }
 
     async fn api_token_request(
