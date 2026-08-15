@@ -15,6 +15,7 @@ mod contacts;
 mod council;
 mod daemon_client;
 mod email;
+mod errands;
 mod feed;
 mod files;
 mod gate;
