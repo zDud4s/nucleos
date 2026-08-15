@@ -89,6 +89,75 @@ pub enum Op {
         name: TagName,
         at: Branch,
     },
+    /// The only operation here that publishes nothing and can undo nothing.
+    ///
+    /// It is in the queue anyway, and the reason is the one the module header gives rather than a
+    /// wish to be complete: a fetch writes the ref store and the object database, which is the shared
+    /// state this pillar serialises. Two fetches racing a merge is the same class of collision as two
+    /// merges racing each other, and `.git/packed-refs` is not a file two processes negotiate over
+    /// politely.
+    ///
+    /// **`remote` and nothing else.** No branch, so the remote's own configured refspec decides what
+    /// arrives — which is what the person who ran `git remote add` chose, and not something the queue
+    /// should second-guess. No `--prune`, which deletes tracking refs; no `--tags`, which fetches a
+    /// namespace nobody asked about. Each of those is a different operation wearing this one's name.
+    Fetch {
+        remote: Remote,
+    },
+    /// Deleting a branch, in the one spelling that cannot destroy unmerged work.
+    ///
+    /// `--delete` and never `-D`. The difference is the whole reason this is queueable at all: `-d`
+    /// asks git to refuse when the branch holds commits no other branch has, and `-D` asks it not to
+    /// care. The safe spelling has a guard that is *git's own*, computed from the commit graph the
+    /// daemon does not have to model — so the queue can offer this without owning the question of
+    /// what is safe to lose.
+    ///
+    /// The sha the branch pointed at is recorded, and that is what makes the row an undo: `git branch
+    /// <name> <sha>` restores exactly what was removed. It is the one operation whose `result_sha`
+    /// describes something that no longer exists, which is precisely when a person needs it.
+    ///
+    /// **`rename` because `rename_all = "snake_case"` would spell this variant `branch_delete` while
+    /// `kind()` spells it `branch-delete`, and one row would then carry both.** What that costs is
+    /// legibility rather than correctness, and the distinction is worth stating exactly because the
+    /// first version of this comment got it wrong: `from_stored` re-derives `kind()` from the parsed
+    /// value rather than reading the payload's tag, so the mismatched row parses back perfectly well
+    /// — measured, by a mutation that removed this line and left the round-trip test green. What it
+    /// leaves behind is a row whose `op` column says one word and whose `args` payload says another,
+    /// for anyone reading the queue or filtering it by JSON path. The hyphen wins because it is the
+    /// spelling `from_request` takes from a caller.
+    ///
+    /// Every other variant is a single word, which is why this appears here first — and it will
+    /// appear again for whoever adds a second multi-word one.
+    #[serde(rename = "branch-delete")]
+    BranchDelete {
+        branch: Branch,
+    },
+    /// Replaying `branch` onto `onto`, and **the only operation here that this pillar's publish
+    /// model cannot carry all the way.**
+    ///
+    /// The model is: compute where nobody is standing, then publish with a command that REFUSES
+    /// rather than destroys. `compute_merge` earns the second half by construction — `--no-ff` makes
+    /// the old tip the merge's first parent, so `publish` is always a fast-forward, and
+    /// `merge --ff-only` in the holder's worktree declines on its own if anything is in the way.
+    ///
+    /// A rebase breaks that by definition. The rebased tip and the old tip are divergent, so no
+    /// fast-forward exists, and there is no git command that moves a checkout across a divergence
+    /// while refusing to destroy: `reset --hard` never refuses, and `checkout` refuses but does not
+    /// move the branch. **So when somebody holds the branch, this operation is `Blocked` rather than
+    /// implemented with a reset.** That is not a gap to be filled later — a queue that hard-resets a
+    /// directory a person may be standing in is a different promise from the one this pillar makes,
+    /// and `worktree.rs` guards its own deletes with `is_dangerous_removal_path` on exactly that
+    /// reasoning.
+    ///
+    /// What is left is the case that is both safe and common enough to be worth having: a branch
+    /// nobody has open, computed in the integration worktree and published by the compare-and-swap
+    /// `publish_by_update_ref` already performs. A run's own branch, held by its own paused
+    /// worktree, is refused — and refusing it is right rather than merely safe, since rewriting a
+    /// branch under a paused run is what would corrupt its state on resume.
+    Rebase {
+        branch: Branch,
+        onto: Branch,
+    },
 }
 
 /// A branch name the daemon is willing to put on a git command line.
@@ -280,6 +349,9 @@ impl Op {
             Op::Merge { .. } => "merge",
             Op::Push { .. } => "push",
             Op::Tag { .. } => "tag",
+            Op::Fetch { .. } => "fetch",
+            Op::BranchDelete { .. } => "branch-delete",
+            Op::Rebase { .. } => "rebase",
         }
     }
 
@@ -321,19 +393,56 @@ impl Op {
                 at: named_branch(source, "tag", "source")?,
                 name: named_tag(target, "tag", "target")?,
             }),
-            // `pr-merge` is the one on this list that is NOT waiting its turn, and saying so here is
-            // the point of the comment: it is the only operation of the nine that is not git. It
-            // would put a second binary with its own authentication, its own network failures and
-            // its own release cadence inside the executor — and it would buy none of what this queue
-            // is made of, since a merge that happens on GitHub's servers is not serialised by a lock
-            // held on this machine. Whoever wants it wants a different pillar, not a tenth variant.
-            other @ ("rebase" | "pull" | "fetch" | "branch-delete" | "worktree-add"
-            | "worktree-remove" | "pr-merge") => Err(format!(
-                "{other} is not yet queued by this daemon — merge, push and tag are the operations \
-                 the queue can execute today"
+            // The two that break the `source`/`target` pair rather than following it, and reading
+            // the missing half as an error is the point: a fetch names only where it fetches FROM,
+            // and a branch delete names only what goes. Inventing a second parameter to keep the
+            // shape symmetrical would give a caller a field it must leave empty and a tool
+            // description a word it must ignore.
+            "fetch" => Ok(Op::Fetch {
+                remote: named_remote(target, "fetch", "target")?,
+            }),
+            "branch-delete" => Ok(Op::BranchDelete {
+                branch: named_branch(source, "branch-delete", "source")?,
+            }),
+            // `source`/`target` as everywhere else, and a rebase is the case where the pair is least
+            // obvious: what MOVES is the branch's commits, and where they GO is on top of `onto`.
+            "rebase" => Ok(Op::Rebase {
+                branch: named_branch(source, "rebase", "source")?,
+                onto: named_branch(target, "rebase", "target")?,
+            }),
+            // **What is left on the spec's list of nine is NOT a backlog, and this arm no longer
+            // pretends it is.** Every name below has been decided against, each on its own grounds,
+            // and the message says so — a caller told "not yet" waits for a version that is never
+            // coming, which is a worse answer than a refusal it can act on.
+            //
+            // - `pr-merge` is the only one of the nine that is not git. It would put a second binary
+            //   with its own authentication, its own network failures and its own release cadence
+            //   inside the executor — and it would buy none of what this queue is made of, since a
+            //   merge on GitHub's servers is not serialised by a lock held on this machine.
+            // - `pull` is `fetch` then `merge`, and this queue can already do both. Admitting it as
+            //   ONE row would have the queue promise an atomicity it does not have: the two halves
+            //   are separate git invocations, another request can be claimed between them only
+            //   because it cannot — but a single row that half-succeeded would be recorded as one
+            //   failure with no way to say which half. Two rows say exactly what happened, and the
+            //   second is `merge` with a source of `origin/<branch>`, which `Branch` already accepts
+            //   and `compute_merge` already resolves.
+            // - `worktree-add` and `worktree-remove` belong to `worktree.rs`, which owns that
+            //   lifecycle entire: the naming scheme `owner_from_dir_name` parses, the orphan sweeper,
+            //   the removal backoff, and `is_dangerous_removal_path`. `git_exec.rs` already refuses
+            //   to run `worktree prune` up front for this exact reason — "doing that on every merge
+            //   would quietly make this module a co-owner of a lifecycle it has no business in" — and
+            //   executing the other two here would be that same mistake, made deliberately.
+            //
+            // Nothing is deferred any more: the spec's nine are six this queue performs and three it
+            // has decided against, each on its own grounds.
+            other @ ("pull" | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
+                "{other} is not an operation this queue performs, and will not become one — see \
+                 `Op::from_request` for why. It understands merge, push, tag, fetch, branch-delete \
+                 and rebase"
             )),
             other => Err(format!(
-                "unknown operation: {other} — the queue understands merge, push and tag"
+                "unknown operation: {other} — the queue understands merge, push, tag, fetch, \
+                 branch-delete and rebase"
             )),
         }
     }
@@ -645,6 +754,90 @@ pub fn tag_from_command(command: &str, current_branch: &str) -> Option<Op> {
     })
 }
 
+/// PURE: the rebase a shell command asks for, in the queue's own terms, or `None`.
+///
+/// `git rebase X`, in a worktree whose HEAD is on `B`, means "replay B onto X" — which is
+/// `Rebase { branch: B, onto: X }`, the mirror of how `merge_from_command` reads its own two halves.
+///
+/// **Everything with a flag is refused, and unlike the other parsers there is no accepted one.**
+/// `-i` opens an editor, which is a human sitting at a terminal that does not exist here.
+/// `--continue`, `--abort` and `--skip` operate on a rebase already in progress — a state this queue
+/// never leaves behind, since a conflicted compute aborts before the row is written. `--onto` takes a
+/// third ref and means something the two-field shape cannot hold. `--exec` runs an arbitrary command
+/// per commit, which is a shell by another name.
+///
+/// Bare `git rebase` is refused for `git push`'s reason: it replays onto the configured upstream, in
+/// a repository the daemon does not control.
+pub fn rebase_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, onto] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("rebase") {
+        return None;
+    }
+    if current_branch.trim() == "HEAD" {
+        return None;
+    }
+    Some(Op::Rebase {
+        branch: Branch::new(current_branch).ok()?,
+        onto: Branch::new(onto).ok()?,
+    })
+}
+
+/// PURE: the fetch a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`git fetch <remote>` exactly.** Bare `git fetch` is refused for `git push`'s reason and not for
+/// `git tag`'s: it is not a read wearing the write's name, it is the operation with its destination
+/// left to `branch.<name>.remote` and `remote.pushDefault` in a repository the daemon does not
+/// control. `--all` fetches from remotes nobody named, `--prune` deletes tracking refs, and `--tags`
+/// pulls in a namespace the refspec deliberately leaves out — three different operations, and the
+/// argv guard stops none of them, so the shape has to.
+pub fn fetch_from_command(command: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, remote] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("fetch") {
+        return None;
+    }
+    Some(Op::Fetch {
+        remote: Remote::new(remote).ok()?,
+    })
+}
+
+/// PURE: the branch deletion a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`-d` and `--delete`, never `-D` and never `--delete --force`**, and this is the one parser
+/// where the accepted flag is mandatory rather than optional. `git branch <name>` CREATES a branch —
+/// `classifier.rs` pins that exact ambiguity as the reason `git branch` is on its
+/// `SAFE_EXACT_COMMANDS` list in its listing spellings only — so a shape that read the flag as
+/// optional would queue a deletion for a command that asked for a creation.
+///
+/// The distinction between the two spellings is not stylistic: `-d` refuses when the branch holds
+/// commits no other ref reaches, and `-D` deletes anyway. That refusal is git's, computed from the
+/// commit graph, and it is the entire reason this operation can be offered at all — the queue never
+/// has to decide what is safe to lose. `-D` asks git to stop answering that question, so it falls
+/// back to the grant like every other unqueueable spelling.
+pub fn branch_delete_from_command(command: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, flag, branch] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("branch") {
+        return None;
+    }
+    // Case-sensitive on purpose, and it is the only place in these parsers where that is load-
+    // bearing rather than incidental: `-d` and `-D` differ by case alone and mean the safe and the
+    // unsafe thing. Folding here would turn every `-D` into the spelling this queue accepts.
+    if *flag != "-d" && !flag.eq_ignore_ascii_case("--delete") {
+        return None;
+    }
+    Some(Op::BranchDelete {
+        branch: Branch::new(branch).ok()?,
+    })
+}
+
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
 /// autonomous and start `awaiting_approval`.
@@ -729,7 +922,22 @@ pub struct ClaimedRequest {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     /// Ran, and did what was asked.
-    Succeeded { sha: String, output_tail: String },
+    ///
+    /// **`sha` is optional because not every operation produces one**, and that is a fact about the
+    /// vocabulary rather than a hedge. A merge, a push, a tag and a branch delete each name exactly
+    /// one object id worth recording — what was published, what was sent, what was tagged, what was
+    /// removed and could therefore be restored. A `fetch` names none: it moves however many
+    /// remote-tracking refs the remote had news about, and picking one of them to put in the column
+    /// would be inventing a headline.
+    ///
+    /// `result_sha` has been nullable since `0048_vcs_requests.sql` and `finish` already writes NULL
+    /// for every non-`Succeeded` outcome, so this makes the type agree with the column rather than
+    /// changing what the column can hold. An empty string would have been the alternative, and it is
+    /// the worse one: a reader cannot tell it from a sha the executor failed to capture.
+    Succeeded {
+        sha: Option<String>,
+        output_tail: String,
+    },
     /// Ran and produced its result, which could not be published because the target worktree's
     /// uncommitted files are in the way. Terminal and never retried in a loop (spec §7): a working
     /// copy left dirty over an afternoon would otherwise hold the whole repository's queue.
@@ -935,7 +1143,7 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     // each arm — see its doc comment for why there is only one place that names a status.
     let status = outcome.status();
     let (result_sha, failure_reason, exit_code, output_tail) = match outcome {
-        Outcome::Succeeded { sha, output_tail } => (Some(sha), None, None, Some(output_tail)),
+        Outcome::Succeeded { sha, output_tail } => (sha, None, None, Some(output_tail)),
         Outcome::Blocked {
             reason,
             output_tail,
@@ -1771,7 +1979,7 @@ impl FakeVcsExecutor {
     /// carried the same text could not tell a test that they had been swapped.
     fn succeeding_with(sha: &str) -> Self {
         Self::reporting(Outcome::Succeeded {
-            sha: sha.into(),
+            sha: Some(sha.into()),
             output_tail: format!("git printed this while succeeding at {sha}"),
         })
     }
@@ -2214,7 +2422,7 @@ mod tests {
             &pool,
             first,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -2552,16 +2760,181 @@ mod tests {
             "git merge feature",
             "git push origin main",
             "git tag v1 main",
+            "git fetch origin",
+            "git branch -d feature",
+            "git rebase master",
         ] {
             let matched = [
                 merge_from_command(command, "master"),
                 push_from_command(command, "master"),
                 tag_from_command(command, "master"),
+                fetch_from_command(command),
+                branch_delete_from_command(command),
+                rebase_from_command(command, "master"),
             ]
             .into_iter()
             .flatten()
             .count();
             assert_eq!(matched, 1, "{command} was read by more than one parser");
+        }
+    }
+
+    /// **What is left of the spec's nine is a set of refusals, not a backlog**, and the message has
+    /// to say which — a caller told "not yet" waits for a release that is never coming.
+    ///
+    /// **Nothing is deferred any more**, and the absence of a "not yet" anywhere is the assertion.
+    /// The spec's nine are now six this queue performs and three it has decided against; a caller
+    /// told "not yet" would be waiting for a release that is never coming.
+    #[test]
+    fn the_operations_this_queue_will_never_perform_say_so_rather_than_saying_not_yet() {
+        for closed in ["pull", "worktree-add", "worktree-remove", "pr-merge"] {
+            let error = Op::from_request(closed, Some("a"), Some("b")).unwrap_err();
+            assert!(
+                error.contains("will not become one"),
+                "{closed} must be refused as a decision, not deferred: {error}"
+            );
+            assert!(!error.contains("not yet"), "{closed}: {error}");
+        }
+
+        // And the whole vocabulary is reachable, which is what says none of the nine is left in
+        // limbo: six build, three refuse with a reason, and no name falls through to "unknown".
+        for (operation, source, target) in [
+            ("merge", Some("feature"), Some("master")),
+            ("push", Some("main"), Some("origin")),
+            ("tag", Some("main"), Some("v1.0")),
+            ("fetch", None, Some("origin")),
+            ("branch-delete", Some("feature"), None),
+            ("rebase", Some("feature"), Some("master")),
+        ] {
+            assert!(
+                Op::from_request(operation, source, target).is_ok(),
+                "{operation} must be one the queue performs"
+            );
+        }
+    }
+
+    /// `git rebase <onto>` reads its two halves the way `merge_from_command` reads its own: the
+    /// branch is the one the worktree stands on, and the command names what it goes on top of.
+    #[test]
+    fn a_rebase_replays_the_worktrees_branch_onto_what_the_command_names() {
+        assert_eq!(
+            rebase_from_command("git rebase master", "feat/x"),
+            Some(Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into()
+            })
+        );
+        assert_eq!(
+            rebase_from_command("GIT REBASE Master", "feat/x"),
+            Some(Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "Master".into()
+            })
+        );
+        // Same guard, same reason as everywhere else: a detached worktree names no branch to replay.
+        assert_eq!(rebase_from_command("git rebase master", "HEAD"), None);
+        assert_eq!(rebase_from_command("git rebase master", ""), None);
+    }
+
+    /// **The one parser with no accepted flag at all**, and each refusal is a different kind.
+    #[test]
+    fn only_a_bare_git_rebase_onto_one_ref_becomes_a_queued_operation() {
+        for command in [
+            // Replays onto the configured upstream, in a repository the daemon does not control.
+            "git rebase",
+            // Opens an editor, for a human at a terminal that does not exist here.
+            "git rebase -i master",
+            "git rebase --interactive master",
+            // Operate on a rebase already in progress — a state this queue never leaves behind.
+            "git rebase --continue",
+            "git rebase --abort",
+            "git rebase --skip",
+            // Takes a third ref, which the two-field shape cannot hold.
+            "git rebase --onto master feature",
+            // Runs an arbitrary command per commit: a shell by another name.
+            "git rebase --exec make master",
+            // Rewrites every commit rather than replaying them.
+            "git rebase --root",
+            // Shape, and the verb.
+            "git rebase master extra",
+            "git --no-verify rebase master",
+            "gh rebase master",
+        ] {
+            assert_eq!(rebase_from_command(command, "feat/x"), None, "{command}");
+        }
+    }
+
+    /// `git fetch <remote>` exactly, and every neighbouring spelling is a different operation.
+    #[test]
+    fn only_a_git_fetch_from_one_named_remote_becomes_a_queued_operation() {
+        assert_eq!(
+            fetch_from_command("git fetch origin"),
+            Some(Op::Fetch {
+                remote: "origin".into()
+            })
+        );
+        assert_eq!(
+            fetch_from_command("GIT FETCH Origin"),
+            Some(Op::Fetch {
+                remote: "Origin".into()
+            })
+        );
+        for command in [
+            // The destination left to config in a repository the daemon does not control.
+            "git fetch",
+            // Remotes nobody named.
+            "git fetch --all",
+            // Deletes tracking refs.
+            "git fetch --prune origin",
+            "git fetch origin --prune",
+            // A namespace the refspec deliberately leaves out.
+            "git fetch --tags origin",
+            // Shape, and the verb.
+            "git fetch origin main",
+            "git --no-verify fetch origin",
+            "gh fetch origin",
+        ] {
+            assert_eq!(fetch_from_command(command), None, "{command}");
+        }
+    }
+
+    /// **`-d` and `-D` differ by CASE alone and mean the safe and the unsafe thing**, which makes
+    /// this the one parser where folding the flag would be a defect rather than a convenience.
+    ///
+    /// The other half is that the flag is mandatory: `git branch <name>` CREATES a branch, so a
+    /// shape that read the flag as optional would queue a deletion for a command that asked for the
+    /// opposite. `classifier.rs` pins that same ambiguity as its reason for listing `git branch` by
+    /// exact form only.
+    #[test]
+    fn deleting_a_branch_is_queued_only_in_the_spelling_that_refuses_unmerged_work() {
+        for command in ["git branch -d feature", "git branch --delete feature"] {
+            assert_eq!(
+                branch_delete_from_command(command),
+                Some(Op::BranchDelete {
+                    branch: "feature".into()
+                }),
+                "{command}"
+            );
+        }
+        for command in [
+            // The whole point: `-D` asks git to stop answering the question this queue relies on it
+            // to answer.
+            "git branch -D feature",
+            "git branch --delete --force feature",
+            "git branch -d -f feature",
+            // Not a deletion at all. Reading the flag as optional would turn this into one.
+            "git branch feature",
+            "git branch",
+            // Other mutations of the same subcommand.
+            "git branch -m old new",
+            "git branch --unset-upstream",
+            // Remote-tracking deletion is a different namespace and a different operation.
+            "git branch -dr origin/feature",
+            // Shape, and the verb.
+            "git branch -d one two",
+            "gh branch -d feature",
+        ] {
+            assert_eq!(branch_delete_from_command(command), None, "{command}");
         }
     }
 
@@ -2661,18 +3034,74 @@ mod tests {
         );
     }
 
-    /// The storage round trip for the third variant, and the column/payload check that catches a
-    /// variant whose `kind()` and serde tag disagree.
+    /// **Every variant round-trips AND spells its name the same way in both columns**, checked as a
+    /// set rather than one test per variant.
+    ///
+    /// The second half is the one that had to be added rather than assumed. `kind()` is written by
+    /// hand and the serde tag is derived, so the two can disagree — and the round trip does NOT
+    /// notice, because `from_stored` re-derives `kind()` from the parsed value instead of reading
+    /// the payload's tag. Measured: removing `#[serde(rename = "branch-delete")]` leaves the round
+    /// trip green and puts `branch_delete` in the `args` payload of a row whose `op` column says
+    /// `branch-delete`. The assertion that sees it is the one comparing the payload's own `op` field
+    /// to `kind()`.
+    ///
+    /// One test over the whole vocabulary catches the next multi-word variant on the day it is
+    /// added, where five separate tests would need somebody to remember to write a sixth.
     #[test]
-    fn a_tag_round_trips_through_storage_too() {
-        let op = Op::Tag {
-            name: "v1.0".into(),
-            at: "main".into(),
-        };
+    fn every_operation_round_trips_through_storage() {
+        let all = [
+            Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            Op::Push {
+                remote: "origin".into(),
+                branch: "main".into(),
+            },
+            Op::Tag {
+                name: "v1.0".into(),
+                at: "main".into(),
+            },
+            Op::Fetch {
+                remote: "origin".into(),
+            },
+            Op::BranchDelete {
+                branch: "feature".into(),
+            },
+            Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into(),
+            },
+        ];
 
-        assert_eq!(op.kind(), "tag");
-        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
-        assert!(Op::from_stored("push", &op.to_args()).is_err());
+        for op in &all {
+            assert_eq!(
+                Op::from_stored(op.kind(), &op.to_args()).as_ref().ok(),
+                Some(op),
+                "{} does not survive its own storage",
+                op.kind()
+            );
+            // The column and the payload are checked against each other, so a mismatched pair is
+            // refused rather than silently trusted.
+            assert!(Op::from_stored("merge", &op.to_args()).is_err() || op.kind() == "merge");
+            // **The assertion the round trip cannot make.** The payload's own tag has to be the
+            // same word as the column, or one row carries two spellings of one operation for
+            // everybody who reads the queue or filters it by JSON path.
+            let payload: serde_json::Value = serde_json::from_str(&op.to_args()).unwrap();
+            assert_eq!(
+                payload["op"].as_str(),
+                Some(op.kind()),
+                "the payload's tag and the `op` column must be the same word"
+            );
+        }
+
+        // And the names are what `from_request` accepts, so the column holds the caller's word.
+        let kinds: Vec<&str> = all.iter().map(Op::kind).collect();
+        assert_eq!(
+            kinds,
+            ["merge", "push", "tag", "fetch", "branch-delete", "rebase"],
+            "the `op` column's vocabulary is the one the door speaks"
+        );
     }
 
     /// A listing narrowed to a project shows the whole repository that project shares.
@@ -2827,7 +3256,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Fast-forward".into(),
             },
         )
@@ -2871,7 +3300,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -2917,7 +3346,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -2961,7 +3390,7 @@ mod tests {
             &pool,
             recent,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "recent".into(),
             },
         )
@@ -3034,7 +3463,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -3076,7 +3505,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "on the boundary".into(),
             },
         )
@@ -3204,7 +3633,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -3342,7 +3771,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -4544,18 +4973,6 @@ mod tests {
         );
     }
 
-    /// A valid operation still round-trips through the column-plus-payload storage `from_stored`
-    /// reads.
-    #[test]
-    fn a_valid_operation_still_round_trips_through_storage() {
-        let op = Op::Merge {
-            source: "feat/x".into(),
-            target: "master".into(),
-        };
-
-        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
-    }
-
     /// The door's whole vocabulary, stated as a table.
     #[test]
     fn the_queue_speaks_merge_and_push_and_says_so_about_everything_else() {
@@ -4586,12 +5003,31 @@ mod tests {
             }
         );
 
-        // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
-        // missing — "unknown operation: rebase" would send a caller looking for a typo.
-        let error = Op::from_request("rebase", Some("feature"), Some("master")).unwrap_err();
-        assert!(error.contains("not yet"), "unexpected error: {error}");
+        // The two that break the source/target pair rather than following it, each taking the one
+        // parameter it has a use for.
+        assert_eq!(
+            Op::from_request("fetch", None, Some("origin")).unwrap(),
+            Op::Fetch {
+                remote: "origin".into()
+            }
+        );
+        assert_eq!(
+            Op::from_request("branch-delete", Some("feature"), None).unwrap(),
+            Op::BranchDelete {
+                branch: "feature".into()
+            }
+        );
+
+        // An operation the spec lists but this queue has decided against must say WHICH thing is
+        // wrong — "unknown operation: pull" would send a caller looking for a typo in its own
+        // request, when what it needs to know is to ask for two operations instead of one.
+        let error = Op::from_request("pull", Some("feature"), Some("origin")).unwrap_err();
         assert!(
-            error.contains("merge") && error.contains("push") && error.contains("tag"),
+            error.contains("will not become one"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("merge") && error.contains("push") && error.contains("rebase"),
             "the error must name what the queue CAN do: {error}"
         );
 
@@ -4657,24 +5093,6 @@ mod tests {
         assert!(
             Op::from_stored("push", r#"{"op":"push","remote":"-o","branch":"main"}"#).is_err(),
             "a hand-edited row is not trusted either"
-        );
-    }
-
-    /// The storage round trip for the second variant. `kind()` and the serde tag are written apart
-    /// and `from_stored` compares them, so a variant whose two spellings disagree stores rows it can
-    /// never read back — and the merge-only version of this test could not see that.
-    #[test]
-    fn a_push_round_trips_through_storage_too() {
-        let op = Op::Push {
-            remote: "origin".into(),
-            branch: "feat/x".into(),
-        };
-
-        assert_eq!(op.kind(), "push");
-        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
-        assert!(
-            Op::from_stored("merge", &op.to_args()).is_err(),
-            "the column and the payload must be checked against each other"
         );
     }
 }

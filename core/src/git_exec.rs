@@ -761,7 +761,7 @@ pub async fn publish(
     // Nothing to publish: the merge found the target already contained the source.
     if computed.new == computed.old {
         return Outcome::Succeeded {
-            sha: computed.new,
+            sha: Some(computed.new),
             output_tail: computed.output_tail,
         };
     }
@@ -808,7 +808,7 @@ async fn publish_by_update_ref(
         );
     }
     Outcome::Succeeded {
-        sha: computed.new,
+        sha: Some(computed.new),
         output_tail: computed.output_tail,
     }
 }
@@ -923,7 +923,7 @@ async fn publish_by_fast_forward(
     };
     if merged.succeeded() {
         return Outcome::Succeeded {
-            sha: computed.new,
+            sha: Some(computed.new),
             output_tail: computed.output_tail,
         };
     }
@@ -1089,7 +1089,196 @@ impl crate::vcs::VcsExecutor for GitExecutor {
             crate::vcs::Op::Tag { name, at } => {
                 tag(project_root, name.as_str(), at.as_str(), deadline).await
             }
+            crate::vcs::Op::Fetch { remote } => {
+                fetch(project_root, remote.as_str(), deadline).await
+            }
+            crate::vcs::Op::BranchDelete { branch } => {
+                branch_delete(project_root, branch.as_str(), deadline).await
+            }
+            crate::vcs::Op::Rebase { branch, onto } => {
+                rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
+            }
         }
+    }
+}
+
+/// Replays `branch` onto `onto`, on a detached HEAD in the integration worktree.
+///
+/// **The holder check comes FIRST, before anything is computed, and that ordering is the operation
+/// rather than an optimisation.** Every other executor here computes and then discovers whether it
+/// can publish; this one cannot publish to a held branch at all — `Op::Rebase` argues why at length,
+/// and the short version is that no git command moves a checkout across a divergence while refusing
+/// to destroy. So a computed rebase nobody could publish would be minutes of work and a pile of
+/// unreferenced objects, thrown away to say something that was knowable before it started.
+///
+/// `Blocked` rather than `Failed` for that case, and it is the one place in this module where
+/// `Blocked`'s terminal-ness is exactly right: nothing about the repository will change on its own to
+/// make this publishable. A person has to check that branch out somewhere else, and until they do a
+/// retry would fail identically.
+async fn rebase(
+    project_root: &Path,
+    branch: &str,
+    onto: &str,
+    deadline: std::time::Instant,
+) -> Outcome {
+    match worktree_holding(project_root, branch, deadline).await {
+        Ok(Some(holder)) => {
+            return Outcome::Blocked {
+                reason: format!(
+                    "{branch} is checked out in {}, and a rebase rewrites it — this queue will not \
+                     reset a worktree it does not own. Check that branch out somewhere else and \
+                     resubmit.",
+                    holder.display()
+                ),
+                output_tail: String::new(),
+            };
+        }
+        Ok(None) => {}
+        Err(outcome) => return outcome,
+    }
+
+    let integration = match prepare_integration_worktree(project_root, deadline).await {
+        Ok(integration) => integration,
+        Err(outcome) => return outcome,
+    };
+
+    // Detached, like `compute_merge` — and here it is not merely permitted but required: `git rebase`
+    // moves whatever HEAD names, so a rebase on an attached HEAD would move the integration
+    // worktree's own branch instead of computing a value to publish.
+    let checkout = match git(&integration, &["checkout", "--detach", branch], deadline).await {
+        Ok(checkout) => checkout,
+        Err(outcome) => return outcome,
+    };
+    if !checkout.succeeded() {
+        return failed(format!("could not check out {branch} to rebase"), &checkout);
+    }
+
+    let old = match revision(&integration, "HEAD", deadline).await {
+        Ok(old) => old,
+        Err(outcome) => return outcome,
+    };
+
+    let rebased = match git(
+        &integration,
+        &["rebase", "--end-of-options", onto],
+        deadline,
+    )
+    .await
+    {
+        Ok(rebased) => rebased,
+        Err(outcome) => return outcome,
+    };
+    if !rebased.succeeded() {
+        // Best effort, and for `compute_merge`'s reason: the next operation resets this worktree
+        // anyway, and a failure to abort must not replace the conflict the caller needs to read.
+        let _ = git(&integration, &["rebase", "--abort"], deadline).await;
+        return failed(format!("rebasing {branch} onto {onto} failed"), &rebased);
+    }
+
+    let new = match revision(&integration, "HEAD", deadline).await {
+        Ok(new) => new,
+        Err(outcome) => return outcome,
+    };
+
+    // Already on top of `onto`: git rebased nothing and HEAD did not move. Publishing would be a
+    // no-op compare-and-swap, so say so instead.
+    if new == old {
+        return Outcome::Succeeded {
+            sha: Some(new),
+            output_tail: rebased.output_tail,
+        };
+    }
+
+    // The same compare-and-swap `publish_by_update_ref` performs for a merge, and reached the same
+    // way: nobody holds this branch — checked above, before any of the work — so there is no
+    // worktree whose files have to move with the ref.
+    publish_by_update_ref(
+        project_root,
+        branch,
+        Computed {
+            old,
+            new,
+            output_tail: rebased.output_tail,
+        },
+        deadline,
+    )
+    .await
+}
+
+/// Fetches from `remote`, using whatever refspec that remote is configured with.
+///
+/// The shortest executor here, and the only one that resolves nothing first — there is no object id
+/// to record, because a fetch moves however many tracking refs the remote had news about. Its
+/// `Succeeded` therefore carries `None`, which is what made `Outcome::Succeeded::sha` optional.
+///
+/// What it still needs from everything above it is the part that does not show in these seven lines:
+/// this is the operation that hands git an ssh and a credential helper, so it depends on
+/// `run_git`'s tree-kill, its `GIT_TERMINAL_PROMPT=0` and its drain grace exactly as `push` does. A
+/// fetch against a dead network is the case spec §7's hung-command row was written about.
+async fn fetch(project_root: &Path, remote: &str, deadline: std::time::Instant) -> Outcome {
+    let fetched = match git(
+        project_root,
+        &["fetch", "--end-of-options", remote],
+        deadline,
+    )
+    .await
+    {
+        Ok(fetched) => fetched,
+        Err(outcome) => return outcome,
+    };
+    if !fetched.succeeded() {
+        return failed(
+            format!("fetching from {remote} failed; git's output says why"),
+            &fetched,
+        );
+    }
+    Outcome::Succeeded {
+        sha: None,
+        output_tail: fetched.output_tail,
+    }
+}
+
+/// Deletes `branch`, in the spelling that refuses to lose unmerged work.
+///
+/// **The sha is read BEFORE the delete and recorded, and that ordering is the operation's whole
+/// value beyond running the command.** Afterwards the ref is gone and nothing can answer what it
+/// pointed at; the row is then the only place holding the one string that undoes this
+/// (`git branch <name> <sha>`). Every other executor here resolves first for a different reason — so
+/// that what it publishes is a value rather than a re-read — and this one does it so that what it
+/// destroys is recoverable.
+///
+/// `--delete` and never `-D`, which `vcs::branch_delete_from_command` argues at length: the refusal
+/// on unmerged commits is git's own, computed from the commit graph, and it is what lets the queue
+/// offer this without owning the question of what is safe to lose. A branch checked out in some
+/// worktree is refused by git too, with `Cannot delete branch … used by worktree` — a guard this
+/// module would otherwise have to reproduce against `worktree list`, and get wrong.
+async fn branch_delete(project_root: &Path, branch: &str, deadline: std::time::Instant) -> Outcome {
+    let reference = format!("refs/heads/{branch}");
+    let sha = match revision(project_root, &reference, deadline).await {
+        Ok(sha) => sha,
+        Err(outcome) => return outcome,
+    };
+
+    let deleted = match git(
+        project_root,
+        &["branch", "--delete", "--end-of-options", branch],
+        deadline,
+    )
+    .await
+    {
+        Ok(deleted) => deleted,
+        Err(outcome) => return outcome,
+    };
+    if !deleted.succeeded() {
+        return failed(
+            format!("deleting {branch} failed; git's output says why"),
+            &deleted,
+        );
+    }
+
+    Outcome::Succeeded {
+        sha: Some(sha),
+        output_tail: deleted.output_tail,
     }
 }
 
@@ -1145,7 +1334,7 @@ async fn tag(project_root: &Path, name: &str, at: &str, deadline: std::time::Ins
     }
 
     Outcome::Succeeded {
-        sha,
+        sha: Some(sha),
         output_tail: tagged.output_tail,
     }
 }
@@ -1207,7 +1396,7 @@ async fn push(
     }
 
     Outcome::Succeeded {
-        sha,
+        sha: Some(sha),
         output_tail: pushed.output_tail,
     }
 }
@@ -1983,7 +2172,7 @@ pub(crate) mod tests {
         let outcome = publish(&repo, "release", computed, deadline()).await;
 
         match outcome {
-            Outcome::Succeeded { sha, .. } => assert_eq!(sha, new),
+            Outcome::Succeeded { sha, .. } => assert_eq!(sha.as_deref(), Some(new.as_str())),
             other => panic!("expected a published merge, got {other:?}"),
         }
         assert_eq!(sha_of(&repo, "release"), new, "the branch moved");
@@ -2139,7 +2328,7 @@ pub(crate) mod tests {
             .await;
 
         let sha = match outcome {
-            Outcome::Succeeded { sha, .. } => sha,
+            Outcome::Succeeded { sha, .. } => sha.expect("this operation names an object id"),
             other => panic!("expected a published merge, got {other:?}"),
         };
         // The sha the row reports IS the merge commit, established from its parents rather than by
@@ -2817,7 +3006,7 @@ pub(crate) mod tests {
             .await;
 
         let sha = match outcome {
-            Outcome::Succeeded { sha, .. } => sha,
+            Outcome::Succeeded { sha, .. } => sha.expect("this operation names an object id"),
             other => panic!("expected a published push, got {other:?}"),
         };
         assert_eq!(sha, local, "the row reports the sha it sent");
@@ -2838,6 +3027,296 @@ pub(crate) mod tests {
                 .status
                 .success(),
             "only the branch the operation named may be published"
+        );
+    }
+
+    /// A rebase nobody has open is computed in isolation and published by compare-and-swap.
+    ///
+    /// The assertion is on the SHAPE of the result, not just that the ref moved: the rebased tip's
+    /// first parent must be `master`, which is what says the commits were replayed rather than
+    /// merged. A `compute_merge` accidentally wired here would move the ref too, and leave a tip with
+    /// two parents.
+    #[tokio::test]
+    async fn a_rebase_of_a_branch_nobody_holds_is_published_by_compare_and_swap() {
+        use crate::vcs::VcsExecutor;
+
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-");
+        let _env = WorktreeRootEnv::set(&container.path().join("roots"));
+        // `master` moves on, so `feat/x` genuinely has somewhere to be replayed onto.
+        std::fs::write(repo.join("later.txt"), "later\n").expect("write");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("later")]
+        ));
+        let master = sha_of(&repo, "refs/heads/master");
+        let before = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Rebase {
+                    branch: "feat/x".into(),
+                    onto: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        let sha = match outcome {
+            Outcome::Succeeded { sha, .. } => sha.expect("a rebase names its new tip"),
+            other => panic!("expected a published rebase, got {other:?}"),
+        };
+        assert_ne!(
+            sha, before,
+            "the commits were replayed, so they are new objects"
+        );
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            sha,
+            "and the branch ref moved to them"
+        );
+        assert_eq!(
+            sha_of(&repo, &format!("{sha}^1")),
+            master,
+            "replayed onto master, so its first parent is master — a merge would have two parents"
+        );
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "--verify", &format!("{sha}^2")])
+                .output()
+                .expect("git should start")
+                .status
+                .success(),
+            "and no second parent, which is what tells a rebase from a merge"
+        );
+    }
+
+    /// **A branch somebody has open is refused before anything is computed.**
+    ///
+    /// Both halves matter. `Blocked` rather than `Failed` says nothing will change on its own to
+    /// make this publishable. And the branch not having moved is what says the refusal came BEFORE
+    /// the work — an executor that computed first and discovered the holder afterwards would leave
+    /// the same status behind, having spent the operation's budget and left unreferenced objects.
+    #[tokio::test]
+    async fn a_rebase_of_a_branch_somebody_holds_is_blocked_before_anything_is_computed() {
+        use crate::vcs::VcsExecutor;
+
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-held-");
+        let roots = container.path().join("roots");
+        let _env = WorktreeRootEnv::set(&roots);
+        let holder = container.path().join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                holder.as_os_str(),
+                OsStr::new("feat/x")
+            ]
+        ));
+        let before = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Rebase {
+                    branch: "feat/x".into(),
+                    onto: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match &outcome {
+            Outcome::Blocked { reason, .. } => assert!(
+                reason.contains("will not reset a worktree it does not own"),
+                "the refusal must say what it declined to do: {reason}"
+            ),
+            other => panic!("a held branch must be blocked, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            before,
+            "and nothing was rewritten"
+        );
+        assert!(
+            !integration_worktree(&repo).exists(),
+            "the refusal came before any computation, so no integration worktree was even made"
+        );
+    }
+
+    /// A fetch moves the tracking ref and reports NO object id.
+    ///
+    /// **Both halves are the test.** That `refs/remotes/origin/master` catches up is what says the
+    /// operation happened; that `sha` is `None` is what says the type change was not cosmetic — an
+    /// executor returning `Some(String::new())` would satisfy every other assertion here and put an
+    /// empty string in a column a reader cannot tell from a capture that failed.
+    #[tokio::test]
+    async fn a_fetch_moves_the_tracking_ref_and_names_no_object_id() {
+        use crate::vcs::VcsExecutor;
+
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-fetch-");
+        let remote = remote_beside(container.path(), &repo);
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("push"),
+                OsStr::new("origin"),
+                OsStr::new("master")
+            ]
+        ));
+        // Move the remote on from a second clone, so there is genuinely something to fetch.
+        let other = container.path().join("other");
+        assert!(
+            Command::new("git")
+                .arg("clone")
+                .arg(&remote)
+                .arg(&other)
+                .status()
+                .expect("git should start")
+                .success()
+        );
+        for (key, value) in [("user.email", "test@x"), ("user.name", "test")] {
+            assert!(git_ok(
+                &other,
+                &[OsStr::new("config"), OsStr::new(key), OsStr::new(value)]
+            ));
+        }
+        std::fs::write(other.join("theirs.txt"), "theirs\n").expect("write");
+        assert!(git_ok(&other, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &other,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("theirs")]
+        ));
+        assert!(git_ok(&other, &[OsStr::new("push")]));
+        let theirs = sha_of(&remote, "refs/heads/master");
+        assert_ne!(
+            sha_of(&repo, "refs/remotes/origin/master"),
+            theirs,
+            "the tracking ref must be behind before the fetch, or this proves nothing"
+        );
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Fetch {
+                    remote: "origin".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match outcome {
+            Outcome::Succeeded { sha, .. } => assert_eq!(
+                sha, None,
+                "a fetch moves however many refs the remote had news about, so it names none"
+            ),
+            other => panic!("expected a completed fetch, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "refs/remotes/origin/master"),
+            theirs,
+            "the tracking ref caught up"
+        );
+    }
+
+    /// Deleting a branch records the sha it pointed at, which is the row's whole value as an undo.
+    ///
+    /// A test that only checked the branch was gone would pass against an executor that deleted
+    /// first and reported nothing — and afterwards nothing on the machine can answer what was lost.
+    #[tokio::test]
+    async fn deleting_a_branch_records_the_sha_that_restores_it() {
+        use crate::vcs::VcsExecutor;
+
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-branchdel-");
+        // Merged into master, so `--delete` is willing: the unmerged case is the next test.
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("merge"),
+                OsStr::new("--no-ff"),
+                OsStr::new("-m"),
+                OsStr::new("bring it in"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        let was = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::BranchDelete {
+                    branch: "feat/x".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match outcome {
+            Outcome::Succeeded { sha, .. } => assert_eq!(
+                sha.as_deref(),
+                Some(was.as_str()),
+                "the row is the only place left holding what would restore this"
+            ),
+            other => panic!("expected a deleted branch, got {other:?}"),
+        }
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "--verify", "refs/heads/feat/x"])
+                .output()
+                .expect("git should start")
+                .status
+                .success(),
+            "and the branch is gone"
+        );
+    }
+
+    /// **The refusal this operation is built on belongs to git, and this is what proves the queue
+    /// asks for it.**
+    ///
+    /// `feat/x` here is NOT merged, so `--delete` refuses and `-D` would not. The branch surviving
+    /// is the assertion: an executor that reached for `-D` — the obvious "fix" for a failing delete
+    /// — passes every other check in this file and silently discards work nobody can get back.
+    #[tokio::test]
+    async fn deleting_an_unmerged_branch_is_refused_by_git_rather_than_forced() {
+        use crate::vcs::VcsExecutor;
+
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-branchdel-unmerged-");
+        let was = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::BranchDelete {
+                    branch: "feat/x".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match &outcome {
+            Outcome::Failed { output_tail, .. } => assert!(
+                !output_tail.is_empty(),
+                "git's own refusal is the only diagnostic the row carries"
+            ),
+            other => panic!("an unmerged branch must not be deleted, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            was,
+            "the branch is still there, with its commits — this queue never forces"
         );
     }
 
@@ -2904,7 +3383,7 @@ pub(crate) mod tests {
             .await;
 
         let sha = match outcome {
-            Outcome::Succeeded { sha, .. } => sha,
+            Outcome::Succeeded { sha, .. } => sha.expect("this operation names an object id"),
             other => panic!("expected a written tag, got {other:?}"),
         };
         assert_eq!(sha, tip, "the row reports the object it tagged");
