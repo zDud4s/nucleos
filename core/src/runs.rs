@@ -1819,7 +1819,11 @@ async fn queueable_operation(
         .ok()?;
     let op = crate::vcs::merge_from_command(command, &branch)
         .or_else(|| crate::vcs::push_from_command(command, &branch))
-        .or_else(|| crate::vcs::tag_from_command(command, &branch))?;
+        .or_else(|| crate::vcs::tag_from_command(command, &branch))
+        // The two that need no worktree branch, so they take none. A fetch names its remote and a
+        // deletion names its branch; neither has a half the command line leaves out.
+        .or_else(|| crate::vcs::fetch_from_command(command))
+        .or_else(|| crate::vcs::branch_delete_from_command(command))?;
     crate::vcs::resolve_repo(&state.pool, project_id)
         .await
         .map_err(|error| {
@@ -3594,6 +3598,54 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             note.contains("tag queued as vcs request"),
             "the trail must name the operation it queued: {note}"
         );
+    }
+
+    /// The two operations that take no branch from the worktree, through the approval door.
+    ///
+    /// Table-driven because what is being pinned is the CHAIN: `queueable_operation` tries five
+    /// parsers in an `or_else` sequence, and the two added last are the two that ignore the branch
+    /// argument entirely. A per-operation test would pass with either of them missing from the
+    /// chain, since each one's own parser is tested next door.
+    #[tokio::test]
+    async fn approving_a_fetch_or_a_branch_delete_queues_it_too() {
+        for (command, expected_op, expected_args) in [
+            (
+                "git fetch origin",
+                "fetch",
+                serde_json::json!({"op": "fetch", "remote": "origin"}),
+            ),
+            (
+                "git branch -d feature",
+                "branch-delete",
+                serde_json::json!({"op": "branch-delete", "branch": "feature"}),
+            ),
+        ] {
+            let (state, _runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600))
+                    .await;
+            let (proposal_id, _branch, _container) =
+                seed_real_worktree_approval(&state, command).await;
+
+            let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+            let (op, args): (String, String) =
+                sqlx::query_as("SELECT op, args FROM vcs_requests ORDER BY id DESC LIMIT 1")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap_or_else(|_| panic!("{command} should have been queued"));
+            assert_eq!(op, expected_op, "{command}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+                expected_args,
+                "{command}"
+            );
+            assert!(
+                !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                    .await
+                    .unwrap(),
+                "{command}: the queue took it, so the run must not also be authorized"
+            );
+        }
     }
 
     /// The other side of the branch, and the one that keeps this from being a regression: an
