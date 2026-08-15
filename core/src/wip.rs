@@ -69,9 +69,22 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
 /// above is per project — so either spelling would agree about them. Where the two forms differ is
 /// on the NEXT kind somebody adds: an exclusion counts it by default and an inclusion drops it
 /// silently, and for a brake, being counted is the direction to fail in.
+///
+/// **`fleet-exclusion` is the next kind, and it is the exception that paragraph was written to make
+/// visible rather than to forbid.** It is the first kind that is inherently about one project's
+/// jobs, so unlike the two above it does carry a `project_id` and does reach this count — the
+/// default landed on it, exactly as designed, and the default is wrong here.
+///
+/// The direction is what settles it. Every other kind counted here is *the system produced
+/// something and now needs you*; an exclusion is *you asked the system to do less*. Counting the
+/// second as the first inverts the brake: at the default limit of 3, drawing three "these two must
+/// not run together" edges would close the project's autonomy completely, and the person who asked
+/// for restraint would be throttled by their own request — with a reason naming a review backlog
+/// they do not have.
 pub const OPEN_REVIEW_ITEMS_SQL: &str = "SELECT
     (SELECT COUNT(*) FROM proposals
-     WHERE project_id = ?1 AND status = 'pending' AND kind <> 'skipped-item')
+     WHERE project_id = ?1 AND status = 'pending'
+       AND kind <> 'skipped-item' AND kind <> 'fleet-exclusion')
     +
     (SELECT COUNT(*) FROM shadow_decisions
      JOIN runs ON shadow_decisions.run_id = runs.id
@@ -207,6 +220,49 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    async fn add_pending_exclusions(pool: &SqlitePool, project_id: &str, count: usize) {
+        for _ in 0..count {
+            sqlx::query(
+                "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+                 VALUES ('fleet-exclusion', 'pending', NULL, ?, 'test', '2026-08-15T00:00:00Z')",
+            )
+            .bind(project_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A request from the person is not a queue for the person.
+    ///
+    /// The pair is the test, and neither half is enough on its own: the first would pass with the
+    /// count broken to zero, the second passes with today's SQL. Together they pin the behaviour
+    /// between the two.
+    ///
+    /// The arithmetic this prevents, at the default limit of 3: somebody who draws three exclusions
+    /// — asking for LESS to happen at once — closes their project's autonomy entirely, and the
+    /// brake's reason would tell them they have work waiting for review that they do not have.
+    #[tokio::test]
+    async fn a_pending_exclusion_does_not_fill_the_review_queue() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_pending_exclusions(&pool, "project-a", 5).await;
+
+        assert_eq!(
+            open_proposals(&pool, "project-a").await.unwrap(),
+            0,
+            "five requests from the person are no backlog at all"
+        );
+        assert_eq!(
+            wip_permits_new_run(&pool, "project-a").await,
+            WipDecision::Allow
+        );
+
+        // And the count is not simply broken: an action approval beside them still counts.
+        add_pending_proposals(&pool, "project-a", 1).await;
+        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 1);
     }
 
     #[test]

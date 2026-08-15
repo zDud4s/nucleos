@@ -10,6 +10,7 @@ import {
 } from "./derive";
 import { Badge, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 import Presets from "./Presets";
+import RunTail from "./RunTail";
 
 /** How many rows the list asks for. The daemon caps this; this is the shell's own default. */
 const DEFAULT_LIMIT = 50;
@@ -366,6 +367,9 @@ function RunDetailView({ token, runId, onCancelled }: RunDetailProps) {
           )}
         </div>
       )}
+      {/* Above `output` and not inside it: while the run is working, `stdout` is empty — it is
+          written when the run ends — so the live tail is the only place its output exists. */}
+      <RunTail token={token} runId={runId} live={stillRunning} />
       {/* Rendered as text, never as markup: this is a model's output and a subprocess's, and both
           are outside this machine's control in the same way an email body is. */}
       {detail.stdout !== null && detail.stdout !== "" && (

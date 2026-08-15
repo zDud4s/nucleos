@@ -3,7 +3,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -69,6 +69,20 @@ pub fn build_router(state: AppState) -> Router {
         // because it answers about the same set — the roster — seen through capacity rather than
         // through mode.
         .route("/concurrency", get(get_concurrency))
+        // Beside `/concurrency` because it is about the same picture: that route says how much fits,
+        // this one asks that two of the things inside it not be there at once. Admin by default, by
+        // being in no table in `auth.rs` — it files a request that changes how the fleet schedules,
+        // which is not something a read-only key buys.
+        .route(
+            "/fleet/exclusions",
+            get(get_fleet_exclusions).post(post_fleet_exclusion),
+        )
+        // The literal ahead of `{id}`; matchit prefers it, and they are different methods besides.
+        .route(
+            "/fleet/exclusions/requests",
+            get(get_fleet_exclusion_requests),
+        )
+        .route("/fleet/exclusions/{id}", delete(delete_fleet_exclusion))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
@@ -91,6 +105,10 @@ pub fn build_router(state: AppState) -> Router {
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
+        // Beside the run it belongs to. Reads no table: the tail lives in `AppState`, because
+        // `run_events` is not written until the run ends and there is nothing durable to read while
+        // the thing is actually happening.
+        .route("/runs/{id}/tail", get(crate::runs::get_run_tail))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route(
             "/runs/{id}/message",
@@ -2022,6 +2040,128 @@ async fn get_project_rules(
 }
 
 #[derive(Deserialize)]
+struct ExclusionRequest {
+    job_a: i64,
+    job_b: i64,
+    /// The files that motivated the request, as `collision.rs` reported them. Optional, and kept
+    /// rather than acted on — see the migration.
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ExclusionQuery {
+    /// Absent means every project, which is what the canvas asks for.
+    project_id: Option<String>,
+}
+
+/// The rules in force, for the canvas to draw.
+///
+/// Only the live ones. A revoked rule is kept in the table so the decision stays readable, but a
+/// screen that drew it would be showing a constraint that is not constraining anything.
+async fn get_fleet_exclusions(
+    State(state): State<AppState>,
+    Query(query): Query<ExclusionQuery>,
+) -> Result<Json<Vec<crate::exclusion::Exclusion>>, StatusCode> {
+    crate::exclusion::live(&state.pool, query.project_id.as_deref())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the fleet exclusions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The requests waiting on an answer.
+///
+/// `/proposals` cannot carry these: it serves `action-approval` alone, deliberately, because
+/// approving one of those resumes a paused run and approving one of these resumes nothing — the
+/// argument `list_pending` and `get_contact_merges` both make at length. So this follows the door
+/// `contact-merge` opened, which also puts the question where the context is: whether two jobs
+/// should be serialised is decided while looking at the fleet.
+async fn get_fleet_exclusion_requests(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::exclusion::pending_requests(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the pending exclusion requests failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Lifts a rule.
+///
+/// 409 and not 404 when it is already revoked: the row is there, and the difference between "no such
+/// rule" and "somebody lifted this before you" is the difference between a stale screen and a wrong
+/// id.
+async fn delete_fleet_exclusion(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::exclusion::revoke(&state.pool, id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(exclusion_id = id, %error, "revoking an exclusion failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Asks that two jobs of one project not run at the same time.
+///
+/// It answers 201 with a PROPOSAL id, not with a rule id, and the difference is the design. Drawing
+/// this edge changes nothing about how the fleet schedules until somebody approves it in the same
+/// queue every other decision passes through. An edge that took effect on being drawn would be a way
+/// to change scheduling without passing through approval, which is exactly the property this
+/// pillar's canvas was meant not to copy from october.dev.
+///
+/// Every refusal carries a sentence, following `post_proposal_approve`: three of the five mean
+/// different things a person can act on — a pair already asked about, a pair already excluded, and
+/// two jobs that share no project — and a bare 409 tells them apart from nothing.
+async fn post_fleet_exclusion(
+    State(state): State<AppState>,
+    Json(body): Json<ExclusionRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    use crate::exclusion::ProposeError;
+    match crate::exclusion::propose(&state.pool, body.job_a, body.job_b, &body.paths).await {
+        Ok(proposal_id) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "proposal_id": proposal_id })),
+        )),
+        Err(ProposeError::SameJob) => Err((
+            StatusCode::BAD_REQUEST,
+            "a job cannot be excluded from itself".to_owned(),
+        )),
+        Err(ProposeError::UnknownJob(id)) => {
+            Err((StatusCode::NOT_FOUND, format!("there is no job {id}")))
+        }
+        Err(ProposeError::DifferentProjects) => Err((
+            StatusCode::BAD_REQUEST,
+            "these jobs belong to different projects, so they share no slots to serialise"
+                .to_owned(),
+        )),
+        Err(ProposeError::AlreadyAsked) => Err((
+            StatusCode::CONFLICT,
+            "these two jobs already have a request waiting for a decision".to_owned(),
+        )),
+        Err(ProposeError::AlreadyExcluded) => Err((
+            StatusCode::CONFLICT,
+            "these two jobs are already excluded from running at the same time".to_owned(),
+        )),
+        Err(ProposeError::Db(error)) => {
+            tracing::warn!(%error, "asking for a fleet exclusion failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the request could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct WipLimitRequest {
     /// `null` switches the brake off for this project.
     limit: Option<i64>,
@@ -3177,6 +3317,54 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "fleet-exclusion" {
+        // Fourth kind through this door, third that starts no run. Uncancellable for the reason the
+        // other three are: the rule and the decision that authorised it commit together, and a
+        // request dropped mid-flight must not leave a job parked by a rule whose proposal still
+        // reads `pending` beside it.
+        let state = state.clone();
+        let decided =
+            uncancellable(async move { crate::exclusion::approve(&state.pool, id).await })
+                .await
+                .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match decided {
+            Ok(crate::exclusion::Approved::Written(exclusion_id)) => {
+                Ok(Json(serde_json::json!({ "exclusion_id": exclusion_id })))
+            }
+            // 200 and not an error: the person answered, and the answer was recorded. What changed
+            // is that the question had stopped mattering while it waited, and a screen that showed
+            // this as a failure would send them looking for a rule that was right not to be written.
+            Ok(crate::exclusion::Approved::Stale) => Ok(Json(serde_json::json!({
+                "exclusion_id": serde_json::Value::Null,
+                "closed": "the jobs it named have ended, so no rule was written",
+            }))),
+            Err(crate::exclusion::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::exclusion::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::exclusion::DecisionError::Malformed) => {
+                tracing::warn!(
+                    proposal_id = id,
+                    "an exclusion request carried no usable pair"
+                );
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this request names no usable pair of jobs".to_owned(),
+                ))
+            }
+            Err(crate::exclusion::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "approving an exclusion failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the rule could not be written".to_owned(),
+                ))
+            }
+        };
+    }
+
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
@@ -3264,6 +3452,27 @@ async fn post_proposal_reject(
             Err(crate::calendar::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
             Err(crate::calendar::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting a calendar proposal failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "fleet-exclusion" {
+        // Refusing an edge leaves nothing behind, because drawing it changed nothing: no rule was
+        // written, no run was paused, no worktree is held. It is the one refusal on this route with
+        // no second half to undo.
+        let state = state.clone();
+        let rejected =
+            uncancellable(async move { crate::exclusion::reject(&state.pool, id).await }).await?;
+        return match rejected {
+            Ok(()) => Ok(StatusCode::NO_CONTENT),
+            Err(crate::exclusion::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::exclusion::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::exclusion::DecisionError::Malformed) => {
+                Err(StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            Err(crate::exclusion::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
@@ -3604,6 +3813,7 @@ mod tests {
                 local_assistant: None,
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                run_tails: Default::default(),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -4096,6 +4306,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -4126,6 +4337,129 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    async fn add_job(pool: &sqlx::SqlitePool, project_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES (?, ?, 'implementing', 5, '2026-08-15T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(format!("C:/projects/{project_id}"))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// The route answers with the PROPOSAL, because that is all it made.
+    ///
+    /// A 201 naming a rule id would be the wrong promise in the one place a caller reads to find out
+    /// what happened: nothing about scheduling has changed yet, and what the caller now owns is a
+    /// question sitting in the same queue as every other decision.
+    #[tokio::test]
+    async fn asking_for_an_exclusion_files_a_proposal_and_no_rule() {
+        let state = test_state().await;
+        let low = add_job(&state.pool, "alpha").await;
+        let high = add_job(&state.pool, "alpha").await;
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/fleet/exclusions",
+            "test-token",
+            Some(serde_json::json!({ "job_a": high, "job_b": low })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["proposal_id"].as_i64().is_some(), "got: {json}");
+
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_exclusions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rules, 0);
+    }
+
+    /// The shared approval door reaches the new kind, which is the half a new proposal kind forgets.
+    ///
+    /// `/proposals/{id}/approve` dispatches by kind and falls through to `resume_approved_run`,
+    /// which would answer 404 for a proposal that pauses no run. The unit tests around
+    /// `exclusion::approve` cannot see that: they call the function the route has to remember to
+    /// call.
+    #[tokio::test]
+    async fn approving_through_the_shared_door_writes_the_rule() {
+        let state = test_state().await;
+        let low = add_job(&state.pool, "alpha").await;
+        let high = add_job(&state.pool, "alpha").await;
+        let proposal_id = crate::exclusion::propose(&state.pool, low, high, &[])
+            .await
+            .unwrap();
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            "test-token",
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["exclusion_id"].as_i64().is_some(), "got: {json}");
+
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_exclusions WHERE job_low = ? AND revoked_at IS NULL",
+        )
+        .bind(low)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 1);
+    }
+
+    /// The second ask is a 409 that says which of the two 409s it is.
+    #[tokio::test]
+    async fn asking_twice_about_one_pair_is_refused_in_words() {
+        let state = test_state().await;
+        let low = add_job(&state.pool, "alpha").await;
+        let high = add_job(&state.pool, "alpha").await;
+        let body = serde_json::json!({ "job_a": low, "job_b": high });
+
+        api_token_request(
+            state.clone(),
+            "POST",
+            "/fleet/exclusions",
+            "test-token",
+            Some(body.clone()),
+        )
+        .await;
+        let again = api_token_request(
+            state.clone(),
+            "POST",
+            "/fleet/exclusions",
+            "test-token",
+            Some(body),
+        )
+        .await;
+
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        let said = axum::body::to_bytes(again.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&said).contains("waiting for a decision"),
+            "a bare 409 does not tell 'already asked' from 'already excluded'"
+        );
     }
 
     async fn api_token_request(
@@ -4331,6 +4665,73 @@ mod tests {
         let response = api_token_request(state, "GET", "/concurrency", &token, None).await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    /// Reading a run's live output is a READ, and the weakest key reaches it through the real
+    /// router. Same join as the test above, for the same reason: the route line and the table line
+    /// agreeing is not something either file can check alone.
+    #[tokio::test]
+    async fn a_read_only_key_can_tail_a_run() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        state.run_tails.lock().unwrap().insert(
+            1,
+            std::sync::Arc::new(std::sync::Mutex::new("olá\n".into())),
+        );
+
+        let response = api_token_request(state, "GET", "/runs/1/tail", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    /// A run with no live tail answers 204, never 404.
+    ///
+    /// The distinction is the contract, not politeness. `404` says *there is no such run*, which is
+    /// a different and usually false claim: the ordinary case is a run that finished, or one this
+    /// daemon did not start, and both of those have a durable transcript in `runs.stdout`. A client
+    /// told `404` concludes the id is wrong and stops asking; told `204` it knows to read the
+    /// recorded copy instead.
+    #[tokio::test]
+    async fn a_run_with_nothing_live_answers_no_content_rather_than_not_found() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        let response = api_token_request(state, "GET", "/runs/4242/tail", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        db.close().await;
+    }
+
+    /// The offset comes back so the next poll starts where this one stopped, and it counts BYTES.
+    ///
+    /// Pinned because the whole no-flicker property rests on it: a shell that redraws from zero
+    /// every three seconds is what this field exists to prevent, and a `next` computed in characters
+    /// would drift the moment any output is not ASCII — which, for a tool that logs paths and
+    /// prompts, is the normal case and not the exotic one.
+    #[tokio::test]
+    async fn the_tail_reports_where_the_next_read_should_start() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        state.run_tails.lock().unwrap().insert(
+            5,
+            std::sync::Arc::new(std::sync::Mutex::new("três\n".into())),
+        );
+
+        let response = api_token_request(state, "GET", "/runs/5/tail?since=0", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["text"], "três\n");
+        assert_eq!(
+            json["next"], 6,
+            "`next` counted characters instead of bytes"
+        );
+        assert_eq!(json["live"], true);
         db.close().await;
     }
 
@@ -6946,6 +7347,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),

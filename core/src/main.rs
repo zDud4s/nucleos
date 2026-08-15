@@ -15,6 +15,7 @@ mod contacts;
 mod council;
 mod daemon_client;
 mod email;
+mod exclusion;
 mod feed;
 mod files;
 mod gate;
@@ -582,6 +583,7 @@ async fn main() {
         }),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };

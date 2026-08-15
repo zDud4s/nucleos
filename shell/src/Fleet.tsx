@@ -1,21 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  approveProposal,
   cancelJob,
   cancelRun,
   createJob,
   getBudget,
   getConcurrency,
+  getExclusionRequests,
+  getExclusions,
   getJobs,
   getLiveRuns,
   getProjects,
+  proposeExclusion,
+  rejectProposal,
+  revokeExclusion,
   type Budget,
   type ConnectionState,
   type Concurrency,
+  type FleetExclusion,
   type HeldSlot,
   type Job,
   type ProjectConcurrency,
   type ProjectSummary,
+  type Proposal,
   type RunSearchResult,
 } from "./api";
 // `fleet-derive` and not `fleet`: a module named `fleet.ts` beside this `Fleet.tsx` resolves to
@@ -23,9 +31,13 @@ import {
 // Same shape as the `Calendar.tsx` / `calendar-grid.ts` pair already in this directory.
 import {
   collisionBadges,
+  exclusionEdges,
   orderColumns,
+  partnersOf,
   slotDetail,
   type CollisionBadge,
+  type ExclusionEdge,
+  type Partner,
   type SlotDetail,
 } from "./fleet-derive";
 import { jobIsLive } from "./derive";
@@ -52,9 +64,11 @@ function ownerKey(slot: HeldSlot): string {
  * slot too, so a column that counted jobs would say `0/2` about a project that is going to refuse
  * the next one with a 409 — and would offer the button that asks for it.
  *
- * The only component at this level that fetches. Five calls per 3-second tick, four of which other
+ * The only component at this level that fetches. Seven calls per 3-second tick, four of which other
  * tabs already make; if it ever hurts, the answer is for `GET /concurrency` to absorb the others,
- * not a new `/fleet`.
+ * not a new `/fleet`. The last two are the exclusions — the rules in force and the requests still
+ * waiting — and they are two calls rather than one because they are two different things, and the
+ * screen draws them differently.
  */
 export default function Fleet({ token, connection, killEngaged, onOpenRuns }: FleetProps) {
   const [concurrency, setConcurrency] = useState<Concurrency | null>(null);
@@ -62,6 +76,8 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
   const [runs, setRuns] = useState<RunSearchResult[] | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [budget, setBudget] = useState<Budget | null>(null);
+  const [exclusions, setExclusions] = useState<FleetExclusion[] | null>(null);
+  const [requests, setRequests] = useState<Proposal[] | null>(null);
   const [stale, setStale] = useState(false);
   const [lastGood, setLastGood] = useState<string | null>(null);
   /** Owners whose card the user sent away, keyed `"job:41"`. */
@@ -78,12 +94,24 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
       const batch = (batchSeq.current += 1);
       inFlight.current += 1;
       try {
-        const [nextConcurrency, nextJobs, nextRuns, nextProjects, nextBudget] = await Promise.all([
+        const [
+          nextConcurrency,
+          nextJobs,
+          nextRuns,
+          nextProjects,
+          nextBudget,
+          nextExclusions,
+          nextProposals,
+        ] = await Promise.all([
           getConcurrency(token),
           getJobs(token, undefined, { live: true }),
           getLiveRuns(token),
           getProjects(token),
           getBudget(token),
+          getExclusions(token),
+          // For the edges that are still questions. The rules come from the route above; a request
+          // waiting for an answer exists only as a proposal, and the two have to be drawn apart.
+          getExclusionRequests(token),
         ]);
         if (batch !== batchSeq.current) return;
         // The authority is written down only when it answers. On a failure the cards from the last
@@ -99,6 +127,10 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
         // Blank, never zero: zero is a claim a failed call did not make.
         setProjects(nextProjects);
         setBudget(nextBudget);
+        // And blank, never empty: a failed read draws no edges, which is not the same as drawing
+        // that there are none — `exclusionEdges` takes both nulls for exactly that reason.
+        setExclusions(nextExclusions);
+        setRequests(nextProposals);
       } finally {
         inFlight.current -= 1;
       }
@@ -150,10 +182,11 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
     });
   }, [concurrency]);
 
-  const proposals =
+  const waiting =
     projects === null
       ? null
       : projects.reduce((total, project) => total + project.open_proposals, 0);
+  const edges = exclusionEdges(exclusions, requests);
   // Stale hides the start action rather than letting it fail after the click: the capacity on
   // screen is no longer the daemon's.
   const canStart = !stale && killEngaged !== true && token !== null;
@@ -163,7 +196,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
       <HouseMeter
         house={concurrency?.house ?? null}
         budget={budget}
-        proposals={proposals}
+        proposals={waiting}
         staleSince={stale ? lastGood : null}
       />
       {concurrency !== null && concurrency.projects.length === 0 ? (
@@ -178,6 +211,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
               project={project}
               jobs={jobs}
               runs={runs}
+              edges={edges}
               token={token ?? ""}
               canStart={canStart}
               cancelled={cancelled}
@@ -244,6 +278,8 @@ interface ProjectColumnProps {
   project: ProjectConcurrency;
   jobs: Job[] | null;
   runs: RunSearchResult[] | null;
+  /** Every exclusion, of every project. The column takes the ones its own cards are named in. */
+  edges: ExclusionEdge[];
   token: string;
   /** `false` hides the *new job* action: the view is stale, or the kill switch is engaged. */
   canStart: boolean;
@@ -264,6 +300,7 @@ export function ProjectColumn({
   project,
   jobs,
   runs,
+  edges,
   token,
   canStart,
   cancelled,
@@ -272,6 +309,62 @@ export function ProjectColumn({
   refresh,
 }: ProjectColumnProps) {
   const drawn = project.slots.filter((slot) => !cancelled.has(ownerKey(slot)));
+  // The job whose partner is being picked. Two clicks and not one, because the request needs two
+  // jobs and a card only knows one — this is the drag of the future canvas, without the canvas.
+  const [pairing, setPairing] = useState<number | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  // Kept apart from `failed`, and drawn apart: the one thing it says is that an approval succeeded
+  // and wrote no rule, which is not a failure and must not wear a failure's colours.
+  const [closed, setClosed] = useState<string | null>(null);
+
+  const cards = drawn.map((slot) => ({ slot, detail: slotDetail(slot, jobs, runs) }));
+  const jobCards = cards.filter((card) => card.detail.kind === "job");
+
+  async function askFor(other: number) {
+    if (pairing === null) return;
+    setFailed(null);
+    const outcome = await proposeExclusion(token, pairing, other);
+    setPairing(null);
+    // The daemon's own sentence, as `NewJob` does with `createJob`: the two 409s here mean opposite
+    // things — wait for the approval, or stop clicking because it is already in force.
+    if (!outcome.ok) {
+      setFailed(outcome.reason);
+      return;
+    }
+    await refresh();
+  }
+
+  async function lift(id: number) {
+    setFailed(null);
+    if (!(await revokeExclusion(token, id))) {
+      setFailed("That rule was already lifted, or the daemon did not answer.");
+    }
+    await refresh();
+  }
+
+  /**
+   * The answer is given here and not on the Autopilot tab.
+   *
+   * That queue serves `action-approval` alone — approving one resumes a paused run, and approving
+   * this resumes nothing — so the daemon keeps the two apart, as it already does for a contact
+   * merge. It also puts the question where the context is: whether two jobs should be serialised is
+   * decided while looking at them.
+   */
+  async function decide(proposalId: number, yes: boolean) {
+    setFailed(null);
+    setClosed(null);
+    if (yes) {
+      const outcome = await approveProposal(token, proposalId);
+      if (!outcome.ok) setFailed(outcome.reason);
+      // An approval that wrote no rule, because both jobs ended while the request waited. Said out
+      // loud: the edge is about to disappear, and an edge that vanishes on the click that approved
+      // it reads as a rule that was made, not as one that was no longer worth making.
+      else if (outcome.closed !== null) setClosed(outcome.closed);
+    } else if (!(await rejectProposal(token, proposalId))) {
+      setFailed("That request could not be refused — it may already have been decided.");
+    }
+    await refresh();
+  }
 
   return (
     <section className="fleet-column">
@@ -281,26 +374,76 @@ export function ProjectColumn({
           {project.slots.length}/{project.limit}
         </span>
       </header>
-      {drawn.map((slot) => (
-        <SlotCard
-          key={ownerKey(slot)}
-          slot={slot}
-          detail={slotDetail(slot, jobs, runs)}
-          badges={collisionBadges(project, { kind: slot.owner_kind, id: slot.owner_id })}
-          token={token}
-          onCancel={() => void onCancel(slot)}
-          onOpenRuns={onOpenRuns}
-        />
-      ))}
+      {/* The banner and not a state on the card: the card being picked FROM can leave the column
+          mid-pick — its job ends — and the way out has to survive that. */}
+      {pairing !== null && (
+        <p className="fleet-pairing">
+          Pick the job that must not run at the same time as job {pairing}.{" "}
+          <Button size="sm" onClick={() => setPairing(null)}>
+            Never mind
+          </Button>
+        </p>
+      )}
+      {failed !== null && <ErrorNote>{failed}</ErrorNote>}
+      {closed !== null && <p className="fleet-closed">{closed}</p>}
+      {cards.map(({ slot, detail }) => {
+        const jobId = detail.kind === "job" ? detail.job.id : null;
+        return (
+          <SlotCard
+            key={ownerKey(slot)}
+            slot={slot}
+            detail={detail}
+            badges={collisionBadges(project, { kind: slot.owner_kind, id: slot.owner_id })}
+            partners={jobId === null ? [] : partnersOf(edges, jobId)}
+            // Offered only where it can be used: a run holds a slot but is not a job, and with one
+            // job in the column there is nothing to pair it with.
+            pairing={
+              jobId === null || jobCards.length < 2
+                ? "none"
+                : pairing === null
+                  ? "offer"
+                  : pairing === jobId
+                    ? "picking"
+                    : "target"
+            }
+            onPair={() => {
+              if (jobId === null) return;
+              if (pairing === null) setPairing(jobId);
+              else void askFor(jobId);
+            }}
+            onLift={(id) => void lift(id)}
+            onDecide={(proposalId, yes) => void decide(proposalId, yes)}
+            token={token}
+            onCancel={() => void onCancel(slot)}
+            onOpenRuns={onOpenRuns}
+          />
+        );
+      })}
       {canStart && <NewJob projectId={project.project_id} token={token} onStarted={refresh} />}
     </section>
   );
 }
 
+/**
+ * This card's part in picking a pair.
+ *
+ * `none` covers two different situations that need the same drawing — the owner is a run, or it is
+ * the only job in its column — and both mean the same thing to the reader: there is nothing here to
+ * pair with.
+ */
+type PairingRole = "none" | "offer" | "picking" | "target";
+
 interface SlotCardProps {
   slot: HeldSlot;
   detail: SlotDetail;
   badges: CollisionBadge[];
+  /** The exclusions this card's owner is named in, from its own end. */
+  partners: Partner[];
+  pairing: PairingRole;
+  onPair: () => void;
+  onLift: (exclusionId: number) => void;
+  /** Answers a request: `true` puts the rule in force, `false` refuses it. */
+  onDecide: (proposalId: number, yes: boolean) => void;
   /** For the `JobGraph` this card mounts when it opens. */
   token: string;
   onCancel: () => void;
@@ -319,7 +462,19 @@ interface SlotCardProps {
  * **It has no "cancelling" state.** Cancelling takes the owner out of the column at the instant of
  * the click, so a card halfway through a cancel does not exist to be drawn.
  */
-export function SlotCard({ slot, detail, badges, token, onCancel, onOpenRuns }: SlotCardProps) {
+export function SlotCard({
+  slot,
+  detail,
+  badges,
+  partners,
+  pairing,
+  onPair,
+  onLift,
+  onDecide,
+  token,
+  onCancel,
+  onOpenRuns,
+}: SlotCardProps) {
   // The open state lives here rather than above, as it does in Autopilot's `JobRow`: opening one
   // card says nothing to the others, and lifting it would re-render the whole column on every
   // keystroke elsewhere in it.
@@ -380,6 +535,39 @@ export function SlotCard({ slot, detail, badges, token, onCancel, onOpenRuns }: 
                 .join(", ")}: ${badge.paths.join(", ")}`}
         </p>
       ))}
+      {partners.map((partner) => (
+        <p
+          key={`${partner.state}-${partner.id}`}
+          className={`exclude-edge is-${partner.state}`}
+        >
+          {edgeLine(partner)}
+          {partner.state === "active" ? (
+            <Button size="sm" onClick={() => onLift(partner.id)}>
+              Lift
+            </Button>
+          ) : (
+            // The same request is drawn on both cards, so both carry the answer. Whichever is
+            // clicked decides the one proposal; the other card's copy leaves on the next tick.
+            <>
+              <Button size="sm" variant="approve" onClick={() => onDecide(partner.id, true)}>
+                Approve
+              </Button>
+              <Button size="sm" variant="link" onClick={() => onDecide(partner.id, false)}>
+                Refuse
+              </Button>
+            </>
+          )}
+        </p>
+      ))}
+      {pairing !== "none" && (
+        <Button size="sm" onClick={onPair} disabled={pairing === "picking"}>
+          {pairing === "target"
+            ? "…as this one"
+            : pairing === "picking"
+              ? "Picking…"
+              : "Not at the same time as…"}
+        </Button>
+      )}
       <ConfirmButton
         variant="danger"
         size="sm"
@@ -390,6 +578,24 @@ export function SlotCard({ slot, detail, badges, token, onCancel, onOpenRuns }: 
       </ConfirmButton>
     </article>
   );
+}
+
+/**
+ * What one edge says from this end of it.
+ *
+ * A pending edge is careful to claim nothing: it has changed nothing about how either job is
+ * scheduled, and until somebody approves it on the Autopilot tab it never will.
+ *
+ * An active one names which of the two waits rather than saying "held" — the wait only happens while
+ * the partner actually holds a slot, and this card is drawn whether it does or not.
+ */
+function edgeLine(partner: Partner): string {
+  if (partner.state === "pending") {
+    return `asked: not at the same time as job ${partner.partner} — waiting for approval`;
+  }
+  return partner.waits
+    ? `not at the same time as job ${partner.partner} — this one waits`
+    : `not at the same time as job ${partner.partner} — that one waits`;
 }
 
 /**
