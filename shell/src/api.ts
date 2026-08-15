@@ -1783,6 +1783,43 @@ export async function getRun(token: string, id: number): Promise<RunDetail | nul
   }
 }
 
+/** What a run has written since an offset, while it is still writing. */
+export interface RunTailChunk {
+  text: string;
+  /** The offset to send next time, in BYTES, as the daemon counted them. */
+  next: number;
+  live: boolean;
+}
+
+/**
+ * Reads a live run's output from where the last read stopped.
+ *
+ * Three answers, and the middle one is the reason this is not a `| null` getter. `"recorded"` is a
+ * 204: the daemon has no live tail for this run, which is what a finished run — or one a previous
+ * daemon started — looks like. Its output is not missing, it is in `runs.stdout`. `null` is a read
+ * that failed, and says nothing at all about where the output is.
+ *
+ * `since` is handed back rather than recomputed here. It is the daemon's `next`, in bytes; measuring
+ * the received string in JavaScript characters instead would drift on the first non-ASCII byte and
+ * then redraw text already on screen.
+ */
+export async function getRunTail(
+  token: string,
+  id: number,
+  since: number,
+): Promise<RunTailChunk | "recorded" | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/${id}/tail?since=${since}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.status === 204) return "recorded";
+    if (!res.ok) return null;
+    return (await res.json()) as RunTailChunk;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Starts a run, reporting the status when it fails.
  *

@@ -720,6 +720,14 @@ details.scoreboard th {
 .rd-gate > pre { flex-basis: 100%; }
 .rd-out > summary { color: var(--muted); font-size: var(--fs-xs); cursor: pointer; }
 
+/* A cauda ao vivo. Aberta sempre, ao contrário do `output` logo abaixo: o registo consulta-se, isto
+   vê-se acontecer, e um bloco fechado por omissão nunca mostraria uma linha a aparecer. */
+.rd-tail { display: grid; gap: var(--sp-1); }
+.rd-tail__state { font-size: var(--fs-xs); color: var(--muted); }
+/* Mais baixa que o `.rd-stream` comum, e com um mínimo: esta caixa cresce a cada tique, e sem o
+   tecto mais cedo empurraria os botões por baixo do cursor de quem está a ler. */
+.rd-tail__stream { min-height: 6rem; max-height: 18rem; }
+
 /* Separado por uma linha do resto do detalhe: o botão que está aqui apaga uma worktree, e não deve
    parecer o próximo item de uma lista de factos sobre o run. */
 .rd-parked {
