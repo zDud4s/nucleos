@@ -143,6 +143,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // companion — but written in by hand, because this table is not "every GET" and the comment
     // above says why.
     (Method::GET, "/concurrency"),
+    // Watching a run work is watching. It returns the same bytes `GET /runs/{id}` already hands a
+    // read-only key in `stdout`, only sooner — so withholding it would protect nothing and would
+    // make the live view the one thing a reader had to be an admin to see.
+    (Method::GET, "/runs/{id}/tail"),
+    // The rules in force, beside `/concurrency` for the same reason it is here: it describes the
+    // shape of the fleet and changes nothing. Asking for one is Admin's; reading which exist is not.
+    (Method::GET, "/fleet/exclusions"),
+    (Method::GET, "/fleet/exclusions/requests"),
     (Method::GET, "/projects/{id}/ls"),
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),
@@ -533,6 +541,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),

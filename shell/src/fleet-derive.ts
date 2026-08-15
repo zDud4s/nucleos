@@ -1,10 +1,12 @@
 import {
   LIVE_LIST_LIMIT,
   type Collisions,
+  type FleetExclusion,
   type HeldSlot,
   type Job,
   type OwnerRef,
   type ProjectConcurrency,
+  type Proposal,
   type RunSearchResult,
 } from "./api";
 
@@ -123,4 +125,87 @@ export function collisionBadges(
 
 function sameOwner(left: OwnerRef, right: OwnerRef): boolean {
   return left.kind === right.kind && left.id === right.id;
+}
+
+/**
+ * One "these two must not run at the same time", in either of its two lives.
+ *
+ * `pending` is a question somebody asked and `active` is a rule in force, and the screen must not
+ * show them as the same thing: a pending edge is changing nothing at all yet, and drawing it as a
+ * constraint would have somebody wondering why both jobs are still running.
+ */
+export interface ExclusionEdge {
+  low: number;
+  high: number;
+  state: "pending" | "active";
+  /** The proposal to answer while pending, and the rule to lift once active. */
+  id: number;
+}
+
+/**
+ * Every edge the canvas can draw, from the rules in force and the requests still waiting.
+ *
+ * Active wins over pending for the same pair. That combination is not supposed to arise — the daemon
+ * refuses a second request for a pair that already has a rule — but drawing one pair twice is a
+ * defect a reader would have to diagnose, and of the two the rule is the one that is actually doing
+ * something.
+ *
+ * A proposal whose `tool_input` does not parse is DROPPED rather than guessed at. It is not a shape
+ * this daemon writes, so the honest reading is that whatever wrote it is not something this screen
+ * knows how to draw.
+ */
+export function exclusionEdges(
+  rules: FleetExclusion[] | null,
+  proposals: Proposal[] | null,
+): ExclusionEdge[] {
+  const edges: ExclusionEdge[] = (rules ?? []).map((rule) => ({
+    low: rule.job_low,
+    high: rule.job_high,
+    state: "active" as const,
+    id: rule.id,
+  }));
+  const seen = new Set(edges.map((edge) => `${edge.low}:${edge.high}`));
+
+  for (const proposal of proposals ?? []) {
+    if (proposal.kind !== "fleet-exclusion" || proposal.status !== "pending") continue;
+    const pair = requestedPair(proposal);
+    if (pair === null || seen.has(`${pair.low}:${pair.high}`)) continue;
+    seen.add(`${pair.low}:${pair.high}`);
+    edges.push({ ...pair, state: "pending", id: proposal.id });
+  }
+  return edges;
+}
+
+function requestedPair(proposal: Proposal): { low: number; high: number } | null {
+  if (proposal.tool_input === null) return null;
+  try {
+    const input: unknown = JSON.parse(proposal.tool_input);
+    if (typeof input !== "object" || input === null) return null;
+    const { job_low: low, job_high: high } = input as Record<string, unknown>;
+    if (typeof low !== "number" || typeof high !== "number") return null;
+    return { low, high };
+  } catch {
+    return null;
+  }
+}
+
+/** One job's side of an edge: who it is tied to, and whether this job is the one that waits. */
+export interface Partner extends ExclusionEdge {
+  partner: number;
+  /**
+   * Whether THIS job is the one held back. Only the higher id waits, so the same edge reads
+   * differently from its two ends, and a card that said "waiting on the other" at both ends would
+   * describe a deadlock the daemon cannot produce.
+   */
+  waits: boolean;
+}
+
+export function partnersOf(edges: ExclusionEdge[], jobId: number): Partner[] {
+  return edges
+    .filter((edge) => edge.low === jobId || edge.high === jobId)
+    .map((edge) => ({
+      ...edge,
+      partner: edge.low === jobId ? edge.high : edge.low,
+      waits: edge.high === jobId,
+    }));
 }
