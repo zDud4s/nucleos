@@ -3,7 +3,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -116,6 +116,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
+        // An errand is standing work on a Telegram topic, and these are the four moves the chat
+        // routes above already make: open one, list them, change one, end it. DELETE ends the
+        // asking and removes nothing — `errands::close` says why.
+        .route("/errands", get(list_errands).post(create_errand))
+        .route("/errands/{id}", patch(patch_errand).delete(close_errand))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
@@ -2998,6 +3003,107 @@ async fn delete_chat(
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|error| {
             tracing::warn!(%error, "archiving a chat failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The errands, newest first, and the closed ones with them.
+///
+/// Unlike `list_chats`, which hides what was archived. Closing an errand is not archiving it: the
+/// row is the record of work already done, and this list is read to find that work again as much as
+/// to find what is still moving.
+async fn list_errands(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::errands::Errand>>, StatusCode> {
+    crate::errands::list(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing errands failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct CreateErrandRequest {
+    name: String,
+    /// `<chat_id>:<thread_id>`, composed by the sidecar. Opaque here and never parsed — this route
+    /// knows a chat key the way `errands.rs` does: as a string it was handed.
+    chat_key: String,
+}
+
+/// Opens an errand on a topic, and answers with the id it was given.
+///
+/// The id is why there is a body at all: the folder is minted from it and every other route here is
+/// keyed by it. The folder itself is not created — `errands::folder_path` makes it on first use, so
+/// an errand nothing was ever written into leaves no empty directory behind.
+async fn create_errand(
+    State(state): State<AppState>,
+    Json(body): Json<CreateErrandRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    crate::errands::create(&state.pool, &body.name, &body.chat_key)
+        .await
+        .map(|errand_id| Json(serde_json::json!({ "errand_id": errand_id })))
+        .map_err(|error| {
+            tracing::warn!(%error, "opening an errand failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct PatchErrandRequest {
+    status: Option<String>,
+    brain: Option<String>,
+}
+
+/// Pauses or resumes an errand, moves it between the local model and the cloud, or both at once —
+/// the shape `patch_chat` has a few blocks up.
+///
+/// Both fields go through `from_wire`, which cannot fail: a spelling nobody recognises becomes the
+/// conservative value — `paused`, which does not act, and `local`, which does not spend — rather
+/// than a 400. No string from this body reaches SQL; what reaches it is an enum, which is the only
+/// thing the column's CHECK constraint accepts.
+async fn patch_errand(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<PatchErrandRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(status) = body.status.as_deref() {
+        crate::errands::set_status(&state.pool, id, crate::errands::Status::from_wire(status))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "pausing or resuming an errand failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(brain) = body.brain.as_deref() {
+        crate::errands::set_brain(&state.pool, id, crate::errands::Brain::from_wire(brain))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing an errand's model failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends an errand, and deletes nothing.
+///
+/// DELETE is the verb a client already has for "I am done with this", and here it means what `/fim`
+/// means in the topic: the asking stops, the row stays, and the folder keeps what was found. The
+/// neighbouring `delete_chat` archives for the same reason — the record of work already done is not
+/// the client's to destroy by asking for a shorter list.
+async fn close_errand(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    crate::errands::close(&state.pool, id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(%error, "closing an errand failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -9587,5 +9693,131 @@ mod tests {
         assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
 
         assert_eq!(promotion_feed_rows(&pool).await, 0);
+    }
+
+    /// A state with somewhere for an errand's folder to be, which the chat routes never needed: a
+    /// chat is rows and an errand is rows plus a directory.
+    ///
+    /// The root comes from `files::ensure_root` rather than from `tempdir()` directly, for the
+    /// reason that function's own comment gives — it canonicalises, and every containment check
+    /// downstream compares against the root it was handed. The `TempDir` is returned rather than
+    /// dropped here, because dropping it takes the directory with it.
+    async fn errand_state() -> (AppState, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        (with_files_root(test_state().await, root), temp)
+    }
+
+    /// The id comes back from the POST because there is no other way for the caller to learn it:
+    /// the folder is minted from it and every later route is keyed by it. Resolving by the chat key
+    /// afterwards is the half that matters — a row that exists but does not answer to its topic is
+    /// an errand nobody in Telegram can reach.
+    #[tokio::test]
+    async fn posting_an_errand_creates_one_that_its_topic_then_resolves() {
+        let (state, _temp) = errand_state().await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "carros para importar",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let errand_id = body["errand_id"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the route did not answer with an id: {body}"));
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("the errand the route created does not resolve by its topic");
+        assert_eq!(found.id, errand_id);
+    }
+
+    /// The list is what `/assuntos` reads. An errand appears in it from the moment it is opened and
+    /// not from its first turn — the same property `posting_a_chat_creates_one_the_list_then_returns`
+    /// asserts one route over, and for the same reason: a thing you opened and cannot see listed
+    /// looks like a thing that was not opened.
+    #[tokio::test]
+    async fn listing_errands_returns_what_was_created() {
+        let (state, _temp) = errand_state().await;
+        call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "carros para importar",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+
+        let (status, listed) = call(state, "GET", "/errands", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        // An array, and the errand is in it under the name a person typed — `folder` is the
+        // núcleo's derivation of that name and is not what a list is read for.
+        let names: Vec<&str> = listed
+            .as_array()
+            .expect("the list route did not answer with an array")
+            .iter()
+            .map(|errand| errand["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["carros para importar"]);
+    }
+
+    /// The two fields a client may move, in one PATCH, the way `patch_chat` takes a title and a
+    /// brain together. Both are asserted through `resolve` rather than through the response,
+    /// because the response says what the route thinks it did and the row says what happened.
+    #[tokio::test]
+    async fn patching_an_errand_moves_its_status_and_its_model() {
+        let (state, _temp) = errand_state().await;
+        let id = crate::errands::create(&state.pool, "carros para importar", "-1001234:7")
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/errands/{id}"),
+            Some(serde_json::json!({"status": "paused", "brain": "cloud"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, crate::errands::Status::Paused);
+        assert_eq!(found.brain, crate::errands::Brain::Cloud);
+    }
+
+    /// Closing over HTTP is `/fim` by another door, and it removes nothing — the row stays, and so
+    /// does the folder with what the errand found in it. `delete_chat` archives for the neighbouring
+    /// reason: the record of work already done is not the client's to destroy by asking for a
+    /// cleaner list. So the closed errand is still listed, and still says it is done.
+    #[tokio::test]
+    async fn closing_an_errand_over_http_leaves_it_findable() {
+        let (state, _temp) = errand_state().await;
+        let id = crate::errands::create(&state.pool, "carros para importar", "-1001234:7")
+            .await
+            .unwrap();
+
+        let (status, _) = call(state.clone(), "DELETE", &format!("/errands/{id}"), None).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("closing an errand over HTTP removed the row");
+        assert_eq!(found.status, crate::errands::Status::Done);
+
+        let (_, listed) = call(state, "GET", "/errands", None).await;
+        assert_eq!(listed.as_array().unwrap()[0]["status"], "done");
     }
 }

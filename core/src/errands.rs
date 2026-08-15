@@ -11,10 +11,13 @@
 //! If this file ever learns any of them, two concerns will have met in one place, which is the drift
 //! the module map in `core/AGENTS.md` exists to prevent.
 
-// This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in the daemon
-// calls into this module yet: the callers are the MCP toolbox (`mcp_tools.rs`), the turn
-// (`assistant.rs`) and the `/errands` routes (`http.rs`), each landing in a later change. The
-// instruction, not a description: DELETE THIS LINE with the change that adds the first caller.
+// This is a bin-only crate, so dead-code reachability starts at `main`, and the module is now half
+// reached: the `/errands` routes (`http.rs`) call `create`, `list`, `set_status`, `set_brain` and
+// `close`, while the notebook, the file surface and the marks still wait for the MCP toolbox
+// (`mcp_tools.rs`) and the turn (`assistant.rs`). Measured rather than assumed — with the line below
+// removed the compiler names eleven items nothing reaches from `main`, and eleven `#[allow]`
+// attributes scattered over them would say less than one line here does. The instruction, not a
+// description: DELETE THIS LINE with the change that gives the last of the eleven a caller.
 //
 // Scoped to the non-test build, the way `contacts.rs` scopes its own suppression, so it silences
 // only the absence of a production caller. Under `cfg(test)` the lint stays live — every item below
@@ -34,6 +37,19 @@ pub enum Brain {
 }
 
 impl Brain {
+    /// The wire spelling, and the only one written down.
+    ///
+    /// The `brain` column carries a CHECK constraint naming these two words (migration 0069), and the
+    /// same two words travel in every JSON body that moves a brain. Routing the column, the wire and
+    /// `from_wire` through one function is what keeps those three answers identical — a spelling
+    /// invented anywhere else is refused by the database, one layer away from whoever wrote it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloud => "cloud",
+            Self::Local => "local",
+        }
+    }
+
     /// An unreadable value reads as `Local`, matching this table's column default — and the default
     /// is the opposite of `chats::Brain`'s. An errand is born from a Telegram message, which goes to
     /// the local model today; a fallback that moved the question off this machine would change the
@@ -59,6 +75,16 @@ pub enum Status {
 }
 
 impl Status {
+    /// The wire spelling, for the reason [`Brain::as_str`] gives: `status` carries its own CHECK
+    /// constraint over these three words, and a fourth spelling is a row the database refuses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Done => "done",
+        }
+    }
+
     /// Closes to the safe side: a value nobody can read becomes `Paused`, and a paused errand does
     /// not act. `Active` is the state that spends money, so it is never what a failed read produces.
     pub fn from_wire(value: &str) -> Self {
@@ -70,8 +96,27 @@ impl Status {
     }
 }
 
+/// Serialized as the wire spelling, never as the variant name.
+///
+/// Hand-written rather than derived: `#[derive(serde::Serialize)]` would put `Cloud` on the wire, a
+/// word neither the column nor any client knows, and `rename_all = "lowercase"` would be a second
+/// copy of the two words [`Brain::as_str`] already owns. Through `as_str` there is one source, so
+/// the brain a client reads out of the list is the brain it can send back in a PATCH.
+impl serde::Serialize for Brain {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// The wire spelling, for the reason [`Brain`]'s own implementation gives.
+impl serde::Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// One errand, as everything downstream needs it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Errand {
     pub id: i64,
     pub name: String,
@@ -88,20 +133,54 @@ pub struct Errand {
 /// chat key, for the same reason `Origin` exists in `assistant.rs` — a fact we wrote down beats a
 /// guess about a numbering scheme somebody else owns.
 pub async fn resolve(pool: &sqlx::SqlitePool, chat_key: &str) -> sqlx::Result<Option<Errand>> {
-    let row = sqlx::query_as::<_, (i64, String, String, String, String)>(
+    let row = sqlx::query_as::<_, ErrandRow>(
         "SELECT id, name, brain, folder, status FROM errands WHERE chat_key = ?",
     )
     .bind(chat_key)
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|(id, name, brain, folder, status)| Errand {
+    Ok(row.map(from_row))
+}
+
+/// The five columns every read of this table selects.
+type ErrandRow = (i64, String, String, String, String);
+
+/// The single place a row becomes an [`Errand`].
+///
+/// Written once because `brain` and `status` are both `TEXT` in a five-column tuple: a second
+/// mapping that read one into the other would compile, and the error would surface as an errand that
+/// is somehow paused because it runs on a local model.
+fn from_row((id, name, brain, folder, status): ErrandRow) -> Errand {
+    Errand {
         id,
         name,
         brain: Brain::from_wire(&brain),
         folder,
         status: Status::from_wire(&status),
-    }))
+    }
+}
+
+/// Every errand, newest first — the closed ones too.
+///
+/// Closed is not archived: `close` ends the asking and keeps the answer, and this list is read to
+/// find work already done as much as work still moving. Hiding `done` here would make the folder on
+/// disk the only surviving trace of it. A caller wanting only the live ones filters on `status`,
+/// which it can only do if they are here.
+///
+/// `id DESC` after `created_at DESC` is not decoration: `create` stamps `Utc::now()`, and three
+/// errands opened in one instant share a timestamp to the second. With the timestamp alone SQLite is
+/// free to return them in any order, and the order it happens to pick is insertion order — oldest
+/// first, exactly when the list is busiest, which is the one case the ordering exists for.
+pub async fn list(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
+    let rows = sqlx::query_as::<_, ErrandRow>(
+        "SELECT id, name, brain, folder, status FROM errands
+          ORDER BY created_at DESC, id DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(from_row).collect())
 }
 
 /// Opens an errand on a topic, answering with its id.
@@ -143,6 +222,55 @@ pub async fn create(pool: &sqlx::SqlitePool, name: &str, chat_key: &str) -> sqlx
 
     transaction.commit().await?;
     Ok(id)
+}
+
+/// Pauses or resumes an errand — one switch, turned in both directions.
+///
+/// `/pausa` and `/retomar` are the same statement with a different argument, and that is deliberate:
+/// a pause nothing could undo would leave closing as the only way out of a topic gone noisy, and
+/// closing is the move that ends the errand. Takes a [`Status`] and never a string, so the CHECK
+/// constraint on the column can only be met.
+pub async fn set_status(pool: &sqlx::SqlitePool, id: i64, status: Status) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errands SET status = ? WHERE id = ?")
+        .bind(status.as_str())
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Moves an errand between the local model and the cloud.
+///
+/// The whole mitigation for the local model not being good enough: an errand that needs judgement is
+/// moved out and pays for it, then moved back, and nothing else about it changes. No session is
+/// dropped on the way, unlike `chats::set_brain`'s caller — an errand's memory is its notebook, a
+/// file both models read, and not a conversation one of them is halfway through.
+pub async fn set_brain(pool: &sqlx::SqlitePool, id: i64, brain: Brain) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errands SET brain = ? WHERE id = ?")
+        .bind(brain.as_str())
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Ends the asking, and keeps everything that was found.
+///
+/// Deletes nothing, by design: the row stays, the folder stays, and the notebook in it is the record
+/// of the work. The topic simply goes back to being loose conversation. A close that removed the row
+/// would throw the answer away along with the question — and would also free `chat_key`, so the next
+/// message in that topic could silently open a second errand over the first one's folder.
+///
+/// `closed_at` is what says WHEN the asking stopped. Without it a finished errand and one that was
+/// never opened are the same row wearing different statuses.
+pub async fn close(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errands SET status = ?, closed_at = ? WHERE id = ?")
+        .bind(Status::Done.as_str())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 /// How long a folder name may be, id included.
@@ -317,6 +445,79 @@ pub async fn artifact_tainted(pool: &sqlx::SqlitePool, errand_id: i64, path: &st
     .ok()
     .flatten()
     .map(|value| value != 0)
+}
+
+/// One file inside this errand's folder, or a refusal.
+///
+/// The relative path reaches here from a model that has been reading the open web, so it is
+/// untrusted in the strictest sense — but no check is written out below. [`folder_path`]
+/// canonicalises the root and hands the folder to `files::resolve_within`, and this asks that same
+/// pair about the file. One function in the daemon decides what is reachable; a second check written
+/// beside it would be a second place for the rule to be wrong, and the wrong one would be whichever
+/// of them nobody remembered to update.
+fn file_path(files_root: &Path, errand: &Errand, relative: &str) -> std::io::Result<PathBuf> {
+    let folder = folder_path(files_root, errand)?;
+    crate::files::resolve_within(&folder, relative).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("errand file {relative:?} refused: {error:?}"),
+        )
+    })
+}
+
+/// A file of this errand, read back by name.
+///
+/// A file that is not there is an error, and deliberately not the empty string [`read_notebook`]
+/// answers with. The notebook is defined to start empty; a file asked for by name is a question that
+/// failed, and answering it with `""` would let a caller quietly carry on with nothing.
+pub fn read_file(files_root: &Path, errand: &Errand, relative: &str) -> std::io::Result<String> {
+    std::fs::read_to_string(file_path(files_root, errand, relative)?)
+}
+
+/// Writes a file into the errand's folder, and records in the same breath what the turn that wrote it
+/// had already read.
+///
+/// One operation and not two, because the second one is the one a caller forgets. A file left on
+/// disk with no row reads back as `None` from [`artifact_tainted`] — "cannot say", which callers
+/// treat as tainted, so the barrier still holds. It holds by making a file the model filled with a
+/// stranger's words indistinguishable from one dropped in the folder by hand, which is one step from
+/// a mark that carries no information at all.
+///
+/// The bytes land before the row on purpose. A write that succeeded with its mark unwritten reads as
+/// unknown, which is the cautious answer; the other order would leave a row vouching for a file that
+/// was never written.
+pub async fn write_file(
+    pool: &sqlx::SqlitePool,
+    files_root: &Path,
+    errand: &Errand,
+    relative: &str,
+    content: &str,
+    tainted: bool,
+    run_id: Option<i64>,
+) -> std::io::Result<()> {
+    std::fs::write(file_path(files_root, errand, relative)?, content)?;
+    // Marked under the name the caller used, which is the name it will ask about later — the
+    // resolved path is absolute and belongs to this machine, not to the conversation.
+    record_artifact(pool, errand.id, relative, tainted, run_id)
+        .await
+        .map_err(|error| std::io::Error::other(format!("marking {relative:?} failed: {error}")))
+}
+
+/// What is in this errand's folder, and nothing else's.
+///
+/// Scoped by the folder and never by the files root, which is the whole of it: there is one root and
+/// many errands, so a listing taken at the root would hand every errand every other errand's
+/// investigation — including the marks saying which of those files carry a stranger's words.
+///
+/// Delegated to `files::list` rather than reading the directory here, so the order is the one the
+/// file manager already shows and an errand's folder is not a second opinion about what a listing is.
+pub fn list_files(files_root: &Path, errand: &Errand) -> std::io::Result<Vec<String>> {
+    let folder = folder_path(files_root, errand)?;
+    crate::files::list(&folder, "")
+        .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+        .map_err(|error| {
+            std::io::Error::other(format!("listing {:?} failed: {error:?}", errand.folder))
+        })
 }
 
 #[cfg(test)]
@@ -569,6 +770,243 @@ mod tests {
             artifact_tainted(&pool, errand.id, "relatorio.md").await,
             Some(true),
             "a clean turn laundered a file that was already tainted"
+        );
+    }
+
+    /// Pausing is how an errand stops answering without losing what it found, and it has to be
+    /// reversible in both directions — `/pausa` and `/retomar` are one switch, not two doors. A
+    /// pause nothing could undo would leave closing as the only way out of a topic gone noisy,
+    /// and closing is the one move that ends the errand.
+    #[tokio::test]
+    async fn pausar_e_retomar_um_assunto() {
+        let pool = test_pool().await;
+        let errand = an_errand(&pool).await;
+
+        set_status(&pool, errand.id, Status::Paused).await.unwrap();
+        assert_eq!(
+            resolve(&pool, "-1001234:7").await.unwrap().unwrap().status,
+            Status::Paused
+        );
+
+        set_status(&pool, errand.id, Status::Active).await.unwrap();
+        assert_eq!(
+            resolve(&pool, "-1001234:7").await.unwrap().unwrap().status,
+            Status::Active
+        );
+    }
+
+    /// Which model answers is a per-errand decision, and it is the whole mitigation for the local
+    /// model not being good enough: an errand that needs judgement is moved to the cloud and pays,
+    /// then moved back. The column is read directly against `as_str` because `brain` carries a
+    /// CHECK constraint on the wire spellings — a value written in any other spelling is refused by
+    /// the database rather than by a reviewer, and that failure would surface far from here.
+    #[tokio::test]
+    async fn mudar_o_cerebro_de_um_assunto() {
+        let pool = test_pool().await;
+        let errand = an_errand(&pool).await;
+
+        set_brain(&pool, errand.id, Brain::Cloud).await.unwrap();
+
+        assert_eq!(
+            resolve(&pool, "-1001234:7").await.unwrap().unwrap().brain,
+            Brain::Cloud
+        );
+        let stored: String = sqlx::query_scalar("SELECT brain FROM errands WHERE id = ?")
+            .bind(errand.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, Brain::Cloud.as_str());
+
+        set_brain(&pool, errand.id, Brain::Local).await.unwrap();
+        assert_eq!(
+            resolve(&pool, "-1001234:7").await.unwrap().unwrap().brain,
+            Brain::Local
+        );
+    }
+
+    /// Closing is not deleting. `/fim` ends the asking and keeps the answer: the row stays, the
+    /// folder stays, and the notebook in it is the record of what was found. The topic simply goes
+    /// back to being loose conversation. A close that removed the row would throw the answer away
+    /// along with the question — and `closed_at` is what says WHEN the asking stopped, which is the
+    /// only thing distinguishing a finished errand from one that was never opened.
+    #[tokio::test]
+    async fn fechar_um_assunto_nao_o_apaga() {
+        let pool = test_pool().await;
+        let errand = an_errand(&pool).await;
+
+        close(&pool, errand.id).await.unwrap();
+
+        let found = resolve(&pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("closing an errand removed the row");
+        assert_eq!(found.status, Status::Done);
+        let closed_at: Option<String> =
+            sqlx::query_scalar("SELECT closed_at FROM errands WHERE id = ?")
+                .bind(errand.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            closed_at.is_some(),
+            "the errand was closed without recording when"
+        );
+    }
+
+    /// The list is what `/assuntos` answers with, and it is read to find the one you were just
+    /// working on — so the newest belongs at the top. The ids are what is asserted rather than the
+    /// names, because three errands opened in the same instant share a timestamp: an order that
+    /// falls back to insertion order there would show the oldest first exactly when the list is
+    /// busiest, which is the one case the ordering exists for.
+    #[tokio::test]
+    async fn a_lista_traz_o_mais_recente_primeiro() {
+        let pool = test_pool().await;
+        let first = create(&pool, "carros para importar", "-1001234:7")
+            .await
+            .unwrap();
+        let second = create(&pool, "obras no telhado", "-1001234:8")
+            .await
+            .unwrap();
+        let third = create(&pool, "seguro do carro", "-1001234:9")
+            .await
+            .unwrap();
+
+        let listed = list(&pool).await.unwrap();
+
+        let ids: Vec<i64> = listed.iter().map(|errand| errand.id).collect();
+        assert_eq!(ids, vec![third, second, first]);
+    }
+
+    /// The folder is where an investigation puts what it found, and a file is only worth writing if
+    /// it reads back. Both halves are asked about the ERRAND and never about a path: neither caller
+    /// gets to say where on disk it landed, which is what makes the containment check unavoidable
+    /// rather than something a caller remembers to ask for.
+    #[tokio::test]
+    async fn escrever_e_ler_um_ficheiro_do_assunto() {
+        let pool = test_pool().await;
+        let errand = an_errand(&pool).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        write_file(
+            &pool,
+            dir.path(),
+            &errand,
+            "relatorio.md",
+            "o primeiro carro custa 12k",
+            false,
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_file(dir.path(), &errand, "relatorio.md").unwrap(),
+            "o primeiro carro custa 12k"
+        );
+    }
+
+    /// The relative path reaches here from a model that has been reading the open web, so it is
+    /// untrusted input in the strictest sense. Both directions are asserted because a guard on one
+    /// of them is a guard on neither: a read that refuses `..` while a write accepts it lets a turn
+    /// place a file anywhere under the root and then read it back through its own folder.
+    ///
+    /// The target of the escape is made to EXIST first, so an implementation that simply joins the
+    /// path and asks the filesystem would succeed — without it the test would pass on a plain
+    /// "no such file", which is the wrong reason and would keep passing after the guard was lost.
+    #[tokio::test]
+    async fn um_ficheiro_fora_da_pasta_do_assunto_e_recusado() {
+        let pool = test_pool().await;
+        let errand = an_errand(&pool).await;
+        let dir = tempfile::tempdir().unwrap();
+        // Through `folder_path`, never from `dir.path()` directly: it is what canonicalises the
+        // root, and a root still holding a short path (`C:\PROGRA~1`) compares unequal to the
+        // children it really does contain.
+        let folder = folder_path(dir.path(), &errand).unwrap();
+        let root = folder.parent().unwrap().to_path_buf();
+        std::fs::write(root.join("segredo.md"), "o que está fora da pasta").unwrap();
+
+        assert!(
+            read_file(dir.path(), &errand, "../segredo.md").is_err(),
+            "an errand read a file outside its own folder"
+        );
+        assert!(
+            write_file(
+                &pool,
+                dir.path(),
+                &errand,
+                "../escapou.md",
+                "isto não devia estar aqui",
+                false,
+                None,
+            )
+            .await
+            .is_err(),
+            "an errand wrote a file outside its own folder"
+        );
+        assert!(
+            !root.join("escapou.md").exists(),
+            "the write was reported as refused and happened anyway"
+        );
+    }
+
+    /// There is one files root and many errands, so scoping the listing by the root instead of by
+    /// the errand would hand every errand every other errand's investigation — including the marks
+    /// that say which of those files carry a stranger's words.
+    #[tokio::test]
+    async fn listar_ficheiros_nao_mostra_os_de_outro_assunto() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let carros = an_errand(&pool).await;
+        create(&pool, "obras no telhado", "-1009999:4")
+            .await
+            .unwrap();
+        let telhado = resolve(&pool, "-1009999:4").await.unwrap().unwrap();
+
+        write_file(&pool, dir.path(), &carros, "carros.md", "12k", false, None)
+            .await
+            .unwrap();
+        write_file(&pool, dir.path(), &telhado, "telhado.md", "3k", false, None)
+            .await
+            .unwrap();
+
+        let listed = list_files(dir.path(), &carros).unwrap();
+
+        assert!(
+            listed.iter().any(|name| name == "carros.md"),
+            "an errand cannot see its own file: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|name| name == "telhado.md"),
+            "another errand's file leaked into this one's listing: {listed:?}"
+        );
+    }
+
+    /// The mark is placed by the write itself, and not by a second call the writer has to remember.
+    /// A turn that skipped that call would leave a file it filled with a stranger's words reading
+    /// back as unrecorded — and unrecorded is the answer a later turn treats as "cannot say", not
+    /// as "tainted", which is one hop away from the barrier being decoration.
+    #[tokio::test]
+    async fn escrever_um_ficheiro_regista_o_artefacto() {
+        let pool = test_pool().await;
+        let errand = an_errand(&pool).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        write_file(
+            &pool,
+            dir.path(),
+            &errand,
+            "relatorio.md",
+            "o stand diz que são 12k",
+            true,
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            artifact_tainted(&pool, errand.id, "relatorio.md").await,
+            Some(true)
         );
     }
 }

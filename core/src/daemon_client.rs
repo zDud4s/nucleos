@@ -320,6 +320,72 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// Opens an errand on a topic, and answers with the id the daemon minted for it.
+    ///
+    /// There is deliberately no parameter for the folder. It is derived from the id, which does not
+    /// exist until the row does, and `errands::create` mints it there precisely so no caller — this
+    /// one included — gets to say where on disk an errand writes.
+    pub async fn create_errand(&self, name: &str, chat_key: &str) -> Result<i64, String> {
+        let response: Value = self
+            .request(reqwest::Method::POST, "/errands")
+            .json(&serde_json::json!({ "name": name, "chat_key": chat_key }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        response["errand_id"]
+            .as_i64()
+            .ok_or_else(|| "create errand response missing errand_id".into())
+    }
+
+    /// Every errand, newest first, closed ones included — the route makes no distinction and neither
+    /// does this: an errand that ended is still the record of what it found.
+    pub async fn list_errands(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/errands")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Pauses or resumes an errand, moves it between the local model and the cloud, or both.
+    /// `None` leaves that half where it was.
+    pub async fn patch_errand(
+        &self,
+        id: i64,
+        status: Option<&str>,
+        brain: Option<&str>,
+    ) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::PATCH, &format!("/errands/{id}"))
+            .json(&serde_json::json!({ "status": status, "brain": brain }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        // Success here is `204 No Content`, so there is no body and `.json()` would fail with a
+        // decoding error naming nothing useful — the reason `cancel_run` goes through this too.
+        json_or_null(response).await
+    }
+
+    /// Ends an errand, and removes nothing.
+    ///
+    /// Named `close` rather than `delete` after what it does, not after the verb it travels as: the
+    /// row survives with `status = done` and the folder keeps what was found. A method called
+    /// `delete_errand` would describe the HTTP and lie about the effect.
+    pub async fn close_errand(&self, id: i64) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::DELETE, &format!("/errands/{id}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_null(response).await
+    }
 }
 
 /// The submit body, built and validated before anything is sent.
