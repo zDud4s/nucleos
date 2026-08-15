@@ -615,6 +615,18 @@ pub struct ScheduleRule {
 /// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
 pub const MAX_ITEMS_CEILING: usize = 5;
 
+/// The ceiling the daemon puts on how many EXTRA implement runs one red gate may buy.
+///
+/// The same argument `MAX_ITEMS_CEILING` makes, against the same file. A retry is a whole run, and
+/// `.ai/autopilot.yaml` is per-developer configuration no review ever sees — a number in it cannot
+/// be the only thing standing between one red gate and an unbounded number of re-implements. It may
+/// lower the budget; it may not raise it past what the daemon is willing to spend on one item.
+///
+/// Three rather than five, and lower than the fan-out ceiling on purpose: past the third attempt the
+/// evidence is that the item cannot be made to pass, and every further run is taken from the items
+/// queued behind it that were never the ones that broke.
+pub const MAX_GATE_RETRIES_CEILING: usize = 3;
+
 /// The ceiling the daemon puts on how many ROUNDS one job may run.
 ///
 /// The symmetric argument to `MAX_ITEMS_CEILING`'s, against a different threat. That one guards a
@@ -674,6 +686,22 @@ fn default_max_items() -> usize {
     MAX_ITEMS_CEILING
 }
 
+/// What a rule that said nothing about retries asks for: one.
+///
+/// The default that costs something, and deliberately so — a red gate is most often a near miss, and
+/// one more implement run told what the gate said is cheaper than the item it saves. One and not
+/// more, because the second retry is where an item that cannot be made to pass starts eating the
+/// runs the items behind it were queued for.
+///
+/// The `jobs.gate_retries` COLUMN defaults to 0 instead, and the two disagree on purpose: this is
+/// what a rule asks for when it says nothing, and 0 is what a job already scheduled keeps when
+/// nobody asked at all.
+pub const DEFAULT_GATE_RETRIES: usize = 1;
+
+fn default_gate_retries() -> usize {
+    DEFAULT_GATE_RETRIES
+}
+
 fn default_true() -> bool {
     true
 }
@@ -689,6 +717,8 @@ pub struct GraphConfig {
     pub gate_after_each_item: bool,
     #[serde(default = "default_true")]
     pub review: bool,
+    #[serde(default = "default_gate_retries")]
+    gate_retries: usize,
 }
 
 impl GraphConfig {
@@ -698,6 +728,16 @@ impl GraphConfig {
     /// struct would silently honour whatever the file said, and the ceiling would be advisory.
     pub fn max_items(&self) -> usize {
         self.max_items.min(MAX_ITEMS_CEILING)
+    }
+
+    /// The retries actually allowed, after the daemon's own ceiling.
+    ///
+    /// Private field plus this accessor for the same reason `max_items` has one, and it is worth
+    /// saying twice because the failure is silent: a caller that read `gate_retries` straight off
+    /// the struct would honour whatever `.ai/autopilot.yaml` asked for, and the ceiling above would
+    /// be decorative — present in the code, absent from every job that actually runs.
+    pub fn gate_retries(&self) -> usize {
+        self.gate_retries.min(MAX_GATE_RETRIES_CEILING)
     }
 }
 
@@ -787,6 +827,53 @@ mod tests {
         )
         .expect("a smaller max_items parses");
         assert_eq!(rules.schedules[0].graph.as_ref().unwrap().max_items(), 2);
+    }
+
+    /// One retry, for a rule that said nothing about retries.
+    ///
+    /// The default that costs something, and deliberately so: a red gate is most often a near miss —
+    /// an import the node forgot, a test it did not know to update — and one more implement run told
+    /// what the gate said is cheaper than the item it saves. One and not more, because the second
+    /// retry is where an item that cannot be made to pass starts eating the runs the items behind it
+    /// were queued for.
+    ///
+    /// The `jobs.gate_retries` COLUMN defaults to 0, not to this. The two disagree on purpose: this
+    /// is what a rule asks for when it says nothing, and that is what a job already scheduled keeps
+    /// when nobody asked at all.
+    #[test]
+    fn gate_retries_defaults_to_one() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph: {}\n",
+        )
+        .expect("an empty graph block is valid and fully defaulted");
+        assert_eq!(
+            rules.schedules[0]
+                .graph
+                .as_ref()
+                .expect("graph present")
+                .gate_retries(),
+            1
+        );
+    }
+
+    /// The same argument `max_items` is guarded by, against the same file.
+    ///
+    /// `.ai/autopilot.yaml` is gitignored per-developer configuration no review ever sees, and a
+    /// retry is a whole run: a number in that file cannot be the only thing standing between one red
+    /// gate and an unbounded number of re-implements. It may lower the budget; it may not raise it
+    /// past what the daemon is willing to spend on one item.
+    #[test]
+    fn an_oversized_gate_retries_is_cut_by_the_ceiling() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      gate_retries: 99\n",
+        )
+        .expect("an oversized gate_retries parses");
+        assert_eq!(
+            rules.schedules[0].graph.as_ref().unwrap().gate_retries(),
+            3,
+            "the ceiling is what governs, not the file"
+        );
+        assert_eq!(MAX_GATE_RETRIES_CEILING, 3);
     }
 
     #[test]

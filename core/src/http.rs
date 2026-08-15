@@ -3413,6 +3413,11 @@ async fn create_job(
                 budget_usd: request.budget_usd,
                 gate_each: true,
                 review: true,
+                // The answer a rule that said nothing about retries gets, and for the same reason:
+                // nobody asked, and one more implement run told what the gate said is cheaper than
+                // the item it saves. Not the caller's to choose either — the request has no field
+                // for it, exactly as it has none for `max_items`.
+                gate_retries: crate::config::DEFAULT_GATE_RETRIES as i64,
                 head_sha: head_sha.as_deref(),
             },
         )

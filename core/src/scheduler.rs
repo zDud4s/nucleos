@@ -255,6 +255,9 @@ async fn start_job(
             max_items: graph.max_items() as i64,
             gate_each: graph.gate_after_each_item,
             review: graph.review,
+            // The accessor and never the field, for the same reason `max_items` reads one: the raw
+            // number is what the gitignored file asked for, and a retry is a whole run.
+            gate_retries: graph.gate_retries() as i64,
             head_sha,
             // A scheduled job asks for neither, which keeps it at one round under the house limit —
             // exactly what a `graph:` rule did before rounds existed. Rounds are opt-in per request,
@@ -990,6 +993,7 @@ mod tests {
                 max_items: 3,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
