@@ -77,6 +77,11 @@ pub fn build_router(state: AppState) -> Router {
             "/fleet/exclusions",
             get(get_fleet_exclusions).post(post_fleet_exclusion),
         )
+        // The literal ahead of `{id}`; matchit prefers it, and they are different methods besides.
+        .route(
+            "/fleet/exclusions/requests",
+            get(get_fleet_exclusion_requests),
+        )
         .route("/fleet/exclusions/{id}", delete(delete_fleet_exclusion))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
@@ -2063,6 +2068,25 @@ async fn get_fleet_exclusions(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "reading the fleet exclusions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The requests waiting on an answer.
+///
+/// `/proposals` cannot carry these: it serves `action-approval` alone, deliberately, because
+/// approving one of those resumes a paused run and approving one of these resumes nothing — the
+/// argument `list_pending` and `get_contact_merges` both make at length. So this follows the door
+/// `contact-merge` opened, which also puts the question where the context is: whether two jobs
+/// should be serialised is decided while looking at the fleet.
+async fn get_fleet_exclusion_requests(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::exclusion::pending_requests(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the pending exclusion requests failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }

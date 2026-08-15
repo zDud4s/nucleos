@@ -271,7 +271,7 @@ it("asks for an exclusion by picking two cards, and says it is only a request", 
   // The next tick brings the request back as a proposal, and it is drawn as a question.
   respondWith({
     ...TWO_JOBS,
-    "/proposals": [
+    "/fleet/exclusions/requests": [
       {
         id: 9,
         kind: "fleet-exclusion",
@@ -291,6 +291,42 @@ it("asks for an exclusion by picking two cards, and says it is only a request", 
   await settle();
 
   expect(screen.getAllByText(/waiting for approval/i).length).toBe(2);
+});
+
+/** One pending request, as the daemon's own queue hands it back. */
+const REQUEST = {
+  id: 9,
+  kind: "fleet-exclusion",
+  status: "pending",
+  run_id: null,
+  session_id: null,
+  project_id: "alpha",
+  tool_name: null,
+  reasoning: "they both touch it",
+  tool_input: JSON.stringify({ pair: "41:42", job_low: 41, job_high: 42 }),
+  created_at: "t",
+  decided_at: null,
+};
+
+/**
+ * The answer is given here, not on the Autopilot tab.
+ *
+ * That queue serves `action-approval` alone — approving one of those resumes a paused run, and this
+ * resumes nothing — so a request filed from the fleet would never appear there, and the edge would
+ * be a question with no way to answer it.
+ */
+it("answers a request from the card that drew it", async () => {
+  respondWith({ ...TWO_JOBS, "/fleet/exclusions/requests": [REQUEST] });
+  renderFleet();
+  await settle();
+
+  fireEvent.click(screen.getAllByRole("button", { name: /^approve$/i })[0]);
+  await settle();
+
+  const approvals = fetchMock.mock.calls.filter(([url]) =>
+    String(url).includes("/proposals/9/approve"),
+  );
+  expect(approvals.length).toBe(1);
 });
 
 /**

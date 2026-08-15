@@ -242,6 +242,28 @@ pub async fn live(pool: &SqlitePool, project_id: Option<&str>) -> sqlx::Result<V
     }
 }
 
+/// The requests still waiting on a person, oldest first.
+///
+/// Its own door and not a slice of `/proposals`, for the reason `get_contact_merges` already gives:
+/// `list_pending` serves `action-approval` alone, and its comment argues at length that a queue
+/// where approving resumes a paused run must not be mixed with decisions that resume nothing. This
+/// is one of those. It also puts the question where the context is — whether two jobs should be
+/// serialised is decided while looking at the fleet, not at a queue of stopped runs.
+///
+/// Oldest first, like the approval queue and unlike the skipped-item record: this is a queue, worked
+/// front to back, and the request that has been waiting longest is the one holding somebody up.
+pub async fn pending_requests(pool: &SqlitePool) -> sqlx::Result<Vec<crate::proposals::Proposal>> {
+    sqlx::query_as::<_, crate::proposals::Proposal>(
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals
+         WHERE status = 'pending' AND kind = 'fleet-exclusion'
+         ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Lifts a rule, keeping it readable.
 ///
 /// Revoked and not deleted: the decision stays legible after it stops applying — somebody will ask
@@ -716,6 +738,30 @@ mod tests {
 
         // And the pair can be asked about again, which is what the partial index is for.
         propose(&pool, low, high, &[]).await.unwrap();
+    }
+
+    /// The queue holds a request until it is decided, and only ever holds this kind.
+    ///
+    /// The kind filter is the load-bearing half. These proposals share a table with the ones a
+    /// paused run is waiting on, and a screen that offered "approve" over the wrong one would be
+    /// resuming a run from a canvas.
+    #[tokio::test]
+    async fn the_queue_holds_undecided_requests_and_nothing_else() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        crate::proposals::create_contact_merge(&pool, 1, 2, "not this one")
+            .await
+            .unwrap();
+        let proposal_id = propose(&pool, low, high, &[]).await.unwrap();
+
+        let waiting = pending_requests(&pool).await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].id, proposal_id);
+        assert_eq!(waiting[0].kind, "fleet-exclusion");
+
+        reject(&pool, proposal_id).await.unwrap();
+        assert!(pending_requests(&pool).await.unwrap().is_empty());
     }
 
     /// The two decisions refuse anything that is not a pending exclusion, by kind and by status.

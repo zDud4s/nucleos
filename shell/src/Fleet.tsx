@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  approveProposal,
   cancelJob,
   cancelRun,
   createJob,
   getBudget,
   getConcurrency,
+  getExclusionRequests,
   getExclusions,
   getJobs,
   getLiveRuns,
   getProjects,
-  getProposals,
   proposeExclusion,
+  rejectProposal,
   revokeExclusion,
   type Budget,
   type ConnectionState,
@@ -73,7 +75,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [budget, setBudget] = useState<Budget | null>(null);
   const [exclusions, setExclusions] = useState<FleetExclusion[] | null>(null);
-  const [proposals, setProposals] = useState<Proposal[] | null>(null);
+  const [requests, setRequests] = useState<Proposal[] | null>(null);
   const [stale, setStale] = useState(false);
   const [lastGood, setLastGood] = useState<string | null>(null);
   /** Owners whose card the user sent away, keyed `"job:41"`. */
@@ -107,7 +109,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
           getExclusions(token),
           // For the edges that are still questions. The rules come from the route above; a request
           // waiting for an answer exists only as a proposal, and the two have to be drawn apart.
-          getProposals(token),
+          getExclusionRequests(token),
         ]);
         if (batch !== batchSeq.current) return;
         // The authority is written down only when it answers. On a failure the cards from the last
@@ -126,7 +128,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
         // And blank, never empty: a failed read draws no edges, which is not the same as drawing
         // that there are none — `exclusionEdges` takes both nulls for exactly that reason.
         setExclusions(nextExclusions);
-        setProposals(nextProposals);
+        setRequests(nextProposals);
       } finally {
         inFlight.current -= 1;
       }
@@ -182,7 +184,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
     projects === null
       ? null
       : projects.reduce((total, project) => total + project.open_proposals, 0);
-  const edges = exclusionEdges(exclusions, proposals);
+  const edges = exclusionEdges(exclusions, requests);
   // Stale hides the start action rather than letting it fail after the click: the capacity on
   // screen is no longer the daemon's.
   const canStart = !stale && killEngaged !== true && token !== null;
@@ -335,6 +337,25 @@ export function ProjectColumn({
     await refresh();
   }
 
+  /**
+   * The answer is given here and not on the Autopilot tab.
+   *
+   * That queue serves `action-approval` alone — approving one resumes a paused run, and approving
+   * this resumes nothing — so the daemon keeps the two apart, as it already does for a contact
+   * merge. It also puts the question where the context is: whether two jobs should be serialised is
+   * decided while looking at them.
+   */
+  async function decide(proposalId: number, yes: boolean) {
+    setFailed(null);
+    if (yes) {
+      const outcome = await approveProposal(token, proposalId);
+      if (!outcome.ok) setFailed(outcome.reason);
+    } else if (!(await rejectProposal(token, proposalId))) {
+      setFailed("That request could not be refused — it may already have been decided.");
+    }
+    await refresh();
+  }
+
   return (
     <section className="fleet-column">
       <header>
@@ -380,6 +401,7 @@ export function ProjectColumn({
               else void askFor(jobId);
             }}
             onLift={(id) => void lift(id)}
+            onDecide={(proposalId, yes) => void decide(proposalId, yes)}
             token={token}
             onCancel={() => void onCancel(slot)}
             onOpenRuns={onOpenRuns}
@@ -409,6 +431,8 @@ interface SlotCardProps {
   pairing: PairingRole;
   onPair: () => void;
   onLift: (exclusionId: number) => void;
+  /** Answers a request: `true` puts the rule in force, `false` refuses it. */
+  onDecide: (proposalId: number, yes: boolean) => void;
   /** For the `JobGraph` this card mounts when it opens. */
   token: string;
   onCancel: () => void;
@@ -435,6 +459,7 @@ export function SlotCard({
   pairing,
   onPair,
   onLift,
+  onDecide,
   token,
   onCancel,
   onOpenRuns,
@@ -505,10 +530,21 @@ export function SlotCard({
           className={`exclude-edge is-${partner.state}`}
         >
           {edgeLine(partner)}
-          {partner.state === "active" && (
+          {partner.state === "active" ? (
             <Button size="sm" onClick={() => onLift(partner.id)}>
               Lift
             </Button>
+          ) : (
+            // The same request is drawn on both cards, so both carry the answer. Whichever is
+            // clicked decides the one proposal; the other card's copy leaves on the next tick.
+            <>
+              <Button size="sm" variant="approve" onClick={() => onDecide(partner.id, true)}>
+                Approve
+              </Button>
+              <Button size="sm" variant="link" onClick={() => onDecide(partner.id, false)}>
+                Refuse
+              </Button>
+            </>
           )}
         </p>
       ))}

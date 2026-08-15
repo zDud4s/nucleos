@@ -165,6 +165,25 @@ export async function getExclusions(token: string): Promise<FleetExclusion[] | n
 }
 
 /**
+ * The exclusion requests waiting on an answer.
+ *
+ * Not `getProposals`, which serves `action-approval` alone: approving one of those resumes a paused
+ * run, and approving one of these resumes nothing. The daemon keeps the two queues apart on purpose,
+ * exactly as it does for a contact merge.
+ */
+export async function getExclusionRequests(token: string): Promise<Proposal[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions/requests`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Proposal[];
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Why an exclusion could not be asked for, in the daemon's own words.
  *
  * The same shape as `CreateJobOutcome`, for the same reason: `409` is both "you already asked about

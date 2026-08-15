@@ -150,6 +150,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // The rules in force, beside `/concurrency` for the same reason it is here: it describes the
     // shape of the fleet and changes nothing. Asking for one is Admin's; reading which exist is not.
     (Method::GET, "/fleet/exclusions"),
+    (Method::GET, "/fleet/exclusions/requests"),
     (Method::GET, "/projects/{id}/ls"),
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),

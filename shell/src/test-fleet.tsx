@@ -48,7 +48,10 @@ export async function settle(rounds = 4) {
 export function respondWith(answers: Record<string, unknown>) {
   fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
     const method = (init?.method ?? "GET").toUpperCase();
-    const keys = Object.keys(answers);
+    // Longest match wins among the bare keys, so `/fleet/exclusions` does not swallow
+    // `/fleet/exclusions/requests` — one is a prefix of the other, and declaration order deciding
+    // which route answers is a trap a reader would spend an afternoon on.
+    const keys = [...Object.keys(answers)].sort((left, right) => right.length - left.length);
     const key =
       keys.find((fragment) => qualified(fragment, url, method)) ??
       keys.find((fragment) => !fragment.includes(" ") && url.includes(fragment));
