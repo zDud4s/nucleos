@@ -70,6 +70,25 @@ pub enum Op {
         remote: Remote,
         branch: Branch,
     },
+    /// **The last command on `classifier.rs`'s approval list that was still handed BACK to the
+    /// agent**, which is the whole reason it comes before `fetch` and `rebase` in a queue that has
+    /// seven operations left to learn. `git push` and `git merge` were the other two and are done;
+    /// `gh pr merge`, `npm publish`, `cargo publish` and `deploy` are not git and are not this
+    /// pillar's. So of every git command that pauses for a human today, this was the only one where
+    /// saying yes still meant the run performed it with its own hands.
+    ///
+    /// `at` is a BRANCH rather than a commit-ish, and that is a real restriction rather than a
+    /// modelling convenience: the executor resolves `refs/heads/<at>`, so `git tag v1 a1b2c3d` is
+    /// refused with a message naming the ref it could not resolve instead of being tagged. Accepting
+    /// a raw sha would make the type's name a lie — `Branch` would hold things that are not branches
+    /// — and the fallback for anyone who wants it is the one every unqueueable spelling gets.
+    ///
+    /// Lightweight only. `-a`/`-s` need a message, and a message is a quoted shell argument — which
+    /// is the one thing `merge_from_command` and its siblings exist to never parse.
+    Tag {
+        name: TagName,
+        at: Branch,
+    },
 }
 
 /// A branch name the daemon is willing to put on a git command line.
@@ -176,6 +195,46 @@ impl From<&str> for Remote {
     }
 }
 
+/// A tag name the daemon is willing to create.
+///
+/// The third type over `argv_safe`, and the one whose separateness is easiest to justify: `Branch`
+/// and `Remote` both name something that already EXISTS and that git will resolve or refuse. A tag
+/// name names something this operation brings into being, in a namespace nothing else here writes.
+/// One type for all three would have made "the queue accepts this tag" the same sentence as "the
+/// queue accepts this branch", and they answer to different authorities the day either rule moves.
+///
+/// **An argv guard, not a ref validator** — the sentence `Branch` writes out at length, and it holds
+/// here with one consequence worth naming rather than leaving to be discovered: `v1..2`, `a~1` and
+/// `x.lock` all pass, and `git tag` refuses each of them itself. The row then records git's own
+/// message. What this refuses is a name that could act as an option, which is the only thing a
+/// string reaching an argv can do that git cannot answer for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagName(String);
+
+impl TagName {
+    pub fn new(value: &str) -> Result<Self, String> {
+        argv_safe(value, "tag name").map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for TagName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        TagName::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The `Branch` counterpart, for the same reason: tests build tag names from literals.
+#[cfg(test)]
+impl From<&str> for TagName {
+    fn from(value: &str) -> Self {
+        TagName::new(value).expect("a test used an invalid tag name literal")
+    }
+}
+
 impl<'de> Deserialize<'de> for Branch {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Branch::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
@@ -207,11 +266,20 @@ fn named_remote(value: Option<&str>, operation: &str, which: &str) -> Result<Rem
     Remote::new(value).map_err(|reason| format!("{which}: {reason}"))
 }
 
+/// PURE: the same, for the one role that names a tag.
+fn named_tag(value: Option<&str>, operation: &str, which: &str) -> Result<TagName, String> {
+    let Some(value) = value else {
+        return Err(format!("a {operation} needs a {which} tag name"));
+    };
+    TagName::new(value).map_err(|reason| format!("{which}: {reason}"))
+}
+
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::Merge { .. } => "merge",
             Op::Push { .. } => "push",
+            Op::Tag { .. } => "tag",
         }
     }
 
@@ -245,19 +313,27 @@ impl Op {
                 branch: named_branch(source, "push", "source")?,
                 remote: named_remote(target, "push", "target")?,
             }),
+            // The same reading of `source`/`target` the paragraph above sets out, and a tag is the
+            // case that shows it is a rule rather than a coincidence: what MOVES is the branch's tip,
+            // and where it GOES is a new name. A tag is a destination in the sense that matters here
+            // — a ref this operation writes — which is why it is the target and not the source.
+            "tag" => Ok(Op::Tag {
+                at: named_branch(source, "tag", "source")?,
+                name: named_tag(target, "tag", "target")?,
+            }),
             // `pr-merge` is the one on this list that is NOT waiting its turn, and saying so here is
             // the point of the comment: it is the only operation of the nine that is not git. It
             // would put a second binary with its own authentication, its own network failures and
             // its own release cadence inside the executor — and it would buy none of what this queue
             // is made of, since a merge that happens on GitHub's servers is not serialised by a lock
             // held on this machine. Whoever wants it wants a different pillar, not a tenth variant.
-            other @ ("rebase" | "pull" | "fetch" | "tag" | "branch-delete" | "worktree-add"
+            other @ ("rebase" | "pull" | "fetch" | "branch-delete" | "worktree-add"
             | "worktree-remove" | "pr-merge") => Err(format!(
-                "{other} is not yet queued by this daemon — merge and push are the operations the \
-                 queue can execute today"
+                "{other} is not yet queued by this daemon — merge, push and tag are the operations \
+                 the queue can execute today"
             )),
             other => Err(format!(
-                "unknown operation: {other} — the queue understands merge and push"
+                "unknown operation: {other} — the queue understands merge, push and tag"
             )),
         }
     }
@@ -523,6 +599,49 @@ pub fn push_from_command(command: &str, current_branch: &str) -> Option<Op> {
     Some(Op::Push {
         remote: Remote::new(remote).ok()?,
         branch: Branch::new(branch).ok()?,
+    })
+}
+
+/// PURE: the tag a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`git tag <name>` and `git tag <name> <branch>`, and nothing else** — the third application of
+/// the posture `merge_from_command` argues. The exclusions are worth naming individually because
+/// they are not one kind of thing:
+///
+/// - **`git tag` alone is a READ.** It lists the repository's tags, and refusing it is not a
+///   restriction: the fallback hands the run a grant and it lists them itself, which is the right
+///   outcome for a command that changes nothing. This is the only one of the three parsers where the
+///   bare two-token form means something entirely different from the operation, rather than meaning
+///   it with the arguments left to config.
+/// - **`-a`, `-s`, `-m` are refused because the queue would have to parse a quoted message**, and
+///   not parsing quoted shell is the whole of `classifier.rs`'s reason to exist. A lightweight tag is
+///   what this executes and an annotated one is a different object, not a decoration on the same one.
+/// - **`-d`, `-f` are the destructive spellings.** One removes a tag and one moves an existing tag
+///   to a new commit, which is the tag equivalent of a force push: it invalidates what anybody who
+///   already fetched believes. The queue creates; it does not overwrite.
+/// - **`-l`, `--list`, `--contains`, `-n` are reads wearing the write's name**, and they are stopped
+///   by `TagName` rather than by this list — a leading dash cannot be a tag name. Named here anyway
+///   because a reader checking whether they are handled should not have to derive it.
+///
+/// The branch is the command's own second word when it has one, and otherwise the branch the
+/// worktree stands on — the same rule `push_from_command` uses, and `HEAD` is refused on both routes
+/// for the same reason: it names nothing by the time a queued row runs.
+pub fn tag_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let (program, subcommand, name, at) = match tokens.as_slice() {
+        [program, subcommand, name] => (program, subcommand, name, current_branch.trim()),
+        [program, subcommand, name, at] => (program, subcommand, name, *at),
+        _ => return None,
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("tag") {
+        return None;
+    }
+    if at == "HEAD" {
+        return None;
+    }
+    Some(Op::Tag {
+        name: TagName::new(name).ok()?,
+        at: Branch::new(at).ok()?,
     })
 }
 
@@ -2421,12 +2540,139 @@ mod tests {
         );
     }
 
-    /// The two parsers are tried one after the other in `runs::queueable_operation`, and this is why
-    /// that order cannot matter: each insists on its own subcommand, so no command is both.
+    /// The parsers are tried one after another in `runs::queueable_operation`, and this is why that
+    /// order cannot matter: each insists on its own subcommand, so no command is more than one.
+    ///
+    /// Every pair rather than a sample: the property is about the SET, and a chain of `or_else` is
+    /// exactly the shape where adding a fourth parser that overlaps an existing one compiles, passes
+    /// its own tests, and silently steals commands from whichever came before it.
     #[test]
-    fn a_command_is_never_both_a_merge_and_a_push() {
-        assert!(merge_from_command("git push origin main", "master").is_none());
-        assert!(push_from_command("git merge feature", "master").is_none());
+    fn a_command_is_never_two_operations_at_once() {
+        for command in [
+            "git merge feature",
+            "git push origin main",
+            "git tag v1 main",
+        ] {
+            let matched = [
+                merge_from_command(command, "master"),
+                push_from_command(command, "master"),
+                tag_from_command(command, "master"),
+            ]
+            .into_iter()
+            .flatten()
+            .count();
+            assert_eq!(matched, 1, "{command} was read by more than one parser");
+        }
+    }
+
+    /// The two shapes a tag may take, and the half the command line does not carry.
+    ///
+    /// Asserted against a worktree branch that is NOT the one named, for the reason the push twin
+    /// gives: with both spelled `main`, an implementation that ignored the command's third word
+    /// would pass.
+    #[test]
+    fn a_tag_takes_its_branch_from_the_command_or_from_the_worktree() {
+        assert_eq!(
+            tag_from_command("git tag v1.0", "release/2"),
+            Some(Op::Tag {
+                name: "v1.0".into(),
+                at: "release/2".into()
+            })
+        );
+        assert_eq!(
+            tag_from_command("git tag v1.0 main", "release/2"),
+            Some(Op::Tag {
+                name: "v1.0".into(),
+                at: "main".into()
+            }),
+            "an explicit branch is the one asked for, even from a worktree standing elsewhere"
+        );
+        // The verb folds; the two NAMES do not. Git is case-sensitive about both, and a tag `V1` is
+        // not a tag `v1`.
+        assert_eq!(
+            tag_from_command("GIT TAG V1 Main", "release/2"),
+            Some(Op::Tag {
+                name: "V1".into(),
+                at: "Main".into()
+            })
+        );
+    }
+
+    /// Everything the strictest reading leaves out. Each row is a different KIND of exclusion, which
+    /// is the reason they are grouped rather than listed as a bag of strings.
+    #[test]
+    fn only_a_bare_git_tag_of_a_new_name_becomes_a_queued_operation() {
+        for command in [
+            // A READ, and the only bare form among the three parsers that means something else
+            // entirely rather than meaning the operation with its arguments left to config.
+            "git tag",
+            // Annotated and signed tags are a different object, and both need a message — a quoted
+            // shell argument, which is the one thing these parsers exist never to read.
+            "git tag -a v1 -m release",
+            "git tag -s v1 -m release",
+            "git tag -m release v1",
+            // The destructive spellings: one removes a tag, one moves an existing one.
+            "git tag -d v1",
+            "git tag -f v1 main",
+            "git tag --force v1 main",
+            // Reads wearing the write's name. Stopped by `TagName` rather than by the shape, which
+            // is the same division of labour `--no-ff` has in the merge parser.
+            "git tag -l",
+            "git tag --list v*",
+            "git tag -n v1",
+            "git tag --contains HEAD",
+            // Shape: a fourth positional is not a spelling this executes.
+            "git tag v1 main extra",
+            // The verb is the verb.
+            "git --no-verify tag v1",
+            "gh tag v1",
+        ] {
+            assert_eq!(tag_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// `HEAD` is refused on both routes into the branch, for the reason the push twin states: a
+    /// queued row naming it names nothing by the time it runs, and `rev-parse --abbrev-ref` is what
+    /// says `HEAD` for a detached worktree.
+    #[test]
+    fn a_tag_never_queues_the_word_head() {
+        assert_eq!(tag_from_command("git tag v1", "HEAD"), None);
+        assert_eq!(tag_from_command("git tag v1", ""), None);
+        assert_eq!(tag_from_command("git tag v1 HEAD", "master"), None);
+    }
+
+    /// A tag name is checked as an argv token by its OWN type, on every route in.
+    ///
+    /// The JSON half is the one that matters: `Op` derives `Deserialize`, so a raw
+    /// `POST /vcs/requests` body reaches `TagName` without passing `from_request` at all. Giving
+    /// `Tag` a `String` name would leave every assertion in the flat-builder test green.
+    #[test]
+    fn a_tag_name_is_an_argv_token_on_every_route_in() {
+        assert_eq!(TagName::new("  v1.0  ").unwrap().as_str(), "v1.0");
+        for bad in ["", "   ", "--format=x", "-d", "v 1", "v\u{1b}1"] {
+            assert!(TagName::new(bad).is_err(), "{bad:?} was accepted");
+        }
+
+        let raw = r#"{"op":"tag","name":"--format=touch x","at":"main"}"#;
+        assert!(serde_json::from_str::<Op>(raw).is_err());
+        assert!(
+            Op::from_stored("tag", r#"{"op":"tag","name":"-d","at":"main"}"#).is_err(),
+            "a hand-edited row is not trusted either"
+        );
+    }
+
+    /// The storage round trip for the third variant, and the column/payload check that catches a
+    /// variant whose `kind()` and serde tag disagree.
+    #[test]
+    fn a_tag_round_trips_through_storage_too() {
+        let op = Op::Tag {
+            name: "v1.0".into(),
+            at: "main".into(),
+        };
+
+        assert_eq!(op.kind(), "tag");
+        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
+        assert!(Op::from_stored("push", &op.to_args()).is_err());
     }
 
     /// A listing narrowed to a project shows the whole repository that project shares.
@@ -4330,12 +4576,22 @@ mod tests {
             }
         );
 
+        // A tag is the case that shows the `source`/`target` reading is a rule and not a
+        // coincidence: what moves is the branch's tip, and where it goes is a new ref.
+        assert_eq!(
+            Op::from_request("tag", Some("main"), Some("v1.0")).unwrap(),
+            Op::Tag {
+                name: "v1.0".into(),
+                at: "main".into()
+            }
+        );
+
         // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
         // missing — "unknown operation: rebase" would send a caller looking for a typo.
         let error = Op::from_request("rebase", Some("feature"), Some("master")).unwrap_err();
         assert!(error.contains("not yet"), "unexpected error: {error}");
         assert!(
-            error.contains("merge") && error.contains("push"),
+            error.contains("merge") && error.contains("push") && error.contains("tag"),
             "the error must name what the queue CAN do: {error}"
         );
 
@@ -4366,8 +4622,20 @@ mod tests {
                 .unwrap_err()
                 .contains("branch")
         );
+        // And the tag arm's own two, since it reaches a third helper with a third message.
+        assert!(
+            Op::from_request("tag", Some("main"), None)
+                .unwrap_err()
+                .contains("tag name")
+        );
+        assert!(
+            Op::from_request("tag", None, Some("v1.0"))
+                .unwrap_err()
+                .contains("branch")
+        );
         assert!(Op::from_request(" Merge ", Some("feature"), Some("master")).is_ok());
         assert!(Op::from_request(" PUSH ", Some("main"), Some("origin")).is_ok());
+        assert!(Op::from_request(" Tag ", Some("main"), Some("v1.0")).is_ok());
     }
 
     /// A remote is checked as an argv token, exactly as a branch is, and by its OWN type.

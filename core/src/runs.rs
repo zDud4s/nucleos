@@ -1779,9 +1779,9 @@ async fn create_run_with(
 /// not certain is the one they read would be worse than either.
 ///
 /// So the bar is: the tool is a shell, the input parses, the command is one the queue can execute —
-/// `git merge <ref>` with at most a `--no-ff`, or `git push <remote> [<branch>]`, each argued in its
-/// own function in `vcs.rs` — the worktree is really there and really on a branch, and the project
-/// resolves to a repository. Anything else falls back.
+/// `git merge <ref>` with at most a `--no-ff`, `git push <remote> [<branch>]`, or
+/// `git tag <name> [<branch>]`, each argued in its own function in `vcs.rs` — the worktree is really
+/// there and really on a branch, and the project resolves to a repository. Anything else falls back.
 ///
 /// **The two are tried in order and the order cannot matter**, which is worth stating rather than
 /// relying on: each parser insists on its own subcommand, so a command is at most one of them. The
@@ -1818,7 +1818,8 @@ async fn queueable_operation(
         })
         .ok()?;
     let op = crate::vcs::merge_from_command(command, &branch)
-        .or_else(|| crate::vcs::push_from_command(command, &branch))?;
+        .or_else(|| crate::vcs::push_from_command(command, &branch))
+        .or_else(|| crate::vcs::tag_from_command(command, &branch))?;
     crate::vcs::resolve_repo(&state.pool, project_id)
         .await
         .map_err(|error| {
@@ -3539,6 +3540,59 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         assert!(
             note.contains("merge queued as vcs request"),
             "the audit trail has to say what the approval actually did: {note}"
+        );
+    }
+
+    /// **The last command on the approval list that was still handed back to the run.**
+    ///
+    /// `git tag` paused for a human and then, on yes, the RUN wrote the tag with its own hands —
+    /// which is the arrangement this whole pillar exists to end, surviving in the one place nobody
+    /// had got to yet. What is pinned is that the approval queues it instead, and that the audit
+    /// trail names the operation: the note was hard-coded to "merge" until `push` landed, and a third
+    /// operation is where a two-way `if` would quietly become wrong again.
+    ///
+    /// The command names no branch, so the tag's target has to come from the worktree — the half no
+    /// `git tag v1` carries, and the same half a bare `git push origin` needs.
+    #[tokio::test]
+    async fn approving_a_tag_queues_it_and_records_which_operation_it_was() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git tag v1.0").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (op, args, origin, status): (String, String, String, String) = sqlx::query_as(
+            "SELECT op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("the approved tag is in the queue");
+        assert_eq!(op, "tag");
+        assert_eq!((origin.as_str(), status.as_str()), ("human", "queued"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            serde_json::json!({"op": "tag", "name": "v1.0", "at": branch}),
+            "the command named the tag; the branch is the one the worktree stands on"
+        );
+
+        assert!(
+            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                .await
+                .unwrap(),
+            "the queue took the tag, so the run must NOT also be authorized to write it"
+        );
+
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains("tag queued as vcs request"),
+            "the trail must name the operation it queued: {note}"
         );
     }
 
