@@ -3247,6 +3247,54 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "fleet-exclusion" {
+        // Fourth kind through this door, third that starts no run. Uncancellable for the reason the
+        // other three are: the rule and the decision that authorised it commit together, and a
+        // request dropped mid-flight must not leave a job parked by a rule whose proposal still
+        // reads `pending` beside it.
+        let state = state.clone();
+        let decided =
+            uncancellable(async move { crate::exclusion::approve(&state.pool, id).await })
+                .await
+                .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match decided {
+            Ok(crate::exclusion::Approved::Written(exclusion_id)) => {
+                Ok(Json(serde_json::json!({ "exclusion_id": exclusion_id })))
+            }
+            // 200 and not an error: the person answered, and the answer was recorded. What changed
+            // is that the question had stopped mattering while it waited, and a screen that showed
+            // this as a failure would send them looking for a rule that was right not to be written.
+            Ok(crate::exclusion::Approved::Stale) => Ok(Json(serde_json::json!({
+                "exclusion_id": serde_json::Value::Null,
+                "closed": "the jobs it named have ended, so no rule was written",
+            }))),
+            Err(crate::exclusion::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::exclusion::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::exclusion::DecisionError::Malformed) => {
+                tracing::warn!(
+                    proposal_id = id,
+                    "an exclusion request carried no usable pair"
+                );
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this request names no usable pair of jobs".to_owned(),
+                ))
+            }
+            Err(crate::exclusion::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "approving an exclusion failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the rule could not be written".to_owned(),
+                ))
+            }
+        };
+    }
+
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
@@ -3334,6 +3382,27 @@ async fn post_proposal_reject(
             Err(crate::calendar::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
             Err(crate::calendar::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting a calendar proposal failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "fleet-exclusion" {
+        // Refusing an edge leaves nothing behind, because drawing it changed nothing: no rule was
+        // written, no run was paused, no worktree is held. It is the one refusal on this route with
+        // no second half to undo.
+        let state = state.clone();
+        let rejected =
+            uncancellable(async move { crate::exclusion::reject(&state.pool, id).await }).await?;
+        return match rejected {
+            Ok(()) => Ok(StatusCode::NO_CONTENT),
+            Err(crate::exclusion::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::exclusion::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::exclusion::DecisionError::Malformed) => {
+                Err(StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            Err(crate::exclusion::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
@@ -4240,6 +4309,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rules, 0);
+    }
+
+    /// The shared approval door reaches the new kind, which is the half a new proposal kind forgets.
+    ///
+    /// `/proposals/{id}/approve` dispatches by kind and falls through to `resume_approved_run`,
+    /// which would answer 404 for a proposal that pauses no run. The unit tests around
+    /// `exclusion::approve` cannot see that: they call the function the route has to remember to
+    /// call.
+    #[tokio::test]
+    async fn approving_through_the_shared_door_writes_the_rule() {
+        let state = test_state().await;
+        let low = add_job(&state.pool, "alpha").await;
+        let high = add_job(&state.pool, "alpha").await;
+        let proposal_id = crate::exclusion::propose(&state.pool, low, high, &[])
+            .await
+            .unwrap();
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            "test-token",
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["exclusion_id"].as_i64().is_some(), "got: {json}");
+
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_exclusions WHERE job_low = ? AND revoked_at IS NULL",
+        )
+        .bind(low)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 1);
     }
 
     /// The second ask is a 409 that says which of the two 409s it is.

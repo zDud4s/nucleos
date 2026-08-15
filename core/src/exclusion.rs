@@ -83,7 +83,7 @@ pub async fn propose(
         return Err(ProposeError::DifferentProjects);
     }
 
-    if is_excluded(pool, low, high).await? {
+    if live_rule_for(pool, low, high).await?.is_some() {
         return Err(ProposeError::AlreadyExcluded);
     }
     if pending_request_for(pool, low, high).await? {
@@ -142,9 +142,9 @@ async fn project_of(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<Strin
         .await
 }
 
-/// Whether this pair already has a rule in force.
-pub async fn is_excluded(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Result<bool> {
-    let found: Option<i64> = sqlx::query_scalar(
+/// The rule in force for this pair, if there is one.
+pub async fn live_rule_for(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
         "SELECT id FROM fleet_exclusions
           WHERE job_low = ? AND job_high = ? AND revoked_at IS NULL
           LIMIT 1",
@@ -152,8 +152,7 @@ pub async fn is_excluded(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Result
     .bind(low)
     .bind(high)
     .fetch_optional(pool)
-    .await?;
-    Ok(found.is_some())
+    .await
 }
 
 /// Whether this pair already has a request waiting on a person.
@@ -170,6 +169,169 @@ async fn pending_request_for(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Re
     .fetch_optional(pool)
     .await?;
     Ok(found.is_some())
+}
+
+/// Why a decision on an exclusion request could not be taken.
+#[derive(Debug)]
+pub enum DecisionError {
+    NotFound,
+    NotPending,
+    /// The request carries no usable pair — nothing this daemon writes looks like that.
+    Malformed,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for DecisionError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+/// What approving a request turned out to mean.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Approved {
+    /// The rule is in force, under this id.
+    Written(i64),
+    /// One of the two jobs had already ended, so the request was closed with a note instead.
+    ///
+    /// Not an error and not a refusal: the person answered a question that had stopped mattering
+    /// while it waited, and the alternative is a rule about two jobs that will never run again
+    /// sitting in the table until somebody prunes it.
+    Stale,
+}
+
+/// Approving writes the rule.
+///
+/// The pair comes out of the proposal's own `tool_input` and never out of the request that
+/// approved it, so what is written is what was shown to the person who agreed.
+pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<Approved, DecisionError> {
+    let proposal = crate::proposals::get(pool, proposal_id)
+        .await?
+        .ok_or(DecisionError::NotFound)?;
+    if proposal.kind != "fleet-exclusion" || proposal.status != "pending" {
+        return Err(DecisionError::NotPending);
+    }
+    let (low, high, paths) = requested_pair(&proposal).ok_or(DecisionError::Malformed)?;
+    let project_id = proposal
+        .project_id
+        .clone()
+        .ok_or(DecisionError::Malformed)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // A request outlives what it was about. A job that has ended never holds a slot again, so a rule
+    // naming one could not park anything — and leaving the request in the queue would ask somebody
+    // to keep deciding it forever.
+    if !is_live(pool, low).await? || !is_live(pool, high).await? {
+        if !crate::proposals::transition(
+            pool,
+            proposal_id,
+            "dismissed",
+            "the jobs it named have ended",
+        )
+        .await?
+        {
+            return Err(DecisionError::NotPending);
+        }
+        return Ok(Approved::Stale);
+    }
+
+    // Already in force is the answer the person wanted, not a collision to report. `propose` refuses
+    // a second pending request for a pair, so reaching this means the rule arrived by some path
+    // this one did not see; approving on top of it changes nothing and says so truthfully.
+    if let Some(existing) = live_rule_for(pool, low, high).await? {
+        if !crate::proposals::transition(
+            pool,
+            proposal_id,
+            "approved",
+            "this pair was already excluded",
+        )
+        .await?
+        {
+            return Err(DecisionError::NotPending);
+        }
+        return Ok(Approved::Written(existing));
+    }
+
+    let mut transaction = pool.begin().await?;
+    let exclusion_id: i64 = sqlx::query_scalar(
+        "INSERT INTO fleet_exclusions
+             (project_id, job_low, job_high, proposal_id, paths, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(&project_id)
+    .bind(low)
+    .bind(high)
+    .bind(proposal_id)
+    .bind(paths)
+    .bind(&now)
+    .fetch_one(&mut *transaction)
+    .await?;
+
+    // One transaction, and it is load-bearing: the rule and the decision that authorised it have to
+    // land together, or a dropped connection leaves a rule parking a job with a request still
+    // reading `pending` beside it.
+    if !crate::proposals::transition_in_transaction(
+        &mut transaction,
+        proposal_id,
+        "approved",
+        "approved by user",
+        &now,
+    )
+    .await?
+    {
+        return Err(DecisionError::NotPending);
+    }
+    transaction.commit().await?;
+    Ok(Approved::Written(exclusion_id))
+}
+
+/// Refusing writes nothing at all.
+///
+/// There is nothing to undo: the request never changed how anything is scheduled, which is the point
+/// of it being a request. Unlike `reject_proposal`, no run is discarded either — an exclusion pauses
+/// no run and holds no worktree.
+pub async fn reject(pool: &SqlitePool, proposal_id: i64) -> Result<(), DecisionError> {
+    let proposal = crate::proposals::get(pool, proposal_id)
+        .await?
+        .ok_or(DecisionError::NotFound)?;
+    if proposal.kind != "fleet-exclusion" || proposal.status != "pending" {
+        return Err(DecisionError::NotPending);
+    }
+    // Compare-and-set, so a refusal that lost the race to an approval is reported rather than
+    // answered 204 — the same reason `reject_proposal` checks the return of its own transition.
+    if !crate::proposals::transition(pool, proposal_id, "rejected", "rejected by user").await? {
+        return Err(DecisionError::NotPending);
+    }
+    Ok(())
+}
+
+/// The pair a request names, as `(low, high, paths)`.
+fn requested_pair(proposal: &crate::proposals::Proposal) -> Option<(i64, i64, Option<String>)> {
+    let input: serde_json::Value = proposal
+        .tool_input
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())?;
+    let low = input.get("job_low")?.as_i64()?;
+    let high = input.get("job_high")?.as_i64()?;
+    // Normalised again on the way out, not trusted. The row's index depends on the order, and this
+    // is the last place before it is written.
+    let (low, high) = pair(low, high)?;
+    let paths = input
+        .get("paths")
+        .filter(|paths| paths.as_array().is_some_and(|list| !list.is_empty()))
+        .map(std::string::ToString::to_string);
+    Some((low, high, paths))
+}
+
+/// Whether a job is still one that could hold a slot.
+async fn is_live(pool: &SqlitePool, job_id: i64) -> sqlx::Result<bool> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status.is_some_and(|status| crate::job::LIVE_STATUSES.contains(&status.as_str())))
 }
 
 #[cfg(test)]
@@ -314,5 +476,139 @@ mod tests {
         let asked = propose(&pool, job, job, &[]).await;
 
         assert!(matches!(asked, Err(ProposeError::SameJob)), "{asked:?}");
+    }
+
+    /// Approving is what writes the rule, and it writes the pair the PROPOSAL named.
+    #[tokio::test]
+    async fn approving_writes_the_rule_and_the_decision_together() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        let proposal_id = propose(&pool, high, low, &["src/shared.rs".to_owned()])
+            .await
+            .unwrap();
+
+        let approved = approve(&pool, proposal_id).await.unwrap();
+
+        let Approved::Written(exclusion_id) = approved else {
+            panic!("two live jobs must yield a rule, got {approved:?}");
+        };
+        let (project_id, stored_low, stored_high, stored_proposal, paths, revoked): (
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT project_id, job_low, job_high, proposal_id, paths, revoked_at
+             FROM fleet_exclusions WHERE id = ?",
+        )
+        .bind(exclusion_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(project_id, "alpha");
+        assert_eq!((stored_low, stored_high), (low, high));
+        assert_eq!(stored_proposal, proposal_id);
+        assert!(paths.unwrap().contains("src/shared.rs"));
+        assert_eq!(revoked, None);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "approved");
+    }
+
+    /// Refusing leaves the table exactly as it found it.
+    #[tokio::test]
+    async fn rejecting_writes_nothing() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        let proposal_id = propose(&pool, low, high, &[]).await.unwrap();
+
+        reject(&pool, proposal_id).await.unwrap();
+
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_exclusions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rules, 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "rejected");
+
+        // And a second decision on it is reported, not silently accepted.
+        assert!(matches!(
+            reject(&pool, proposal_id).await,
+            Err(DecisionError::NotPending)
+        ));
+    }
+
+    /// A request outlives the jobs it was about, and answering it then writes no rule.
+    ///
+    /// A finished job never holds a slot again, so the rule could park nothing — it would sit in the
+    /// table naming two jobs that will never run, until somebody went looking for why it was there.
+    /// The request is closed with a note instead, which is also what takes it out of the queue: left
+    /// pending it would be a question nobody can usefully answer, asked forever.
+    #[tokio::test]
+    async fn approving_a_request_whose_job_has_ended_closes_it_with_a_note() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        let proposal_id = propose(&pool, low, high, &[]).await.unwrap();
+        sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = ?")
+            .bind(high)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(approve(&pool, proposal_id).await.unwrap(), Approved::Stale);
+
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_exclusions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rules, 0);
+        let (status, note): (String, Option<String>) = sqlx::query_as(
+            "SELECT proposals.status, proposal_events.note
+               FROM proposals
+               JOIN proposal_events ON proposal_events.proposal_id = proposals.id
+              WHERE proposals.id = ? AND proposal_events.to_status = 'dismissed'",
+        )
+        .bind(proposal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "dismissed");
+        assert_eq!(note.as_deref(), Some("the jobs it named have ended"));
+    }
+
+    /// The two decisions refuse anything that is not a pending exclusion, by kind and by status.
+    #[tokio::test]
+    async fn a_proposal_of_another_kind_is_not_decided_here() {
+        let pool = test_pool().await;
+        let proposal_id = crate::proposals::create_contact_merge(&pool, 1, 2, "test")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            approve(&pool, proposal_id).await,
+            Err(DecisionError::NotPending)
+        ));
+        assert!(matches!(
+            reject(&pool, proposal_id).await,
+            Err(DecisionError::NotPending)
+        ));
+        assert!(matches!(
+            approve(&pool, 404).await,
+            Err(DecisionError::NotFound)
+        ));
     }
 }
