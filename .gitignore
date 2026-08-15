@@ -44,8 +44,29 @@ sidecars/**/*.exe
 # ─────────────────────────────────────────────────────────────
 AGENTS.md
 CLAUDE.md
+*.md
+
+# Brainstorming companion scratch (HTML mockups + event log). Agent working
+# material — local only. The `*.md` rule above already covers the specs it emits,
+# but the mockups are .html and would otherwise be committable.
+.superpowers/
 
 # Local git hooks (core.hooksPath) — local only, never committed.
 # A rule rather than a habit: without this the directory is merely untracked, one `git add -A`
 # away from entering history. Recreate it with scripts/install-hooks.sh.
 .githooks/
+.vscode/
+
+# ─────────────────────────────────────────────────────────────
+# Design and docs — local working material
+# ─────────────────────────────────────────────────────────────
+# These were purged from the history rather than merely untracked, and the difference is the
+# whole point: the prototypes and the integration notes were already committed, and a
+# repository that gains a remote publishes its history, not its checkout. Untracking them
+# would have left them one `git log` away from anyone who cloned it.
+#
+# The files themselves stay on disk. `docs/` keeps exactly one tracked file so the directory
+# survives a fresh clone.
+design/
+docs/*
+!docs/.gitkeep
