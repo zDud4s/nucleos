@@ -1086,7 +1086,67 @@ impl crate::vcs::VcsExecutor for GitExecutor {
             crate::vcs::Op::Push { remote, branch } => {
                 push(project_root, remote.as_str(), branch.as_str(), deadline).await
             }
+            crate::vcs::Op::Tag { name, at } => {
+                tag(project_root, name.as_str(), at.as_str(), deadline).await
+            }
         }
+    }
+}
+
+/// Creates a lightweight tag at the tip of `at`.
+///
+/// The sha is resolved first and the tag written AT that object id rather than at the branch name,
+/// for the reason `push` gives at length: what the row records has to be a statement about what
+/// happened, not a re-reading of a ref that other queued operations are moving. Here it buys one
+/// thing more — the tag and the row cannot disagree even if the branch advances between the two git
+/// commands, which on a busy repository is a window this queue exists to have opinions about.
+///
+/// **No `-f`, ever, and a tag that already exists is git's refusal to report rather than ours to
+/// overrule.** Moving an existing tag is the tag-shaped force push: it invalidates what everybody who
+/// already fetched believes, and unlike a branch there is no expectation that it ever moves. So the
+/// row comes back `Failed` carrying git's own `tag 'v1' already exists`.
+///
+/// `Failed` rather than `Blocked` for every refusal, on `publish_by_fast_forward`'s reasoning:
+/// `Blocked` is terminal and means a human must clear something out of the way here and now, which
+/// describes none of the ways this can fail.
+///
+/// **`--end-of-options` earns its place HERE, unlike in `push` where it is labelled unobservable —
+/// measured, both ways.** Everything after it is a positional, so a flag that reached this argv
+/// would be read as a tag name rather than as a flag: moving `-f` from before it to after it turns a
+/// silent `Updated tag 'v1.0' (was 129eccf)` — somebody's release tag relocated — into
+/// `fatal: too many arguments`. The difference from `push` is the argv shape rather than the care
+/// taken: `git push <remote> <refspec>` has no option that could masquerade as either, and
+/// `git tag -f <name>` is one keystroke from the operation this performs.
+async fn tag(project_root: &Path, name: &str, at: &str, deadline: std::time::Instant) -> Outcome {
+    // `refs/heads/<at>` rather than `<at>` bare, which is what makes `at` a BRANCH rather than a
+    // commit-ish the type merely calls one. A sha, a tag or `HEAD~1` fails here, naming the ref it
+    // could not resolve — a refusal the caller can read, rather than a tag quietly written somewhere
+    // the row's own type says it could not have been.
+    let sha = match revision(project_root, &format!("refs/heads/{at}"), deadline).await {
+        Ok(sha) => sha,
+        Err(outcome) => return outcome,
+    };
+
+    let tagged = match git(
+        project_root,
+        &["tag", "--end-of-options", name, &sha],
+        deadline,
+    )
+    .await
+    {
+        Ok(tagged) => tagged,
+        Err(outcome) => return outcome,
+    };
+    if !tagged.succeeded() {
+        return failed(
+            format!("tagging {at} as {name} failed; git's output says why"),
+            &tagged,
+        );
+    }
+
+    Outcome::Succeeded {
+        sha,
+        output_tail: tagged.output_tail,
     }
 }
 
@@ -2813,6 +2873,137 @@ pub(crate) mod tests {
             ),
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    /// The tag end to end, through `execute` the way the daemon runs it.
+    ///
+    /// **The assertion is that `refs/tags/v1.0` resolves to the sha the row reports**, which is what
+    /// separates a tag that was written from a git command that merely exited 0. It is also what
+    /// catches the argv built the other way round: `git tag <sha> <name>` is a perfectly valid
+    /// command — it creates a tag NAMED after the object id, pointing at whatever `<name>` resolves
+    /// to — so a swap exits 0 and leaves `v1.0` absent.
+    #[tokio::test]
+    async fn a_tag_lands_on_the_branch_tip_it_names() {
+        use crate::vcs::VcsExecutor;
+
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-tag-");
+        let tip = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Tag {
+                    name: "v1.0".into(),
+                    // Deliberately NOT the checked-out branch: a tag is written to the ref store and
+                    // never touches a worktree, so nothing about this needs `master`.
+                    at: "feat/x".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        let sha = match outcome {
+            Outcome::Succeeded { sha, .. } => sha,
+            other => panic!("expected a written tag, got {other:?}"),
+        };
+        assert_eq!(sha, tip, "the row reports the object it tagged");
+        assert_eq!(
+            sha_of(&repo, "refs/tags/v1.0"),
+            tip,
+            "and the tag is on it, under the name that was asked for"
+        );
+    }
+
+    /// **A name already taken is git's refusal to report, not ours to overrule.**
+    ///
+    /// The second half is the assertion that matters: the existing tag must still point where it
+    /// did. A `-f` creeping into the argv would make this operation succeed and move somebody's
+    /// release tag onto a different commit — the tag-shaped force push, and the one failure here
+    /// that nobody downstream can detect from their own clone.
+    #[tokio::test]
+    async fn a_tag_that_already_exists_is_refused_rather_than_moved() {
+        use crate::vcs::VcsExecutor;
+
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-tag-taken-");
+        let original = sha_of(&repo, "refs/heads/master");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("tag"),
+                OsStr::new("v1.0"),
+                OsStr::new("refs/heads/master")
+            ]
+        ));
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Tag {
+                    name: "v1.0".into(),
+                    at: "feat/x".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match &outcome {
+            Outcome::Failed { output_tail, .. } => assert!(
+                !output_tail.is_empty(),
+                "git's own refusal is the only diagnostic the row carries"
+            ),
+            other => panic!("a taken tag name is a retryable failure, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "refs/tags/v1.0"),
+            original,
+            "the tag that was already there did not move — this queue never forces"
+        );
+    }
+
+    /// `at` is a BRANCH, and the executor is where that stops being a claim about the type's name.
+    ///
+    /// A raw object id passes `Branch`'s argv rules — it is one word with no leading dash — so
+    /// nothing before this point can refuse it. `refs/heads/<at>` is what does, and the message names
+    /// the ref rather than leaving a caller to wonder why a perfectly good sha was rejected.
+    #[tokio::test]
+    async fn tagging_something_that_is_not_a_branch_is_refused_by_the_ref_it_resolves() {
+        use crate::vcs::VcsExecutor;
+
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-tag-notbranch-");
+        let sha = sha_of(&repo, "refs/heads/master");
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Tag {
+                    name: "v1.0".into(),
+                    at: sha.as_str().into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+            })
+            .await;
+
+        match outcome {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("refs/heads/") && reason.contains(&sha),
+                "the message must name the ref it could not resolve: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "--verify", "refs/tags/v1.0"])
+                .output()
+                .expect("git should start")
+                .status
+                .success(),
+            "and nothing was tagged"
+        );
     }
 
     /// **A remote that moved refuses the push, and the row is `Failed` rather than `Blocked`.**

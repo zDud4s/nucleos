@@ -519,6 +519,7 @@ mod tests {
     #[test]
     fn an_operation_the_queue_does_not_have_never_reaches_the_daemon() {
         assert!(vcs_submit_body("nucleos", "rebase", Some("feature"), Some("master")).is_err());
+        assert!(vcs_submit_body("nucleos", "tag", Some("main"), Some("-d")).is_err());
         assert!(vcs_submit_body("nucleos", "merge", Some("-f"), Some("master")).is_err());
         // The same guard on the operation the queue DID learn, because a second variant is a second
         // route to argv and inherits none of the first one's checks by being next to it.
