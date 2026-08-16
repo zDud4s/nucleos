@@ -98,6 +98,23 @@ function itemTone(state: string): "active" | "off" | "pending" | "paused" {
 }
 
 /**
+ * Whether arming this rule grows a tree that nothing bounds by money.
+ *
+ * The tree ceiling the daemon reads is the ROOT's `budget_usd`, against the spend of every run
+ * under it (`team_trigger::tree_has_room`). Which run is the root depends on the source, and that
+ * is the whole of this function: `cron` and `email_triaged` fire with a default lineage, so the run
+ * they start IS its own root and the ceiling is this team's. `team_finished` inherits the root of
+ * the run that just ended, so the ceiling is some OTHER team's — this team's null says nothing
+ * about it, and warning here would name the wrong number on the wrong card.
+ *
+ * A tree with no ceiling is not unbounded: the depth stops at three and the house budget is always
+ * there. It is bounded by nothing the owner set for THIS department, which is worth saying once.
+ */
+function growsAnUncappedTree(trigger: TeamTrigger, ceiling: number | null): boolean {
+  return ceiling === null && (trigger.source === "cron" || trigger.source === "email_triaged");
+}
+
+/**
  * What starts a department when nobody is asking, and — for a clock rule — when it next will.
  *
  * The next time is fetched per rule and not computed here, for the reason the daemon's own route
@@ -106,9 +123,11 @@ function itemTone(state: string): "active" | "off" | "pending" | "paused" {
  * rule that never runs and says so nowhere.
  */
 function TriggerList({
-  triggers, token, refresh,
+  triggers, ceiling, token, refresh,
 }: {
   triggers: TeamTrigger[];
+  /** The team's own `budget_usd`. Null is the default, and the reason the warning exists. */
+  ceiling: number | null;
   token: string;
   refresh: () => Promise<void>;
 }) {
@@ -156,6 +175,7 @@ function TriggerList({
       <h4>What starts it</h4>
       {triggers.map((trigger) => {
         const when = next[trigger.id];
+        const uncapped = growsAnUncappedTree(trigger, ceiling);
         return (
           <article className="feed-item" key={trigger.id}>
             <div className="f-meta">
@@ -173,12 +193,33 @@ function TriggerList({
               {when?.next != null && trigger.enabled === 1 && (
                 <span className="a-note">next {relativeTime(when.next)}</span>
               )}
+              {/* Beside the rule and not on the team's own line, which already says "no ceiling of
+                  its own": there it is a setting, here it is a consequence. */}
+              {uncapped && (
+                <span className="a-note">
+                  no ceiling on what this starts — the team set none of its own
+                </span>
+              )}
             </div>
             <p className="f-body">{trigger.request}</p>
             <div className="a-actions">
-              <Button size="sm" disabled={busy} onClick={() => void toggle(trigger)}>
-                {trigger.enabled === 1 ? "Disarm" : "Arm"}
-              </Button>
+              {/* A question and not a refusal, for the reason the design gives: the house budget is
+                  the brake that never goes missing. Disarming is never asked about — putting a
+                  question in front of the safe direction teaches people to click through it. */}
+              {uncapped && trigger.enabled === 0 ? (
+                <ConfirmButton
+                  size="sm"
+                  confirmLabel="Arm with no ceiling?"
+                  disabled={busy}
+                  onConfirm={() => void toggle(trigger)}
+                >
+                  Arm
+                </ConfirmButton>
+              ) : (
+                <Button size="sm" disabled={busy} onClick={() => void toggle(trigger)}>
+                  {trigger.enabled === 1 ? "Disarm" : "Arm"}
+                </Button>
+              )}
               <ConfirmButton
                 size="sm"
                 variant="danger"
@@ -768,6 +809,7 @@ function Departments({ token }: { token: string }) {
                 starts is a rule nobody connects to anything. */}
             <TriggerList
               triggers={triggers.filter((trigger) => trigger.team_id === team.id)}
+              ceiling={team.budget_usd}
               token={token}
               refresh={refresh}
             />

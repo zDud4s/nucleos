@@ -362,8 +362,10 @@ describe("the departments tab", () => {
   });
 
   it("arms a rule through the daemon rather than by hiding the button", async () => {
+    // A team with a ceiling of its own, which is the path where arming is one click. The
+    // ceiling-less team is the other path, and has its own tests below.
     await show({
-      teams: [team()],
+      teams: [team({ budget_usd: 5 })],
       agents: [agent()],
       triggers: [trigger({ enabled: 0 })],
     });
@@ -373,6 +375,73 @@ describe("the departments tab", () => {
     });
     const armed = writeCalls().find(([url]) => String(url).endsWith("/team-triggers/1/enable"));
     expect(JSON.parse(String((armed?.[1] as { body?: string }).body))).toEqual({ enabled: true });
+  });
+
+  /**
+   * The design's second risk, made visible. A clock rule on a team with no `budget_usd` starts a
+   * run that is its own root, and the tree ceiling read is the root's — so nothing the owner set
+   * for this department caps what the chain spends. A question and not a refusal: the house budget
+   * is still there, and the owner may well mean it.
+   */
+  it("asks before arming a rule whose tree no ceiling of this team's bounds", async () => {
+    await show({
+      teams: [team({ budget_usd: null })],
+      agents: [agent()],
+      triggers: [trigger({ enabled: 0 })],
+    });
+
+    expect(screen.getByText(/no ceiling on what this starts/)).toBeTruthy();
+
+    // The first click asks. Nothing has been armed at the daemon by then.
+    fireEvent.click(screen.getByText("Arm"));
+    expect(screen.getByText("Arm with no ceiling?")).toBeTruthy();
+    expect(writeCalls().filter(([url]) => String(url).endsWith("/enable"))).toHaveLength(0);
+
+    advance(400);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Arm with no ceiling?"));
+    });
+    const armed = writeCalls().find(([url]) => String(url).endsWith("/team-triggers/1/enable"));
+    expect(JSON.parse(String((armed?.[1] as { body?: string }).body))).toEqual({ enabled: true });
+  });
+
+  /**
+   * The distinction that makes the warning true rather than decorative. `team_finished` fires with
+   * the lineage of the run that ended, so the tree ceiling is the ROOT team's — this team's null
+   * says nothing about it, and a warning here would name the wrong number.
+   */
+  it("does not warn about a rule that joins someone else's tree instead of starting one", async () => {
+    await show({
+      teams: [team({ budget_usd: null })],
+      agents: [agent()],
+      triggers: [
+        trigger({
+          enabled: 0,
+          source: "team_finished",
+          cron: null,
+          timezone: null,
+          from_team: "research",
+        }),
+      ],
+    });
+
+    expect(screen.queryByText(/no ceiling on what this starts/)).toBeNull();
+    expect(screen.getByText("Arm")).toBeTruthy();
+  });
+
+  /** Disarming is the safe direction, and a question in front of it is one people learn to skip. */
+  it("does not ask before disarming a rule that has no ceiling", async () => {
+    await show({
+      teams: [team({ budget_usd: null })],
+      agents: [agent()],
+      triggers: [trigger({ enabled: 1 })],
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Disarm"));
+    });
+    const off = writeCalls().find(([url]) => String(url).endsWith("/team-triggers/1/enable"));
+    expect(JSON.parse(String((off?.[1] as { body?: string }).body))).toEqual({ enabled: false });
   });
 
   /** The ceilings belong to the daemon; the form only refuses one round trip earlier. */
