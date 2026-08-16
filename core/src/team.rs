@@ -3348,7 +3348,7 @@ mod tests {
         assert_eq!(fetch_run(&state, &id).await.state, "done");
     }
 
-    /// The column migration 0072 adds, doing the job it was added for: the director's own nodes are
+    /// The column migration 0073 adds, doing the job it was added for: the director's own nodes are
     /// part of what the run cost.
     #[tokio::test]
     async fn a_runs_spend_counts_the_directors_nodes_and_not_another_runs() {

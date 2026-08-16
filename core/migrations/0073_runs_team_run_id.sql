@@ -1,5 +1,12 @@
 -- Which team run paid for this run, in the shape `runs.job_id` already established.
 --
+-- Numbered 0073, having been cut as 0072. Master landed `0072_job_notes.sql` (`02787ff`) while this
+-- branch was being built, which is the fourth time this repository has had two files with different
+-- names claiming the same version — and, as `0065_council.sql` records at length, the fourth time
+-- git reported nothing: the two merge clean and only `sqlx::migrate!` would have found it, at the
+-- daemon's next start. The rule held again, unchanged: the BRANCH gives way, master's lineage
+-- stands.
+--
 -- The teams design said no existing table needed changing, and for four of the five columns it was
 -- right. This is the fifth. `team_runs.director_run_id` names the director node IN FLIGHT and is
 -- overwritten by the next one, so the plan node, the replan nodes and the delivery node of a
