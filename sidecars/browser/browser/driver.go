@@ -1,0 +1,208 @@
+// Package browser is the contract for driving a real browser, and nothing else.
+//
+// It contains no CDP, no Chrome, and no process management. That is the point: the spike of
+// 2026-08-15 changed the answer to "which driver" twice in one afternoon and never touched a line of
+// this package. Whatever ends up behind the interface — PinchTab, go-rod, raw CDP — implements
+// Driver, and everything above it is already written and already tested against Fake.
+//
+// # Two properties that are not type-hygiene
+//
+// OpenRequest has no profile field. The agent chooses WHAT to look at; the núcleo chooses WHERE it
+// happens (spec §5.3, §6.1). A profile field here would let the caller pick the identity it browses
+// under, which is the whole boundary this pillar exists to hold, handed away in a struct tag.
+//
+// ActResult separates Done from Refused. A refusal by the fence (spec §6.2) is an ANSWER, not a
+// failure: the agent asked for something with a consequence, was told so, and can carry on. If it
+// arrived as an error it would be indistinguishable from a crashed browser, and the agent would
+// retry the one thing it must not.
+package browser
+
+import (
+	"context"
+	"errors"
+)
+
+// SessionID identifies one browsing session for its lifetime.
+type SessionID string
+
+// Mode is who is holding the wheel. There are exactly two, and there is deliberately no third:
+// spec §4.1 forbids a hidden rendering state, so a session is either headless-and-agent-driven or
+// visible-and-person-driven, never rendering somewhere nobody can see.
+type Mode string
+
+const (
+	// ModeAgent is headless, fenced, and consequence-free (spec §6.2).
+	ModeAgent Mode = "agent"
+	// ModeHuman is a real window, with a person in front of it and no fence.
+	ModeHuman Mode = "human"
+)
+
+// OpenRequest asks for a session on a URL.
+//
+// There is no profile field. See the package comment: that omission is the boundary.
+type OpenRequest struct {
+	URL string `json:"url"`
+}
+
+// Session is what a caller gets back. RequestedURL and FinalURL are both reported because the trust
+// decision is a conjunction over the two (spec §5.3) — a redirect that lands somewhere else is the
+// case the allowlist exists for, and a driver that reported only one of them would make that
+// decision impossible to take.
+type Session struct {
+	ID           SessionID `json:"id"`
+	Mode         Mode      `json:"mode"`
+	RequestedURL string    `json:"requested_url"`
+	FinalURL     string    `json:"final_url"`
+	Title        string    `json:"title"`
+}
+
+// Element is one thing on the page the agent may refer to.
+//
+// Ref is a stable handle minted by the driver ("e5"), not a CSS selector. Selectors are long, break
+// on a class rename, and invite the agent to synthesise one for an element it never saw. A ref can
+// only name something that was actually in a snapshot.
+type Element struct {
+	Ref  string `json:"ref"`
+	Role string `json:"role"`
+	Name string `json:"name"`
+}
+
+// Snapshot is the accessibility view of a page: what is there and what it is called.
+type Snapshot struct {
+	SessionID SessionID `json:"session_id"`
+	URL       string    `json:"url"`
+	Title     string    `json:"title"`
+	Elements  []Element `json:"elements"`
+}
+
+// ActionKind is the verb. The set is small and closed on purpose (spec §6.2, "consequence-free in
+// v1"): every member is something a person could do with a mouse and a keyboard and that cannot, on
+// its own, leave the machine.
+type ActionKind string
+
+const (
+	ActionClick  ActionKind = "click"
+	ActionType   ActionKind = "type"
+	ActionScroll ActionKind = "scroll"
+)
+
+// Action is one attempt to touch the page.
+type Action struct {
+	Kind ActionKind `json:"kind"`
+	Ref  string     `json:"ref"`
+	Text string     `json:"text,omitempty"`
+}
+
+// Outcome is the shape of an ActResult.
+type Outcome string
+
+const (
+	OutcomeDone    Outcome = "done"
+	OutcomeRefused Outcome = "refused"
+)
+
+// Consequence names WHY the fence refused. It is a closed vocabulary rather than a message because
+// the núcleo has to be able to tell these apart without reading prose, and because the agent is
+// shown the reason — a string assembled at the refusal site would drift into something a page could
+// influence.
+type Consequence string
+
+const (
+	// ConsequenceMethod — anything that is not GET or HEAD (spec §6.2).
+	ConsequenceMethod Consequence = "non-get-method"
+	// ConsequenceForm — a form submission, whatever its method.
+	ConsequenceForm Consequence = "form-submission"
+	// ConsequenceChannel — a channel that is not HTTP(S): WebSocket, WebRTC (spec §6.2, §6.2b).
+	ConsequenceChannel Consequence = "non-http-channel"
+	// ConsequenceDownload — a GET that would write to disk.
+	ConsequenceDownload Consequence = "download"
+	// ConsequenceNewTarget — a popup or new tab (spec §5.4).
+	ConsequenceNewTarget Consequence = "new-target"
+	// ConsequenceScheme — data:, blob:, javascript: (spec §6.2; contained by CSP, not cancellable).
+	ConsequenceScheme Consequence = "schemeless-navigation"
+	// ConsequenceOffAllowlist — a document from a host the profile does not admit (spec §5.4).
+	ConsequenceOffAllowlist Consequence = "off-allowlist"
+)
+
+// Refusal is a refusal by the fence: a named consequence, and a detail for the human reading a log.
+type Refusal struct {
+	Consequence Consequence `json:"consequence"`
+	Detail      string      `json:"detail,omitempty"`
+}
+
+// ActResult is the answer to an Act. Exactly one of the two states is meaningful, and Refusal is
+// non-nil precisely when Outcome is OutcomeRefused — see Valid.
+type ActResult struct {
+	Outcome Outcome  `json:"outcome"`
+	Refusal *Refusal `json:"refusal,omitempty"`
+}
+
+// Valid reports whether an ActResult is internally consistent. A driver that returns a refusal with
+// no consequence, or a "done" carrying one, has a bug that would otherwise surface as the agent
+// being told nothing at all.
+func (r ActResult) Valid() bool {
+	switch r.Outcome {
+	case OutcomeDone:
+		return r.Refusal == nil
+	case OutcomeRefused:
+		return r.Refusal != nil && r.Refusal.Consequence != ""
+	default:
+		return false
+	}
+}
+
+// Refused builds a refusal result.
+func Refused(consequence Consequence, detail string) ActResult {
+	return ActResult{
+		Outcome: OutcomeRefused,
+		Refusal: &Refusal{Consequence: consequence, Detail: detail},
+	}
+}
+
+// Done builds a successful result.
+func Done() ActResult { return ActResult{Outcome: OutcomeDone} }
+
+// HandoffTicket is the driver's half of passing the wheel: the session is ready to be shown to a
+// person. The núcleo turns this into a proposal (spec §4.4); the driver does not decide that a
+// human's attention gets spent, it only reports that the session can take one.
+type HandoffTicket struct {
+	SessionID SessionID `json:"session_id"`
+	Mode      Mode      `json:"mode"`
+	URL       string    `json:"url"`
+	Reason    string    `json:"reason"`
+}
+
+// ErrFenceNotAttached is the failure that spec §6.2a exists to force:
+//
+//	"Se o interceptor não estiver atado, o separador não navega."
+//
+// A driver returns it rather than opening an unfenced session. It is separate from every other
+// error because a fence that is absent is indistinguishable, from the outside, from a fence that is
+// open — and the whole non-Acts classification of these tools (spec §6.0) rests on it being there.
+var ErrFenceNotAttached = errors.New("browser: fence is not attached, refusing to navigate")
+
+// ErrNoSuchSession is returned for an unknown or already-closed SessionID.
+var ErrNoSuchSession = errors.New("browser: no such session")
+
+// ErrUnsupported is returned by a driver that cannot do something the contract allows.
+var ErrUnsupported = errors.New("browser: unsupported by this driver")
+
+// Driver is the seam. Six verbs, matching spec §6.1.
+type Driver interface {
+	// Open starts a session. It MUST fail with ErrFenceNotAttached rather than navigate without
+	// the fence in place, in agent mode.
+	Open(ctx context.Context, req OpenRequest) (Session, error)
+	// Snapshot returns the accessibility view. Cheap enough to call between every action.
+	Snapshot(ctx context.Context, id SessionID) (Snapshot, error)
+	// Act performs one action. A fence refusal is a value, not an error.
+	Act(ctx context.Context, id SessionID, action Action) (ActResult, error)
+	// Screenshot returns PNG bytes, for a person to look at.
+	Screenshot(ctx context.Context, id SessionID) ([]byte, error)
+	// Handoff prepares the session to be driven by a person.
+	Handoff(ctx context.Context, id SessionID, reason string) (HandoffTicket, error)
+	// Close ends the session and releases its profile. It is the only verb of the six that reads
+	// nothing from the page, which is why it is the only ReadsOwn tool of the set (spec §6.1a).
+	Close(ctx context.Context, id SessionID) error
+	// Name identifies the driver in logs and in the health readout.
+	Name() string
+}
