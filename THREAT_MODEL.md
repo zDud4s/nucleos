@@ -161,9 +161,22 @@ and the fence is now three things, none of which is sufficient alone:
    browser session the same request is intercepted and the registration does not happen. This was never a limit of
    Chrome; it was where the fence hung.
 2. **A loopback proxy the browser is launched behind.** `Network.setBlockedURLs` does NOT stop a WebSocket handshake —
-   measured, with a control — and `Fetch` never sees a `ws://` url at all. The proxy sees it as `CONNECT host:port` and
-   can refuse. `setBlockedURLs` is no longer relied on for anything.
-3. **CSP injected by rewriting response headers**, which is what covers the channels the other two cannot see.
+   measured, with a control — and `Fetch` never sees a `ws://` url at all. The proxy sees a plaintext `ws://` handshake
+   as an ordinary `GET` carrying `Upgrade` and refuses it. `setBlockedURLs` is no longer relied on for anything.
+   **It is a thin layer and is described as one:** `wss://` reaches it as `CONNECT host:443`, byte-identical to the
+   CONNECT for any https sub-resource, and everything inside that tunnel is TLS to a host the page chose. An earlier
+   version of the design also had it refusing any CONNECT to a port other than 443; that rule was removed rather than
+   kept for comfort, because a page wanting to reach a host of its choosing does it on 443, so the rule stopped nothing
+   while breaking a configuration the design supports on purpose — an origin with its own port.
+3. **CSP injected by rewriting response headers**, which is what covers the channels the other two cannot see —
+   `connect-src 'none'` is what closes `wss://`, since no CSP source expression can admit `https:` while refusing `wss:`.
+4. **Loopback is refused unless the profile names it.** Agent mode is launched with `--proxy-bypass-list=<-loopback>` so
+   that the fence sees loopback traffic at all; the consequence is that a page can address the núcleo's own HTTP API, the
+   other sidecars, and — this is the one that matters — the browser's own debugging port, which needs no token and grants
+   control of every profile on the machine. The fence refuses every loopback destination, in both layers and for
+   sub-resources as well as documents, unless an explicit per-profile list names it. That list is separate from the site
+   allowlist on purpose: the two fail in opposite directions, and one list would mean an entry added to reach a site
+   silently opening one of ours.
 
 Plus `--block-new-web-contents`, which makes `window.open` return null, and `Target.setAutoAttach` with
 `waitForDebuggerOnStart`, which is what closes the window in which a new target could navigate before the interception
@@ -191,8 +204,18 @@ forget: `chrome.Connect` is the only constructor, it arms the fence first, and i
   successor, and top-level `data:` is refused by Chrome itself. What contains the other two is that a `blob:` document
   **inherits the parent's CSP** — measured, with a control that escapes when the parent carries none. So the residual is
   that the agent can be reading a document the URL bar misdescribes. It is not a path for data to leave.
-- **Sub-resources are not filtered.** A permitted site that loads a script from a compromised CDN exposes the profile.
-  This is equally true in the person's own browser; it is stated rather than solved.
+- **Sub-resources are not filtered**, except on loopback. A permitted site that loads a script from a compromised CDN
+  exposes the profile. This is equally true in the person's own browser; it is stated rather than solved. Loopback is the
+  one exception, and it is an exception because nothing on `127.0.0.1` belongs to a web page.
+- **Private address ranges are not refused.** `10/8`, `172.16/12` and `192.168/16` are somebody's intranet as often as
+  they are an attack, and a browser that could not reach an internal Jira is a browser nobody uses. Loopback has no such
+  reading, which is why it is treated differently rather than lumped in.
+- **The site allowlist is not exercised against a real browser.** The rule itself is table-tested and the WIRING is
+  proven against Chrome, but proving the https allowlist end to end needs two different hosts over https, and testing
+  against the live internet is forbidden — a suite that depends on somebody else's site fails for reasons that are not
+  ours. Chrome's `--host-resolver-rules` would map two names onto loopback, but with a proxy configured Chrome does not
+  resolve at all. So what a real Chrome demonstrates is that a refused document really does stop; WHICH rule refused it
+  is demonstrated elsewhere.
 - **Chromium talks to Google on its own.** A `crashpad-handler` runs with `--url=https://clients2.google.com/cr/report`
   and survives `--disable-crash-reporter`, `--disable-breakpad`, `--no-report-upload` and
   `--disable-background-networking`. **No upload was demonstrated** — the process carrying a url is not a report being
@@ -319,5 +342,7 @@ typo in a list of model names cannot stop the daemon and take mail, autopilot an
 12. Nothing in the council has been exercised against a real model. Every integration test drives a scripted `CommandRunner`, and a local seat is proved only as far as landing its `runs` row — no seat, cloud or local, has produced an answer. There is no `.ai/council.yaml` on this machine, so the pillar is dark; the first roster written is the first contact, and the phase-2 and phase-3 prompts are the part with no evidence behind them yet.
 13. **WebRTC leaves the browser pillar's fence open**, and nothing inside Chrome closes it — see "The browser" above for the six mechanisms measured and rejected. The bound is same-origin: a page exfiltrates what is already its own. The remaining mechanism is a firewall rule on the Chromium process, which nobody has written or tested. This is the one hole that would, if it turned out to be wider than stated, require the browser tools' non-`Acts` classification to be revisited.
 14. **An arbitrary `GET` under the owner's authenticated identity** is reachable by `browser_open(url)` on any path of a permitted host. `GET` is not a safe verb in practice — `/logout`, `/unsubscribe?token=…`, `/approve?id=…`. Nothing mitigates it in v1. The designed path is a human-approved proposal, which is not built.
-15. **Nothing in the browser pillar has been exercised against a real browser under the fence.** The driver is tested against a fake CDP endpoint; the mechanisms were measured by a throwaway spike harness, not by the shipped code. The pillar is `enabled: false` and the first `true` is the first contact — the same shape as gaps 10 and 12, recorded before it can be forgotten rather than after.
-16. **The Chromium is pinned but the patching has no owner.** The install refuses an archive without a pinned sha256, and a revision bump is a new directory rather than an overwrite. What does not exist is the process that decides when to bump: a browser that never updates is a browser accumulating known holes, and "we own the version" is only an advantage while somebody moves it.
+15. **The browser pillar's fence is now exercised against a real browser, and the first run found two defects the unit tests could not.** `ServiceWorker.enable` does not exist on the browser session — real Chrome answers -32601 — and `Fetch.continueResponse` rejects a status without headers, which sent every non-document response down the failure path and blocked pages the fence meant to allow. Both passed the unit tests, because a fake CDP endpoint answers everything. The gap that remains is narrower and worth stating in its own terms: what runs against Chrome is a small group behind a build tag, it needs a browser present or it skips, and the pinned Chromium is not installed on any machine yet — so the group has only ever run against a system Chrome of the same major version.
+16. **A page can address this machine unless the profile's loopback list says otherwise.** The fence refuses loopback by default and the browser's own debugging port is the destination that matters, but the defence is a list somebody has to keep right: an entry added to reach a local dev server admits every path on that origin, and the entry outlives the reason it was added. Nothing expires it and nothing warns when a listed port starts answering as something else.
+
+17. **The Chromium is pinned but the patching has no owner.** The install refuses an archive without a pinned sha256, and a revision bump is a new directory rather than an overwrite. What does not exist is the process that decides when to bump: a browser that never updates is a browser accumulating known holes, and "we own the version" is only an advantage while somebody moves it.
