@@ -298,6 +298,33 @@ fn errand_not_answering(errand: &crate::errands::Errand) -> String {
     )
 }
 
+/// Why a turn was refused before it cost anything: the emergency stop is engaged.
+///
+/// A whole message and not a prefix, unlike `ERRAND_NOT_ANSWERING` — there is nothing to name, the
+/// stop is one switch. Its own constant, and further down its own status code, because a person
+/// looking at a topic that has gone quiet has two possible reasons and they are undone by different
+/// gestures: `/retomar` releases a paused errand, `/kill off` releases this one. Told only that the
+/// turn was refused, they would try the wrong one.
+pub const KILL_ENGAGED: &str =
+    "the emergency stop is engaged; this errand answers nothing until it is released";
+
+/// Whether the emergency stop forbids this turn.
+///
+/// **A stop that cannot be read counts as engaged.** The other reading — could not tell, so carry
+/// on — turns any database hiccup into a silent re-arming of the one control that exists to stop
+/// everything, and nothing about the resulting turn would look wrong. The read is cheap and it is
+/// the last thing in the system that a person can rely on when everything else has gone strange, so
+/// it pays the cost of the false positive.
+async fn kill_switch_forbids(pool: &sqlx::SqlitePool) -> bool {
+    match crate::autopilot::kill_switch_engaged(pool).await {
+        Ok(engaged) => engaged,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the emergency stop; treating it as engaged");
+            true
+        }
+    }
+}
+
 /// The errand behind this conversation, ready to be worked in — or `None`, which is the common
 /// answer.
 ///
@@ -379,6 +406,15 @@ pub async fn send_message(
     // Resolved before anything else, because both refusals it can produce have to happen while the
     // turn still costs nothing.
     let errand = errand_turn(state, chat_id).await?;
+
+    // The emergency stop, asked only when there is an errand. It governs what the machine does on
+    // its own — which is what an errand is about to become — and not whether the owner may talk to
+    // their own bot. A stop that also takes the conversation off the air is a stop nobody engages,
+    // and one nobody engages stops nothing. Asked here so the refusal, like the two above it,
+    // happens while the turn still costs nothing.
+    if errand.is_some() && kill_switch_forbids(&state.pool).await {
+        return Err(KILL_ENGAGED.to_string());
+    }
 
     // Who answers this conversation. Three steps, in order of how specific the fact is: the
     // errand's own row, then the chat's, then the origin — every Telegram conversation that is
@@ -2579,5 +2615,61 @@ mod tests {
             Box::new(Capturing(seen)),
             Box::new(NoTools),
         ))
+    }
+
+    /// The emergency stop reaches an errand. Until this passed it did not: `kill_switch_engaged`
+    /// existed and only `repo_trigger.rs` ever asked it, so an errand — the one kind of chat the
+    /// scheduler will soon start on its own — was the one thing the stop could not stop.
+    #[tokio::test]
+    async fn the_kill_switch_stops_an_errands_turn() {
+        let (state, _dir, _runner) = errand_state().await;
+        open_errand(&state, "carros", "-1:20").await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let outcome = send_message(&state, "-1:20", "procura", Origin::Telegram).await;
+
+        assert_eq!(outcome, Err(KILL_ENGAGED.to_string()));
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "a turn refused by the brake costs nothing");
+    }
+
+    /// The other half, and the one that decides whether the first is acceptable: an ordinary chat
+    /// still answers with the stop engaged. The kill switch is about what runs on its own, not
+    /// about whether the owner may talk to their own bot — and a stop that also takes the chat off
+    /// the air is a stop nobody will engage.
+    #[tokio::test]
+    async fn the_kill_switch_does_not_silence_an_ordinary_chat() {
+        let state = test_state().await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let id = send_message(&state, "conversa", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(settled_turn(&state.pool, id).await.0, "completed");
+    }
+
+    /// A stop that cannot be read is a stop that is on. The alternative reading — "could not tell,
+    /// so carry on" — is a database hiccup silently re-arming the one control that exists to stop
+    /// everything, and nothing about it would look wrong.
+    #[tokio::test]
+    async fn a_kill_switch_that_cannot_be_read_is_engaged() {
+        let (state, _dir, _runner) = errand_state().await;
+        open_errand(&state, "carros", "-1:21").await;
+        sqlx::query("DELETE FROM autopilot_global")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let outcome = send_message(&state, "-1:21", "procura", Origin::Telegram).await;
+
+        assert_eq!(outcome, Err(KILL_ENGAGED.to_string()));
     }
 }

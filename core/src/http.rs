@@ -1644,6 +1644,12 @@ async fn post_assistant_message(
         Err(msg) if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
             Err(StatusCode::CONFLICT)
         }
+        // 423 and not a third 409, because 409 already carries two meanings on this route — a chat
+        // mid-turn and an errand on hold — and this is a third with a different undoing. A topic
+        // that has gone quiet is answered with `/retomar` when it is paused and `/kill off` when it
+        // is this, and one number for both leaves the sidecar to guess. Locked is the accurate word:
+        // the errand is active and conflicts with nothing; a decision taken elsewhere holds it shut.
+        Err(msg) if msg == crate::assistant::KILL_ENGAGED => Err(StatusCode::LOCKED),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -6512,6 +6518,33 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// The emergency stop gets a code of its own, and 409 is why. A topic that has gone quiet has
+    /// two undoings — `/retomar` for a pause, `/kill off` for the stop — and both refusals arriving
+    /// as the same number leaves the sidecar guessing which sentence to say. 423 because the errand
+    /// is not in conflict with anything: it exists, it is active, and it is locked by a decision
+    /// taken elsewhere.
+    #[tokio::test]
+    async fn the_emergency_stop_is_not_the_same_refusal_as_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = with_files_root(test_state().await, dir.path().to_path_buf());
+        crate::errands::create(&state.pool, "carros", "-1:98")
+            .await
+            .unwrap();
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": "-1:98", "text": "procura", "origin": "telegram"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::LOCKED);
     }
 
     #[tokio::test]
