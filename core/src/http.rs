@@ -126,6 +126,9 @@ pub fn build_router(state: AppState) -> Router {
         // node leaves the tree holding edits no gate measured — but only this one reaches a job
         // that has no node in flight: parked for budget, waiting for the slot, or between nodes.
         .route("/jobs/{id}/cancel", post(cancel_job))
+        // Speaking to a job that is already running. Scoped like `POST /runs/{id}/message` and
+        // deliberately NOT like the `POST /jobs` one segment above it — see `post_job_note`.
+        .route("/jobs/{id}/notes", post(post_job_note))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -3858,6 +3861,73 @@ async fn cancel_job(
         Ok(crate::job::CancelOutcome::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct LeaveNoteRequest {
+    body: String,
+}
+
+#[derive(serde::Serialize)]
+struct LeaveNoteResponse {
+    note_id: i64,
+}
+
+/// `POST /jobs/{id}/notes` — leaves words for whichever of this job's nodes comes next.
+///
+/// **Admin, by being in no scope table at all.** `auth::permits` is default-deny, so a route nobody
+/// lists is reachable only by Control and Admin, and that is the grade this one wants. The table it
+/// must not be added to is `RUN_CREATING_ROUTES`, where `POST /jobs` sits one path segment away:
+/// creating a job authorises the prompt supplied at that moment, in advance of the work existing,
+/// while a note adds a second author to work already running past every check its creation went
+/// through. That is exactly why `POST /runs/{id}/message` is kept out of the same table, and a note
+/// is steering with a longer wait.
+///
+/// The author is [`notes::OWNER`] and never a field of the body. Only Control and Admin arrive here
+/// and both of them are the person, so there is nothing for a caller to claim to be — and a note
+/// that could name its own author is the first half of a run leaving notes for another run.
+///
+/// 201 rather than 204 because the note now has an id and a life the caller can watch: it appears in
+/// `GET /jobs/{id}` while it waits, and carries the run it eventually reached once it has been read
+/// out. The acknowledgement says only that the words were accepted — nothing has read them yet, and
+/// the next node may be minutes away or may be the review at the end of the night.
+///
+/// A note left on a job that has already finished is accepted and never delivered. Refusing it would
+/// mean deciding here what "still able to hear you" means, and the honest place to see that is the
+/// job detail, where the note sits visibly undelivered beside a job that is over.
+async fn post_job_note(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<LeaveNoteRequest>,
+) -> Result<(StatusCode, Json<LeaveNoteResponse>), StatusCode> {
+    // A note with no words is not a note: it would be an entry in the queue that delivers nothing
+    // and can never be delivered again.
+    let body = request.body.trim();
+    if body.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Asked before the insert so a note for a job that does not exist is a 404 and not the 500 the
+    // foreign key would otherwise make of it.
+    let job: Option<i64> = sqlx::query_scalar("SELECT id FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(job_id = id, %error, "reading a job to leave a note on it failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if job.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    crate::notes::leave(&state.pool, id, body, crate::notes::OWNER)
+        .await
+        .map(|note_id| (StatusCode::CREATED, Json(LeaveNoteResponse { note_id })))
+        .map_err(|error| {
+            tracing::warn!(job_id = id, %error, "leaving a note on a job failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn post_worktree_release(
@@ -10257,5 +10327,151 @@ mod tests {
         assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
 
         assert_eq!(promotion_feed_rows(&pool).await, 0);
+    }
+
+    /// The sentence an owner would leave, kept in one place so both note tests say the same thing.
+    const A_NOTE: &str = "when you get to item 3, update the docs too";
+
+    async fn notes_left_on(pool: &sqlx::SqlitePool, job_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_notes WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Speaking into work already in flight is Admin's, and RUN-CREATING is the level that matters.
+    ///
+    /// `permits` is default-deny, so a route nobody thought about is already refused to a read-only
+    /// key — which makes the read-only half of this test the cheap half. The expensive one is the
+    /// run-creating key, because `POST /jobs` is in `RUN_CREATING_ROUTES` and a note lives at a URL
+    /// one segment away from it. Filing the note route beside the job route is the natural mistake,
+    /// it reads as consistent, and it is wrong for the reason `POST /runs/{id}/message` is kept out
+    /// of that table: creating a job authorises the prompt supplied at that moment, in advance of
+    /// the work existing, while a note adds a second author to work that is already running past
+    /// every check its creation went through. That is why steering asks for Admin, and a note is
+    /// steering with a longer wait.
+    ///
+    /// The refusals are checked for having written nothing, and the acceptance for having written
+    /// something. Without the first, a route that answered 403 and stored the note anyway would
+    /// pass; without the second, so would a route that answered 200 and did nothing — and either
+    /// would leave the whole test asserting the shape of a status code.
+    #[tokio::test]
+    async fn leaving_a_note_needs_more_than_a_read_only_token() {
+        let state = test_state().await;
+        let job_id = add_job(&state.pool, "project-a").await;
+        let read_only = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let admin = store_api_token_at_level(&state, "administrator", ApiTokenLevel::Admin).await;
+
+        for token in [&read_only, &run_creating] {
+            let response = api_token_request(
+                state.clone(),
+                "POST",
+                &format!("/jobs/{job_id}/notes"),
+                token,
+                Some(serde_json::json!({ "body": A_NOTE })),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "a key that cannot approve anything got to add an author to a job in flight"
+            );
+        }
+        assert_eq!(
+            notes_left_on(&state.pool, job_id).await,
+            0,
+            "a refused request left the note behind anyway, so the refusal protected nothing"
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/jobs/{job_id}/notes"),
+            &admin,
+            Some(serde_json::json!({ "body": A_NOTE })),
+        )
+        .await;
+
+        assert!(
+            response.status().is_success(),
+            "an Admin key may leave a note; a door nothing can open is an outage, not a boundary \
+             — got {}",
+            response.status()
+        );
+        assert_eq!(
+            notes_left_on(&state.pool, job_id).await,
+            1,
+            "the route answered as though it had taken the note and stored nothing"
+        );
+    }
+
+    /// A note is visible while it waits, which is the whole of what makes it worth leaving.
+    ///
+    /// `POST /jobs/{id}/notes` answers before any node has read the words — the next one may be
+    /// minutes away, or may be the review at the end of the night — so the acknowledgement it
+    /// returns says only that the note was accepted. Until `GET /jobs/{id}` shows it, the owner has
+    /// no way to tell a note that is queued from one that was dropped, and the natural response to
+    /// that uncertainty is to leave it a second time.
+    ///
+    /// `delivered_at` is asserted null for the same reason it is the queue: it is the field that
+    /// separates "still waiting" from "already said", and a detail that showed every note without it
+    /// would tell an owner nothing about whether the job has heard them yet.
+    ///
+    /// Both halves go through the real router. Seeding the row by hand and reading it back would
+    /// check that `detail` can select from a table, which is not the question — the question is
+    /// whether the note a person left through the front door comes back out of it.
+    #[tokio::test]
+    async fn a_jobs_detail_shows_the_notes_still_waiting() {
+        let state = test_state().await;
+        let job_id = add_job(&state.pool, "project-a").await;
+
+        let left = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/jobs/{job_id}/notes"),
+            "test-token",
+            Some(serde_json::json!({ "body": A_NOTE })),
+        )
+        .await;
+        assert!(
+            left.status().is_success(),
+            "the note was refused before this test could ask about it — got {}",
+            left.status()
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "GET",
+            &format!("/jobs/{job_id}"),
+            "test-token",
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let notes = detail["notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a job's detail has to carry its notes: {detail}"));
+        assert_eq!(
+            notes.len(),
+            1,
+            "the note the owner left is not on the job they left it on: {detail}"
+        );
+        assert_eq!(
+            notes[0]["body"], A_NOTE,
+            "the words came back changed: {detail}"
+        );
+        assert!(
+            notes[0]["delivered_at"].is_null(),
+            "a note nothing has read yet reads as already delivered, so the owner cannot tell \
+             whether the job has heard them: {detail}"
+        );
     }
 }
