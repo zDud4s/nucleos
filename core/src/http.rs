@@ -1637,6 +1637,13 @@ async fn post_assistant_message(
         // machine has nothing that can — a fact about how it is configured, which the caller can
         // act on by choosing the other model. A 500 would send them looking for a crash.
         Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => Err(StatusCode::SERVICE_UNAVAILABLE),
+        // Also not a 500, and for the same reason: the topic has an errand somebody paused or
+        // closed. That is a state this request conflicts with, which is what 409 already means here
+        // for a chat that is mid-turn — and it is what lets the sidecar answer "that topic is on
+        // hold" instead of reporting a fault that did not happen.
+        Err(msg) if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
+            Err(StatusCode::CONFLICT)
+        }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -6480,6 +6487,31 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A paused errand is a decision somebody made, not a daemon that broke. The sidecar has to be
+    /// able to say "that topic is on hold" rather than "something went wrong", and a 500 is exactly
+    /// the answer that sends a reader looking for a crash that did not happen.
+    #[tokio::test]
+    async fn a_message_to_a_paused_errand_is_refused_without_looking_like_a_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = with_files_root(test_state().await, dir.path().to_path_buf());
+        let errand = crate::errands::create(&state.pool, "carros", "-1:99")
+            .await
+            .unwrap();
+        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": "-1:99", "text": "procura", "origin": "telegram"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
