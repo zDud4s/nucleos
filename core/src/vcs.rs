@@ -28,26 +28,136 @@ use serde::{Deserialize, Serialize};
 /// Typed rather than a command string on purpose: a string would have to be parsed, and parsing
 /// shell is the surface `classifier.rs` exists to keep closed. The daemon builds every argv.
 ///
-/// **Whoever adds the next variant here owes two things that `Merge` did not.**
+/// **Whoever adds the next variant here owes three things that `Merge` did not — and `Push` is what
+/// paying them looks like, so it is worth reading as the worked example rather than as prose.**
 ///
-/// 1. `git_exec::run_git` justifies having no process-tree kill with "nothing here hands git a
-///    shell". That is true of `merge`, and it stops being true the day `Fetch` or `Push` lands and
-///    git starts spawning ssh and credential helpers — which is the exact case spec §7's hung-command
-///    row was written about, a fetch against a dead network. That comment will become wrong without
-///    anybody editing it, so the obligation is recorded here, where the change has to be made.
+/// 1. `git_exec::run_git` justified having no process-tree kill with "nothing here hands git a
+///    shell". That was true of `merge`, and it stopped being true the moment `Push` landed and git
+///    started spawning ssh and credential helpers — the exact case spec §7's hung-command row was
+///    written about. That comment would have become wrong without anybody editing it, which is why
+///    the obligation was recorded here, where the change had to be made. **Paid:** `process_tree.rs`
+///    now holds the one `TreeKiller`, and `run_git` spawns through it.
 /// 2. `Merge`'s `source`/`target` reach argv without a `--end-of-options`, and get away with it by
 ///    accident rather than design: a dashed string can set an option but cannot also name a commit,
 ///    HEAD in the integration worktree is always detached so `merge`'s upstream fallback dies, and
 ///    `update-ref` rejects a dashed ref name. A variant with a different argv shape does not inherit
 ///    any of that. `Branch` is that accident turned into a rule for the two fields `Merge` has; a
-///    variant carrying a name of some other kind owes its own type.
+///    variant carrying a name of some other kind owes its own type. **Paid:** `Push` names its remote
+///    with `Remote`, and its argv carries an explicit `--end-of-options` rather than an argument
+///    about why it does not need one.
 /// 3. The operation names in `from_request` are matched as `&str`, so adding a variant here does NOT
 ///    fail to compile there. Whoever adds one must also take its name out of the "not yet" arm by
 ///    hand, or the queue will go on refusing an operation it has learned to perform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    Merge { source: Branch, target: Branch },
+    Merge {
+        source: Branch,
+        target: Branch,
+    },
+    /// **The first operation that leaves the machine, and the only one so far that a human cannot
+    /// undo by reaching for the reflog.** A merge the queue got wrong is a local ref somebody moves
+    /// back; a push the queue got wrong is on a server other people have already fetched from. That
+    /// is the argument for it needing at least what a merge needs by way of consent, never less —
+    /// and `runs::queueable_operation` gives it exactly the merge's route, where a human's approval
+    /// IS the queueing.
+    ///
+    /// `branch` rather than a refspec, and no force of any kind. The queue builds
+    /// `<sha>:refs/heads/<branch>` itself from the sha the branch names when the operation runs, so
+    /// what is published is a value the row records rather than whatever the ref drifted to; a
+    /// non-fast-forward is then the remote's refusal to record, not ours to overrule.
+    Push {
+        remote: Remote,
+        branch: Branch,
+    },
+    /// **The last command on `classifier.rs`'s approval list that was still handed BACK to the
+    /// agent**, which is the whole reason it comes before `fetch` and `rebase` in a queue that has
+    /// seven operations left to learn. `git push` and `git merge` were the other two and are done;
+    /// `gh pr merge`, `npm publish`, `cargo publish` and `deploy` are not git and are not this
+    /// pillar's. So of every git command that pauses for a human today, this was the only one where
+    /// saying yes still meant the run performed it with its own hands.
+    ///
+    /// `at` is a BRANCH rather than a commit-ish, and that is a real restriction rather than a
+    /// modelling convenience: the executor resolves `refs/heads/<at>`, so `git tag v1 a1b2c3d` is
+    /// refused with a message naming the ref it could not resolve instead of being tagged. Accepting
+    /// a raw sha would make the type's name a lie — `Branch` would hold things that are not branches
+    /// — and the fallback for anyone who wants it is the one every unqueueable spelling gets.
+    ///
+    /// Lightweight only. `-a`/`-s` need a message, and a message is a quoted shell argument — which
+    /// is the one thing `merge_from_command` and its siblings exist to never parse.
+    Tag {
+        name: TagName,
+        at: Branch,
+    },
+    /// The only operation here that publishes nothing and can undo nothing.
+    ///
+    /// It is in the queue anyway, and the reason is the one the module header gives rather than a
+    /// wish to be complete: a fetch writes the ref store and the object database, which is the shared
+    /// state this pillar serialises. Two fetches racing a merge is the same class of collision as two
+    /// merges racing each other, and `.git/packed-refs` is not a file two processes negotiate over
+    /// politely.
+    ///
+    /// **`remote` and nothing else.** No branch, so the remote's own configured refspec decides what
+    /// arrives — which is what the person who ran `git remote add` chose, and not something the queue
+    /// should second-guess. No `--prune`, which deletes tracking refs; no `--tags`, which fetches a
+    /// namespace nobody asked about. Each of those is a different operation wearing this one's name.
+    Fetch {
+        remote: Remote,
+    },
+    /// Deleting a branch, in the one spelling that cannot destroy unmerged work.
+    ///
+    /// `--delete` and never `-D`. The difference is the whole reason this is queueable at all: `-d`
+    /// asks git to refuse when the branch holds commits no other branch has, and `-D` asks it not to
+    /// care. The safe spelling has a guard that is *git's own*, computed from the commit graph the
+    /// daemon does not have to model — so the queue can offer this without owning the question of
+    /// what is safe to lose.
+    ///
+    /// The sha the branch pointed at is recorded, and that is what makes the row an undo: `git branch
+    /// <name> <sha>` restores exactly what was removed. It is the one operation whose `result_sha`
+    /// describes something that no longer exists, which is precisely when a person needs it.
+    ///
+    /// **`rename` because `rename_all = "snake_case"` would spell this variant `branch_delete` while
+    /// `kind()` spells it `branch-delete`, and one row would then carry both.** What that costs is
+    /// legibility rather than correctness, and the distinction is worth stating exactly because the
+    /// first version of this comment got it wrong: `from_stored` re-derives `kind()` from the parsed
+    /// value rather than reading the payload's tag, so the mismatched row parses back perfectly well
+    /// — measured, by a mutation that removed this line and left the round-trip test green. What it
+    /// leaves behind is a row whose `op` column says one word and whose `args` payload says another,
+    /// for anyone reading the queue or filtering it by JSON path. The hyphen wins because it is the
+    /// spelling `from_request` takes from a caller.
+    ///
+    /// Every other variant is a single word, which is why this appears here first — and it will
+    /// appear again for whoever adds a second multi-word one.
+    #[serde(rename = "branch-delete")]
+    BranchDelete {
+        branch: Branch,
+    },
+    /// Replaying `branch` onto `onto`, and **the only operation here that this pillar's publish
+    /// model cannot carry all the way.**
+    ///
+    /// The model is: compute where nobody is standing, then publish with a command that REFUSES
+    /// rather than destroys. `compute_merge` earns the second half by construction — `--no-ff` makes
+    /// the old tip the merge's first parent, so `publish` is always a fast-forward, and
+    /// `merge --ff-only` in the holder's worktree declines on its own if anything is in the way.
+    ///
+    /// A rebase breaks that by definition. The rebased tip and the old tip are divergent, so no
+    /// fast-forward exists, and there is no git command that moves a checkout across a divergence
+    /// while refusing to destroy: `reset --hard` never refuses, and `checkout` refuses but does not
+    /// move the branch. **So when somebody holds the branch, this operation is `Blocked` rather than
+    /// implemented with a reset.** That is not a gap to be filled later — a queue that hard-resets a
+    /// directory a person may be standing in is a different promise from the one this pillar makes,
+    /// and `worktree.rs` guards its own deletes with `is_dangerous_removal_path` on exactly that
+    /// reasoning.
+    ///
+    /// What is left is the case that is both safe and common enough to be worth having: a branch
+    /// nobody has open, computed in the integration worktree and published by the compare-and-swap
+    /// `publish_by_update_ref` already performs. A run's own branch, held by its own paused
+    /// worktree, is refused — and refusing it is right rather than merely safe, since rewriting a
+    /// branch under a paused run is what would corrupt its state on resume.
+    Rebase {
+        branch: Branch,
+        onto: Branch,
+    },
 }
 
 /// A branch name the daemon is willing to put on a git command line.
@@ -78,29 +188,119 @@ pub struct Branch(String);
 
 impl Branch {
     pub fn new(value: &str) -> Result<Self, String> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err("a branch name may not be empty".to_owned());
-        }
-        if value.starts_with('-') {
-            return Err(format!("a branch name may not start with '-': {value}"));
-        }
-        if value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-        {
-            // Both halves are named, because the message is what a caller reads: told only
-            // "whitespace" about a name carrying an ESC it would go looking for a space that is
-            // not there.
-            return Err(format!(
-                "a branch name may not contain whitespace or control characters: {value}"
-            ));
-        }
-        Ok(Self(value.to_owned()))
+        argv_safe(value, "branch name").map(Self)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// PURE: the whole of the argv rule, shared by every name the queue puts on a git command line.
+///
+/// Shared as a function rather than by making one type serve two roles, and the difference is what a
+/// reader can conclude: `Branch` and `Remote` happen to be checked for the same three properties
+/// today, and nothing says they must stay that way — a remote is a config key and a branch is a ref,
+/// and they answer to different authorities. One type would have made "the queue accepts this
+/// remote" and "the queue accepts this branch" literally the same sentence.
+fn argv_safe(value: &str, what: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("a {what} may not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!("a {what} may not start with '-': {value}"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        // Both halves are named, because the message is what a caller reads: told only "whitespace"
+        // about a name carrying an ESC it would go looking for a space that is not there.
+        return Err(format!(
+            "a {what} may not contain whitespace or control characters: {value}"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+/// A remote the daemon is willing to name on a git command line.
+///
+/// Its own type because `Op`'s doc comment says a variant carrying a name of some other kind owes
+/// one, and for the reason `argv_safe` gives about not collapsing two roles into one.
+///
+/// **An argv guard, not a remote validator.** `origin`, `upstream`, and equally a name no `git
+/// remote` in the repository has ever heard of, all pass here — git is the authority on which
+/// remotes exist, and a push to one that does not is a failed row carrying git's own message. What
+/// this refuses is a name that could act as an option. A URL passes too, and that is worth saying
+/// out loud rather than discovering: `git push https://…` is legal, so a caller can push to a
+/// destination the repository never configured. It is exactly as legal as the command the caller
+/// could have run by hand, and the queue's job here is serialization rather than policy — `wip.rs`
+/// and `proposals.rs` are where "may this actor ask for this" is decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Remote(String);
+
+impl Remote {
+    pub fn new(value: &str) -> Result<Self, String> {
+        argv_safe(value, "remote name").map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Remote {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Remote::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The `Branch` counterpart, and it exists for the same reason: tests build remotes from literals.
+#[cfg(test)]
+impl From<&str> for Remote {
+    fn from(value: &str) -> Self {
+        Remote::new(value).expect("a test used an invalid remote name literal")
+    }
+}
+
+/// A tag name the daemon is willing to create.
+///
+/// The third type over `argv_safe`, and the one whose separateness is easiest to justify: `Branch`
+/// and `Remote` both name something that already EXISTS and that git will resolve or refuse. A tag
+/// name names something this operation brings into being, in a namespace nothing else here writes.
+/// One type for all three would have made "the queue accepts this tag" the same sentence as "the
+/// queue accepts this branch", and they answer to different authorities the day either rule moves.
+///
+/// **An argv guard, not a ref validator** — the sentence `Branch` writes out at length, and it holds
+/// here with one consequence worth naming rather than leaving to be discovered: `v1..2`, `a~1` and
+/// `x.lock` all pass, and `git tag` refuses each of them itself. The row then records git's own
+/// message. What this refuses is a name that could act as an option, which is the only thing a
+/// string reaching an argv can do that git cannot answer for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagName(String);
+
+impl TagName {
+    pub fn new(value: &str) -> Result<Self, String> {
+        argv_safe(value, "tag name").map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for TagName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        TagName::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The `Branch` counterpart, for the same reason: tests build tag names from literals.
+#[cfg(test)]
+impl From<&str> for TagName {
+    fn from(value: &str) -> Self {
+        TagName::new(value).expect("a test used an invalid tag name literal")
     }
 }
 
@@ -120,17 +320,38 @@ impl From<&str> for Branch {
 }
 
 /// PURE: a caller-supplied branch name for one named role, or why it is not usable as one.
-fn named_branch(value: Option<&str>, which: &str) -> Result<Branch, String> {
+fn named_branch(value: Option<&str>, operation: &str, which: &str) -> Result<Branch, String> {
     let Some(value) = value else {
-        return Err(format!("a merge needs a {which} branch"));
+        return Err(format!("a {operation} needs a {which} branch"));
     };
     Branch::new(value).map_err(|reason| format!("{which}: {reason}"))
+}
+
+/// PURE: the same, for the one role that names a remote.
+fn named_remote(value: Option<&str>, operation: &str, which: &str) -> Result<Remote, String> {
+    let Some(value) = value else {
+        return Err(format!("a {operation} needs a {which} remote"));
+    };
+    Remote::new(value).map_err(|reason| format!("{which}: {reason}"))
+}
+
+/// PURE: the same, for the one role that names a tag.
+fn named_tag(value: Option<&str>, operation: &str, which: &str) -> Result<TagName, String> {
+    let Some(value) = value else {
+        return Err(format!("a {operation} needs a {which} tag name"));
+    };
+    TagName::new(value).map_err(|reason| format!("{which}: {reason}"))
 }
 
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::Merge { .. } => "merge",
+            Op::Push { .. } => "push",
+            Op::Tag { .. } => "tag",
+            Op::Fetch { .. } => "fetch",
+            Op::BranchDelete { .. } => "branch-delete",
+            Op::Rebase { .. } => "rebase",
         }
     }
 
@@ -142,8 +363,14 @@ impl Op {
     ///
     /// Every rejection names what is wrong, and the rejection for an operation the SPEC lists but
     /// the executor cannot perform yet is deliberately different from the one for a word that is not
-    /// an operation at all. A caller told "unknown operation: push" would go looking for a typo in
-    /// its own request; a caller told "push is not queued yet" knows to wait or do something else.
+    /// an operation at all. A caller told "unknown operation: rebase" would go looking for a typo in
+    /// its own request; a caller told "rebase is not queued yet" knows to wait or do something else.
+    ///
+    /// **`source` and `target` mean the same two things for both operations, and that is why the
+    /// push arm reads backwards at first glance.** `source` is what is being moved and `target` is
+    /// where it goes: for a merge, a branch into a branch; for a push, a branch to a remote. Naming
+    /// the fields after the operation instead would give the tool description two vocabularies for
+    /// one pair of parameters, which is the thing this flat shape exists to avoid.
     pub fn from_request(
         operation: &str,
         source: Option<&str>,
@@ -151,16 +378,71 @@ impl Op {
     ) -> Result<Self, String> {
         match operation.trim().to_ascii_lowercase().as_str() {
             "merge" => Ok(Op::Merge {
-                source: named_branch(source, "source")?,
-                target: named_branch(target, "target")?,
+                source: named_branch(source, "merge", "source")?,
+                target: named_branch(target, "merge", "target")?,
             }),
-            other @ ("rebase" | "push" | "pull" | "fetch" | "tag" | "branch-delete"
-            | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
-                "{other} is not yet queued by this daemon — merge is the only operation the queue \
-                 can execute today"
+            "push" => Ok(Op::Push {
+                branch: named_branch(source, "push", "source")?,
+                remote: named_remote(target, "push", "target")?,
+            }),
+            // The same reading of `source`/`target` the paragraph above sets out, and a tag is the
+            // case that shows it is a rule rather than a coincidence: what MOVES is the branch's tip,
+            // and where it GOES is a new name. A tag is a destination in the sense that matters here
+            // — a ref this operation writes — which is why it is the target and not the source.
+            "tag" => Ok(Op::Tag {
+                at: named_branch(source, "tag", "source")?,
+                name: named_tag(target, "tag", "target")?,
+            }),
+            // The two that break the `source`/`target` pair rather than following it, and reading
+            // the missing half as an error is the point: a fetch names only where it fetches FROM,
+            // and a branch delete names only what goes. Inventing a second parameter to keep the
+            // shape symmetrical would give a caller a field it must leave empty and a tool
+            // description a word it must ignore.
+            "fetch" => Ok(Op::Fetch {
+                remote: named_remote(target, "fetch", "target")?,
+            }),
+            "branch-delete" => Ok(Op::BranchDelete {
+                branch: named_branch(source, "branch-delete", "source")?,
+            }),
+            // `source`/`target` as everywhere else, and a rebase is the case where the pair is least
+            // obvious: what MOVES is the branch's commits, and where they GO is on top of `onto`.
+            "rebase" => Ok(Op::Rebase {
+                branch: named_branch(source, "rebase", "source")?,
+                onto: named_branch(target, "rebase", "target")?,
+            }),
+            // **What is left on the spec's list of nine is NOT a backlog, and this arm no longer
+            // pretends it is.** Every name below has been decided against, each on its own grounds,
+            // and the message says so — a caller told "not yet" waits for a version that is never
+            // coming, which is a worse answer than a refusal it can act on.
+            //
+            // - `pr-merge` is the only one of the nine that is not git. It would put a second binary
+            //   with its own authentication, its own network failures and its own release cadence
+            //   inside the executor — and it would buy none of what this queue is made of, since a
+            //   merge on GitHub's servers is not serialised by a lock held on this machine.
+            // - `pull` is `fetch` then `merge`, and this queue can already do both. Admitting it as
+            //   ONE row would have the queue promise an atomicity it does not have: the two halves
+            //   are separate git invocations, another request can be claimed between them only
+            //   because it cannot — but a single row that half-succeeded would be recorded as one
+            //   failure with no way to say which half. Two rows say exactly what happened, and the
+            //   second is `merge` with a source of `origin/<branch>`, which `Branch` already accepts
+            //   and `compute_merge` already resolves.
+            // - `worktree-add` and `worktree-remove` belong to `worktree.rs`, which owns that
+            //   lifecycle entire: the naming scheme `owner_from_dir_name` parses, the orphan sweeper,
+            //   the removal backoff, and `is_dangerous_removal_path`. `git_exec.rs` already refuses
+            //   to run `worktree prune` up front for this exact reason — "doing that on every merge
+            //   would quietly make this module a co-owner of a lifecycle it has no business in" — and
+            //   executing the other two here would be that same mistake, made deliberately.
+            //
+            // Nothing is deferred any more: the spec's nine are six this queue performs and three it
+            // has decided against, each on its own grounds.
+            other @ ("pull" | "worktree-add" | "worktree-remove" | "pr-merge") => Err(format!(
+                "{other} is not an operation this queue performs, and will not become one — see \
+                 `Op::from_request` for why. It understands merge, push, tag, fetch, branch-delete \
+                 and rebase"
             )),
             other => Err(format!(
-                "unknown operation: {other} — the queue understands merge"
+                "unknown operation: {other} — the queue understands merge, push, tag, fetch, \
+                 branch-delete and rebase"
             )),
         }
     }
@@ -192,20 +474,22 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Human,
-    // **Nothing maps to this, and that is a decision rather than an omission.** `http.rs`'s
-    // `vcs_origin` argues the whole case: in this repo "shell" means the Tauri desktop app, which
-    // holds the *control* token and therefore already arrives as `Human`, and an admin API token is
-    // deliberately NOT recorded as `shell` because that would name the one client that did not make
-    // the call. An arm here would need a scope that means something no scope means today — a
-    // credential belonging to an external session in its own right, distinct from both the desktop
-    // app's control token and a run's.
+    // **A person's own editor session, asking through its safety hook** — `hooks::session_git_decision`.
     //
-    // It survives anyway, because the schema outranks the mapping: the `origin` column's CHECK
-    // constraint accepts `'shell'`, and `Ticket` and `RequestSummary` hand a row's columns back
-    // verbatim rather than parsing them, so such a row can exist and be listed whether or not this
-    // variant does. Deleting it would leave the one enum that is meant to be the authority on that
-    // column unable to name a value the column permits, which is the wrong way round.
-    #[allow(dead_code)]
+    // This said "nothing maps to this, and that is a decision rather than an omission", and it
+    // survived on the argument that the schema outranks the mapping. The caller it was waiting for
+    // is the one it described almost exactly: *"a credential belonging to an external session in its
+    // own right, distinct from both the desktop app's control token and a run's"*. What arrived is
+    // one step off that description and the difference is worth keeping straight — the hook presents
+    // the control token, so the credential is not a session's own; what is a session's own is the
+    // ASKING. `Human` would have been a lie of a readable kind: nobody clicked anything.
+    //
+    // It stays distinct from `Human` for the reason the audit exists. A `human` row means a person
+    // acted in the app; a `shell` row means a person's agent tried to act and was redirected here
+    // instead. Those are different events and the queue is the only place that records the second.
+    //
+    // The Tauri app is NOT this, despite owning the `shell/` directory: it holds the control token
+    // and arrives through `vcs_origin` as `Human`, which is why the name was free.
     Shell,
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
@@ -297,6 +581,63 @@ pub enum ResolveError {
 // itself, so a `Display` here would be dead code that clippy cannot see — trait impls are exempt
 // from dead-code analysis. Whoever gains a caller that wants to print one whole writes it then.
 
+/// The project a directory belongs to, for a caller that knows only where it is standing.
+///
+/// `resolve_repo` goes the other way, from a name the caller already had. This is for the caller that
+/// has no name at all: an interactive session's safety hook, which knows its `cwd` and nothing else.
+/// Both ends meet at the same `ResolvedRepo`, because this returns a project id and hands it straight
+/// back to `resolve_repo` rather than building one — the type has one production constructor for a
+/// reason, and a second would be free to let `root` and `key` disagree.
+///
+/// **The match is on the repository, not on the path**, and that is the whole reason a session in a
+/// linked worktree resolves at all. `C:\Projects\nucleos-assuntos` is not under `C:\Projects\nucleos`
+/// and no prefix test would ever relate them; what relates them is `--git-common-dir`, which both
+/// answer identically. Measured on this repo: thirteen worktrees, thirteen different top levels, one
+/// common dir. That is also precisely why the queue serialises across them for free — the key it
+/// locks on IS that common dir, so `one_running_vcs_request_per_repo` was already counting every
+/// session in every worktree before any of them could reach it.
+///
+/// The parent of the common dir is the main working tree's root. That holds for every repository this
+/// queue can serve and fails only for a bare one, which `repo_key` has already refused by here.
+pub async fn project_for_worktree(
+    pool: &sqlx::SqlitePool,
+    worktree_root: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let key = crate::git_exec::repo_key(worktree_root, deadline).await?;
+    let main_root = std::path::Path::new(&key)
+        .parent()
+        .ok_or_else(|| format!("{key} has no parent, so it names no working tree"))?
+        .to_owned();
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL
+         ORDER BY project_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("could not read the project roster: {error}"))?;
+
+    for (project_id, root) in &rows {
+        // Canonicalised on both sides rather than compared as written. `canonical` returns a Windows
+        // verbatim path and a recorded root is whatever a person typed, so the two spellings reach
+        // one directory and compare unequal — the failure `canonical`'s own doc comment warns about.
+        // A root that has since been deleted canonicalises to an error and is skipped, not fatal:
+        // one stale roster row must not stop the rest of the roster from answering.
+        if let Ok(canonical_root) = crate::git_exec::canonical(std::path::Path::new(root)).await
+            && std::path::Path::new(&canonical_root) == main_root
+        {
+            return Ok(project_id.clone());
+        }
+    }
+
+    Err(format!(
+        "no project on the roster is rooted at {} — the queue takes work for projects it knows, and \
+         a project in `off` mode has its root cleared, so that is the first thing to check",
+        main_root.display()
+    ))
+}
+
 /// The single production path from a project id to a repository the queue may lock.
 ///
 /// Both halves are needed: `autopilot_state` is the only place a root is recorded, and git is what
@@ -329,12 +670,22 @@ pub async fn resolve_repo(
 /// the integration worktree and moves the holder's worktree afterwards when the holder is the one
 /// standing on `B`, which is the case this whole pillar was written around.
 ///
-/// **The strictest possible reading: exactly `git merge <ref>`, three tokens, nothing else.** Not
-/// because more could not be parsed, but because everything else is a DIFFERENT operation.
-/// `--no-ff` asks for a merge commit and `publish` is `--ff-only`; `--squash` does not merge at all;
-/// `--abort` unwinds one; a second ref is an octopus merge. A caller whose spelling is not this one
-/// keeps exactly the behaviour it has always had, rather than having the queue perform something
-/// adjacent to what it wrote.
+/// **The strictest reading that still admits what the queue performs: `git merge <ref>`, with an
+/// optional `--no-ff` on either side of the ref, and nothing else.** Not because more could not be
+/// parsed, but because everything else is a DIFFERENT operation: `--squash` does not merge at all;
+/// `--abort` unwinds one; a second ref is an octopus merge; `--ff` and `--ff-only` both ask for a
+/// fast-forward where this queue always writes a merge commit. A caller whose spelling is not one of
+/// these keeps exactly the behaviour it has always had, rather than having the queue perform
+/// something adjacent to what it wrote.
+///
+/// **`--no-ff` was in that rejected list, and it was there on a false premise** — worth recording,
+/// because the sentence read true and the mistake cost the pillar its whole point for that spelling.
+/// It said `--no-ff` wants a merge commit while `publish` is `--ff-only`, which conflates two
+/// different things: `compute_merge` runs `git merge --no-ff` unconditionally, so the commit this
+/// queue publishes is ALWAYS a merge commit, and `publish`'s `--ff-only` fast-forwards the holder's
+/// checkout ONTO that already-computed commit. `--no-ff` is therefore not adjacent to what the queue
+/// does — it is a literal spelling of it. Refusing it sent the merge back to be performed by the
+/// agent's own hand, which is the one outcome this pillar exists to abolish.
 ///
 /// **This is not the shell parsing `classifier.rs` exists to keep closed, and the difference is
 /// where the output goes.** Nothing here reaches an argv: both names pass through `Branch` — the
@@ -346,10 +697,61 @@ pub async fn resolve_repo(
 /// A `target` of `HEAD` is refused rather than passed on. It is what `rev-parse --abbrev-ref` says
 /// for a detached HEAD, and it is meaningless as a merge target besides — the integration worktree's
 /// own HEAD is always detached, so publishing "into HEAD" names nothing.
+/// PURE: the command segments a shell string holds, in order, with any leading environment
+/// assignments stripped.
+///
+/// **Every parser below matches the WHOLE token list as an exact shape, which is right for what
+/// they are and wrong for what they were being handed.** `merge_from_command` accepts
+/// `[program, subcommand, source]` and nothing longer — a deliberate strictness, argued at length
+/// in its own comment, so that a spelling the queue cannot perform keeps working directly instead
+/// of becoming impossible. But `cd repo && git merge feature` is not a different spelling of merge.
+/// It is the same operation with a shell in front of it, and the exact-shape match cannot see it:
+/// five tokens, no match, `None` — and `session_git_decision` reads `None` as "not mine", which is
+/// an ALLOW. Every guarantee the queue makes was one `cd` away from being optional.
+///
+/// Splitting here rather than loosening the parsers keeps that strictness intact: each segment is
+/// still matched as a whole shape, there are just more of them. A segment that is not a git command
+/// matches nothing, exactly as an unrecognised command does today.
+///
+/// Not a shell parser, and it must not become one. Quoting is ignored, so
+/// `echo "a; git merge x"` yields a segment that parses as a merge and is refused. That direction is
+/// the safe one — the refusal is a sentence a person can reword, and the caller cannot approve
+/// anything with it — and it is the same trade `ask_daemon.py`'s own filter makes for the same
+/// reason.
+pub fn shell_segments(command: &str) -> Vec<&str> {
+    command
+        .split(['\n', '\r', ';', '&', '|', '(', ')'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            // `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and
+            // leaving them in makes `program` read `FOO=bar` and the whole segment parse as nothing.
+            let mut rest = segment;
+            while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+                if head.contains('=') && !head.starts_with('-') {
+                    rest = tail.trim_start();
+                } else {
+                    break;
+                }
+            }
+            rest
+        })
+        .collect()
+}
+
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let [program, subcommand, source] = tokens.as_slice() else {
-        return None;
+    // Matched as whole shapes rather than by filtering the flag out of the token list, and the
+    // difference is what a caller can smuggle: a filter would turn `git --no-ff merge feature` —
+    // which git itself refuses — into a queued merge, performing something nobody could have run.
+    // Here the flag is only ever recognised in argument position, where it is the only thing it can
+    // be. A `source` left holding `--no-ff` (`git merge --no-ff`) falls through to `Branch`, which
+    // refuses a leading dash; that guard is load-bearing here and not merely nearby.
+    let [program, subcommand, source] = match tokens.as_slice() {
+        [program, subcommand, source]
+        | [program, subcommand, "--no-ff", source]
+        | [program, subcommand, source, "--no-ff"] => [program, subcommand, source],
+        _ => return None,
     };
     if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("merge") {
         return None;
@@ -363,11 +765,202 @@ pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     })
 }
 
+/// PURE: the push a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`git push <remote>` and `git push <remote> <branch>`, and nothing else** — the same strictness
+/// posture `merge_from_command` argues at length, applied to an operation where being wrong is worse
+/// because it is public. What that list leaves out is the interesting part, and each exclusion is a
+/// different KIND of thing rather than a longer list of the same one:
+///
+/// - `git push` alone is refused, and it is the one that looks safest. It has no argv of its own —
+///   what it does is read out of `push.default`, `branch.<name>.remote` and the upstream, in a
+///   repository the daemon does not control. The queue would have to guess a destination, and the
+///   spelling that means "the usual place" to the person who typed it means whatever their config
+///   says to us.
+/// - `-u` / `--set-upstream` is refused because the queue's argv would not do it. The push would
+///   succeed, the upstream would not be set, and the row would say `succeeded` — a silent partial
+///   execution, which is worse than a refusal that hands the command back.
+/// - `--force`, `--force-with-lease`, `--delete`, `--tags`, `--all`, `--mirror` are refused because
+///   each is a different operation, in the sense `merge_from_command` uses the word: they destroy or
+///   move things this one only adds to. There is no `--no-ff`-shaped case here — no flag that is
+///   merely a literal spelling of what the executor already does — so nothing is admitted beside the
+///   bare shapes.
+///
+/// The branch is the command's own second word when it has one, and otherwise the branch the
+/// worktree is standing on. `git push origin feature` from a worktree on `master` is a perfectly
+/// ordinary thing to write and does not touch any worktree, so there is no reason to require the two
+/// to agree — but `HEAD` is refused in both routes, whether it arrived from a detached worktree or
+/// was typed, because a queued row naming `HEAD` names nothing by the time it runs.
+pub fn push_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let (program, subcommand, remote, branch) = match tokens.as_slice() {
+        [program, subcommand, remote] => (program, subcommand, remote, current_branch.trim()),
+        [program, subcommand, remote, branch] => (program, subcommand, remote, *branch),
+        _ => return None,
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("push") {
+        return None;
+    }
+    // Both routes, deliberately: `rev-parse --abbrev-ref` says `HEAD` for a detached worktree, and a
+    // caller may equally have typed it. Neither is a branch this queue can push a week later.
+    if branch == "HEAD" {
+        return None;
+    }
+    Some(Op::Push {
+        remote: Remote::new(remote).ok()?,
+        branch: Branch::new(branch).ok()?,
+    })
+}
+
+/// PURE: the tag a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`git tag <name>` and `git tag <name> <branch>`, and nothing else** — the third application of
+/// the posture `merge_from_command` argues. The exclusions are worth naming individually because
+/// they are not one kind of thing:
+///
+/// - **`git tag` alone is a READ.** It lists the repository's tags, and refusing it is not a
+///   restriction: the fallback hands the run a grant and it lists them itself, which is the right
+///   outcome for a command that changes nothing. This is the only one of the three parsers where the
+///   bare two-token form means something entirely different from the operation, rather than meaning
+///   it with the arguments left to config.
+/// - **`-a`, `-s`, `-m` are refused because the queue would have to parse a quoted message**, and
+///   not parsing quoted shell is the whole of `classifier.rs`'s reason to exist. A lightweight tag is
+///   what this executes and an annotated one is a different object, not a decoration on the same one.
+/// - **`-d`, `-f` are the destructive spellings.** One removes a tag and one moves an existing tag
+///   to a new commit, which is the tag equivalent of a force push: it invalidates what anybody who
+///   already fetched believes. The queue creates; it does not overwrite.
+/// - **`-l`, `--list`, `--contains`, `-n` are reads wearing the write's name**, and they are stopped
+///   by `TagName` rather than by this list — a leading dash cannot be a tag name. Named here anyway
+///   because a reader checking whether they are handled should not have to derive it.
+///
+/// The branch is the command's own second word when it has one, and otherwise the branch the
+/// worktree stands on — the same rule `push_from_command` uses, and `HEAD` is refused on both routes
+/// for the same reason: it names nothing by the time a queued row runs.
+pub fn tag_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let (program, subcommand, name, at) = match tokens.as_slice() {
+        [program, subcommand, name] => (program, subcommand, name, current_branch.trim()),
+        [program, subcommand, name, at] => (program, subcommand, name, *at),
+        _ => return None,
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("tag") {
+        return None;
+    }
+    if at == "HEAD" {
+        return None;
+    }
+    Some(Op::Tag {
+        name: TagName::new(name).ok()?,
+        at: Branch::new(at).ok()?,
+    })
+}
+
+/// PURE: the rebase a shell command asks for, in the queue's own terms, or `None`.
+///
+/// `git rebase X`, in a worktree whose HEAD is on `B`, means "replay B onto X" — which is
+/// `Rebase { branch: B, onto: X }`, the mirror of how `merge_from_command` reads its own two halves.
+///
+/// **Everything with a flag is refused, and unlike the other parsers there is no accepted one.**
+/// `-i` opens an editor, which is a human sitting at a terminal that does not exist here.
+/// `--continue`, `--abort` and `--skip` operate on a rebase already in progress — a state this queue
+/// never leaves behind, since a conflicted compute aborts before the row is written. `--onto` takes a
+/// third ref and means something the two-field shape cannot hold. `--exec` runs an arbitrary command
+/// per commit, which is a shell by another name.
+///
+/// Bare `git rebase` is refused for `git push`'s reason: it replays onto the configured upstream, in
+/// a repository the daemon does not control.
+///
+/// **Every rebase that arrives through this parser blocks, and that is structural rather than
+/// incidental.** The branch is the worktree's own — this function has no other one to name — and a
+/// run's worktree is precisely what holds it, so `GitExecutor`'s holder check finds the caller
+/// itself and refuses. Measured end to end: an approved `git rebase master` in a run's worktree
+/// wrote `blocked`, naming that worktree, and the takeover grant left the run unable to perform it
+/// by hand either. That is the correct answer and not a gap — the branch the queue would rewrite is
+/// the one the paused run resumes onto, and rewriting it underneath is what would corrupt the run.
+/// The publishing half is reached from `POST /vcs/requests`, where a caller names a branch nobody
+/// has open; that half is proven too, and moves the ref through `publish_by_update_ref`'s
+/// compare-and-swap rather than through the rebase.
+pub fn rebase_from_command(command: &str, current_branch: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, onto] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("rebase") {
+        return None;
+    }
+    if current_branch.trim() == "HEAD" {
+        return None;
+    }
+    Some(Op::Rebase {
+        branch: Branch::new(current_branch).ok()?,
+        onto: Branch::new(onto).ok()?,
+    })
+}
+
+/// PURE: the fetch a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`git fetch <remote>` exactly.** Bare `git fetch` is refused for `git push`'s reason and not for
+/// `git tag`'s: it is not a read wearing the write's name, it is the operation with its destination
+/// left to `branch.<name>.remote` and `remote.pushDefault` in a repository the daemon does not
+/// control. `--all` fetches from remotes nobody named, `--prune` deletes tracking refs, and `--tags`
+/// pulls in a namespace the refspec deliberately leaves out — three different operations, and the
+/// argv guard stops none of them, so the shape has to.
+pub fn fetch_from_command(command: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, remote] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("fetch") {
+        return None;
+    }
+    Some(Op::Fetch {
+        remote: Remote::new(remote).ok()?,
+    })
+}
+
+/// PURE: the branch deletion a shell command asks for, in the queue's own terms, or `None`.
+///
+/// **`-d` and `--delete`, never `-D` and never `--delete --force`**, and this is the one parser
+/// where the accepted flag is mandatory rather than optional. `git branch <name>` CREATES a branch —
+/// `classifier.rs` pins that exact ambiguity as the reason `git branch` is on its
+/// `SAFE_EXACT_COMMANDS` list in its listing spellings only — so a shape that read the flag as
+/// optional would queue a deletion for a command that asked for a creation.
+///
+/// The distinction between the two spellings is not stylistic: `-d` refuses when the branch holds
+/// commits no other ref reaches, and `-D` deletes anyway. That refusal is git's, computed from the
+/// commit graph, and it is the entire reason this operation can be offered at all — the queue never
+/// has to decide what is safe to lose. `-D` asks git to stop answering that question, so it falls
+/// back to the grant like every other unqueueable spelling.
+pub fn branch_delete_from_command(command: &str) -> Option<Op> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, subcommand, flag, branch] = tokens.as_slice() else {
+        return None;
+    };
+    if !program.eq_ignore_ascii_case("git") || !subcommand.eq_ignore_ascii_case("branch") {
+        return None;
+    }
+    // Case-sensitive on purpose, and it is the only place in these parsers where that is load-
+    // bearing rather than incidental: `-d` and `-D` differ by case alone and mean the safe and the
+    // unsafe thing. Folding here would turn every `-D` into the spelling this queue accepts.
+    if *flag != "-d" && !flag.eq_ignore_ascii_case("--delete") {
+        return None;
+    }
+    Some(Op::BranchDelete {
+        branch: Branch::new(branch).ok()?,
+    })
+}
+
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
-/// autonomous and start `awaiting_approval`. The transition out of `awaiting_approval` — approved
-/// into `queued`, or `rejected` — belongs to Chunk 4 alongside the `proposals.rs` wiring that
-/// grants it; this function only ever writes the initial state.
+/// autonomous and start `awaiting_approval`.
+///
+/// **Nothing writes the transition out of `awaiting_approval`, and that is settled rather than
+/// pending.** This said it belonged to Chunk 4 "alongside the `proposals.rs` wiring that grants it".
+/// Chunk 4 landed and took the other road, the one `auth.rs` had already argued for: a run may not
+/// queue on its own behalf at all (*"Queueing is Admin's"*), so `resume_approved_run` admits an
+/// approved action directly as `Origin::Human` and no row ever starts at `awaiting_approval` in
+/// production. `drain_once` carries the full account. This function still only writes the initial
+/// state, and the `Run`/`Job` arm is the shape the day a scope exists that may ask for itself.
 ///
 /// The repository arrives resolved rather than as fields to be trusted — see `ResolvedRepo`.
 pub async fn submit(
@@ -441,7 +1034,22 @@ pub struct ClaimedRequest {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     /// Ran, and did what was asked.
-    Succeeded { sha: String, output_tail: String },
+    ///
+    /// **`sha` is optional because not every operation produces one**, and that is a fact about the
+    /// vocabulary rather than a hedge. A merge, a push, a tag and a branch delete each name exactly
+    /// one object id worth recording — what was published, what was sent, what was tagged, what was
+    /// removed and could therefore be restored. A `fetch` names none: it moves however many
+    /// remote-tracking refs the remote had news about, and picking one of them to put in the column
+    /// would be inventing a headline.
+    ///
+    /// `result_sha` has been nullable since `0048_vcs_requests.sql` and `finish` already writes NULL
+    /// for every non-`Succeeded` outcome, so this makes the type agree with the column rather than
+    /// changing what the column can hold. An empty string would have been the alternative, and it is
+    /// the worse one: a reader cannot tell it from a sha the executor failed to capture.
+    Succeeded {
+        sha: Option<String>,
+        output_tail: String,
+    },
     /// Ran and produced its result, which could not be published because the target worktree's
     /// uncommitted files are in the way. Terminal and never retried in a loop (spec §7): a working
     /// copy left dirty over an afternoon would otherwise hold the whole repository's queue.
@@ -647,7 +1255,7 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     // each arm — see its doc comment for why there is only one place that names a status.
     let status = outcome.status();
     let (result_sha, failure_reason, exit_code, output_tail) = match outcome {
-        Outcome::Succeeded { sha, output_tail } => (Some(sha), None, None, Some(output_tail)),
+        Outcome::Succeeded { sha, output_tail } => (sha, None, None, Some(output_tail)),
         Outcome::Blocked {
             reason,
             output_tail,
@@ -820,6 +1428,28 @@ pub const DEFAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(45)
 /// `VcsExecutor` staying a plain trait rather than a channel.
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// The statuses a request can no longer leave.
+///
+/// A positive list rather than `NOT IN ('queued','running','awaiting_approval')`, and
+/// `council::prune` argues which way that mistake falls: a status added later and forgotten here
+/// simply never ages out and never ends a wait early — a caller kept waiting and a row too many,
+/// rather than a row swept while something was still writing to it.
+///
+/// **`rejected` is in this list and nothing writes it**, which is the one entry worth arguing.
+/// `Ticket`'s doc comment records that it is in the `status` column's CHECK constraint and that
+/// `cancelled` sat in exactly that position until `cancel_for_run` arrived. Both readers of this
+/// list want it there before that happens: a wait on a rejected row would otherwise run to the
+/// deadline on a row that can never change, and its tail would never age out. Neither is observable
+/// today, and both become wrong silently on the day the status is first written.
+pub const TERMINAL_STATUSES: [&str; 6] = [
+    "succeeded",
+    "failed",
+    "blocked",
+    "rejected",
+    "cancelled",
+    "interrupted",
+];
+
 /// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
 /// comes first — and returns a `Ticket` either way.
 ///
@@ -853,10 +1483,13 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// missing row is not "hasn't arrived yet" — it cannot ever arrive — and polling it out to the
 /// deadline would just be quietly burning the caller's wait on a request that does not exist.
 ///
-/// The hedge is deliberate: that is a claim about the whole module, not about this function, and the
-/// first retention or cleanup pass added anywhere in `vcs.rs` invalidates it silently — the failure
-/// would be a caller told "no such request" about one that merely aged out. Whoever adds pruning
-/// owns revisiting this.
+/// The hedge was deliberate: that is a claim about the whole module, not about this function, and
+/// the first retention or cleanup pass added anywhere in `vcs.rs` would invalidate it silently — the
+/// failure being a caller told "no such request" about one that merely aged out. **Pruning has since
+/// arrived and the claim still holds**, because `prune_output_tails` empties `output_tail` and keeps
+/// the row rather than deleting it — a shape it was pushed into by `action_grants.queued_request_id`
+/// having no foreign key, and which happens to discharge this obligation for free. The hedge stays
+/// written down because the next cleanup pass inherits it.
 ///
 /// Reads before it ever sleeps, and every subsequent iteration does the same: the terminal check
 /// runs on freshly read data, not on whatever the previous iteration saw, so a row that finishes
@@ -879,10 +1512,7 @@ pub async fn wait_for(
             return Err(sqlx::Error::RowNotFound);
         };
 
-        let terminal = matches!(
-            status.as_str(),
-            "succeeded" | "failed" | "blocked" | "interrupted" | "cancelled"
-        );
+        let terminal = TERMINAL_STATUSES.contains(&status.as_str());
         if terminal || started.elapsed() >= deadline {
             return Ok(Ticket {
                 id,
@@ -1090,6 +1720,83 @@ pub async fn reap_requests_of_ended_runs(
     Ok(reaped.len() as u64)
 }
 
+/// How long a finished request keeps what git printed.
+///
+/// Thirty days, the same window `runs::prune_transcripts` gives a run's transcript, because it is
+/// the same kind of thing: the tail is what a subprocess said, kept so a person can read why an
+/// operation ended the way it did, and nobody reads that a month later. What people DO read months
+/// later is the metadata — which operation, against which repository, which sha came out — and that
+/// is a couple of hundred bytes.
+///
+/// The bulk is real rather than theoretical: `git_exec::OUTPUT_TAIL_BYTES` caps one tail at 8 KiB,
+/// and a conflicted merge in a large repository reaches it.
+pub const DEFAULT_OUTPUT_RETENTION_DAYS: i64 = 30;
+
+/// The window, overridable for an operator who wants a different one — the shape
+/// `runs::transcript_retention_days` uses, for the reason it gives.
+pub fn output_retention_days() -> i64 {
+    std::env::var("NUCLEOS_VCS_OUTPUT_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_OUTPUT_RETENTION_DAYS)
+}
+
+/// Empties the output of every finished request past the window, leaving the row.
+///
+/// **The row survives, and here that is not merely the tidier choice — it is the only correct one.**
+/// `runs::prune_transcripts` keeps its rows because a feed entry, a job item or a proposal still
+/// points at them. This table has a sharper version of the same fact: `action_grants.queued_request_id`
+/// (migration 0054) names a request by id and carries **no foreign key** — checked, it is a bare
+/// `INTEGER`. So a DELETE would not fail and would not cascade; it would leave a takeover grant
+/// pointing at nothing, and `proposals::matching_queued_request` would go on telling a run that
+/// request 7 holds its work.
+///
+/// It also discharges, rather than merely dodging, the obligation `wait_for` records: that function
+/// answers `RowNotFound` immediately because a missing row *cannot ever arrive*, and its doc comment
+/// says the first pruning pass in this module invalidates that silently. Emptying instead of
+/// deleting keeps it true by construction.
+///
+/// `COALESCE(finished_at, created_at)` because a terminal row with no finish stamp is possible —
+/// `reconcile_interrupted` writes one, but a hand-edited or half-written row need not — and ageing
+/// such a row from nothing would exempt it for ever.
+///
+/// The cutoff is RFC 3339 built in Rust and never SQLite's `datetime('now','-N days')`, for the
+/// reason `web::prune` sets out in full and the other three sweeps repeat: the two spellings are
+/// compared as TEXT and `T` (0x54) sorts after the space (0x20), so within the cutoff's own day a
+/// row hours too old compares as newer and survives every sweep for ever.
+pub async fn prune_output_tails(
+    pool: &sqlx::SqlitePool,
+    retain_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<u64> {
+    if retain_days <= 0 {
+        // Zero would strip every tail on the machine at the next sweep, which is not a retention
+        // policy but a typo with a plausible-looking value. The reading all three existing sweeps
+        // make.
+        return Ok(0);
+    }
+
+    let cutoff = (now - chrono::Duration::days(retain_days)).to_rfc3339();
+    // `AssertSqlSafe` because sqlx only trusts `&'static str` and this is built at runtime. The one
+    // interpolation is a row of `?` derived from a compile-time constant's length; every status and
+    // the cutoff are bound. The same audit `reap_requests_of_ended_runs` writes out above.
+    let placeholders = vec!["?"; TERMINAL_STATUSES.len()].join(", ");
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE vcs_requests
+            SET output_tail = NULL
+          WHERE status IN ({placeholders})
+            AND COALESCE(finished_at, created_at) < ?
+            AND output_tail IS NOT NULL"
+    )));
+    for status in TERMINAL_STATUSES {
+        update = update.bind(status);
+    }
+    // `output_tail IS NOT NULL` above is what makes the count mean something: without it every
+    // eligible row is rewritten on every hourly sweep for ever, and the log would report the same
+    // number until the end of time instead of the number of tails this pass actually dropped.
+    Ok(update.bind(&cutoff).execute(pool).await?.rows_affected())
+}
+
 /// The núcleo↔git boundary, the same seam `runner.rs` gives the núcleo↔model one: this module
 /// decides *when* an operation may run and records how it ended, and this trait is the only thing
 /// that knows how to actually perform one. Chunk 1 has only the test double below, which is why
@@ -1230,13 +1937,21 @@ pub async fn drain_once(
         // `#[cfg(test)] mod tests`. So `run_id` is NULL on every row this table holds, claimable or
         // not, and this `None` throws nothing away.
         //
-        // Two separate things have to land before that stops being true, and Chunk 4 brings both:
-        // the route opening to a run scope, and the `awaiting_approval` → `queued` transition
-        // `proposals.rs` grants — without the second a `Run` request would still never be claimable,
-        // since that is the status `submit` gives it. When they do land, nothing here breaks: a
-        // merge a run asked for appears in the feed with no run attached, which costs the person
-        // reading it the link back and costs the queue nothing. Chunk 4 is where threading it earns
-        // its keep.
+        // **This paragraph used to promise that Chunk 4 would open the route to a run scope, and
+        // that promise contradicted `auth.rs`.** Chunk 4 has since landed and did the opposite, on
+        // purpose: `auth.rs` argues at length that `POST /vcs/requests` is a sibling of
+        // `/email/send` rather than of `/runs` — *"Queueing is Admin's"* — and `Scope::Run` still
+        // reaches exactly one route. What Chunk 4 opened instead is the door a human already stood
+        // at: `runs::resume_approved_run` translates an approved action and admits it in the same
+        // transaction, as `Origin::Human`, because a person just authorised it.
+        //
+        // So `run_id` is NULL on every row in production and this `None` still throws nothing away.
+        // Two consequences worth stating rather than leaving to be rediscovered: `Origin::Run`,
+        // `needs_approval`, `cancel_for_run` and `reap_requests_of_ended_runs` are correct and
+        // DORMANT — they have nothing to match, because no production row carries a `run_id` — and
+        // they are kept rather than deleted because they are what the design needs the day a scope
+        // is invented that may queue on its own behalf. Whoever invents it changes `auth.rs` first,
+        // and this comment second.
         // (`reconcile_interrupted` and `reap_requests_of_ended_runs` do attach one, because they
         // read whole rows rather than a claim.)
         Ok(()) => {
@@ -1367,6 +2082,23 @@ struct FakeVcsExecutor {
     /// fields: two adjacent `String`s destructured positionally can be swapped with every assertion
     /// still passing, which is the hazard `claim_next`'s own 5-tuple carries a warning about.
     seen: std::sync::Mutex<Vec<ClaimedRequest>>,
+    /// One permit per execution entered, so a test can wait for the operation to *begin*.
+    ///
+    /// A semaphore rather than a `Notify` because permits accumulate: an execution that starts
+    /// before anyone is waiting still counts, so there is no wake-up to lose and no order the two
+    /// halves have to arrive in. `entered` is what reads it.
+    started: tokio::sync::Semaphore,
+    /// A latch the test opens when it is ready for the operation to answer. One permit per
+    /// execution — each waits for its own release rather than sharing one.
+    ///
+    /// `delay` is the other way to hold an operation open, and for a test that has work to do
+    /// *inside* that window it is a bet: the window is a slice of wall clock, and the bet is that
+    /// the work fits. On a loaded machine one SQLite write does not always fit —
+    /// `an_outcome_the_row_refuses...` lost that bet 8 runs in 20 while a full build ran beside it,
+    /// and failed on an assertion about a log line, which is not what went wrong. `started` fixed
+    /// the near edge of that window and this fixes the far one; between them the test names its own
+    /// interleaving instead of buying it by the millisecond.
+    held: Option<tokio::sync::Semaphore>,
 }
 
 #[cfg(test)]
@@ -1376,7 +2108,7 @@ impl FakeVcsExecutor {
     /// carried the same text could not tell a test that they had been swapped.
     fn succeeding_with(sha: &str) -> Self {
         Self::reporting(Outcome::Succeeded {
-            sha: sha.into(),
+            sha: Some(sha.into()),
             output_tail: format!("git printed this while succeeding at {sha}"),
         })
     }
@@ -1385,6 +2117,19 @@ impl FakeVcsExecutor {
     fn succeeding_slowly(sha: &str, delay: std::time::Duration) -> Self {
         Self {
             delay,
+            ..Self::succeeding_with(sha)
+        }
+    }
+
+    /// Does not answer until the test says so — and never, if it never does.
+    ///
+    /// Prefer this to `succeeding_slowly` whenever the test does anything while the operation is
+    /// running. The duration in `succeeding_slowly` then has to be long enough for that work on
+    /// every machine the suite runs on, which is a number nobody can pick; a latch is that number
+    /// being unnecessary.
+    fn succeeding_until_released(sha: &str) -> Self {
+        Self {
+            held: Some(tokio::sync::Semaphore::new(0)),
             ..Self::succeeding_with(sha)
         }
     }
@@ -1420,7 +2165,40 @@ impl FakeVcsExecutor {
             delay: std::time::Duration::ZERO,
             barrier: None,
             seen: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            held: None,
         }
+    }
+
+    /// Lets one held execution answer. Panics on a fake that was not built to be held, because a
+    /// test releasing an executor that never waits is asserting an ordering it does not have.
+    fn release(&self) {
+        self.held
+            .as_ref()
+            .expect("only a `succeeding_until_released` fake has anything to release")
+            .add_permits(1);
+    }
+
+    /// Resolves once at least `n` executions have been entered.
+    ///
+    /// What it replaces, and why that mattered: a test that has to act *while* an operation runs
+    /// used to `sleep` a fixed 10ms first and assume the drain had got there. That is a real-time
+    /// budget for a reap and a claim — two SQLite writes — and on a machine also compiling and
+    /// running the other thousand tests it is occasionally missed. The test then acts BEFORE the
+    /// operation begins: a different scenario wearing the test's name, failing on an assertion that
+    /// says nothing about what actually went wrong. The flake was never about how long the suite
+    /// took; it was about jitter, and no larger sleep fixes that.
+    ///
+    /// Waiting on the event itself has no budget to miss. The permits are handed back on the way
+    /// out — dropping a `SemaphorePermit` returns it — so this reads the count without consuming it
+    /// and a second caller sees the same answer.
+    async fn entered(&self, n: usize) {
+        drop(
+            self.started
+                .acquire_many(n as u32)
+                .await
+                .expect("the fake's semaphore is never closed"),
+        );
     }
 
     /// Derived from `seen` rather than kept beside it: a separate counter can drift from the list it
@@ -1443,7 +2221,19 @@ impl VcsExecutor for FakeVcsExecutor {
         // The guard is a temporary so it is dropped at the end of this statement — held across the
         // await it would make this future non-`Send`, which `async_trait` requires.
         self.seen.lock().unwrap().push(request.clone());
+        // Signalled here for the same reason `seen` is written here: what a waiting test needs to
+        // know is that the operation BEGAN, and after the delay is too late to be that signal.
+        self.started.add_permits(1);
         tokio::time::sleep(self.delay).await;
+        // Before the barrier rather than after: the barrier is about executions releasing each
+        // other, and a held one has not really started until the test lets it. `forget` because the
+        // permit is spent — one release, one execution, so a second is held again.
+        if let Some(held) = &self.held {
+            held.acquire()
+                .await
+                .expect("the fake's latch is never closed")
+                .forget();
+        }
         // Held here rather than before the delay so it is the last thing between being entered and
         // answering: whatever else an execution does, it does not finish until its peers arrive.
         if let Some(barrier) = &self.barrier {
@@ -1819,7 +2609,7 @@ mod tests {
             &pool,
             first,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -1960,13 +2750,54 @@ mod tests {
         assert_eq!(retired.finished_at, None);
     }
 
-    /// The one spelling that becomes a queued merge, and its neighbours that must not.
+    /// `--no-ff` is queued, and it is the only flag that is, because it is the only one that asks
+    /// for what this queue performs anyway.
+    ///
+    /// `compute_merge` runs `git merge --no-ff` unconditionally, so the commit the queue publishes
+    /// is always a merge commit. Refusing this spelling handed the merge back to the agent to
+    /// perform by hand — the exact outcome the pillar exists to abolish — in exchange for nothing.
+    ///
+    /// Accepted on either side of the ref because both orders spell the same operation, and refused
+    /// anywhere else by shape: a flag cannot stand where the program or the subcommand goes, and a
+    /// `source` that ends up holding `--no-ff` is stopped by `Branch`, the argv guard, rather than
+    /// by this reader.
+    #[test]
+    fn a_no_ff_merge_is_queued_because_it_is_what_the_queue_already_does() {
+        let expected = Some(Op::Merge {
+            source: "feature".into(),
+            target: "master".into(),
+        });
+        assert_eq!(
+            merge_from_command("git merge --no-ff feature", "master"),
+            expected
+        );
+        assert_eq!(
+            merge_from_command("git merge feature --no-ff", "master"),
+            expected
+        );
+
+        // The flag is recognised in argument position only. `git --no-ff merge feature` is not a
+        // command git would run, and a reader that "helpfully" queued it would be performing
+        // something the caller could not have written.
+        assert_eq!(
+            merge_from_command("git --no-ff merge feature", "master"),
+            None
+        );
+        // Left holding the flag as a ref, the argv guard is what refuses — not the shape.
+        assert_eq!(merge_from_command("git merge --no-ff", "master"), None);
+        assert_eq!(
+            merge_from_command("git merge --no-ff --no-ff", "master"),
+            None
+        );
+    }
+
+    /// The spellings that become a queued merge, and their neighbours that must not.
     ///
     /// Each rejection is a different operation wearing a similar command line, and queueing any of
-    /// them would perform something the caller did not write: `--no-ff` wants a merge commit where
-    /// `publish` fast-forwards, `--squash` does not merge, `--abort` unwinds, two refs is an
-    /// octopus. `-X` is there to pin that `Branch` — the argv guard — is actually applied, and not
-    /// merely available.
+    /// them would perform something the caller did not write: `--squash` does not merge, `--abort`
+    /// unwinds, two refs is an octopus, and `--ff`/`--ff-only` both ask for a fast-forward where
+    /// this queue always writes a merge commit. `-X` is there to pin that `Branch` — the argv guard
+    /// — is actually applied, and not merely available.
     #[test]
     fn only_a_bare_git_merge_becomes_a_queued_operation() {
         assert_eq!(
@@ -1987,15 +2818,86 @@ mod tests {
         );
 
         for command in [
-            "git merge --no-ff feature",
             "git merge --squash feature",
             "git merge --abort",
             "git merge feature other",
             "git merge",
             "git status",
             "git merge -X",
+            // Both ask for a fast-forward when one is possible; `compute_merge` writes a merge
+            // commit either way, so queueing these would answer a different question.
+            "git merge --ff feature",
+            "git merge --ff-only feature",
+            // The one accepted flag does not make its compounds acceptable.
+            "git merge --no-ff --squash feature",
+            "git merge --no-ff feature other",
         ] {
             assert_eq!(merge_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// The bypass every parser in this file was open to, and it needed no cleverness to use.
+    ///
+    /// Each of them matches the whole token list as an exact shape, so a shell operator in front of
+    /// the git command makes the list longer and the match fail — `None`, which
+    /// `session_git_decision` reads as "not an operation this queue performs" and ALLOWS. A `cd` was
+    /// enough. Measured on the running daemon before this existed: `cd repo && git merge master`
+    /// came back `allow` from the route whose whole purpose is to refuse exactly that.
+    ///
+    /// The asserted cases are the shapes that actually occur — a directory change first, a chained
+    /// `&&`, one per line — plus an environment assignment, which breaks the match for a different
+    /// reason (`program` reads `FOO=bar`) and would otherwise be a second bypass wearing the same
+    /// clothes.
+    #[test]
+    fn a_git_command_behind_a_shell_operator_is_still_the_operation_it_names() {
+        let wrapped = [
+            "cd /repo && git merge feature",
+            "cd /repo\ngit merge feature",
+            "true; git merge feature",
+            "echo hi | git merge feature",
+            "FOO=bar git merge feature",
+            "cd /repo && git merge feature && echo done",
+        ];
+        for command in wrapped {
+            // The defect itself, pinned rather than described: handed the whole command, the parser
+            // still answers `None`. That is not a thing to fix in the parser — its exact-shape match
+            // is what keeps `--squash` working directly — so this line must keep passing, and it is
+            // what makes the assertion below about the SPLIT rather than about merge parsing.
+            assert_eq!(
+                merge_from_command(command, "master"),
+                None,
+                "unsplit, this is the bypass: {command}"
+            );
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(
+                found,
+                Some(Op::Merge {
+                    source: Branch::new("feature").unwrap(),
+                    target: Branch::new("master").unwrap(),
+                }),
+                "{command}"
+            );
+        }
+    }
+
+    /// And splitting must not turn a command that is NOT a queue operation into one, which is the
+    /// cost a looser parser would have carried. The strictness stays where it was: each segment is
+    /// still matched as a whole shape, so every spelling the queue declines keeps working directly.
+    #[test]
+    fn splitting_a_command_does_not_invent_an_operation() {
+        for command in [
+            "cd /repo && git status",
+            "cd /repo && git merge --squash feature",
+            "echo git && echo merge && echo feature",
+            "cd /repo",
+            "",
+        ] {
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(found, None, "{command}");
         }
     }
 
@@ -2005,6 +2907,453 @@ mod tests {
     fn a_detached_head_is_not_a_merge_target() {
         assert_eq!(merge_from_command("git merge feature", "HEAD"), None);
         assert_eq!(merge_from_command("git merge feature", ""), None);
+    }
+
+    /// The two shapes a push may take, and the half the command line does not carry.
+    ///
+    /// `git push origin` names no branch, so the branch is the one the worktree stands on — the same
+    /// role the worktree's branch plays as a merge's TARGET, in the opposite position. The two cases
+    /// are asserted against different worktree branches on purpose: with both on `main`, an
+    /// implementation that ignored the command's second word would pass.
+    #[test]
+    fn a_push_takes_its_branch_from_the_command_or_from_the_worktree() {
+        assert_eq!(
+            push_from_command("git push origin", "feat/x"),
+            Some(Op::Push {
+                remote: "origin".into(),
+                branch: "feat/x".into()
+            })
+        );
+        assert_eq!(
+            push_from_command("git push origin main", "feat/x"),
+            Some(Op::Push {
+                remote: "origin".into(),
+                branch: "main".into()
+            }),
+            "an explicit branch is the one asked for, even from a worktree standing elsewhere"
+        );
+        // Folded for comparison, and the NAMES are not — git is case-sensitive about both a branch
+        // and a remote, and a queued push to `Origin` is not a push to `origin`.
+        assert_eq!(
+            push_from_command("GIT PUSH Origin Main", "feat/x"),
+            Some(Op::Push {
+                remote: "Origin".into(),
+                branch: "Main".into()
+            })
+        );
+    }
+
+    /// Everything the strictest reading leaves out. Each row is a different KIND of exclusion, which
+    /// is why they are listed with what they are rather than as a bag of strings.
+    #[test]
+    fn only_a_bare_git_push_to_a_named_remote_becomes_a_queued_operation() {
+        for command in [
+            // No argv of its own: what this does is read out of config the daemon does not control.
+            "git push",
+            // The queue's argv would not set the upstream, so queueing it would succeed at less than
+            // was asked and report success.
+            "git push -u origin main",
+            "git push --set-upstream origin main",
+            // Different operations: each destroys or moves what this one only adds to.
+            "git push --force origin main",
+            "git push --force-with-lease origin main",
+            "git push -f origin main",
+            "git push --delete origin main",
+            "git push --tags origin",
+            "git push --all origin",
+            "git push --mirror origin",
+            // Shape, not flags: a third positional is a second refspec.
+            "git push origin main extra",
+            // The verb is the verb. A flag in its place is not one.
+            "git --no-verify push origin main",
+            "gh push origin main",
+        ] {
+            assert_eq!(push_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// **`HEAD` is refused on BOTH routes into the branch, and only two assertions can tell that.**
+    ///
+    /// One arrives from the worktree (`rev-parse --abbrev-ref` says `HEAD` for a detached checkout)
+    /// and the other was typed. `git push origin HEAD` is a perfectly ordinary thing for a person to
+    /// write and means "whatever I am standing on right now" — which is a sentence with no meaning
+    /// left by the time a queued row runs, possibly several operations later.
+    #[test]
+    fn a_push_never_queues_the_word_head() {
+        assert_eq!(push_from_command("git push origin", "HEAD"), None);
+        assert_eq!(push_from_command("git push origin", ""), None);
+        assert_eq!(push_from_command("git push origin HEAD", "master"), None);
+    }
+
+    /// The argv guard is what refuses a dashed name that reached an argument position, exactly as it
+    /// does for a merge — and it is `Remote` doing it for the remote, which is the field a `String`
+    /// would have let straight through.
+    #[test]
+    fn a_dashed_name_in_a_push_is_stopped_by_the_type_rather_than_the_shape() {
+        assert_eq!(
+            push_from_command("git push --receive-pack=touch", "master"),
+            None
+        );
+        assert_eq!(
+            push_from_command("git push origin --exec=x", "master"),
+            None
+        );
+    }
+
+    /// The parsers are tried one after another in `runs::queueable_operation`, and this is why that
+    /// order cannot matter: each insists on its own subcommand, so no command is more than one.
+    ///
+    /// Every pair rather than a sample: the property is about the SET, and a chain of `or_else` is
+    /// exactly the shape where adding a fourth parser that overlaps an existing one compiles, passes
+    /// its own tests, and silently steals commands from whichever came before it.
+    #[test]
+    fn a_command_is_never_two_operations_at_once() {
+        for command in [
+            "git merge feature",
+            "git push origin main",
+            "git tag v1 main",
+            "git fetch origin",
+            "git branch -d feature",
+            "git rebase master",
+        ] {
+            let matched = [
+                merge_from_command(command, "master"),
+                push_from_command(command, "master"),
+                tag_from_command(command, "master"),
+                fetch_from_command(command),
+                branch_delete_from_command(command),
+                rebase_from_command(command, "master"),
+            ]
+            .into_iter()
+            .flatten()
+            .count();
+            assert_eq!(matched, 1, "{command} was read by more than one parser");
+        }
+    }
+
+    /// **What is left of the spec's nine is a set of refusals, not a backlog**, and the message has
+    /// to say which — a caller told "not yet" waits for a release that is never coming.
+    ///
+    /// **Nothing is deferred any more**, and the absence of a "not yet" anywhere is the assertion.
+    /// The spec's nine are now six this queue performs and three it has decided against; a caller
+    /// told "not yet" would be waiting for a release that is never coming.
+    #[test]
+    fn the_operations_this_queue_will_never_perform_say_so_rather_than_saying_not_yet() {
+        for closed in ["pull", "worktree-add", "worktree-remove", "pr-merge"] {
+            let error = Op::from_request(closed, Some("a"), Some("b")).unwrap_err();
+            assert!(
+                error.contains("will not become one"),
+                "{closed} must be refused as a decision, not deferred: {error}"
+            );
+            assert!(!error.contains("not yet"), "{closed}: {error}");
+        }
+
+        // And the whole vocabulary is reachable, which is what says none of the nine is left in
+        // limbo: six build, three refuse with a reason, and no name falls through to "unknown".
+        for (operation, source, target) in [
+            ("merge", Some("feature"), Some("master")),
+            ("push", Some("main"), Some("origin")),
+            ("tag", Some("main"), Some("v1.0")),
+            ("fetch", None, Some("origin")),
+            ("branch-delete", Some("feature"), None),
+            ("rebase", Some("feature"), Some("master")),
+        ] {
+            assert!(
+                Op::from_request(operation, source, target).is_ok(),
+                "{operation} must be one the queue performs"
+            );
+        }
+    }
+
+    /// `git rebase <onto>` reads its two halves the way `merge_from_command` reads its own: the
+    /// branch is the one the worktree stands on, and the command names what it goes on top of.
+    #[test]
+    fn a_rebase_replays_the_worktrees_branch_onto_what_the_command_names() {
+        assert_eq!(
+            rebase_from_command("git rebase master", "feat/x"),
+            Some(Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into()
+            })
+        );
+        assert_eq!(
+            rebase_from_command("GIT REBASE Master", "feat/x"),
+            Some(Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "Master".into()
+            })
+        );
+        // Same guard, same reason as everywhere else: a detached worktree names no branch to replay.
+        assert_eq!(rebase_from_command("git rebase master", "HEAD"), None);
+        assert_eq!(rebase_from_command("git rebase master", ""), None);
+    }
+
+    /// **The one parser with no accepted flag at all**, and each refusal is a different kind.
+    #[test]
+    fn only_a_bare_git_rebase_onto_one_ref_becomes_a_queued_operation() {
+        for command in [
+            // Replays onto the configured upstream, in a repository the daemon does not control.
+            "git rebase",
+            // Opens an editor, for a human at a terminal that does not exist here.
+            "git rebase -i master",
+            "git rebase --interactive master",
+            // Operate on a rebase already in progress — a state this queue never leaves behind.
+            "git rebase --continue",
+            "git rebase --abort",
+            "git rebase --skip",
+            // Takes a third ref, which the two-field shape cannot hold.
+            "git rebase --onto master feature",
+            // Runs an arbitrary command per commit: a shell by another name.
+            "git rebase --exec make master",
+            // Rewrites every commit rather than replaying them.
+            "git rebase --root",
+            // Shape, and the verb.
+            "git rebase master extra",
+            "git --no-verify rebase master",
+            "gh rebase master",
+        ] {
+            assert_eq!(rebase_from_command(command, "feat/x"), None, "{command}");
+        }
+    }
+
+    /// `git fetch <remote>` exactly, and every neighbouring spelling is a different operation.
+    #[test]
+    fn only_a_git_fetch_from_one_named_remote_becomes_a_queued_operation() {
+        assert_eq!(
+            fetch_from_command("git fetch origin"),
+            Some(Op::Fetch {
+                remote: "origin".into()
+            })
+        );
+        assert_eq!(
+            fetch_from_command("GIT FETCH Origin"),
+            Some(Op::Fetch {
+                remote: "Origin".into()
+            })
+        );
+        for command in [
+            // The destination left to config in a repository the daemon does not control.
+            "git fetch",
+            // Remotes nobody named.
+            "git fetch --all",
+            // Deletes tracking refs.
+            "git fetch --prune origin",
+            "git fetch origin --prune",
+            // A namespace the refspec deliberately leaves out.
+            "git fetch --tags origin",
+            // Shape, and the verb.
+            "git fetch origin main",
+            "git --no-verify fetch origin",
+            "gh fetch origin",
+        ] {
+            assert_eq!(fetch_from_command(command), None, "{command}");
+        }
+    }
+
+    /// **`-d` and `-D` differ by CASE alone and mean the safe and the unsafe thing**, which makes
+    /// this the one parser where folding the flag would be a defect rather than a convenience.
+    ///
+    /// The other half is that the flag is mandatory: `git branch <name>` CREATES a branch, so a
+    /// shape that read the flag as optional would queue a deletion for a command that asked for the
+    /// opposite. `classifier.rs` pins that same ambiguity as its reason for listing `git branch` by
+    /// exact form only.
+    #[test]
+    fn deleting_a_branch_is_queued_only_in_the_spelling_that_refuses_unmerged_work() {
+        for command in ["git branch -d feature", "git branch --delete feature"] {
+            assert_eq!(
+                branch_delete_from_command(command),
+                Some(Op::BranchDelete {
+                    branch: "feature".into()
+                }),
+                "{command}"
+            );
+        }
+        for command in [
+            // The whole point: `-D` asks git to stop answering the question this queue relies on it
+            // to answer.
+            "git branch -D feature",
+            "git branch --delete --force feature",
+            "git branch -d -f feature",
+            // Not a deletion at all. Reading the flag as optional would turn this into one.
+            "git branch feature",
+            "git branch",
+            // Other mutations of the same subcommand.
+            "git branch -m old new",
+            "git branch --unset-upstream",
+            // Remote-tracking deletion is a different namespace and a different operation.
+            "git branch -dr origin/feature",
+            // Shape, and the verb.
+            "git branch -d one two",
+            "gh branch -d feature",
+        ] {
+            assert_eq!(branch_delete_from_command(command), None, "{command}");
+        }
+    }
+
+    /// The two shapes a tag may take, and the half the command line does not carry.
+    ///
+    /// Asserted against a worktree branch that is NOT the one named, for the reason the push twin
+    /// gives: with both spelled `main`, an implementation that ignored the command's third word
+    /// would pass.
+    #[test]
+    fn a_tag_takes_its_branch_from_the_command_or_from_the_worktree() {
+        assert_eq!(
+            tag_from_command("git tag v1.0", "release/2"),
+            Some(Op::Tag {
+                name: "v1.0".into(),
+                at: "release/2".into()
+            })
+        );
+        assert_eq!(
+            tag_from_command("git tag v1.0 main", "release/2"),
+            Some(Op::Tag {
+                name: "v1.0".into(),
+                at: "main".into()
+            }),
+            "an explicit branch is the one asked for, even from a worktree standing elsewhere"
+        );
+        // The verb folds; the two NAMES do not. Git is case-sensitive about both, and a tag `V1` is
+        // not a tag `v1`.
+        assert_eq!(
+            tag_from_command("GIT TAG V1 Main", "release/2"),
+            Some(Op::Tag {
+                name: "V1".into(),
+                at: "Main".into()
+            })
+        );
+    }
+
+    /// Everything the strictest reading leaves out. Each row is a different KIND of exclusion, which
+    /// is the reason they are grouped rather than listed as a bag of strings.
+    #[test]
+    fn only_a_bare_git_tag_of_a_new_name_becomes_a_queued_operation() {
+        for command in [
+            // A READ, and the only bare form among the three parsers that means something else
+            // entirely rather than meaning the operation with its arguments left to config.
+            "git tag",
+            // Annotated and signed tags are a different object, and both need a message — a quoted
+            // shell argument, which is the one thing these parsers exist never to read.
+            "git tag -a v1 -m release",
+            "git tag -s v1 -m release",
+            "git tag -m release v1",
+            // The destructive spellings: one removes a tag, one moves an existing one.
+            "git tag -d v1",
+            "git tag -f v1 main",
+            "git tag --force v1 main",
+            // Reads wearing the write's name. Stopped by `TagName` rather than by the shape, which
+            // is the same division of labour `--no-ff` has in the merge parser.
+            "git tag -l",
+            "git tag --list v*",
+            "git tag -n v1",
+            "git tag --contains HEAD",
+            // Shape: a fourth positional is not a spelling this executes.
+            "git tag v1 main extra",
+            // The verb is the verb.
+            "git --no-verify tag v1",
+            "gh tag v1",
+        ] {
+            assert_eq!(tag_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// `HEAD` is refused on both routes into the branch, for the reason the push twin states: a
+    /// queued row naming it names nothing by the time it runs, and `rev-parse --abbrev-ref` is what
+    /// says `HEAD` for a detached worktree.
+    #[test]
+    fn a_tag_never_queues_the_word_head() {
+        assert_eq!(tag_from_command("git tag v1", "HEAD"), None);
+        assert_eq!(tag_from_command("git tag v1", ""), None);
+        assert_eq!(tag_from_command("git tag v1 HEAD", "master"), None);
+    }
+
+    /// A tag name is checked as an argv token by its OWN type, on every route in.
+    ///
+    /// The JSON half is the one that matters: `Op` derives `Deserialize`, so a raw
+    /// `POST /vcs/requests` body reaches `TagName` without passing `from_request` at all. Giving
+    /// `Tag` a `String` name would leave every assertion in the flat-builder test green.
+    #[test]
+    fn a_tag_name_is_an_argv_token_on_every_route_in() {
+        assert_eq!(TagName::new("  v1.0  ").unwrap().as_str(), "v1.0");
+        for bad in ["", "   ", "--format=x", "-d", "v 1", "v\u{1b}1"] {
+            assert!(TagName::new(bad).is_err(), "{bad:?} was accepted");
+        }
+
+        let raw = r#"{"op":"tag","name":"--format=touch x","at":"main"}"#;
+        assert!(serde_json::from_str::<Op>(raw).is_err());
+        assert!(
+            Op::from_stored("tag", r#"{"op":"tag","name":"-d","at":"main"}"#).is_err(),
+            "a hand-edited row is not trusted either"
+        );
+    }
+
+    /// **Every variant round-trips AND spells its name the same way in both columns**, checked as a
+    /// set rather than one test per variant.
+    ///
+    /// The second half is the one that had to be added rather than assumed. `kind()` is written by
+    /// hand and the serde tag is derived, so the two can disagree — and the round trip does NOT
+    /// notice, because `from_stored` re-derives `kind()` from the parsed value instead of reading
+    /// the payload's tag. Measured: removing `#[serde(rename = "branch-delete")]` leaves the round
+    /// trip green and puts `branch_delete` in the `args` payload of a row whose `op` column says
+    /// `branch-delete`. The assertion that sees it is the one comparing the payload's own `op` field
+    /// to `kind()`.
+    ///
+    /// One test over the whole vocabulary catches the next multi-word variant on the day it is
+    /// added, where five separate tests would need somebody to remember to write a sixth.
+    #[test]
+    fn every_operation_round_trips_through_storage() {
+        let all = [
+            Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            Op::Push {
+                remote: "origin".into(),
+                branch: "main".into(),
+            },
+            Op::Tag {
+                name: "v1.0".into(),
+                at: "main".into(),
+            },
+            Op::Fetch {
+                remote: "origin".into(),
+            },
+            Op::BranchDelete {
+                branch: "feature".into(),
+            },
+            Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into(),
+            },
+        ];
+
+        for op in &all {
+            assert_eq!(
+                Op::from_stored(op.kind(), &op.to_args()).as_ref().ok(),
+                Some(op),
+                "{} does not survive its own storage",
+                op.kind()
+            );
+            // The column and the payload are checked against each other, so a mismatched pair is
+            // refused rather than silently trusted.
+            assert!(Op::from_stored("merge", &op.to_args()).is_err() || op.kind() == "merge");
+            // **The assertion the round trip cannot make.** The payload's own tag has to be the
+            // same word as the column, or one row carries two spellings of one operation for
+            // everybody who reads the queue or filters it by JSON path.
+            let payload: serde_json::Value = serde_json::from_str(&op.to_args()).unwrap();
+            assert_eq!(
+                payload["op"].as_str(),
+                Some(op.kind()),
+                "the payload's tag and the `op` column must be the same word"
+            );
+        }
+
+        // And the names are what `from_request` accepts, so the column holds the caller's word.
+        let kinds: Vec<&str> = all.iter().map(Op::kind).collect();
+        assert_eq!(
+            kinds,
+            ["merge", "push", "tag", "fetch", "branch-delete", "rebase"],
+            "the `op` column's vocabulary is the one the door speaks"
+        );
     }
 
     /// A listing narrowed to a project shows the whole repository that project shares.
@@ -2159,7 +3508,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Fast-forward".into(),
             },
         )
@@ -2203,7 +3552,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -2214,6 +3563,220 @@ mod tests {
             output_tail_of(&pool, id).await.as_deref(),
             Some("Merge made by the 'ort' strategy.")
         );
+    }
+
+    /// Ages a request by writing its stamps directly. The queue writes `finished_at` itself and has
+    /// no way to be told a different one, which is the same reason `runs::prune_transcripts`'s tests
+    /// backdate rather than wait.
+    async fn backdate(pool: &sqlx::SqlitePool, id: i64, days: i64) {
+        let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        sqlx::query("UPDATE vcs_requests SET created_at = ?, finished_at = ? WHERE id = ?")
+            .bind(&when)
+            .bind(&when)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A finished request past the window loses what git printed and keeps everything else.
+    ///
+    /// **Both halves are asserted, and the second is the one that matters.** Emptying the tail is
+    /// what the sweep is for; keeping the row is what the shape was chosen for —
+    /// `action_grants.queued_request_id` names these rows by id with no foreign key behind it, so a
+    /// DELETE would leave a takeover grant pointing at nothing and `matching_queued_request` would
+    /// go on telling a run that a request holds its work. A test that only checked the tail was gone
+    /// would pass against exactly that.
+    #[tokio::test]
+    async fn a_finished_request_loses_what_git_printed_and_keeps_the_row() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: Some("abc123".into()),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, id, 31).await;
+
+        let pruned = prune_output_tails(&pool, 30, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(pruned, 1);
+        assert_eq!(output_tail_of(&pool, id).await, None);
+        let (status, sha): (String, Option<String>) =
+            sqlx::query_as("SELECT status, result_sha FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), sha.as_deref()),
+            ("succeeded", Some("abc123")),
+            "the row and what it published survive; only the diagnostic ages out"
+        );
+    }
+
+    /// The three things the sweep must not touch, in one test because each is a different reason.
+    ///
+    /// A row inside the window is the ordinary case. A row that is still `running` is the dangerous
+    /// one — something is writing to it — and it is what a `NOT IN ('queued','running',…)` spelling
+    /// would get wrong the day a status is added. And `retain_days <= 0` is the typo guard every
+    /// other sweep in this crate carries: it must refuse rather than strip the whole table.
+    #[tokio::test]
+    async fn the_sweep_leaves_alone_what_is_recent_still_running_or_covered_by_a_zero_window() {
+        let pool = test_pool().await;
+        let recent = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            recent,
+            Outcome::Succeeded {
+                sha: Some("abc123".into()),
+                output_tail: "recent".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, recent, 29).await;
+
+        let running = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        sqlx::query("UPDATE vcs_requests SET output_tail = 'in flight' WHERE id = ?")
+            .bind(running)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate(&pool, running, 400).await;
+        // `backdate` also rewrites `finished_at`, which a running row would not have. Put it back,
+        // so what keeps this row is its STATUS and not a missing stamp — otherwise the assertion
+        // below passes against a sweep with no status filter at all.
+        sqlx::query("UPDATE vcs_requests SET status = 'running', finished_at = NULL WHERE id = ?")
+            .bind(running)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prune_output_tails(&pool, 30, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            output_tail_of(&pool, recent).await.as_deref(),
+            Some("recent")
+        );
+        assert_eq!(
+            output_tail_of(&pool, running).await.as_deref(),
+            Some("in flight")
+        );
+
+        // A window of zero is a typo with a plausible-looking value, not an instruction to empty
+        // every row on the machine.
+        backdate(&pool, recent, 400).await;
+        assert_eq!(
+            prune_output_tails(&pool, 0, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            output_tail_of(&pool, recent).await.as_deref(),
+            Some("recent")
+        );
+    }
+
+    /// The sweep reports what it did, not what it could have done.
+    ///
+    /// Run twice over one aged row: the second pass must report nothing. Without the
+    /// `output_tail IS NOT NULL` filter the UPDATE matches the same row every hour for ever, and the
+    /// log reports a constant instead of a count — which reads as a sweep that never converges.
+    #[tokio::test]
+    async fn a_second_sweep_over_the_same_rows_reports_nothing() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: Some("abc123".into()),
+                output_tail: "Merge made by the 'ort' strategy.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, id, 31).await;
+
+        assert_eq!(
+            prune_output_tails(&pool, 30, chrono::Utc::now())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            prune_output_tails(&pool, 30, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0,
+            "there is nothing left to drop, so the sweep must say so"
+        );
+    }
+
+    /// **The trap the other three sweeps each pay for in their own doc comment**, pinned here on the
+    /// boundary rather than by a coarse test that could not see it.
+    ///
+    /// `finished_at` is RFC 3339 (`2026-08-01T12:00:00+00:00`); SQLite's `datetime('now','-30 days')`
+    /// would produce `2026-07-13 12:00:00`. Compared as TEXT, `T` (0x54) sorts after the space
+    /// (0x20) — so within the cutoff's OWN day a row hours too old compares as newer and survives
+    /// every sweep for ever. A row aged exactly to the boundary is the only input that tells the two
+    /// spellings apart.
+    #[tokio::test]
+    async fn the_retention_boundary_is_exact_rather_than_to_the_day() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Succeeded {
+                sha: Some("abc123".into()),
+                output_tail: "on the boundary".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Thirty days and one hour old: past a window of thirty by an hour, and inside the cutoff's
+        // own calendar day, which is where the two spellings disagree.
+        let now = chrono::Utc::now();
+        let when = (now - chrono::Duration::days(30) - chrono::Duration::hours(1)).to_rfc3339();
+        sqlx::query("UPDATE vcs_requests SET finished_at = ? WHERE id = ?")
+            .bind(&when)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(prune_output_tails(&pool, 30, now).await.unwrap(), 1);
+        assert_eq!(output_tail_of(&pool, id).await, None);
     }
 
     #[tokio::test]
@@ -2322,7 +3885,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -2460,7 +4023,7 @@ mod tests {
             &pool,
             id,
             Outcome::Succeeded {
-                sha: "abc123".into(),
+                sha: Some("abc123".into()),
                 output_tail: "Merge made by the 'ort' strategy.".into(),
             },
         )
@@ -2664,12 +4227,18 @@ mod tests {
         submit(&pool, &repo(), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
 
         let logged = logged_during(async {
             tokio::join!(drain_once(&pool, "alpha", &executor), async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                reconcile_interrupted(&pool).await.unwrap()
+                // The reconcile has to land while the operation is running, and both edges of that
+                // window are named rather than timed: `entered` is the operation beginning, and it
+                // cannot end until `release`. This was a 10ms sleep inside a 100ms delay, which is
+                // the same sentence written as a wager on two SQLite writes.
+                executor.entered(1).await;
+                let reconciled = reconcile_interrupted(&pool).await.unwrap();
+                executor.release();
+                reconciled
             })
         })
         .await;
@@ -2703,13 +4272,16 @@ mod tests {
             .await
             .unwrap();
 
-        // A 10x margin over the reconcile's own wait, so which lands first is not a race: an
-        // in-memory claim takes microseconds, and `reconciled == 1` below fails loudly rather than
-        // passing quietly if that ever stops being true.
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        // The reconcile must land strictly inside the operation, so the operation is held open
+        // around it rather than given a duration long enough to probably cover it. `reconciled == 1`
+        // below is what would fail if that ever stopped being true — loudly, which is how the old
+        // 10ms-sleep-inside-100ms version was caught.
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
         let (drained, reconciled) = tokio::join!(drain_once(&pool, "alpha", &executor), async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            reconcile_interrupted(&pool).await.unwrap()
+            executor.entered(1).await;
+            let reconciled = reconcile_interrupted(&pool).await.unwrap();
+            executor.release();
+            reconciled
         });
 
         assert_eq!(
@@ -2780,8 +4352,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Far longer than the guard below, so which of the two fires is not a race.
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
+        // Never released, so the operation cannot finish at all — as opposed to the 30s this used
+        // to sleep, which was a duration chosen to be longer than a guard rather than a statement
+        // that finishing is not one of the things that may happen here.
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
         {
             let drain = drain_once(&pool, "alpha", &executor);
             tokio::pin!(drain);
@@ -2789,29 +4363,26 @@ mod tests {
             // Polled until the executor has actually been ENTERED, and abandoned there — rather
             // than after a fixed slice of wall clock.
             //
-            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. The
-            // executor's 30s makes it a non-race only for the half AFTER the operation begins;
-            // before that, `drain_once` still has a reap and a claim to get through, and 50ms was a
-            // real-time budget for two SQLite writes. On a machine also compiling and running the
-            // other thousand tests that budget is occasionally missed, and the drain is then
-            // abandoned BEFORE the operation — a different scenario wearing this test's name, which
-            // is why the flake read `calls(): 0 != 1` rather than anything about jamming.
+            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. Holding
+            // the executor open settles only the half AFTER the operation begins; before that,
+            // `drain_once` still has a reap and a claim to get through, and 50ms was a real-time
+            // budget for two SQLite writes. On a machine also compiling and running the other
+            // thousand tests that budget is occasionally missed, and the drain is then abandoned
+            // BEFORE the operation — a different scenario wearing this test's name, which is why
+            // the flake read `calls(): 0 != 1` rather than anything about jamming.
             //
-            // `calls()` is the property this test is about, so it is what is waited on. The outer
-            // timeout is not a budget: it is reached only if the drain never arrives at all, and it
-            // is there so that failure is a message rather than a hung suite.
+            // Entering the executor is the property this test is about, so it is what is waited on.
+            // The `select!` is still needed to keep the drain being polled — nothing else drives
+            // it — and its first arm turns "the drain finished" into a message rather than a
+            // confusing later assertion. The outer timeout is not a budget: it is reached only if
+            // the drain never arrives at all, and it is there so that failure is a message rather
+            // than a hung suite.
             tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    tokio::select! {
-                        _ = &mut drain => {
-                            panic!("the executor sleeps for 30s — the drain cannot have finished")
-                        }
-                        () = tokio::time::sleep(Duration::from_millis(1)) => {
-                            if executor.calls() == 1 {
-                                break;
-                            }
-                        }
+                tokio::select! {
+                    _ = &mut drain => {
+                        panic!("the executor is never released — the drain cannot have finished")
                     }
+                    () = executor.entered(1) => {}
                 }
             })
             .await
@@ -3662,21 +5233,9 @@ mod tests {
         );
     }
 
-    /// A valid operation still round-trips through the column-plus-payload storage `from_stored`
-    /// reads.
-    #[test]
-    fn a_valid_operation_still_round_trips_through_storage() {
-        let op = Op::Merge {
-            source: "feat/x".into(),
-            target: "master".into(),
-        };
-
-        assert_eq!(Op::from_stored(op.kind(), &op.to_args()).unwrap(), op);
-    }
-
     /// The door's whole vocabulary, stated as a table.
     #[test]
-    fn the_queue_speaks_merge_and_says_so_about_everything_else() {
+    fn the_queue_speaks_merge_and_push_and_says_so_about_everything_else() {
         assert_eq!(
             Op::from_request("merge", Some("feature"), Some("master")).unwrap(),
             Op::Merge {
@@ -3684,13 +5243,51 @@ mod tests {
                 target: "master".into()
             }
         );
+        // `source` is the thing that moves and `target` is where it goes, for BOTH operations — so a
+        // push is a branch to a remote, in that order.
+        assert_eq!(
+            Op::from_request("push", Some("main"), Some("origin")).unwrap(),
+            Op::Push {
+                remote: "origin".into(),
+                branch: "main".into()
+            }
+        );
 
-        // An operation the spec lists but the executor cannot perform yet must say WHICH thing is
-        // missing — "unknown operation: push" would send a caller looking for a typo.
-        let error = Op::from_request("push", Some("origin"), Some("master")).unwrap_err();
-        assert!(error.contains("not yet"), "unexpected error: {error}");
+        // A tag is the case that shows the `source`/`target` reading is a rule and not a
+        // coincidence: what moves is the branch's tip, and where it goes is a new ref.
+        assert_eq!(
+            Op::from_request("tag", Some("main"), Some("v1.0")).unwrap(),
+            Op::Tag {
+                name: "v1.0".into(),
+                at: "main".into()
+            }
+        );
+
+        // The two that break the source/target pair rather than following it, each taking the one
+        // parameter it has a use for.
+        assert_eq!(
+            Op::from_request("fetch", None, Some("origin")).unwrap(),
+            Op::Fetch {
+                remote: "origin".into()
+            }
+        );
+        assert_eq!(
+            Op::from_request("branch-delete", Some("feature"), None).unwrap(),
+            Op::BranchDelete {
+                branch: "feature".into()
+            }
+        );
+
+        // An operation the spec lists but this queue has decided against must say WHICH thing is
+        // wrong — "unknown operation: pull" would send a caller looking for a typo in its own
+        // request, when what it needs to know is to ask for two operations instead of one.
+        let error = Op::from_request("pull", Some("feature"), Some("origin")).unwrap_err();
         assert!(
-            error.contains("merge"),
+            error.contains("will not become one"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("merge") && error.contains("push") && error.contains("rebase"),
             "the error must name what the queue CAN do: {error}"
         );
 
@@ -3709,6 +5306,53 @@ mod tests {
                 .unwrap_err()
                 .contains("source")
         );
+        // The push arm's own two, because it reaches `named_branch`/`named_remote` with different
+        // arguments and a swapped pair would still compile.
+        assert!(
+            Op::from_request("push", Some("main"), None)
+                .unwrap_err()
+                .contains("remote")
+        );
+        assert!(
+            Op::from_request("push", None, Some("origin"))
+                .unwrap_err()
+                .contains("branch")
+        );
+        // And the tag arm's own two, since it reaches a third helper with a third message.
+        assert!(
+            Op::from_request("tag", Some("main"), None)
+                .unwrap_err()
+                .contains("tag name")
+        );
+        assert!(
+            Op::from_request("tag", None, Some("v1.0"))
+                .unwrap_err()
+                .contains("branch")
+        );
         assert!(Op::from_request(" Merge ", Some("feature"), Some("master")).is_ok());
+        assert!(Op::from_request(" PUSH ", Some("main"), Some("origin")).is_ok());
+        assert!(Op::from_request(" Tag ", Some("main"), Some("v1.0")).is_ok());
+    }
+
+    /// A remote is checked as an argv token, exactly as a branch is, and by its OWN type.
+    ///
+    /// The second half is the one worth a test: `Op` derives `Deserialize`, so a raw
+    /// `POST /vcs/requests` body reaches `Remote` without passing `Op::from_request` at all — the
+    /// route `a_dashed_branch_cannot_arrive_as_json_either` exists for, on the field it does not
+    /// cover. Giving `Push` a `String` remote would leave every assertion in the flat-builder test
+    /// above green.
+    #[test]
+    fn a_remote_is_an_argv_token_on_every_route_in() {
+        assert_eq!(Remote::new("  origin  ").unwrap().as_str(), "origin");
+        for bad in ["", "  ", "--upload-pack=x", "-o", "a b", "a\u{1b}b"] {
+            assert!(Remote::new(bad).is_err(), "{bad:?} was accepted");
+        }
+
+        let raw = r#"{"op":"push","remote":"--receive-pack=touch x","branch":"main"}"#;
+        assert!(serde_json::from_str::<Op>(raw).is_err());
+        assert!(
+            Op::from_stored("push", r#"{"op":"push","remote":"-o","branch":"main"}"#).is_err(),
+            "a hand-edited row is not trusted either"
+        );
     }
 }

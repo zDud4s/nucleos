@@ -30,6 +30,152 @@ pub struct Decision {
     pub reason: String,
 }
 
+#[derive(Deserialize)]
+pub struct SessionGitPayload {
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_input: Value,
+    /// Where the session is standing. Not necessarily a repository root — see `git_exec::toplevel`.
+    pub cwd: String,
+}
+
+/// The decision for a session nobody launched: a person's own editor, in a worktree, with no run
+/// behind it.
+///
+/// **This exists because the pillar was governing the wrong half of its own purpose.** The queue is
+/// there to order git operations *between sessions*, and the sessions doing the most work are the
+/// ones a person opens by hand. Those carry no `NUCLEOS_RUN_ID`, so `ask_daemon.py` expressed no
+/// opinion and git ran directly — measured, not theorised: an editor session was asked to
+/// `git merge master` and it merged, with no hook, no proposal and no row. Every guarantee the queue
+/// offers is a guarantee about requests that reach the queue.
+///
+/// **It answers with `deny` or with nothing, never with `allow`**, and that is what makes it safe to
+/// add where the old code chose silence. The comment it replaces was right about its own case:
+/// registered repo-wide, an `allow` emitted by a daemon that does not know what the person is doing
+/// would auto-approve their tools. A refusal grants nothing.
+///
+/// **Only what the queue can actually perform is refused** — the same six parsers that decide it for
+/// runs, not the classifier's much wider `pending_approval` net. That distinction is the difference
+/// between a gate and a wall: the classifier sends everything not provably read-only for approval, so
+/// refusing on its verdict would stop a session at its second command. And a spelling the queue
+/// declines (`git merge --squash`, `git branch -D`) must keep working directly, or it becomes
+/// impossible rather than governed.
+///
+/// The refusal is not a redirect: the operation is admitted here, in the daemon, and the session is
+/// told the ticket. The alternative was to answer "ask the queue yourself", which would have meant
+/// telling every editor session how to obtain the control token — handing out the master key to
+/// avoid one round trip.
+pub async fn session_git_decision(
+    State(state): State<AppState>,
+    Json(payload): Json<SessionGitPayload>,
+) -> Json<Decision> {
+    let no_opinion = || {
+        Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "not an operation this queue performs".to_owned(),
+        })
+    };
+
+    if !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell") {
+        return no_opinion();
+    }
+    let Some(command) = payload.tool_input.get("command").and_then(Value::as_str) else {
+        return no_opinion();
+    };
+
+    // One deadline for the whole decision. A hook runs in front of every tool call, so this path
+    // spends git subprocesses on a person's keystrokes — which is why the caller filters first and
+    // only asks about commands that could possibly be queueable.
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let Ok(root) = crate::git_exec::toplevel(Path::new(&payload.cwd), deadline).await else {
+        // Standing outside a working tree, so no git command from here reaches a repository this
+        // queue serves. Silence rather than refusal: this hook is registered for one repository and
+        // a session that has wandered out of it is not the case being governed.
+        return no_opinion();
+    };
+    let Ok(branch) = crate::git_exec::current_branch(&root, deadline).await else {
+        return no_opinion();
+    };
+
+    // Per SEGMENT, not per command. Every parser below matches its whole token list as an exact
+    // shape, so a shell operator in front of the git call made the list longer and the match fail —
+    // and a failed match here is an ALLOW. `cd repo && git merge master` was permitted by the route
+    // whose entire purpose is to refuse it, measured against the running daemon. The strictness of
+    // the parsers is not what was wrong and is not touched; they are simply asked about each command
+    // in the line rather than about the line.
+    let Some(op) = crate::vcs::shell_segments(command)
+        .into_iter()
+        .find_map(|segment| {
+            crate::vcs::merge_from_command(segment, &branch)
+                .or_else(|| crate::vcs::push_from_command(segment, &branch))
+                .or_else(|| crate::vcs::tag_from_command(segment, &branch))
+                .or_else(|| crate::vcs::fetch_from_command(segment))
+                .or_else(|| crate::vcs::branch_delete_from_command(segment))
+                .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
+        })
+    else {
+        return no_opinion();
+    };
+
+    // From here the command IS one the queue performs, so every remaining failure refuses rather
+    // than falls through. The direction is deliberately the opposite of `runs::queueable_operation`,
+    // and the two are right for opposite reasons: there, a person has already approved an action and
+    // being unable to queue it must not strand them holding it; here, nobody has approved anything,
+    // and falling through would hand back the very bypass this function closes.
+    let project_id = match crate::vcs::project_for_worktree(&state.pool, &root, deadline).await {
+        Ok(project_id) => project_id,
+        Err(reason) => {
+            return Json(deny_with(&format!(
+                "{} goes through the queue, and {reason}",
+                op.kind()
+            )));
+        }
+    };
+    let repo = match crate::vcs::resolve_repo(&state.pool, &project_id).await {
+        Ok(repo) => repo,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                ?error,
+                "session-git: could not resolve the repository"
+            );
+            return Json(deny_with(&format!(
+                "{} goes through the queue, and {project_id}'s repository could not be resolved",
+                op.kind()
+            )));
+        }
+    };
+
+    match crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await {
+        Ok(id) => Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!(
+                "queued as vcs request #{id} ({}) — this repository takes one git operation at a \
+                 time, across every session in every worktree, so it is performed by the queue \
+                 rather than here. Do not run it again and do not run it another way: watch \
+                 GET /vcs/requests/{id}/wait, and expect your worktree to be moved under you when \
+                 it lands.",
+                op.kind()
+            ),
+        }),
+        Err(error) => {
+            tracing::error!(?error, "session-git: could not admit the request");
+            Json(deny_with(&format!(
+                "{} goes through the queue, and admitting it failed",
+                op.kind()
+            )))
+        }
+    }
+}
+
+/// A refusal that never becomes an approval, however its caller fails.
+fn deny_with(reason: &str) -> Decision {
+    Decision {
+        decision: "deny".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -133,7 +279,27 @@ pub async fn pretooluse_decision(
     // can never satisfy (a resume expects a worktree run). Allow the sanctioned MCP tools, block
     // everything else, and never create a proposal or terminate the turn.
     if mode == "assistant" {
+        // ...unless the turn is ROOTED: one continuing a session had in the IDE, spoken to from the
+        // machine, in a directory that registers this hook. That turn was launched
+        // `ToolPolicy::Unrestricted` precisely so it can touch the code the conversation is about,
+        // and the branch below would deny every one of those calls — leaving it holding tools it can
+        // never use, which is worse than not having them.
+        if let Some(root) = rooted_turn(&state, payload.run_id).await {
+            return rooted_decision(&state, &payload, &root).await;
+        }
         return assistant_decision(&state, &payload).await;
+    }
+
+    // A council seat reads in order to answer a question, and does nothing else. Same shape as the
+    // branch above and a strictly narrower list: `mcp_tools::COUNCIL_TOOLS` carries no `Acts` at
+    // all, so there is no ordering rule to apply and nothing a seat can do that the owner would
+    // have to undo.
+    //
+    // Like the orchestrator's, this returns BEFORE the classifier — a council run has no worktree
+    // and no proposal to resume into, so a `pending_approval` here would terminate the seat and
+    // mint an approval nothing could ever satisfy.
+    if mode == crate::council::COUNCIL_MODE {
+        return council_decision(&state, &payload).await;
     }
 
     let classification = classifier::classify(
@@ -360,6 +526,120 @@ pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
 /// act while nothing third-party has entered the turn — but not both, and not in that order. It is
 /// deliberately not a hard split of the tool set, because reading mail from a phone is the feature,
 /// and the ordering costs the owner one extra message rather than the tool.
+/// The directory a turn is rooted in, or `None` when it is an ordinary orchestrator turn.
+///
+/// Read from the CHAT and not from the run, because it is a property of the conversation: every
+/// turn of a continued conversation runs in the same place, and a run column would be a second copy
+/// free to disagree with the one `assistant.rs` launches from.
+async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT c.cwd FROM runs r JOIN chats c ON c.chat_id = r.chat_id WHERE r.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// What the owner is told when a rooted turn asks for something that would need approving.
+pub(crate) const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and a conversation is not where that happens — do it in the window, or \
+     say what you want and let it start a run";
+
+/// A rooted turn's tool call: the NucleOS tools as ever, and the machine through the classifier.
+///
+/// **The MCP tools keep their own door.** Anything `mcp__nucleos__*` goes to `assistant_decision`
+/// unchanged, so the untrusted-read marking and the barrier that follows it are one implementation
+/// and not two.
+///
+/// **A built-in goes through the classifier**, with the run's ROOT as its workspace — which is what
+/// makes `writes outside the run's workspace are denied` mean something here: the conversation may
+/// touch the project it is about and not the rest of the disk.
+///
+/// **`pending_approval` is answered with a refusal, not with a parked proposal.** This is the whole
+/// reason the orchestrator branch existed: parking mints a proposal that expects a worktree run to
+/// resume into, and a chat turn has none, so the turn would die owing an approval nobody can grant.
+/// Refusing is not a lesser version of that — it is the right answer HERE. Elevation requires
+/// `Origin::Shell`, which means the owner is sitting at this window; parking exists for work nobody
+/// is watching, and the useful reply to somebody who is watching is to say so and let them answer.
+///
+/// The turn survives either way, which is the property the orchestrator branch was protecting: the
+/// hook never terminates a conversation and never leaves a proposal behind it.
+async fn rooted_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    root: &str,
+) -> Json<Decision> {
+    if payload.tool_name.starts_with("mcp__") {
+        return assistant_decision(state, payload).await;
+    }
+
+    let classification = crate::classifier::classify(
+        &payload.tool_name,
+        &payload.tool_input,
+        Some(Path::new(root)),
+    );
+    if classification.decision.decision == "deny" {
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: classification.reason,
+        });
+    }
+
+    // The read-untrusted barrier, extended to the tools this turn now has.
+    //
+    // Without it the barrier would hold on the MCP side and be walked around on the other: a turn
+    // that read a mail body could not `approve_proposal`, and could run `Bash`.
+    //
+    // Keyed on `classifier::only_reads` and NOT on `action_class == "read-local"`, which was the
+    // first attempt and was wrong in the direction that matters: that class is about approval, and
+    // it covers ordinary in-workspace writes too, so `Write` sailed through the barrier. An
+    // allow-list of tools that cannot change anything, rather than a deny-list of the classes that
+    // can — because the second hands every future class through by default.
+    if !crate::classifier::only_reads(&payload.tool_name) {
+        match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool = %payload.tool_name,
+                    "pretooluse-decision: refused a rooted turn's action after it read third-party content"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool = %payload.tool_name,
+                    %error,
+                    "pretooluse-decision: could not tell whether the rooted turn has read third-party content — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not tell whether this turn has read third-party content"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+
+    if classification.decision.decision == "allow" {
+        return Json(Decision {
+            decision: "allow".to_owned(),
+            reason: classification.reason,
+        });
+    }
+
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: ROOTED_APPROVAL_DENY_REASON.to_owned(),
+    })
+}
+
 async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
     // Whole segment, not a prefix. MCP tool names are `mcp__<server>__<tool>`, so a server called
     // `nucleos__x` produced `mcp__nucleos__x__...`, which passed a prefix test and inherited the
@@ -446,6 +726,92 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             decision: "allow".to_owned(),
             reason: "orchestrator NucleOS tool".to_owned(),
         }),
+    }
+}
+
+/// What a council seat may call: the named list, and nothing else.
+///
+/// An ALLOW-list, written out, rather than "deny the `Acts` ones". The two are the same today and
+/// stop being the same the moment somebody adds a tool to the MCP server: a deny-list hands a
+/// council every future tool by default, and this hands it none of them until somebody decides. The
+/// direction matters more here than for the orchestrator, because a council is up to eight agents
+/// launched by one sentence rather than one turn a person is watching.
+///
+/// Almost pure. The list is a membership test that cannot fail; the one stateful question is which
+/// run a `get_run` names, and that one fails closed.
+async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
+    // Whole segment, not a prefix, for the reason `assistant_decision` records: an MCP server named
+    // `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test.
+    let tool = payload
+        .tool_name
+        .strip_prefix("mcp__nucleos__")
+        .filter(|tool| !tool.contains("__"))
+        .filter(|tool| crate::mcp_tools::COUNCIL_TOOLS.contains(tool));
+
+    if let Some(tool) = tool {
+        // `get_run` reads any run by id, and run ids are sequential integers — so a seat could
+        // read the row next to its own and find a sibling's answer before writing its own. Phase 1
+        // is supposed to be N independent answers, and one seat that waited would be answering
+        // with the others' work in front of it.
+        //
+        // The same shape as the orchestrator's `get_run` check above, and for a related reason:
+        // that one asks whether the named run holds a stranger's words, this one whether it holds
+        // a peer's. Both fail closed, because "I could not tell" is not "no".
+        if tool == "get_run" && get_run_names_a_council_run(state, &payload.tool_input).await {
+            tracing::debug!(
+                run_id = payload.run_id,
+                "pretooluse-decision: refused a council seat a look at another seat's run"
+            );
+            return Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "a council seat may not read another seat's run".to_owned(),
+            });
+        }
+        return Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "council seats may read NucleOS state".to_owned(),
+        });
+    }
+
+    // Not warned about. A seat reaching for `create_run` is a model being a model, not a symptom of
+    // anything — where an orchestrator refused an action after reading mail is a line somebody
+    // should read. A log level is a claim about who should look at it.
+    tracing::debug!(
+        run_id = payload.run_id,
+        tool = %payload.tool_name,
+        "pretooluse-decision: refused a tool a council seat may not call"
+    );
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: "a council seat may only read NucleOS state".to_owned(),
+    })
+}
+
+/// Whether a `get_run` call names another council seat's run.
+///
+/// Fails closed on every shape it cannot read, exactly as its triage sibling does, and for a reason
+/// that is weaker but points the same way: what is lost by refusing is one lookup, and what is lost
+/// by allowing wrongly is the independence phase 1 exists to have. A run that does not exist is the
+/// one honest `false` — the tool returns an error and nothing is read.
+async fn get_run_names_a_council_run(state: &AppState, tool_input: &Value) -> bool {
+    let Some(id) = tool_input.get("id").and_then(Value::as_i64) else {
+        return true;
+    };
+    match sqlx::query_scalar::<_, String>("SELECT mode FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(mode)) => mode == crate::council::COUNCIL_MODE,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "pretooluse-decision: could not resolve the mode of the run a seat asked for — refusing it"
+            );
+            true
+        }
     }
 }
 
@@ -901,10 +1267,12 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -2212,6 +2580,147 @@ mod tests {
         );
     }
 
+    /// An in-flight turn of a conversation ROOTED in `root` — one continuing a session had in the
+    /// IDE. Returns the run id.
+    async fn rooted_turn_run(state: &AppState, root: &str) -> i64 {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, Some(root))
+            .await
+            .unwrap();
+        let run_id = in_flight_run(state, "assistant", None, None, None).await;
+        sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
+            .bind(&chat_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    /// The whole point of the rooted branch: an ordinary orchestrator turn is denied a `Read`, and
+    /// this one is not. Asserted as a PAIR, because the interesting claim is the difference — either
+    /// alone would still pass if the branch stopped being reached.
+    #[tokio::test]
+    async fn only_a_rooted_turn_may_read_the_machine() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let plain = in_flight_run(&state, "assistant", None, None, None).await;
+        let rooted = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let read = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Read","tool_input":{{"file_path":"a.rs"}}}}"#
+            )
+        };
+        assert_eq!(decide(&app, &read(plain)).await.decision, "deny");
+        assert_eq!(decide(&app, &read(rooted)).await.decision, "allow");
+    }
+
+    /// The NucleOS tools keep the door they always had, so there is one implementation of the
+    /// untrusted-read marking and not two.
+    #[tokio::test]
+    async fn a_rooted_turn_still_reaches_the_nucleos_tools_the_same_way() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"mcp__nucleos__list_runs","tool_input":{{}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+    }
+
+    /// A conversation may touch the project it is about, and not the rest of the disk. The
+    /// classifier already enforces this — what this fixes is that it is now given a workspace to
+    /// enforce it against.
+    #[tokio::test]
+    async fn a_rooted_turn_may_not_write_outside_the_project_it_continues() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Write","tool_input":{{"file_path":"C:/Windows/System32/drivers/etc/hosts","content":"x"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+    }
+
+    /// Refused, and NOT parked. Parking mints a proposal that expects a worktree run to resume into,
+    /// and a conversation has none — the turn would die owing an approval nobody can grant. It is
+    /// also the right answer on its own terms: a rooted turn requires `Origin::Shell`, so the owner
+    /// is at the window while this is being asked.
+    #[tokio::test]
+    async fn a_rooted_turn_is_refused_rather_than_parked_when_something_needs_approving() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"frobnicate --hard"}}}}"#
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "running",
+            "the conversation was terminated by a refusal"
+        );
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(proposals, 0, "a refusal left a proposal nobody can resume");
+    }
+
+    /// The barrier follows the tools. Without this the rule would hold on the MCP side and be walked
+    /// around on the other: no `approve_proposal` after reading mail, but `Bash` all you like.
+    #[tokio::test]
+    async fn a_rooted_turn_that_read_third_party_text_may_still_read_and_may_do_nothing_else() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        crate::runs::mark_untrusted_context(&state.pool, run_id)
+            .await
+            .unwrap();
+
+        let reading = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Read","tool_input":{{"file_path":"a.rs"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            reading.decision, "allow",
+            "reading this machine is still allowed"
+        );
+
+        let writing = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Write","tool_input":{{"file_path":"C:/Projects/nucleos/a.rs","content":"x"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(writing.decision, "deny");
+        assert_eq!(writing.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+    }
+
     #[tokio::test]
     async fn assistant_turn_allows_nucleos_mcp_tool() {
         let state = test_state().await;
@@ -2710,6 +3219,194 @@ mod tests {
         assert!(consumed_at.is_none());
     }
 
+    /// A seat's whole job is to read this machine's state and answer, so the reads have to work or
+    /// the tools are decoration.
+    #[tokio::test]
+    async fn a_council_turn_allows_a_reads_own_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        // A `worktree` run, so `get_run` below names something that is not a peer.
+        let other = in_flight_run(&state, "worktree", None, None, None).await;
+        let app = test_router(state);
+
+        for tool in ["list_projects", "list_proposals", "get_budget", "get_kill"] {
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "get_run", serde_json::json!({"id": other}))
+                .await
+                .decision,
+            "allow"
+        );
+    }
+
+    /// Phase 1 is N INDEPENDENT answers, and run ids are sequential integers — so without this a
+    /// seat could read the row next to its own and find a sibling's answer before writing its own.
+    /// The seat that waited would then be answering with the others' work in front of it, and the
+    /// ranking that follows would be measuring the wait.
+    #[tokio::test]
+    async fn a_council_seat_cannot_read_another_seats_run() {
+        let state = test_state().await;
+        let seat = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let sibling = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state);
+
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": sibling}))
+                .await
+                .decision,
+            "deny"
+        );
+        // Its own row is a council run too, and the same rule refuses it. Nothing is lost: a seat
+        // knows what it was asked, and the row holds nothing the seat did not write.
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": seat}))
+                .await
+                .decision,
+            "deny"
+        );
+        // Fails closed on a shape it cannot read, like its triage sibling: an absent id, and an id
+        // that is not a number, are both "I could not tell" rather than "no".
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({}))
+                .await
+                .decision,
+            "deny"
+        );
+        assert_eq!(
+            orchestrator_tool(&app, seat, "get_run", serde_json::json!({"id": "nine"}))
+                .await
+                .decision,
+            "deny"
+        );
+    }
+
+    /// The half that makes a seat worth asking. Half the questions somebody puts to a council are
+    /// about what arrived, and a seat that cannot read mail answers those from what it half-recalls.
+    ///
+    /// Safe here in a way it is not for the orchestrator, and for a structural reason rather than a
+    /// hopeful one: the taint rule exists to stop a stranger's words from reaching a tool that ACTS,
+    /// and no tool a seat may call acts.
+    #[tokio::test]
+    async fn a_council_turn_allows_a_reads_untrusted_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        for tool in ["get_email_queue", "get_email", "list_files"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+
+        // And having read them changes nothing afterwards, because there was never anything to
+        // withdraw: a seat could not act before the mail and cannot act after it.
+        assert_eq!(
+            orchestrator_tool(&app, run_id, "create_run", serde_json::json!({}))
+                .await
+                .decision,
+            "deny"
+        );
+    }
+
+    /// The brake itself. Every `Acts` tool refused, the run left alone, and no proposal minted —
+    /// a council has no worktree to resume into, so an approval for one could never be satisfied.
+    #[tokio::test]
+    async fn a_council_turn_denies_an_acts_tool_and_creates_no_proposal() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::council::COUNCIL_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        for tool in [
+            "create_run",
+            "create_job",
+            "approve_proposal",
+            "reject_proposal",
+            "cancel_run",
+            "set_kill",
+            "triage_email",
+            "vcs_request",
+            // Not an action, and refused all the same: `web_search` and `web_read` reach off this
+            // machine, and a roster of local seats holding either would stop being a local council.
+            "web_search",
+            "web_read",
+            // The read-back half of `vcs_request`. A seat that cannot queue an operation has
+            // nothing of its own to read back.
+            "vcs_ticket",
+        ] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_eq!(decision.decision, "deny", "{tool}");
+        }
+
+        // Tools outside this server too: a seat is not an ordinary run and does not get Bash by
+        // falling through to the classifier.
+        for tool in ["Bash", "Write", "Read", "mcp__other__anything"] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": tool,
+                    "tool_input": {"command": "git push"}
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(decision.decision, "deny", "{tool}");
+        }
+
+        // The prefix trap `assistant_decision` records: a server called `nucleos__x` would produce
+        // this name, and a prefix test would have inherited the council's allow.
+        assert_eq!(
+            decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": "mcp__nucleos__x__get_budget",
+                    "tool_input": {}
+                })
+                .to_string(),
+            )
+            .await
+            .decision,
+            "deny"
+        );
+
+        assert!(
+            proposals::list_pending(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running", "a refusal must not terminate the seat");
+    }
+
+    /// The property the mode branches are written to preserve: a mode nobody has written a branch
+    /// for does not inherit an unconditional allow.
+    ///
+    /// It falls through to the classifier, where an MCP tool name is `unrecognized` and therefore
+    /// `pending_approval` — which is a stop, not a grant. Asserted as "not allow" rather than as the
+    /// exact verdict, because the value of this test is the direction and pinning the spelling would
+    /// make a later refinement of the classifier read as a regression here.
+    #[tokio::test]
+    async fn an_unknown_mode_gets_no_acts_by_default() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "a-mode-invented-later", None, None, None).await;
+        let app = test_router(state);
+
+        for tool in ["create_run", "set_kill", "vcs_request"] {
+            let decision =
+                orchestrator_tool(&app, run_id, tool, serde_json::json!({"id": 1})).await;
+            assert_ne!(decision.decision, "allow", "{tool}");
+        }
+    }
+
     #[tokio::test]
     async fn no_proposal_created_when_run_is_not_in_flight() {
         let state = test_state().await;
@@ -2724,5 +3421,166 @@ mod tests {
 
         let pending = proposals::list_pending(&state.pool).await.unwrap();
         assert!(pending.is_empty());
+    }
+
+    /// A repository on the roster, and the path a session would be standing in.
+    async fn rostered_repo(state: &AppState, prefix: &str) -> tempfile::TempDir {
+        let dir = crate::git_exec::tests::space_free_tempdir(prefix);
+        crate::git_exec::tests::initialize_repo(dir.path());
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+        )
+        .bind("p")
+        .bind(dir.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        dir
+    }
+
+    async fn session_decision(state: &AppState, command: &str, cwd: &Path) -> Decision {
+        session_git_decision(
+            State(state.clone()),
+            Json(SessionGitPayload {
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": command }),
+                cwd: cwd.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .0
+    }
+
+    async fn queued_rows(state: &AppState) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT op, origin FROM vcs_requests ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// **The whole point, and the behaviour that was missing.** A session nobody launched asked for
+    /// a merge and got it, because the hook had no opinion without a run id.
+    #[tokio::test]
+    async fn an_editor_sessions_merge_is_queued_and_the_command_refused() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-merge").await;
+
+        let decision = session_decision(&state, "git merge feature", repo.path()).await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("queued as vcs request #1"),
+            "the refusal has to name the ticket, or the session has nothing to watch: {}",
+            decision.reason
+        );
+        assert_eq!(
+            queued_rows(&state).await,
+            vec![("merge".to_owned(), "shell".to_owned())],
+            "an editor session is `shell`: a person's agent redirected here, not a person acting"
+        );
+    }
+
+    /// The asymmetry that makes it safe to speak at all. Nothing this function does may end in an
+    /// approval — the old silence was chosen because an `allow` from a daemon that cannot see what
+    /// the person is doing would auto-approve their own tools.
+    #[tokio::test]
+    async fn a_session_decision_is_never_an_approval() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-never-allow").await;
+
+        for command in [
+            "git merge feature",
+            "git push origin",
+            "git tag v1",
+            "git fetch origin",
+            "git branch -d stale",
+            "git rebase main",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+        }
+    }
+
+    /// The difference between a gate and a wall. The classifier sends everything not provably
+    /// read-only for approval; refusing on THAT would stop a session at its second command. And a
+    /// spelling the queue declines has to keep working directly, or it becomes impossible rather
+    /// than governed — `--squash` does not merge, and no queue row would ever perform it.
+    #[tokio::test]
+    async fn what_the_queue_will_not_perform_is_left_alone_rather_than_made_impossible() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-declined").await;
+
+        for command in [
+            "cargo test",
+            "git status",
+            "git merge --squash feature",
+            "git branch -D stale",
+            "git log --oneline",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "allow", "{command}: {}", decision.reason);
+        }
+        assert!(
+            queued_rows(&state).await.is_empty(),
+            "no opinion must also mean no row"
+        );
+    }
+
+    /// The direction this function fails, and it is the opposite of `runs::queueable_operation`'s.
+    /// There, a person has already approved an action and being unable to queue it must not strand
+    /// them holding it. Here nobody has approved anything, so falling through would hand back
+    /// exactly the bypass this exists to close.
+    #[tokio::test]
+    async fn a_repository_no_project_claims_is_refused_rather_than_waved_through() {
+        let state = test_state().await;
+        let dir = crate::git_exec::tests::space_free_tempdir("hook-session-unclaimed");
+        crate::git_exec::tests::initialize_repo(dir.path());
+
+        let decision = session_decision(&state, "git merge feature", dir.path()).await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("no project on the roster"),
+            "the refusal has to say which precondition failed: {}",
+            decision.reason
+        );
+        assert!(queued_rows(&state).await.is_empty());
+    }
+
+    /// A session standing outside any repository is not the case being governed, and refusing there
+    /// would block tools in every directory a person wanders into.
+    ///
+    /// The system temp directory, NOT `space_free_tempdir` — which builds inside the checkout on
+    /// purpose, and is therefore inside a git repository. Writing this test the other way asserted
+    /// nothing about being outside a working tree and failed by finding this very repo, which is a
+    /// better outcome than the version that would have passed for the wrong reason.
+    #[tokio::test]
+    async fn a_session_outside_a_working_tree_gets_no_opinion() {
+        let state = test_state().await;
+        let dir = tempfile::tempdir().expect("create a tempdir outside any repository");
+        assert!(
+            !dir.path().join(".git").exists(),
+            "the premise of this test is that nothing here is a repository"
+        );
+
+        let decision = session_decision(&state, "git merge feature", dir.path()).await;
+
+        assert_eq!(decision.decision, "allow", "{}", decision.reason);
+    }
+
+    /// `cwd` is wherever the person was standing, which is a subdirectory more often than not.
+    /// `current_branch` and `repo_key` both refuse a non-root path, and reading that refusal as
+    /// "nothing to govern" is the bypass `git_exec::toplevel` exists to close.
+    #[tokio::test]
+    async fn a_session_standing_in_a_subdirectory_is_governed_just_the_same() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-subdir").await;
+        let inside = repo.path().join("core");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let decision = session_decision(&state, "git merge feature", &inside).await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert_eq!(queued_rows(&state).await.len(), 1);
     }
 }

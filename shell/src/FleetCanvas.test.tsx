@@ -1,0 +1,483 @@
+import { beforeEach, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+
+import type { HeldSlot, ProjectConcurrency } from "./api";
+import FleetCanvas from "./FleetCanvas";
+import { fallbackPosition, readLayout, writeLayout } from "./fleet-layout";
+import { column, fetchMock, job, respondWith, run, settle } from "./test-fleet";
+
+function slot(over: Partial<HeldSlot> = {}): HeldSlot {
+  return {
+    project_id: "alpha",
+    slot: 0,
+    owner_kind: "job",
+    owner_id: 41,
+    claimed_at: "2026-08-16T00:00:00Z",
+    ...over,
+  };
+}
+
+function canvasFor(projects: ProjectConcurrency[], over: Record<string, unknown> = {}) {
+  return (
+    <FleetCanvas
+      projects={projects}
+      jobs={[job({ id: 41 }), job({ id: 7 })]}
+      runs={[run({ id: 7 })]}
+      edges={[]}
+      token="test-token"
+      cancelled={new Set<string>()}
+      onCancel={async () => {}}
+      onOpenRuns={() => {}}
+      refresh={async () => {}}
+      {...over}
+    />
+  );
+}
+
+function renderCanvas(projects: ProjectConcurrency[], over: Record<string, unknown> = {}) {
+  return render(canvasFor(projects, over));
+}
+
+/**
+ * A pointer event jsdom will actually carry the coordinates of.
+ *
+ * jsdom has no `PointerEvent`, so a fabricated one loses `clientX`/`clientY` and every drag
+ * assertion below would compare `NaN` to `NaN`. A `MouseEvent` named `pointerdown` is the same thing
+ * as far as React's synthetic layer is concerned, and it does carry the numbers.
+ */
+function pointer(type: string, at: { x: number; y: number }) {
+  return new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: at.x,
+    clientY: at.y,
+  });
+}
+
+/** The header is the handle: the card is full of buttons, and a whole-card grab eats their clicks. */
+function grip(container: HTMLElement, key: string): Element {
+  const found = container.querySelector(`[data-node="${key}"] header`);
+  if (found === null) throw new Error(`no grip on ${key}`);
+  return found;
+}
+
+/**
+ * Where a node actually is, read off the element.
+ *
+ * jsdom does no layout, so `getBoundingClientRect` answers zeros for everything — asking it would
+ * make every one of these tests pass against a canvas that piles the whole fleet in the corner. The
+ * `transform` is the one thing that is really there, because it is what the component wrote.
+ */
+function positionOf(container: HTMLElement, key: string) {
+  const node = container.querySelector<HTMLElement>(`[data-node="${key}"]`);
+  if (node === null) throw new Error(`no node for ${key}`);
+  const found = /translate\((-?[\d.]+)px, ?(-?[\d.]+)px\)/.exec(node.style.transform);
+  if (found === null) throw new Error(`node ${key} has no translate: "${node.style.transform}"`);
+  return { x: Number(found[1]), y: Number(found[2]) };
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  fetchMock.mockReset();
+});
+
+/** The nub a line is pulled from. Only jobs have one: an exclusion names two jobs. */
+function nub(container: HTMLElement, key: string): Element {
+  const found = container.querySelector(`[data-node="${key}"] [data-pull]`);
+  if (found === null) throw new Error(`no nub on ${key}`);
+  return found;
+}
+
+/** Every exclusion the canvas asked the daemon for, as `[jobA, jobB]`. */
+function asked(): Array<[number, number]> {
+  return fetchMock.mock.calls
+    .filter((call) => {
+      const init = call[1] as RequestInit | undefined;
+      return String(call[0]).includes("/fleet/exclusions") && init?.method === "POST";
+    })
+    .map((call) => {
+      const body = JSON.parse(String((call[1] as RequestInit).body)) as {
+        job_a: number;
+        job_b: number;
+      };
+      return [body.job_a, body.job_b] as [number, number];
+    });
+}
+
+/**
+ * The canvas is the whole house, not one project.
+ *
+ * That is the difference from the columns and the reason the canvas exists at all: an exclusion is
+ * about two jobs, and looking at two jobs at once is what a single surface makes possible.
+ */
+it("draws a node for every slot, of every project", () => {
+  const { container } = renderCanvas([
+    column({ project_id: "alpha", slots: [slot({ owner_id: 41 })] }),
+    column({
+      project_id: "beta",
+      slots: [slot({ project_id: "beta", owner_kind: "run", owner_id: 7 })],
+    }),
+  ]);
+
+  expect(container.querySelectorAll("[data-node]")).toHaveLength(2);
+  expect(container.querySelector('[data-node="job:41"]')).not.toBeNull();
+  expect(container.querySelector('[data-node="run:7"]')).not.toBeNull();
+});
+
+/**
+ * The first paint is the one that decides whether the canvas is worth opening twice.
+ *
+ * Nothing has a saved position then. Dropping every node at the origin puts the fleet in one pile in
+ * the corner, which a person reads as broken and has to undo by hand before the feature can be
+ * judged at all.
+ */
+it("never stacks the first paint in the corner", () => {
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] }),
+  ]);
+
+  const first = positionOf(container, "job:41");
+  const second = positionOf(container, "job:7");
+
+  expect(first).toEqual(fallbackPosition("job:41"));
+  expect(second).toEqual(fallbackPosition("job:7"));
+  expect(first).not.toEqual({ x: 0, y: 0 });
+  expect(first).not.toEqual(second);
+});
+
+/**
+ * Job ids and run ids come from different sequences and collide constantly.
+ *
+ * Keyed on the bare number, the run and the job that share it would be one entry in the layout —
+ * two cards at one position, one of them unreachable. Same reasoning `slotDetail` gives for
+ * comparing the pair rather than the id.
+ */
+it("tells a run and a job with the same number apart", () => {
+  const { container } = renderCanvas([
+    column({
+      slots: [slot({ owner_kind: "job", owner_id: 7 }), slot({ slot: 1, owner_kind: "run", owner_id: 7 })],
+    }),
+  ]);
+
+  expect(positionOf(container, "job:7")).not.toEqual(positionOf(container, "run:7"));
+});
+
+/** An arrangement somebody chose is the whole reason for saving one. */
+it("puts a node back where it was left", () => {
+  writeLayout(localStorage, { "job:41": { x: 640, y: 220 } });
+
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+
+  expect(positionOf(container, "job:41")).toEqual({ x: 640, y: 220 });
+});
+
+/**
+ * A cancelled owner leaves the canvas at the click, as it leaves the column.
+ *
+ * The two views read the same `cancelled` set for that reason: a card that vanishes in one and
+ * stays in the other would have somebody cancelling the same job twice.
+ */
+it("does not draw an owner the user already sent away", () => {
+  const { container } = renderCanvas(
+    [column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] })],
+    { cancelled: new Set(["job:41"]) },
+  );
+
+  expect(container.querySelectorAll("[data-node]")).toHaveLength(1);
+  expect(container.querySelector('[data-node="job:41"]')).toBeNull();
+});
+
+/**
+ * The arithmetic, not the pixels.
+ *
+ * jsdom does no layout, so there is no such thing as a screen coordinate here — every rectangle is
+ * zeros. What CAN be checked is the only thing the drag is allowed to do: add the pointer's delta to
+ * the position the node started at. Whether the result looks right on a real screen is what the
+ * visual pass is for.
+ */
+it("moves a node by the pointer's delta, and remembers where it was let go", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  fireEvent(grip(container, "job:41"), pointer("pointerdown", { x: 100, y: 100 }));
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 160, y: 130 }));
+
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 60, y: from.y + 30 });
+
+  fireEvent(grip(container, "job:41"), pointer("pointerup", { x: 160, y: 130 }));
+
+  expect(readLayout(localStorage)["job:41"]).toEqual({ x: from.x + 60, y: from.y + 30 });
+});
+
+/**
+ * The spatial version of the `batchSeq` guard `Fleet.tsx` keeps against a stale batch.
+ *
+ * A poll lands every three seconds, and from the canvas that arrival is a fresh set of props. A
+ * position recomputed from what just arrived would jump back to where it was under the hand of
+ * whoever is dragging it — the defect that makes a canvas feel broken and cannot be reproduced on
+ * demand, because it only happens on the tick.
+ */
+it("does not put the node back when a poll lands mid-drag", () => {
+  const { container, rerender } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  fireEvent(grip(container, "job:41"), pointer("pointerdown", { x: 100, y: 100 }));
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 200, y: 100 }));
+
+  // The tick: another job took a slot while the hand was moving.
+  rerender(
+    canvasFor([column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] })]),
+  );
+
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 100, y: from.y });
+
+  fireEvent(grip(container, "job:41"), pointer("pointerup", { x: 200, y: 100 }));
+
+  expect(readLayout(localStorage)["job:41"]).toEqual({ x: from.x + 100, y: from.y });
+});
+
+/**
+ * A gesture that ended has to be over, wherever it ended.
+ *
+ * In a browser the pointer is captured, so the release arrives even with the cursor far outside the
+ * surface. What is checked here is the consequence: after it, the node stops following the pointer.
+ * A drag that never ends is a node that chases the mouse around the screen forever.
+ */
+it("ends the gesture on release, even far outside the surface", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  fireEvent(grip(container, "job:41"), pointer("pointerdown", { x: 100, y: 100 }));
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 150, y: 150 }));
+  fireEvent(grip(container, "job:41"), pointer("pointerup", { x: -9000, y: -9000 }));
+
+  const rested = positionOf(container, "job:41");
+  expect(rested).toEqual({ x: from.x + 50, y: from.y + 50 });
+
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 900, y: 900 }));
+
+  expect(positionOf(container, "job:41")).toEqual(rested);
+});
+
+/**
+ * A card cannot be dragged out of the world.
+ *
+ * The surface scrolls into positive coordinates only, so a node left past the left or top edge is
+ * partly unreachable, and one far enough past it is gone with no way back short of clearing the
+ * browser's storage by hand. It stops at the edge instead — and keeps following the pointer on the
+ * way back, which is why the gesture's raw position is kept and only the drawing is clamped.
+ */
+it("stops a node at the edge instead of letting it off the surface", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  // A thousand pixels up and to the left, which is past both edges from anywhere on the grid.
+  fireEvent(grip(container, "job:41"), pointer("pointerdown", { x: 1000, y: 1000 }));
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 0, y: 0 }));
+
+  expect(positionOf(container, "job:41")).toEqual({ x: 0, y: 0 });
+
+  // Back the other way: the node follows again from where the pointer is, with no lag owed for the
+  // distance it spent beyond the edge.
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 1050, y: 1050 }));
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 50, y: from.y + 50 });
+
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 0, y: 0 }));
+  fireEvent(grip(container, "job:41"), pointer("pointerup", { x: 0, y: 0 }));
+
+  expect(readLayout(localStorage)["job:41"]).toEqual({ x: 0, y: 0 });
+});
+
+/**
+ * The exclusion is a line between two cards, and a question is drawn differently from a rule.
+ *
+ * Dashed against solid is the same pair of drawings the cards already use for pending against
+ * active, so there are not two languages on one screen. A pending edge has changed nothing about
+ * how either job is scheduled, and a line claiming otherwise would have somebody wondering why
+ * both jobs are still running.
+ */
+it("draws each exclusion as a line, and a request as a dashed one", () => {
+  const { container } = renderCanvas(
+    [column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] })],
+    { edges: [{ low: 7, high: 41, state: "pending", id: 9 }] },
+  );
+
+  const line = container.querySelector('[data-edge="9"]');
+  expect(line).not.toBeNull();
+  expect(line?.getAttribute("class")).toContain("is-pending");
+});
+
+/** A line to a card that is not on the canvas points at nothing, so it is not drawn. */
+it("draws no line to a job that is not on the canvas", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })], {
+    edges: [{ low: 41, high: 99, state: "active", id: 3 }],
+  });
+
+  expect(container.querySelector("[data-edge]")).toBeNull();
+});
+
+/** The line is attached to the card, not to where the card used to be. */
+it("keeps a line attached to the node being dragged", () => {
+  const { container } = renderCanvas(
+    [column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] })],
+    { edges: [{ low: 7, high: 41, state: "active", id: 3 }] },
+  );
+  const before = container.querySelector('[data-edge="3"] line')?.getAttribute("x1");
+
+  fireEvent(grip(container, "job:7"), pointer("pointerdown", { x: 100, y: 100 }));
+  fireEvent(grip(container, "job:7"), pointer("pointermove", { x: 300, y: 100 }));
+
+  expect(container.querySelector('[data-edge="3"] line')?.getAttribute("x1")).toBe(
+    String(Number(before) + 200),
+  );
+});
+
+/**
+ * The gesture the canvas exists for: pull a line from one job to another and it asks.
+ *
+ * The same route the button takes — `POST /fleet/exclusions` — because a second way of asking that
+ * asked differently would be a second thing to keep in step. The button stays: it is the one that
+ * works without a fine mouse, and answering the request is still a decision, taken on the card.
+ */
+it("asks for the exclusion when a line is pulled from one job to another", async () => {
+  respondWith({ "POST /fleet/exclusions": { proposal_id: 9 } });
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] }),
+  ]);
+
+  fireEvent(nub(container, "job:41"), pointer("pointerdown", { x: 10, y: 10 }));
+  fireEvent(grip(container, "job:7"), pointer("pointermove", { x: 60, y: 60 }));
+  fireEvent(grip(container, "job:7"), pointer("pointerup", { x: 60, y: 60 }));
+  await settle();
+
+  expect(asked()).toEqual([[41, 7]]);
+});
+
+/** While the line is being pulled it follows the pointer, or there is nothing to aim. */
+it("draws a line following the pointer while it is being pulled", () => {
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] }),
+  ]);
+
+  expect(container.querySelector('[data-edge="pulling"]')).toBeNull();
+
+  fireEvent(nub(container, "job:41"), pointer("pointerdown", { x: 10, y: 10 }));
+  fireEvent(grip(container, "job:7"), pointer("pointermove", { x: 60, y: 60 }));
+
+  expect(container.querySelector('[data-edge="pulling"]')).not.toBeNull();
+
+  fireEvent(grip(container, "job:7"), pointer("pointerup", { x: 60, y: 60 }));
+
+  expect(container.querySelector('[data-edge="pulling"]')).toBeNull();
+});
+
+/**
+ * A line dropped where it cannot become a rule asks nothing.
+ *
+ * All three refusals are the daemon's own — itself, another project, a pair that already has an
+ * edge — and a gesture whose only possible outcome is a 409 is the defect the visual pass caught in
+ * the columns, drawn instead of clicked.
+ */
+it("asks nothing when the line is dropped somewhere it cannot become a rule", async () => {
+  respondWith({ "POST /fleet/exclusions": { proposal_id: 9 } });
+  const { container } = renderCanvas(
+    [
+      column({
+        slots: [
+          slot({ owner_id: 41 }),
+          slot({ slot: 1, owner_id: 7 }),
+          slot({ slot: 2, owner_kind: "run", owner_id: 7 }),
+        ],
+      }),
+      column({
+        project_id: "beta",
+        slots: [slot({ project_id: "beta", owner_id: 51 })],
+      }),
+    ],
+    {
+      jobs: [job({ id: 41 }), job({ id: 7 }), job({ id: 51, project_id: "beta" })],
+      edges: [{ low: 7, high: 41, state: "active", id: 3 }],
+    },
+  );
+
+  const drop = (from: string, to: string) => {
+    fireEvent(nub(container, from), pointer("pointerdown", { x: 10, y: 10 }));
+    fireEvent(grip(container, to), pointer("pointerup", { x: 60, y: 60 }));
+  };
+
+  drop("job:41", "job:41"); // itself
+  drop("job:41", "job:7"); // already tied
+  drop("job:41", "job:51"); // another project
+  drop("job:41", "run:7"); // a run is not a job — and has no nub either
+  await settle();
+
+  expect(asked()).toEqual([]);
+});
+
+/**
+ * A canvas that only answers a mouse closes the arrangement to anyone who does not use one.
+ *
+ * The *Not at the same time as…* button is already there for exactly that reason, and it is the
+ * reason the button stays now that a line can be pulled. MOVING a node had no equivalent at all
+ * until this: the layout is the one thing on the canvas a person owns, and a person who cannot
+ * point precisely was locked out of it.
+ */
+it("moves a node with the arrow keys, and remembers that too", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const node = container.querySelector<HTMLElement>('[data-node="job:41"]');
+  if (node === null) throw new Error("no node");
+  const from = positionOf(container, "job:41");
+
+  node.focus();
+  expect(document.activeElement).toBe(node);
+
+  fireEvent.keyDown(node, { key: "ArrowRight" });
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 20, y: from.y });
+
+  // Held down, shift covers ground: nudging a card across a canvas twenty pixels at a time is a
+  // gesture nobody finishes.
+  fireEvent.keyDown(node, { key: "ArrowDown", shiftKey: true });
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 20, y: from.y + 100 });
+
+  expect(readLayout(localStorage)["job:41"]).toEqual({ x: from.x + 20, y: from.y + 100 });
+});
+
+/** The card is full of buttons, and an arrow key aimed at one of them is not aimed at the node. */
+it("leaves the node alone when the key was meant for something on the card", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  fireEvent.keyDown(screen.getByRole("button", { name: "Show items" }), { key: "ArrowRight" });
+
+  expect(positionOf(container, "job:41")).toEqual(from);
+});
+
+/** Focus lands on something that says whose node it is, not on an anonymous box. */
+it("says whose node it is", () => {
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_kind: "run", owner_id: 7 })] }),
+  ]);
+
+  expect(container.querySelector('[data-node="job:41"]')?.getAttribute("aria-label")).toContain(
+    "job 41",
+  );
+  expect(container.querySelector('[data-node="run:7"]')?.getAttribute("aria-label")).toContain(
+    "run 7",
+  );
+});
+
+/**
+ * A click on the header is not a drag, and must not write anything.
+ *
+ * Writing on every press would freeze the derived fallback into storage the first time anybody
+ * touches a card — turning a position that improves whenever `fallbackPosition` changes into one
+ * that is stuck forever, in exchange for a gesture nobody made.
+ */
+it("writes nothing when the pointer never moved", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+
+  fireEvent(grip(container, "job:41"), pointer("pointerdown", { x: 100, y: 100 }));
+  fireEvent(grip(container, "job:41"), pointer("pointerup", { x: 100, y: 100 }));
+
+  expect(readLayout(localStorage)).toEqual({});
+});

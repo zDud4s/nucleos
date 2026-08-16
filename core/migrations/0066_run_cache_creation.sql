@@ -1,0 +1,11 @@
+-- The fourth number in a prompt, missing since 0031.
+--
+-- A prompt's total is `input + cache_creation + cache_read`; `input_tokens` alone is only the
+-- uncached remainder. Without the middle term, `cache_read = 0` is two different facts wearing the
+-- same face: a run that WROTE the cache (billed 1.25x or 2x, exactly as intended, because somebody
+-- had to pay for the first copy) and a run that MISSED the prefix entirely (a defect). Any
+-- efficiency reading taken from `cache_read` alone accuses the first of being the second.
+--
+-- Absence is not zero — a run that reported nothing must read back as unknown, not as a measured
+-- zero. Rows that predate this keep NULL, which is honest: nothing knows what they wrote.
+ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER;

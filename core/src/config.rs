@@ -405,12 +405,193 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     }
 }
 
+/// How many seats one council may hold.
+///
+/// Eight, from the Python orchestrator this pillar was ported out of, where it was the parallelism
+/// cap. Here it is the roster cap and the parallelism cap at once, because the roster IS the
+/// parallelism: every seat of phase 1 is launched together, so a ninth seat would be a ninth agent
+/// process and a ninth cloud bill for one question. A number in this file may lower the fan-out and
+/// may not raise it, exactly as `MAX_ITEMS_CEILING` may not — `.ai/` is gitignored, so nobody
+/// reviews what is written here.
+pub const MAX_COUNCIL_SEATS: usize = 8;
+
+/// The wall clock one seat gets, when the file does not say.
+///
+/// 600 seconds, the same default the Python council ran on. It is per SEAT and not per council: the
+/// seats of phase 1 run concurrently, so a council of eight is still bounded by one of these plus
+/// phase 2 plus phase 3.
+pub const DEFAULT_COUNCIL_TIMEOUT_SECONDS: u64 = 600;
+
+/// The ceiling on that clock, whatever the file asks for.
+///
+/// A council holds no worktree and takes no concurrency slot (that is decision 7 of the design), so
+/// nothing else in the daemon would ever end one. The clock is therefore the only thing that does,
+/// and an unbounded one is a council that stays `running` for as long as the daemon lives.
+pub const MAX_COUNCIL_TIMEOUT_SECONDS: u64 = 3_600;
+
+/// Where one seat's answer comes from.
+///
+/// Two variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole
+/// reason a mixed roster is a feature, and a variant that decided it for the operator would make
+/// the roster stop being the statement of that.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SeatKind {
+    /// An agent CLI, through `runner.rs`.
+    Cloud,
+    /// A model on this machine, through `local_agent.rs`.
+    Local,
+}
+
+impl SeatKind {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            SeatKind::Cloud => "cloud",
+            SeatKind::Local => "local",
+        }
+    }
+}
+
+/// One seat of a roster: where it runs and which model answers.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilSeat {
+    pub kind: SeatKind,
+    /// Spelled `ref` in the file, because that is what the design and the Python it came from call
+    /// it, and `model_ref` in Rust, because `ref` is a keyword.
+    #[serde(rename = "ref")]
+    pub model_ref: String,
+}
+
+/// `.ai/council.yaml`. Absent means there is no council — this pillar has no useful default,
+/// because a roster nobody chose is a list of models nobody agreed to pay for.
+///
+/// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
+/// would otherwise parse into a council with no seats, which is a council that answers every
+/// question with the chairman's own opinion while looking like it deliberated.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilConfig {
+    #[serde(default = "default_council_timeout")]
+    pub timeout_seconds: u64,
+    pub chairman: CouncilSeat,
+    pub members: Vec<CouncilSeat>,
+}
+
+fn default_council_timeout() -> u64 {
+    DEFAULT_COUNCIL_TIMEOUT_SECONDS
+}
+
+impl CouncilConfig {
+    /// Everything wrong with a roster, said as one list rather than as the first thing noticed.
+    ///
+    /// An operator editing this file by hand is going to get more than one thing wrong at once, and
+    /// a loader that reports only the first turns a single correction into three restarts.
+    fn faults(&self, local_available: bool) -> Vec<String> {
+        let mut faults = Vec::new();
+
+        if self.members.is_empty() {
+            faults.push("the roster has no members".to_string());
+        }
+        if self.members.len() > MAX_COUNCIL_SEATS {
+            faults.push(format!(
+                "the roster has {} members, above the ceiling of {MAX_COUNCIL_SEATS}",
+                self.members.len()
+            ));
+        }
+        for (index, seat) in self.seats().enumerate() {
+            let who = if index == 0 {
+                "the chairman".to_string()
+            } else {
+                format!("seat {}", index - 1)
+            };
+            if seat.model_ref.trim().is_empty() {
+                faults.push(format!("{who} names no model"));
+            }
+            // Refused rather than quietly re-routed to the cloud. An operator who wrote `local`
+            // asked for a question that does not leave this machine, and answering it in the cloud
+            // anyway is the one failure this check exists to prevent.
+            if seat.kind == SeatKind::Local && !local_available {
+                faults.push(format!(
+                    "{who} asks for a local model and no local model is configured"
+                ));
+            }
+        }
+
+        faults
+    }
+
+    /// The chairman first, then the members, which is the order `faults` numbers them in.
+    fn seats(&self) -> impl Iterator<Item = &CouncilSeat> {
+        std::iter::once(&self.chairman).chain(self.members.iter())
+    }
+
+    fn validated(mut self) -> Self {
+        if self.timeout_seconds == 0 {
+            tracing::warn!(
+                "council config: timeout_seconds must be above zero; using {DEFAULT_COUNCIL_TIMEOUT_SECONDS}"
+            );
+            self.timeout_seconds = DEFAULT_COUNCIL_TIMEOUT_SECONDS;
+        }
+        if self.timeout_seconds > MAX_COUNCIL_TIMEOUT_SECONDS {
+            tracing::warn!(
+                timeout_seconds = self.timeout_seconds,
+                "council config: timeout_seconds is capped at {MAX_COUNCIL_TIMEOUT_SECONDS}"
+            );
+            self.timeout_seconds = MAX_COUNCIL_TIMEOUT_SECONDS;
+        }
+        self
+    }
+}
+
+/// Reads `.ai/council.yaml`. Absent, unreadable, malformed or invalid → `None`, with a warning.
+///
+/// This follows `load_web_config` and NOT `load_models_config`, and the direction was chosen rather
+/// than inherited. Erroring would stop the daemon — mail, autopilot, voice and the API with it —
+/// over a typo in a list of model names, and the fallback here is the feature being OFF rather than
+/// a permissive one. A council nobody can start costs the operator a council; a daemon that will
+/// not boot costs them everything else.
+///
+/// `local_available` is passed in rather than read, because whether this machine can answer locally
+/// is not configuration — startup PROVES it by probing the model, and only `main.rs` holds that
+/// answer.
+pub fn load_council_config(path: &Path, local_available: bool) -> Option<CouncilConfig> {
+    if !path.exists() {
+        return None;
+    }
+    let config = match std::fs::read_to_string(path).map(|text| serde_yaml::from_str(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "council config: could not be parsed; there is no council");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "council config: could not be read; there is no council");
+            return None;
+        }
+    };
+
+    let faults = CouncilConfig::faults(&config, local_available);
+    if !faults.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            faults = %faults.join("; "),
+            "council config: the roster is not usable; there is no council"
+        );
+        return None;
+    }
+
+    Some(config.validated())
+}
+
 /// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
 /// `schedule:` for `schedules:` parses cleanly into an empty ruleset, and all autonomy for that
 /// project silently stops. That direction is fail-closed, which is precisely why nobody notices —
 /// the contract this module advertises is "error on malformed YAML rather than guess", and a
 /// misspelt key is malformed.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`: `GraphConfig` carries an `Option<f64>` now, and floats are not `Eq`.
+// Nothing outside this module ever needed the total equality.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleRule {
     pub name: String,
@@ -435,6 +616,18 @@ pub struct ScheduleRule {
 /// that no review ever sees. A number in it therefore cannot be the only thing standing between one
 /// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
 pub const MAX_ITEMS_CEILING: usize = 5;
+
+/// The ceiling the daemon puts on how many EXTRA implement runs one red gate may buy.
+///
+/// The same argument `MAX_ITEMS_CEILING` makes, against the same file. A retry is a whole run, and
+/// `.ai/autopilot.yaml` is per-developer configuration no review ever sees — a number in it cannot
+/// be the only thing standing between one red gate and an unbounded number of re-implements. It may
+/// lower the budget; it may not raise it past what the daemon is willing to spend on one item.
+///
+/// Three rather than five, and lower than the fan-out ceiling on purpose: past the third attempt the
+/// evidence is that the item cannot be made to pass, and every further run is taken from the items
+/// queued behind it that were never the ones that broke.
+pub const MAX_GATE_RETRIES_CEILING: usize = 3;
 
 /// The ceiling the daemon puts on how many ROUNDS one job may run.
 ///
@@ -495,13 +688,30 @@ fn default_max_items() -> usize {
     MAX_ITEMS_CEILING
 }
 
+/// What a rule that said nothing about retries asks for: one.
+///
+/// The default that costs something, and deliberately so — a red gate is most often a near miss, and
+/// one more implement run told what the gate said is cheaper than the item it saves. One and not
+/// more, because the second retry is where an item that cannot be made to pass starts eating the
+/// runs the items behind it were queued for.
+///
+/// The `jobs.gate_retries` COLUMN defaults to 0 instead, and the two disagree on purpose: this is
+/// what a rule asks for when it says nothing, and 0 is what a job already scheduled keeps when
+/// nobody asked at all.
+pub const DEFAULT_GATE_RETRIES: usize = 1;
+
+fn default_gate_retries() -> usize {
+    DEFAULT_GATE_RETRIES
+}
+
 fn default_true() -> bool {
     true
 }
 
 /// Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a
 /// single run capped by one context window.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`: `budget_usd` is an `Option<f64>`, and floats have no total equality.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphConfig {
     #[serde(default = "default_max_items")]
@@ -510,6 +720,24 @@ pub struct GraphConfig {
     pub gate_after_each_item: bool,
     #[serde(default = "default_true")]
     pub review: bool,
+    #[serde(default = "default_gate_retries")]
+    gate_retries: usize,
+    /// The most this one job may spend, in USD, before its own brakes stop it.
+    ///
+    /// `None` — the key absent — means what every `graph:` rule has always meant: only the house
+    /// limit governs this job. That is the behaviour of every rule already sitting in somebody's
+    /// gitignored `.ai/autopilot.yaml`, and it must stay theirs, so there is no default number here.
+    ///
+    /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
+    /// accessor because the accessor applies a CEILING against a per-developer file no review sees.
+    /// A budget has no ceiling to apply: it runs UNDER the house limit rather than instead of it, so
+    /// whatever the file writes here can only ever tighten what this job is allowed to spend. There
+    /// is no number a rule could put in this key that buys it more than the daemon already allows.
+    ///
+    /// The value must be a finite, non-negative number; `load_schedule_rules` refuses the rest
+    /// rather than clamping, for the reasons written at `validate_rules`.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
 }
 
 impl GraphConfig {
@@ -519,6 +747,16 @@ impl GraphConfig {
     /// struct would silently honour whatever the file said, and the ceiling would be advisory.
     pub fn max_items(&self) -> usize {
         self.max_items.min(MAX_ITEMS_CEILING)
+    }
+
+    /// The retries actually allowed, after the daemon's own ceiling.
+    ///
+    /// Private field plus this accessor for the same reason `max_items` has one, and it is worth
+    /// saying twice because the failure is silent: a caller that read `gate_retries` straight off
+    /// the struct would honour whatever `.ai/autopilot.yaml` asked for, and the ceiling above would
+    /// be decorative — present in the code, absent from every job that actually runs.
+    pub fn gate_retries(&self) -> usize {
+        self.gate_retries.min(MAX_GATE_RETRIES_CEILING)
     }
 }
 
@@ -530,7 +768,8 @@ pub struct RepoTrigger {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AutopilotRules {
     #[serde(default)]
@@ -555,8 +794,63 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
     if contents.trim().is_empty() {
         return Ok(AutopilotRules::default());
     }
-    serde_yaml::from_str(&contents)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let rules: AutopilotRules = serde_yaml::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    validate_rules(&rules)?;
+    Ok(rules)
+}
+
+/// Refuses the values that parse as numbers but that no rule could have meant.
+///
+/// Here rather than in a `Deserialize` detail on purpose: serde's job is the shape of the file, and
+/// this is a range check on a value whose shape was fine. `load_schedule_rules` is already the place
+/// where "the file says something impossible" becomes `InvalidData`, so it stays the one place a
+/// caller has to look, and a hand-built `GraphConfig` in a test is not silently held to a rule that
+/// only the file-reading path enforces.
+///
+/// Refused rather than clamped, both times, because `.ai/autopilot.yaml` is gitignored per-developer
+/// configuration no review ever sees. A number quietly corrected there is a number nobody learns was
+/// wrong: the file would keep reading as though it had asked for something, and the job would behave
+/// as though it had asked for something else.
+///
+/// - **Negative.** A negative allowance is not a number anyone meant to write. Clamped to zero it
+///   would stop the job at its first node, which is a real behaviour change bought by a typo.
+/// - **Non-finite.** The sharp one, and the reason "reject negatives" is not the whole rule. Every
+///   comparison against NaN is false, and `job::job_over_budget` decides with
+///   `spent + reserve <= limit`: a NaN limit makes that false for ever, so the brake reads as
+///   already blown and the job stops at its FIRST node while the file reads as though it had asked
+///   for something generous. An infinity is the same class of answer from the other end — a ceiling
+///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
+///   by leaving the key out, which is what `None` already means.
+fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+    for rule in &rules.schedules {
+        let Some(budget) = rule.graph.as_ref().and_then(|graph| graph.budget_usd) else {
+            continue;
+        };
+        if !budget.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "schedule `{}`: budget_usd must be a finite number, got `{budget}`; a ceiling \
+                     that cannot be compared against is not a ceiling — leave the key out to run \
+                     under the house limit alone",
+                    rule.name
+                ),
+            ));
+        }
+        if budget < 0.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "schedule `{}`: budget_usd must not be negative, got `{budget}`; it is not \
+                     clamped to zero because that would stop the job at its first node while the \
+                     file still read as though it had asked for something",
+                    rule.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -610,6 +904,53 @@ mod tests {
         assert_eq!(rules.schedules[0].graph.as_ref().unwrap().max_items(), 2);
     }
 
+    /// One retry, for a rule that said nothing about retries.
+    ///
+    /// The default that costs something, and deliberately so: a red gate is most often a near miss —
+    /// an import the node forgot, a test it did not know to update — and one more implement run told
+    /// what the gate said is cheaper than the item it saves. One and not more, because the second
+    /// retry is where an item that cannot be made to pass starts eating the runs the items behind it
+    /// were queued for.
+    ///
+    /// The `jobs.gate_retries` COLUMN defaults to 0, not to this. The two disagree on purpose: this
+    /// is what a rule asks for when it says nothing, and that is what a job already scheduled keeps
+    /// when nobody asked at all.
+    #[test]
+    fn gate_retries_defaults_to_one() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph: {}\n",
+        )
+        .expect("an empty graph block is valid and fully defaulted");
+        assert_eq!(
+            rules.schedules[0]
+                .graph
+                .as_ref()
+                .expect("graph present")
+                .gate_retries(),
+            1
+        );
+    }
+
+    /// The same argument `max_items` is guarded by, against the same file.
+    ///
+    /// `.ai/autopilot.yaml` is gitignored per-developer configuration no review ever sees, and a
+    /// retry is a whole run: a number in that file cannot be the only thing standing between one red
+    /// gate and an unbounded number of re-implements. It may lower the budget; it may not raise it
+    /// past what the daemon is willing to spend on one item.
+    #[test]
+    fn an_oversized_gate_retries_is_cut_by_the_ceiling() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      gate_retries: 99\n",
+        )
+        .expect("an oversized gate_retries parses");
+        assert_eq!(
+            rules.schedules[0].graph.as_ref().unwrap().gate_retries(),
+            3,
+            "the ceiling is what governs, not the file"
+        );
+        assert_eq!(MAX_GATE_RETRIES_CEILING, 3);
+    }
+
     #[test]
     fn a_misspelt_graph_key_is_malformed_rather_than_ignored() {
         // Same fail-closed contract the rest of this module keeps: a typo that parsed cleanly would
@@ -619,6 +960,97 @@ mod tests {
         )
         .expect_err("an unknown key inside graph is an error");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The overnight case is the one this field exists for. A job fired at 03:00 with nobody
+    /// watching is precisely the job that can eat the whole house allowance before morning, and
+    /// until now it was the only kind that could not be given a ceiling of its own: `POST /jobs`
+    /// has taken `budget_usd` since the column did, and the scheduler hard-coded `None` because
+    /// there was nowhere in a rule to write one.
+    ///
+    /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
+    /// accessor because the accessor applies a CEILING; a budget has no ceiling to apply, because
+    /// it runs UNDER the house limit rather than instead of it and can therefore only ever tighten.
+    /// Public is what `gate_after_each_item` and `review` already are, for the same reason.
+    #[test]
+    fn a_graph_block_may_name_its_own_budget() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: 5.0\n",
+        )
+        .expect("a graph block naming a budget parses");
+        assert_eq!(
+            rules.schedules[0].graph.as_ref().unwrap().budget_usd,
+            Some(5.0),
+            "the number the file asked for is the number the rule carries"
+        );
+    }
+
+    /// Absent means absent, and never zero. A rule that says nothing about money keeps exactly
+    /// today's behaviour — only the house limit governs — and every `graph:` rule already sitting in
+    /// somebody's gitignored `.ai/autopilot.yaml` says nothing about money. Defaulting this to a
+    /// number would put a ceiling on all of them overnight, and the first evidence would be a job
+    /// stopping for a limit nobody set.
+    ///
+    /// The block here is non-empty on purpose: what must yield `None` is the absence of this one
+    /// key inside a `graph:` block that is otherwise present and saying things.
+    #[test]
+    fn a_graph_block_without_a_budget_leaves_the_house_limit_alone() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_items: 2\n",
+        )
+        .expect("a graph block that says nothing about money parses");
+        assert_eq!(rules.schedules[0].graph.as_ref().unwrap().budget_usd, None);
+    }
+
+    /// Malformed, not clamped. The posture this module advertises is that it falls back to defaults
+    /// when the file is ABSENT but errors on malformed YAML rather than guessing, and a negative
+    /// allowance is not a number anyone meant to write.
+    ///
+    /// Clamping it silently to zero would be the worse of the two failures: the job would stop at
+    /// its first node while `.ai/autopilot.yaml` still read as though it had asked for something,
+    /// and the file is gitignored per-developer configuration that no review ever sees.
+    #[test]
+    fn a_negative_budget_is_malformed_rather_than_clamped() {
+        let error = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: -1.0\n",
+        )
+        .expect_err("a negative allowance is not a number anyone meant");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        // Refused for the RIGHT reason. Before `budget_usd` existed as a field, `deny_unknown_fields`
+        // refused this same YAML as an unknown key — so without this line the assertion above is
+        // green on both sides of what the test claims, and would stay green if the field were added
+        // and the range check forgotten.
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "the key must be recognised and its VALUE refused: {error}"
+        );
+    }
+
+    /// NaN is the sharp case, and the reason "reject negatives" is not the whole rule.
+    ///
+    /// Every comparison against NaN is false. `job::job_over_budget` decides with
+    /// `spent + reserve <= limit`, so a NaN limit makes that false forever: the brake reads as
+    /// already blown and the job stops at its FIRST node, while the file reads as though it had
+    /// asked for something generous. An infinity is the same class of answer from the other end — a
+    /// ceiling that can never be reached is not a ceiling, and a rule that wanted no ceiling says so
+    /// by leaving the key out.
+    #[test]
+    fn a_budget_that_is_not_a_finite_number_is_refused() {
+        for value in [".nan", ".inf"] {
+            let error = rules_from(&format!(
+                "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: {value}\n"
+            ))
+            .err()
+            .unwrap_or_else(|| panic!("{value} must be refused, not accepted as a budget"));
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{value}");
+            // As in the negative case: `deny_unknown_fields` refuses this YAML today for a reason
+            // that has nothing to do with the value, so the kind check alone would pass before the
+            // field exists and after a finiteness check was left out.
+            assert!(
+                !error.to_string().contains("unknown field"),
+                "{value} must be recognised as a budget and refused as a number: {error}"
+            );
+        }
     }
 
     fn email_config_from(yaml: &str) -> EmailConfig {
@@ -706,6 +1138,149 @@ mod tests {
         assert_eq!(
             email_config_from("retain_bodies_days: 0\n").retain_bodies_days,
             0
+        );
+    }
+
+    fn council_config_from(yaml: &str, local_available: bool) -> Option<CouncilConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("council.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        load_council_config(&path, local_available)
+    }
+
+    const A_GOOD_ROSTER: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }\n\
+                                 members:\n\
+                                 \x20\x20- { kind: cloud, ref: claude-opus-4-8 }\n\
+                                 \x20\x20- { kind: cloud, ref: gpt-5.6-terra }\n";
+
+    #[test]
+    fn a_council_roster_parses_with_its_default_clock() {
+        let config = council_config_from(A_GOOD_ROSTER, false).expect("a cloud-only roster loads");
+        assert_eq!(config.timeout_seconds, DEFAULT_COUNCIL_TIMEOUT_SECONDS);
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.chairman.kind, SeatKind::Cloud);
+        assert_eq!(config.members[1].model_ref, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn an_absent_council_config_means_there_is_no_council() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_council_config(&dir.path().join("council.yaml"), true).is_none());
+    }
+
+    /// Absent and malformed reach the same inert state, and neither is an error.
+    ///
+    /// The direction is the one `load_web_config` takes and not `load_models_config`'s: erroring
+    /// would stop the daemon — mail, autopilot, voice and the API with it — over a typo in a list of
+    /// model names. The `member:` case is the one worth pinning, because `deny_unknown_fields` is
+    /// the only thing standing between that typo and a council that answers every question with the
+    /// chairman's own opinion while looking like it deliberated.
+    #[test]
+    fn a_malformed_council_yaml_leaves_the_feature_off() {
+        assert!(council_config_from("chairman: [this is not a seat", true).is_none());
+        assert!(council_config_from("", true).is_none());
+        assert!(
+            council_config_from(
+                "chairman: { kind: cloud, ref: m }\nmember:\n  - { kind: cloud, ref: m }\n",
+                true
+            )
+            .is_none(),
+            "`member:` for `members:` must not parse into a seatless council"
+        );
+        assert!(
+            council_config_from("chairman: { kind: sideways, ref: m }\nmembers: []\n", true)
+                .is_none(),
+            "a `kind` that is neither cloud nor local is not a seat"
+        );
+    }
+
+    /// An operator who wrote `local` asked for a question that does not leave this machine.
+    /// Answering it in the cloud anyway is the one failure this check exists to prevent, so the
+    /// council is refused rather than re-routed.
+    #[test]
+    fn a_local_seat_without_a_local_model_is_refused() {
+        const MIXED: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }\n\
+                             members:\n\
+                             \x20\x20- { kind: cloud, ref: claude-opus-4-8 }\n\
+                             \x20\x20- { kind: local, ref: qwen3.5:4b }\n";
+
+        assert!(council_config_from(MIXED, false).is_none());
+        assert_eq!(
+            council_config_from(MIXED, true)
+                .expect("the same roster loads once a local model exists")
+                .members
+                .len(),
+            2
+        );
+
+        // The chairman is a seat too, and is checked on the same rule.
+        assert!(
+            council_config_from(
+                "chairman: { kind: local, ref: qwen3.5:4b }\nmembers:\n  - { kind: cloud, ref: m }\n",
+                false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_roster_that_is_empty_or_oversized_is_refused() {
+        assert!(
+            council_config_from("chairman: { kind: cloud, ref: m }\nmembers: []\n", true).is_none(),
+            "a council with no members is the chairman talking to itself"
+        );
+
+        let mut oversized = "chairman: { kind: cloud, ref: m }\nmembers:\n".to_string();
+        for _ in 0..=MAX_COUNCIL_SEATS {
+            oversized.push_str("  - { kind: cloud, ref: m }\n");
+        }
+        assert!(council_config_from(&oversized, true).is_none());
+
+        let mut at_the_ceiling = "chairman: { kind: cloud, ref: m }\nmembers:\n".to_string();
+        for _ in 0..MAX_COUNCIL_SEATS {
+            at_the_ceiling.push_str("  - { kind: cloud, ref: m }\n");
+        }
+        assert_eq!(
+            council_config_from(&at_the_ceiling, true)
+                .expect("the ceiling itself is allowed")
+                .members
+                .len(),
+            MAX_COUNCIL_SEATS
+        );
+    }
+
+    #[test]
+    fn a_seat_that_names_no_model_is_refused() {
+        assert!(
+            council_config_from(
+                "chairman: { kind: cloud, ref: m }\nmembers:\n  - { kind: cloud, ref: \"  \" }\n",
+                true
+            )
+            .is_none()
+        );
+    }
+
+    /// Nothing else in the daemon would ever end a council — it holds no worktree and takes no
+    /// concurrency slot — so the clock is the only thing that does, and an unbounded one is a
+    /// council that stays `running` for as long as the daemon lives.
+    #[test]
+    fn the_seat_clock_is_bounded_at_both_ends() {
+        let long = format!("timeout_seconds: 99999\n{A_GOOD_ROSTER}");
+        assert_eq!(
+            council_config_from(&long, true).unwrap().timeout_seconds,
+            MAX_COUNCIL_TIMEOUT_SECONDS
+        );
+
+        let zero = format!("timeout_seconds: 0\n{A_GOOD_ROSTER}");
+        assert_eq!(
+            council_config_from(&zero, true).unwrap().timeout_seconds,
+            DEFAULT_COUNCIL_TIMEOUT_SECONDS
+        );
+
+        let chosen = format!("timeout_seconds: 120\n{A_GOOD_ROSTER}");
+        assert_eq!(
+            council_config_from(&chosen, true).unwrap().timeout_seconds,
+            120
         );
     }
 

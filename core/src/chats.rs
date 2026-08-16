@@ -41,6 +41,13 @@ pub struct ChatSummary {
     pub title: Option<String>,
     pub brain: String,
     pub created_at: String,
+    /// Where this conversation's turns run, or `None` for the daemon's own directory.
+    ///
+    /// Set only when the conversation continues a session that was had somewhere else. It travels
+    /// to the list because the window has to show it: two conversations continued from two
+    /// worktrees of the same repository are otherwise indistinguishable by anything a person can
+    /// read.
+    pub cwd: Option<String>,
     /// The fallback title. Read from the turns rather than copied into `title` at creation, so it
     /// cannot go stale.
     pub first_message: Option<String>,
@@ -59,15 +66,34 @@ pub struct ChatSummary {
 /// `chat_id` becomes part of a filename in the temporary MCP config, and `assistant.rs` encodes it
 /// precisely because it arrives from a sidecar and cannot be trusted. That encoding stays; this
 /// simply declines to open a second door for arbitrary strings.
-pub async fn create(pool: &SqlitePool, brain: Brain) -> sqlx::Result<String> {
+///
+/// `cwd` is named by every caller rather than defaulted, for the reason `RunRequest` gives about
+/// its own fields: it decides both where the turn runs AND how much it may do, and a parameter with
+/// a default is a parameter nobody chose.
+pub async fn create(pool: &SqlitePool, brain: Brain, cwd: Option<&str>) -> sqlx::Result<String> {
     let chat_id = crate::auth::generate_uuid_v4();
-    sqlx::query("INSERT INTO chats (chat_id, title, brain, created_at) VALUES (?, NULL, ?, ?)")
-        .bind(&chat_id)
-        .bind(brain.as_str())
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO chats (chat_id, title, brain, created_at, cwd) VALUES (?, NULL, ?, ?, ?)",
+    )
+    .bind(&chat_id)
+    .bind(brain.as_str())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(cwd)
+    .execute(pool)
+    .await?;
     Ok(chat_id)
+}
+
+/// Where this conversation's turns run, or `None` for the daemon's own directory.
+///
+/// Its own query rather than a field off `get`, matching `brain_of`: this is read on the hot path of
+/// every single turn, and `get` walks the whole list to answer.
+pub async fn cwd_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
+    let cwd: Option<Option<String>> = sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(cwd.flatten())
 }
 
 /// The app's conversations, most recently active first.
@@ -81,7 +107,7 @@ pub async fn create(pool: &SqlitePool, brain: Brain) -> sqlx::Result<String> {
 /// second, and "the first message" must not depend on which of them SQLite happens to return.
 pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
     sqlx::query_as::<_, ChatSummary>(
-        "SELECT c.chat_id, c.title, c.brain, c.created_at,
+        "SELECT c.chat_id, c.title, c.brain, c.created_at, c.cwd,
                 (SELECT r.prompt FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
@@ -217,7 +243,7 @@ mod tests {
     async fn a_new_chat_is_listed_before_it_has_any_turns() {
         let pool = test_pool().await;
 
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         let listed = list(&pool).await.unwrap();
 
         // The whole reason for the table: a conversation you can open and not yet have used.
@@ -245,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn archiving_removes_it_from_the_list_and_leaves_the_turns_alone() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         sqlx::query(
             "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
              VALUES ('olá', 'completed', 'assistant', 's', ?, '2026-08-11T10:00:00+00:00')",
@@ -270,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn the_list_carries_the_first_message_so_an_unnamed_chat_has_something_to_show() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         for (prompt, at) in [
             ("a primeira", "2026-08-11T10:00:00+00:00"),
             ("a segunda", "2026-08-11T11:00:00+00:00"),
@@ -304,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn renaming_persists_and_an_empty_name_falls_back_to_no_name() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
 
         rename(&pool, &id, Some("sobre o orçamento")).await.unwrap();
         assert_eq!(
@@ -338,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_still_thinking_is_not_something_to_come_back_to() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
 
         turn_in(&pool, &id, "running").await;
 
@@ -350,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_that_landed_is_waiting_until_the_chat_is_opened() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         turn_in(&pool, &id, "completed").await;
 
         assert_eq!(waiting_in(&pool, &id).await, 1);
@@ -363,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_failed_is_waiting_too() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         turn_in(&pool, &id, "failed").await;
 
         // Knowing the answer never came matters at least as much as knowing it did — and a failed
@@ -374,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn only_what_landed_after_the_last_look_counts() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         turn_in(&pool, &id, "completed").await;
         mark_seen(&pool, &id).await.unwrap();
 
@@ -389,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn opening_a_chat_mid_turn_does_not_mark_the_answer_still_coming() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud).await.unwrap();
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
         turn_in(&pool, &id, "completed").await;
         let live = turn_in(&pool, &id, "running").await;
 
@@ -407,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn a_conversation_with_no_row_has_no_brain_rather_than_a_default_one() {
         let pool = test_pool().await;
-        let id = create(&pool, Brain::Local).await.unwrap();
+        let id = create(&pool, Brain::Local, None).await.unwrap();
 
         assert_eq!(brain_of(&pool, &id).await.unwrap(), Some(Brain::Local));
         // The `None` is what `send_message` reads to know nobody chose, so the origin rule still

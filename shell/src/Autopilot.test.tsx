@@ -163,8 +163,17 @@ describe("ApprovalQueuePanel", () => {
     expect(renderedIds(container)).toEqual([12, 11]);
   });
 
-  it("reports a failed approval against the proposal it was aimed at", async () => {
-    fetchMock.mockResolvedValue({ ok: false, status: 409, json: async () => ({}) });
+  // The panel used to print one sentence of its own for every refusal. The daemon's 409 is either
+  // "somebody already decided this" or "this can never resume, the run has no worktree", and those
+  // have opposite remedies — so what is pinned here is that the daemon's words reach the screen,
+  // not that *a* message does.
+  it("reports a failed approval in the daemon's own words, against the proposal it was aimed at", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 409,
+      text: async () =>
+        "this approval cannot resume the run: no live worktree for the paused run",
+    });
     renderPanel([proposal({ id: 11 })]);
 
     fireEvent.click(screen.getByRole("button", { name: "Approve & resume" }));
@@ -172,7 +181,11 @@ describe("ApprovalQueuePanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Approve & resume?" }));
     await settle();
 
-    expect(screen.getByText("Could not approve this proposal.")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "this approval cannot resume the run: no live worktree for the paused run",
+      ),
+    ).toBeTruthy();
   });
 });
 

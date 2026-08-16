@@ -21,6 +21,12 @@ pub struct RunUsage {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
+    /// Tokens billed to WRITE the cache, at 1.25x or 2x base input depending on the TTL asked for.
+    ///
+    /// Separate from `cache_read_tokens` because the two are opposite verdicts about the same run.
+    /// Reads mean the prefix was found; writes mean it was paid for so a later run could find it.
+    /// A run with neither read nor wrote anything — which is the only shape worth complaining about.
+    pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
 }
 
@@ -38,6 +44,7 @@ pub struct RunOutcome {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
 }
 
@@ -440,6 +447,10 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
                     .get("usage")
                     .and_then(|result_usage| result_usage.get("cache_read_input_tokens"))
                     .and_then(serde_json::Value::as_i64),
+                cache_creation_tokens: value
+                    .get("usage")
+                    .and_then(|result_usage| result_usage.get("cache_creation_input_tokens"))
+                    .and_then(serde_json::Value::as_i64),
                 num_turns: value.get("num_turns").and_then(serde_json::Value::as_i64),
             };
         }
@@ -447,47 +458,10 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
     usage
 }
 
-/// Kills a spawned CLI's whole process TREE when a run is dropped mid-flight.
-///
-/// `kill_on_drop` reaches the direct child and stops there, but `claude` is a supervisor: it spawns
-/// bash, cargo, git and node to do the actual work. Terminating only the parent orphans those, and
-/// an orphaned `cargo build` keeps file locks inside the worktree that the run was supposed to
-/// release — which is what makes `git worktree remove` fail through its entire backoff and leaves
-/// the GC reporting the same failure every half hour.
-///
-/// Sound only while the `Child` is still alive, because the open process handle is what stops
-/// Windows reusing the pid. Hence `disarm()` the moment the child is reaped, and hence the killer
-/// is declared AFTER the child so it drops FIRST.
-struct TreeKiller {
-    pid: u32,
-    armed: bool,
-}
-
-impl TreeKiller {
-    fn new(pid: u32) -> Self {
-        Self { pid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TreeKiller {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Best effort by definition: this runs while a future is being dropped, so it cannot await
-        // and cannot report. `/T` is the whole point (the tree), `/F` because a cancelled run is
-        // not being asked politely.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &self.pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
+// The `TreeKiller` this module used to define lives in `process_tree.rs` now, together with the
+// spawn contract that makes it correct off Windows. This copy was the one whose `Drop` called
+// `taskkill` with no `cfg` at all — a silent no-op on every other platform.
+use crate::process_tree::TreeKiller;
 
 /// Why an Ollama model cannot safely accept the local triage prompt.
 ///
@@ -821,18 +795,24 @@ pub async fn ollama_message(
     // well succeed; a refusal to connect is about the endpoint and every request after it will fail
     // the same way. `pii_shadow`'s sweep reads exactly that distinction to decide between moving
     // past one field and abandoning the pass.
+    // One classification, applied to every await that can expire, rather than to the first one. The
+    // client's timeout covers the body read as well as the request, and a timeout surfacing there
+    // used to be reported as `Other` — which this function's own contract, three lines up, says
+    // means the endpoint is gone. The caller would have abandoned its pass over a slow answer.
+    fn classify(error: reqwest::Error) -> std::io::Error {
+        if error.is_timeout() {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+        } else {
+            std::io::Error::other(error)
+        }
+    }
+
     let response = client
         .post(format!("{base_url}/api/chat"))
         .json(&body)
         .send()
         .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, error)
-            } else {
-                std::io::Error::other(error)
-            }
-        })?;
+        .map_err(classify)?;
 
     // The BODY, not just the status. `error_for_status` throws it away, and it is where Ollama says
     // what was wrong — "this model does not support thinking", say. Without it a configuration
@@ -850,7 +830,7 @@ pub async fn ollama_message(
     let response = response
         .json::<serde_json::Value>()
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(classify)?;
 
     response
         .get("message")
@@ -1009,6 +989,7 @@ impl CommandRunner for OllamaRunner {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             });
         }
@@ -1022,6 +1003,7 @@ impl CommandRunner for OllamaRunner {
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         })
     }
@@ -1095,6 +1077,9 @@ impl CommandRunner for ClaudeCliRunner {
         // kill_on_drop turns an aborted awaiting-task (cancel/timeout, Task 4) into the OS `claude`
         // process actually dying. DO NOT drop this line — Chunk 5 Task 1 adds `--model` and preserves it.
         cmd.kill_on_drop(true);
+        // The other half of the `TreeKiller` below: off Windows, killing a tree means killing a
+        // process GROUP, and the child has to lead one before it can be named.
+        crate::process_tree::spawn_in_own_group(&mut cmd);
 
         // The ONLY `?` from here on. Everything below turns a failure into a failed RunOutcome
         // instead of an `Err`, because `runs::spawn_run` reads `Err` as "the CLI never ran, so a
@@ -1321,6 +1306,7 @@ impl CommandRunner for ClaudeCliRunner {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
         })
     }
@@ -1384,9 +1370,9 @@ pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<St
 /// the ceiling with nothing to pause on.
 ///
 /// A plain-text transcript and a structured event carrying no `usage` object are the same silence:
-/// unknown in both, and unknown is not zero. `num_turns` has no counterpart in this stream and stays
-/// `None` for that reason — counting the events that happened to be read is not the tool reporting a
-/// turn count.
+/// unknown in both, and unknown is not zero. `num_turns` and `cache_creation_tokens` have no
+/// counterpart in this stream and stay `None` for that reason — counting the events that happened to
+/// be read is not the tool reporting a turn count.
 pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
@@ -1408,6 +1394,10 @@ pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
                 cache_read_tokens: reported
                     .and_then(|reported| reported.get("cached_input_tokens"))
                     .and_then(serde_json::Value::as_i64),
+                // Codex reports what it read from the cache and never what it wrote there. Unknown,
+                // not zero — and unknown is what disqualifies a Codex run from the cache signal
+                // rather than making every one of them look like a miss.
+                cache_creation_tokens: None,
                 num_turns: None,
             };
         }
@@ -1523,6 +1513,7 @@ impl CommandRunner for CodexCliRunner {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        crate::process_tree::spawn_in_own_group(&mut cmd);
 
         // The ONLY `?` from here on, for the reason spelled out in `ClaudeCliRunner`: past the spawn
         // a failure becomes a failed `RunOutcome`, because an `Err` claims no work was done.
@@ -1634,6 +1625,7 @@ impl CommandRunner for CodexCliRunner {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
         })
     }
@@ -1744,6 +1736,7 @@ impl CommandRunner for FakeCommandRunner {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })
         };
@@ -2011,6 +2004,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             ..Default::default()
@@ -2084,6 +2078,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             last_plan_only: std::sync::Mutex::new(None),
@@ -2119,6 +2114,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             // The fake releases one canned event per interval. The complete run therefore lasts
@@ -2238,6 +2234,32 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(500));
         assert_eq!(usage.cache_read_tokens, None);
         assert_eq!(usage.num_turns, Some(12));
+    }
+
+    #[test]
+    fn extract_usage_reads_cache_creation() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","num_turns":3,"usage":{"input_tokens":40,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":12000}}"#;
+
+        let usage = extract_usage(stdout);
+
+        // The run that pays to fill the cache reads nothing back, and this is the shape that proves
+        // the two are different facts: without the second number it is indistinguishable from a run
+        // that missed the prefix entirely.
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert_eq!(usage.cache_creation_tokens, Some(12000));
+    }
+
+    #[test]
+    fn absent_cache_creation_stays_unknown() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":1000,"cache_read_input_tokens":9000}}"#;
+
+        let usage = extract_usage(stdout);
+
+        // Not `Some(0)`. A transcript that never mentioned cache creation has not reported writing
+        // nothing — it has reported nothing, and a detector must be able to tell those apart.
+        assert_eq!(usage.cache_creation_tokens, None);
     }
 
     #[test]

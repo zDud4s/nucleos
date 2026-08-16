@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -327,7 +327,7 @@ pub(crate) fn run_env(
 /// a secret that lands in the row a moment later would 401 that call for reasons no log explains.
 /// A failure to store is not fatal — the run proceeds with a key that authenticates nothing, so its
 /// tool calls are refused rather than ungoverned, which is the right direction to fail in.
-async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
+pub(crate) async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
     let (token, secret) = crate::auth::mint_run_token(id);
     if let Err(error) = sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
         .bind(&secret)
@@ -460,6 +460,10 @@ struct Registration {
     /// a task can end are the three ways a run stops listening — and a sender outliving its receiver
     /// would let `post_run_message` accept a turn nothing will ever read.
     messages: crate::state::RunMessages,
+    /// Released here for the same reason as the two above, and the cost of getting it wrong is
+    /// different in kind: an abort handle is a word, a transcript is the run's entire output. Left
+    /// behind, every run the daemon has ever executed stays in memory until restart.
+    tails: crate::state::RunTails,
     id: i64,
 }
 
@@ -467,7 +471,31 @@ impl Drop for Registration {
     fn drop(&mut self) {
         self.handles.lock().unwrap().remove(&self.id);
         self.messages.lock().unwrap().remove(&self.id);
+        self.tails.lock().unwrap().remove(&self.id);
     }
+}
+
+/// What a live run has written so far, from `since` bytes in.
+///
+/// `None` means there is no live tail — the run finished, or this daemon never started it. It does
+/// NOT mean the run wrote nothing, and the difference is the whole point: `run_events` is written
+/// once at the end (`append_run_events` has two callers and both are terminal), so a finished run's
+/// output lives in the database and not here. A caller that renders `None` as an empty transcript
+/// claims a run produced nothing when the durable copy may hold thousands of lines.
+///
+/// `since` is in BYTES. The last line of a working run has not ended, so a line count would give a
+/// cursor that moves backwards as that line grows.
+pub(crate) fn read_tail(
+    tails: &crate::state::RunTails,
+    run_id: i64,
+    since: usize,
+) -> Option<String> {
+    let buffer = tails.lock().ok()?.get(&run_id).cloned()?;
+    let text = buffer.lock().ok()?;
+    // Saturating rather than slicing: `since` past the end is what every poll of a run that wrote
+    // nothing since the last one looks like, so it is the common path, and `&text[since..]` would
+    // panic on it inside the daemon's HTTP thread.
+    Some(text.get(since..).unwrap_or("").to_owned())
 }
 
 /// Tells a steerable run that no more turns are coming.
@@ -508,6 +536,7 @@ where
     let registration = Registration {
         handles: state.run_handles.clone(),
         messages: state.run_messages.clone(),
+        tails: state.run_tails.clone(),
         id,
     };
     let mut handles = state.run_handles.lock().unwrap();
@@ -873,6 +902,27 @@ async fn prepare_handoff_successor(
     .execute(pool)
     .await?;
 
+    // And the slot with it, for the same reason and with the same filter. The tree moving without
+    // the slot leaves the two rows disagreeing about who is working in that checkout, and
+    // `reconcile_orphaned_slots` settles it the wrong way: it frees any slot whose owner is not
+    // live, the predecessor is finished by then, and the project — reading one fewer in flight than
+    // it has — starts a second run in the same repository.
+    //
+    // `owner_kind = 'run'` is load-bearing here exactly as it is above: a job node holds no slot of
+    // its own (only the standalone arm of `create_run_with` claims one), so for a node this matches
+    // nothing and must, because the slot belongs to the job and moving it to one node would free it
+    // when that node finished, with the rest of the queue still to run.
+    //
+    // A handover, not a claim — the difference `resume_approved_run` also depends on. A claim is per
+    // owner, so the successor would ask for a SECOND slot while its predecessor still held the
+    // first, and a project at its ceiling would refuse to continue work already admitted. Moving the
+    // row cannot fail that way, because it does not change how many are held.
+    sqlx::query("UPDATE project_slots SET owner_id = ? WHERE owner_kind = 'run' AND owner_id = ?")
+        .bind(successor_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+
     Ok(Some(HandoffSuccessor {
         id: successor_id,
         session_id,
@@ -994,6 +1044,7 @@ fn spawn_run(
     let progress_timeout = state.progress_timeout;
     let handoff_state = state.clone();
     let run_messages = state.run_messages.clone();
+    let run_tails = state.run_tails.clone();
 
     spawn_registered(state, id, async move {
         let mut attempt: u32 = 1;
@@ -1016,6 +1067,17 @@ fn spawn_run(
 
             // Owned out here so it survives the timeout below dropping the run future.
             let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            // Published so `GET /runs/{id}/tail` can read it while the CLI is still writing. This
+            // is inside the retry loop, and the insert therefore REPLACES the previous attempt's
+            // buffer rather than adding to it — which is the wanted behaviour: a retry starts a
+            // fresh CLI on a fresh context, so the old transcript describes work that is no longer
+            // happening, and a screen still showing it would be reporting a dead attempt as live.
+            //
+            // Removal is not here. `Registration`'s `Drop` takes this entry out beside the abort
+            // handle and the steering channel, which is what covers the abort and panic paths too.
+            if let Ok(mut map) = run_tails.lock() {
+                map.insert(id, std::sync::Arc::clone(&transcript));
+            }
             let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
             // Held for this attempt only: a retry starts a fresh CLI on a fresh context, so the
             // previous attempt's mirror has nothing left to say. Dropping the guard at the end of
@@ -1128,7 +1190,7 @@ fn spawn_run(
                         None => (None, None, None),
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, num_turns = ?, context_fill = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, context_fill = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -1139,6 +1201,7 @@ fn spawn_run(
                     .bind(o.input_tokens)
                     .bind(o.output_tokens)
                     .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
                     .bind(o.num_turns)
                     .bind(context_fill)
                     .bind(&completed_at)
@@ -1212,6 +1275,28 @@ fn spawn_run(
                             model.clone(),
                         ))
                         .await;
+                    }
+
+                    // Judged from the row the terminal write just put there, so it is gated on the
+                    // same CAS: losing the race means the numbers in `runs` belong to whoever won,
+                    // and reading them here would count another attempt's spending as this one's.
+                    //
+                    // LAST on this arm, deliberately. `let _ =` swallows an `Err` but not a panic,
+                    // and a panic here unwinds through `spawn_registered` — where the supervisor's
+                    // recovery write is `WHERE status = 'running'` and therefore matches nothing,
+                    // this arm having already written `completed`. Ahead of the completion feed row
+                    // and the handoff, that would cost the run both; behind them, it can only cost
+                    // the observation, which is what nothing depends on. It also has to run after
+                    // `spawn_handoff_if_needed` for a second reason: `successor_run_id` is what
+                    // tells `ContextSwelling` the handoff already happened.
+                    if terminal_write_won
+                        && let Err(error) = crate::token_efficiency::observe_run(&pool, id).await
+                    {
+                        // Warned rather than swallowed, like every other best-effort call on this
+                        // arm. A lock held past the busy timeout is the realistic failure, and a
+                        // detector that goes quiet without saying so is indistinguishable from one
+                        // that has nothing to report.
+                        tracing::warn!(%error, run_id = id, "token efficiency not observed");
                     }
                     break;
                 }
@@ -1725,7 +1810,7 @@ async fn create_run_with(
     Ok(id)
 }
 
-/// The merge this approval should hand to the queue instead of handing back to the run, if it is
+/// The operation this approval should hand to the queue instead of handing back to the run, if it is
 /// one at all.
 ///
 /// **Every `None` here means "keep the behaviour this approval has always had"** — a single-use
@@ -1734,12 +1819,17 @@ async fn create_run_with(
 /// approved, no way to perform it, and nothing to read explaining why; queueing an operation we are
 /// not certain is the one they read would be worse than either.
 ///
-/// So the bar is: the tool is a shell, the input parses, the command is exactly `git merge <ref>`
-/// (`vcs::merge_from_command` argues that strictness), the worktree is really there and really on a
-/// branch, and the project resolves to a repository. Anything else falls back.
+/// So the bar is: the tool is a shell, the input parses, the command is one the queue can execute —
+/// `git merge <ref>` with at most a `--no-ff`, `git push <remote> [<branch>]`, or
+/// `git tag <name> [<branch>]`, each argued in its own function in `vcs.rs` — the worktree is really
+/// there and really on a branch, and the project resolves to a repository. Anything else falls back.
+///
+/// **The two are tried in order and the order cannot matter**, which is worth stating rather than
+/// relying on: each parser insists on its own subcommand, so a command is at most one of them. The
+/// `or_else` is a sequence and not a precedence.
 ///
 /// It runs git twice and must therefore be called before the transaction opens — see the call site.
-async fn queueable_merge(
+async fn queueable_operation(
     state: &AppState,
     proposal: &crate::proposals::Proposal,
     project_id: &str,
@@ -1753,6 +1843,11 @@ async fn queueable_merge(
 
     // One deadline for both calls, so a slow repository cannot spend the budget twice over.
     let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    // Read for BOTH parsers, and for different jobs in each: a merge's target is the branch the
+    // worktree stands on, while a push only falls back to it when the command did not name one. It
+    // is asked for unconditionally because it is also the liveness check on the worktree — a path
+    // that has been removed answers with the enclosing checkout's branch or with an error, and
+    // `current_branch`'s own `--show-toplevel` guard is what tells those apart.
     let branch = crate::git_exec::current_branch(std::path::Path::new(worktree_path), deadline)
         .await
         .map_err(|error| {
@@ -1763,7 +1858,14 @@ async fn queueable_merge(
             );
         })
         .ok()?;
-    let op = crate::vcs::merge_from_command(command, &branch)?;
+    let op = crate::vcs::merge_from_command(command, &branch)
+        .or_else(|| crate::vcs::push_from_command(command, &branch))
+        .or_else(|| crate::vcs::tag_from_command(command, &branch))
+        // The two that need no worktree branch, so they take none. A fetch names its remote and a
+        // deletion names its branch; neither has a half the command line leaves out.
+        .or_else(|| crate::vcs::fetch_from_command(command))
+        .or_else(|| crate::vcs::branch_delete_from_command(command))
+        .or_else(|| crate::vcs::rebase_from_command(command, &branch))?;
     crate::vcs::resolve_repo(&state.pool, project_id)
         .await
         .map_err(|error| {
@@ -1831,7 +1933,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
     // it runs git twice — reading the worktree's branch and identifying the repository — and holding
     // SQLite's write lock across a subprocess would stall every other writer in the daemon.
-    let queueable = queueable_merge(state, &proposal, &wt_project_id, &wt_path).await;
+    let queueable = queueable_operation(state, &proposal, &wt_project_id, &wt_path).await;
 
     // The class the grant will authorize, derived before the transaction opens so a parse cannot
     // hold SQLite's write lock. Re-derived here rather than carried on the proposal because
@@ -1889,12 +1991,23 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         None => None,
     };
 
-    // The run is told which of the two happened, because the two ask opposite things of it.
-    let prompt = match queued_request_id {
-        Some(request_id) => format!(
-            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the merge it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
-        ),
-        None => format!(
+    // The run is told which of the two happened, because the two ask opposite things of it. Named by
+    // `kind()` rather than by the word "merge", which is what it said while merge was the only thing
+    // the queue could do: a run told its *merge* was queued after asking for a push would read that
+    // as the daemon having misunderstood it, and go looking for what it had misfiled.
+    let prompt = match (queued_request_id, &queueable) {
+        (Some(request_id), Some((_, op))) => {
+            let kind = op.kind();
+            format!(
+                "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the {kind} it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
+            )
+        }
+        // `queued_request_id` is `Some` exactly when `queueable` is, and they are matched together
+        // rather than one of them being unwrapped inside the other's arm — so the impossible pairing
+        // has to be written out, and what it does is fall back to authorizing. A run told to proceed
+        // is the safe half of this decision: the grant is single-use and the action is one a human
+        // just approved.
+        _ => format!(
             "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
         ),
     };
@@ -2008,11 +2121,12 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // The queued request id belongs in the audit trail, not only in the resumed run's prompt: this
     // row is where somebody reconstructs what an approval actually did, and "approved" alone no
     // longer says whether the action was authorised or taken over.
-    let note = match queued_request_id {
-        Some(request_id) => {
-            format!("approved; merge queued as vcs request {request_id}; resume run {resume_id}")
+    let note = match (queued_request_id, &queueable) {
+        (Some(request_id), Some((_, op))) => {
+            let kind = op.kind();
+            format!("approved; {kind} queued as vcs request {request_id}; resume run {resume_id}")
         }
-        None => format!("approved; resume run {resume_id}"),
+        _ => format!("approved; resume run {resume_id}"),
     };
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
@@ -2098,6 +2212,50 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     );
 
     Ok(resume_id)
+}
+
+/// Where a tail read should resume from. Absent is the start.
+#[derive(serde::Deserialize)]
+pub struct TailQuery {
+    pub since: Option<usize>,
+}
+
+/// What a run has written since `since`, while it is still writing.
+#[derive(serde::Serialize)]
+pub struct TailResponse {
+    pub text: String,
+    /// The offset to send back next time, in bytes. Handed over rather than left to the client to
+    /// compute: it is `since + text.len()`, and a client that measured the string in characters
+    /// instead would drift on the first non-ASCII byte and then re-send text it already had.
+    pub next: usize,
+    /// Always `true` on a 200 — there is no live tail without a live run. Present so the shape does
+    /// not change if a recorded fallback is ever served through this same route, and so the screen
+    /// has something to bind its "ao vivo" label to rather than inferring it from the status code.
+    pub live: bool,
+}
+
+/// Serves the live tail, and answers 204 when there is not one.
+///
+/// **204, never 404.** `404` claims the run does not exist, which is usually false and always
+/// misleading here: the ordinary reason for no tail is a run that finished, or one a previous
+/// daemon started, and both of those have their whole output in `runs.stdout` and `run_events`. A
+/// client told the id is wrong stops asking; a client told there is no content knows to read the
+/// recorded copy instead.
+///
+/// No database work on this path at all, which is what lets a screen poll it every three seconds
+/// per visible run without the tick paying for it.
+pub async fn get_run_tail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<TailQuery>,
+) -> Result<Json<TailResponse>, StatusCode> {
+    let since = query.since.unwrap_or(0);
+    let text = read_tail(&state.run_tails, id, since).ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(TailResponse {
+        next: since + text.len(),
+        text,
+        live: true,
+    }))
 }
 
 pub async fn get_run(
@@ -2415,11 +2573,11 @@ pub async fn prune_transcripts(
 /// otherwise never reach a sweep at all — the lesson `triage::run_triage_loop` already learned.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Retention for everything a finished run leaves behind: its transcript, its events, and in time
-/// its entries in the activity feed.
+/// Retention for everything finished work leaves behind: a run's transcript, its events, its
+/// entries in the activity feed, and the councils that are over.
 ///
-/// One loop rather than three, because they are the same sweep at different windows and splitting
-/// them would mean three tasks waking on the same hour to take the same write lock. Every failure
+/// One loop rather than four, because they are the same sweep at different windows and splitting
+/// them would mean four tasks waking on the same hour to take the same write lock. Every failure
 /// is best-effort and logged: a sweep that could not run is a fuller disk later, not a reason to
 /// take a daemon down now.
 pub async fn run_retention_loop(state: AppState) {
@@ -2440,6 +2598,25 @@ pub async fn run_retention_loop(state: AppState) {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "feed: entries past the retention window"),
             Err(error) => tracing::warn!(%error, "feed: retention sweep failed"),
+        }
+        // Unconditional, unlike the pillar's other work: a council is deleted whether or not
+        // `.ai/council.yaml` still names a roster. Gating the sweep on the pillar being configured
+        // would make a roster somebody removed the way their history stops being collected.
+        match crate::council::prune(&state.pool, crate::council::retention_days(), now).await {
+            Ok(0) => {}
+            Ok(pruned) => {
+                tracing::info!(pruned, "council: deliberations past the retention window")
+            }
+            Err(error) => tracing::warn!(%error, "council: retention sweep failed"),
+        }
+        // The fourth window, and the one that empties rather than deletes: a queued operation's row
+        // is what `action_grants.queued_request_id` points at, so only what git printed goes.
+        match crate::vcs::prune_output_tails(&state.pool, crate::vcs::output_retention_days(), now)
+            .await
+        {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "vcs: outputs past the retention window"),
+            Err(error) => tracing::warn!(%error, "vcs: retention sweep failed"),
         }
     }
 }
@@ -2508,6 +2685,80 @@ mod tests {
             HANDOFF_CONTEXT_LIMIT_FLOOR, 200_000,
             "update CONTEXT_WINDOW_TOKENS in shell/src/derive.ts to match, then this number here",
         );
+    }
+
+    /// A live run's tail is readable from outside its task, and the offset is in BYTES.
+    ///
+    /// Bytes rather than lines because the last line of a working run has not ended yet: counting
+    /// lines would give a cursor that moves backwards every time the line in progress grows, and the
+    /// reader would redraw text it already had.
+    #[test]
+    fn a_live_tail_is_read_from_a_byte_offset() {
+        let tails: crate::state::RunTails = Default::default();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        tails
+            .lock()
+            .unwrap()
+            .insert(7, std::sync::Arc::clone(&buffer));
+
+        buffer.lock().unwrap().push_str("primeira\n");
+        assert_eq!(read_tail(&tails, 7, 0).as_deref(), Some("primeira\n"));
+
+        buffer.lock().unwrap().push_str("segunda");
+        assert_eq!(
+            read_tail(&tails, 7, 9).as_deref(),
+            Some("segunda"),
+            "the second read repeated what the first had already shown"
+        );
+    }
+
+    /// No entry is `None`, and `None` is not the empty string.
+    ///
+    /// The distinction is the whole contract. A run this daemon never started, and a run that has
+    /// finished, both have no tail — and neither produced no output. `Some("")` would let a screen
+    /// draw an empty transcript over a run that wrote thousands of lines; `None` makes it say where
+    /// the durable copy is instead.
+    #[test]
+    fn a_run_with_no_live_tail_is_absent_rather_than_empty() {
+        let tails: crate::state::RunTails = Default::default();
+        assert_eq!(read_tail(&tails, 404, 0), None);
+    }
+
+    /// An offset past the end is empty, not a panic.
+    ///
+    /// It happens on every ordinary poll of a run that wrote nothing since the last one, so it is
+    /// the common path and not an edge case. It is also what a slicing bug would turn into a crash
+    /// in the daemon's HTTP thread.
+    #[test]
+    fn an_offset_at_or_past_the_end_reads_empty() {
+        let tails: crate::state::RunTails = Default::default();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::from("abc")));
+        tails.lock().unwrap().insert(1, buffer);
+
+        assert_eq!(read_tail(&tails, 1, 3).as_deref(), Some(""));
+        assert_eq!(read_tail(&tails, 1, 99).as_deref(), Some(""));
+    }
+
+    /// The guard that drops a run's abort handle drops its tail with it.
+    ///
+    /// Registered in one place and released in another is how a map leaks: every run the daemon has
+    /// ever executed would keep its whole transcript in memory until restart. `Registration` already
+    /// owns that lifetime for the other two maps, and this is what keeps the third beside them.
+    #[test]
+    fn ending_a_run_takes_its_tail_with_the_rest_of_its_registration() {
+        let handles: crate::state::RunHandles = Default::default();
+        let messages: crate::state::RunMessages = Default::default();
+        let tails: crate::state::RunTails = Default::default();
+        tails.lock().unwrap().insert(9, Default::default());
+
+        drop(Registration {
+            handles: handles.clone(),
+            messages: messages.clone(),
+            tails: tails.clone(),
+            id: 9,
+        });
+
+        assert!(tails.lock().unwrap().is_empty(), "the tail outlived its run");
     }
 
     async fn retention_pool() -> sqlx::SqlitePool {
@@ -2766,6 +3017,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
                 num_turns: None,
             })),
             delay: std::sync::Mutex::new(delay),
@@ -2783,10 +3035,12 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout,
         };
@@ -2981,6 +3235,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 max_items: 5,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
@@ -3454,17 +3709,123 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         );
     }
 
+    /// **The last command on the approval list that was still handed back to the run.**
+    ///
+    /// `git tag` paused for a human and then, on yes, the RUN wrote the tag with its own hands —
+    /// which is the arrangement this whole pillar exists to end, surviving in the one place nobody
+    /// had got to yet. What is pinned is that the approval queues it instead, and that the audit
+    /// trail names the operation: the note was hard-coded to "merge" until `push` landed, and a third
+    /// operation is where a two-way `if` would quietly become wrong again.
+    ///
+    /// The command names no branch, so the tag's target has to come from the worktree — the half no
+    /// `git tag v1` carries, and the same half a bare `git push origin` needs.
+    #[tokio::test]
+    async fn approving_a_tag_queues_it_and_records_which_operation_it_was() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git tag v1.0").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (op, args, origin, status): (String, String, String, String) = sqlx::query_as(
+            "SELECT op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("the approved tag is in the queue");
+        assert_eq!(op, "tag");
+        assert_eq!((origin.as_str(), status.as_str()), ("human", "queued"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            serde_json::json!({"op": "tag", "name": "v1.0", "at": branch}),
+            "the command named the tag; the branch is the one the worktree stands on"
+        );
+
+        assert!(
+            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                .await
+                .unwrap(),
+            "the queue took the tag, so the run must NOT also be authorized to write it"
+        );
+
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains("tag queued as vcs request"),
+            "the trail must name the operation it queued: {note}"
+        );
+    }
+
+    /// The two operations that take no branch from the worktree, through the approval door.
+    ///
+    /// Table-driven because what is being pinned is the CHAIN: `queueable_operation` tries five
+    /// parsers in an `or_else` sequence, and the two added last are the two that ignore the branch
+    /// argument entirely. A per-operation test would pass with either of them missing from the
+    /// chain, since each one's own parser is tested next door.
+    #[tokio::test]
+    async fn approving_a_fetch_or_a_branch_delete_queues_it_too() {
+        for (command, expected_op, expected_args) in [
+            (
+                "git fetch origin",
+                "fetch",
+                serde_json::json!({"op": "fetch", "remote": "origin"}),
+            ),
+            (
+                "git branch -d feature",
+                "branch-delete",
+                serde_json::json!({"op": "branch-delete", "branch": "feature"}),
+            ),
+        ] {
+            let (state, _runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600))
+                    .await;
+            let (proposal_id, _branch, _container) =
+                seed_real_worktree_approval(&state, command).await;
+
+            let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+            let (op, args): (String, String) =
+                sqlx::query_as("SELECT op, args FROM vcs_requests ORDER BY id DESC LIMIT 1")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap_or_else(|_| panic!("{command} should have been queued"));
+            assert_eq!(op, expected_op, "{command}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+                expected_args,
+                "{command}"
+            );
+            assert!(
+                !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                    .await
+                    .unwrap(),
+                "{command}: the queue took it, so the run must not also be authorized"
+            );
+        }
+    }
+
     /// The other side of the branch, and the one that keeps this from being a regression: an
     /// approved action the queue cannot perform is authorized exactly as it always was.
     ///
-    /// `git push` is the case that matters — it is on the approval list, the queue has no executor
-    /// for it, and redirecting it would leave a run denied with nowhere to go.
+    /// **The subject used to be `git push origin main`, and this is what it cost to change it.** That
+    /// command is now queued, so the test as written would have gone red — which is the correct
+    /// signal, and the wrong fix would have been to delete it. The property is not about push; it is
+    /// that a run whose approved action has no executor still gets to perform it, and losing that
+    /// leaves a person holding an approval with nowhere to go. `--force-with-lease` is the sharpest
+    /// remaining case precisely BECAUSE it is a push: `vcs::push_from_command` sees the right verb
+    /// and refuses on the flag, so this exercises the refusal rather than the absence of a parser.
     #[tokio::test]
     async fn approving_something_the_queue_cannot_perform_still_authorizes_the_run() {
         let (state, _runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         let (proposal_id, _branch, _container) =
-            seed_real_worktree_approval(&state, "git push origin main").await;
+            seed_real_worktree_approval(&state, "git push --force-with-lease origin main").await;
 
         let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
 
@@ -3472,11 +3833,64 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(queued, 0, "the queue cannot push, so it must not claim to");
+        assert_eq!(
+            queued, 0,
+            "the queue does not force-push, so it must not claim to"
+        );
         assert_eq!(
             grants_for(&state, resume_id).await,
             1,
             "an action the queue does not take is still the run's to perform, once"
+        );
+    }
+
+    /// The push counterpart of `approving_a_merge_queues_it_instead_of_letting_the_run_perform_it`,
+    /// and it is not a copy of it: it pins the two halves that are push's own.
+    ///
+    /// The command names only the remote, so the BRANCH has to come from the worktree — the same
+    /// half no push command line carries that a merge's target does. And the audit note has to say
+    /// `push`, because that sentence was hard-coded to the word "merge" for as long as merge was the
+    /// only thing the queue could do; a trail that calls every operation a merge is a trail nobody
+    /// can reconstruct an approval from.
+    #[tokio::test]
+    async fn approving_a_push_queues_it_and_records_which_operation_it_was() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git push origin").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (op, args, origin, status): (String, String, String, String) =
+            sqlx::query_as("SELECT op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .expect("the approved push is in the queue");
+        assert_eq!(op, "push");
+        assert_eq!((origin.as_str(), status.as_str()), ("human", "queued"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            serde_json::json!({"op": "push", "remote": "origin", "branch": branch}),
+            "the command named the remote; the branch is the one the worktree stands on"
+        );
+
+        assert!(
+            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
+                .await
+                .unwrap(),
+            "the queue took the push, so the run must NOT also be authorized to perform it"
+        );
+
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains("push queued as vcs request"),
+            "the trail must name the operation it queued, not the one it used to be: {note}"
         );
     }
 
@@ -3501,6 +3915,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 max_items: 5,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
@@ -3617,9 +4032,8 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
     /// matters is that `resume_approved_run` does not **re-record** the worktree, and that is only
     /// provable by exercising it. Hence the three assertions: one row, a new owner, the same base.
     ///
-    /// The twin for the handoff path is deliberately unwritten. That path creates its successor
-    /// with a raw `INSERT INTO runs`, and the defect around it is unconfirmed; a test written now
-    /// would either pass by accident or fail for a reason that is not this one.
+    /// The twin for the handoff path is `a_handed_off_run_takes_the_slot_of_the_run_it_continues`,
+    /// below. It was left unwritten while the defect there was unconfirmed; it is confirmed now.
     #[tokio::test]
     async fn a_resumed_run_keeps_the_base_of_the_tree_it_inherited() {
         let (state, _runner) =
@@ -3645,6 +4059,123 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             rows,
             vec![("run".to_owned(), resume_run_id, Some("ba5eba5e".to_owned()))],
             "the resume re-recorded the tree instead of taking the row over"
+        );
+    }
+
+    /// A context handoff carries the slot across, like the approval resume above it.
+    ///
+    /// The two paths continue one piece of work in one checkout, and the slot is what says that
+    /// checkout is occupied. The handoff already moves the `worktrees` row to the successor; leaving
+    /// `project_slots` pointing at the predecessor makes the two disagree about who is working in
+    /// the tree, and `reconcile_orphaned_slots` settles that argument the wrong way — it frees any
+    /// slot whose owner is not live, and the predecessor is `completed` by then. The project reads
+    /// one fewer in flight than it has and starts another run in the same repository, which is the
+    /// single thing `project_slots` exists to prevent.
+    ///
+    /// Handed over rather than claimed, for the reason spelled out at the resume: a claim is per
+    /// owner, so the successor would ask for a SECOND slot while the predecessor still held the
+    /// first, and a project at its ceiling would refuse to continue work it had already admitted.
+    /// A handover cannot fail on a full project, because it does not change how many are held.
+    #[tokio::test]
+    async fn a_handed_off_run_takes_the_slot_of_the_run_it_continues() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43001, 'project-a', 'a long one', 'running', 'real', ?, '2026-08-12T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let held = crate::concurrency::claim(
+            &pool,
+            "project-a",
+            crate::worktree::Owner::Run(43001),
+        )
+        .await
+        .unwrap();
+        let crate::concurrency::ClaimOutcome::Claimed(slot) = held else {
+            panic!("the predecessor could not take a slot to hand over");
+        };
+
+        let successor = prepare_handoff_successor(&pool, 43001)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Run(successor.id))
+                .await
+                .unwrap(),
+            Some(slot),
+            "the successor is working in the tree without holding its slot"
+        );
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Run(43001))
+                .await
+                .unwrap(),
+            None,
+            "the predecessor kept a slot it is no longer working in"
+        );
+    }
+
+    /// The other half of that filter: a node's handoff must not move its JOB's slot.
+    ///
+    /// A job holds one slot for the whole chain, and its nodes hold none. Were the update above
+    /// keyed on the owner id alone, a node handing off would carry the job's slot to itself — and
+    /// the job would lose it the moment that one node finished, with the rest of the queue still to
+    /// run. The same trap the `worktrees` update next to it names, one table over.
+    #[tokio::test]
+    async fn a_node_handing_off_leaves_its_jobs_slot_where_it_is() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (7, 'project-a', 'C:/somewhere', 'implementing', 5, '2026-08-12T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, job_id, created_at)
+             VALUES (43101, 'project-a', 'a node', 'running', 'real', ?, 7, '2026-08-12T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The job owns the slot, exactly as `create_run_with` leaves it: the node claimed nothing.
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(7))
+            .await
+            .unwrap();
+
+        let successor = prepare_handoff_successor(&pool, 43101)
+            .await
+            .unwrap()
+            .expect("the node was over the threshold and had no successor yet");
+
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Job(7))
+                .await
+                .unwrap(),
+            Some(0),
+            "the node's handoff took the slot out from under its own job"
+        );
+        assert_eq!(
+            crate::concurrency::slot_of(&pool, crate::worktree::Owner::Run(successor.id))
+                .await
+                .unwrap(),
+            None,
+            "a node was given a slot of its own, so the job now costs two"
         );
     }
 
@@ -3876,6 +4407,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: Some(1000),
             output_tokens: Some(500),
             cache_read_tokens: Some(20_000),
+            cache_creation_tokens: Some(3_000),
             num_turns: Some(12),
         });
         let pool = state.pool.clone();
@@ -3885,15 +4417,32 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
         for _ in 0..20 {
             let parsed = get_run_status(&app, created.id).await;
             if parsed.status == "completed" {
-                let usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
-                    "SELECT input_tokens, output_tokens, cache_read_tokens, num_turns
-                         FROM runs WHERE id = ?",
-                )
-                .bind(created.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                assert_eq!(usage, (Some(1000), Some(500), Some(20_000), Some(12)));
+                // Named because clippy counts the tuple's arms, and the fifth column is exactly the
+                // one this test exists to cover.
+                type PersistedUsage = (
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                );
+                let usage: PersistedUsage =
+                    sqlx::query_as(
+                        "SELECT input_tokens, output_tokens, cache_read_tokens,
+                                cache_creation_tokens, num_turns
+                             FROM runs WHERE id = ?",
+                    )
+                    .bind(created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                // `cache_creation_tokens` is asserted here rather than in a test of its own: it is
+                // the same round trip through the same UPDATE, and a near-copy of this test would
+                // only make the fifth column look like a separate mechanism from the other four.
+                assert_eq!(
+                    usage,
+                    (Some(1000), Some(500), Some(20_000), Some(3_000), Some(12))
+                );
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3918,6 +4467,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         });
         let pool = state.pool.clone();
@@ -5708,6 +6258,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         });
         let pool = state.pool.clone();
@@ -5781,6 +6332,7 @@ calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
             num_turns: None,
         });
         let pool = state.pool.clone();

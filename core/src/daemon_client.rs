@@ -518,8 +518,31 @@ mod tests {
     /// so without a round trip, and the daemon never sees a request it would only reject.
     #[test]
     fn an_operation_the_queue_does_not_have_never_reaches_the_daemon() {
-        assert!(vcs_submit_body("nucleos", "push", Some("origin"), Some("master")).is_err());
+        // One the queue has decided against, rather than one it has not got to: nothing is deferred
+        // any more, so a name that fails here fails for a reason the caller can act on.
+        assert!(vcs_submit_body("nucleos", "pull", Some("feature"), Some("origin")).is_err());
+        assert!(vcs_submit_body("nucleos", "tag", Some("main"), Some("-d")).is_err());
         assert!(vcs_submit_body("nucleos", "merge", Some("-f"), Some("master")).is_err());
+        // The same guard on the operation the queue DID learn, because a second variant is a second
+        // route to argv and inherits none of the first one's checks by being next to it.
+        assert!(vcs_submit_body("nucleos", "push", Some("main"), Some("--exec=x")).is_err());
+    }
+
+    /// `source` is what moves and `target` is where it goes, for both operations — so a push reads
+    /// "branch, then remote". Asserted on the wire shape because that convention is the one thing a
+    /// caller cannot infer from the parameter names alone, and swapping the two arguments at the
+    /// call site would otherwise produce a request that queues and pushes the wrong thing.
+    #[test]
+    fn a_push_body_names_the_branch_as_source_and_the_remote_as_target() {
+        let body = vcs_submit_body("nucleos", "push", Some("main"), Some("origin")).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "project_id": "nucleos",
+                "operation": {"op": "push", "remote": "origin", "branch": "main"}
+            })
+        );
     }
 
     /// The two ticket routes differ only in a suffix, and nothing else in the suite would notice if they

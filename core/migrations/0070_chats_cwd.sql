@@ -1,0 +1,13 @@
+-- Where a conversation's turns run.
+--
+-- NULL means the daemon's own directory, which is what every conversation that exists today is —
+-- so this column changes nothing for any of them, and that is the point. It is set only when a
+-- conversation continues a session that was had somewhere else: the CLI finds a session by the
+-- directory it belongs to, so resuming one from the wrong place does not fail loudly, it quietly
+-- starts a new session instead.
+--
+-- It is also what decides how much a turn may do. A conversation rooted in a directory gets that
+-- directory's tools when the message comes from the machine itself; everything without a root stays
+-- on the MCP-only policy that keeps a Telegram turn away from the filesystem. Both rules read this
+-- one column, so there is no second place for them to disagree — see `assistant.rs`.
+ALTER TABLE chats ADD COLUMN cwd TEXT;

@@ -36,14 +36,41 @@ export async function settle(rounds = 4) {
  *
  * `answers` maps a URL fragment to a body, or to `null`, which becomes a 500. Anything unmatched
  * yields `[]` — so a test does not have to describe calls it is not talking about.
+ *
+ * A key may name a method — `"POST /fleet/exclusions"` — and a method-qualified key is tried before
+ * a bare one. Without that, one route reached by two verbs (asking for an exclusion and listing
+ * them) would answer both with whichever key happened to be declared first.
+ *
+ * `text()` is answered as well as `json()`, on both branches: the daemon writes its refusals as
+ * plain text and several callers read them, so a mock that only spoke JSON would send them all down
+ * their catch arm and report an unreachable daemon.
  */
 export function respondWith(answers: Record<string, unknown>) {
-  fetchMock.mockImplementation(async (url: string) => {
-    const key = Object.keys(answers).find((fragment) => url.includes(fragment));
+  fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    const method = (init?.method ?? "GET").toUpperCase();
+    // Longest match wins among the bare keys, so `/fleet/exclusions` does not swallow
+    // `/fleet/exclusions/requests` — one is a prefix of the other, and declaration order deciding
+    // which route answers is a trap a reader would spend an afternoon on.
+    const keys = [...Object.keys(answers)].sort((left, right) => right.length - left.length);
+    const key =
+      keys.find((fragment) => qualified(fragment, url, method)) ??
+      keys.find((fragment) => !fragment.includes(" ") && url.includes(fragment));
     const body = key === undefined ? [] : answers[key];
-    if (body === null) return { ok: false, status: 500, json: async () => ({}) };
-    return { ok: true, status: 200, json: async () => body };
+    if (body === null) {
+      return { ok: false, status: 500, json: async () => ({}), text: async () => "" };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    };
   });
+}
+
+function qualified(fragment: string, url: string, method: string): boolean {
+  const [head, rest] = fragment.split(" ");
+  return rest !== undefined && head.toUpperCase() === method && url.includes(rest);
 }
 
 export const CONCURRENCY = "/concurrency";

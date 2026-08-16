@@ -50,6 +50,20 @@ pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 /// In-flight steerable runs' turn channels, keyed by `runs.id`.
 pub type RunMessages = Arc<Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender<String>>>>;
 
+/// In-flight runs' transcripts as they fill, keyed by `runs.id`.
+///
+/// The third map of this shape, and the one whose absence means the most. `run_events` is written
+/// ONCE, when a run ends (`runs::append_run_events` has two callers and both are terminal), so
+/// nothing durable can be read while a run is working — the buffer behind this handle is the only
+/// place its output exists in the meantime. The timeout branch already relies on that, which is why
+/// it is the one path that salvages anything from a run the clock killed.
+///
+/// **Deliberately ephemeral.** A restarted daemon has no entry here for a run it did not start, and
+/// a finished run is removed. Neither means the run produced nothing — it means the durable copy
+/// (`runs.stdout`, `run_events`) is now the only one. A reader that shows an absent tail as an empty
+/// transcript is lying about a run that may have written thousands of lines.
+pub type RunTails = Arc<Mutex<HashMap<i64, Arc<Mutex<String>>>>>;
+
 /// The email pillar's process-wide settings, resolved once at startup.
 ///
 /// Grouped into one struct rather than spread across `AppState` because they are read together and
@@ -243,6 +257,9 @@ pub struct AppState {
     /// and a `Default` that means "UTC, ordinary office hours" so no test that ignores calendars
     /// has to know this field exists.
     pub calendar: Arc<crate::calendar::CalendarRuntime>,
+    /// The council: the roster, the per-seat clock, and the scoped key its seats reach the daemon
+    /// with. `Default` means there is no council, which is the shipped state.
+    pub council: Arc<crate::council::CouncilRuntime>,
     /// In-flight runs' abort handles, keyed by `runs.id`. Inserted when a run's task spawns
     /// (`runs::create_run`), removed when it completes/times out/is cancelled.
     pub run_handles: RunHandles,
@@ -255,6 +272,10 @@ pub struct AppState {
     /// `http::post_run_message` decides on the run's own recorded facts and only then looks for the
     /// channel.
     pub run_messages: RunMessages,
+    /// In-flight runs' transcripts as they fill, keyed by `runs.id`. Inserted beside the abort
+    /// handle when a run's task spawns, removed beside it when the task ends — the three maps are
+    /// populated and drained together so none of them can outlive the run it describes.
+    pub run_tails: RunTails,
     /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
     pub progress_timeout: Duration,
     pub run_timeout: Duration,

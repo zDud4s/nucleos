@@ -267,15 +267,45 @@ describe("daemon API client", () => {
     expectGetCall(2, `${DAEMON_URL}/proposals`);
   });
 
-  it("approves a proposal and returns the resume run id, null when non-ok", async () => {
-    fetchMock
-      .mockResolvedValueOnce(okJson({ resume_run_id: 77 }))
-      .mockResolvedValueOnce(nonOk());
+  it("approves a proposal and returns the resume run id", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ resume_run_id: 77 }));
 
-    await expect(api.approveProposal(TOKEN, 5)).resolves.toBe(77);
+    await expect(api.approveProposal(TOKEN, 5)).resolves.toEqual({
+      ok: true,
+      resumeRunId: 77,
+      // Null and not absent: an ordinary approval closed nothing early, and the field being there
+      // with nothing in it is what lets a caller test it without knowing which kind it approved.
+      closed: null,
+    });
     expectPostCall(1, `${DAEMON_URL}/proposals/5/approve`);
-    await expect(api.approveProposal(TOKEN, 5)).resolves.toBeNull();
-    expectPostCall(2, `${DAEMON_URL}/proposals/5/approve`);
+  });
+
+  // The refusal carries the daemon's sentence, because a 409 here is either "already decided" or
+  // "can never resume" and the panel has to say which. A test on `ok: false` alone would pass
+  // against the version that threw the sentence away.
+  it("carries the daemon's own reason when an approval is refused", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      text: async () => "this approval cannot resume the run: no live worktree for the paused run",
+    });
+
+    await expect(api.approveProposal(TOKEN, 5)).resolves.toEqual({
+      ok: false,
+      status: 409,
+      reason:
+        "this approval cannot resume the run: no live worktree for the paused run",
+    });
+  });
+
+  it("falls back to a sentence of its own when a refusal carries no body", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 401, text: async () => "" });
+
+    await expect(api.approveProposal(TOKEN, 5)).resolves.toEqual({
+      ok: false,
+      status: 401,
+      reason: "The daemon refused this approval and gave no reason.",
+    });
   });
 
   it("rejects a proposal and reflects response ok", async () => {

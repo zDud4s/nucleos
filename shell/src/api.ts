@@ -133,6 +133,117 @@ export interface Proposal {
   decided_at: string | null;
 }
 
+/**
+ * A rule in force: two jobs of one project that may not run at the same time.
+ *
+ * `job_low` is not decoration. The daemon parks the HIGHER id and never the lower one, so the pair's
+ * order is also which of the two waits — a screen that showed the edge without it could not say
+ * which card is the one being held.
+ */
+export interface FleetExclusion {
+  id: number;
+  project_id: string;
+  job_low: number;
+  job_high: number;
+  /** The request that authorised it. */
+  proposal_id: number;
+  /** What motivated it, as JSON, when the asker named files. Recorded, not acted on. */
+  paths: string | null;
+  created_at: string;
+}
+
+export async function getExclusions(token: string): Promise<FleetExclusion[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as FleetExclusion[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The exclusion requests waiting on an answer.
+ *
+ * Not `getProposals`, which serves `action-approval` alone: approving one of those resumes a paused
+ * run, and approving one of these resumes nothing. The daemon keeps the two queues apart on purpose,
+ * exactly as it does for a contact merge.
+ */
+export async function getExclusionRequests(token: string): Promise<Proposal[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions/requests`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Proposal[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Why an exclusion could not be asked for, in the daemon's own words.
+ *
+ * The same shape as `CreateJobOutcome`, for the same reason: `409` is both "you already asked about
+ * this pair" and "these two are already excluded", and the remedies are opposite — wait for the
+ * approval, or stop clicking because it is done.
+ */
+export type ProposeExclusionOutcome =
+  | { ok: true; proposalId: number }
+  | { ok: false; status: number; reason: string };
+
+/**
+ * Asks that two jobs not run at the same time.
+ *
+ * Answers with a PROPOSAL, never a rule: nothing about scheduling changes until somebody approves it
+ * on the Autopilot tab. A screen that reported this as done would be describing an effect that has
+ * not happened.
+ */
+export async function proposeExclusion(
+  token: string,
+  jobA: number,
+  jobB: number,
+  paths: string[] = [],
+): Promise<ProposeExclusionOutcome> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ job_a: jobA, job_b: jobB, paths }),
+    });
+    if (!res.ok) {
+      const reason = (await res.text()).trim();
+      return {
+        ok: false,
+        status: res.status,
+        reason: reason === "" ? `the daemon refused with ${res.status}` : reason,
+      };
+    }
+    const data = (await res.json()) as { proposal_id: number };
+    return { ok: true, proposalId: data.proposal_id };
+  } catch {
+    return { ok: false, status: 0, reason: "the daemon could not be reached" };
+  }
+}
+
+/** Lifts a rule. `false` covers both "already lifted" and "the call failed" — neither changed it. */
+export async function revokeExclusion(token: string, id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/fleet/exclusions/${id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export interface ScopedKill {
   scope_type: string;
   scope_id: string;
@@ -980,10 +1091,38 @@ export async function getProposals(
   }
 }
 
+/**
+ * Why an approval did not go through, in the daemon's own words.
+ *
+ * The same shape as `CreateJobOutcome` and for the same reason: `409` is both "somebody already
+ * decided this" and "this approval can never resume — the run has no worktree", and those have
+ * opposite remedies. Collapsing them to `null` gave the panel one sentence for both, which is the
+ * sentence a person reads before deciding whether to click again.
+ *
+ * `resumeRunId` is nullable on the success side because the approvals that start no run — a contact
+ * merge, a calendar event — come back through this same door with a body of their own.
+ */
+export type ApproveOutcome =
+  | {
+      ok: true;
+      resumeRunId: number | null;
+      /**
+       * What the approval turned out to mean, when it was not simply "done".
+       *
+       * The daemon writes this on the one 200 that changes nothing: an exclusion whose two jobs both
+       * ended while the request waited is dismissed with a note instead of becoming a rule. It is a
+       * success — the person answered and the answer was recorded — so it cannot travel as a
+       * refusal, and without a field of its own the screen would show the request vanishing with no
+       * account of why.
+       */
+      closed: string | null;
+    }
+  | { ok: false; status: number; reason: string };
+
 export async function approveProposal(
   token: string,
   id: number,
-): Promise<number | null> {
+): Promise<ApproveOutcome> {
   try {
     const res = await fetch(`${DAEMON_URL}/proposals/${id}/approve`, {
       method: "POST",
@@ -992,11 +1131,27 @@ export async function approveProposal(
         "Content-Type": "application/json",
       },
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // Plain text, as `createJob` reads it. The fallback covers a status raised by the middleware
+      // rather than the handler, which writes no body.
+      const reason = (await res.text()).trim();
+      return {
+        ok: false,
+        status: res.status,
+        reason:
+          reason === ""
+            ? "The daemon refused this approval and gave no reason."
+            : reason,
+      };
+    }
     const data = await res.json();
-    return data.resume_run_id;
+    return {
+      ok: true,
+      resumeRunId: data.resume_run_id ?? null,
+      closed: typeof data.closed === "string" ? data.closed : null,
+    };
   } catch {
-    return null;
+    return { ok: false, status: 0, reason: "The daemon is not reachable." };
   }
 }
 
@@ -1756,6 +1911,43 @@ export async function getRun(token: string, id: number): Promise<RunDetail | nul
   }
 }
 
+/** What a run has written since an offset, while it is still writing. */
+export interface RunTailChunk {
+  text: string;
+  /** The offset to send next time, in BYTES, as the daemon counted them. */
+  next: number;
+  live: boolean;
+}
+
+/**
+ * Reads a live run's output from where the last read stopped.
+ *
+ * Three answers, and the middle one is the reason this is not a `| null` getter. `"recorded"` is a
+ * 204: the daemon has no live tail for this run, which is what a finished run — or one a previous
+ * daemon started — looks like. Its output is not missing, it is in `runs.stdout`. `null` is a read
+ * that failed, and says nothing at all about where the output is.
+ *
+ * `since` is handed back rather than recomputed here. It is the daemon's `next`, in bytes; measuring
+ * the received string in JavaScript characters instead would drift on the first non-ASCII byte and
+ * then redraw text already on screen.
+ */
+export async function getRunTail(
+  token: string,
+  id: number,
+  since: number,
+): Promise<RunTailChunk | "recorded" | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/runs/${id}/tail?since=${since}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.status === 204) return "recorded";
+    if (!res.ok) return null;
+    return (await res.json()) as RunTailChunk;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Starts a run, reporting the status when it fails.
  *
@@ -1860,6 +2052,99 @@ export async function endRunTurns(token: string, id: number): Promise<boolean> {
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+// ── Agents ──────────────────────────────────────────────────────────────────
+
+/** One named agent in the house catalogue: who it is, and how it is allowed to run. */
+export interface Agent {
+  id: string;
+  name: string;
+  speciality: string;
+  prompt: string;
+  engine: string;
+  model: string | null;
+  tool_policy: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentInput {
+  name: string;
+  speciality: string;
+  prompt: string;
+  engine: string;
+  model: string | null;
+  tool_policy: string;
+}
+
+export const AGENT_ENGINES = ["claude", "codex", "local"] as const;
+
+/**
+ * The two policies an agent of this catalogue may hold.
+ *
+ * `unrestricted` is absent on purpose rather than by oversight: the daemon refuses it, because that
+ * policy only means something for a run the `PreToolUse` classifier governs, and one of these has
+ * no worktree and no hook wired. An option whose only outcome is a 400 is not an option.
+ */
+export const AGENT_TOOL_POLICIES = ["mcp_only", "none"] as const;
+
+export async function listAgents(token: string): Promise<Agent[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/agents`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Agent[];
+  } catch {
+    return null;
+  }
+}
+
+/** 409 means the name — or the id it slugs to — is taken, so the status travels back. */
+export async function createAgent(
+  token: string,
+  input: AgentInput,
+): Promise<ApiResult<Agent>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/agents`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as Agent };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Deletes an agent.
+ *
+ * Returns the status where `deletePreset` returns a bare boolean, and the difference is the whole
+ * point: this route has a refusal worth reading. A 409 means a team is standing on this agent, and
+ * collapsing that into `false` would tell the owner "could not delete" when the daemon told them
+ * exactly which thing was in the way.
+ */
+export async function deleteAgent(token: string, id: string): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/agents/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
   }
 }
 
@@ -2029,6 +2314,14 @@ export async function getAssistantTurn(
 export interface AssistantTurnRow {
   id: number;
   asked: string;
+  /**
+   * The CLI session this turn ran in. Null on turns from before the daemon recorded one.
+   *
+   * Optional here, not merely nullable: a daemon older than the field sends no key at all, and the
+   * transcript treating that as "no session" is right — it cannot claim a restart it has no evidence
+   * of either way.
+   */
+  session_id?: string | null;
   /** The reply, or null while the turn is still running or if it produced nothing. */
   answer: string | null;
   /** What it failed with, when it failed. Shown rather than left as an empty bubble. */
@@ -2085,6 +2378,14 @@ export interface ChatRow {
   first_message: string | null;
   last_activity: string | null;
   /**
+   * Where this conversation's turns run, or null for the daemon's own directory.
+   *
+   * Set only on conversations continuing a session that was had in the IDE. The window shows it
+   * because it is the only thing separating two conversations continued out of two worktrees of the
+   * same repository.
+   */
+  cwd: string | null;
+  /**
    * How many answers landed here since the conversation was last opened.
    *
    * Waiting for YOU, not for the model — a turn still being written is the chat waiting on the
@@ -2112,13 +2413,47 @@ export async function listChats(token: string): Promise<ChatRow[] | null> {
   }
 }
 
-/** Opens a conversation and answers with the id the daemon minted for it. */
-export async function createChat(token: string, brain: Brain = "cloud"): Promise<ApiResult<string>> {
+/** A conversation already had in the IDE, which the daemon could continue. */
+export interface IdeSession {
+  session_id: string;
+  /** Where it was had, and therefore where it will be resumed from. */
+  cwd: string;
+  /** The first thing its owner said in it, or null when nothing quotable was said. */
+  title: string | null;
+  last_activity: string;
+}
+
+/** The IDE conversations this daemon can still pick up. */
+export async function listIdeSessions(token: string): Promise<IdeSession[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/assistant/ide-sessions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as IdeSession[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Opens a conversation and answers with the id the daemon minted for it.
+ *
+ * `continueSession` names a session already had in the IDE. Only the id travels: the directory it
+ * runs in is looked up by the daemon from the transcript, never sent from here.
+ */
+export async function createChat(
+  token: string,
+  brain: Brain = "cloud",
+  continueSession?: string,
+): Promise<ApiResult<string>> {
   try {
     const res = await fetch(`${DAEMON_URL}/assistant/chats`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ brain }),
+      body: JSON.stringify(
+        continueSession === undefined ? { brain } : { brain, continue_session: continueSession },
+      ),
     });
     if (!res.ok) return { ok: false, fault: faultForStatus(res.status), status: res.status };
     const data = (await res.json()) as { chat_id: string };
@@ -3118,5 +3453,115 @@ export async function readWebPage(
     return { ok: true, value: (await res.json()) as WebReadView };
   } catch {
     return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/** One seat of a council, as the daemon reports it. */
+export interface CouncilSeatView {
+  seat_idx: number;
+  kind: string;
+  ref: string;
+  /** pending | ok | error | timeout | cancelled. */
+  stage1_status: string;
+  stage1_error: string | null;
+  /** The seat's answer. `null` while it is working, and after a failure that produced none. */
+  answer: string | null;
+  /** The same set plus `skipped`, which is every seat when there was nothing to rank. */
+  stage2_status: string;
+  stage2_error: string | null;
+  rankings: { anon: string; rank: number }[];
+}
+
+export interface CouncilLeaderboardEntry {
+  seat_idx: number;
+  avg_rank: number;
+  /** How many peers ranked this seat. An average over one vote is not the claim five make. */
+  n: number;
+}
+
+export interface CouncilView {
+  id: string;
+  created_at: string;
+  question: string;
+  /** running | done | error | cancelled. */
+  status: string;
+  stage: number;
+  error: string | null;
+  chairman_kind: string;
+  chairman_ref: string;
+  synthesis: string | null;
+  anon_map: Record<string, number>;
+  leaderboard: CouncilLeaderboardEntry[];
+  seats: CouncilSeatView[];
+}
+
+export interface CouncilSummary {
+  id: string;
+  created_at: string;
+  question: string;
+  status: string;
+  stage: number;
+}
+
+export async function listCouncils(token: string): Promise<CouncilSummary[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CouncilSummary[];
+  } catch {
+    return null;
+  }
+}
+
+export async function getCouncil(token: string, id: string): Promise<CouncilView | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CouncilView;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convenes a council.
+ *
+ * Reports HOW it failed, unlike the two getters above, because every refusal here is something a
+ * person can act on: 503 means there is no roster to convene, 429 means the budget window is spent,
+ * and 400 means the question was empty. Flattened to `null` all three would read as "it did not
+ * work", which is the one answer that suggests nothing to do about it.
+ */
+export async function createCouncil(
+  token: string,
+  question: string,
+): Promise<ApiResult<{ id: string }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { id: string } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function cancelCouncil(token: string, id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/council/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }

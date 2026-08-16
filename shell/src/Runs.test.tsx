@@ -36,6 +36,10 @@ function daemonWith(one: RunDetail, presets: unknown[] = []) {
     if (/\/runs\/\d+\/message$/.test(target)) {
       return { ok: true, status: init?.method === "DELETE" ? 204 : 202 };
     }
+    // No live tail, which is what this daemon answers for every run it did not itself start. Left
+    // to the catch-all below, `/runs/7/tail` would match `includes("/runs")` and be served the
+    // INDEX — an array the tail panel would then read fields off.
+    if (/\/runs\/\d+\/tail/.test(target)) return { ok: true, status: 204 };
     if (/\/runs\/\d+$/.test(target)) return { ok: true, status: 200, json: async () => one };
     if (target.includes("/runs")) {
       return { ok: true, status: 200, json: async () => [row({ id: one.id, status: one.status })] };

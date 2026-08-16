@@ -945,6 +945,67 @@ mod tests {
         db.close().await;
     }
 
+    /// The whole loop, on real repositories: two live trees, each genuinely edited, measured by the
+    /// real pass, and read back as a collision that names the one file they share.
+    ///
+    /// The two tests around it each cover half and neither covers the join. `measure` is exercised
+    /// against one repository, so it never sees two; the arithmetic is exercised against SEEDED
+    /// measurements, so it never sees `changed_paths`. Everything between them — two trees measured
+    /// in one pass, their path sets crossing, the intersection surviving into the readout — was
+    /// only ever going to be checked by hand, and checking it by hand costs two autonomous agents
+    /// and a person watching a screen for thirty seconds.
+    ///
+    /// `only-a.rs` is what makes this an intersection rather than a union: it is touched, it is
+    /// measured, and it must NOT appear. Without it the assertion would pass on a bug that reported
+    /// every path either tree touched.
+    #[tokio::test]
+    async fn two_real_trees_editing_one_file_collide_over_exactly_that_file() {
+        let db = crate::storage::TempDb::new().await;
+        let (tree_a, base_a) = crate::inspect::tests::seeded_repo();
+        let (tree_b, base_b) = crate::inspect::tests::seeded_repo();
+        std::fs::write(tree_a.path().join("shared.rs"), "written by a\n").unwrap();
+        std::fs::write(tree_a.path().join("only-a.rs"), "a alone\n").unwrap();
+        std::fs::write(tree_b.path().join("shared.rs"), "written by b\n").unwrap();
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            tree_a.path(),
+            Some(&base_a),
+        )
+        .await;
+        seed_worktree_row(
+            &db.pool,
+            "run",
+            2,
+            "project-a",
+            tree_b.path(),
+            Some(&base_b),
+        )
+        .await;
+
+        measure(&db.pool).await;
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(
+            collisions.observed.state,
+            State::Collide,
+            "two real trees on one file did not read as a collision"
+        );
+        assert_eq!(
+            collisions.observed.overlaps.len(),
+            1,
+            "one pair of trees should produce one overlap"
+        );
+        assert_eq!(
+            collisions.observed.overlaps[0].paths,
+            vec!["shared.rs".to_string()],
+            "the overlap is not the intersection of what the two trees touched"
+        );
+        db.close().await;
+    }
+
     /// A worktree with no base is left unmeasured, and the missing row is what the read turns into
     /// `not_measured`. Writing an empty set would say "I measured, and it touched nothing".
     #[tokio::test]
