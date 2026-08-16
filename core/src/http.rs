@@ -3163,6 +3163,11 @@ async fn errand_by_id(state: &AppState, id: i64) -> Result<crate::errands::Erran
 struct PatchErrandRequest {
     status: Option<String>,
     brain: Option<String>,
+    /// When this errand is finished, in the owner's words, and how many turns it may take on its
+    /// own getting there. Both or neither: see `errands::set_investigation` for why they are one
+    /// decision and not two fields.
+    done_when: Option<String>,
+    windows: Option<i64>,
 }
 
 /// Pauses or resumes an errand, moves it between the local model and the cloud, or both at once —
@@ -3180,7 +3185,11 @@ async fn patch_errand(
     // Answered before anything is written, for the reason `patch_chat` gives further up: `204` over
     // an UPDATE that matched no row is the API saying "done" about something it did not do, and a
     // client that believes it carries on with an errand that was never there.
-    errand_by_id(&state, id).await?;
+    //
+    // Kept, not discarded, because the criterion below is a field this request may leave out while
+    // changing the windows beside it — "give it three more goes at the same thing" — and answering
+    // that needs the criterion it already has.
+    let errand = errand_by_id(&state, id).await?;
 
     if let Some(status) = body.status.as_deref() {
         crate::errands::set_status(&state.pool, id, crate::errands::Status::from_wire(status))
@@ -3196,6 +3205,21 @@ async fn patch_errand(
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "changing an errand's model failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // Written together, and only when at least one of them was asked for, so a PATCH that merely
+    // pauses an errand does not silently call off an investigation it never mentioned. `windows`
+    // alone means "give it more of the same criterion"; `done_when` alone means "this, once", which
+    // is one window and not zero — zero would store a criterion nothing will ever act on.
+    if body.done_when.is_some() || body.windows.is_some() {
+        let criterion = body.done_when.as_deref().or(errand.done_when.as_deref());
+        let windows = body.windows.unwrap_or(1);
+        crate::errands::set_investigation(&state.pool, id, criterion, windows)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "setting an errand's criterion failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }

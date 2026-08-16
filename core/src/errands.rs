@@ -133,6 +133,14 @@ pub struct Errand {
     /// Relative to the files root, and only ever resolved through [`folder_path`].
     pub folder: String,
     pub status: Status,
+    /// When this errand is finished, in the owner's words — the gate of an investigation.
+    ///
+    /// `None` for every errand that answers when spoken to and does nothing else, which is the
+    /// default and stays the default. See migration 0078 for why the gate is a sentence.
+    pub done_when: Option<String>,
+    /// How many more turns it may take on its own initiative. Zero means none, which is what makes
+    /// this dark until somebody turns it on.
+    pub windows_left: i64,
 }
 
 /// The errand of this topic, if there is one.
@@ -143,7 +151,7 @@ pub struct Errand {
 /// guess about a numbering scheme somebody else owns.
 pub async fn resolve(pool: &sqlx::SqlitePool, chat_key: &str) -> sqlx::Result<Option<Errand>> {
     let row = sqlx::query_as::<_, ErrandRow>(
-        "SELECT id, name, chat_key, brain, folder, status FROM errands WHERE chat_key = ?",
+        "SELECT id, name, chat_key, brain, folder, status, done_when, windows_left FROM errands WHERE chat_key = ?",
     )
     .bind(chat_key)
     .fetch_optional(pool)
@@ -152,15 +160,26 @@ pub async fn resolve(pool: &sqlx::SqlitePool, chat_key: &str) -> sqlx::Result<Op
     Ok(row.map(from_row))
 }
 
-/// The six columns every read of this table selects.
-type ErrandRow = (i64, String, String, String, String, String);
+/// The columns every read of this table selects.
+type ErrandRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
 
 /// The single place a row becomes an [`Errand`].
 ///
 /// Written once because five of the six columns are `TEXT` in one tuple: a second mapping that read
 /// any of them into another would compile, and the error would surface as an errand that is somehow
 /// paused because it runs on a local model, or one whose folder is a chat key.
-fn from_row((id, name, chat_key, brain, folder, status): ErrandRow) -> Errand {
+fn from_row(
+    (id, name, chat_key, brain, folder, status, done_when, windows_left): ErrandRow,
+) -> Errand {
     Errand {
         id,
         name,
@@ -168,6 +187,8 @@ fn from_row((id, name, chat_key, brain, folder, status): ErrandRow) -> Errand {
         brain: Brain::from_wire(&brain),
         folder,
         status: Status::from_wire(&status),
+        done_when,
+        windows_left,
     }
 }
 
@@ -184,7 +205,7 @@ fn from_row((id, name, chat_key, brain, folder, status): ErrandRow) -> Errand {
 /// first, exactly when the list is busiest, which is the one case the ordering exists for.
 pub async fn list(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
     let rows = sqlx::query_as::<_, ErrandRow>(
-        "SELECT id, name, chat_key, brain, folder, status FROM errands
+        "SELECT id, name, chat_key, brain, folder, status, done_when, windows_left FROM errands
           ORDER BY created_at DESC, id DESC",
     )
     .fetch_all(pool)
@@ -202,7 +223,7 @@ pub async fn list(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
 /// down" answers the first with the status of the second.
 pub async fn get(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<Option<Errand>> {
     let row = sqlx::query_as::<_, ErrandRow>(
-        "SELECT id, name, chat_key, brain, folder, status FROM errands WHERE id = ?",
+        "SELECT id, name, chat_key, brain, folder, status, done_when, windows_left FROM errands WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -750,6 +771,87 @@ pub async fn create_rule(
         sqlx::Error::Database(database) if database.is_unique_violation() => RuleError::Duplicate,
         _ => RuleError::Db(error),
     })
+}
+
+/// Turns an errand into an investigation, or back into an ordinary one.
+///
+/// Both halves in one statement because they are one decision. A criterion with no windows is a
+/// sentence nothing reads; windows with no criterion is a loop with no early stop, which is the
+/// shape this whole piece exists to avoid. Clearing either — `None`, or zero — ends the
+/// investigation and leaves the errand answering when spoken to, which is how an owner calls it off
+/// without closing anything.
+pub async fn set_investigation(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    done_when: Option<&str>,
+    windows: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errands SET done_when = ?, windows_left = ? WHERE id = ?")
+        .bind(done_when)
+        .bind(windows.max(0))
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Every investigation with windows left to spend.
+///
+/// Active only, for the same reason `armed_rules` filters on status: a paused investigation must
+/// stop spending, and applied downstream that filter leaves the window already gone.
+pub async fn open_investigations(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
+    let rows = sqlx::query_as::<_, ErrandRow>(
+        "SELECT id, name, chat_key, brain, folder, status, done_when, windows_left FROM errands
+         WHERE status = 'active' AND windows_left > 0 AND done_when IS NOT NULL
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(from_row).collect())
+}
+
+/// Spends one window, answering whether this caller is the one that got it.
+///
+/// A compare-and-set on the count the caller read, so two ticks cannot both spend the last one. Like
+/// the rule claim, it happens BEFORE the turn starts: a window spent on a turn that failed to start
+/// is a window lost, and a turn started on a window nobody spent is the loop with no floor.
+pub async fn spend_window(pool: &sqlx::SqlitePool, id: i64, was: i64) -> sqlx::Result<bool> {
+    sqlx::query("UPDATE errands SET windows_left = ? WHERE id = ? AND windows_left = ?")
+        .bind(was - 1)
+        .bind(id)
+        .bind(was)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() == 1)
+}
+
+/// Gives a window back when nothing was started with it.
+///
+/// `was` is the count BEFORE it was spent, so the compare-and-set matches the value this caller
+/// wrote and nothing else — a concurrent tick that has since spent one of its own is not clobbered.
+/// The mirror of [`spend_window`], and called only where the turn provably did not start: past that
+/// point a window stays spent, because refunding on a maybe is how a budget stops being one.
+pub async fn refund_window(pool: &sqlx::SqlitePool, id: i64, was: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errands SET windows_left = ? WHERE id = ? AND windows_left = ?")
+        .bind(was)
+        .bind(id)
+        .bind(was - 1)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Ends an investigation without ending the errand.
+///
+/// What the verifier saying "enough" comes to, and what running out of windows comes to as well.
+/// The criterion is deliberately LEFT in place: it is the record of what was being looked for, and
+/// an owner who wants another few windows should not have to write it again.
+pub async fn close_investigation(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errands SET windows_left = 0 WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 /// One rule of an errand still answering, with everything firing it needs.
