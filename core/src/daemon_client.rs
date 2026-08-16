@@ -207,14 +207,13 @@ impl DaemonClient {
     /// over a URL before anything is fetched, and a search that returned content would make that
     /// decision arrive too late to mean anything.
     pub async fn web_search(&self, query: &str, limit: Option<i64>) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/web/search")
+        let response = self
+            .request(reqwest::Method::POST, "/web/search")
             .json(&serde_json::json!({ "query": query, "limit": limit }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "a web search").await
     }
 
     /// Read one page.
@@ -224,14 +223,13 @@ impl DaemonClient {
     /// the method that fills an agent's context with text a stranger wrote, and any write sitting
     /// beside it becomes something those words can try to aim.
     pub async fn web_read(&self, url: &str) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/web/read")
+        let response = self
+            .request(reqwest::Method::POST, "/web/read")
             .json(&serde_json::json!({ "url": url }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "reading a web page").await
     }
 
     /// What is in the files folder. Reading only — there is deliberately no client method here for
@@ -485,13 +483,39 @@ fn contents_of(answer: &Value) -> Result<String, String> {
 /// errand, or a file, that is not there; `400` is a path that named somewhere outside the errand's
 /// folder, which is the guard doing its job and not a fault to retry. `context` says which of the
 /// two the caller was attempting, because the status alone does not.
+///
+/// The web routes refuse differently — a status AND a sentence — and go through here for the second
+/// reason, which is sharper. Everything this returns is read by a model deciding what to tell a
+/// person, and the two failures are answered oppositely: a search that came back empty is a fact
+/// about the world, and a search that never happened is a fact about the machine. Told "error
+/// decoding response body", a model has neither, and what it writes into the errand's notebook is
+/// that it looked and found nothing.
 async fn json_or_refusal(response: reqwest::Response, context: &str) -> Result<Value, String> {
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("the daemon refused {context}: {status}"));
+        // The body when there is one, because the web routes put the actionable half there — "the
+        // web pillar is off: set enabled: true in .ai/web.yaml" is a sentence somebody can act on
+        // and `503` alone is not. Truncated because this string lands in a model's context and the
+        // thing most likely to answer a request with kilobytes of body is a proxy, not the daemon.
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.trim();
+        return match detail.chars().take(REFUSAL_DETAIL_LIMIT + 1).count() {
+            0 => Err(format!("the daemon refused {context}: {status}")),
+            n if n > REFUSAL_DETAIL_LIMIT => {
+                let cut: String = detail.chars().take(REFUSAL_DETAIL_LIMIT).collect();
+                Err(format!("the daemon refused {context}: {status}: {cut}…"))
+            }
+            _ => Err(format!("the daemon refused {context}: {status}: {detail}")),
+        };
     }
     json_or_null(response).await
 }
+
+/// How much of a refusal's body travels back with it, in characters.
+///
+/// Long enough for every sentence the daemon itself writes, short enough that an HTML error page
+/// from something sitting between here and it cannot become the turn's context.
+const REFUSAL_DETAIL_LIMIT: usize = 300;
 
 /// The submit body, built and validated before anything is sent.
 ///
@@ -744,6 +768,110 @@ mod tests {
 
         assert_eq!(body.mode, "worktree");
         assert_eq!(body.cwd, "C:/projects/active");
+    }
+
+    /// What an errand is told when the web is off, and why the wording is the whole task.
+    ///
+    /// `/web/search` answers a disabled pillar with `503` and a sentence in plain text. Neither web
+    /// method looked at the status, so the sentence never arrived: `.json()` choked on it and the
+    /// model received `{"error":"error decoding response body"}`. That reads as a glitch in the
+    /// plumbing, and §10 names the failure it produces — the errand writes down that it searched
+    /// and found nothing, which is a lie that then lives in the notebook for good.
+    ///
+    /// A model told the search did not happen can say so. A model told the response would not parse
+    /// has nothing to report and will fill the gap itself.
+    #[tokio::test]
+    async fn a_web_call_the_daemon_refused_says_the_web_did_not_answer() {
+        let url = refusing_daemon(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "the web pillar is off: set enabled: true in .ai/web.yaml",
+        )
+        .await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        let searched = client.web_search("golf 2.0 tdi", Some(5)).await;
+        let read = client.web_read("https://stand.example/golf").await;
+
+        for (what, outcome) in [("web_search", &searched), ("web_read", &read)] {
+            let refusal = outcome
+                .as_ref()
+                .expect_err("a refusal must not be reported as an answer");
+            assert!(
+                refusal.contains("503") || refusal.contains("Service Unavailable"),
+                "{what} said {refusal:?}, which does not say the daemon refused it"
+            );
+            assert!(
+                !refusal.contains("decoding"),
+                "{what} said {refusal:?}, which reads as a parse fault rather than a refusal"
+            );
+            // The actionable half. `503` says the call did not happen; only the sentence says what
+            // would make it happen, and this one is a line in a config file.
+            assert!(
+                refusal.contains("web.yaml"),
+                "{what} said {refusal:?}, dropping the one part somebody can act on"
+            );
+        }
+    }
+
+    /// A refusal is read by a model, so its length is a cost. The daemon's own sentences are short;
+    /// the thing likely to answer a request with kilobytes is a proxy between here and it, and
+    /// handing that to the turn as context is how an unrelated error page becomes what the errand
+    /// thinks it learned.
+    #[tokio::test]
+    async fn a_refusal_that_arrives_as_a_wall_of_text_is_cut_down() {
+        let url = refusing_daemon(
+            axum::http::StatusCode::BAD_GATEWAY,
+            concat!(
+                "<html><body>",
+                include_str!("../Cargo.toml"),
+                "</body></html>"
+            ),
+        )
+        .await;
+
+        let refusal = DaemonClient::new(url, "test-token".to_string())
+            .web_search("golf", None)
+            .await
+            .expect_err("a 502 is not an answer");
+
+        assert!(
+            refusal.chars().count() < REFUSAL_DETAIL_LIMIT * 2,
+            "the refusal is {} characters long",
+            refusal.chars().count()
+        );
+        assert!(refusal.contains('…'), "a cut refusal must say it was cut");
+        assert!(
+            refusal.contains("502"),
+            "and must still say what happened: {refusal:?}"
+        );
+    }
+
+    /// The direction that is worse than an unhelpful message: a refusal delivered as success.
+    ///
+    /// Any route that refuses with a JSON body would have been read straight through as the answer,
+    /// and since the refusal slugs landed there is one of those in this daemon. A caller cannot tell
+    /// an empty result set from a rejection when both arrive as `Ok`.
+    #[tokio::test]
+    async fn a_refusal_that_happens_to_be_json_is_still_a_refusal() {
+        let url =
+            refusing_daemon(axum::http::StatusCode::FORBIDDEN, r#"{"error":"blocked"}"#).await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        assert!(
+            client.web_read("https://192.168.1.1/admin").await.is_err(),
+            "a 403 carrying JSON must not be handed back as the page"
+        );
+    }
+
+    /// A daemon that answers one canned refusal to everything.
+    async fn refusing_daemon(status: axum::http::StatusCode, body: &'static str) -> String {
+        let app = axum::Router::new().fallback(move || async move { (status, body) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
     }
 
     #[test]

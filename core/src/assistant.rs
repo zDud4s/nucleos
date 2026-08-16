@@ -257,7 +257,11 @@ impl ErrandTurn {
     fn prompt_for(&self, text: &str) -> String {
         let mut prompt = format!(
             "You are working on the errand {:?}. Your own folder is the working directory; \
-             use the errand tools to read and write in it.\n\n",
+             use the errand tools to read and write in it.\n\n\
+             If a tool comes back with an error, say so in your answer and write it in the \
+             notebook. A search that failed is not a search that found nothing: the first is a \
+             fact about this machine and the second is a fact about the world, and later turns \
+             will read whichever one you record as if you had checked.\n\n",
             self.errand.name
         );
         if !self.notebook.is_empty() {
@@ -2477,6 +2481,43 @@ mod tests {
         assert!(
             prompt.contains("e agora?"),
             "and it must still be asked the question: {prompt}"
+        );
+    }
+
+    /// §10's second half, and the half no test can finish: a turn that could not reach the web says
+    /// so instead of routing around it.
+    ///
+    /// The tool now returns a refusal that names itself — that is the part the machine can
+    /// guarantee. What it cannot guarantee is what the model does next, and the failure mode is
+    /// specific: a model that treats a failed search as an empty one writes "I looked and found
+    /// nothing" into a notebook that outlives the turn, and every later turn reads it as a finding.
+    /// An empty result is a fact about the world; a refused call is a fact about this machine.
+    ///
+    /// So the preamble says it, and this asserts only that it was said. Obedience is not testable
+    /// here and is not pretended to be — the assertion is on the instruction reaching the model,
+    /// which is the whole of what this side controls.
+    #[tokio::test]
+    async fn an_errand_is_told_to_report_a_tool_that_failed_rather_than_work_around_it() {
+        let (state, _dir, runner) = errand_state().await;
+        let errand = open_errand(&state, "carros", "-1:12").await;
+        crate::errands::set_brain(&state.pool, errand.id, crate::errands::Brain::Cloud)
+            .await
+            .unwrap();
+
+        let id = send_message(&state, "-1:12", "procura", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let prompt = runner.last_prompt.lock().unwrap().clone().unwrap();
+        let lowered = prompt.to_lowercase();
+        assert!(
+            lowered.contains("failed") || lowered.contains("could not"),
+            "the preamble never mentions a tool failing: {prompt}"
+        );
+        assert!(
+            lowered.contains("say so") || lowered.contains("report"),
+            "the preamble never says to report it: {prompt}"
         );
     }
 
