@@ -386,6 +386,111 @@ impl DaemonClient {
             .map_err(|e| e.to_string())?;
         json_or_null(response).await
     }
+
+    /// What is in this errand's folder, by name.
+    ///
+    /// Every path below is relative to that folder and only means anything against this errand — the
+    /// daemon scopes the listing there, so a name from here can be handed straight back to
+    /// [`Self::read_errand_file`].
+    pub async fn list_errand_files(&self, errand_id: i64) -> Result<Vec<String>, String> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/errands/{errand_id}/files"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let listed = json_or_refusal(response, "the listing of an errand's folder").await?;
+        serde_json::from_value(listed).map_err(|e| e.to_string())
+    }
+
+    /// One file of this errand, read back by name.
+    pub async fn read_errand_file(&self, errand_id: i64, path: &str) -> Result<String, String> {
+        let response = self
+            .request(reqwest::Method::GET, &errand_file_path(errand_id, path))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let answer = json_or_refusal(response, &format!("reading {path:?}")).await?;
+        contents_of(&answer)
+    }
+
+    /// Writes a file into this errand's folder.
+    ///
+    /// The whole content, every time — there is no append and no patch, because the daemon writes
+    /// the file and records what wrote it in one step, and a partial write would leave that mark
+    /// describing a file that is now half something else.
+    pub async fn write_errand_file(
+        &self,
+        errand_id: i64,
+        path: &str,
+        contents: &str,
+    ) -> Result<(), String> {
+        let response = self
+            .request(reqwest::Method::PUT, &errand_file_path(errand_id, path))
+            .json(&serde_json::json!({ "contents": contents }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, &format!("writing {path:?}"))
+            .await
+            .map(|_| ())
+    }
+
+    /// The errand's notebook, which is what it knows across turns.
+    ///
+    /// An empty string is the ordinary answer for an errand that has not written anything yet, and
+    /// not an error: the daemon answers a notebook that does not exist that way on purpose.
+    pub async fn read_errand_notebook(&self, errand_id: i64) -> Result<String, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/errands/{errand_id}/notebook"),
+            )
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let answer = json_or_refusal(response, "reading an errand's notebook").await?;
+        contents_of(&answer)
+    }
+}
+
+/// Where one file of an errand lives, with the path encoded for the wire.
+///
+/// Extracted so both callers spell it the same way, and encoded for the reason
+/// [`urlencoding_encode`] gives about a query value — sharper here, because this value IS the path:
+/// a name carrying `#` or a space would otherwise arrive at the daemon as a different request than
+/// the one intended. `/` survives as `%2F` and reaches the handler decoded, so a file in a
+/// subdirectory of the folder is still reachable, and `..` reaches the daemon's guard as part of the
+/// path it inspects rather than as something the encoding smuggled past it.
+fn errand_file_path(errand_id: i64, path: &str) -> String {
+    format!("/errands/{errand_id}/files/{}", urlencoding_encode(path))
+}
+
+/// The `contents` a read answered with.
+///
+/// Both reads share the envelope, so they share the complaint when it is not there — an answer in an
+/// unexpected shape is a daemon that changed under this client, and reporting it as an empty file
+/// would look exactly like an errand that has written nothing.
+fn contents_of(answer: &Value) -> Result<String, String> {
+    answer["contents"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "the daemon's answer carried no contents".to_owned())
+}
+
+/// The body of an answer, or the status it was refused with.
+///
+/// A refusal from the errand routes is a bare status with an empty body — they return
+/// `Result<_, StatusCode>` — so `.json()` on one fails with a decoding error that names nothing
+/// useful. The status IS the message, and on this surface it is a message worth reading: `404` is an
+/// errand, or a file, that is not there; `400` is a path that named somewhere outside the errand's
+/// folder, which is the guard doing its job and not a fault to retry. `context` says which of the
+/// two the caller was attempting, because the status alone does not.
+async fn json_or_refusal(response: reqwest::Response, context: &str) -> Result<Value, String> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("the daemon refused {context}: {status}"));
+    }
+    json_or_null(response).await
 }
 
 /// The submit body, built and validated before anything is sent.

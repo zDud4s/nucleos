@@ -11,13 +11,16 @@
 //! If this file ever learns any of them, two concerns will have met in one place, which is the drift
 //! the module map in `core/AGENTS.md` exists to prevent.
 
-// This is a bin-only crate, so dead-code reachability starts at `main`, and the module is now half
-// reached: the `/errands` routes (`http.rs`) call `create`, `list`, `set_status`, `set_brain` and
-// `close`, while the notebook, the file surface and the marks still wait for the MCP toolbox
-// (`mcp_tools.rs`) and the turn (`assistant.rs`). Measured rather than assumed — with the line below
-// removed the compiler names eleven items nothing reaches from `main`, and eleven `#[allow]`
-// attributes scattered over them would say less than one line here does. The instruction, not a
-// description: DELETE THIS LINE with the change that gives the last of the eleven a caller.
+// This is a bin-only crate, so dead-code reachability starts at `main`, and the module is now
+// nearly reached: the `/errands` routes (`http.rs`) call `create`, `get`, `list`, `set_status`,
+// `set_brain` and `close`, and the file and notebook routes beside them reach the folder, the files
+// and the marks that go with them. Three items still wait for the turn (`assistant.rs`) and the MCP
+// toolbox (`mcp_tools.rs`): `resolve`, which is how a message finds the errand it landed in,
+// `append_notebook`, which the núcleo writes after answering, and `artifact_tainted`, which is asked
+// before a file's text enters a prompt. Measured rather than assumed — with the line below removed
+// the compiler names those three and nothing else, and three `#[allow]` attributes scattered over
+// them would say less than one line here does. The instruction, not a description: DELETE THIS LINE
+// with the change that gives the last of the three a caller.
 //
 // Scoped to the non-test build, the way `contacts.rs` scopes its own suppression, so it silences
 // only the absence of a production caller. Under `cfg(test)` the lint stays live — every item below
@@ -181,6 +184,24 @@ pub async fn list(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
     .await?;
 
     Ok(rows.into_iter().map(from_row).collect())
+}
+
+/// One errand by its id, if there is one.
+///
+/// [`resolve`] asked from the other side. A Telegram message arrives knowing its topic; an HTTP
+/// route arrives knowing the id it handed out, and every function below this line takes an `Errand`
+/// rather than an id — so this is the step between the two. The absence of a row is again the
+/// answer and not an error, because a route that cannot tell "no such errand" from "the database is
+/// down" answers the first with the status of the second.
+pub async fn get(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<Option<Errand>> {
+    let row = sqlx::query_as::<_, ErrandRow>(
+        "SELECT id, name, brain, folder, status FROM errands WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(from_row))
 }
 
 /// Opens an errand on a topic, answering with its id.

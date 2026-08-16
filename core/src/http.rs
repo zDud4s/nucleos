@@ -121,6 +121,20 @@ pub fn build_router(state: AppState) -> Router {
         // asking and removes nothing — `errands::close` says why.
         .route("/errands", get(list_errands).post(create_errand))
         .route("/errands/{id}", patch(patch_errand).delete(close_errand))
+        // The errand's folder and its notebook, over HTTP because that is the only door the MCP
+        // process has: it runs beside the daemon and never touches the pool.
+        //
+        // `{*path}` is a wildcard and not a `{name}` because a note may sit in a subdirectory of the
+        // folder, and a segment parameter stops at the first slash. Nothing here joins that path
+        // itself — every one of the three goes through `errands::file_path`, which is what puts a
+        // path chosen by a model that has been reading the open web through
+        // `files::resolve_within`, the one function in the daemon that decides what is reachable.
+        .route("/errands/{id}/files", get(list_errand_files))
+        .route(
+            "/errands/{id}/files/{*path}",
+            get(read_errand_file).put(write_errand_file),
+        )
+        .route("/errands/{id}/notebook", get(read_errand_notebook))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
@@ -3045,9 +3059,38 @@ async fn create_errand(
         .await
         .map(|errand_id| Json(serde_json::json!({ "errand_id": errand_id })))
         .map_err(|error| {
+            // One topic holds one errand: `chat_key` is UNIQUE, and `errands::create` leans on that
+            // rather than reading first, so a second POST on a topic that already has one arrives
+            // here as a constraint violation. 500 would tell the caller this daemon is broken and
+            // invite a retry that can never work; 409 names the one thing that is actually wrong.
+            //
+            // Asked of the typed database error, the way `presets.rs` asks it — never of the
+            // message's text, which belongs to the driver and changes with it.
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation())
+            {
+                return StatusCode::CONFLICT;
+            }
             tracing::warn!(%error, "opening an errand failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// The errand this id names, or the refusal every route keyed by one owes its caller.
+///
+/// Written once because six routes need the same two steps: the row, and a 404 when there is no
+/// row. The `Errand` it hands back is not a formality — `read_file`, `write_file`, `list_files` and
+/// `read_notebook` all take one, and the folder they resolve against comes from it. So this is also
+/// the only place a route learns which directory it is allowed to touch.
+async fn errand_by_id(state: &AppState, id: i64) -> Result<crate::errands::Errand, StatusCode> {
+    crate::errands::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, id, "reading an errand failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(serde::Deserialize)]
@@ -3068,6 +3111,11 @@ async fn patch_errand(
     Path(id): Path<i64>,
     Json(body): Json<PatchErrandRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    // Answered before anything is written, for the reason `patch_chat` gives further up: `204` over
+    // an UPDATE that matched no row is the API saying "done" about something it did not do, and a
+    // client that believes it carries on with an errand that was never there.
+    errand_by_id(&state, id).await?;
+
     if let Some(status) = body.status.as_deref() {
         crate::errands::set_status(&state.pool, id, crate::errands::Status::from_wire(status))
             .await
@@ -3099,12 +3147,135 @@ async fn close_errand(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
+    // Checked first for the reason `patch_errand` gives, and it applies harder to this one: closing
+    // is the move a client makes once and then stops watching, so a `204` about an errand that does
+    // not exist is a report nobody ever goes back to check.
+    errand_by_id(&state, id).await?;
+
     crate::errands::close(&state.pool, id)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|error| {
             tracing::warn!(%error, "closing an errand failed");
             StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// What the errand's file surface answers when a path is refused or missing.
+///
+/// `InvalidInput` is the kind that carries the decision: `errands::file_path` wraps every refusal
+/// from `files::resolve_within` in it, so a path naming somewhere outside this errand's folder
+/// arrives here and leaves as `400` — the caller's mistake, said to the caller. A `500` would blame
+/// the daemon for it and invite the same request again.
+///
+/// `NotFound` is a file that is not there, which is a different sentence and a different fix.
+/// Everything else is this machine's problem: a disk that would not read, a name the platform
+/// refused. The path itself is never echoed back — it came from whoever wrote it.
+fn errand_file_status(error: &std::io::Error) -> StatusCode {
+    match error.kind() {
+        std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// What is in this errand's folder, and nothing else's.
+///
+/// The scoping is `errands::list_files`'s and is deliberately not restated here: there is one files
+/// root and many errands under it, so a listing taken at the root would hand every errand every
+/// other errand's investigation.
+async fn list_errand_files(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::list_files(&root, &errand)
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, id, "listing an errand's folder failed");
+            errand_file_status(&error)
+        })
+}
+
+/// One file of this errand, read back by name.
+///
+/// The name arrives from a model that has been reading the open web, so `..` in it is the expected
+/// request and not a hypothetical one. Nothing is joined here: `errands::read_file` resolves it
+/// through `files::resolve_within`, which refuses a `..` component before any canonicalisation
+/// happens. A path built in this handler would inherit none of that.
+async fn read_errand_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(i64, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::read_file(&root, &errand, &path)
+        .map(|contents| Json(serde_json::json!({ "contents": contents })))
+        .map_err(|error| {
+            tracing::warn!(%error, id, "reading an errand's file failed");
+            errand_file_status(&error)
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct WriteErrandFileRequest {
+    contents: String,
+}
+
+/// Writes a file into this errand's folder, and marks it in the same breath.
+///
+/// The mark is `errands::write_file`'s to make and cannot be forgotten here, which is why the write
+/// goes through it rather than through `std::fs`. It is recorded as TAINTED, and that is not
+/// pessimism about the caller: this route is how the MCP process writes, the MCP process is driven
+/// by a model that reads the open web, and nothing in this request says what that model had read
+/// before it composed these bytes. `artifact_tainted` treats "cannot say" as tainted already — a
+/// route claiming otherwise would be vouching for something it cannot see.
+async fn write_errand_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(i64, String)>,
+    Json(body): Json<WriteErrandFileRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::write_file(
+        &state.pool,
+        &root,
+        &errand,
+        &path,
+        &body.contents,
+        true,
+        None,
+    )
+    .await
+    .map(|()| StatusCode::NO_CONTENT)
+    .map_err(|error| {
+        tracing::warn!(%error, id, "writing an errand's file failed");
+        errand_file_status(&error)
+    })
+}
+
+/// The errand's notebook, which is its memory across turns.
+///
+/// A notebook that has never been written reads back as `200` with an empty string, because
+/// `errands::read_notebook` answers a missing file that way and this route does not put a `404` on
+/// top of it. The two say different things to a client: "this errand is not there" would send it
+/// looking for a bug, when what happened is that nothing has been written yet.
+async fn read_errand_notebook(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::read_notebook(&root, &errand)
+        .map(|contents| Json(serde_json::json!({ "contents": contents })))
+        .map_err(|error| {
+            tracing::warn!(%error, id, "reading an errand's notebook failed");
+            errand_file_status(&error)
         })
 }
 
@@ -9819,5 +9990,339 @@ mod tests {
 
         let (_, listed) = call(state, "GET", "/errands", None).await;
         assert_eq!(listed.as_array().unwrap()[0]["status"], "done");
+    }
+
+    /// The errand as the domain functions want it, which is not what the routes hand out: a route
+    /// answers with an id and `read_file`, `list_files` and `append_notebook` all take an `Errand`.
+    /// Written once because every file and notebook test below needs both halves of that.
+    async fn an_errand(state: &AppState, name: &str, chat_key: &str) -> crate::errands::Errand {
+        crate::errands::create(&state.pool, name, chat_key)
+            .await
+            .unwrap();
+        crate::errands::resolve(&state.pool, chat_key)
+            .await
+            .unwrap()
+            .expect("the errand that was just created does not resolve by its topic")
+    }
+
+    /// A file read straight off the wire, because `call` parses the body as JSON and falls back to
+    /// `Null` — which would turn "the body did not carry the secret" into a claim about a value that
+    /// was thrown away before the assertion could look at it. The path goes in exactly as given, so
+    /// a caller can hand this an escape spelling of its own.
+    async fn get_errand_file(state: AppState, id: i64, path: &str) -> (StatusCode, String) {
+        let response = raw(
+            state,
+            "GET",
+            &format!("/errands/{id}/files/{path}"),
+            Body::empty(),
+        )
+        .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The MCP tools in the stdio process reach the folder over HTTP and by no other door — they
+    /// never touch the pool. So a file the domain can write and the wire cannot read is a file the
+    /// model cannot use, however well `errands::read_file` works in isolation.
+    #[tokio::test]
+    async fn reading_an_errand_file_over_http_returns_its_contents() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+        crate::errands::write_file(
+            &state.pool,
+            &state.email.files_root,
+            &errand,
+            "nota.txt",
+            "215 cv, 2019, 84 mil km",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = get_errand_file(state, errand.id, "nota.txt").await;
+
+        assert_eq!(status, StatusCode::OK);
+        // `contains` and not `==`: what is asserted is that the bytes reached the caller, which
+        // holds whether the route hands the text back raw or wrapped in a JSON envelope.
+        assert!(
+            body.contains("215 cv, 2019, 84 mil km"),
+            "the file's contents did not come back: {body}"
+        );
+    }
+
+    /// The other direction, and the one that matters more: an errand that can only read is an
+    /// errand that cannot record what it found. Asserted through the domain rather than through a
+    /// second HTTP read, because a route that stored the bytes somewhere only it knows about would
+    /// pass a round trip through itself and still have written to the wrong place.
+    #[tokio::test]
+    async fn writing_an_errand_file_over_http_lands_it_in_the_folder() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+
+        let (status, _) = call(
+            state.clone(),
+            "PUT",
+            &format!("/errands/{}/files/nota.txt", errand.id),
+            Some(serde_json::json!({ "contents": "215 cv, 2019, 84 mil km" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::errands::read_file(&state.email.files_root, &errand, "nota.txt").unwrap(),
+            "215 cv, 2019, 84 mil km"
+        );
+    }
+
+    /// There is one files root and many errands under it, so a listing taken at the root instead of
+    /// at the folder would hand every errand every other errand's investigation. That is the mistake
+    /// this route is in a position to make, and the only one worth a test here — which is why the
+    /// assertion is about the neighbour's file being absent as much as about this one's being there.
+    #[tokio::test]
+    async fn listing_an_errand_files_over_http_names_only_its_own() {
+        let (state, _temp) = errand_state().await;
+        let mine = an_errand(&state, "carros para importar", "-1001234:7").await;
+        let neighbour = an_errand(&state, "obras na casa", "-1001234:9").await;
+        for (errand, name) in [(&mine, "carros.md"), (&neighbour, "casa.md")] {
+            crate::errands::write_file(
+                &state.pool,
+                &state.email.files_root,
+                errand,
+                name,
+                "o que foi encontrado",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (status, listed) =
+            call(state, "GET", &format!("/errands/{}/files", mine.id), None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap_or_else(|| panic!("the listing route did not answer with an array: {listed}"))
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a listed path is not a string: {entry}"))
+            })
+            .collect();
+        assert!(names.contains(&"carros.md"), "got: {names:?}");
+        assert!(
+            !names.contains(&"casa.md"),
+            "the listing leaked the neighbouring errand's file: {names:?}"
+        );
+    }
+
+    /// The path arrives from a model that has been reading the open web, so `..` in it is the
+    /// expected attack and not a hypothetical one.
+    ///
+    /// The escape target is created first and holds real text: a refusal that is only a refusal
+    /// because the file was not there proves nothing about the guard. It sits at the files root —
+    /// outside this errand's FOLDER, which is what `errands::file_path` resolves within, and the
+    /// neighbouring errands' folders are its siblings.
+    ///
+    /// The legitimate read at the top is the control. Without it a route that does not exist answers
+    /// 404 to everything, and 404 is a client error, so the whole test would pass against nothing.
+    #[tokio::test]
+    async fn an_errand_file_path_that_escapes_is_refused() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+        crate::errands::write_file(
+            &state.pool,
+            &state.email.files_root,
+            &errand,
+            "nota.txt",
+            "215 cv, 2019, 84 mil km",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            state.email.files_root.join("segredo.txt"),
+            "a senha do wifi e batatas",
+        )
+        .unwrap();
+
+        let (status, body) = get_errand_file(state.clone(), errand.id, "nota.txt").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the control read failed, so nothing below is evidence about escapes: {body}"
+        );
+        assert!(body.contains("215 cv, 2019, 84 mil km"), "got: {body}");
+
+        // Both spellings, because the wildcard segment is percent-decoded on its way to the handler
+        // and a guard applied on the wrong side of that decoding sees only one of them.
+        for escape in ["../segredo.txt", &urlencode("../segredo.txt")] {
+            let (status, body) = get_errand_file(state.clone(), errand.id, escape).await;
+            assert!(
+                status.is_client_error(),
+                "{escape:?} was not refused: {status}"
+            );
+            assert!(
+                !body.contains("a senha do wifi e batatas"),
+                "{escape:?} handed back a file outside the errand's folder: {body}"
+            );
+        }
+    }
+
+    /// A file on disk with no row reads back as `None` from `artifact_tainted` — "cannot say", which
+    /// every caller treats as tainted. So a route that writes the bytes and forgets the mark does not
+    /// fail loudly: it quietly makes everything the model wrote through HTTP indistinguishable from a
+    /// file somebody dropped in the folder by hand, and the taint barrier stops carrying information.
+    #[tokio::test]
+    async fn writing_an_errand_file_over_http_records_its_artifact() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+
+        let (status, _) = call(
+            state.clone(),
+            "PUT",
+            &format!("/errands/{}/files/nota.txt", errand.id),
+            Some(serde_json::json!({ "contents": "215 cv, 2019, 84 mil km" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // `Some(_)` and not `Some(false)`: whether the route calls this write tainted is its own
+        // decision, and what is asserted is that it made one at all.
+        assert!(
+            crate::errands::artifact_tainted(&state.pool, errand.id, "nota.txt")
+                .await
+                .is_some(),
+            "the write left no mark, so the file reads back as unknown"
+        );
+    }
+
+    /// The notebook is the errand's memory across turns, and the model reads it back through this
+    /// route before it decides anything. A notebook the núcleo can append to and the wire cannot read
+    /// is an errand that writes its memory down and never consults it.
+    #[tokio::test]
+    async fn reading_the_notebook_over_http_returns_it() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+        crate::errands::append_notebook(
+            &state.email.files_root,
+            &errand,
+            42,
+            "encontrei tres anuncios abaixo de 12 mil",
+        )
+        .unwrap();
+
+        let (status, body) = call(
+            state,
+            "GET",
+            &format!("/errands/{}/notebook", errand.id),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let contents = body["contents"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the notebook route did not answer with contents: {body}"));
+        assert!(
+            contents.contains("encontrei tres anuncios abaixo de 12 mil"),
+            "got: {contents}"
+        );
+    }
+
+    /// A freshly opened errand has never answered anything, and that is the normal case rather than
+    /// an error — `read_notebook` says so already, and this asserts the route did not put a 404 back
+    /// on top of it. The difference matters to the caller: 404 reads as "this errand is not there",
+    /// which would send a client looking for a bug in the errand instead of writing the first entry.
+    #[tokio::test]
+    async fn the_notebook_of_a_fresh_errand_is_empty_not_missing() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+
+        let (status, body) = call(
+            state,
+            "GET",
+            &format!("/errands/{}/notebook", errand.id),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["contents"], "");
+    }
+
+    /// `patch_chat` a few blocks up checks existence before it writes, and its comment says why: 204
+    /// over an UPDATE that matched no row is the API saying "done" about something it did not do.
+    /// Both errand routes take an id straight into an UPDATE, so both can say it, and a client that
+    /// believes them carries on with an errand that was never there.
+    #[tokio::test]
+    async fn patching_an_errand_that_does_not_exist_is_a_404() {
+        let (state, _temp) = errand_state().await;
+        // No errand was ever created, so no id is real — 4242 least of all.
+        let missing = 4242;
+
+        let (patched, _) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/errands/{missing}"),
+            Some(serde_json::json!({"status": "paused", "brain": "cloud"})),
+        )
+        .await;
+        assert_eq!(patched, StatusCode::NOT_FOUND);
+
+        let (deleted, _) = call(state, "DELETE", &format!("/errands/{missing}"), None).await;
+        assert_eq!(deleted, StatusCode::NOT_FOUND);
+    }
+
+    /// One topic holds one errand — `chat_key` is UNIQUE, and `errands::create` leans on that instead
+    /// of reading first, so two callers racing lose on the key rather than on a read that was true a
+    /// moment ago. What the route does with that loss is the question here: 500 tells the caller the
+    /// daemon is broken and invites a retry that cannot ever work, while 409 names the one thing that
+    /// is actually wrong. `presets.rs` maps the same violation the same way.
+    ///
+    /// The first errand is checked afterwards because the failure that matters is not the status
+    /// code: a second `create` that half-applied would have moved the name out from under a running
+    /// errand.
+    #[tokio::test]
+    async fn posting_a_second_errand_on_one_topic_is_a_409() {
+        let (state, _temp) = errand_state().await;
+        let (first, body) = call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "carros para importar",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+        let errand_id = body["errand_id"].as_i64().unwrap();
+
+        let (second, _) = call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "obras na casa",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+
+        assert_eq!(second, StatusCode::CONFLICT);
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("the refused second POST took the first errand with it");
+        assert_eq!(found.id, errand_id);
+        assert_eq!(found.name, "carros para importar");
     }
 }
