@@ -102,13 +102,6 @@ pub struct EmailRuntime {
     pub poll_interval_secs: u64,
     /// The directory a triage run works in, so it never inherits the daemon's (spec §5.5).
     pub sandbox: std::path::PathBuf,
-    /// The files folder, canonicalised once so every containment check compares against a path the
-    /// filesystem has already resolved.
-    ///
-    /// It lives in this struct for its history — it began as the folder mail was filed into — and
-    /// it is no longer only that: the Files tab writes here without the email pillar being on at
-    /// all. `main.rs` builds it unconditionally for exactly that reason.
-    pub files_root: std::path::PathBuf,
     /// Set once the hook barrier has been PROVEN at startup, and read by the triage loop before
     /// every batch.
     ///
@@ -152,7 +145,6 @@ impl std::fmt::Debug for EmailRuntime {
             .field("username", &self.username)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("sandbox", &self.sandbox)
-            .field("files_root", &self.files_root)
             .field("armed", &self.armed)
             .field(
                 "sidecar_token",
@@ -178,7 +170,6 @@ impl Default for EmailRuntime {
             username: String::new(),
             poll_interval_secs: 300,
             sandbox: std::path::PathBuf::new(),
-            files_root: std::path::PathBuf::new(),
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sidecar_token: None,
         }
@@ -192,7 +183,6 @@ impl EmailRuntime {
     pub fn from_config(
         config: &crate::config::EmailConfig,
         sandbox: std::path::PathBuf,
-        files_root: std::path::PathBuf,
         sidecar_token: Option<String>,
     ) -> Self {
         Self {
@@ -207,7 +197,6 @@ impl EmailRuntime {
             username: config.username.clone(),
             poll_interval_secs: config.poll_interval_secs,
             sandbox,
-            files_root,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sidecar_token,
         }
@@ -240,6 +229,18 @@ pub struct AppState {
     /// daemon's own state, so answering it in the cloud is what already happens today rather than a
     /// leak the operator asked to prevent.
     pub local_assistant: Option<Arc<crate::local_agent::LocalAssistant>>,
+    /// The folder a person arranges their files in, canonicalised once at startup so every
+    /// containment check compares against a path the filesystem has already resolved.
+    ///
+    /// It lived in `EmailRuntime` for its history — it began as the folder mail was filed into —
+    /// and it stopped being the mail pillar's alone twice over: the Files tab writes here with the
+    /// pillar off, and a team's workspace is a folder under this root that its own loop creates and
+    /// collects. Three readers is where a field belongs to the daemon rather than to one pillar.
+    ///
+    /// `None` means startup could not make the directory, and every route beneath it answers 503
+    /// (`http::files_root`). An `Option` rather than the empty path it used to be: "no folder" and
+    /// "the folder at the empty path" are different facts, and only one of them can be a bug.
+    pub files_root: Option<std::path::PathBuf>,
     /// Read-only after startup, so it is shared rather than copied per clone of the state.
     pub email: Arc<EmailRuntime>,
     /// The voice pillar's settings, its transcriber and its HTTP client, resolved once at startup.

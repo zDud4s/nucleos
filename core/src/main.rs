@@ -354,16 +354,16 @@ async fn main() {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
 
-    // The folder a person arranges their files in — uploads of their own, and the mail they filed.
-    // Created whether or not the email pillar is enabled, for the same reason as the sandbox: a
-    // directory that always exists is one less thing to go wrong the day email is switched on, and
-    // this one is now reachable from its own tab with the pillar off. An empty path means every
-    // route under it refuses, which is the right answer when the directory could not be made.
+    // The folder a person arranges their files in — uploads of their own, the mail they filed, and
+    // now a workspace per team run. Created whether or not the email pillar is enabled, for the same
+    // reason as the sandbox: a directory that always exists is one less thing to go wrong the day
+    // email is switched on, and this one is reachable from its own tab with the pillar off. `None`
+    // means every route under it refuses, which is the right answer when it could not be made.
     let files_root = match files::ensure_root(dirs.data_local_dir()) {
-        Ok(root) => root,
+        Ok(root) => Some(root),
         Err(error) => {
             tracing::warn!(%error, "could not create the files folder — the Files tab will be unavailable");
-            std::path::PathBuf::new()
+            None
         }
     };
 
@@ -559,10 +559,10 @@ async fn main() {
         triage_runner,
         local_triage_disabled,
         local_assistant,
+        files_root,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
-            files_root,
             email_sidecar_token,
         )),
         voice: Arc::new(voice::VoiceRuntime::from_config(

@@ -3055,6 +3055,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),

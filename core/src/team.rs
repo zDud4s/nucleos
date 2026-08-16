@@ -2616,10 +2616,6 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let email = crate::state::EmailRuntime {
-            files_root: root,
-            ..Default::default()
-        };
         AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
@@ -2630,7 +2626,8 @@ mod tests {
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
-            email: Arc::new(email),
+            files_root: Some(root),
+            email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
@@ -2835,6 +2832,32 @@ mod tests {
             matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("local model")),
             "got {refusal:?}"
         );
+    }
+
+    /// A department's whole output is files in a folder, so a machine without one has nowhere to
+    /// put the answer. The refusal is what makes the shared root worth sharing: this pillar and the
+    /// Files tab read the same `AppState.files_root` through the same helper, and an installation
+    /// missing it must say the same thing to both rather than half-starting a run whose deliverable
+    /// has no home. Refusing here also means no row, no key and no charge.
+    #[tokio::test]
+    async fn a_machine_with_no_files_folder_refuses_to_start_a_department() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let state = AppState {
+            files_root: None,
+            ..state
+        };
+
+        let refusal = start(&state, "marketing", "write the launch post").await;
+        assert!(
+            matches!(&refusal, Err(StartError::Unavailable(why)) if why.contains("files folder")),
+            "got {refusal:?}"
+        );
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "a refused start must not leave a run behind");
     }
 
     #[tokio::test]
@@ -3515,8 +3538,9 @@ mod tests {
         .unwrap();
 
         let folder = state
-            .email
             .files_root
+            .as_ref()
+            .unwrap()
             .join("teams")
             .join("marketing")
             .join(id);

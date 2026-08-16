@@ -1277,18 +1277,16 @@ fn folder_status(error: crate::files::PathError) -> StatusCode {
 }
 
 /// The folder root, or a refusal when startup could not create it.
-/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
-/// thing worth sharing is the 503: an installation with no files folder configured must answer the
-/// same way whichever route asked.
 ///
-/// The teams design asks for more than this — for the root to be promoted out of `EmailRuntime`
-/// now that it is not the mail pillar's alone. That is tidying with a wide diff (every `AppState`
-/// literal in the crate's tests) and no behaviour in it, so it is deliberately not done here.
+/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
+/// thing worth sharing is the 503: an installation with no files folder must answer the same way
+/// whichever route asked. The field itself lives on `AppState` rather than in any one pillar's
+/// runtime — see the doc there for why it stopped being the mail pillar's.
 pub(crate) fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
-    if state.email.files_root.as_os_str().is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    Ok(&state.email.files_root)
+    state
+        .files_root
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 #[derive(Deserialize)]
@@ -4024,6 +4022,7 @@ mod tests {
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
+                files_root: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -4517,6 +4516,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -5572,10 +5572,8 @@ mod tests {
     }
 
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
-        let mut email = (*state.email).clone();
-        email.files_root = root;
         AppState {
-            email: std::sync::Arc::new(email),
+            files_root: Some(root),
             ..state
         }
     }
@@ -6523,7 +6521,6 @@ mod tests {
                 poll_interval_secs: 120,
                 ..Default::default()
             },
-            std::path::PathBuf::new(),
             std::path::PathBuf::new(),
             None,
         ));
@@ -7640,6 +7637,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
