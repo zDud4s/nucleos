@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -159,14 +160,16 @@ func TestTheLayoutMatchesTheSpec(t *testing.T) {
 	if filepath.Base(install.Dir()) != "chromium-1400000" {
 		t.Errorf("install dir: %s", install.Dir())
 	}
-	if filepath.Base(install.ProjectProfile("42")) != "project-42" {
-		t.Errorf("project profile: %s", install.ProjectProfile("42"))
+	// The profiles live beside the binary, never inside it: `profile.Store` is given this directory
+	// and is allowed to delete trees under it, so a layout where the Chromium sat below would put the
+	// browser within reach of the sweeper. What the profile directories are CALLED is tested in
+	// package profile, which is the only place that names them.
+	if filepath.Dir(install.ProfilesDir()) != install.Root {
+		t.Errorf("profiles directory %s is not directly under the root", install.ProfilesDir())
 	}
-	if filepath.Base(install.EphemeralProfile("run7")) != "run-run7" {
-		t.Errorf("ephemeral profile: %s", install.EphemeralProfile("run7"))
-	}
-	if filepath.Dir(install.ProjectProfile("42")) != install.ProfilesDir() {
-		t.Error("profiles do not live under the profiles directory")
+	if relative, err := filepath.Rel(install.ProfilesDir(), install.Dir()); err == nil &&
+		!strings.HasPrefix(relative, "..") {
+		t.Errorf("the pinned Chromium (%s) sits inside the profiles directory", install.Dir())
 	}
 }
 

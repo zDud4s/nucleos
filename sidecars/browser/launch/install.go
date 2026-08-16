@@ -59,18 +59,14 @@ func (i Install) ExecutablePath() string {
 	return filepath.Join(i.Dir(), filepath.FromSlash(i.Pin.ExecutableInArchive))
 }
 
-// ProfilesDir holds both kinds of profile (spec §5.6).
+// ProfilesDir holds both kinds of profile (spec §5.6). It is a sibling of the Chromium directory and
+// never a parent of it, which is what lets `profile.Store` delete inside it without being able to
+// reach the browser binary.
+//
+// What lives in there, and under which name, is `profile`'s business and not this package's. An
+// earlier version had ProjectProfile and EphemeralProfile here, building a path by concatenating an
+// ID that nobody had validated — two path builders, one of them unguarded, for one layout.
 func (i Install) ProfilesDir() string { return filepath.Join(i.Root, "profiles") }
-
-// ProjectProfile is the persistent profile for one project — the one with the logins in it.
-func (i Install) ProjectProfile(projectID string) string {
-	return filepath.Join(i.ProfilesDir(), "project-"+projectID)
-}
-
-// EphemeralProfile is a throwaway, deleted when its run ends.
-func (i Install) EphemeralProfile(runID string) string {
-	return filepath.Join(i.ProfilesDir(), "run-"+runID)
-}
 
 // Present reports whether the pinned Chromium is installed and executable.
 func (i Install) Present() bool {

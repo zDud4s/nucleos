@@ -39,7 +39,14 @@ type Options struct {
 	// ProxyAddr is the loopback address of the fence's proxy, "127.0.0.1:port". Required in agent
 	// mode; ignored in human mode, where the person is the one deciding what to click.
 	ProxyAddr string
+	// CacheMB caps this profile's disk cache (spec §5.6, §8's cache_size_mb). Zero takes
+	// DefaultCacheMB rather than meaning "unlimited": profiles.Admit bounds how many profiles there
+	// are and how much they hold together, and nothing else bounds how much ONE of them grows.
+	CacheMB int
 }
+
+// DefaultCacheMB matches the value spec §8 ships in `.ai/browser.yaml`.
+const DefaultCacheMB = 100
 
 // Args builds the command line, or refuses to.
 func Args(opts Options) ([]string, error) {
@@ -50,11 +57,20 @@ func Args(opts Options) ([]string, error) {
 		return nil, errors.New("launch: no profile directory")
 	}
 
+	cacheMB := opts.CacheMB
+	if cacheMB <= 0 {
+		cacheMB = DefaultCacheMB
+	}
+
 	args := []string{
 		// Port 0 makes the OS choose; the real port is read back from DevToolsActivePort in the
 		// profile directory. A fixed port would collide the moment two sessions run at once.
 		"--remote-debugging-port=0",
 		"--user-data-dir=" + opts.ProfileDir,
+		// In bytes, and applied in BOTH modes. A cap that only held while the agent drove would be a
+		// cap on the half of the profile's life that writes least: the person's headful session is
+		// the one that visits a video site.
+		fmt.Sprintf("--disk-cache-size=%d", int64(cacheMB)<<20),
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-background-networking",

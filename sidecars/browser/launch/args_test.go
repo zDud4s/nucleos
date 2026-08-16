@@ -2,6 +2,7 @@ package launch
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -89,6 +90,38 @@ func TestBothModesCarryTheProfileTheNucleoChose(t *testing.T) {
 		if !slices.Contains(args, `--user-data-dir=C:\profiles\project-1`) {
 			t.Errorf("%s: profile dir missing from %v", mode, args)
 		}
+	}
+}
+
+// TestTheCacheIsCappedInBothModes — spec §5.6 and §8's cache_size_mb. Both modes, because the
+// person's headful session is the half of a profile's life that visits a video site, and a cap that
+// only applied while the agent drove would be a cap on the quiet half.
+func TestTheCacheIsCappedInBothModes(t *testing.T) {
+	for _, mode := range []browser.Mode{browser.ModeAgent, browser.ModeHuman} {
+		opts := agentOptions()
+		opts.Mode = mode
+		opts.CacheMB = 7
+		args, err := Args(opts)
+		if err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+		if !slices.Contains(args, "--disk-cache-size=7340032") {
+			t.Errorf("%s: cache cap missing from %v", mode, args)
+		}
+	}
+}
+
+// TestAnUnsetCacheCapTakesTheDefaultRatherThanNone. Zero is what a caller that never heard of the
+// setting passes, and reading it as "unlimited" would leave the one thing nothing else bounds — how
+// big a SINGLE profile grows — silently uncapped.
+func TestAnUnsetCacheCapTakesTheDefaultRatherThanNone(t *testing.T) {
+	args, err := Args(agentOptions())
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
+	want := fmt.Sprintf("--disk-cache-size=%d", int64(DefaultCacheMB)<<20)
+	if !slices.Contains(args, want) {
+		t.Errorf("want %s in %v", want, args)
 	}
 }
 
