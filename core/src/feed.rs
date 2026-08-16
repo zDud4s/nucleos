@@ -7,16 +7,27 @@ pub struct FeedEntry {
     pub kind: String,
     pub summary: String,
     pub run_id: Option<i64>,
+    /// The errand this line belongs to, if it belongs to one.
+    ///
+    /// Beside `project_id` rather than replacing it, because they are two different owners and a
+    /// row has at most one of them. What must not happen is both being NULL when the line is
+    /// somebody's: that is the state `Global` reads as "the machine did this by itself".
+    pub errand_id: Option<i64>,
     pub created_at: String,
 }
 
-/// The feed scope to search. `Global` deliberately means only `project_id IS NULL`; it does not
-/// merge every project's feed, which is what `All` is for.
+/// The feed scope to search.
+///
+/// `Global` means the machine's own lines and nobody else's — `project_id IS NULL` AND `errand_id
+/// IS NULL`. It is deliberately not a merge of every scope, which is what `All` is for, and the
+/// second half of that clause is not redundant: an errand has no project, so without it an errand's
+/// every line answers to `Global` and buries the kill switch and the budget underneath them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedScope {
     All,
     Global,
     Project(String),
+    Errand(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -72,8 +83,61 @@ pub async fn append_on(
     Ok(result.last_insert_rowid())
 }
 
-/// Returns one feed scope newest-first. `None` selects explicitly aggregated global rows
-/// (`project_id IS NULL`), not a merge of every project's feed.
+/// Writes a line that belongs to an errand.
+///
+/// A separate entry point rather than a sixth parameter on [`append`], and the reason is that the
+/// sixth parameter would be `None` at every one of its forty-odd call sites. A caller that has an
+/// errand says so by calling this; nobody else has to be edited to keep saying they have not got
+/// one — and no existing line can acquire an errand through a mistake at a call site that never had
+/// a reason to think about errands.
+///
+/// `project_id` is not offered, because a row cannot have both owners: an errand is standing work
+/// that is NOT a code project, and that is most of what an errand is.
+pub async fn append_for_errand(
+    pool: &sqlx::SqlitePool,
+    errand_id: i64,
+    kind: &str,
+    summary: &str,
+    run_id: Option<i64>,
+) -> sqlx::Result<i64> {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO feed (project_id, errand_id, kind, summary, run_id, created_at)
+         VALUES (NULL, ?, ?, ?, ?, ?)",
+    )
+    .bind(errand_id)
+    .bind(kind)
+    .bind(summary)
+    .bind(run_id)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
+/// One errand's own lines, newest first.
+///
+/// [`list_feed`]'s counterpart for the other owner. Not folded into it as a second `Option`
+/// parameter: two optional owners in one signature makes "both given" and "neither given" states a
+/// caller can reach and this module would have to have an opinion about, when the caller always
+/// knows which of the two it is holding.
+pub async fn list_errand_feed(
+    pool: &sqlx::SqlitePool,
+    errand_id: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<FeedEntry>> {
+    sqlx::query_as::<_, FeedEntry>(
+        "SELECT id, project_id, kind, summary, run_id, errand_id, created_at
+         FROM feed WHERE errand_id = ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(errand_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Returns one feed scope newest-first. `None` selects the machine's own rows (`project_id IS NULL`
+/// AND `errand_id IS NULL`), not a merge of every project's feed and not an errand's.
 pub async fn list_feed(
     pool: &sqlx::SqlitePool,
     project_id: Option<&str>,
@@ -82,7 +146,7 @@ pub async fn list_feed(
     match project_id {
         Some(project_id) => {
             sqlx::query_as::<_, FeedEntry>(
-                "SELECT id, project_id, kind, summary, run_id, created_at
+                "SELECT id, project_id, kind, summary, run_id, errand_id, created_at
                  FROM feed WHERE project_id = ? ORDER BY id DESC LIMIT ?",
             )
             .bind(project_id)
@@ -92,8 +156,9 @@ pub async fn list_feed(
         }
         None => {
             sqlx::query_as::<_, FeedEntry>(
-                "SELECT id, project_id, kind, summary, run_id, created_at
-                 FROM feed WHERE project_id IS NULL ORDER BY id DESC LIMIT ?",
+                "SELECT id, project_id, kind, summary, run_id, errand_id, created_at
+                 FROM feed WHERE project_id IS NULL AND errand_id IS NULL
+                 ORDER BY id DESC LIMIT ?",
             )
             .bind(limit)
             .fetch_all(pool)
@@ -106,7 +171,7 @@ pub async fn list_feed(
 /// Distinct from `list_feed(None)`, which returns only global (`project_id IS NULL`) rows.
 pub async fn list_all(pool: &sqlx::SqlitePool, limit: i64) -> sqlx::Result<Vec<FeedEntry>> {
     sqlx::query_as::<_, FeedEntry>(
-        "SELECT id, project_id, kind, summary, run_id, created_at
+        "SELECT id, project_id, kind, summary, run_id, errand_id, created_at
          FROM feed ORDER BY id DESC LIMIT ?",
     )
     .bind(limit)
@@ -120,16 +185,19 @@ pub async fn search(
     filter: &SearchFilter,
 ) -> sqlx::Result<Vec<FeedEntry>> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT id, project_id, kind, summary, run_id, created_at FROM feed WHERE 1 = 1",
+        "SELECT id, project_id, kind, summary, run_id, errand_id, created_at FROM feed WHERE 1 = 1",
     );
 
     match &filter.scope {
         FeedScope::All => {}
         FeedScope::Global => {
-            query.push(" AND project_id IS NULL");
+            query.push(" AND project_id IS NULL AND errand_id IS NULL");
         }
         FeedScope::Project(project_id) => {
             query.push(" AND project_id = ").push_bind(project_id);
+        }
+        FeedScope::Errand(errand_id) => {
+            query.push(" AND errand_id = ").push_bind(errand_id);
         }
     }
     if let Some(kind) = &filter.kind {
@@ -210,7 +278,21 @@ pub async fn prune(
 
 #[cfg(test)]
 mod tests {
-    use super::{FeedScope, SearchFilter, append, list_all, list_feed, prune, search};
+    use super::{
+        FeedScope, SearchFilter, append, append_for_errand, list_all, list_feed, prune, search,
+    };
+
+    /// A search that filters on nothing but the scope, so a scope test is about the scope.
+    fn scoped(scope: FeedScope) -> SearchFilter {
+        SearchFilter {
+            scope,
+            q: None,
+            kind: None,
+            since: None,
+            until: None,
+            limit: 50,
+        }
+    }
 
     fn query(q: &str) -> SearchFilter {
         SearchFilter {
@@ -422,6 +504,121 @@ mod tests {
         assert_eq!(project.len(), 1);
         assert_eq!(project[0].project_id.as_deref(), Some("project-a"));
         assert_eq!(project[0].summary, "project summary");
+    }
+
+    /// An errand's line does not fall into the global feed.
+    ///
+    /// This is the whole of T10 and it is a correction, not an addition. `Global` has always meant
+    /// `project_id IS NULL`, and that was the same thing as "belongs to nobody in particular" only
+    /// because a project was the one owner there was. An errand is a second owner with no
+    /// `project_id`, so on the old clause every scheduled errand turn — and there will be one per
+    /// rule per day — would land in the feed a person opens to see what the MACHINE did overnight.
+    /// The global feed would become an errand log, and the thing it was for would be unreadable.
+    #[tokio::test]
+    async fn an_errands_line_does_not_fall_into_the_global_feed() {
+        let pool = test_pool().await;
+        append(&pool, None, "kill_switch", "the stop was released", None)
+            .await
+            .unwrap();
+        append_for_errand(&pool, 1, "errand_rule_fired", "manhã fired", None)
+            .await
+            .unwrap();
+
+        let global = list_feed(&pool, None, 50).await.unwrap();
+        assert_eq!(global.len(), 1, "{global:?}");
+        assert_eq!(global[0].summary, "the stop was released");
+
+        let searched = search(
+            &pool,
+            &SearchFilter {
+                scope: FeedScope::Global,
+                ..query("")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(searched.len(), 1, "{searched:?}");
+        assert_eq!(searched[0].summary, "the stop was released");
+    }
+
+    /// One errand's feed is its own, and it carries the errand it belongs to.
+    ///
+    /// Two errands share `project_id IS NULL` and nothing else in the row told them apart, which is
+    /// the same gap `proposals.errand_id` closed one table over. Without it the only feed an errand
+    /// could have is everybody's.
+    #[tokio::test]
+    async fn an_errands_feed_is_its_own() {
+        let pool = test_pool().await;
+        append_for_errand(&pool, 1, "errand_rule_fired", "carros", None)
+            .await
+            .unwrap();
+        append_for_errand(&pool, 2, "errand_rule_fired", "casa", None)
+            .await
+            .unwrap();
+
+        let carros = search(
+            &pool,
+            &SearchFilter {
+                scope: FeedScope::Errand(1),
+                ..query("")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(carros.len(), 1, "{carros:?}");
+        assert_eq!(carros[0].summary, "carros");
+        assert_eq!(carros[0].errand_id, Some(1));
+    }
+
+    /// The aggregate keeps aggregating: `All` still means everything, errands included.
+    ///
+    /// `Global` narrowing and `All` narrowing with it would be the same bug in the other direction
+    /// — a machine-wide view that quietly stopped showing a whole class of work.
+    #[tokio::test]
+    async fn the_aggregate_still_carries_the_errands_too() {
+        let pool = test_pool().await;
+        append(&pool, None, "kill_switch", "the stop was released", None)
+            .await
+            .unwrap();
+        append(&pool, Some("project-a"), "run_completed", "a run", None)
+            .await
+            .unwrap();
+        append_for_errand(&pool, 1, "errand_rule_fired", "manhã fired", None)
+            .await
+            .unwrap();
+
+        assert_eq!(list_all(&pool, 50).await.unwrap().len(), 3);
+        assert_eq!(
+            search(
+                &pool,
+                &SearchFilter {
+                    scope: FeedScope::All,
+                    ..query("")
+                }
+            )
+            .await
+            .unwrap()
+            .len(),
+            3
+        );
+    }
+
+    /// A project's feed does not acquire errands, which is the regression half of the same change.
+    #[tokio::test]
+    async fn a_projects_feed_is_untouched_by_errands() {
+        let pool = test_pool().await;
+        append(&pool, Some("project-a"), "run_completed", "a run", None)
+            .await
+            .unwrap();
+        append_for_errand(&pool, 1, "errand_rule_fired", "manhã fired", None)
+            .await
+            .unwrap();
+
+        let project = list_feed(&pool, Some("project-a"), 50).await.unwrap();
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].summary, "a run");
+        assert_eq!(project[0].errand_id, None);
     }
 
     #[tokio::test]

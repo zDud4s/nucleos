@@ -526,6 +526,10 @@ struct ProjectQuery {
 #[derive(Deserialize)]
 struct FeedQuery {
     project_id: Option<String>,
+    /// The other owner a feed line can have. Beside `project_id` and never combined with it: an
+    /// errand has no project, so a request carrying both is asking for rows that cannot exist —
+    /// `get_feed` takes the errand as the narrower fact and says so there.
+    errand_id: Option<i64>,
     scope: Option<String>,
     q: Option<String>,
     kind: Option<String>,
@@ -2317,6 +2321,8 @@ async fn get_feed(
     if !has_search_filters {
         let entries = if query.scope.as_deref() == Some("all") {
             feed::list_all(&state.pool, 50).await
+        } else if let Some(errand_id) = query.errand_id {
+            feed::list_errand_feed(&state.pool, errand_id, 50).await
         } else {
             feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
         };
@@ -2325,8 +2331,15 @@ async fn get_feed(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    // The errand is read before the project on purpose. They are two different owners and a row has
+    // at most one, so a request naming both is asking for rows that cannot exist; taking the errand
+    // gives that request the answer nearest to what it asked for instead of the empty list an `AND`
+    // of the two would produce. Both branches fall through to `Global`, which since the errand
+    // arrived means the machine's own lines and nothing else's.
     let scope = if query.scope.as_deref() == Some("all") {
         feed::FeedScope::All
+    } else if let Some(errand_id) = query.errand_id {
+        feed::FeedScope::Errand(errand_id)
     } else if let Some(project_id) = query.project_id {
         feed::FeedScope::Project(project_id)
     } else {
@@ -10421,8 +10434,13 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (_, still_there) =
-            call(state.clone(), "GET", &format!("/errands/{carros}/rules"), None).await;
+        let (_, still_there) = call(
+            state.clone(),
+            "GET",
+            &format!("/errands/{carros}/rules"),
+            None,
+        )
+        .await;
         assert_eq!(still_there.as_array().unwrap().len(), 1);
 
         let (status, _) = call(
