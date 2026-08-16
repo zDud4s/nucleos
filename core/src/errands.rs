@@ -123,6 +123,12 @@ impl serde::Serialize for Status {
 pub struct Errand {
     pub id: i64,
     pub name: String,
+    /// The topic this errand sits on, as the sidecar composed it.
+    ///
+    /// Carried out of the table rather than kept private to `resolve`, because the sidecar arrives
+    /// knowing its chat key and nothing else: `/pausa` in a topic has to find the errand of THAT
+    /// topic, and a list that does not say which topic each errand is on cannot answer it.
+    pub chat_key: String,
     pub brain: Brain,
     /// Relative to the files root, and only ever resolved through [`folder_path`].
     pub folder: String,
@@ -137,7 +143,7 @@ pub struct Errand {
 /// guess about a numbering scheme somebody else owns.
 pub async fn resolve(pool: &sqlx::SqlitePool, chat_key: &str) -> sqlx::Result<Option<Errand>> {
     let row = sqlx::query_as::<_, ErrandRow>(
-        "SELECT id, name, brain, folder, status FROM errands WHERE chat_key = ?",
+        "SELECT id, name, chat_key, brain, folder, status FROM errands WHERE chat_key = ?",
     )
     .bind(chat_key)
     .fetch_optional(pool)
@@ -146,18 +152,19 @@ pub async fn resolve(pool: &sqlx::SqlitePool, chat_key: &str) -> sqlx::Result<Op
     Ok(row.map(from_row))
 }
 
-/// The five columns every read of this table selects.
-type ErrandRow = (i64, String, String, String, String);
+/// The six columns every read of this table selects.
+type ErrandRow = (i64, String, String, String, String, String);
 
 /// The single place a row becomes an [`Errand`].
 ///
-/// Written once because `brain` and `status` are both `TEXT` in a five-column tuple: a second
-/// mapping that read one into the other would compile, and the error would surface as an errand that
-/// is somehow paused because it runs on a local model.
-fn from_row((id, name, brain, folder, status): ErrandRow) -> Errand {
+/// Written once because five of the six columns are `TEXT` in one tuple: a second mapping that read
+/// any of them into another would compile, and the error would surface as an errand that is somehow
+/// paused because it runs on a local model, or one whose folder is a chat key.
+fn from_row((id, name, chat_key, brain, folder, status): ErrandRow) -> Errand {
     Errand {
         id,
         name,
+        chat_key,
         brain: Brain::from_wire(&brain),
         folder,
         status: Status::from_wire(&status),
@@ -177,7 +184,7 @@ fn from_row((id, name, brain, folder, status): ErrandRow) -> Errand {
 /// first, exactly when the list is busiest, which is the one case the ordering exists for.
 pub async fn list(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
     let rows = sqlx::query_as::<_, ErrandRow>(
-        "SELECT id, name, brain, folder, status FROM errands
+        "SELECT id, name, chat_key, brain, folder, status FROM errands
           ORDER BY created_at DESC, id DESC",
     )
     .fetch_all(pool)
@@ -195,7 +202,7 @@ pub async fn list(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Errand>> {
 /// down" answers the first with the status of the second.
 pub async fn get(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<Option<Errand>> {
     let row = sqlx::query_as::<_, ErrandRow>(
-        "SELECT id, name, brain, folder, status FROM errands WHERE id = ?",
+        "SELECT id, name, chat_key, brain, folder, status FROM errands WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1029,5 +1036,31 @@ mod tests {
             artifact_tainted(&pool, errand.id, "relatorio.md").await,
             Some(true)
         );
+    }
+
+    /// The topic an errand sits on has to come back with it.
+    ///
+    /// Without it the sidecar cannot answer `/pausa` in a topic: it knows the chat key it is in and
+    /// nothing else, so finding "the errand of this topic" in a list that does not say which topic
+    /// each errand is on is not possible. It is also what makes `/assuntos` worth reading — a list
+    /// of names with no topics tells you almost nothing.
+    #[tokio::test]
+    async fn an_errand_carries_the_topic_it_sits_on() {
+        let pool = test_pool().await;
+        let id = create(&pool, "carros", "-100200300:7").await.unwrap();
+
+        for (label, errand) in [
+            (
+                "resolve",
+                resolve(&pool, "-100200300:7").await.unwrap().unwrap(),
+            ),
+            ("get", get(&pool, id).await.unwrap().unwrap()),
+            (
+                "list",
+                list(&pool).await.unwrap().into_iter().next().unwrap(),
+            ),
+        ] {
+            assert_eq!(errand.chat_key, "-100200300:7", "{label}");
+        }
     }
 }

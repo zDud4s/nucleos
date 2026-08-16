@@ -14,10 +14,10 @@ func TestASlowUpdateDoesNotStallTheChannelBehindIt(t *testing.T) {
 	stuck := make(chan struct{})
 	defer close(stuck)
 
-	dispatcher.Dispatch(1, func() { <-stuck })
+	dispatcher.Dispatch("1", func() { <-stuck })
 
 	done := make(chan struct{})
-	dispatcher.Dispatch(2, func() { close(done) })
+	dispatcher.Dispatch("2", func() { close(done) })
 
 	select {
 	case <-done:
@@ -35,7 +35,7 @@ func TestUpdatesFromOneChatRunOneAtATimeAndInOrder(t *testing.T) {
 	order := make(chan int, updates)
 	slot := make(chan struct{}, 1)
 	for i := 0; i < updates; i++ {
-		dispatcher.Dispatch(7, func() {
+		dispatcher.Dispatch("7", func() {
 			select {
 			case slot <- struct{}{}:
 			default:
@@ -67,8 +67,8 @@ func TestAPanickingUpdateDoesNotTakeTheChannelDown(t *testing.T) {
 	dispatcher := NewDispatcher()
 	survived := make(chan struct{})
 
-	dispatcher.Dispatch(1, func() { panic("a nil map, somewhere deep") })
-	dispatcher.Dispatch(1, func() { close(survived) })
+	dispatcher.Dispatch("1", func() { panic("a nil map, somewhere deep") })
+	dispatcher.Dispatch("1", func() { close(survived) })
 
 	select {
 	case <-survived:
@@ -84,7 +84,7 @@ func TestShutdownWaitsForWorkAlreadyInFlight(t *testing.T) {
 	dispatcher := NewDispatcher()
 	finished := make(chan struct{})
 
-	dispatcher.Dispatch(1, func() {
+	dispatcher.Dispatch("1", func() {
 		time.Sleep(50 * time.Millisecond)
 		close(finished)
 	})
@@ -104,4 +104,24 @@ func TestRunGuardedReportsWhetherTheWorkFinished(t *testing.T) {
 	if runGuarded("test", func() { panic("boom") }) {
 		t.Error("runGuarded(panicking work) = true, want false")
 	}
+}
+
+// Two topics of the same group are two errands, and the núcleo hands each its own turn — so one
+// slow topic must not hold up the other. Before topics, "one queue per chat" was the same statement
+// as "one queue per conversation"; it stopped being once a chat could hold several.
+func TestTopicsOfOneGroupDoNotBlockEachOther(t *testing.T) {
+	dispatcher := NewDispatcher()
+	stuck := make(chan struct{})
+	done := make(chan struct{})
+
+	dispatcher.Dispatch("-100123:7", func() { <-stuck })
+	dispatcher.Dispatch("-100123:9", func() { close(done) })
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a topic waited behind another topic of the same group")
+	}
+	close(stuck)
+	dispatcher.Shutdown(time.Second)
 }

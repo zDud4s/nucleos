@@ -6,17 +6,19 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"nucleostelegram/config"
+	"nucleostelegram/daemon"
 	"nucleostelegram/telegram"
 )
 
 type sentMessage struct {
-	chatID int64
-	text   string
+	to   telegram.Destination
+	text string
 }
 
 type callbackAnswer struct {
@@ -35,19 +37,19 @@ type recordingBot struct {
 	buttonCalls   int
 }
 
-func (b *recordingBot) SendMessage(chatID int64, text string) error {
-	b.messages = append(b.messages, sentMessage{chatID: chatID, text: text})
+func (b *recordingBot) SendMessage(to telegram.Destination, text string) error {
+	b.messages = append(b.messages, sentMessage{to: to, text: text})
 	return nil
 }
 
-func (b *recordingBot) SendHTML(chatID int64, html string) error {
-	b.htmlMessages = append(b.htmlMessages, sentMessage{chatID: chatID, text: html})
+func (b *recordingBot) SendHTML(to telegram.Destination, html string) error {
+	b.htmlMessages = append(b.htmlMessages, sentMessage{to: to, text: html})
 	return b.htmlErr
 }
 
-func (b *recordingBot) SendMessageWithButtons(chatID int64, text string, _ [][]telegram.Button) error {
+func (b *recordingBot) SendMessageWithButtons(to telegram.Destination, text string, _ [][]telegram.Button) error {
 	b.buttonCalls++
-	b.messages = append(b.messages, sentMessage{chatID: chatID, text: text})
+	b.messages = append(b.messages, sentMessage{to: to, text: text})
 	if b.buttonCalls == 1 {
 		return b.buttonErrOnce
 	}
@@ -62,8 +64,11 @@ func (b *recordingBot) AnswerCallbackQuery(callbackID, text string) error {
 type recordingDaemon struct {
 	sendAssistantErr   error
 	sendAssistantCalls int
-	run                map[string]any
-	runErr             error
+	// lastChatID is the key the daemon was told to route on, which is the string an errand is
+	// registered under — so a test can prove the topic survived the trip.
+	lastChatID string
+	run        map[string]any
+	runErr     error
 	// getRunFailures is how many leading GetRun calls report the daemon as unreachable, for the
 	// tests that pin what happens to a turn that outlives a daemon restart.
 	getRunFailures   int
@@ -91,8 +96,9 @@ func (d fakeDownloader) DownloadFile(string) ([]byte, error) {
 	return d.data, nil
 }
 
-func (d *recordingDaemon) SendAssistantMessage(string, string) (int64, error) {
+func (d *recordingDaemon) SendAssistantMessage(chatID, _ string) (int64, error) {
 	d.sendAssistantCalls++
+	d.lastChatID = chatID
 	return 0, d.sendAssistantErr
 }
 
@@ -235,7 +241,7 @@ func TestHandleMessageKillOn(t *testing.T) {
 	bot := &recordingBot{}
 	dc := &recordingDaemon{}
 
-	HandleMessage(bot, dc, NewTracker(), 42, "/kill on")
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/kill on")
 
 	if len(dc.setKillCalls) != 1 || !dc.setKillCalls[0] {
 		t.Fatalf("SetKill calls = %v, want [true]", dc.setKillCalls)
@@ -247,7 +253,7 @@ func TestHandleMessageKillOn(t *testing.T) {
 
 func TestHandleMessageHelp(t *testing.T) {
 	bot := &recordingBot{}
-	HandleMessage(bot, &recordingDaemon{}, NewTracker(), 42, "/help")
+	HandleMessage(bot, &recordingDaemon{}, NewTracker(), telegram.Destination{ChatID: 42}, "/help")
 
 	if len(bot.messages) != 1 || bot.messages[0].text == "" {
 		t.Errorf("messages = %v, want non-empty help text", bot.messages)
@@ -261,7 +267,7 @@ func TestProjShortcutIsDeterministicNoLLM(t *testing.T) {
 		{"project_id": "b", "mode": "shadow", "project_root": `C:\x`, "pending": float64(0)},
 	}}
 
-	HandleMessage(bot, dc, NewTracker(), 42, "/projects")
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/projects")
 
 	if dc.getProjectsCalls != 1 {
 		t.Errorf("GetProjects calls = %d, want 1", dc.getProjectsCalls)
@@ -284,7 +290,7 @@ func TestProjFilterMatchesOne(t *testing.T) {
 		{"project_id": "b", "mode": "shadow", "project_root": `C:\x`, "pending": float64(0)},
 	}}
 
-	HandleMessage(bot, dc, NewTracker(), 42, "/proj b")
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/proj b")
 
 	if dc.sendAssistantCalls != 0 {
 		t.Errorf("SendAssistantMessage calls = %d, want 0", dc.sendAssistantCalls)
@@ -301,9 +307,9 @@ func TestHandleMessageCancelTrackedTurn(t *testing.T) {
 	bot := &recordingBot{}
 	dc := &recordingDaemon{}
 	tracker := NewTracker()
-	tracker.Set(42, 7)
+	tracker.Set("42", 7)
 
-	HandleMessage(bot, dc, tracker, 42, "/cancel")
+	HandleMessage(bot, dc, tracker, telegram.Destination{ChatID: 42}, "/cancel")
 
 	if len(dc.cancelCalls) != 1 || dc.cancelCalls[0] != 7 {
 		t.Fatalf("CancelRun calls = %v, want [7]", dc.cancelCalls)
@@ -339,7 +345,7 @@ func TestStartTurnError(t *testing.T) {
 	bot := &recordingBot{}
 	dc := &recordingDaemon{sendAssistantErr: errors.New("busy")}
 
-	startTurn(bot, dc, NewTracker(), 42, "hello")
+	startTurn(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "hello")
 
 	if len(bot.messages) != 1 || !strings.Contains(bot.messages[0].text, "couldn't start turn") {
 		t.Errorf("messages = %v, want couldn't start turn", bot.messages)
@@ -349,7 +355,7 @@ func TestStartTurnError(t *testing.T) {
 func TestSendReplyUsesHTMLAndChunks(t *testing.T) {
 	bot := &recordingBot{}
 
-	sendReply(bot, 42, "**bold**")
+	sendReply(bot, telegram.Destination{ChatID: 42}, "**bold**")
 
 	if len(bot.htmlMessages) == 0 {
 		t.Fatal("SendHTML calls = 0, want at least one")
@@ -362,7 +368,7 @@ func TestSendReplyUsesHTMLAndChunks(t *testing.T) {
 func TestSendReplyFallsBackToPlaintextOnHTMLError(t *testing.T) {
 	bot := &recordingBot{htmlErr: errors.New("invalid entities")}
 
-	sendReply(bot, 42, "**bold**")
+	sendReply(bot, telegram.Destination{ChatID: 42}, "**bold**")
 
 	if len(bot.messages) != 1 {
 		t.Fatalf("SendMessage calls = %d, want 1", len(bot.messages))
@@ -613,7 +619,7 @@ func TestAThrottledReplyIsNotImmediatelyResentAsPlainText(t *testing.T) {
 		RetryAfter: 5 * time.Second,
 	}}
 
-	sendReply(bot, 42, "**bold**")
+	sendReply(bot, telegram.Destination{ChatID: 42}, "**bold**")
 
 	if len(bot.messages) != 0 {
 		t.Errorf("plain-text sends = %v, want none while throttled", bot.messages)
@@ -640,7 +646,7 @@ func TestTheNotifierNeverAnnouncesTheBacklogItFindsAtBoot(t *testing.T) {
 		feed: []map[string]any{{"id": float64(9), "kind": "run", "summary": "old news"}},
 	}
 
-	RunNotifier(ctx, bot, dc, 42, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
 
 	if len(bot.messages) != 0 {
 		t.Errorf("announcements = %v, want none for what was already there when the daemon came up", bot.messages)
@@ -662,7 +668,7 @@ func TestTheNotifierAnnouncesWhatArrivesAfterItIsSeeded(t *testing.T) {
 		arriving:        map[int][]map[string]any{4: {{"id": float64(1)}, {"id": float64(2), "tool_name": "git push"}}},
 	}
 
-	RunNotifier(ctx, bot, dc, 42, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
 
 	if len(bot.messages) != 1 || !strings.Contains(bot.messages[0].text, "git push") {
 		t.Errorf("announcements = %v, want exactly the proposal that arrived after seeding", bot.messages)
@@ -685,7 +691,7 @@ func TestAProposalAnnouncementThatFailedToSendIsOfferedAgain(t *testing.T) {
 		arriving:        map[int][]map[string]any{3: waiting, 4: waiting, 5: waiting},
 	}
 
-	RunNotifier(ctx, bot, dc, 42, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
 
 	if bot.buttonCalls != 2 {
 		t.Fatalf("proposal announcements attempted = %d, want 2 (the lost one and its retry)", bot.buttonCalls)
@@ -827,3 +833,336 @@ func TestSilenceFromTheDaemonSaysNothingWasHeard(t *testing.T) {
 		t.Errorf("resolveIncoming(voice) = %q, want a nothing-was-heard note", got)
 	}
 }
+
+func TestChatKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		to   telegram.Destination
+		want string
+	}{
+		{"a topic of a group", telegram.Destination{ChatID: -1001234567890, ThreadID: 7}, "-1001234567890:7"},
+		// The guard on this whole change. A one-to-one chat, and a group's General, have to produce
+		// the key they produce today — byte for byte. Anything else and every existing conversation
+		// loses its session on the day this ships.
+		{"no topic", telegram.Destination{ChatID: -1001234567890}, "-1001234567890"},
+		{"a positive id", telegram.Destination{ChatID: 12345, ThreadID: 3}, "12345:3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ChatKey(tc.to); got != tc.want {
+				t.Errorf("ChatKey(%+v) = %q, want %q", tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
+// `/cancel` cancels the turn of the topic it was typed in, not the last turn of the group. The
+// tracker is keyed on the same string the daemon routes on, so the two cannot disagree about what
+// "this conversation" means.
+func TestTheTrackerKeepsOneTurnPerTopic(t *testing.T) {
+	tracker := NewTracker()
+	tracker.Set("-100123:7", 11)
+	tracker.Set("-100123:9", 22)
+
+	if got, ok := tracker.Get("-100123:7"); !ok || got != 11 {
+		t.Errorf("Get(topic 7) = %d, %v; want 11, true", got, ok)
+	}
+	if got, ok := tracker.Get("-100123:9"); !ok || got != 22 {
+		t.Errorf("Get(topic 9) = %d, %v; want 22, true", got, ok)
+	}
+	if _, ok := tracker.Get("-100123"); ok {
+		t.Error("the group itself had no turn and must not inherit one from a topic in it")
+	}
+}
+
+// The whole point of Task 17, seen from the outside: a question asked in a topic is answered in
+// that topic. Nothing errors when this is wrong — the reply simply appears in General.
+func TestAReplyGoesBackToTheTopicItCameFrom(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &recordingDaemon{}
+	cfg := config.Config{AllowedChatID: -100123, AllowedUserIDs: []int64{7}}
+
+	HandleUpdate(bot, dc, fakeDownloader{}, cfg, NewTracker(), telegram.Update{
+		Message: &telegram.Message{
+			Chat:            telegram.Chat{ID: -100123},
+			From:            &telegram.User{ID: 7},
+			MessageThreadID: 7,
+			IsTopicMessage:  true,
+			Text:            "olá",
+		},
+	})
+
+	if len(bot.messages) == 0 {
+		t.Fatal("the bot said nothing at all")
+	}
+	for _, sent := range bot.messages {
+		if sent.to != (telegram.Destination{ChatID: -100123, ThreadID: 7}) {
+			t.Errorf("%q went to %+v, want the topic it came from", sent.text, sent.to)
+		}
+	}
+	if dc.lastChatID != "-100123:7" {
+		t.Errorf("the daemon was told chat %q, want the topic key", dc.lastChatID)
+	}
+}
+
+// errandDaemon answers the errand routes and records what it was asked to change, so a test can
+// tell "said it did" apart from "did".
+type errandDaemon struct {
+	recordingDaemon
+	errands   []daemon.Errand
+	listErr   error
+	createErr error
+	created   [][2]string
+	statuses  [][2]string
+	brains    [][2]string
+	closed    []int64
+	nextID    int64
+}
+
+func (d *errandDaemon) ListErrands() ([]daemon.Errand, error) {
+	return d.errands, d.listErr
+}
+
+func (d *errandDaemon) ErrandOfChat(chatKey string) (daemon.Errand, bool, error) {
+	if d.listErr != nil {
+		return daemon.Errand{}, false, d.listErr
+	}
+	for _, errand := range d.errands {
+		if errand.ChatKey == chatKey {
+			return errand, true, nil
+		}
+	}
+	return daemon.Errand{}, false, nil
+}
+
+func (d *errandDaemon) CreateErrand(name, chatKey string) (int64, error) {
+	d.created = append(d.created, [2]string{name, chatKey})
+	if d.createErr != nil {
+		return 0, d.createErr
+	}
+	d.nextID++
+	return d.nextID, nil
+}
+
+func (d *errandDaemon) SetErrandStatus(id int64, status string) error {
+	d.statuses = append(d.statuses, [2]string{strconv.FormatInt(id, 10), status})
+	return nil
+}
+
+func (d *errandDaemon) SetErrandBrain(id int64, brain string) error {
+	d.brains = append(d.brains, [2]string{strconv.FormatInt(id, 10), brain})
+	return nil
+}
+
+func (d *errandDaemon) CloseErrand(id int64) error {
+	d.closed = append(d.closed, id)
+	return nil
+}
+
+func lastMessage(t *testing.T, bot *recordingBot) string {
+	t.Helper()
+	if len(bot.messages) == 0 {
+		t.Fatal("the bot said nothing")
+	}
+	return bot.messages[len(bot.messages)-1].text
+}
+
+func topic(chat, thread int64) telegram.Destination {
+	return telegram.Destination{ChatID: chat, ThreadID: thread}
+}
+
+func TestOpenAnErrandOnATopic(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/assunto carros usados")
+
+	if len(dc.created) != 1 || dc.created[0] != [2]string{"carros usados", "-100123:7"} {
+		t.Fatalf("created = %v, want the name and the topic key", dc.created)
+	}
+	if !strings.Contains(lastMessage(t, bot), "carros usados") {
+		t.Errorf("the confirmation should name the errand: %q", lastMessage(t, bot))
+	}
+}
+
+// An errand IS a topic, so there is nowhere to put one in a chat that has no topics. Refusing here
+// is what keeps a one-to-one chat from acquiring an errand that would then answer every message in
+// it — including the ones that have nothing to do with the errand.
+func TestOpeningAnErrandOutsideATopicIsRefused(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{}
+
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: -100123}, "/assunto carros")
+
+	if len(dc.created) != 0 {
+		t.Fatalf("created = %v, want nothing", dc.created)
+	}
+	if dc.sendAssistantCalls != 0 {
+		t.Error("a refused command must not fall through and be answered as a question")
+	}
+	if !strings.Contains(strings.ToLower(lastMessage(t, bot)), "tópico") {
+		t.Errorf("the refusal should say a topic is needed: %q", lastMessage(t, bot))
+	}
+}
+
+func TestOpeningAnErrandWithNoNameAsksForOne(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/assunto")
+
+	if len(dc.created) != 0 {
+		t.Fatalf("created = %v, want nothing", dc.created)
+	}
+	if dc.sendAssistantCalls != 0 {
+		t.Error("a command missing its argument must not be sent to the model as a question")
+	}
+	if lastMessage(t, bot) == "" {
+		t.Error("a command that did nothing has to say so")
+	}
+}
+
+// One topic holds one errand — the daemon enforces it with a UNIQUE constraint and answers 409. The
+// person who typed it gets a sentence, not a status code.
+func TestOpeningASecondErrandOnOneTopicSaysWhy(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{createErr: errors.New("open errand: status code 409: ")}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/assunto outro")
+
+	message := lastMessage(t, bot)
+	if strings.Contains(message, "409") {
+		t.Errorf("a status code is not an explanation: %q", message)
+	}
+	if message == "" {
+		t.Error("the refusal has to be said out loud")
+	}
+}
+
+func TestPauseResumeAndCloseActOnTheErrandOfThisTopic(t *testing.T) {
+	here := daemon.Errand{ID: 4, Name: "carros", ChatKey: "-100123:7", Brain: "local", Status: "active"}
+	elsewhere := daemon.Errand{ID: 5, Name: "casa", ChatKey: "-100123:9", Brain: "cloud", Status: "active"}
+
+	for _, tc := range []struct {
+		command string
+		check   func(*testing.T, *errandDaemon)
+	}{
+		{"/pausa", func(t *testing.T, d *errandDaemon) {
+			if len(d.statuses) != 1 || d.statuses[0] != [2]string{"4", "paused"} {
+				t.Errorf("statuses = %v", d.statuses)
+			}
+		}},
+		{"/retomar", func(t *testing.T, d *errandDaemon) {
+			if len(d.statuses) != 1 || d.statuses[0] != [2]string{"4", "active"} {
+				t.Errorf("statuses = %v", d.statuses)
+			}
+		}},
+		{"/fim", func(t *testing.T, d *errandDaemon) {
+			if len(d.closed) != 1 || d.closed[0] != 4 {
+				t.Errorf("closed = %v, want the errand of this topic", d.closed)
+			}
+		}},
+		{"/cerebro cloud", func(t *testing.T, d *errandDaemon) {
+			if len(d.brains) != 1 || d.brains[0] != [2]string{"4", "cloud"} {
+				t.Errorf("brains = %v", d.brains)
+			}
+		}},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			bot := &recordingBot{}
+			dc := &errandDaemon{errands: []daemon.Errand{elsewhere, here}}
+
+			HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), tc.command)
+
+			tc.check(t, dc)
+			if lastMessage(t, bot) == "" {
+				t.Error("a command that changed something has to say so")
+			}
+		})
+	}
+}
+
+// The same commands in a topic with no errand change nothing and say so. Silence here reads as
+// success, and the next message would go to a model nobody moved.
+func TestErrandCommandsInATopicWithNoErrandChangeNothing(t *testing.T) {
+	for _, command := range []string{"/pausa", "/retomar", "/fim", "/cerebro cloud"} {
+		t.Run(command, func(t *testing.T) {
+			bot := &recordingBot{}
+			dc := &errandDaemon{}
+
+			HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), command)
+
+			if len(dc.statuses)+len(dc.brains)+len(dc.closed) != 0 {
+				t.Errorf("something was changed: %v %v %v", dc.statuses, dc.brains, dc.closed)
+			}
+			if dc.sendAssistantCalls != 0 {
+				t.Error("an errand command must not fall through to the model")
+			}
+			if !strings.Contains(strings.ToLower(lastMessage(t, bot)), "assunto") {
+				t.Errorf("the answer should say there is no errand here: %q", lastMessage(t, bot))
+			}
+		})
+	}
+}
+
+// `/cerebro` with a word the daemon does not know changes nothing. `Brain::from_wire` resolves
+// anything unrecognised to a default, so passing a typo through would move the errand silently.
+func TestAnUnknownBrainChangesNothing(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{errands: []daemon.Errand{
+		{ID: 4, Name: "carros", ChatKey: "-100123:7", Brain: "local", Status: "active"},
+	}}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/cerebro nuvem")
+
+	if len(dc.brains) != 0 {
+		t.Errorf("brains = %v, want nothing changed", dc.brains)
+	}
+	if dc.sendAssistantCalls != 0 {
+		t.Error("an unrecognised brain must not be sent to the model as a question")
+	}
+	if !strings.Contains(lastMessage(t, bot), "local") {
+		t.Errorf("the refusal should name the two that exist: %q", lastMessage(t, bot))
+	}
+}
+
+func TestListErrandsNamesTheTopicOfEachOne(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{errands: []daemon.Errand{
+		{ID: 4, Name: "carros", ChatKey: "-100123:7", Brain: "local", Status: "active"},
+		{ID: 5, Name: "casa", ChatKey: "-100123:9", Brain: "cloud", Status: "paused"},
+	}}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/assuntos")
+
+	said := lastMessage(t, bot)
+	for _, want := range []string{"carros", "casa", "paused", "cloud"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the listing should mention %q: %q", want, said)
+		}
+	}
+}
+
+func TestListErrandsWithNoneSaysSo(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &errandDaemon{}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/assuntos")
+
+	if dc.sendAssistantCalls != 0 {
+		t.Error("/assuntos must not fall through to the model")
+	}
+	if !strings.Contains(lastMessage(t, bot), "/assunto") {
+		t.Errorf("an empty list should say how to open one: %q", lastMessage(t, bot))
+	}
+}
+
+// The errand routes on the plain recording daemon: present so it still satisfies Daemon, and inert
+// so a test that did not ask about errands cannot quietly exercise them.
+func (d *recordingDaemon) ListErrands() ([]daemon.Errand, error) { return nil, nil }
+func (d *recordingDaemon) ErrandOfChat(string) (daemon.Errand, bool, error) {
+	return daemon.Errand{}, false, nil
+}
+func (d *recordingDaemon) CreateErrand(string, string) (int64, error) { return 0, nil }
+func (d *recordingDaemon) SetErrandStatus(int64, string) error        { return nil }
+func (d *recordingDaemon) SetErrandBrain(int64, string) error         { return nil }
+func (d *recordingDaemon) CloseErrand(int64) error                    { return nil }
