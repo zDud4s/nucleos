@@ -2040,6 +2040,23 @@ struct FakeVcsExecutor {
     /// fields: two adjacent `String`s destructured positionally can be swapped with every assertion
     /// still passing, which is the hazard `claim_next`'s own 5-tuple carries a warning about.
     seen: std::sync::Mutex<Vec<ClaimedRequest>>,
+    /// One permit per execution entered, so a test can wait for the operation to *begin*.
+    ///
+    /// A semaphore rather than a `Notify` because permits accumulate: an execution that starts
+    /// before anyone is waiting still counts, so there is no wake-up to lose and no order the two
+    /// halves have to arrive in. `entered` is what reads it.
+    started: tokio::sync::Semaphore,
+    /// A latch the test opens when it is ready for the operation to answer. One permit per
+    /// execution — each waits for its own release rather than sharing one.
+    ///
+    /// `delay` is the other way to hold an operation open, and for a test that has work to do
+    /// *inside* that window it is a bet: the window is a slice of wall clock, and the bet is that
+    /// the work fits. On a loaded machine one SQLite write does not always fit —
+    /// `an_outcome_the_row_refuses...` lost that bet 8 runs in 20 while a full build ran beside it,
+    /// and failed on an assertion about a log line, which is not what went wrong. `started` fixed
+    /// the near edge of that window and this fixes the far one; between them the test names its own
+    /// interleaving instead of buying it by the millisecond.
+    held: Option<tokio::sync::Semaphore>,
 }
 
 #[cfg(test)]
@@ -2058,6 +2075,19 @@ impl FakeVcsExecutor {
     fn succeeding_slowly(sha: &str, delay: std::time::Duration) -> Self {
         Self {
             delay,
+            ..Self::succeeding_with(sha)
+        }
+    }
+
+    /// Does not answer until the test says so — and never, if it never does.
+    ///
+    /// Prefer this to `succeeding_slowly` whenever the test does anything while the operation is
+    /// running. The duration in `succeeding_slowly` then has to be long enough for that work on
+    /// every machine the suite runs on, which is a number nobody can pick; a latch is that number
+    /// being unnecessary.
+    fn succeeding_until_released(sha: &str) -> Self {
+        Self {
+            held: Some(tokio::sync::Semaphore::new(0)),
             ..Self::succeeding_with(sha)
         }
     }
@@ -2093,7 +2123,40 @@ impl FakeVcsExecutor {
             delay: std::time::Duration::ZERO,
             barrier: None,
             seen: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            held: None,
         }
+    }
+
+    /// Lets one held execution answer. Panics on a fake that was not built to be held, because a
+    /// test releasing an executor that never waits is asserting an ordering it does not have.
+    fn release(&self) {
+        self.held
+            .as_ref()
+            .expect("only a `succeeding_until_released` fake has anything to release")
+            .add_permits(1);
+    }
+
+    /// Resolves once at least `n` executions have been entered.
+    ///
+    /// What it replaces, and why that mattered: a test that has to act *while* an operation runs
+    /// used to `sleep` a fixed 10ms first and assume the drain had got there. That is a real-time
+    /// budget for a reap and a claim — two SQLite writes — and on a machine also compiling and
+    /// running the other thousand tests it is occasionally missed. The test then acts BEFORE the
+    /// operation begins: a different scenario wearing the test's name, failing on an assertion that
+    /// says nothing about what actually went wrong. The flake was never about how long the suite
+    /// took; it was about jitter, and no larger sleep fixes that.
+    ///
+    /// Waiting on the event itself has no budget to miss. The permits are handed back on the way
+    /// out — dropping a `SemaphorePermit` returns it — so this reads the count without consuming it
+    /// and a second caller sees the same answer.
+    async fn entered(&self, n: usize) {
+        drop(
+            self.started
+                .acquire_many(n as u32)
+                .await
+                .expect("the fake's semaphore is never closed"),
+        );
     }
 
     /// Derived from `seen` rather than kept beside it: a separate counter can drift from the list it
@@ -2116,7 +2179,19 @@ impl VcsExecutor for FakeVcsExecutor {
         // The guard is a temporary so it is dropped at the end of this statement — held across the
         // await it would make this future non-`Send`, which `async_trait` requires.
         self.seen.lock().unwrap().push(request.clone());
+        // Signalled here for the same reason `seen` is written here: what a waiting test needs to
+        // know is that the operation BEGAN, and after the delay is too late to be that signal.
+        self.started.add_permits(1);
         tokio::time::sleep(self.delay).await;
+        // Before the barrier rather than after: the barrier is about executions releasing each
+        // other, and a held one has not really started until the test lets it. `forget` because the
+        // permit is spent — one release, one execution, so a second is held again.
+        if let Some(held) = &self.held {
+            held.acquire()
+                .await
+                .expect("the fake's latch is never closed")
+                .forget();
+        }
         // Held here rather than before the delay so it is the last thing between being entered and
         // answering: whatever else an execution does, it does not finish until its peers arrive.
         if let Some(barrier) = &self.barrier {
@@ -4045,12 +4120,18 @@ mod tests {
         submit(&pool, &repo(), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
 
         let logged = logged_during(async {
             tokio::join!(drain_once(&pool, "alpha", &executor), async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                reconcile_interrupted(&pool).await.unwrap()
+                // The reconcile has to land while the operation is running, and both edges of that
+                // window are named rather than timed: `entered` is the operation beginning, and it
+                // cannot end until `release`. This was a 10ms sleep inside a 100ms delay, which is
+                // the same sentence written as a wager on two SQLite writes.
+                executor.entered(1).await;
+                let reconciled = reconcile_interrupted(&pool).await.unwrap();
+                executor.release();
+                reconciled
             })
         })
         .await;
@@ -4084,13 +4165,16 @@ mod tests {
             .await
             .unwrap();
 
-        // A 10x margin over the reconcile's own wait, so which lands first is not a race: an
-        // in-memory claim takes microseconds, and `reconciled == 1` below fails loudly rather than
-        // passing quietly if that ever stops being true.
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        // The reconcile must land strictly inside the operation, so the operation is held open
+        // around it rather than given a duration long enough to probably cover it. `reconciled == 1`
+        // below is what would fail if that ever stopped being true — loudly, which is how the old
+        // 10ms-sleep-inside-100ms version was caught.
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
         let (drained, reconciled) = tokio::join!(drain_once(&pool, "alpha", &executor), async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            reconcile_interrupted(&pool).await.unwrap()
+            executor.entered(1).await;
+            let reconciled = reconcile_interrupted(&pool).await.unwrap();
+            executor.release();
+            reconciled
         });
 
         assert_eq!(
@@ -4161,8 +4245,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Far longer than the guard below, so which of the two fires is not a race.
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
+        // Never released, so the operation cannot finish at all — as opposed to the 30s this used
+        // to sleep, which was a duration chosen to be longer than a guard rather than a statement
+        // that finishing is not one of the things that may happen here.
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
         {
             let drain = drain_once(&pool, "alpha", &executor);
             tokio::pin!(drain);
@@ -4170,29 +4256,26 @@ mod tests {
             // Polled until the executor has actually been ENTERED, and abandoned there — rather
             // than after a fixed slice of wall clock.
             //
-            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. The
-            // executor's 30s makes it a non-race only for the half AFTER the operation begins;
-            // before that, `drain_once` still has a reap and a claim to get through, and 50ms was a
-            // real-time budget for two SQLite writes. On a machine also compiling and running the
-            // other thousand tests that budget is occasionally missed, and the drain is then
-            // abandoned BEFORE the operation — a different scenario wearing this test's name, which
-            // is why the flake read `calls(): 0 != 1` rather than anything about jamming.
+            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. Holding
+            // the executor open settles only the half AFTER the operation begins; before that,
+            // `drain_once` still has a reap and a claim to get through, and 50ms was a real-time
+            // budget for two SQLite writes. On a machine also compiling and running the other
+            // thousand tests that budget is occasionally missed, and the drain is then abandoned
+            // BEFORE the operation — a different scenario wearing this test's name, which is why
+            // the flake read `calls(): 0 != 1` rather than anything about jamming.
             //
-            // `calls()` is the property this test is about, so it is what is waited on. The outer
-            // timeout is not a budget: it is reached only if the drain never arrives at all, and it
-            // is there so that failure is a message rather than a hung suite.
+            // Entering the executor is the property this test is about, so it is what is waited on.
+            // The `select!` is still needed to keep the drain being polled — nothing else drives
+            // it — and its first arm turns "the drain finished" into a message rather than a
+            // confusing later assertion. The outer timeout is not a budget: it is reached only if
+            // the drain never arrives at all, and it is there so that failure is a message rather
+            // than a hung suite.
             tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    tokio::select! {
-                        _ = &mut drain => {
-                            panic!("the executor sleeps for 30s — the drain cannot have finished")
-                        }
-                        () = tokio::time::sleep(Duration::from_millis(1)) => {
-                            if executor.calls() == 1 {
-                                break;
-                            }
-                        }
+                tokio::select! {
+                    _ = &mut drain => {
+                        panic!("the executor is never released — the drain cannot have finished")
                     }
+                    () = executor.entered(1) => {}
                 }
             })
             .await
