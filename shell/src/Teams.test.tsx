@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import Teams from "./Teams";
-import type { Agent, Team, TeamAction, TeamRun, TeamRunDetail } from "./api";
+import type {
+  Agent, Team, TeamAction, TeamRun, TeamRunDetail, TeamTrigger, TeamTriggerNext,
+} from "./api";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -32,6 +34,7 @@ function team(overrides: Partial<Team> = {}): Team {
     max_parallel: 2,
     budget_usd: null,
     max_open_actions: 5,
+    max_live_runs: 1,
     created_at: "2026-08-16T10:00:00Z",
     updated_at: "2026-08-16T10:00:00Z",
     members: ["copywriter"],
@@ -87,7 +90,27 @@ interface DaemonState {
   runs?: TeamRun[];
   detail?: TeamRunDetail;
   actions?: TeamAction[];
+  triggers?: TeamTrigger[];
+  next?: TeamTriggerNext;
   write?: { ok: boolean; status: number };
+}
+
+function trigger(overrides: Partial<TeamTrigger> = {}): TeamTrigger {
+  return {
+    id: 1,
+    team_id: "marketing",
+    name: "morning summary",
+    enabled: 1,
+    source: "cron",
+    cron: "0 7 * * *",
+    timezone: "Europe/Lisbon",
+    from_team: null,
+    email_class: null,
+    request: "prepare the summary",
+    created_at: "2026-08-16T10:00:00Z",
+    updated_at: "2026-08-16T10:00:00Z",
+    ...overrides,
+  };
 }
 
 /** A daemon holding this state, answering every write with the status given. */
@@ -112,6 +135,16 @@ function daemonHolding(state: DaemonState) {
     }
     if (path.endsWith("/team-runs")) {
       return Promise.resolve({ ok: true, status: 200, json: async () => state.runs ?? [] });
+    }
+    if (path.includes("/team-triggers/") && path.endsWith("/next")) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => state.next ?? { next: null, error: null },
+      });
+    }
+    if (path.endsWith("/team-triggers")) {
+      return Promise.resolve({ ok: true, status: 200, json: async () => state.triggers ?? [] });
     }
     if (path.endsWith("/agents")) {
       return Promise.resolve({ ok: true, status: 200, json: async () => state.agents ?? [] });
@@ -278,6 +311,68 @@ describe("the departments tab", () => {
 
     expect(screen.getByText(/may file_document freely/)).toBeTruthy();
     expect(screen.queryByText(/^may send_email/)).toBeNull();
+  });
+
+  /**
+   * A rule sits beside the department it starts, and says whether it is armed — because writing a
+   * rule and arming it are two acts, and a screen that showed only the text would make the two
+   * look like one.
+   */
+  it("shows what starts a department, and whether it is armed", async () => {
+    await show({
+      teams: [team()],
+      agents: [agent()],
+      triggers: [
+        trigger(),
+        trigger({
+          id: 2,
+          name: "write it up",
+          enabled: 0,
+          source: "team_finished",
+          cron: null,
+          timezone: null,
+          from_team: "research",
+        }),
+      ],
+      next: { next: "2026-08-17T07:00:00Z", error: null },
+    });
+
+    expect(screen.getByText("morning summary")).toBeTruthy();
+    expect(screen.getByText("0 7 * * * Europe/Lisbon")).toBeTruthy();
+    expect(screen.getByText("armed")).toBeTruthy();
+    // The name and what fires it are two facts, and the card shows both.
+    expect(screen.getByText("write it up")).toBeTruthy();
+    expect(screen.getByText("after research")).toBeTruthy();
+    expect(screen.getByText("not armed")).toBeTruthy();
+  });
+
+  /**
+   * An invalid cron makes a rule that is skipped every tick and logged at debug — 2,880 times a
+   * day, which is to say invisibly. This is where it becomes a sentence somebody reads.
+   */
+  it("says why a rule will never fire instead of showing a time that never comes", async () => {
+    await show({
+      teams: [team()],
+      agents: [agent()],
+      triggers: [trigger({ cron: "every morning please" })],
+      next: { next: null, error: "'every morning please' is not a cron expression" },
+    });
+
+    expect(screen.getByText(/is not a cron expression/)).toBeTruthy();
+  });
+
+  it("arms a rule through the daemon rather than by hiding the button", async () => {
+    await show({
+      teams: [team()],
+      agents: [agent()],
+      triggers: [trigger({ enabled: 0 })],
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Arm"));
+    });
+    const armed = writeCalls().find(([url]) => String(url).endsWith("/team-triggers/1/enable"));
+    expect(JSON.parse(String((armed?.[1] as { body?: string }).body))).toEqual({ enabled: true });
   });
 
   /** The ceilings belong to the daemon; the form only refuses one round trip earlier. */

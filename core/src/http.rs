@@ -139,6 +139,25 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::team::post_team_action).get(crate::team::list_open_actions),
         )
         .route("/team-recruits", post(crate::team::post_team_recruit))
+        // All Control, and NONE of them in `auth::TEAM_ROUTES`. A department neither arms nor fires
+        // a rule, and that is not an oversight: it is what stops a chain feeding itself underneath
+        // the graph the cycle check walks.
+        .route(
+            "/team-triggers",
+            get(crate::team_trigger::list_triggers).post(crate::team_trigger::create_trigger),
+        )
+        .route(
+            "/team-triggers/{id}",
+            axum::routing::delete(crate::team_trigger::delete_trigger),
+        )
+        .route(
+            "/team-triggers/{id}/enable",
+            post(crate::team_trigger::post_trigger_enable),
+        )
+        .route(
+            "/team-triggers/{id}/next",
+            get(crate::team_trigger::get_trigger_next),
+        )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",

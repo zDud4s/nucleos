@@ -2236,6 +2236,9 @@ export interface Team {
   budget_usd: number | null;
   /** How many requests this department may leave waiting for a person at once. */
   max_open_actions: number;
+  /** How many runs of it may be in flight at once. A rule firing over a live run skips its window
+   *  rather than queueing — a queue is a debt the machine tries to pay all at once. */
+  max_live_runs: number;
   created_at: string;
   updated_at: string;
   /** The roster, flattened onto the team by the daemon: the membership IS the team. */
@@ -2259,6 +2262,7 @@ export interface TeamInput {
   max_parallel: number;
   budget_usd: number | null;
   max_open_actions: number;
+  max_live_runs: number;
   members: string[];
   grants: TeamGrant[];
 }
@@ -2333,6 +2337,94 @@ export const TEAM_GRANTABLE_ACTIONS = [
 
 export const TEAM_MAX_OPEN_ACTIONS_CEILING = 20;
 export const TEAM_DEFAULT_MAX_OPEN_ACTIONS = 5;
+/** `team_trigger::MAX_LIVE_TEAM_RUNS` — the daemon's ceiling, which no configuration raises. */
+export const TEAM_MAX_LIVE_RUNS_CEILING = 4;
+
+/** One rule that starts a department when nobody is asking. */
+export interface TeamTrigger {
+  id: number;
+  team_id: string;
+  name: string;
+  /** 0 or 1. Writing a rule and arming it are two acts, so a new one is always 0. */
+  enabled: number;
+  /** cron | team_finished | email_triaged. */
+  source: string;
+  cron: string | null;
+  /** IANA. Null is UTC. */
+  timezone: string | null;
+  from_team: string | null;
+  email_class: string | null;
+  /** The text the department is asked. The owner's words, never a model's. */
+  request: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * When a cron rule fires next, or why it never will.
+ *
+ * The error half is the reason this route exists: an invalid cron makes a rule that is skipped
+ * every tick and logged at debug — 2,880 times a day, which is to say invisibly — so the rule
+ * simply never runs and nothing anywhere says so.
+ */
+export interface TeamTriggerNext {
+  next: string | null;
+  error: string | null;
+}
+
+export async function listTeamTriggers(token: string): Promise<TeamTrigger[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/team-triggers`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TeamTrigger[];
+  } catch {
+    return null;
+  }
+}
+
+export async function getTeamTriggerNext(
+  token: string,
+  id: number,
+): Promise<TeamTriggerNext | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/team-triggers/${id}/next`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TeamTriggerNext;
+  } catch {
+    return null;
+  }
+}
+
+export async function setTeamTriggerEnabled(
+  token: string,
+  id: number,
+  enabled: boolean,
+): Promise<ApiResult<TeamTrigger>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/team-triggers/${id}/enable`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as TeamTrigger };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function deleteTeamTrigger(token: string, id: number): Promise<ApiResult<null>> {
+  return teamVerb(`${DAEMON_URL}/team-triggers/${id}`, "DELETE", token);
+}
 
 /**
  * The daemon's own ceilings, mirrored so the form refuses out of range at the field rather than by

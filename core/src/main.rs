@@ -51,6 +51,7 @@ mod sidecar;
 mod state;
 mod storage;
 mod team;
+mod team_trigger;
 mod token_efficiency;
 mod transcribe;
 mod triage;
@@ -706,6 +707,11 @@ async fn main() {
     // its own.
     tokio::spawn(team::run_team_loop(state.clone()));
     tokio::spawn(team::run_workspace_gc_loop(state.clone()));
+    // A third loop and not a branch in either of the two above. What DECIDES that a department
+    // starts is a different question from how it runs — the same separation `scheduler.rs` has from
+    // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
+    // and a department has no project, no root and no HEAD.
+    tokio::spawn(team_trigger::run_team_trigger_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run

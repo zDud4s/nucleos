@@ -260,7 +260,13 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 /// One table rather than a capability declared beside each route: this is a safety boundary, and a
 /// boundary you have to reconstruct by reading forty route definitions is one nobody audits. A new
 /// route is unreachable by a scoped key until someone adds it here on purpose.
-fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
+///
+/// Visible to the crate's tests so a module that ADDS routes can assert its own absence from a
+/// scope's table where those routes are written — `team_trigger` does exactly that. The boundary is
+/// still decided only here; being readable from a test is what makes forgetting to add a route
+/// fail somewhere other than production.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     match scope {
         Scope::Control => true,
         Scope::Run(_) => method == Method::POST && path == HOOK_ROUTE,

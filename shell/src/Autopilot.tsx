@@ -649,7 +649,12 @@ interface ScopedKillPanelProps {
   refresh: () => Promise<void>;
 }
 
-const TRIGGER_TYPES = ["scheduled", "repo"] as const;
+/**
+ * The scopes the daemon reads. `team` is the fourth, and the switch a department's rules answer to
+ * — its ceilings aside, it is the only thing an owner can turn off deliberately, because the
+ * attention brake is not consulted for departments (`team_trigger::team_trigger_tick`).
+ */
+const TRIGGER_TYPES = ["scheduled", "repo", "team"] as const;
 
 function ScopedKillPanel({ scopedKills, token, refresh }: ScopedKillPanelProps) {
   const [busy, setBusy] = useState(false);

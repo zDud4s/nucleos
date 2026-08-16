@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  cancelTeamRun, createTeam, deleteTeam, deleteTeamRun, getTeamRun, listAgents, listTeamRunActions,
-  listTeamRuns, listTeams, startTeamRun, teamRunIsLive, updateTeam,
-  TEAM_DEFAULT_MAX_OPEN_ACTIONS, TEAM_GRANTABLE_ACTIONS, TEAM_MAX_OPEN_ACTIONS_CEILING,
-  TEAM_MAX_PARALLEL_CEILING, TEAM_MAX_ROUNDS_CEILING,
+  cancelTeamRun, createTeam, deleteTeam, deleteTeamRun, deleteTeamTrigger, getTeamRun,
+  getTeamTriggerNext, listAgents, listTeamRunActions, listTeamRuns, listTeams, listTeamTriggers,
+  setTeamTriggerEnabled, startTeamRun, teamRunIsLive, updateTeam,
+  TEAM_DEFAULT_MAX_OPEN_ACTIONS, TEAM_GRANTABLE_ACTIONS, TEAM_MAX_LIVE_RUNS_CEILING,
+  TEAM_MAX_OPEN_ACTIONS_CEILING, TEAM_MAX_PARALLEL_CEILING, TEAM_MAX_ROUNDS_CEILING,
   type Agent, type ConnectionState, type Team, type TeamAction, type TeamInput, type TeamRun,
-  type TeamRunDetail,
+  type TeamRunDetail, type TeamTrigger, type TeamTriggerNext,
 } from "./api";
+import { relativeTime } from "./derive";
 import { Badge, Button, ConfirmButton, ErrorNote, Panel, Teach } from "./ui";
 
 /** How often a live run is read back. A round is minutes; this is well under one. */
@@ -14,7 +16,8 @@ const POLL_MS = 4000;
 
 const BLANK: TeamInput = {
   name: "", mission: "", director_agent_id: "", max_rounds: 3, max_parallel: 2,
-  budget_usd: null, max_open_actions: TEAM_DEFAULT_MAX_OPEN_ACTIONS, members: [], grants: [],
+  budget_usd: null, max_open_actions: TEAM_DEFAULT_MAX_OPEN_ACTIONS, max_live_runs: 1,
+  members: [], grants: [],
 };
 
 /** What a department may do with one kind of action. `""` is the daemon's default: nothing. */
@@ -94,6 +97,105 @@ function itemTone(state: string): "active" | "off" | "pending" | "paused" {
   return "paused";
 }
 
+/**
+ * What starts a department when nobody is asking, and — for a clock rule — when it next will.
+ *
+ * The next time is fetched per rule and not computed here, for the reason the daemon's own route
+ * gives: a screen that worked out "next at 08:00" by a second route would eventually disagree with
+ * the tick that fires it. The ERROR half is why the route exists at all — an invalid cron makes a
+ * rule that never runs and says so nowhere.
+ */
+function TriggerList({
+  triggers, token, refresh,
+}: {
+  triggers: TeamTrigger[];
+  token: string;
+  refresh: () => Promise<void>;
+}) {
+  const [next, setNext] = useState<Record<number, TeamTriggerNext>>({});
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const answers = await Promise.all(
+        triggers
+          .filter((trigger) => trigger.source === "cron")
+          .map(async (trigger) => [trigger.id, await getTeamTriggerNext(token, trigger.id)] as const),
+      );
+      if (cancelled) return;
+      setNext(
+        Object.fromEntries(
+          answers.filter((pair): pair is [number, TeamTriggerNext] => pair[1] !== null),
+        ),
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [triggers, token]);
+
+  if (triggers.length === 0) return null;
+
+  async function toggle(trigger: TeamTrigger) {
+    setBusy(true);
+    await setTeamTriggerEnabled(token, trigger.id, trigger.enabled === 0);
+    await refresh();
+    setBusy(false);
+  }
+
+  async function remove(id: number) {
+    setBusy(true);
+    await deleteTeamTrigger(token, id);
+    await refresh();
+    setBusy(false);
+  }
+
+  return (
+    <div>
+      <h4>What starts it</h4>
+      {triggers.map((trigger) => {
+        const when = next[trigger.id];
+        return (
+          <article className="feed-item" key={trigger.id}>
+            <div className="f-meta">
+              <b>{trigger.name}</b>
+              <Badge tone={trigger.enabled === 1 ? "active" : "off"}>
+                {trigger.enabled === 1 ? "armed" : "not armed"}
+              </Badge>
+              <span>
+                {trigger.source === "cron" && `${trigger.cron} ${trigger.timezone ?? "UTC"}`}
+                {trigger.source === "team_finished" && `after ${trigger.from_team}`}
+                {trigger.source === "email_triaged" && `on ${trigger.email_class} mail`}
+              </span>
+              {/* The error, when there is one, rather than a next time that will never come. */}
+              {when?.error != null && <span className="a-note">{when.error}</span>}
+              {when?.next != null && trigger.enabled === 1 && (
+                <span className="a-note">next {relativeTime(when.next)}</span>
+              )}
+            </div>
+            <p className="f-body">{trigger.request}</p>
+            <div className="a-actions">
+              <Button size="sm" disabled={busy} onClick={() => void toggle(trigger)}>
+                {trigger.enabled === 1 ? "Disarm" : "Arm"}
+              </Button>
+              <ConfirmButton
+                size="sm"
+                variant="danger"
+                confirmLabel="Delete the rule?"
+                disabled={busy}
+                onConfirm={() => void remove(trigger.id)}
+              >
+                Delete
+              </ConfirmButton>
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
 interface TeamFormProps {
   agents: Agent[];
   initial: TeamInput;
@@ -118,6 +220,7 @@ function TeamForm({ agents, initial, busy, submitLabel, onSubmit, onCancel }: Te
   const [parallel, setParallel] = useState(String(initial.max_parallel));
   const [budget, setBudget] = useState(initial.budget_usd === null ? "" : String(initial.budget_usd));
   const [openActions, setOpenActions] = useState(String(initial.max_open_actions));
+  const [liveRuns, setLiveRuns] = useState(String(initial.max_live_runs));
   const [members, setMembers] = useState<string[]>(initial.members);
   const [grants, setGrants] = useState<Record<string, GrantMode>>(() =>
     Object.fromEntries(initial.grants.map((grant) => [grant.kind, grant.mode as GrantMode])),
@@ -127,6 +230,7 @@ function TeamForm({ agents, initial, busy, submitLabel, onSubmit, onCancel }: Te
   const parallelValue = Number(parallel);
   const budgetValue = budget.trim() === "" ? null : Number(budget);
   const openActionsValue = Number(openActions);
+  const liveRunsValue = Number(liveRuns);
 
   const incomplete =
     name.trim() === "" ||
@@ -141,6 +245,9 @@ function TeamForm({ agents, initial, busy, submitLabel, onSubmit, onCancel }: Te
     !Number.isInteger(openActionsValue) ||
     openActionsValue < 0 ||
     openActionsValue > TEAM_MAX_OPEN_ACTIONS_CEILING ||
+    !Number.isInteger(liveRunsValue) ||
+    liveRunsValue < 1 ||
+    liveRunsValue > TEAM_MAX_LIVE_RUNS_CEILING ||
     (budgetValue !== null && (!Number.isFinite(budgetValue) || budgetValue <= 0));
 
   function toggle(id: string) {
@@ -163,6 +270,7 @@ function TeamForm({ agents, initial, busy, submitLabel, onSubmit, onCancel }: Te
           max_parallel: parallelValue,
           budget_usd: budgetValue,
           max_open_actions: openActionsValue,
+          max_live_runs: liveRunsValue,
           members,
           // Only the kinds actually chosen. A `""` row is the absence of a grant, and the absence
           // of a row is what the daemon reads as "no" — there is no `deny` to send.
@@ -230,6 +338,16 @@ function TeamForm({ agents, initial, busy, submitLabel, onSubmit, onCancel }: Te
           max={TEAM_MAX_OPEN_ACTIONS_CEILING}
           value={openActions}
           onChange={(event) => setOpenActions(event.target.value)}
+        />
+      </label>
+      <label>
+        At once, in all
+        <input
+          type="number"
+          min={1}
+          max={TEAM_MAX_LIVE_RUNS_CEILING}
+          value={liveRuns}
+          onChange={(event) => setLiveRuns(event.target.value)}
         />
       </label>
       <fieldset className="wide">
@@ -501,6 +619,7 @@ function Departments({ token }: { token: string }) {
   const [teams, setTeams] = useState<Team[] | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [runs, setRuns] = useState<TeamRun[]>([]);
+  const [triggers, setTriggers] = useState<TeamTrigger[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
@@ -509,14 +628,16 @@ function Departments({ token }: { token: string }) {
   const [failed, setFailed] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const [nextTeams, nextAgents, nextRuns] = await Promise.all([
+    const [nextTeams, nextAgents, nextRuns, nextTriggers] = await Promise.all([
       listTeams(token),
       listAgents(token),
       listTeamRuns(token),
+      listTeamTriggers(token),
     ]);
     setTeams(nextTeams);
     setAgents(nextAgents ?? []);
     setRuns(nextRuns ?? []);
+    setTriggers(nextTriggers ?? []);
     setLoading(false);
   }, [token]);
 
@@ -642,6 +763,14 @@ function Departments({ token }: { token: string }) {
               )}
             </div>
             <p className="f-body">{team.mission}</p>
+            {/* Beside the department rather than on a rules tab of its own: what starts a
+                department is part of what the department IS, and a rule read away from the team it
+                starts is a rule nobody connects to anything. */}
+            <TriggerList
+              triggers={triggers.filter((trigger) => trigger.team_id === team.id)}
+              token={token}
+              refresh={refresh}
+            />
             {editing === team.id ? (
               <TeamForm
                 agents={agents}
@@ -653,6 +782,7 @@ function Departments({ token }: { token: string }) {
                   max_parallel: team.max_parallel,
                   budget_usd: team.budget_usd,
                   max_open_actions: team.max_open_actions,
+                  max_live_runs: team.max_live_runs,
                   members: team.members,
                   grants: team.grants,
                 }}

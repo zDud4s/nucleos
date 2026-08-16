@@ -127,6 +127,10 @@ pub struct Team {
     /// How many actions this team may leave waiting for a human at once. See
     /// `DEFAULT_MAX_OPEN_ACTIONS`.
     pub max_open_actions: i64,
+    /// How many runs of this department may be in flight at once. One by default: a rule that
+    /// fires while the last run is still going SKIPS its window rather than queueing, because a
+    /// queue is a debt the machine then tries to pay all at once.
+    pub max_live_runs: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -155,6 +159,8 @@ pub struct TeamRequest {
     /// team instead of 400ing on a field it has never heard of.
     #[serde(default = "default_max_open_actions")]
     pub max_open_actions: i64,
+    #[serde(default = "default_max_live_runs")]
+    pub max_live_runs: i64,
     #[serde(default)]
     pub members: Vec<String>,
     /// Replaced wholesale, exactly as `members` is, and for the same reason: the editor sends the
@@ -166,6 +172,10 @@ pub struct TeamRequest {
 
 fn default_max_open_actions() -> i64 {
     DEFAULT_MAX_OPEN_ACTIONS
+}
+
+fn default_max_live_runs() -> i64 {
+    1
 }
 
 #[derive(Debug)]
@@ -236,6 +246,11 @@ fn validate(request: &TeamRequest) -> Result<(), TeamError> {
             "max_open_actions is outside what a daemon allows",
         ));
     }
+    if !(1..=crate::team_trigger::MAX_LIVE_TEAM_RUNS).contains(&request.max_live_runs) {
+        return Err(TeamError::Invalid(
+            "max_live_runs is outside what a daemon allows",
+        ));
+    }
     for grant in &request.grants {
         if !GRANTABLE_ACTIONS.contains(&grant.kind.as_str()) {
             return Err(TeamError::Invalid(
@@ -303,8 +318,9 @@ pub async fn create(pool: &sqlx::SqlitePool, request: TeamRequest) -> Result<Tea
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
-                            budget_usd, max_open_actions, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            budget_usd, max_open_actions, max_live_runs, created_at,
+                            updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&request.name)
@@ -314,6 +330,7 @@ pub async fn create(pool: &sqlx::SqlitePool, request: TeamRequest) -> Result<Tea
     .bind(request.max_parallel)
     .bind(request.budget_usd)
     .bind(request.max_open_actions)
+    .bind(request.max_live_runs)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -426,7 +443,7 @@ async fn replace_roster(
 pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<TeamView>, TeamError> {
     let teams: Vec<Team> = sqlx::query_as(
         "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
-                max_open_actions, created_at, updated_at
+                max_open_actions, max_live_runs, created_at, updated_at
          FROM teams ORDER BY name",
     )
     .fetch_all(pool)
@@ -448,7 +465,7 @@ pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<TeamView>, TeamError> {
 pub async fn get(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<TeamView>, TeamError> {
     let team: Option<Team> = sqlx::query_as(
         "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
-                max_open_actions, created_at, updated_at
+                max_open_actions, max_live_runs, created_at, updated_at
          FROM teams WHERE id = ?",
     )
     .bind(id)
@@ -489,7 +506,7 @@ pub async fn update(
     let affected = sqlx::query(
         "UPDATE teams
          SET name = ?, mission = ?, director_agent_id = ?, max_rounds = ?, max_parallel = ?,
-             budget_usd = ?, max_open_actions = ?, updated_at = ?
+             budget_usd = ?, max_open_actions = ?, max_live_runs = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&request.name)
@@ -499,6 +516,7 @@ pub async fn update(
     .bind(request.max_parallel)
     .bind(request.budget_usd)
     .bind(request.max_open_actions)
+    .bind(request.max_live_runs)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
@@ -554,6 +572,31 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
         .bind(id)
         .execute(pool)
         .await?;
+    // This team's own rules go with it — a rule that starts a department which no longer exists
+    // fires at nothing, every window, for ever.
+    sqlx::query(
+        "DELETE FROM team_trigger_state WHERE trigger_id IN
+           (SELECT id FROM team_triggers WHERE team_id = ?)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM team_triggers WHERE team_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    // Rules that fire ON this team are DISARMED and not deleted — the opposite treatment, for the
+    // opposite reason. Such a rule still describes something its author wanted and has merely lost
+    // its signal: deleting it throws away their sentence, and leaving it armed leaves a rule that
+    // can never fire looking like one that might.
+    sqlx::query(
+        "UPDATE team_triggers SET enabled = 0, updated_at = ?
+          WHERE source = 'team_finished' AND from_team = ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await?;
     let result = sqlx::query("DELETE FROM teams WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -595,6 +638,30 @@ pub struct TeamRun {
     pub created_at: String,
     pub updated_at: String,
     pub finished_at: Option<String>,
+    /// The rule that started this, or NULL when a person did.
+    pub trigger_id: Option<i64>,
+    /// The run whose ending started this. For drawing the chain; it decides nothing.
+    pub parent_id: Option<String>,
+    /// The run this tree grew from. **This is what decides the money** — see
+    /// `team_trigger::tree_has_room`. A run a person asked for is its own root, never NULL: a NULL
+    /// meaning "I am the root" makes every reader write `COALESCE(root_id, id)`, and the day one
+    /// forgets, the tree ceiling reads the wrong run.
+    pub root_id: String,
+    pub depth: i64,
+}
+
+/// Where a run came from, for the columns above.
+///
+/// Defaulted to "a person asked, and this is its own tree", which is what every caller that is not
+/// a trigger means. `start` takes no lineage at all and `start_with` takes one, so the ordinary
+/// path cannot accidentally declare itself the child of something.
+#[derive(Debug, Clone, Default)]
+pub struct Lineage {
+    pub trigger_id: Option<i64>,
+    pub parent_id: Option<String>,
+    /// `None` means this run is its own root.
+    pub root_id: Option<String>,
+    pub depth: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
@@ -868,6 +935,21 @@ impl std::fmt::Display for StartError {
 /// a director that was deleted, a local member on a machine with no local model, and a house budget
 /// that is already spent.
 pub async fn start(state: &AppState, team_id: &str, request: &str) -> Result<String, StartError> {
+    start_with(state, team_id, request, Lineage::default()).await
+}
+
+/// `start`, for a caller that knows where the run came from.
+///
+/// One function and not two paths: a triggered run is an ordinary run with four columns filled in,
+/// and every refusal above applies to it unchanged. What a trigger adds — the depth, the tree
+/// ceiling, the live-run counts — is checked by `team_trigger::fire` BEFORE it gets here, because
+/// those are questions about whether to start at all rather than about whether this team can.
+pub async fn start_with(
+    state: &AppState,
+    team_id: &str,
+    request: &str,
+    lineage: Lineage,
+) -> Result<String, StartError> {
     let request = request.trim();
     if request.is_empty() {
         return Err(StartError::Invalid("the request is empty".to_owned()));
@@ -943,8 +1025,8 @@ pub async fn start(state: &AppState, team_id: &str, request: &str) -> Result<Str
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO team_runs (id, team_id, request, workspace, token, state, created_at,
-                                updated_at)
-         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?)",
+                                updated_at, trigger_id, parent_id, root_id, depth)
+         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&team.team.id)
@@ -953,6 +1035,13 @@ pub async fn start(state: &AppState, team_id: &str, request: &str) -> Result<Str
     .bind(&secret)
     .bind(&now)
     .bind(&now)
+    .bind(lineage.trigger_id)
+    .bind(&lineage.parent_id)
+    // Its own id when nobody named a root. Written rather than left NULL for the reason the column
+    // documents: a sentinel meaning "me" is a `COALESCE` at every reader, and one missing `COALESCE`
+    // is a tree ceiling read off the wrong run.
+    .bind(lineage.root_id.as_deref().unwrap_or(&id))
+    .bind(lineage.depth)
     .execute(&state.pool)
     .await
     .map_err(|error| StartError::Unavailable(error.to_string()))?;
@@ -1896,7 +1985,7 @@ pub async fn team_tick(state: &AppState, now: chrono::DateTime<chrono::Utc>) {
     let live: Vec<TeamRun> = match sqlx::query_as(
         "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                 next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                updated_at, finished_at
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
          FROM team_runs
          WHERE state IN ('planning', 'working', 'delivering')
          ORDER BY created_at",
@@ -2002,7 +2091,61 @@ async fn ceiling_reached(
             ));
         }
     }
+
+    // And the TREE's, which is a different question once a run can start another. Two teams with a
+    // $5 ceiling that start each other spend $5 every time, for ever, and every run is inside its
+    // own ceiling the whole time — so the check above never fires and nothing is locally wrong.
+    //
+    // Both checks stand, and neither weakens the other: a $1 department does not get to spend $4
+    // because the root allowed it, and a chain does not get to spend without end because each link
+    // is cheap. For a run a person asked for the two are the same question, since it is its own
+    // root and its own tree.
+    if run.root_id != run.id {
+        let root_ceiling: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT teams.budget_usd FROM team_runs
+               JOIN teams ON teams.id = team_runs.team_id
+              WHERE team_runs.id = ?",
+        )
+        .bind(&run.root_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        if let Some(root_ceiling) = root_ceiling {
+            let spent = spend_of_tree(&state.pool, &run.root_id).await;
+            if spent >= root_ceiling {
+                return Some((
+                    "stopped",
+                    format!(
+                        "this chain has spent ${spent:.2} of the ${root_ceiling:.2} its first run \
+                         was given"
+                    ),
+                ));
+            }
+        }
+    }
     None
+}
+
+/// What a whole chain has cost, every run in it and every director node of each.
+///
+/// Keyed on `root_id` with an index, not a recursive walk of `parent_id`: this is asked at every
+/// pass of every run in the tree, one indexed read beats a CTE that arrives at the same answer by a
+/// route that can be got wrong. It rests on `runs.team_run_id` (migration 0073) — without that
+/// column a run's cost counts the specialists alone, and a tree ceiling built on a sum that
+/// undercounts errs towards spending, multiplied by the depth.
+pub async fn spend_of_tree(pool: &sqlx::SqlitePool, root_id: &str) -> f64 {
+    sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT SUM(cost_usd) FROM runs
+          WHERE team_run_id IN (SELECT id FROM team_runs WHERE root_id = ?)",
+    )
+    .bind(root_id)
+    .fetch_one(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0.0)
 }
 
 /// What one run has cost, director nodes included.
@@ -2435,7 +2578,7 @@ async fn team_and_director(
 ) -> Result<Option<(Team, crate::agent::Agent)>, sqlx::Error> {
     let team: Option<Team> = sqlx::query_as(
         "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
-                max_open_actions, created_at, updated_at
+                max_open_actions, max_live_runs, created_at, updated_at
          FROM teams WHERE id = ?",
     )
     .bind(&run.team_id)
@@ -3023,7 +3166,7 @@ pub async fn reconcile_orphaned_team_runs(state: &AppState) -> Result<(), sqlx::
     let live: Vec<TeamRun> = sqlx::query_as(
         "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                 next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                updated_at, finished_at
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
          FROM team_runs
          WHERE state IN ('planning', 'working', 'delivering') AND director_node != 'none'",
     )
@@ -3197,7 +3340,7 @@ pub async fn list_team_runs(
     sqlx::query_as(
         "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                 next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                updated_at, finished_at
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
          FROM team_runs ORDER BY created_at DESC LIMIT 100",
     )
     .fetch_all(&state.pool)
@@ -3213,7 +3356,7 @@ pub async fn get_team_run(
     let run: Option<TeamRun> = sqlx::query_as(
         "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                 next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                updated_at, finished_at
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
          FROM team_runs WHERE id = ?",
     )
     .bind(&id)
@@ -3460,6 +3603,18 @@ pub async fn post_read_file(
         path: request.path,
         content,
     }))
+}
+
+/// The one piece of this module's test scaffolding another module needs.
+///
+/// `team_trigger.rs` starts real departments to test what starts them, and a second copy of this
+/// `AppState` would be a second set of answers to "what does a daemon with a files folder look
+/// like" — kept in step by hand, and wrong on the day somebody adds a field.
+#[cfg(test)]
+pub mod test_support {
+    pub async fn state_with(root: std::path::PathBuf) -> crate::state::AppState {
+        super::tests::test_state(root).await
+    }
 }
 
 #[cfg(test)]
@@ -3809,7 +3964,7 @@ mod tests {
     // The database, end to end
     // -----------------------------------------------------------------------------------------
 
-    async fn test_state(root: std::path::PathBuf) -> AppState {
+    pub(super) async fn test_state(root: std::path::PathBuf) -> AppState {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -3884,6 +4039,7 @@ mod tests {
                 max_parallel: 2,
                 budget_usd: None,
                 max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
                 grants: Vec::new(),
                 members: vec!["copywriter".to_owned(), "researcher".to_owned()],
             },
@@ -3923,6 +4079,7 @@ mod tests {
                 max_parallel: 2,
                 budget_usd: None,
                 max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
                 grants: Vec::new(),
                 members: vec!["copywriter".to_owned()],
             },
@@ -3948,6 +4105,7 @@ mod tests {
                 max_parallel: 1,
                 budget_usd: None,
                 max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
                 grants: Vec::new(),
                 members: vec!["nobody".to_owned()],
             },
@@ -3979,6 +4137,7 @@ mod tests {
                     max_parallel: parallel,
                     budget_usd: None,
                     max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                    max_live_runs: 1,
                     grants: Vec::new(),
                     members: Vec::new(),
                 },
@@ -4342,6 +4501,7 @@ mod tests {
                 max_parallel: 1,
                 budget_usd: None,
                 max_open_actions: 1,
+                max_live_runs: 1,
                 grants: vec![TeamGrant {
                     kind: "send_email".to_owned(),
                     mode: "propose".to_owned(),
@@ -4735,7 +4895,7 @@ mod tests {
         let run: TeamRun = sqlx::query_as(
             "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                     next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                    updated_at, finished_at
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
              FROM team_runs WHERE id = ?",
         )
         .bind(&run_id)
@@ -4764,7 +4924,7 @@ mod tests {
         let run: TeamRun = sqlx::query_as(
             "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                     next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                    updated_at, finished_at
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
              FROM team_runs WHERE id = ?",
         )
         .bind(&run_id)
@@ -4973,6 +5133,7 @@ mod tests {
                 max_parallel: 1,
                 budget_usd: None,
                 max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
                 grants: Vec::new(),
                 members: Vec::new(),
             },
@@ -5004,6 +5165,7 @@ mod tests {
                 max_parallel: 1,
                 budget_usd: None,
                 max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
                 grants: Vec::new(),
                 members: vec!["localist".to_owned()],
             },
@@ -5056,7 +5218,7 @@ mod tests {
         let run: TeamRun = sqlx::query_as(
             "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                     next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                    updated_at, finished_at
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
              FROM team_runs WHERE id = ?",
         )
         .bind(&id)
@@ -5286,7 +5448,7 @@ mod tests {
         sqlx::query_as(
             "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                     next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
-                    updated_at, finished_at
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
              FROM team_runs WHERE id = ?",
         )
         .bind(id)
@@ -5572,6 +5734,7 @@ mod tests {
                 max_parallel: 2,
                 budget_usd: Some(1.0),
                 max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
                 grants: Vec::new(),
                 members: vec!["copywriter".to_owned()],
             },
