@@ -10,7 +10,7 @@
 -- machine did overnight would become an errand log, and the question it exists to answer would stop
 -- being answerable — silently, because nothing about it looks broken.
 --
--- So the same column `proposals` got in 0075, for the same reason and with the same shape: NULL for
+-- So the same column `proposals` got in 0076, for the same reason and with the same shape: NULL for
 -- every row written before this and for every row that belongs to a project, and `Global` is
 -- narrowed in `feed.rs` to mean BOTH are NULL. `All` is untouched — a machine-wide view that
 -- quietly stopped showing a whole class of work would be this same bug in the other direction.

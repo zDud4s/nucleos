@@ -42,7 +42,7 @@ pub enum Brain {
 impl Brain {
     /// The wire spelling, and the only one written down.
     ///
-    /// The `brain` column carries a CHECK constraint naming these two words (migration 0069), and the
+    /// The `brain` column carries a CHECK constraint naming these two words (migration 0074), and the
     /// same two words travel in every JSON body that moves a brain. Routing the column, the wire and
     /// `from_wire` through one function is what keeps those three answers identical — a spelling
     /// invented anywhere else is refused by the database, one layer away from whoever wrote it.
@@ -136,7 +136,7 @@ pub struct Errand {
     /// When this errand is finished, in the owner's words — the gate of an investigation.
     ///
     /// `None` for every errand that answers when spoken to and does nothing else, which is the
-    /// default and stays the default. See migration 0078 for why the gate is a sentence.
+    /// default and stays the default. See migration 0079 for why the gate is a sentence.
     pub done_when: Option<String>,
     /// How many more turns it may take on its own initiative. Zero means none, which is what makes
     /// this dark until somebody turns it on.
@@ -663,7 +663,7 @@ pub fn list_files(files_root: &Path, errand: &Errand) -> std::io::Result<Vec<Str
 
 /// One standing instruction of an errand: when it fires, what it says, and where its window stands.
 ///
-/// The rule and its scheduler state in one struct because they are one row — see migration 0076 for
+/// The rule and its scheduler state in one struct because they are one row — see migration 0077 for
 /// why they are one row. `last_fired_at` and the day's count go out on the wire with the rest: what
 /// a person wants from a list of rules is mostly "did it run", and answering that from a second
 /// route would be a second read of a fact this one already had in its hand.
