@@ -1824,6 +1824,32 @@ details.scoreboard th {
     linear-gradient(var(--bg-raise), var(--bg-raise));
 }
 
+/* As arestas ficam POR CIMA dos cartões e surdas ao ponteiro.
+   Por baixo liam-se ao contrário: com um terceiro cartão entre as duas pontas, a linha entrava de
+   um lado do cartão inocente e saía do outro, e o que se via era uma exclusão entre o par errado —
+   na única funcionalidade cujo assunto inteiro é QUAIS DOIS. `pointer-events: none` é o que mantém
+   os botões por baixo clicáveis, e era esse o argumento todo para pôr a camada em baixo. */
+.fleet-wires {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  pointer-events: none;
+  overflow: visible;
+}
+/* Tracejada = pedida, cheia = em vigor. É o mesmo par de desenhos que os cartões já usam para
+   `is-pending` contra `is-active`, para não haver duas linguagens no mesmo ecrã. */
+.fleet-wire line { stroke-width: 2; stroke: var(--line); }
+/* O ponto em cada ponta diz onde a linha pertence, para um cartão que ela apenas atravessa nunca
+   ser confundido com um que ela liga. */
+.fleet-wire circle { fill: var(--line); }
+.fleet-wire.is-active line { stroke: var(--faint); }
+.fleet-wire.is-active circle { fill: var(--faint); }
+/* Pedida: tracejada, e a ponta é um anel em vez de um ponto cheio — a mesma ideia de "ainda não é
+   um facto" que o cartão já diz com o tracejado. */
+.fleet-wire.is-pending line { stroke-dasharray: 6 5; }
+.fleet-wire.is-pending circle { fill: none; stroke: var(--line); stroke-width: 2; }
+
 /* O nó debaixo da mão vai à frente dos outros e larga a sombra: sem isto, arrastar um cartão para
    cima de outro esconde-o por baixo e parece que se perdeu. */
 .fleet-node.is-dragging {

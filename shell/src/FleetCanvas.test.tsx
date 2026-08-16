@@ -265,6 +265,50 @@ it("stops a node at the edge instead of letting it off the surface", () => {
 });
 
 /**
+ * The exclusion is a line between two cards, and a question is drawn differently from a rule.
+ *
+ * Dashed against solid is the same pair of drawings the cards already use for pending against
+ * active, so there are not two languages on one screen. A pending edge has changed nothing about
+ * how either job is scheduled, and a line claiming otherwise would have somebody wondering why
+ * both jobs are still running.
+ */
+it("draws each exclusion as a line, and a request as a dashed one", () => {
+  const { container } = renderCanvas(
+    [column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] })],
+    { edges: [{ low: 7, high: 41, state: "pending", id: 9 }] },
+  );
+
+  const line = container.querySelector('[data-edge="9"]');
+  expect(line).not.toBeNull();
+  expect(line?.getAttribute("class")).toContain("is-pending");
+});
+
+/** A line to a card that is not on the canvas points at nothing, so it is not drawn. */
+it("draws no line to a job that is not on the canvas", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })], {
+    edges: [{ low: 41, high: 99, state: "active", id: 3 }],
+  });
+
+  expect(container.querySelector("[data-edge]")).toBeNull();
+});
+
+/** The line is attached to the card, not to where the card used to be. */
+it("keeps a line attached to the node being dragged", () => {
+  const { container } = renderCanvas(
+    [column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] })],
+    { edges: [{ low: 7, high: 41, state: "active", id: 3 }] },
+  );
+  const before = container.querySelector('[data-edge="3"] line')?.getAttribute("x1");
+
+  fireEvent(grip(container, "job:7"), pointer("pointerdown", { x: 100, y: 100 }));
+  fireEvent(grip(container, "job:7"), pointer("pointermove", { x: 300, y: 100 }));
+
+  expect(container.querySelector('[data-edge="3"] line')?.getAttribute("x1")).toBe(
+    String(Number(before) + 200),
+  );
+});
+
+/**
  * A click on the header is not a drag, and must not write anything.
  *
  * Writing on every press would freeze the derived fallback into storage the first time anybody

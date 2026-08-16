@@ -9,6 +9,7 @@ import {
   slotDetail,
   type ExclusionEdge,
 } from "./fleet-derive";
+import { edgeGeometry } from "./fleet-edges";
 import {
   clamped,
   positionsFor,
@@ -173,6 +174,13 @@ export default function FleetCanvas({
     neighbours.set(node.project.project_id, found);
   }
 
+  // Where every node is being drawn RIGHT NOW, including the one under the hand. The lines are
+  // built from this rather than from the saved layout, so an edge stays attached to the card being
+  // dragged instead of to where the card used to be.
+  const drawn: Layout = {};
+  for (const key of keys) drawn[key] = positionOf(key);
+  const lines = edgeGeometry(edges, drawn, NODE);
+
   // How far the surface has to reach. Derived from where the nodes actually are, so a node dragged
   // into the far corner stays reachable instead of being clipped out of the world.
   const extent = nodes.reduce(
@@ -208,6 +216,29 @@ export default function FleetCanvas({
         onPointerUp={drop}
         onPointerCancel={() => setDrag(null)}
       >
+        {/* OVER the cards, and deaf to the pointer.
+            Under them it read wrong: with a third card sitting between the two ends, the line went
+            in one side of the innocent card and out the other, and what a person saw was an
+            exclusion between the wrong pair — on the one feature whose entire subject is WHICH TWO.
+            `pointer-events: none` is what keeps the buttons underneath clickable, and it is the
+            whole of the argument for putting the layer below; crossing a card is legible, ending on
+            one that is not yours is not.
+            The dot at each end says where the line belongs, so a card it merely crosses is never
+            mistaken for one it joins. */}
+        <svg
+          className="fleet-wires"
+          width={extent.width}
+          height={extent.height}
+          aria-hidden="true"
+        >
+          {lines.map((line) => (
+            <g key={line.id} data-edge={line.id} className={`fleet-wire is-${line.state}`}>
+              <line x1={line.from.x} y1={line.from.y} x2={line.to.x} y2={line.to.y} />
+              <circle cx={line.from.x} cy={line.from.y} r={4} />
+              <circle cx={line.to.x} cy={line.to.y} r={4} />
+            </g>
+          ))}
+        </svg>
         {nodes.map(({ project, slot, key, detail }) => {
           const jobId = detail.kind === "job" ? detail.job.id : null;
           const partners = jobId === null ? [] : partnersOf(edges, jobId);
