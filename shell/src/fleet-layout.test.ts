@@ -57,6 +57,26 @@ describe("where a node sits", () => {
     expect(crowded["job:41"]).toEqual(alone["job:41"]);
   });
 
+  /**
+   * Two keys can want the same cell, and half of all five-job fleets contain such a pair.
+   *
+   * `job:1` and `job:41` are one, and the pair the columns already had on screen — `job:41` and
+   * `run:3` — is another. Left alone, the second card is drawn exactly underneath the first: it
+   * cannot be read, cannot be clicked, and cannot even be dragged out from under, because the one
+   * on top takes the pointer. That is worse than the dent it costs in "a node never moves because
+   * its neighbours changed", so the collision is separated here.
+   *
+   * The tie goes by the key, never by arrival order: the same node gives way every time, and the
+   * one that keeps the cell keeps it whoever else turns up.
+   */
+  it("does not stack two nodes that want the same cell", () => {
+    expect(fallbackPosition("job:1")).toEqual(fallbackPosition("job:41"));
+
+    const both = positionsFor(["job:1", "job:41"], {});
+    expect(both["job:1"]).not.toEqual(both["job:41"]);
+    expect(positionsFor(["job:41", "job:1"], {})).toEqual(both);
+  });
+
   /** A saved position wins over the derived one; that is the whole point of saving it. */
   it("prefers the position somebody chose", () => {
     const saved: Layout = { "job:41": { x: 500, y: 320 } };

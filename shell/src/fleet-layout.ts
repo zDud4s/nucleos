@@ -18,11 +18,34 @@ export interface Point {
 
 export type Layout = Record<string, Point>;
 
-/** How far apart the fallback positions sit, and how wide a row is before it wraps. */
-const STEP_X = 260;
-const STEP_Y = 190;
+/**
+ * How far apart the fallback positions sit, and how wide a row is before it wraps.
+ *
+ * **A cell has to be bigger than a card**, and the first pass at this got it wrong: 260 wide was
+ * exactly a card's width and 190 tall was well under one, so two nodes in the same column of the
+ * grid overlapped on the very first paint. jsdom cannot see that — it does no layout — and the
+ * screenshot could.
+ */
+const STEP_X = 300;
+const STEP_Y = 340;
 const PER_ROW = 4;
 const MARGIN = 24;
+
+/**
+ * How many cells the derived positions are spread over before they repeat.
+ *
+ * Cells beyond this are still valid — `cellPosition` simply carries on into lower rows — and that
+ * is what gives the collision walk below somewhere to go.
+ */
+const CELLS = PER_ROW * PER_ROW;
+
+/** Where the nth cell of the fallback grid is. Defined for every n, not only the first `CELLS`. */
+function cellPosition(index: number): Point {
+  return {
+    x: MARGIN + (index % PER_ROW) * STEP_X,
+    y: MARGIN + Math.floor(index / PER_ROW) * STEP_Y,
+  };
+}
 
 /**
  * Where a node with no saved position goes.
@@ -37,11 +60,7 @@ const MARGIN = 24;
  * first paint and be unusable on the second.
  */
 export function fallbackPosition(key: string): Point {
-  const slot = hash(key) % (PER_ROW * PER_ROW);
-  return {
-    x: MARGIN + (slot % PER_ROW) * STEP_X,
-    y: MARGIN + Math.floor(slot / PER_ROW) * STEP_Y,
-  };
+  return cellPosition(hash(key) % CELLS);
 }
 
 /**
@@ -65,11 +84,30 @@ function hash(key: string): number {
  * Takes the keys that exist NOW and answers for exactly those. That is what prunes the layout: a job
  * that ended keeps its entry in storage until the next write, and this never hands it back, so
  * nothing downstream can draw a card for work that is over.
+ *
+ * **Two keys that want the same cell are separated here**, and that is a deliberate dent in the
+ * "a node never moves because its neighbours changed" rule. It has to be: any position derived from
+ * the key alone collides, and measuring it says half of all five-job fleets contain such a pair. The
+ * two failures are not comparable — a card exactly underneath another cannot be read, cannot be
+ * clicked, and cannot even be dragged out from under, because the one on top takes the pointer.
+ *
+ * The tie is broken by the KEY and not by arrival order, so it is the same node that gives way every
+ * time, and the one that keeps the cell keeps it whoever else turns up. The loser walks to the next
+ * free cell, which is why cells past the last row still have to be valid.
  */
 export function positionsFor(keys: string[], saved: Layout): Layout {
   const layout: Layout = {};
-  for (const key of keys) {
-    layout[key] = saved[key] ?? fallbackPosition(key);
+  const taken = new Set<number>();
+  for (const key of [...keys].sort()) {
+    const chosen = saved[key];
+    if (chosen !== undefined) {
+      layout[key] = chosen;
+      continue;
+    }
+    let cell = hash(key) % CELLS;
+    while (taken.has(cell)) cell += 1;
+    taken.add(cell);
+    layout[key] = cellPosition(cell);
   }
   return layout;
 }

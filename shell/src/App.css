@@ -1797,6 +1797,34 @@ details.scoreboard th {
   left: 0;
   width: 260px;
 }
+/* Numa coluna os cartões nunca se sobrepõem e o vidro translúcido é bonito; numa tela sobrepõem-se
+   sempre, e dois cartões translúcidos um em cima do outro leem-se ao mesmo tempo — apanhado na
+   fotografia do arrasto, onde o `running` do cartão de baixo atravessava o de cima.
+   As camadas repetem a pilha que a coluna já dá (vidro sobre painel sobre fundo), só que opaca: a
+   cor é a mesma, o que muda é o que está por trás deixar de se ver. */
+.fleet-node .slot-card {
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(var(--glass), var(--glass)),
+    linear-gradient(var(--bg-raise), var(--bg-raise));
+}
+
+/* O nó debaixo da mão vai à frente dos outros e larga a sombra: sem isto, arrastar um cartão para
+   cima de outro esconde-o por baixo e parece que se perdeu. */
+.fleet-node.is-dragging {
+  z-index: 2;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+}
+
+/* A pega é o cabeçalho, e só na tela. `touch-action: none` porque sem ele o browser trata o gesto
+   como deslocamento da página e o arrasto nunca chega ao componente num ecrã táctil.
+   `user-select: none` para não pintar o texto de seleção a meio do movimento. */
+.slot-card > header.is-grab {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.fleet-node.is-dragging .slot-card > header.is-grab { cursor: grabbing; }
 
 /* ── O zoom 2: a cadeia de itens de um job ────────────── */
 

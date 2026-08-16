@@ -22,6 +22,13 @@ interface SlotCardProps {
   token: string;
   onCancel: () => void;
   onOpenRuns: () => void;
+  /**
+   * Starts a drag, when the surface this card sits on has somewhere to drag it to.
+   *
+   * On the HEADER and not the card: the card is full of buttons, and a grab that begins anywhere
+   * turns every missed click into a one-pixel move. Absent in a column, where nothing moves.
+   */
+  onGrab?: (event: React.PointerEvent<HTMLElement>) => void;
 }
 
 /**
@@ -52,6 +59,7 @@ export function SlotCard({
   token,
   onCancel,
   onOpenRuns,
+  onGrab,
 }: SlotCardProps) {
   // The open state lives here rather than above, as it does in Autopilot's `JobRow`: opening one
   // card says nothing to the others, and lifting it would re-render the whole column on every
@@ -62,7 +70,7 @@ export function SlotCard({
 
   return (
     <article className={`slot-card${modifier}`}>
-      <header>
+      <header className={onGrab === undefined ? undefined : "is-grab"} onPointerDown={onGrab}>
         <span className="slot-number">slot {slot.slot}</span>
         <span className="slot-owner">
           {slot.owner_kind} {slot.owner_id}
