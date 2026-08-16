@@ -820,6 +820,26 @@ mod tests {
         );
     }
 
+    /// The agent catalogue is the owner's, and stays that way by being in no scope table. Asserted
+    /// rather than left to the absence of a line, because an absence does not fail when it ends.
+    #[test]
+    fn no_scoped_key_reaches_the_agent_catalogue() {
+        for path in ["/agents", "/agents/copywriter"] {
+            assert!(!permits(&Scope::Run(1), &Method::GET, path));
+            assert!(!permits(
+                &Scope::Service(Service::Council),
+                &Method::GET,
+                path
+            ));
+            assert!(!permits(
+                &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                &Method::GET,
+                path
+            ));
+            assert!(!permits(&Scope::Run(1), &Method::DELETE, path));
+        }
+    }
+
     /// The grant that this change actually makes, and the one that failed before it.
     ///
     /// A job is several runs over one worktree, so the key that buys runs buys it. Asserting the

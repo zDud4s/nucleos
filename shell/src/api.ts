@@ -2055,6 +2055,99 @@ export async function endRunTurns(token: string, id: number): Promise<boolean> {
   }
 }
 
+// ── Agents ──────────────────────────────────────────────────────────────────
+
+/** One named agent in the house catalogue: who it is, and how it is allowed to run. */
+export interface Agent {
+  id: string;
+  name: string;
+  speciality: string;
+  prompt: string;
+  engine: string;
+  model: string | null;
+  tool_policy: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentInput {
+  name: string;
+  speciality: string;
+  prompt: string;
+  engine: string;
+  model: string | null;
+  tool_policy: string;
+}
+
+export const AGENT_ENGINES = ["claude", "codex", "local"] as const;
+
+/**
+ * The two policies an agent of this catalogue may hold.
+ *
+ * `unrestricted` is absent on purpose rather than by oversight: the daemon refuses it, because that
+ * policy only means something for a run the `PreToolUse` classifier governs, and one of these has
+ * no worktree and no hook wired. An option whose only outcome is a 400 is not an option.
+ */
+export const AGENT_TOOL_POLICIES = ["mcp_only", "none"] as const;
+
+export async function listAgents(token: string): Promise<Agent[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/agents`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Agent[];
+  } catch {
+    return null;
+  }
+}
+
+/** 409 means the name — or the id it slugs to — is taken, so the status travels back. */
+export async function createAgent(
+  token: string,
+  input: AgentInput,
+): Promise<ApiResult<Agent>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/agents`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as Agent };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Deletes an agent.
+ *
+ * Returns the status where `deletePreset` returns a bare boolean, and the difference is the whole
+ * point: this route has a refusal worth reading. A 409 means a team is standing on this agent, and
+ * collapsing that into `false` would tell the owner "could not delete" when the daemon told them
+ * exactly which thing was in the way.
+ */
+export async function deleteAgent(token: string, id: string): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/agents/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
 // ── Presets ─────────────────────────────────────────────────────────────────
 
 /** A saved run request: a name, plus the exact body `/runs` would have taken. */
