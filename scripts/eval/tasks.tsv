@@ -16,6 +16,6 @@
 # on the reference. Two earlier rows were removed for being neither.
 #
 # id	reference	test_path	test_file
-T1	41e9a56	triage::tests::an_exhausted_budget_blocks_triage	core/src/triage.rs
-T2	58e4864	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs
-T3	41e9a56	runs::tests::a_triage_run_uses_the_local_runner_when_one_is_configured	core/src/runs.rs
+T1	9affc9e	triage::tests::an_exhausted_budget_blocks_triage	core/src/triage.rs
+T2	3c9c309	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs
+T3	190efff	runs::tests::a_triage_run_uses_the_local_runner_when_one_is_configured	core/src/runs.rs
