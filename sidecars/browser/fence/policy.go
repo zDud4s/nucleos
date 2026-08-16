@@ -17,12 +17,20 @@
 //	  (csp.go)                  wss:, form submission; inherited by     but only where a document
 //	                            blob: documents, which is the only      response passes through us
 //	                            thing that contains them
-//	Loopback proxy              ws:// (a GET with Upgrade), and a raw   wss://, which is
-//	  (proxy.go)                tunnel to any port that is not 443      CONNECT host:443 and looks
-//	                                                                    exactly like an https fetch
+//	Loopback proxy              ws:// (a GET with Upgrade); loopback,   everything inside a CONNECT
+//	  (proxy.go)                which the CDP layer also refuses        tunnel, which is TLS to a
+//	                                                                    host the page chose
 //
 // WebRTC is closed by none of the three, and the spike proved every mechanism that claimed to. See
 // spec §6.2b and [launch.WebRTCIsNotFencedHere].
+//
+// # How narrow the proxy actually is, since it is easy to overrate
+//
+// Almost all real traffic reaches it as CONNECT and passes through opaque. Its unique contribution is
+// plaintext `ws://`, which the CDP layer cannot see at all — and real sites use `wss://`, which it
+// cannot see either. So it is a thin layer that closes one measured hole and backstops the CSP on
+// plain-http documents, and the security of this pillar does not rest on it. Saying otherwise would
+// put weight on the layer least able to carry it.
 //
 // # Why wss: is layer 2's job and not layer 3's
 //
@@ -37,6 +45,7 @@ package fence
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -72,6 +81,18 @@ type Policy struct {
 	// rule mirror `core/src/browser_policy.rs` deliberately: two allowlists that disagree about what
 	// "the same site" means is a hole neither of them can see.
 	Origins []string
+	// Loopback is what this profile may reach ON THIS MACHINE, as "scheme://host:port". Empty means
+	// nothing, which is the normal case.
+	//
+	// A separate field rather than entries in Origins, and the separation is the point. Origins is
+	// about which sites the profile's cookies may meet; this is about which of OUR OWN services a
+	// page may address. They fail in opposite directions — a too-wide Origins spends the person's
+	// session on a stranger, a too-wide Loopback hands a stranger the núcleo — and one list would
+	// mean an entry added for the first reason silently doing the second.
+	//
+	// It also accepts http://, which Origins never does: a local dev server on plain http is the
+	// ordinary case here, and there is no session on it to lose.
+	Loopback []string
 }
 
 // ErrNoProfileKind is [Policy.Validate]'s refusal to fence a profile nobody named. Spec §6.2a's rule
@@ -81,6 +102,11 @@ var ErrNoProfileKind = errors.New("fence: policy names no profile kind, refusing
 
 // Validate reports whether a policy is usable. A driver refuses to exist without one.
 func (p Policy) Validate() error {
+	for _, entry := range p.Loopback {
+		if normaliseLoopback(entry) == "" {
+			return fmt.Errorf("fence: %q is not a loopback origin", entry)
+		}
+	}
 	switch p.Profile {
 	case Ephemeral:
 		if len(p.Origins) > 0 {
@@ -187,6 +213,19 @@ func Decide(policy Policy, request Request) Verdict {
 		return refuse(browser.ConsequenceMethod, "%s has a consequence", strings.ToUpper(request.Method))
 	}
 
+	// Loopback, for EVERY resource type and in both kinds of profile.
+	//
+	// This is the one place the fence protects us rather than the site on the other side, and it is
+	// the reason spec §5.5's "sub-resources are unrestricted" cannot be read literally. Agent mode is
+	// launched with --proxy-bypass-list=<-loopback> precisely so the fence sees loopback traffic; the
+	// consequence is that a page CAN address this machine's own services — the núcleo's API, the
+	// other sidecars, and the browser's own debugging port, all of which answer on 127.0.0.1. An
+	// allowlist entry is the only way in, so a profile that has business with a local service says so
+	// in configuration rather than by a page guessing a port.
+	if isLoopbackURL(request.URL) && !listedLoopback(loopbackOriginOf(request.URL), policy.Loopback) {
+		return refuse(browser.ConsequenceLoopback, "this machine's own services are not addressable from a page")
+	}
+
 	if policy.Profile == Project && request.IsDocument() {
 		origin := OriginOf(request.URL)
 		if origin == "" || !listed(origin, policy.Origins) {
@@ -196,6 +235,106 @@ func Decide(policy Policy, request Request) Verdict {
 	}
 
 	return allow()
+}
+
+// DecideTunnel is the CONNECT rule, and it is deliberately thin.
+//
+// A CONNECT tunnel is opaque: the bytes inside are TLS to a server the page chose, and no proxy that
+// is not terminating that TLS can say anything about them. So this does NOT try to police method or
+// content — the CDP layer does that, and it can, because it sees the request before it is encrypted.
+//
+// What was here first was a rule refusing any port but 443, and it was removed rather than kept for
+// comfort. It bought nothing — a page that wants to reach a host of its choosing does it on 443,
+// which was allowed — and it broke the case `core/src/browser_policy.rs` explicitly supports, an
+// origin with its own port such as https://jira.example.com:8443. A check that blocks legitimate
+// configuration while stopping nothing is worse than no check: it reads as a boundary.
+//
+// What remains is the boundary that is real: loopback is this machine.
+func DecideTunnel(policy Policy, hostPort string) Verdict {
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil || host == "" {
+		return refuse(browser.ConsequenceChannel, "unreadable CONNECT target")
+	}
+	// CONNECT means TLS, so the origin behind it is an https one whatever the port.
+	if isLoopbackHost(host) && !listedLoopback(normaliseLoopback("https://"+hostPort), policy.Loopback) {
+		return refuse(browser.ConsequenceLoopback, "this machine's own services are not addressable from a page")
+	}
+	return allow()
+}
+
+// loopbackOriginOf reduces a url to "scheme://host:port", keeping the scheme — unlike [OriginOf],
+// which drops everything that is not https. Plain http is the ordinary case for a local service, and
+// there is no session on it to protect by refusing.
+func loopbackOriginOf(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return normaliseLoopback(parsed.Scheme + "://" + parsed.Host)
+}
+
+func normaliseLoopback(entry string) string {
+	parsed, err := url.Parse(strings.TrimSpace(entry))
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host == "" || !isLoopbackHost(host) {
+		// A non-loopback entry in this list is a configuration mistake that would otherwise sit
+		// there matching nothing and reading as though it did something.
+		return ""
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[scheme]
+	}
+	if number, err := strconv.Atoi(port); err != nil || number <= 0 || number > 65535 {
+		return ""
+	}
+	return scheme + "://" + host + ":" + port
+}
+
+func listedLoopback(origin string, entries []string) bool {
+	if origin == "" {
+		return false
+	}
+	for _, entry := range entries {
+		if normaliseLoopback(entry) == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// isLoopbackURL reports whether a url addresses this machine.
+func isLoopbackURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return isLoopbackHost(parsed.Hostname())
+}
+
+// isLoopbackHost covers the names and the addresses, because they are the same destination and a
+// check that only knew one of them would be a check the caller can spell around.
+//
+// Known gap, named rather than silently absent: the private ranges (10/8, 172.16/12, 192.168/16) are
+// NOT refused here. They are somebody's intranet as often as they are an attack, and a browser that
+// could not reach an internal Jira would be a browser nobody uses. Loopback has no such reading —
+// nothing on 127.0.0.1 belongs to a web page.
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.Trim(strings.TrimSuffix(host, "."), "[]"))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if address := net.ParseIP(host); address != nil {
+		return address.IsLoopback() || address.IsUnspecified()
+	}
+	return false
 }
 
 // Response is a response the browser is about to receive, at the response stage.

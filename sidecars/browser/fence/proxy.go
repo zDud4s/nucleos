@@ -21,15 +21,25 @@ import (
 //
 // # What it does not close, said plainly
 //
-// `wss://` reaches it as `CONNECT host:443`, which is byte-identical to the CONNECT for any https
-// sub-resource. There is nothing here to distinguish them, so this layer does not try; the injected
-// `connect-src 'none'` closes it instead (see [Directives]). What CONNECT does buy is the port: a
-// tunnel to anything other than 443 is refused, which is where a raw TCP channel would otherwise sit.
+// `wss://` reaches it as `CONNECT host:443`, byte-identical to the CONNECT for any https sub-resource,
+// and everything inside that tunnel is TLS to a host the page chose. There is nothing here to
+// distinguish them, so this layer does not try; the injected `connect-src 'none'` closes it instead
+// (see [Directives]). That makes the proxy a thin layer, and it is described as one — the pillar's
+// security does not rest on it.
+//
+// # The one thing that IS a boundary here
+//
+// Loopback. Agent mode is launched with --proxy-bypass-list=<-loopback> so that this process sees
+// requests to 127.0.0.1 at all, and the consequence is that a page can address the núcleo's API, the
+// other sidecars, and the browser's own debugging port. [DecideTunnel] refuses them unless the
+// profile's Loopback list names them. The CDP layer refuses the same thing for plain HTTP, so a
+// change to one of the two is not a hole in the other.
 //
 // # Why it is not an open relay worth worrying about
 //
-// It listens on loopback and forwards only GET and HEAD. Any local process that could reach it could
-// already make the same request directly, so it hands out no reach that was not already there.
+// It listens on loopback and forwards only GET and HEAD, and refuses loopback destinations. Any local
+// process that could reach it could already make the same request directly, so it hands out no reach
+// that was not already there.
 type Proxy struct {
 	policy    Policy
 	listener  net.Listener
@@ -141,17 +151,10 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	p.forward(w, r)
 }
 
-// tunnel answers CONNECT.
+// tunnel answers CONNECT. See [DecideTunnel] for why the rule is as thin as it is.
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
-	host, port, err := net.SplitHostPort(r.Host)
-	if err != nil || host == "" {
-		p.refuse(w, r.Host, refuse(browser.ConsequenceChannel, "unreadable CONNECT target"))
-		return
-	}
-	if port != "443" {
-		// The one thing CONNECT gives this layer. A tunnel to any other port carries whatever the
-		// page wants in both directions and is invisible to every other part of the fence.
-		p.refuse(w, r.Host, refuse(browser.ConsequenceChannel, "tunnel to port %s", port))
+	if verdict := DecideTunnel(p.policy, r.Host); !verdict.Allow {
+		p.refuse(w, r.Host, verdict)
 		return
 	}
 

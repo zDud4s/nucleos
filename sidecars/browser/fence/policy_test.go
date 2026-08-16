@@ -117,6 +117,41 @@ func TestDecide(t *testing.T) {
 			want:    browser.ConsequenceScheme,
 		},
 		{
+			name:    "the browser's own debugging port is not a web page's business",
+			policy:  listed,
+			request: Request{Method: "GET", URL: "http://127.0.0.1:9222/json/list", ResourceType: "XHR"},
+			want:    browser.ConsequenceLoopback,
+		},
+		{
+			name:    "nor is the núcleo's own API",
+			policy:  listed,
+			request: Request{Method: "GET", URL: "http://localhost:8795/health", ResourceType: "Document"},
+			want:    browser.ConsequenceLoopback,
+		},
+		{
+			name:   "loopback applies to sub-resources too, unlike the site allowlist",
+			policy: listed,
+			// Spec §5.5 says sub-resources are unrestricted, and that cannot be read literally here:
+			// the whole reason agent mode passes loopback through the proxy is so the fence sees it.
+			request: Request{Method: "GET", URL: "http://[::1]:8795/x.js", ResourceType: "Script"},
+			want:    browser.ConsequenceLoopback,
+		},
+		{
+			name:    "a site entry does NOT admit a local service",
+			policy:  project("https://127.0.0.1:8443"),
+			request: Request{Method: "GET", URL: "https://127.0.0.1:8443/", ResourceType: "Document"},
+			// The two lists are separate on purpose: an entry added to reach a site must not open
+			// one of our own services as a side effect.
+			want: browser.ConsequenceLoopback,
+		},
+		{
+			name: "the loopback list is what admits it",
+			policy: Policy{Profile: Project,
+				Origins:  []string{"https://127.0.0.1:8443"},
+				Loopback: []string{"https://127.0.0.1:8443"}},
+			request: Request{Method: "GET", URL: "https://127.0.0.1:8443/", ResourceType: "Document"},
+		},
+		{
 			name:    "a sub-resource from anywhere is allowed: spec §5.5",
 			policy:  listed,
 			request: Request{Method: "GET", URL: "https://cdn.elsewhere.net/app.js", ResourceType: "Script"},

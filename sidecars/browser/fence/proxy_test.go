@@ -32,6 +32,13 @@ func throughProxy(t *testing.T, proxy *Proxy) *http.Client {
 	}
 }
 
+// admitting builds a policy that lets the fence reach one loopback test server and nothing else.
+// Every httptest server is on 127.0.0.1, so without this the loopback rule refuses the lot — which
+// is the rule working, and would make every test in this file pass for the wrong reason.
+func admitting(server *httptest.Server) Policy {
+	return Policy{Profile: Ephemeral, Loopback: []string{server.URL}}
+}
+
 func startProxy(t *testing.T, policy Policy) *Proxy {
 	t.Helper()
 	proxy, err := NewProxy(policy)
@@ -57,7 +64,7 @@ func TestTheProxyForwardsAGet(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	response, err := throughProxy(t, proxy).Get(origin.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -81,7 +88,7 @@ func TestTheProxyRefusesAPost(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	response, err := throughProxy(t, proxy).Post(origin.URL, "text/plain", strings.NewReader("x"))
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -108,7 +115,7 @@ func TestTheProxyRefusesAWebSocketHandshake(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 
 	request, err := http.NewRequest(http.MethodGet, origin.URL+"/live", nil)
 	if err != nil {
@@ -151,7 +158,7 @@ func TestTheSameRequestWithoutTheUpgradePasses(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	response, err := throughProxy(t, proxy).Get(origin.URL + "/live")
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -167,8 +174,7 @@ func TestTheSameRequestWithoutTheUpgradePasses(t *testing.T) {
 	}
 }
 
-// connect speaks CONNECT by hand. Go's client will not issue one for an http:// url, and the port
-// rule is the only thing this layer buys from CONNECT at all.
+// connect speaks CONNECT by hand, because Go's client will not issue one for an http:// url.
 func connect(t *testing.T, proxy *Proxy, target string) *http.Response {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", proxy.Addr(), 5*time.Second)
@@ -188,48 +194,62 @@ func connect(t *testing.T, proxy *Proxy, target string) *http.Response {
 	return response
 }
 
-// TestATunnelToAnyPortButHttpsIsRefused. What CONNECT gives this layer is the port, and nothing
-// else: a tunnel to any other port carries whatever the page wants in both directions, invisibly to
-// every other part of the fence.
-func TestATunnelToAnyPortButHttpsIsRefused(t *testing.T) {
+// deadLoopbackPort returns an address on this machine that is well-formed and will not answer, so a
+// dial attempt fails locally and nothing leaves the machine.
+func deadLoopbackPort(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	return address
+}
+
+// TestATunnelToLoopbackIsRefused is the boundary that survived.
+//
+// A rule refusing every CONNECT to a port other than 443 was here first, and was removed rather than
+// kept for comfort: a page that wants to reach a host of its choosing does it on 443, so the rule
+// stopped nothing, while breaking the case browser_policy.rs supports on purpose — an origin with
+// its own port. This is what is left, and it is real: 9222 is the browser's own debugging port, and
+// whoever reaches it owns every profile on the machine.
+func TestATunnelToLoopbackIsRefused(t *testing.T) {
 	proxy := startProxy(t, Policy{Profile: Ephemeral})
 
-	for _, target := range []string{"example.org:8443", "example.org:22", "example.org:80", "example.org:1337"} {
+	for _, target := range []string{"127.0.0.1:9222", "localhost:8795", "[::1]:443", "127.0.0.1:443"} {
 		response := connect(t, proxy, target)
 		if response.StatusCode != http.StatusForbidden {
 			t.Errorf("CONNECT %s answered %d, want 403", target, response.StatusCode)
 		}
 		_ = response.Body.Close()
 	}
+
+	refusals := proxy.Refusals()
+	if len(refusals) == 0 || refusals[0].Consequence != browser.ConsequenceLoopback {
+		t.Fatalf("recorded %+v", refusals)
+	}
 }
 
-// TestATunnelTo443GetsPastThePolicy is that test's control, and it distinguishes the two failures
-// that look alike: 403 is the fence refusing, 502 is the fence allowing and the network saying no.
-// Without it, a proxy that refused every CONNECT would pass the test above.
-func TestATunnelTo443GetsPastThePolicy(t *testing.T) {
-	// A listener that is closed immediately, so the port is dead but the address is well-formed and
-	// nothing leaves this machine.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+// TestAnAdmittedLoopbackTunnelGetsPastThePolicy is the control, and it separates the two failures
+// that look identical from outside: 403 is the fence refusing, 502 is the fence allowing and the
+// dial failing. Without it, a proxy that refused every CONNECT would pass the test above.
+func TestAnAdmittedLoopbackTunnelGetsPastThePolicy(t *testing.T) {
+	dead := deadLoopbackPort(t)
+	proxy := startProxy(t, Policy{Profile: Ephemeral, Loopback: []string{"https://" + dead}})
+
+	allowed := connect(t, proxy, dead)
+	_ = allowed.Body.Close()
+	if allowed.StatusCode == http.StatusForbidden {
+		t.Fatalf("an admitted loopback origin was refused; the rule refuses everything")
 	}
-	dead := listener.Addr().String()
-	_ = listener.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
-
-	// Port 443 on a host that will not answer. The policy is what is under test, not the dial.
-	refused := connect(t, proxy, "127.0.0.1:443")
+	// And a neighbouring port on the same host is not admitted by that entry.
+	other := deadLoopbackPort(t)
+	refused := connect(t, proxy, other)
 	_ = refused.Body.Close()
-	if refused.StatusCode == http.StatusForbidden {
-		t.Fatal("CONNECT to 443 was refused by policy; the port rule refuses everything")
-	}
-
-	// And the same address on a non-443 port is refused by us, not by the network.
-	byPolicy := connect(t, proxy, dead)
-	_ = byPolicy.Body.Close()
-	if byPolicy.StatusCode != http.StatusForbidden {
-		t.Fatalf("CONNECT %s answered %d, want a policy refusal", dead, byPolicy.StatusCode)
+	if refused.StatusCode != http.StatusForbidden {
+		t.Fatalf("CONNECT %s answered %d; the entry admitted a port it does not name", other, refused.StatusCode)
 	}
 }
 
@@ -243,7 +263,7 @@ func TestAPlainHtmlDocumentGetsTheFenceCSP(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	response, err := throughProxy(t, proxy).Get(origin.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -272,7 +292,7 @@ func TestANonDocumentResponseIsNotGivenACSP(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	response, err := throughProxy(t, proxy).Get(origin.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -293,7 +313,7 @@ func TestThePagesOwnCSPSurvivesTheProxy(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	response, err := throughProxy(t, proxy).Get(origin.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -322,7 +342,7 @@ func TestARefusalReachesTheObserver(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer origin.Close()
 
-	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy := startProxy(t, admitting(origin))
 	seen := make(chan ProxyRefusal, 1)
 	proxy.OnRefusal(func(refusal ProxyRefusal) { seen <- refusal })
 

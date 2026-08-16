@@ -133,6 +133,12 @@ const (
 	ConsequenceScheme Consequence = "schemeless-navigation"
 	// ConsequenceOffAllowlist — a document from a host the profile does not admit (spec §5.4).
 	ConsequenceOffAllowlist Consequence = "off-allowlist"
+	// ConsequenceLoopback — this machine's own services. Separate from off-allowlist because it is
+	// the only refusal aimed at US: the núcleo's HTTP API, the sidecars, and the browser's own
+	// debugging port all live on loopback behind a bearer token, and agent mode is launched with
+	// --proxy-bypass-list=<-loopback> so that the fence sees loopback at all rather than letting the
+	// page reach it directly.
+	ConsequenceLoopback Consequence = "loopback"
 )
 
 // Refusal is a refusal by the fence: a named consequence, and a detail for the human reading a log.
