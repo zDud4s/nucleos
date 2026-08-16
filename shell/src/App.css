@@ -629,8 +629,12 @@ details.scoreboard th {
 .form-grid .wide,
 .filters .wide { grid-column: 1 / -1; }
 
+/* `.fleet-new-job input` entra nesta lista em vez de repetir o bloco: era o único campo da
+   interface sem estilo nenhum, e aparecia BRANCO contra o escuro de tudo o resto — o sinal de que
+   nunca passou por aqui. */
 .form-grid input, .form-grid select, .form-grid textarea,
-.filters input, .filters select, .filters textarea {
+.filters input, .filters select, .filters textarea,
+.fleet-new-job input {
   width: 100%;
   background: var(--bg-raise);
   border: 1px solid var(--line);
@@ -1703,8 +1707,8 @@ details.scoreboard th {
 /* `n/limit` conta os slots que o núcleo diz existirem, não os cartões desenhados. */
 .fleet-count { font-size: var(--fs-xs); color: var(--muted); }
 
+/* A caixa de texto herda o estilo dos outros campos, lá acima. */
 .fleet-new-job { display: grid; gap: var(--sp-2); }
-.fleet-new-job input { width: 100%; }
 
 .slot-card {
   display: grid;
