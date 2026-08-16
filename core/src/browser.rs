@@ -21,18 +21,15 @@
 //! document — nothing ran — and this module reopens the same request in a throwaway. That is spec
 //! §5.4's "the url is handed to an ephemeral session", and it is a downgrade rather than a failure.
 
-// Nothing calls this yet: the storage and the domain land before the handlers that mount them.
-//
-// INSTRUCTION, not description — the same one `browser_policy.rs` and `browser_client.rs` carry:
-// DELETE THIS LINE when the `/browser/*` routes exist. All three suppressions go together, and if
-// any is still here afterwards, that module has grown something nothing reaches.
-#![cfg_attr(not(test), allow(dead_code))]
-
-use serde::Serialize;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
 use crate::browser_client::{BrowserClient, BrowserError, Placement, Session};
 use crate::browser_policy::{self, Outcome, Profile, Requester, Surface};
+use crate::state::AppState;
 
 /// What the daemon carries for this pillar. Built once at startup from `.ai/browser.yaml`.
 #[derive(Debug)]
@@ -41,6 +38,21 @@ pub struct BrowserRuntime {
     /// the tools are green together.
     pub enabled: bool,
     pub client: BrowserClient,
+}
+
+impl BrowserRuntime {
+    /// The pillar, off. Named rather than derived, for `WebRuntime::disabled`'s reason: a derived
+    /// default would invent a client pointing at nothing, and "off" should be a state somebody chose.
+    ///
+    /// `#[cfg(test)]` because production always builds a real one from `.ai/browser.yaml`; this is
+    /// what the `test_state()` fixtures hold.
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            client: BrowserClient::new(crate::sidecar::BROWSER_ADDR, String::new()),
+        }
+    }
 }
 
 /// One origin a project's profile admits, as it is stored.
@@ -130,6 +142,10 @@ pub async fn list_sites(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
 /// `chain` is the navigation the headful window recorded. `browser_policy::granted_origins`
 /// normalises it and drops anything that is not an https origin, so what reaches the table has
 /// already been through the same rules the decision uses.
+// Unreachable until the handoff lands (spec §4.4): the wheel coming back is the one act that calls
+// this. Named on the function rather than on the module, so it is the only thing here that may be
+// unreached — and so this line has to be deleted by the phase that adds the caller.
+#[allow(dead_code)]
 pub async fn grant(
     pool: &SqlitePool,
     project_id: &str,
@@ -517,6 +533,248 @@ async fn close_row(pool: &SqlitePool, id: i64, reason: &str, now: &str) -> sqlx:
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The handlers. `/browser/*`, mounted in `http.rs`.
+//
+// None of them takes a `requester` or a `surface` from the request body. Both are derived here, for
+// `web.rs`'s reason and one more: the shell and an agent authenticate with the same token, so a
+// field on the wire saying which one is calling would be a permission the caller grants itself —
+// and the permission in question is whether a page may run inside the profile that holds the
+// owner's logins.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct OpenBody {
+    pub project_id: String,
+    pub url: String,
+    #[serde(default)]
+    pub run_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionBody {
+    pub session_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActBody {
+    pub session_id: i64,
+    pub kind: String,
+    #[serde(rename = "ref")]
+    pub element_ref: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// `POST /browser/open`.
+pub async fn post_open(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<OpenBody>,
+) -> axum::response::Response {
+    let now = chrono::Utc::now();
+    let ask = Ask {
+        project_id: &body.project_id,
+        run_id: body.run_id,
+        url: &body.url,
+        // The assistant, always, in this version. Spec §6.0b: the autonomous path is a seam and not
+        // a road, and the seam is `browser_policy`'s refusal rather than a branch here. When a
+        // pillar does reach the browser, it will arrive through its own caller and name itself.
+        surface: Surface::Assistant,
+        requester: requester_now(&state, now).await,
+        now: &now.to_rfc3339(),
+    };
+    match open(&state.pool, &state.browser, ask).await {
+        Ok(Opened::Session(row)) => axum::Json(row).into_response(),
+        Ok(Opened::Refused { rule, recoverable }) => (
+            // 409 rather than 403: nothing about the credentials is wrong. The request cannot be
+            // carried out in the state the machine is in, and `recoverable` says whether that state
+            // is one the person can change.
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "refused": rule,
+                "recoverable": recoverable,
+            })),
+        )
+            .into_response(),
+        Err(error) => browser_error(error),
+    }
+}
+
+/// `POST /browser/snapshot`.
+pub async fn post_snapshot(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SessionBody>,
+) -> axum::response::Response {
+    let Some(row) = live_session(&state, body.session_id).await else {
+        return gone();
+    };
+    match state.browser.client.snapshot(&row.sidecar_id).await {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(error) => browser_error(error),
+    }
+}
+
+/// `POST /browser/act`.
+///
+/// A refusal by the fence comes back as 200 carrying `outcome: "refused"`, all the way from the
+/// sidecar. Mapping it to a 4xx here would undo the one property the whole surface is arranged
+/// around (spec §6.2).
+pub async fn post_act(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ActBody>,
+) -> axum::response::Response {
+    let Some(row) = live_session(&state, body.session_id).await else {
+        return gone();
+    };
+    match state
+        .browser
+        .client
+        .act(&row.sidecar_id, &body.kind, &body.element_ref, &body.text)
+        .await
+    {
+        Ok(result) => {
+            if result.refused() {
+                // Worth a line in the daemon's log, and only a line: it is an ordinary answer, not a
+                // fault. What it buys is that a person reading back a run can see the fence acted,
+                // rather than inferring it from a page that did not change.
+                tracing::info!(
+                    session = row.id,
+                    consequence = result
+                        .refusal
+                        .as_ref()
+                        .map(|refusal| refusal.consequence.as_str())
+                        .unwrap_or_default(),
+                    "the fence refused an action"
+                );
+            }
+            axum::Json(result).into_response()
+        }
+        Err(error) => browser_error(error),
+    }
+}
+
+/// `POST /browser/screenshot` — pixels, for a person to look at.
+///
+/// It answers to the shell and not to the agent. Spec §3.5 records why: `filter_outgoing` in
+/// `mcp_tools.rs` redacts text and has never had an image branch, so a screenshot of the owner's
+/// authenticated session handed to a model would leave the machine without passing the redaction
+/// every other answer goes through.
+pub async fn post_screenshot(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SessionBody>,
+) -> axum::response::Response {
+    let Some(row) = live_session(&state, body.session_id).await else {
+        return gone();
+    };
+    match state.browser.client.screenshot(&row.sidecar_id).await {
+        Ok(image) => ([(axum::http::header::CONTENT_TYPE, "image/png")], image).into_response(),
+        Err(error) => browser_error(error),
+    }
+}
+
+/// `POST /browser/close`.
+pub async fn post_close(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SessionBody>,
+) -> axum::response::Response {
+    let now = chrono::Utc::now().to_rfc3339();
+    match close(&state.pool, &state.browser, body.session_id, &now).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => gone(),
+        Err(error) => browser_error(error),
+    }
+}
+
+/// `GET /browser/sessions` — what is open right now.
+pub async fn list_open_sessions(State(state): State<AppState>) -> axum::response::Response {
+    match open_sessions(&state.pool).await {
+        Ok(sessions) => axum::Json(sessions).into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
+/// `GET /browser/sites/{project_id}` — where this project has logged in.
+///
+/// Admin, like everything else here and unlike `GET /web/pages` beside it. The list of hosts a
+/// person has accounts on is a map of their working life, and a read-only key exists to be handed
+/// to something less trusted than the shell.
+pub async fn get_sites(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> axum::response::Response {
+    match list_sites(&state.pool, &project_id).await {
+        Ok(sites) => axum::Json(sites).into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeBody {
+    pub project_id: String,
+    pub origin: String,
+}
+
+/// `POST /browser/revoke` — withdraw one origin from a project's profile.
+///
+/// There is no matching grant route, and its absence is the invariant: the list grows when a person
+/// finishes a login and hands the wheel back (spec §5.2), which is a different act in a different
+/// place. A `POST /browser/grant` would be a way to add a host by asking, and everything above rests
+/// on there not being one.
+pub async fn post_revoke(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<RevokeBody>,
+) -> axum::response::Response {
+    match revoke(&state.pool, &body.project_id, &body.origin).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
+/// Presence, read here and never taken from the caller.
+async fn requester_now(state: &AppState, now: chrono::DateTime<chrono::Utc>) -> Requester {
+    if crate::attention::owner_is_present(&state.pool, now).await {
+        Requester::Owner
+    } else {
+        Requester::Autonomous
+    }
+}
+
+/// The session row, if it is still open. A closed one is not addressable: the browser behind it is
+/// gone, and answering from the row would describe a page that no longer exists.
+async fn live_session(state: &AppState, id: i64) -> Option<SessionRow> {
+    match session_row(&state.pool, id).await {
+        Ok(Some(row)) if row.closed_at.is_none() => Some(row),
+        _ => None,
+    }
+}
+
+fn gone() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, "no such browsing session").into_response()
+}
+
+fn db_error(error: sqlx::Error) -> axum::response::Response {
+    tracing::error!(%error, "browser database error");
+    (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+}
+
+/// The sidecar's failures, in the grades a caller has to tell apart.
+///
+/// `FenceDown` is 503 and not 500 for the reason spec §6.2a gives: nothing is broken, browsing is
+/// simply not available, and a 500 reads as a crash and invites the retry loop that would run
+/// against an unfenced browser.
+fn browser_error(error: BrowserError) -> axum::response::Response {
+    let status = match error {
+        BrowserError::Unreachable(_) => StatusCode::BAD_GATEWAY,
+        BrowserError::FenceDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+        BrowserError::NoSuchSession(_) => StatusCode::NOT_FOUND,
+        BrowserError::BadRequest(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BrowserError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+        BrowserError::Failed(_) => StatusCode::BAD_GATEWAY,
+    };
+    (status, error.to_string()).into_response()
 }
 
 #[cfg(test)]

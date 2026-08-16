@@ -20,15 +20,6 @@
 //! So `Placement` is a required argument, produced from `browser_policy::decide`, and there is no
 //! constructor on it that fills in a default.
 
-// Nothing calls this yet: the client lands before `browser.rs`, which is what will use it.
-//
-// INSTRUCTION, not description — the same one `browser_policy.rs` carries, and for the same reason
-// `contacts.rs` records: DELETE THIS LINE when `browser.rs` calls the client. If it is still here
-// once that has landed, this module has grown a verb nothing reaches.
-//
-// Scoped to the non-test build, so every item below is still held up by this module's own tests.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -167,6 +158,10 @@ impl ActResult {
     }
 }
 
+/// The driver's half of passing the wheel. Unreachable until the state machine of spec §4.4 exists:
+/// asking for the wheel raises a proposal, and a route that asked the sidecar directly would hand a
+/// window to somebody who never accepted it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HandoffTicket {
     pub session_id: String,
@@ -292,6 +287,8 @@ impl BrowserClient {
             .map_err(|error| BrowserError::Failed(error.to_string()))
     }
 
+    /// Unreachable until spec §4.4's state machine exists. See [`HandoffTicket`].
+    #[allow(dead_code)]
     pub async fn handoff(
         &self,
         session_id: &str,

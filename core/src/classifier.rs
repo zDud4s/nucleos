@@ -34,6 +34,12 @@ const SELF_GOVERNING_FILES: &[&str] = &[
     // next page from that host would arrive unmediated. Same shape as `gate_command` and
     // `stt_command` above: what makes the file dangerous is that its CONTENTS are the policy.
     ".ai/web.yaml",
+    // Holds the browser pillar's ceilings and its enabled switch. It does NOT hold the site lists —
+    // those live in `browser_sites`, and spec §5.2 lets them grow only by a person logging in — but
+    // it does hold `enabled`, and a run that could turn the pillar on would be granting itself a
+    // browser. Same shape as the three above: what makes the file dangerous is that its CONTENTS are
+    // the policy.
+    ".ai/browser.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
 ];

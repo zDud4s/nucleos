@@ -237,6 +237,12 @@ pub struct AppState {
     /// The web pillar: the trust allowlist, retention, and the client for the sidecar that is the
     /// only process here allowed to open a connection off this machine.
     pub web: Arc<crate::web::WebRuntime>,
+    /// The browser pillar: whether it is on, and the client for the process that drives Chromium.
+    ///
+    /// The site lists are deliberately NOT here. They live in `browser_sites` and are read per
+    /// request, because a list cached in the runtime would keep admitting a host somebody revoked —
+    /// and the revocation screen would report success while the profile went on loading it.
+    pub browser: Arc<crate::browser::BrowserRuntime>,
     /// The calendar's settings — the default zone and the window a proposal may land in.
     ///
     /// Same shape and same reasoning as `email` and `voice` above: read together, changed together,

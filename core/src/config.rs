@@ -405,6 +405,68 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     }
 }
 
+/// `.ai/browser.yaml`. The browser pillar's switch and its ceilings (spec §8).
+///
+/// The site lists are deliberately NOT here, and that omission is the pillar's central invariant:
+/// they live in `browser_sites` and grow only when a person finishes a login (spec §5.2). A field in
+/// this file would be a way to grant a profile access to a host by editing a gitignored YAML, which
+/// is exactly the path §5.2 exists to close.
+///
+/// There is also no field that widens the fence. Spec §6.4: the boundary of §6.2 is not
+/// configurable, because a switch to loosen it is a switch somebody eventually finds a reason to
+/// flip at 2am.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct BrowserConfig {
+    /// Opt-in, like every pillar that reaches the network. Ships off (spec §14.2).
+    pub enabled: bool,
+    /// Live tabs. They compete with the local model for the same card, so this is a ceiling rather
+    /// than a target.
+    pub max_sessions: u32,
+    pub cache_size_mb: u32,
+    /// Persistent profiles. Above this the sidecar refuses and names one to forget.
+    pub max_profiles: u32,
+    /// The whole profiles directory, ephemeral included. Reaching it sweeps first and refuses second.
+    pub disk_budget_mb: u32,
+    pub load_timeout_seconds: u32,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        // The numbers spec §8 ships, so the documented file and an absent file behave alike.
+        Self {
+            enabled: false,
+            max_sessions: 2,
+            cache_size_mb: 100,
+            max_profiles: 20,
+            disk_budget_mb: 3000,
+            load_timeout_seconds: 30,
+        }
+    }
+}
+
+/// Reads `.ai/browser.yaml`. Absent, unreadable or malformed → defaults, with a warning.
+///
+/// Defaults mean the pillar is OFF, so a broken file costs a capability and never grants one — the
+/// same asymmetry [`load_web_config`] has, and here it is easier to justify: there is nothing in
+/// this file whose default is more permissive than what somebody would have written.
+pub fn load_browser_config(path: &Path) -> BrowserConfig {
+    if !path.exists() {
+        return BrowserConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<BrowserConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "browser config: could not be parsed; the pillar stays off");
+            BrowserConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "browser config: could not be read; the pillar stays off");
+            BrowserConfig::default()
+        }
+    }
+}
+
 /// How many seats one council may hold.
 ///
 /// Eight, from the Python orchestrator this pillar was ported out of, where it was the parallelism

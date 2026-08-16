@@ -195,6 +195,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/web/read", post(crate::web::post_read))
         .route("/web/pages", get(crate::web::list_pages))
         .route("/web/pages/{id}", get(crate::web::get_page))
+        // The browser pillar. Every one of these needs Admin — none is in `auth.rs`'s read-only
+        // table, including the two GETs, because the list of hosts a project has logged into is a
+        // map of where its owner has accounts.
+        //
+        // There is no `/browser/grant`, and its absence is the pillar's central invariant rather
+        // than an omission: the site list grows when a person finishes a login and hands the wheel
+        // back (spec §5.2), never by asking for a host to be added.
+        .route("/browser/open", post(crate::browser::post_open))
+        .route("/browser/snapshot", post(crate::browser::post_snapshot))
+        .route("/browser/act", post(crate::browser::post_act))
+        .route("/browser/screenshot", post(crate::browser::post_screenshot))
+        .route("/browser/close", post(crate::browser::post_close))
+        .route("/browser/revoke", post(crate::browser::post_revoke))
+        .route("/browser/sessions", get(crate::browser::list_open_sessions))
+        .route(
+            "/browser/sites/{project_id}",
+            get(crate::browser::get_sites),
+        )
         .route("/voice/config", get(crate::voice::get_config))
         .route("/voice/memos", get(crate::voice::list_memos))
         // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
@@ -3601,6 +3619,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+                browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -4093,6 +4112,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -6943,6 +6963,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),

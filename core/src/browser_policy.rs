@@ -22,18 +22,6 @@
 //! controls the zone, and one XSS on any subdomain would otherwise reach the session. So here the
 //! match is on the **whole origin** — scheme, host and port, exactly (spec §5.3). No wildcards.
 
-// Nothing in production calls this module yet: the rollout builds the decision (step B) before the
-// caller that uses it (step N), so the fence is written and tested before anything can browse.
-//
-// INSTRUCTION, not description — `contacts.rs` records what happens when a suppression describes a
-// plan instead: DELETE THIS LINE in step N, when `browser.rs` calls `decide`. If it is still here
-// once that lands, the module has grown something nothing uses.
-//
-// Scoped to the non-test build on purpose. Under `cfg(test)` there is no suppression, so every item
-// below is held up by this module's own tests, and one that stops being exercised warns instead of
-// going quiet.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use url::Url;
 
 pub use crate::trust::Requester;
@@ -64,6 +52,12 @@ pub enum Surface {
     /// now.
     Assistant,
     /// A pillar, a scheduled run, a repo trigger. Not an assistant surface at all.
+    ///
+    /// Never constructed in production, and that IS the design (spec §6.0b): the v1 serves the
+    /// assistant, and the autonomous path is left as a seam rather than a road. The variant exists
+    /// so the refusal is a case in the table with a test on it, instead of an absence somebody later
+    /// fills in with a default. The pillar that builds that path is the one that deletes this line.
+    #[allow(dead_code)]
     Autonomous,
 }
 
