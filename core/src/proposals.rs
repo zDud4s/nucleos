@@ -213,6 +213,91 @@ pub async fn create_calendar_event(
     Ok(proposal_id)
 }
 
+/// Everything a wheel request has to say, as one value.
+///
+/// A struct rather than seven arguments, and the grouping is not only length: three of these are
+/// `&str` and one of them is the thing the person will read and decide on. Two same-typed arguments
+/// swapped in a call would compile, and the swap that mattered would put the wrong host in the
+/// dialogue — which is exactly the failure spec §5.2's measures exist to prevent.
+#[derive(Debug, Clone, Copy)]
+pub struct WheelAsk<'a> {
+    pub run_id: Option<i64>,
+    pub project_id: &'a str,
+    /// The row in `browser_sessions` this is about.
+    pub session_id: i64,
+    pub requested_url: &'a str,
+    pub final_url: &'a str,
+    /// The complete, literal origin — punycode as stored, never prettified.
+    pub origin: &'a str,
+    pub reasoning: &'a str,
+}
+
+/// An agent hit a wall and is asking for the wheel (spec §4.4 rule 3).
+///
+/// It lands here and not in `attention.rs` for a reason the spec calls out by name: that module is
+/// the owner-presence brake, and what it holds expires in two minutes — the exact opposite of what
+/// this needs. A wheel request has to survive the shell being closed, the run ending, and the person
+/// going away for a day. **It never expires**, because §4.4 rule 2 says the wheel does not come back
+/// by time; only a person decides.
+///
+/// # What goes into `tool_input`, and why each field is there
+///
+/// The three measures of spec §5.2 against the confused deputy are all dialogue content, and this is
+/// where the dialogue gets its facts:
+///
+/// - `origin` is the **complete and literal** origin, in the punycode form the policy stored, never
+///   abbreviated. `xn--exemp1o-...` is the information; prettifying it is the attack.
+/// - `requested_url` and `final_url` are how the agent got there. A permission asked for from a page
+///   the agent followed a link to is not the same request as one from a url a person typed, and the
+///   only way for a person to tell is to be shown both.
+/// - `session_id` is the row in `browser_sessions`, so accepting can find the session without the
+///   caller naming it — and so a proposal cannot be pointed at a different session after the fact.
+pub async fn create_wheel_request(pool: &SqlitePool, ask: WheelAsk<'_>) -> sqlx::Result<i64> {
+    let WheelAsk {
+        run_id,
+        project_id,
+        session_id,
+        requested_url,
+        final_url,
+        origin,
+        reasoning,
+    } = ask;
+    let now = chrono::Utc::now().to_rfc3339();
+    let tool_input = serde_json::json!({
+        "session_id": session_id,
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "origin": origin,
+    })
+    .to_string();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('browser-wheel', 'pending', ?, NULL, ?, 'browser_handoff', ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
 /// Whether a message already has a calendar proposal waiting on a decision.
 ///
 /// Without this, every triage pass over the same `action` message would file another one, and the
@@ -299,6 +384,31 @@ pub async fn dismiss_skipped_item(pool: &SqlitePool, id: i64) -> Result<(), Reje
     if !transition(pool, id, "dismissed", "dismissed by user").await? {
         return Err(RejectError::NotPending);
     }
+    Ok(())
+}
+
+/// Add a line to a proposal's history without changing its status.
+///
+/// For the case spec §4.4a describes: a wheel request that was accepted and whose window then failed
+/// to open. The proposal is no longer pending, so `transition` cannot carry the news, and the person
+/// needs to be told why the window they asked for is not there. The event is written with the same
+/// status on both sides, which is what says "nothing was decided here, something happened".
+pub async fn note(pool: &SqlitePool, id: i64, note: &str) -> sqlx::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let Some(proposal) = get(pool, id).await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(&proposal.status)
+    .bind(&proposal.status)
+    .bind(note)
+    .bind(&now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

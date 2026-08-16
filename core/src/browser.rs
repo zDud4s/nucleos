@@ -73,16 +73,40 @@ pub struct SessionRow {
     pub id: i64,
     pub sidecar_id: String,
     pub run_id: Option<i64>,
+    /// The project this session was opened FOR — not necessarily the one whose profile it runs in.
+    /// A throwaway belongs to no project, but the session that used it was still asked for by one,
+    /// and spec §4.5's handover needs to know which.
     pub project_id: Option<String>,
     pub profile_kind: String,
     pub profile_id: String,
     pub requested_url: String,
     pub final_url: String,
     pub rule: String,
+    /// `agent`, `wheel-requested`, `human` or `delivery-failed` — spec §4.4's state machine.
     pub mode: String,
     pub refusal: Option<String>,
+    /// The proposal that asked for the wheel, once one exists (spec §4.4 rule 3).
+    pub proposal_id: Option<i64>,
+    /// The navigation the person's window recorded, as JSON, once the wheel has come back.
+    pub chain: Option<String>,
+    /// When the person answered "keep these?" — either way. `None` with a `chain` present means the
+    /// question is still open, which is exactly what the UI needs to know to ask it.
+    pub chain_decided_at: Option<String>,
     pub opened_at: String,
     pub closed_at: Option<String>,
+}
+
+/// The states of spec §4.4, spelled once.
+pub mod mode {
+    /// The agent drives: headless, fenced, consequence-free.
+    pub const AGENT: &str = "agent";
+    /// The agent has asked for the wheel. Its actions are refused from HERE, not from the window
+    /// opening (spec §4.4 rule 1).
+    pub const WHEEL_REQUESTED: &str = "wheel-requested";
+    /// A person is driving a real window.
+    pub const HUMAN: &str = "human";
+    /// They accepted and the headful browser would not start (spec §4.4a). Not a way back to AGENT.
+    pub const DELIVERY_FAILED: &str = "delivery-failed";
 }
 
 /// What an open produced.
@@ -394,11 +418,10 @@ async fn insert_session(
          VALUES ('', ?, ?, ?, '', ?, '', ?, 'agent', ?)",
     )
     .bind(run_id)
-    .bind(if profile == Profile::Project {
-        Some(project_id)
-    } else {
-        None
-    })
+    // The project the session was opened FOR, whichever profile it lands in. Spec §4.5 needs it for
+    // the throwaway case above all: a wheel request from a throwaway is a request to establish a
+    // session in the project, and without this the handover would have no project to establish it in.
+    .bind(project_id)
     .bind(profile.as_str())
     .bind(url)
     .bind(rule)
@@ -440,7 +463,8 @@ async fn finish_session(
 pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<SessionRow>> {
     let row = sqlx::query(
         "SELECT id, sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
-                final_url, rule, mode, refusal, opened_at, closed_at \
+                final_url, rule, mode, refusal, proposal_id, chain, chain_decided_at, \
+                opened_at, closed_at \
          FROM browser_sessions WHERE id = ?",
     )
     .bind(id)
@@ -458,9 +482,118 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
         rule: row.get("rule"),
         mode: row.get("mode"),
         refusal: row.get("refusal"),
+        proposal_id: row.get("proposal_id"),
+        chain: row.get("chain"),
+        chain_decided_at: row.get("chain_decided_at"),
         opened_at: row.get("opened_at"),
         closed_at: row.get("closed_at"),
     }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The wheel's writes. The state machine that drives them is `browser_wheel`, which owns no SQL —
+// these stay here so `browser_sessions` keeps having exactly one module that touches it.
+// ---------------------------------------------------------------------------------------------
+
+/// Move a session between the states of spec §4.4, and only from the state the caller expected.
+///
+/// Compare-and-set, and this is the atomic write rule 1 rests on: "a transição para fora de
+/// `agente_conduz` é a mesma escrita atómica que regista a aceitação". A read-then-write would leave
+/// a window in which two callers both believed they had the wheel — and one of them would be an
+/// agent clicking on a page a person had just been handed.
+pub async fn set_mode(pool: &SqlitePool, id: i64, from: &str, to: &str) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE browser_sessions SET mode = ? WHERE id = ? AND mode = ? AND closed_at IS NULL",
+    )
+    .bind(to)
+    .bind(id)
+    .bind(from)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Point a session at the proposal that asked for its wheel.
+pub async fn attach_proposal(pool: &SqlitePool, id: i64, proposal_id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE browser_sessions SET proposal_id = ? WHERE id = ?")
+        .bind(proposal_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Replace the sidecar's id for a session, which the handover changes.
+///
+/// The headful window is a different browser and a different session over there; here it is the same
+/// row, because it is the same request by the same run for the same page. Keeping one row is what
+/// lets the UI show a handover as something that happened TO a session rather than as two unrelated
+/// ones.
+pub async fn rebind_sidecar(
+    pool: &SqlitePool,
+    id: i64,
+    sidecar_id: &str,
+    profile_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE browser_sessions SET sidecar_id = ?, profile_kind = 'project', \
+         profile_id = ? WHERE id = ?",
+    )
+    .bind(sidecar_id)
+    .bind(profile_id)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Store the navigation a person's window recorded, unanswered.
+pub async fn record_chain(pool: &SqlitePool, id: i64, chain: &[String]) -> sqlx::Result<()> {
+    sqlx::query("UPDATE browser_sessions SET chain = ? WHERE id = ?")
+        .bind(serde_json::to_string(chain).unwrap_or_else(|_| "[]".to_string()))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Take the recorded chain, once, and stamp the moment it was answered.
+///
+/// Once, because the permission belongs to the moment of the login (spec §5.2). A chain that could
+/// be answered twice could be answered a week later by somebody who had forgotten what it was for,
+/// and the answer grants a permanent right to load a host inside the profile holding the logins.
+/// `chain_decided_at IS NULL` in the WHERE is what makes that impossible rather than unlikely.
+pub async fn take_chain(
+    pool: &SqlitePool,
+    id: i64,
+    now: &str,
+) -> sqlx::Result<Option<Vec<String>>> {
+    let row = sqlx::query(
+        "UPDATE browser_sessions SET chain_decided_at = ? \
+         WHERE id = ? AND chain IS NOT NULL AND chain_decided_at IS NULL \
+         RETURNING chain",
+    )
+    .bind(now)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let chain: String = row.get("chain");
+    Ok(Some(
+        serde_json::from_str(&chain).unwrap_or_else(|_| Vec::new()),
+    ))
+}
+
+/// Close a session's row from outside this module's own paths — the wheel's failures need it.
+pub async fn close_session_row(
+    pool: &SqlitePool,
+    id: i64,
+    reason: &str,
+    now: &str,
+) -> sqlx::Result<()> {
+    close_row(pool, id, reason, now).await
 }
 
 /// The open sessions, oldest first.
@@ -628,6 +761,22 @@ pub async fn post_act(
     let Some(row) = live_session(&state, body.session_id).await else {
         return gone();
     };
+    // Spec §4.4 rule 1, on this side. From the moment the wheel is ASKED for — not from the window
+    // opening — the agent's actions are refused and not queued. The sidecar refuses them too, and
+    // neither layer is redundant: this one holds when the two processes disagree about who is
+    // driving, which is the state a crash between the request and the handover produces.
+    //
+    // A refusal and not an error, in the shape the agent already knows how to read (§6.2).
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so it is not the agent's to act on", row.mode),
+            },
+        }))
+        .into_response();
+    }
     match state
         .browser
         .client
@@ -1017,7 +1166,9 @@ mod tests {
         };
         assert_eq!(row.profile_kind, "ephemeral");
         assert_eq!(row.rule, browser_policy::RULE_OFF_LIST);
-        assert_eq!(row.project_id, None, "a throwaway belongs to no project");
+        // The PROFILE belongs to no project; the session was still opened for one, and spec §4.5's
+        // handover reads exactly this field to know where to establish the login.
+        assert_eq!(row.project_id.as_deref(), Some("acme"));
         assert_eq!(row.profile_id, "r7", "one throwaway per run");
 
         let sent = placements(&seen);

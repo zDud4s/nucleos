@@ -7,6 +7,7 @@ mod backup;
 mod browser;
 mod browser_client;
 mod browser_policy;
+mod browser_wheel;
 mod budget;
 mod calendar;
 mod chats;

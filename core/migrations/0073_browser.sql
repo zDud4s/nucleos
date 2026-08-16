@@ -72,7 +72,13 @@ CREATE TABLE IF NOT EXISTS browser_sessions (
   -- The run this session belongs to, when there is one. NULL for an assistant turn that is not
   -- inside a run.
   run_id         INTEGER,
-  -- The project whose profile this is, or NULL for a throwaway that belongs to no project.
+  -- The project this session was opened FOR — not necessarily the one whose profile it runs in.
+  --
+  -- The two are different questions and an earlier version of this column answered only the second,
+  -- leaving NULL for every throwaway. That lost the fact that the assistant was working on a project
+  -- when it browsed, and spec §4.5 needs exactly that fact: a wheel request from a throwaway is a
+  -- request to establish a session IN THE PROJECT, so the handover has to know which one. Which
+  -- profile a session actually ran in is `profile_kind` + `profile_id`, one line below.
   project_id     TEXT,
   profile_kind   TEXT NOT NULL CHECK (profile_kind IN ('project', 'ephemeral')),
   -- What actually went on the wire as the profile id: the project id, or the run id for a throwaway.
@@ -86,7 +92,31 @@ CREATE TABLE IF NOT EXISTS browser_sessions (
   -- the same reason — "ephemeral" alone cannot be audited, and the interesting question is always
   -- which condition failed.
   rule           TEXT NOT NULL,
-  mode           TEXT NOT NULL CHECK (mode IN ('agent', 'human')),
+  -- Who has the wheel, as spec §4.4's state machine spells it.
+  --
+  -- `wheel-requested` is a state and not a flag on `agent`, because rule 1 turns on it: from the
+  -- REQUEST onward — not from the window opening — the agent's actions are refused. The two moments
+  -- are separated by a process swap (§4.2), which is not atomic, and an act landing in between would
+  -- touch a page the person is about to inherit.
+  --
+  -- `delivery-failed` is §4.4a: the person accepted and the headful browser would not start. It does
+  -- NOT go back to `agent` — the agent does not recover the wheel because of a failure of ours — and
+  -- it is distinguishable from `human` so the UI can offer a retry rather than a window.
+  mode           TEXT NOT NULL
+                 CHECK (mode IN ('agent', 'wheel-requested', 'human', 'delivery-failed')),
+  -- The proposal that asked for the wheel (spec §4.4 rule 3). NULL until the agent asks.
+  proposal_id    INTEGER,
+  -- The navigation the person's window recorded, as a JSON array, written when the wheel comes back.
+  --
+  -- Stored rather than passed straight to `grant` because the decision needs two steps: the window
+  -- closes, the person is shown where they went, and only then do they keep the set or none of it
+  -- (spec §5.3a). Keeping it here is also what makes the second step unable to name a host — it
+  -- answers yes or no to what is written in this column, and the column was written by a browser
+  -- under a person's own hands.
+  chain          TEXT,
+  -- When the person answered that question. Set on either answer, so a chain cannot be granted twice
+  -- nor days later: the permission belongs to the moment of the login, which is the whole of §5.2.
+  chain_decided_at TEXT,
   -- The consequence the fence named when it stopped the navigation this session was opened for, or
   -- NULL when nothing was stopped. A refused session still exists and is still addressable; it is
   -- simply empty (spec §6.2).

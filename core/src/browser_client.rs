@@ -158,10 +158,11 @@ impl ActResult {
     }
 }
 
-/// The driver's half of passing the wheel. Unreachable until the state machine of spec §4.4 exists:
-/// asking for the wheel raises a proposal, and a route that asked the sidecar directly would hand a
-/// window to somebody who never accepted it.
-#[allow(dead_code)]
+/// The driver's half of asking for the wheel: the session is ready to be shown to a person.
+///
+/// It does not hand anything over. Spec §4.4 rule 3 puts the request in `proposals.rs` because the
+/// daemon runs without a shell, and what this marks in the sidecar is the other half of rule 1 — from
+/// here on the agent's actions are refused rather than queued.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HandoffTicket {
     pub session_id: String,
@@ -169,6 +170,28 @@ pub struct HandoffTicket {
     pub url: String,
     #[serde(default)]
     pub reason: String,
+}
+
+/// The window, open, with a person in front of it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Wheel {
+    pub session: String,
+    pub mode: String,
+    pub url: String,
+    /// The agent sessions that were closed to make room. Spec §4.1 allows one browser per profile, so
+    /// a handover into a profile that already had one takes it down — and the rows for those sessions
+    /// have to be closed here, or the UI offers to hand over a browser that no longer exists.
+    #[serde(default)]
+    pub displaced: Vec<String>,
+}
+
+/// The wheel coming back, carrying the only thing that makes the trip worth recording.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Returned {
+    /// The navigation the headful window recorded (spec §5.3a). Candidates, not permissions: nothing
+    /// here is granted until a person says so, and what they are shown is exactly this list.
+    #[serde(default)]
+    pub chain: Vec<String>,
 }
 
 /// What went wrong, in the shapes a caller has to tell apart.
@@ -287,8 +310,6 @@ impl BrowserClient {
             .map_err(|error| BrowserError::Failed(error.to_string()))
     }
 
-    /// Unreachable until spec §4.4's state machine exists. See [`HandoffTicket`].
-    #[allow(dead_code)]
     pub async fn handoff(
         &self,
         session_id: &str,
@@ -297,6 +318,39 @@ impl BrowserClient {
         self.call(
             "/handoff",
             &serde_json::json!({ "session_id": session_id, "reason": reason }),
+        )
+        .await
+    }
+
+    /// Hand the wheel to a person: close the agent's browser, open a headful one over the project's
+    /// profile (spec §4.2, §4.5).
+    ///
+    /// The placement is sent rather than inferred from the session, and that is the whole of §4.5:
+    /// the profile a handover targets is not the one the agent was in. A run that hit a login wall
+    /// was almost certainly in a throwaway, and a throwaway is deleted with the run — so a person
+    /// asked to log in there would be logging into something that is about to be erased.
+    pub async fn take_wheel(
+        &self,
+        session_id: &str,
+        url: &str,
+        placement: &Placement,
+    ) -> Result<Wheel, BrowserError> {
+        self.call(
+            "/wheel/take",
+            &serde_json::json!({
+                "session_id": session_id,
+                "url": url,
+                "placement": placement,
+            }),
+        )
+        .await
+    }
+
+    /// Take the wheel back: close the person's window and read what it recorded.
+    pub async fn return_wheel(&self, session_id: &str) -> Result<Returned, BrowserError> {
+        self.call(
+            "/wheel/return",
+            &serde_json::json!({ "session_id": session_id }),
         )
         .await
     }

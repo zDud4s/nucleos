@@ -208,6 +208,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/screenshot", post(crate::browser::post_screenshot))
         .route("/browser/close", post(crate::browser::post_close))
         .route("/browser/revoke", post(crate::browser::post_revoke))
+        // The wheel (spec §4.4). `/handoff` is the agent asking; there is deliberately no route that
+        // ACCEPTS — accepting is `POST /proposals/{id}/approve`, the same door every other decision
+        // goes through, so the compare-and-set that settles a concurrent approve is also the write
+        // that moves the session out of the agent's hands (rule 1).
+        //
+        // `/keep` is the closest thing to a grant on this surface, and it names no host: it answers
+        // yes or no to a chain a browser recorded under a person's own hands.
+        .route("/browser/handoff", post(crate::browser_wheel::post_handoff))
+        .route("/browser/return", post(crate::browser_wheel::post_return))
+        .route("/browser/keep", post(crate::browser_wheel::post_keep))
         .route("/browser/sessions", get(crate::browser::list_open_sessions))
         .route(
             "/browser/sites/{project_id}",
@@ -3195,6 +3205,10 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "browser-wheel" {
+        return approve_browser_wheel(state, id).await;
+    }
+
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
@@ -3233,6 +3247,104 @@ async fn post_proposal_approve(
     }
 }
 
+/// A person took the wheel (spec §4.4, rules 1 and 3).
+///
+/// The `transition` below is the load-bearing line, and its position is the argument: it is a
+/// compare-and-set on `status = 'pending'`, so exactly one of two concurrent approvals wins — and the
+/// one that wins is the one that then hands over the browser. Handing over first and recording
+/// afterwards would let both callers open a window; recording without handing over would leave a
+/// proposal saying a person is driving something that was never started.
+///
+/// Uncancellable for the same reason as the three arms above: a request dropped in between would
+/// leave the decision recorded and the window unopened.
+async fn approve_browser_wheel(
+    state: AppState,
+    id: i64,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a wheel request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the proposal could not be read".to_owned(),
+            )
+        })?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(serde_json::Value::as_i64))
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this wheel request names no session".to_owned(),
+            )
+        })?;
+
+    let transitioned = crate::proposals::transition(&state.pool, id, "approved", "wheel accepted")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "accepting a wheel request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decision could not be recorded".to_owned(),
+            )
+        })?;
+    if !transitioned {
+        return Err((
+            StatusCode::CONFLICT,
+            "this proposal has already been decided".to_owned(),
+        ));
+    }
+
+    let handover = state.clone();
+    match uncancellable(async move { crate::browser_wheel::accept(&handover, session_id).await })
+        .await
+        .map_err(|status| (status, "the handover task did not finish".to_owned()))?
+    {
+        Ok(row) => Ok(Json(serde_json::json!({ "session": row }))),
+        Err(crate::browser_wheel::WheelError::NoSuchSession) => Err((
+            StatusCode::NOT_FOUND,
+            "the session this wheel was asked for is gone".to_owned(),
+        )),
+        // The window did not open (spec §4.4a). The session is recorded as a failed delivery and the
+        // proposal carries the reason; it does NOT go back to the agent.
+        Err(error) => Err((StatusCode::BAD_GATEWAY, error.to_string())),
+    }
+}
+
+/// The wheel was not given (spec §4.4), and the session goes with the refusal.
+///
+/// Spec §4.4's diagram draws an arrow back to `agente_conduz`, and this is deliberately narrower —
+/// `browser_wheel`'s module comment carries the reasoning. In short: the wall that caused the request
+/// is still there, §4.5 already says the run continues without that page, and giving the wheel back
+/// would need a second place where the two processes can disagree about who is driving.
+async fn reject_browser_wheel(state: AppState, id: i64) -> Result<StatusCode, StatusCode> {
+    let session_id = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(serde_json::Value::as_i64));
+
+    if !crate::proposals::transition(&state.pool, id, "rejected", "wheel refused")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "rejecting a wheel request failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    if let Some(session_id) = session_id
+        && let Err(error) = crate::browser_wheel::refuse(&state, session_id).await
+    {
+        // Logged and not returned. The refusal is recorded and that is the part the person asked
+        // for; a session left open by a sidecar that did not answer is retired on its next restart.
+        tracing::warn!(session = session_id, error = %error, "closing a refused wheel's session failed");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn post_proposal_reject(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -3245,6 +3357,9 @@ async fn post_proposal_reject(
         })?
         .ok_or(StatusCode::NOT_FOUND)?
         .kind;
+    if kind == "browser-wheel" {
+        return reject_browser_wheel(state, id).await;
+    }
     if kind == "contact-merge" {
         // `reject_merge` records the refused pair in the same transaction as the status, which is
         // what stops the heuristic asking the identical question forever. Wiring the approval

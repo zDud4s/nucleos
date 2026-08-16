@@ -179,7 +179,7 @@ pub fn decide(
 /// break a hand-rolled extractor are the shapes an attacker reaches for: `https://jira.example@evil.com/`
 /// has host `evil.com`. It also gives IDN hosts back in punycode, which is what makes the homograph
 /// case fall out for free instead of needing to be spotted.
-fn origin_of(raw: &str) -> Option<String> {
+pub fn origin_of(raw: &str) -> Option<String> {
     let parsed = Url::parse(raw).ok()?;
     if parsed.scheme() != "https" {
         return None;
