@@ -7,9 +7,13 @@
 //
 // # Two properties that are not type-hygiene
 //
-// OpenRequest has no profile field. The agent chooses WHAT to look at; the núcleo chooses WHERE it
-// happens (spec §5.3, §6.1). A profile field here would let the caller pick the identity it browses
-// under, which is the whole boundary this pillar exists to hold, handed away in a struct tag.
+// OpenRequest carries a Placement, and the agent never fills it in. The agent chooses WHAT to look
+// at; the núcleo chooses WHERE it happens (spec §5.3, §6.1) and attaches that decision on the way
+// through. An earlier version of this file expressed the same rule by having no profile field at
+// all, which was a stronger-looking guarantee and a worse one: with nowhere to put the decision, the
+// núcleo could not transmit it, and the choice of identity would have fallen to whichever process
+// had a default handy. The boundary is that the field is filled downstream of the agent, not that it
+// is absent.
 //
 // ActResult separates Done from Refused. A refusal by the fence (spec §6.2) is an ANSWER, not a
 // failure: the agent asked for something with a consequence, was told so, and can carry on. If it
@@ -20,6 +24,8 @@ package browser
 import (
 	"context"
 	"errors"
+
+	"nucleosbrowser/profile"
 )
 
 // SessionID identifies one browsing session for its lifetime.
@@ -37,11 +43,28 @@ const (
 	ModeHuman Mode = "human"
 )
 
-// OpenRequest asks for a session on a URL.
+// Placement is the núcleo's answer to "as whom": which profile this session runs in, and what that
+// profile is allowed to load.
 //
-// There is no profile field. See the package comment: that omission is the boundary.
+// The two travel together because they are one decision. A profile without its site list is a
+// browser holding the owner's logins and no rule about where they may be sent (spec §5.4); a site
+// list without its profile is a rule nothing enforces. Splitting them across two calls would create
+// a window in which one had arrived and the other had not, and that window is a browser with logins
+// and no fence.
+//
+// Origins is empty for an ephemeral profile, and must be: there are no logins in it to protect, and
+// a list there would be silently ignored — fence.Policy refuses that rather than accept a security
+// control that does nothing.
+type Placement struct {
+	Profile profile.Ref `json:"profile"`
+	Origins []string    `json:"origins,omitempty"`
+}
+
+// OpenRequest asks for a session on a URL, in the profile the núcleo chose.
 type OpenRequest struct {
 	URL string `json:"url"`
+	// Placement is filled by the núcleo, never by the agent. See the package comment.
+	Placement Placement `json:"placement"`
 }
 
 // Session is what a caller gets back. RequestedURL and FinalURL are both reported because the trust

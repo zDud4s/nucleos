@@ -53,11 +53,14 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 
 // OpenRequest is what the núcleo posts to /open.
 //
-// It carries no profile, and neither does browser.OpenRequest — see that package's comment. The
-// núcleo has already decided which profile this session runs in before it calls; letting the wire
-// carry the choice would move that decision to the caller.
+// The placement is browser.Placement itself rather than a wire type of its own. Everything else here
+// is restated deliberately — a wire shape that follows an internal struct around is a wire shape
+// nobody decided — but this one is the núcleo's decision travelling verbatim, and a second spelling
+// of it would be a second thing to keep in step with `browser_policy.rs`. There is already one such
+// mirror across the language boundary; two would be one too many.
 type OpenRequest struct {
-	URL string `json:"url"`
+	URL       string            `json:"url"`
+	Placement browser.Placement `json:"placement"`
 }
 
 // SessionRequest names an existing session. Used by every verb after /open.
@@ -89,7 +92,17 @@ func openHandler(driver browser.Driver) http.HandlerFunc {
 			http.Error(w, "url is required", http.StatusBadRequest)
 			return
 		}
-		session, err := driver.Open(r.Context(), browser.OpenRequest{URL: request.URL})
+		if err := request.Placement.Profile.Validate(); err != nil {
+			// Refused at the door, like an unknown action kind. A request that does not say which
+			// profile it belongs to cannot be answered by guessing: one guess loses the person's
+			// logins and the other hands them to a stranger's page (spec §5.1).
+			http.Error(w, "placement: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		session, err := driver.Open(r.Context(), browser.OpenRequest{
+			URL:       request.URL,
+			Placement: request.Placement,
+		})
 		if err != nil {
 			writeDriverError(w, "open", err)
 			return

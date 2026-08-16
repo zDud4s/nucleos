@@ -5,13 +5,27 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/config"
+	"nucleosbrowser/profile"
 )
 
 const token = "test-token"
+
+// opening is a well-formed /open body: a url plus the placement the núcleo would have decided. Every
+// test that is about something else uses it, so that "no placement" stays a case a test states on
+// purpose rather than a state most tests happen to be in.
+func opening(url string) OpenRequest {
+	return OpenRequest{
+		URL: url,
+		Placement: browser.Placement{
+			Profile: profile.Ref{Kind: profile.Ephemeral, ID: "run1"},
+		},
+	}
+}
 
 func testServer(t *testing.T, driver browser.Driver) *httptest.Server {
 	t.Helper()
@@ -66,7 +80,7 @@ func TestEveryRouteNeedsTheToken(t *testing.T) {
 // a retry loop, and the thing being retried would be browsing without a fence.
 func TestFenceNotAttachedIs503(t *testing.T) {
 	server := testServer(t, &browser.Fake{}) // zero value: no fence
-	response := post(t, server, "/open", OpenRequest{URL: "https://example.org/"}, true)
+	response := post(t, server, "/open", opening("https://example.org/"), true)
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("got %d, want 503", response.StatusCode)
 	}
@@ -82,7 +96,7 @@ func TestRefusalIsTwoHundred(t *testing.T) {
 	server := testServer(t, driver)
 
 	var session browser.Session
-	response := post(t, server, "/open", OpenRequest{URL: "https://example.org/"}, true)
+	response := post(t, server, "/open", opening("https://example.org/"), true)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("open: got %d", response.StatusCode)
 	}
@@ -117,7 +131,7 @@ func TestUnknownActionKindIsRefusedAtTheDoor(t *testing.T) {
 	server := testServer(t, driver)
 
 	var session browser.Session
-	response := post(t, server, "/open", OpenRequest{URL: "https://example.org/"}, true)
+	response := post(t, server, "/open", opening("https://example.org/"), true)
 	json.NewDecoder(response.Body).Decode(&session)
 
 	response = post(t, server, "/act", ActRequest{
@@ -141,25 +155,61 @@ func TestUnknownSessionIs404(t *testing.T) {
 	}
 }
 
-// TestOpenWireCarriesNoProfile mirrors the reflection guard in the browser package, one layer out:
-// the wire type must not grow a way to choose the identity either.
-func TestOpenWireCarriesNoProfile(t *testing.T) {
+// TestOpenWithoutAPlacementIsRefusedAtTheDoor. There is no answer to give a request that does not
+// say which profile it belongs to: one guess loses the person's logins, the other hands them to a
+// stranger's page (spec §5.1). So it is a 400, and the driver never sees it — the same treatment an
+// unknown action kind gets, for the same reason.
+func TestOpenWithoutAPlacementIsRefusedAtTheDoor(t *testing.T) {
 	driver := &browser.Fake{FenceAttached: true}
 	server := testServer(t, driver)
 
-	// A caller that tries anyway gets its extra field ignored, and the driver sees only the url.
-	response := post(t, server, "/open", map[string]any{
-		"url":     "https://example.org/",
-		"profile": "project-42",
-	}, true)
-	if response.StatusCode != http.StatusOK {
+	for _, body := range []map[string]any{
+		{"url": "https://example.org/"},
+		{"url": "https://example.org/", "placement": map[string]any{}},
+		{"url": "https://example.org/", "placement": map[string]any{"profile": map[string]any{"id": "42"}}},
+		{"url": "https://example.org/", "placement": map[string]any{
+			"profile": map[string]any{"kind": "project", "id": "../chromium-1400000"}}},
+	} {
+		response := post(t, server, "/open", body, true)
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("%v: got %d, want 400", body, response.StatusCode)
+		}
+	}
+	if len(driver.Opened) != 0 {
+		t.Fatalf("the driver was asked to open %d of them", len(driver.Opened))
+	}
+}
+
+// TestThePlacementReachesTheDriverUnchanged is the control, and the half that matters most: the
+// decision the núcleo took has to arrive at the driver exactly as it was taken. A wire that dropped
+// the site list would leave a project profile with an empty allowlist — which fails closed, loudly,
+// and is still a bug that would look like the fence working.
+func TestThePlacementReachesTheDriverUnchanged(t *testing.T) {
+	driver := &browser.Fake{FenceAttached: true}
+	server := testServer(t, driver)
+
+	sent := OpenRequest{
+		URL: "https://jira.example.org/browse/X-1",
+		Placement: browser.Placement{
+			Profile: profile.Ref{Kind: profile.Project, ID: "acme"},
+			Origins: []string{"https://jira.example.org", "https://accounts.google.com"},
+		},
+	}
+	if response := post(t, server, "/open", sent, true); response.StatusCode != http.StatusOK {
 		t.Fatalf("open: got %d", response.StatusCode)
 	}
 	if len(driver.Opened) != 1 {
 		t.Fatalf("driver saw %d opens", len(driver.Opened))
 	}
-	if driver.Opened[0].URL != "https://example.org/" {
-		t.Fatalf("url: got %q", driver.Opened[0].URL)
+	got := driver.Opened[0]
+	if got.URL != sent.URL {
+		t.Errorf("url: got %q", got.URL)
+	}
+	if got.Placement.Profile != sent.Placement.Profile {
+		t.Errorf("profile: got %+v, want %+v", got.Placement.Profile, sent.Placement.Profile)
+	}
+	if !slices.Equal(got.Placement.Origins, sent.Placement.Origins) {
+		t.Errorf("origins: got %v, want %v", got.Placement.Origins, sent.Placement.Origins)
 	}
 }
 
@@ -180,7 +230,7 @@ func TestGetIsNotAllowed(t *testing.T) {
 func TestCloseThenSnapshotIsGone(t *testing.T) {
 	server := testServer(t, &browser.Fake{FenceAttached: true})
 	var session browser.Session
-	response := post(t, server, "/open", OpenRequest{URL: "https://example.org/"}, true)
+	response := post(t, server, "/open", opening("https://example.org/"), true)
 	json.NewDecoder(response.Body).Decode(&session)
 
 	response = post(t, server, "/close", SessionRequest{SessionID: string(session.ID)}, true)

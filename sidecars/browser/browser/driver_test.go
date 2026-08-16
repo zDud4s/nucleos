@@ -4,30 +4,47 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"testing"
 )
 
-// TestOpenRequestCannotChooseAProfile is the guard on the boundary this whole pillar holds.
+// TestOpenRequestNamesOnlyTheUrlAndThePlacement is the guard on the boundary this whole pillar
+// holds.
 //
-// The agent chooses WHAT to look at; the núcleo chooses WHERE it happens (spec §5.3, §6.1). If a
-// profile, user-data-dir or identity field ever appears on OpenRequest, the caller can pick which
-// logged-in identity it browses under — and every allowlist above becomes decoration. That would
-// arrive as a one-line struct change in a hurry, which is exactly the sort of thing a test has to
-// be standing in front of.
-func TestOpenRequestCannotChooseAProfile(t *testing.T) {
-	forbidden := []string{"profile", "userdata", "userdatadir", "identity", "session", "cookie", "dir"}
+// The agent chooses WHAT to look at; the núcleo chooses WHERE it happens (spec §5.3, §6.1), and the
+// two live in different fields so that the second can be attached downstream of the first. What must
+// never appear is a THIRD way to say where — a UserDataDir, an Identity, a Cookies — because a
+// request carrying both a placement and a directory has two answers to "as whom", and the loser of
+// that tie is decided by whichever line of the driver runs last.
+//
+// An earlier version of this test forbade a profile field outright. That was the right rule when
+// there was nowhere for the núcleo's decision to go, and it stopped being the rule when the decision
+// had to travel; the property that survived the change is this one.
+func TestOpenRequestNamesOnlyTheUrlAndThePlacement(t *testing.T) {
+	want := map[string]bool{"URL": true, "Placement": true}
 	typ := reflect.TypeOf(OpenRequest{})
 	for i := range typ.NumField() {
-		name := strings.ToLower(typ.Field(i).Name)
-		for _, bad := range forbidden {
-			if strings.Contains(name, bad) {
-				t.Fatalf(
-					"OpenRequest has field %q: the caller must never choose where it browses (spec §5.3, §6.1)",
-					typ.Field(i).Name,
-				)
-			}
+		if !want[typ.Field(i).Name] {
+			t.Fatalf(
+				"OpenRequest has field %q: only the url and the núcleo's placement belong here (spec §5.3, §6.1)",
+				typ.Field(i).Name,
+			)
 		}
+	}
+	if typ.NumField() != len(want) {
+		t.Fatalf("OpenRequest has %d fields, want %d", typ.NumField(), len(want))
+	}
+}
+
+// TestAPlacementNobodyFilledInIsNotUsable. The fail-closed half of the boundary above: with a field
+// to carry the decision there is also a zero value for it, and a zero value that resolved to
+// something would be the default nobody chose — which for this field means an identity nobody chose.
+func TestAPlacementNobodyFilledInIsNotUsable(t *testing.T) {
+	var placement Placement
+	if err := placement.Profile.Validate(); err == nil {
+		t.Fatal("the zero Placement names a usable profile")
+	}
+	if len(placement.Origins) != 0 {
+		t.Fatal("the zero Placement carries a site list")
 	}
 }
 
