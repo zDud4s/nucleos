@@ -147,6 +147,7 @@ describe("Chats", () => {
       cost_usd: null,
       failed: false,
       answeredBy: "cloud",
+      sessionId: null,
     };
     fetchMock.mockImplementation(
       daemon([
@@ -175,6 +176,7 @@ describe("Chats", () => {
       cost_usd: null,
       failed: false,
       answeredBy: "cloud",
+      sessionId: null,
     };
     fetchMock.mockImplementation(daemon([{ chat_id: "busy-one", title: "the busy one" }]));
     renderChats({ "busy-one": [thinking] });

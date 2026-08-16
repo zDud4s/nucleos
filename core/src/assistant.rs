@@ -257,6 +257,23 @@ pub async fn send_message(
     let resume = get_session(&state.pool, chat_id)
         .await
         .map_err(|e| e.to_string())?;
+    // Where this conversation runs, and — through `tool_policy_for` — how much it may do there.
+    //
+    // Read for EVERY turn and not only for the elevated ones, because the working directory is also
+    // how the CLI finds a session at all: it keys its transcripts by the directory they were had in,
+    // so a `--resume` launched from the wrong place does not fail, it silently starts a new session.
+    // That would strand a Telegram message to an IDE-rooted chat in a fresh context while the window
+    // went on showing the conversation it thought it was continuing.
+    let cwd = crate::chats::cwd_of(&state.pool, chat_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tool_policy = tool_policy_for(
+        cwd.as_deref(),
+        origin,
+        cwd.as_deref().is_some_and(|dir| {
+            crate::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
+        }),
+    );
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe);
@@ -298,12 +315,16 @@ pub async fn send_message(
 
     spawn_assistant_turn(
         state,
-        id,
-        slot,
-        text.to_string(),
-        resume,
-        session_id,
-        mcp_path,
+        TurnLaunch {
+            id,
+            slot,
+            text: text.to_string(),
+            resume,
+            session_id,
+            mcp_path,
+            cwd: cwd.map(std::path::PathBuf::from),
+            tool_policy,
+        },
     );
     Ok(id)
 }
@@ -526,29 +547,100 @@ async fn spawn_local_turn(
     Ok(id)
 }
 
-fn spawn_assistant_turn(
-    state: &crate::state::AppState,
+/// What tools a conversation's turn may reach.
+///
+/// Three conditions, and every one of them is load-bearing. Written as one pure function so the
+/// rule has a single home and can be read whole; the caller supplies the filesystem answer.
+///
+/// **A directory.** A conversation continuing a session from the IDE is rooted somewhere and is
+/// about the code there. Every conversation that predates this has no root, which is why nothing
+/// changes for any of them: they take the first `None` arm and stay exactly as they were.
+///
+/// **The machine.** `Origin::Shell` means the person is sitting at this computer. Telegram stays on
+/// `McpOnly` because the policy — not the MCP allowlist, which only grants — is the one thing that
+/// keeps a message arriving over the network away from this machine's filesystem and shell.
+///
+/// **A wired hook.** `Unrestricted` is not "ungoverned": it hands the decision to the `PreToolUse`
+/// classifier. But that hook is COOPERATIVE — it runs only if the `.claude/settings.json` resolved
+/// from the run's working directory registers it — so in a directory that never onboarded,
+/// `Unrestricted` would mean a shell with nothing watching it. The transcripts on this machine span
+/// sixty-nine directories and most were never NucleOS projects at all, so this is the common case
+/// and not the edge one.
+///
+/// The three failing arms all fall to `McpOnly`, which is what every chat turn has always used: the
+/// conversation still continues and still resumes its session, and what it loses is the ability to
+/// touch the machine.
+pub(crate) fn tool_policy_for(
+    cwd: Option<&str>,
+    origin: Origin,
+    hook_is_wired: bool,
+) -> crate::runner::ToolPolicy {
+    match (cwd, origin, hook_is_wired) {
+        (Some(_), Origin::Shell, true) => crate::runner::ToolPolicy::Unrestricted,
+        _ => crate::runner::ToolPolicy::McpOnly,
+    }
+}
+
+/// Everything one orchestrator turn is launched with.
+///
+/// A struct rather than a row of parameters, for the reason `RunRequest` gives about its own: at
+/// this width, `resume` and `session_id` sit side by side and are both string-shaped, so swapping
+/// them is one careless edit that the compiler would let through without a word — and the symptom
+/// would be a conversation quietly resuming the id it was about to mint.
+struct TurnLaunch {
     id: i64,
     slot: ChatSlot,
     text: String,
+    /// The session this turn continues, or `None` to start on a fresh context.
     resume: Option<String>,
+    /// The id this turn is recorded under, which is `resume` when there is one.
     session_id: String,
     mcp_path: std::path::PathBuf,
-) {
+    cwd: Option<std::path::PathBuf>,
+    tool_policy: crate::runner::ToolPolicy,
+}
+
+fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
+    let TurnLaunch {
+        id,
+        slot,
+        text,
+        resume,
+        session_id,
+        mcp_path,
+        cwd,
+        tool_policy,
+    } = launch;
     let pool = state.pool.clone();
     let runner = state.runner.clone();
     let run_timeout = state.run_timeout;
-    // The one agent that carries the control token, and the only one that can: an orchestrator turn
-    // runs under `ToolPolicy::McpOnly`, so it has no Bash, no Read and no Write — no way to look at
-    // its own environment. It needs the full surface because approving a proposal or disengaging the
-    // kill switch on the user's word is its job, and a scoped key would make it useless for that.
-    let env = crate::runs::run_env(&state.token.0, id, None);
+    let control_token = state.token.0.clone();
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
     let turn = TurnGuard { slot, mcp_path };
 
     crate::runs::spawn_registered(state, id, async move {
+        // WHICH key this turn carries follows from what it can read, and the two must be decided
+        // together or not at all.
+        //
+        // An orchestrator turn carries the daemon's control token — the key that approves proposals
+        // and disengages the kill switch — and the only reason that is safe is that `McpOnly` leaves
+        // it no Bash, no Read and no Write to look at its own environment with. A rooted turn has
+        // all three. Handing it the same key would rebuild, exactly, the hole `runs.rs` records
+        // having already closed once: a run with Bash whose classifier calls `echo
+        // $NUCLEOS_DAEMON_TOKEN` a `read-local` action.
+        //
+        // So it gets a scoped key of its own instead, and loses the power to approve proposals and
+        // to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
+        // it the tools, which means the person asking is sitting at this machine, in front of the
+        // window where both of those are one click away.
+        let env = match tool_policy {
+            crate::runner::ToolPolicy::Unrestricted => {
+                crate::runs::run_env(&crate::runs::mint_run_token(&pool, id).await, id, None)
+            }
+            _ => crate::runs::run_env(&control_token, id, None),
+        };
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
             let pool = pool.clone();
@@ -590,14 +682,17 @@ fn spawn_assistant_turn(
                 crate::runner::RunRequest {
                     prompt: text,
                     env,
-                    cwd: None,
+                    // Set for every rooted conversation, elevated or not: this is how the CLI finds
+                    // the session to resume in the first place.
+                    cwd,
                     plan_only: false,
                     resume_session_id: resume,
                     mcp_config: Some(turn.mcp_path.clone()),
-                    // The orchestrator talks to NucleOS and to nothing else. The MCP allowlist below
-                    // does not enforce that on its own — an allowlist only grants — so the policy is
-                    // what actually keeps a Telegram turn away from the filesystem and the shell.
-                    tool_policy: crate::runner::ToolPolicy::McpOnly,
+                    // Decided by `tool_policy_for`, which is where the rule is written out. The
+                    // default remains what it always was — the orchestrator talks to NucleOS and to
+                    // nothing else, and the MCP allowlist does not enforce that on its own, because
+                    // an allowlist only grants.
+                    tool_policy,
                     progress_timeout: None,
                     // Always set. `cli_args` reads this only when there is no `--resume`, which is
                     // exactly the first turn — the one that used to be launched with no session id
@@ -1023,7 +1118,7 @@ mod tests {
     async fn a_chat_marked_local_is_answered_locally_even_from_the_shell() {
         let mut state = test_state().await;
         state.local_assistant = Some(fake_local_assistant("na máquina"));
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
             .await
             .unwrap();
 
@@ -1041,7 +1136,7 @@ mod tests {
     async fn a_chat_marked_cloud_is_answered_in_the_cloud_even_from_telegram() {
         let mut state = test_state().await;
         state.local_assistant = Some(fake_local_assistant("never asked"));
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
 
@@ -1085,7 +1180,7 @@ mod tests {
     async fn a_local_chat_with_no_local_model_refuses_instead_of_quietly_costing_money() {
         // No local model configured: `state.local_assistant` is None.
         let state = test_state().await;
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
             .await
             .unwrap();
 
@@ -1955,6 +2050,134 @@ mod tests {
         assert!(
             ChatSlot::acquire(chat_id).is_some(),
             "a cancelled turn must free the chat for the next message"
+        );
+    }
+
+    /// Every combination, because the rule's whole value is that the three conditions are AND-ed:
+    /// stated as three separate tests, a change that dropped one of them would leave two green.
+    #[test]
+    fn only_a_rooted_conversation_spoken_to_from_the_machine_with_a_wired_hook_gets_the_tools() {
+        use crate::runner::ToolPolicy;
+        let root = Some("C:/Projects/nucleos");
+
+        for (cwd, origin, wired, expected, why) in [
+            (
+                root,
+                Origin::Shell,
+                true,
+                ToolPolicy::Unrestricted,
+                "all three",
+            ),
+            (
+                root,
+                Origin::Shell,
+                false,
+                ToolPolicy::McpOnly,
+                "no hook watching",
+            ),
+            (
+                root,
+                Origin::Telegram,
+                true,
+                ToolPolicy::McpOnly,
+                "over the network",
+            ),
+            (
+                root,
+                Origin::Telegram,
+                false,
+                ToolPolicy::McpOnly,
+                "neither",
+            ),
+            (None, Origin::Shell, true, ToolPolicy::McpOnly, "no root"),
+            (
+                None,
+                Origin::Shell,
+                false,
+                ToolPolicy::McpOnly,
+                "no root, no hook",
+            ),
+            (
+                None,
+                Origin::Telegram,
+                true,
+                ToolPolicy::McpOnly,
+                "no root, over the network",
+            ),
+            (
+                None,
+                Origin::Telegram,
+                false,
+                ToolPolicy::McpOnly,
+                "nothing at all",
+            ),
+        ] {
+            assert_eq!(
+                tool_policy_for(cwd, origin, wired),
+                expected,
+                "{why}: cwd={cwd:?} origin={origin:?} wired={wired}"
+            );
+        }
+    }
+
+    /// The conversations that exist today have no root, and this is the line that says so out loud:
+    /// whatever else changes here, none of them may pick up the filesystem by accident.
+    #[test]
+    fn a_conversation_with_no_directory_keeps_exactly_the_policy_it_always_had() {
+        for origin in [Origin::Shell, Origin::Telegram] {
+            for wired in [true, false] {
+                assert_eq!(
+                    tool_policy_for(None, origin, wired),
+                    crate::runner::ToolPolicy::McpOnly
+                );
+            }
+        }
+    }
+
+    /// A session the daemon never started has no rows in `runs`, so both of `get_session`'s
+    /// `NOT EXISTS` guards pass for want of anything to refuse — and the first turn resumes it.
+    ///
+    /// This is the behaviour the owner asked for, and it is what the code already did by accident.
+    /// The test is here to make it a decision: anyone tightening either guard sees this fail and
+    /// learns that continuing an IDE conversation depends on it.
+    #[tokio::test]
+    async fn a_session_the_daemon_never_ran_is_resumable_because_there_is_nothing_against_it() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, Some("C:/x"))
+            .await
+            .unwrap();
+        upsert_session(
+            &state.pool,
+            &chat_id,
+            "had-in-the-ide",
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_session(&state.pool, &chat_id).await.unwrap().as_deref(),
+            Some("had-in-the-ide"),
+        );
+    }
+
+    /// And the directory travels with it. The CLI keys its transcripts by the directory a session
+    /// was had in, so a turn launched from anywhere else does not fail — it quietly starts a new
+    /// session, and the window goes on showing a conversation that is no longer being continued.
+    #[tokio::test]
+    async fn a_continued_conversation_remembers_where_it_is_to_be_resumed_from() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(
+            &state.pool,
+            crate::chats::Brain::Cloud,
+            Some("C:/Projects/nucleos-canvas"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::chats::cwd_of(&state.pool, &chat_id).await.unwrap(),
+            Some("C:/Projects/nucleos-canvas".to_string()),
         );
     }
 }

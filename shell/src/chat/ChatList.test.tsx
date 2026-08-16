@@ -11,6 +11,7 @@ function chat(overrides: Partial<ChatRow> & { chat_id: string }): ChatRow {
     created_at: "2026-08-11T10:00:00+00:00",
     first_message: null,
     last_activity: null,
+    cwd: null,
     waiting: 0,
     ...overrides,
   };
@@ -27,6 +28,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -42,6 +44,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -59,6 +62,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -76,6 +80,7 @@ describe("ChatList", () => {
         busy={new Set(["a"])}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -94,6 +99,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -112,6 +118,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -129,6 +136,7 @@ describe("ChatList", () => {
         busy={new Set(["a"])}
         onSelect={noop}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -146,6 +154,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={noop}
         onNew={onNew}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );
@@ -164,6 +173,7 @@ describe("ChatList", () => {
         busy={new Set()}
         onSelect={onSelect}
         onNew={noop}
+        onContinueFromIde={noop}
         onArchive={noop}
       />,
     );

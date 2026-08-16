@@ -327,7 +327,7 @@ pub(crate) fn run_env(
 /// a secret that lands in the row a moment later would 401 that call for reasons no log explains.
 /// A failure to store is not fatal — the run proceeds with a key that authenticates nothing, so its
 /// tool calls are refused rather than ungoverned, which is the right direction to fail in.
-async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
+pub(crate) async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
     let (token, secret) = crate::auth::mint_run_token(id);
     if let Err(error) = sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
         .bind(&secret)

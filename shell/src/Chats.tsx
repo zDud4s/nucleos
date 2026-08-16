@@ -7,6 +7,7 @@ import {
 import { runIsLive } from "./derive";
 import BrainPicker from "./chat/BrainPicker";
 import ChatList from "./chat/ChatList";
+import IdeSessions from "./chat/IdeSessions";
 import Composer from "./chat/Composer";
 import Transcript from "./chat/Transcript";
 import { merge, replyText, turnFromRow, type Turn } from "./chat/turns";
@@ -60,6 +61,8 @@ function Chats({
   const [read, setRead] = useState<Set<string>>(new Set());
   const [localAvailable, setLocalAvailable] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
+  /** Whether the picker of IDE conversations is open, taking the place of the open conversation. */
+  const [picking, setPicking] = useState(false);
 
   const ready = connection === "connected" && token !== null;
 
@@ -181,14 +184,25 @@ function Chats({
 
   const busy = useMemo(() => new Set(pending.map((turn) => turn.chatId)), [pending]);
 
-  async function openChat() {
+  /**
+   * Opens a conversation — a fresh one, or one continuing a session had in the IDE.
+   *
+   * One function for both, because from here they differ by a single argument and the daemon does
+   * the rest. A second one would be the same four lines with a different failure message.
+   */
+  async function openChat(continueSession?: string) {
     if (token === null) return;
     setFailed(null);
-    const created = await createChat(token, "cloud");
+    const created = await createChat(token, "cloud", continueSession);
     if (!created.ok) {
-      setFailed("The daemon did not open a conversation.");
+      setFailed(
+        continueSession === undefined
+          ? "The daemon did not open a conversation."
+          : "That conversation is no longer on this machine — its folder may have been removed.",
+      );
       return;
     }
+    setPicking(false);
     await refreshChats();
     onSelect(created.value);
   }
@@ -211,6 +225,10 @@ function Chats({
           cost_usd: null,
           failed: false,
           answeredBy: null,
+          // Both null for the same reason: the daemon has not answered yet, so nothing is known
+          // about which model took it or which session it landed in. A guess here would draw a
+          // "restarted" line under a turn that has not run.
+          sessionId: null,
         },
       ]);
       void refreshChats();
@@ -281,12 +299,22 @@ function Chats({
         chats={chats ?? []}
         selected={selected}
         busy={busy}
-        onSelect={onSelect}
+        onSelect={(chatId) => {
+          setPicking(false);
+          onSelect(chatId);
+        }}
         onNew={() => void openChat()}
+        onContinueFromIde={() => setPicking(true)}
         onArchive={(chatId) => void archive(chatId)}
       />
       <div className="chat-open">
-        {current === null ? (
+        {picking && token !== null ? (
+          <IdeSessions
+            token={token}
+            onContinue={(sessionId) => void openChat(sessionId)}
+            onClose={() => setPicking(false)}
+          />
+        ) : current === null ? (
           <Teach title="Nothing is open.">
             Open a conversation to talk to the núcleo. Each message is a run, so it is billed and
             appears in the run history like any other — and the thread is kept by the daemon, so it
@@ -298,6 +326,15 @@ function Chats({
               <span>
                 chat <b>{current.chat_id}</b>
               </span>
+              {/*
+                Where it runs, on the conversations that run somewhere. It is not decoration: this
+                is what says the turns reach that directory's files rather than nothing at all.
+              */}
+              {current.cwd != null && (
+                <span>
+                  in <b>{current.cwd}</b>
+                </span>
+              )}
               <span>
                 one turn at a time · <b>a turn costs a run</b>
               </span>

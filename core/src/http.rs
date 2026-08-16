@@ -124,6 +124,7 @@ pub fn build_router(state: AppState) -> Router {
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
         .route("/assistant/local-model", get(get_local_model))
+        .route("/assistant/ide-sessions", get(list_ide_sessions))
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -2837,6 +2838,14 @@ struct AssistantTurn {
     /// that distinction: it is what stops a "changed model here" mark being drawn against a turn
     /// nothing knows the model of.
     answered_by: Option<String>,
+    /// The CLI session this turn ran in.
+    ///
+    /// Travels to the window so it can say where the conversation RESTARTED. `get_session` refuses
+    /// to resume past 140k tokens of context and past anything that read third-party text, and the
+    /// next turn then mints a fresh id — so a change here is the moment the model stopped
+    /// remembering what came before it. Without it, that happens and the transcript above and below
+    /// looks like one unbroken conversation, which is the one thing it is not.
+    session_id: Option<String>,
     created_at: String,
 }
 
@@ -2860,7 +2869,7 @@ async fn get_assistant_chat(
 ) -> Result<Json<Vec<AssistantTurn>>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, created_at
+                answered_by, session_id, created_at
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -2915,7 +2924,51 @@ async fn list_chats(
 struct CreateChatRequest {
     /// Absent means cloud, matching the column default and every caller written before this.
     brain: Option<String>,
+    /// The id of a session already had in the IDE, which this conversation continues.
+    ///
+    /// The ID and nothing else. The directory it runs in is looked up from the transcript, never
+    /// accepted here — a caller that could name its own working directory could name one where the
+    /// classifier hook is wired and collect the tools that come with it.
+    continue_session: Option<String>,
 }
+
+/// The conversations already had in the IDE that this daemon could continue.
+///
+/// Ones already continued are dropped: a second conversation resuming the same session would put
+/// two threads on one context, and the window would show them as unrelated.
+async fn list_ide_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::sessions::IdeSession>>, StatusCode> {
+    let Some(root) = crate::sessions::default_root() else {
+        return Ok(Json(Vec::new()));
+    };
+    let taken: Vec<String> = sqlx::query_scalar("SELECT session_id FROM assistant_sessions")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "listing the sessions already continued failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Read on the request rather than kept warm in memory. The store is the CLI's, it changes
+    // whenever a session is typed into, and a cache would be a second copy of somebody else's truth.
+    let found = tokio::task::spawn_blocking(move || {
+        crate::sessions::discover(&root, IDE_SESSIONS_SHOWN)
+            .into_iter()
+            .filter(|session| !taken.contains(&session.session_id))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(found))
+}
+
+/// How many past sessions the list offers.
+///
+/// There are hundreds on this machine and they are ordered by recency, so this is a question about
+/// how far back a person reaches for a conversation they mean to continue — not about completeness.
+const IDE_SESSIONS_SHOWN: usize = 40;
 
 /// Opens a conversation, and answers with the id it was given.
 ///
@@ -2927,13 +2980,54 @@ async fn create_chat(
     Json(body): Json<CreateChatRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let brain = crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud"));
-    crate::chats::create(&state.pool, brain)
+
+    // Resolved BEFORE the row is written, so a session the daemon cannot find leaves nothing behind
+    // — rather than a conversation that looks continued and starts a fresh context on its first turn.
+    let continued = match body.continue_session.clone() {
+        None => None,
+        Some(session_id) => {
+            let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
+            let found =
+                tokio::task::spawn_blocking(move || crate::sessions::find(&root, &session_id))
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Some(found.ok_or(StatusCode::NOT_FOUND)?)
+        }
+    };
+
+    let chat_id = crate::chats::create(
+        &state.pool,
+        brain,
+        continued.as_ref().map(|session| session.cwd.as_str()),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "opening a chat failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Written after the chat exists, because it is what `get_session` reads to decide the first
+    // turn resumes rather than starts clean. A failure here is not a failed request: the
+    // conversation is real and usable, it simply begins a context of its own — so it is logged as
+    // the thing it is rather than rolled back into a 500 the caller cannot act on.
+    if let Some(session) = &continued
+        && let Err(error) = crate::assistant::upsert_session(
+            &state.pool,
+            &chat_id,
+            &session.session_id,
+            &chrono::Utc::now().to_rfc3339(),
+        )
         .await
-        .map(|chat_id| Json(serde_json::json!({ "chat_id": chat_id })))
-        .map_err(|error| {
-            tracing::warn!(%error, "opening a chat failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    {
+        tracing::warn!(
+            %error,
+            chat_id = %chat_id,
+            session_id = %session.session_id,
+            "the conversation was opened but could not be attached to its session; it will start clean"
+        );
+    }
+
+    Ok(Json(serde_json::json!({ "chat_id": chat_id })))
 }
 
 #[derive(serde::Deserialize)]
@@ -6542,6 +6636,88 @@ mod tests {
         );
     }
 
+    /// A chat opened the ordinary way is rooted nowhere, which is what keeps it on the tool policy
+    /// every chat has always had. The one line that would quietly hand the filesystem to every
+    /// existing conversation is the one that made this default something other than `None`.
+    #[tokio::test]
+    async fn a_chat_opened_the_ordinary_way_is_rooted_nowhere() {
+        let state = test_state().await;
+        let created = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let chat_id = json_body(created).await["chat_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            crate::chats::cwd_of(&state.pool, &chat_id).await.unwrap(),
+            None
+        );
+    }
+
+    /// A session that is not on this machine leaves NOTHING behind — not a chat, not a row.
+    ///
+    /// The alternative is worse than an error: a conversation that says it continues something,
+    /// starts a fresh context on its first turn, and never explains the difference to anyone.
+    #[tokio::test]
+    async fn continuing_a_session_that_does_not_exist_opens_no_conversation_at_all() {
+        let state = test_state().await;
+        // Counted rather than asserted empty: `0061` seeds the conversation the single-assistant
+        // page used to be, so a fresh database already has one and always will.
+        let before = crate::chats::list(&state.pool).await.unwrap().len();
+        let refused = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"continue_session":"no-such-session-anywhere"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            crate::chats::list(&state.pool).await.unwrap().len(),
+            before,
+            "a refused continuation left a conversation behind"
+        );
+    }
+
+    /// The list answers, and answers a list. What is on it depends on the machine; that it is
+    /// reachable and behind the token does not.
+    #[tokio::test]
+    async fn the_ide_sessions_are_offered_over_http() {
+        let state = test_state().await;
+        let listed = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert!(json_body(listed).await.is_array());
+    }
+
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.
     ///
     /// Parked rather than slow, for the reason `LiveContextFillRunner` gives further down: a delay
@@ -6580,7 +6756,7 @@ mod tests {
     #[tokio::test]
     async fn changing_the_brain_forgets_the_session_the_other_model_left_behind() {
         let state = test_state().await;
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
             .await
             .unwrap();
         crate::assistant::upsert_session(
@@ -6615,7 +6791,7 @@ mod tests {
     async fn the_brain_cannot_be_changed_under_a_running_turn() {
         let mut state = test_state().await;
         state.runner = Arc::new(ParkedRunner);
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         crate::assistant::send_message(
@@ -6643,7 +6819,7 @@ mod tests {
     #[tokio::test]
     async fn renaming_a_chat_keeps_the_session_it_was_in_the_middle_of() {
         let state = test_state().await;
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         crate::assistant::upsert_session(
@@ -6700,7 +6876,7 @@ mod tests {
     async fn a_conversation_can_be_marked_read_while_it_is_still_answering() {
         let mut state = test_state().await;
         state.runner = Arc::new(ParkedRunner);
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         record_turn(&state, &id, "quanto sobra?", "cerca de 200").await;
@@ -6737,7 +6913,7 @@ mod tests {
     #[tokio::test]
     async fn the_listing_carries_how_many_answers_are_waiting() {
         let state = test_state().await;
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         record_turn(&state, &id, "quanto sobra?", "cerca de 200").await;
@@ -6777,7 +6953,7 @@ mod tests {
     #[tokio::test]
     async fn archiving_a_chat_takes_it_off_the_list() {
         let state = test_state().await;
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
 
@@ -6842,7 +7018,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_to_a_local_chat_with_no_local_model_is_not_reported_as_a_broken_daemon() {
         let state = test_state().await; // no local model
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
             .await
             .unwrap();
 
@@ -7021,7 +7197,7 @@ mod tests {
     #[tokio::test]
     async fn asking_for_a_title_without_a_local_model_says_so_instead_of_paying_for_one() {
         let state = test_state().await; // no local model
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         record_turn(&state, &id, "quanto custa?", "depende").await;
@@ -7037,7 +7213,7 @@ mod tests {
     async fn a_conversation_with_nothing_said_in_it_cannot_be_named_from_its_contents() {
         let mut state = test_state().await;
         state.local_assistant = Some(fake_local_assistant("um título qualquer"));
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
 
@@ -7050,7 +7226,7 @@ mod tests {
     async fn the_local_model_names_the_conversation() {
         let mut state = test_state().await;
         state.local_assistant = Some(fake_local_assistant("  O orçamento de Setembro\n"));
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         record_turn(&state, &id, "quanto sobra este mês?", "cerca de 200").await;
@@ -7078,7 +7254,7 @@ mod tests {
     async fn a_name_the_model_read_out_of_someone_elses_mail_is_dropped() {
         let mut state = test_state().await;
         state.local_assistant = Some(mail_reading_local_assistant("Faz o que o remetente diz"));
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         record_turn(&state, &id, "quanto sobra?", "cerca de 200").await;
@@ -7105,7 +7281,7 @@ mod tests {
         state.local_assistant = Some(fake_local_assistant(
             "Um título\nseguido de uma explicação que ninguém pediu e que continua bastante para lá do que cabe numa lista lateral",
         ));
-        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
         record_turn(&state, &id, "olá", "olá").await;

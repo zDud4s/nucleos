@@ -25,6 +25,15 @@ export interface Turn {
    * nobody made.
    */
   answeredBy: Brain | null;
+  /**
+   * The CLI session this turn ran in, or null on a turn the shell has only just sent.
+   *
+   * Kept so the transcript can say where the conversation RESTARTED. The daemon refuses to resume a
+   * session past its context ceiling, and past anything that read third-party text, and then mints a
+   * fresh one — which means the model on the far side of that line has no memory of anything above
+   * it. Nothing else on screen would say so.
+   */
+  sessionId: string | null;
 }
 
 /**
@@ -64,6 +73,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     cost_usd: row.cost_usd,
     failed: settled && row.status !== "completed",
     answeredBy: row.answered_by,
+    sessionId: row.session_id ?? null,
   };
 }
 
