@@ -441,6 +441,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                         tool,
                         "pretooluse-decision: refused an action in a turn that has read third-party content"
                     );
+                    record_refused_action(state, payload, tool).await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -473,6 +474,55 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                 reason: "orchestrator NucleOS tool".to_owned(),
             })
         }
+    }
+}
+
+/// Writes down an action the barrier just refused, so somebody finds out it was wanted.
+///
+/// **Best-effort, and deliberately after the decision is already made.** Every failure here is
+/// swallowed: the refusal is the security property and this is the courtesy beside it, so a full
+/// disk or a lost race must never be able to turn a `deny` into anything else. The one failure that
+/// is expected rather than exceptional is the unique violation — a run that reaches a second time
+/// already has its row — and it is not worth a warning, which is why the log line says how many
+/// rather than complaining.
+///
+/// The reasoning is the same sentence the model was given, because the person reading this in the
+/// morning is answering a different question from the model's: not "may I", but "should I do this
+/// myself". The tool input travels with it for the same reason — an errand asking to email a dealer
+/// is a decision nobody can take from the tool name alone.
+async fn record_refused_action(state: &AppState, payload: &PreToolUsePayload, tool: &str) {
+    let session_id =
+        sqlx::query_scalar::<_, Option<String>>("SELECT session_id FROM runs WHERE id = ?")
+            .bind(payload.run_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+
+    match crate::proposals::create_refused_action(
+        &state.pool,
+        payload.run_id,
+        session_id.as_deref(),
+        None,
+        tool,
+        UNTRUSTED_CONTEXT_DENY_REASON,
+        Some(&payload.tool_input.to_string()),
+    )
+    .await
+    {
+        Ok(proposal_id) => tracing::info!(
+            run_id = payload.run_id,
+            proposal_id,
+            tool,
+            "pretooluse-decision: the refused action was written down for a person to read"
+        ),
+        Err(error) => tracing::debug!(
+            run_id = payload.run_id,
+            tool,
+            %error,
+            "pretooluse-decision: this run already has a refused action on record, or it could not be written"
+        ),
     }
 }
 
@@ -2550,6 +2600,119 @@ mod tests {
                 .await
                 .unwrap(),
             "a file classified against an errand this run does not belong to must count as a stranger's words"
+        );
+    }
+
+    /// The barrier gets a door, and the door is a person.
+    ///
+    /// §6 refuses an action once a turn has read a stranger's words, and for an errand that is
+    /// every turn that did any research — which is all of them. Until now the refusal was the end
+    /// of the line: the model was stopped and the owner never learned what it had wanted to do. So
+    /// the errand that spends an afternoon finding the right car cannot tell anyone it found it.
+    ///
+    /// The refusal does not move. What changes is that it is written down where somebody can read
+    /// it, decide, and act — or ask the errand again in a fresh turn, which starts clean and may
+    /// act. That is the whole of piece 5: the refusal keeps a record instead of a silence.
+    #[tokio::test]
+    async fn an_action_refused_after_the_web_is_written_down_for_a_person() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:8").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "deny", "the barrier does not bend");
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused.len(), 1, "and the person gets to know about it");
+        assert_eq!(refused[0].tool_name.as_deref(), Some("create_run"));
+        assert!(
+            refused[0]
+                .tool_input
+                .as_deref()
+                .unwrap()
+                .contains("encomendar o Golf"),
+            "with enough of it to decide on: {:?}",
+            refused[0].tool_input
+        );
+    }
+
+    /// The guard. If this fails, piece 5 has put a human step in front of everything that worked
+    /// before it — which is the failure mode of every approval mechanism ever added to anything.
+    #[tokio::test]
+    async fn an_action_in_a_clean_turn_still_goes_straight_through() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:9").await;
+        let app = test_router(state.clone());
+
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "allow");
+        assert!(
+            crate::proposals::list_refused_actions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was refused, so there is nothing to ask anybody about"
+        );
+    }
+
+    /// A turn that keeps reaching leaves ONE record, not one per attempt.
+    ///
+    /// The same shape the git queue already uses for the same problem: a model told no will often
+    /// try again, and a person who opens their phone to eleven copies of one question stops reading
+    /// the list — which costs more than the feature was worth. Enforced by a partial unique index
+    /// rather than a check-then-insert, so two attempts racing cannot both find nothing there.
+    #[tokio::test]
+    async fn a_turn_that_keeps_reaching_leaves_one_record_not_many() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:10").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        for prompt in ["primeira", "segunda", "terceira"] {
+            let act = orchestrator_tool(
+                &app,
+                run_id,
+                "create_run",
+                serde_json::json!({"project_id": "proj", "prompt": prompt}),
+            )
+            .await;
+            assert_eq!(act.decision, "deny", "every one of them is still refused");
+        }
+
+        assert_eq!(
+            crate::proposals::list_refused_actions(&state.pool)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 

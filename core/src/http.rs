@@ -140,6 +140,7 @@ pub fn build_router(state: AppState) -> Router {
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
         .route("/proposals/skipped-items", get(get_skipped_items))
+        .route("/proposals/refused-actions", get(get_refused_actions))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
         .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
@@ -3347,6 +3348,25 @@ async fn get_skipped_items(
         })
 }
 
+/// What the injection barrier refused, and what it was going to do.
+///
+/// The same shape as the listing above and for the same reason: neither kind can be approved into
+/// happening, so neither belongs on `/proposals`, whose two buttons answer 409 for anything but an
+/// `action-approval`. Its own route rather than sharing `/proposals/skipped-items`, because those
+/// are a job's items and the shell renders them inside a job graph — an errand's refused email has
+/// no graph to sit in and would arrive there as an orphan.
+async fn get_refused_actions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_refused_actions(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing refused actions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 /// Puts a read skipped item away. Its own door, not a third arm of `/reject`.
 ///
 /// Nothing is being refused here and nothing is released — the job let go of the item and the
@@ -6543,6 +6563,67 @@ mod tests {
             Some(serde_json::json!({"chat_id": "-1:99", "text": "procura", "origin": "telegram"})),
         )
         .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// A record nobody can reach is the same as no record. This is the door.
+    ///
+    /// Dismiss and not approve or reject: nothing is held, so there is nothing to release and
+    /// nothing to let through. The person has read it, and a list that cannot be cleared stops
+    /// being read — which is the same outcome as having no route, arrived at more slowly.
+    #[tokio::test]
+    async fn a_refused_action_can_be_read_and_then_put_away() {
+        let state = test_state().await;
+        let id = crate::proposals::create_refused_action(
+            &state.pool,
+            7,
+            None,
+            None,
+            "send_email",
+            "this turn has read third-party content and can no longer act",
+            Some(r#"{"to":"stand@example"}"#),
+        )
+        .await
+        .unwrap();
+
+        let (status, listed) = call(state.clone(), "GET", "/proposals/refused-actions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["tool_name"], "send_email");
+
+        let (dismissed, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{id}/dismiss"),
+            None,
+        )
+        .await;
+        assert_eq!(dismissed, StatusCode::NO_CONTENT);
+
+        let (_, after) = call(state, "GET", "/proposals/refused-actions", None).await;
+        assert!(after.as_array().unwrap().is_empty());
+    }
+
+    /// The guard on the widened dismissal. An `action-approval` holds a paused run and a worktree;
+    /// putting one away here would drop both on the floor with no record of a decision, and the
+    /// person who meant to press reject would see a 204 and believe they had.
+    #[tokio::test]
+    async fn an_action_approval_still_cannot_be_dismissed() {
+        let state = test_state().await;
+        let id = crate::proposals::create_action_approval(
+            &state.pool,
+            7,
+            None,
+            Some("proj"),
+            "Bash",
+            "push needs approval",
+            Some(r#"{"command":"git push"}"#),
+        )
+        .await
+        .unwrap();
+
+        let (status, _) = call(state, "POST", &format!("/proposals/{id}/dismiss"), None).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
     }
