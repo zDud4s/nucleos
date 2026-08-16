@@ -682,6 +682,177 @@ func TestTheNotifierAnnouncesWhatArrivesAfterItIsSeeded(t *testing.T) {
 	}
 }
 
+// An errand's line goes to the errand's topic, and not to the configured chat.
+//
+// This is what piece 4 was missing. A rule fires with nobody watching the topic, and until now the
+// only trace was a row in the database: the sidecar polls the GLOBAL feed, and an errand's lines
+// deliberately do not appear there. Sending them to the configured chat instead would be the wrong
+// half of the fix — the answer belongs where the question was asked, which is the whole reason a
+// topic IS an errand.
+func TestAnErrandsFeedLineGoesToItsOwnTopic(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{},
+		stopAfter:       6,
+		stop:            cancel,
+		errands: []daemon.Errand{
+			{ID: 1, Name: "carros", ChatKey: "-1001234567890:7", Status: "active"},
+		},
+		feedArriving: map[int][]map[string]any{3: {
+			{"id": float64(31), "errand_id": float64(1), "kind": "errand_rule_fired",
+				"summary": "a regra manhã começou um turno"},
+		}},
+	}
+
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+
+	var errandLines []sentMessage
+	for _, message := range bot.messages {
+		if strings.Contains(message.text, "manhã") {
+			errandLines = append(errandLines, message)
+		}
+	}
+	if len(errandLines) != 1 {
+		t.Fatalf("errand announcements = %v, want exactly one", bot.messages)
+	}
+	want := telegram.Destination{ChatID: -1001234567890, ThreadID: 7}
+	if errandLines[0].to != want {
+		t.Errorf("errand line went to %+v, want %+v", errandLines[0].to, want)
+	}
+}
+
+// The guard on the other side: what the MACHINE does still goes to the configured chat.
+//
+// The kill switch, the budget and a proposal awaiting approval are not any errand's business, and
+// the configured chat is where somebody is watching for them. Routing by errand must not become
+// routing everything by errand — a stop nobody is told about is a stop that stopped nothing.
+func TestMachineNotificationsStayInTheConfiguredChat(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	configured := telegram.Destination{ChatID: 42}
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{},
+		stopAfter:       6,
+		stop:            cancel,
+		arriving:        map[int][]map[string]any{3: {{"id": float64(5), "tool_name": "git push"}}},
+		errands: []daemon.Errand{
+			{ID: 1, Name: "carros", ChatKey: "-1001234567890:7", Status: "active"},
+		},
+		feedArriving: map[int][]map[string]any{3: {
+			{"id": float64(31), "errand_id": float64(1), "kind": "errand_rule_fired",
+				"summary": "a regra manhã começou um turno"},
+			// `errand_id` spelled as an explicit null, because that is what the daemon sends: serde
+			// writes the field on every row whether or not it holds anything. A machine line in a
+			// test that simply omits the key cannot catch the reading that goes by presence — and
+			// that reading is not hypothetical, it shipped once in `formatProposal` and printed
+			// `project: <nil>` on every proposal without a project.
+			{"id": float64(32), "errand_id": nil, "kind": "kill_switch",
+				"summary": "the emergency stop was released"},
+		}},
+	}
+
+	RunNotifier(ctx, bot, dc, configured, time.Millisecond)
+
+	// Arrival first, and it is not a formality: a routing that reads `errand_id` by presence rather
+	// than by type finds the explicit null, decides the line belongs to errand 0, finds no such
+	// errand and DROPS it. Nothing is misrouted, so a test that only checks where messages went
+	// passes while the emergency stop stops being announced.
+	var stop *sentMessage
+	for i, message := range bot.messages {
+		if strings.Contains(message.text, "emergency stop") {
+			stop = &bot.messages[i]
+		}
+	}
+	if stop == nil {
+		t.Fatalf("the kill-switch line was never announced: %v", bot.messages)
+	}
+	if stop.to != configured {
+		t.Errorf("the kill-switch line went to %+v, want the configured chat %+v", stop.to, configured)
+	}
+
+	for _, message := range bot.messages {
+		if strings.Contains(message.text, "manhã") {
+			continue
+		}
+		if message.to != configured {
+			t.Errorf("a machine notification went to %+v, want the configured chat %+v: %q",
+				message.to, configured, message.text)
+		}
+	}
+}
+
+// An errand whose topic cannot be read is skipped, and nothing of it is sent anywhere.
+//
+// The guessing this refuses is not hypothetical: every other branch here has a destination to hand,
+// so "use the one we already have" is the natural thing to write. It would post an errand's working
+// notes — which may quote whatever it has been reading on the open web — into the group's General.
+func TestAnErrandWithAnUnreadableTopicIsSkippedRatherThanRedirected(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{},
+		stopAfter:       6,
+		stop:            cancel,
+		errands: []daemon.Errand{
+			{ID: 1, Name: "carros", ChatKey: "not-a-topic", Status: "active"},
+		},
+		feedArriving: map[int][]map[string]any{3: {
+			{"id": float64(31), "errand_id": float64(1), "kind": "errand_rule_fired",
+				"summary": "a regra manhã começou um turno"},
+		}},
+	}
+
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+
+	for _, message := range bot.messages {
+		if strings.Contains(message.text, "manhã") {
+			t.Errorf("an errand line was sent to %+v despite an unreadable topic: %q", message.to, message.text)
+		}
+	}
+}
+
+// A closed or paused errand is not polled, and says nothing.
+//
+// `/pausa` stops the schedule (the núcleo's `armed_rules` filters on status) and this is the same
+// promise one layer out: a paused errand goes quiet in its topic too. Without it a pause would still
+// be repeating whatever was in the feed when it was paused.
+func TestAPausedErrandSaysNothing(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{},
+		stopAfter:       6,
+		stop:            cancel,
+		errands: []daemon.Errand{
+			{ID: 1, Name: "carros", ChatKey: "-1001234567890:7", Status: "paused"},
+			{ID: 2, Name: "casa", ChatKey: "-1001234567890:9", Status: "done"},
+		},
+		feedArriving: map[int][]map[string]any{3: {
+			{"id": float64(31), "errand_id": float64(1), "kind": "errand_rule_fired",
+				"summary": "a regra manhã começou um turno"},
+			{"id": float64(32), "errand_id": float64(2), "kind": "errand_rule_fired",
+				"summary": "a regra contas começou um turno"},
+		}},
+	}
+
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+
+	for _, message := range bot.messages {
+		if strings.Contains(message.text, "manhã") || strings.Contains(message.text, "contas") {
+			t.Errorf("an errand that is not answering still spoke: %q", message.text)
+		}
+	}
+}
+
 // A proposal was marked as announced before anyone had been announced to, so a send that failed
 // took the prompt with it: the agent's action sits waiting and the person who has to decide never
 // learns there is anything to decide.
@@ -729,6 +900,19 @@ type bootingDaemon struct {
 	proposals      []map[string]any
 	feed           []map[string]any
 	arriving       map[int][]map[string]any
+	// feedArriving is `arriving` for the feed: what shows up on a given poll rather than what was
+	// already there at boot. Seeding marks everything present at boot as told, so a line placed in
+	// `feed` can never be announced — which is correct, and is why a test about announcing needs
+	// this instead.
+	feedArriving map[int][]map[string]any
+	errands      []daemon.Errand
+}
+
+func (d *bootingDaemon) ListErrands() ([]daemon.Errand, error) {
+	if d.calls <= d.unreachableFor {
+		return nil, errors.New("daemon not up yet")
+	}
+	return d.errands, nil
 }
 
 func (d *bootingDaemon) GetProposals() ([]map[string]any, error) {
@@ -748,6 +932,9 @@ func (d *bootingDaemon) GetProposals() ([]map[string]any, error) {
 func (d *bootingDaemon) GetFeed() ([]map[string]any, error) {
 	if d.calls <= d.unreachableFor {
 		return nil, errors.New("daemon not up yet")
+	}
+	if arrived, ok := d.feedArriving[d.calls]; ok {
+		return arrived, nil
 	}
 	return d.feed, nil
 }
@@ -857,6 +1044,56 @@ func TestChatKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := ChatKey(tc.to); got != tc.want {
 				t.Errorf("ChatKey(%+v) = %q, want %q", tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
+// The way back. `ChatKey` composes and, until now, nothing took one apart — which was fine while
+// every key the sidecar held came from an update it had just received, and stops being fine the
+// moment the daemon hands one back: an errand's `chat_key` is the only thing that says which topic
+// its work belongs to.
+//
+// Every case here is a case of `TestChatKey` read in the other direction, deliberately, because the
+// property that matters is that the pair are inverses. A decomposition that disagreed with the
+// composition would put an errand's answers in a topic nobody is reading.
+func TestDestinationFromKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  string
+		want telegram.Destination
+	}{
+		{"a topic of a group", "-1001234567890:7", telegram.Destination{ChatID: -1001234567890, ThreadID: 7}},
+		{"no topic", "-1001234567890", telegram.Destination{ChatID: -1001234567890}},
+		{"a positive id", "12345:3", telegram.Destination{ChatID: 12345, ThreadID: 3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := DestinationFromKey(tc.key)
+			if !ok {
+				t.Fatalf("DestinationFromKey(%q) refused a key ChatKey produces", tc.key)
+			}
+			if got != tc.want {
+				t.Errorf("DestinationFromKey(%q) = %+v, want %+v", tc.key, got, tc.want)
+			}
+			if round := ChatKey(got); round != tc.key {
+				t.Errorf("ChatKey(DestinationFromKey(%q)) = %q; the two are not inverses", tc.key, round)
+			}
+		})
+	}
+}
+
+// A key that cannot be read is refused, and never quietly becomes the configured chat.
+//
+// This is the one that matters for what gets SEEN. The fallback nobody writes on purpose is "send
+// it to the usual place", and the usual place is a group's General: an errand's working notes,
+// which may quote whatever it has been reading on the open web, posted where the errand is not.
+// Refusing costs a log line and a missing notification; guessing costs the thing being in the wrong
+// room, and nothing about it looks wrong afterwards.
+func TestAKeyThatCannotBeReadIsRefusedRatherThanGuessedAt(t *testing.T) {
+	for _, key := range []string{"", "abc", "-100:", ":7", "-100:abc", "-100:7:9", " -100"} {
+		t.Run(key, func(t *testing.T) {
+			if got, ok := DestinationFromKey(key); ok {
+				t.Errorf("DestinationFromKey(%q) = %+v, true; want a refusal", key, got)
 			}
 		})
 	}

@@ -139,6 +139,47 @@ func ChatKey(to telegram.Destination) string {
 	return key
 }
 
+// DestinationFromKey is ChatKey read backwards: the topic a key names, or a refusal.
+//
+// It exists because keys now travel in the other direction. Every key this sidecar held used to come
+// from an update it had just received, so a `telegram.Destination` was always at hand; an errand's
+// `chat_key` arrives from the daemon with no update behind it, and it is the only thing that says
+// which topic that errand's work belongs to.
+//
+// Split on the LAST colon, though neither half can contain one — a chat id and a thread id are both
+// integers. Taking the last is what makes a malformed key with two colons fail on the parse instead
+// of silently reading `-100:7` as a chat id, which is the shape a wrong answer would take.
+//
+// The refusal is the point of the second return value. The fallback nobody writes on purpose is
+// "send it to the usual place", and the usual place is the configured chat — a group's General,
+// where an errand's working notes do not belong. A missing notification is a thing somebody
+// notices; a notification in the wrong room is not.
+func DestinationFromKey(key string) (telegram.Destination, bool) {
+	chat, thread := key, ""
+	if cut := strings.LastIndex(key, ":"); cut >= 0 {
+		chat, thread = key[:cut], key[cut+1:]
+	}
+
+	chatID, err := strconv.ParseInt(chat, 10, 64)
+	if err != nil {
+		return telegram.Destination{}, false
+	}
+	if thread == "" {
+		// No colon at all: a one-to-one chat or a group's General, exactly as `ChatKey` writes it.
+		// A key ENDING in a colon is a different thing and lands in the parse below, where it fails.
+		if !strings.Contains(key, ":") {
+			return telegram.Destination{ChatID: chatID}, true
+		}
+		return telegram.Destination{}, false
+	}
+
+	threadID, err := strconv.ParseInt(thread, 10, 64)
+	if err != nil {
+		return telegram.Destination{}, false
+	}
+	return telegram.Destination{ChatID: chatID, ThreadID: threadID}, true
+}
+
 // DestinationOf is where an update came from, and therefore where its answer goes.
 func DestinationOf(u telegram.Update) telegram.Destination {
 	switch {
@@ -827,8 +868,20 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 			}
 		}
 		if feed, err := dc.GetFeed(); err == nil {
+			// Read once per round, not once per line: an errand's topic does not change between
+			// two lines of a single poll.
+			topics := errandTopics(dc)
 			for _, f := range state.NewFeedItems(feed) {
-				err := bot.SendMessage(to, "📣 "+formatFeed(f))
+				where, ok := feedDestination(f, topics, to)
+				if !ok {
+					// An errand line with nowhere to go. Left marked as seen rather than forgotten:
+					// the reasons it has nowhere to go — the errand was closed, or its topic is not
+					// a topic — do not clear by looking again, so retrying would only repeat the log
+					// line for ever. What is NOT allowed is the other resolution, which is to send
+					// it to `to` and put an errand's notes in the group's General.
+					continue
+				}
+				err := bot.SendMessage(where, "📣 "+formatFeed(f))
 				logSend("feed item", err)
 				if err != nil {
 					state.Forget(idOf(f))
@@ -850,6 +903,64 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 			logSend("budget alert", bot.SendMessage(to, formatBudget(budget)))
 		}
 	}
+}
+
+// errandTopics is where each errand still answering can be reached.
+//
+// Only the active ones, and only those whose key reads as a topic. Both exclusions are the same
+// decision as an omission: an errand that is paused or closed has nothing to say in its topic — the
+// núcleo already stopped its schedule for the same reason — and a key that will not parse has
+// nowhere to say it. Absent from this map means the line is dropped, which is the whole point of
+// building the map from what is reachable rather than checking each line against a list.
+//
+// An error reading the errands returns an empty map, and so drops that round's errand lines. The
+// alternative would be to fall back to the configured chat while the daemon is briefly unreachable,
+// which is exactly the disclosure this routing exists to prevent.
+func errandTopics(dc Daemon) map[int64]telegram.Destination {
+	topics := map[int64]telegram.Destination{}
+	errands, err := dc.ListErrands()
+	if err != nil {
+		log.Printf("notifier: could not read the errands; their lines wait for the next look: %v", err)
+		return topics
+	}
+	for _, errand := range errands {
+		if errand.Status != "active" {
+			continue
+		}
+		where, ok := DestinationFromKey(errand.ChatKey)
+		if !ok {
+			log.Printf("notifier: errand %d (%q) has a topic that cannot be read (%q); it stays quiet",
+				errand.ID, errand.Name, errand.ChatKey)
+			continue
+		}
+		topics[errand.ID] = where
+	}
+	return topics
+}
+
+// feedDestination is where one feed line belongs: its errand's topic, or the configured chat.
+//
+// `errand_id` is read by TYPE and not by presence, which is not pedantry — serde writes the field on
+// every row whether or not it holds anything, so a presence check would call every machine-wide line
+// an errand's and route the kill switch into a topic. That exact mistake was live in
+// `formatProposal` until this branch, where it printed `project: <nil>` on every proposal without a
+// project.
+//
+// The `false` means "nowhere", never "the usual place". A caller that treated it as a fallback would
+// undo the routing in the one case it exists for.
+func feedDestination(
+	item map[string]any,
+	topics map[int64]telegram.Destination,
+	configured telegram.Destination,
+) (telegram.Destination, bool) {
+	raw, ok := item["errand_id"].(float64)
+	if !ok {
+		// The machine's own line: the kill switch, the budget, a run that finished. It goes where
+		// somebody is watching for it.
+		return configured, true
+	}
+	where, ok := topics[int64(raw)]
+	return where, ok
 }
 
 // seedNotifier records what already exists so it is never announced. It is all-or-nothing: a
