@@ -2148,6 +2148,209 @@ export async function deleteAgent(token: string, id: string): Promise<ApiResult<
   }
 }
 
+// ── Teams ───────────────────────────────────────────────────────────────────
+
+/** A department: a director, a roster, and the ceilings it runs under. */
+export interface Team {
+  id: string;
+  name: string;
+  mission: string;
+  director_agent_id: string;
+  max_rounds: number;
+  max_parallel: number;
+  budget_usd: number | null;
+  created_at: string;
+  updated_at: string;
+  /** The roster, flattened onto the team by the daemon: the membership IS the team. */
+  members: string[];
+}
+
+export interface TeamInput {
+  name: string;
+  mission: string;
+  director_agent_id: string;
+  max_rounds: number;
+  max_parallel: number;
+  budget_usd: number | null;
+  members: string[];
+}
+
+/** One piece of work a director handed to one specialist. */
+export interface TeamItem {
+  ordinal: number;
+  round: number;
+  agent_id: string;
+  description: string;
+  state: string;
+  run_id: number | null;
+  /** Relative to the run's folder. Null until there is an answer — a failed item never gets one. */
+  output_path: string | null;
+}
+
+export interface TeamRun {
+  id: string;
+  team_id: string;
+  request: string;
+  /** Relative to the files root, so the Files tab reaches the delivery without a second path. */
+  workspace: string;
+  state: string;
+  director_node: string;
+  director_run_id: number | null;
+  round: number;
+  next_ordinal: number;
+  dry_rounds: number;
+  plan_retries: number;
+  replanned: string;
+  outcome: string | null;
+  why: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
+export interface TeamRunDetail extends TeamRun {
+  items: TeamItem[];
+  cost_usd: number;
+}
+
+/**
+ * The daemon's own ceilings, mirrored so the form refuses out of range at the field rather than by
+ * a 400 the owner has to read. They are the daemon's to enforce; these are only where it is said.
+ */
+export const TEAM_MAX_ROUNDS_CEILING = 6;
+export const TEAM_MAX_PARALLEL_CEILING = 8;
+
+/** The three states in which a run is still going somewhere — `team::LIVE_STATES`. */
+export const TEAM_LIVE_STATES = ["planning", "working", "delivering"] as const;
+
+export function teamRunIsLive(state: string): boolean {
+  return (TEAM_LIVE_STATES as readonly string[]).includes(state);
+}
+
+export async function listTeams(token: string): Promise<Team[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/teams`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as Team[];
+  } catch {
+    return null;
+  }
+}
+
+export async function createTeam(token: string, input: TeamInput): Promise<ApiResult<Team>> {
+  return writeTeam(`${DAEMON_URL}/teams`, "POST", token, input);
+}
+
+export async function updateTeam(
+  token: string,
+  id: string,
+  input: TeamInput,
+): Promise<ApiResult<Team>> {
+  return writeTeam(`${DAEMON_URL}/teams/${encodeURIComponent(id)}`, "PUT", token, input);
+}
+
+async function writeTeam(
+  url: string,
+  method: string,
+  token: string,
+  input: TeamInput,
+): Promise<ApiResult<Team>> {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as Team };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function deleteTeam(token: string, id: string): Promise<ApiResult<null>> {
+  return teamVerb(`${DAEMON_URL}/teams/${encodeURIComponent(id)}`, "DELETE", token);
+}
+
+/** 202 and an id: the record exists and the department has not started thinking yet. */
+export async function startTeamRun(
+  token: string,
+  id: string,
+  request: string,
+): Promise<ApiResult<{ id: string }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/teams/${encodeURIComponent(id)}/runs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ request }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { id: string } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+export async function listTeamRuns(token: string): Promise<TeamRun[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/team-runs`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TeamRun[];
+  } catch {
+    return null;
+  }
+}
+
+export async function getTeamRun(token: string, id: string): Promise<TeamRunDetail | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/team-runs/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TeamRunDetail;
+  } catch {
+    return null;
+  }
+}
+
+export async function cancelTeamRun(token: string, id: string): Promise<ApiResult<null>> {
+  return teamVerb(`${DAEMON_URL}/team-runs/${encodeURIComponent(id)}/cancel`, "POST", token);
+}
+
+/** Deletes the record AND the folder. The daemon refuses while the run is still live. */
+export async function deleteTeamRun(token: string, id: string): Promise<ApiResult<null>> {
+  return teamVerb(`${DAEMON_URL}/team-runs/${encodeURIComponent(id)}`, "DELETE", token);
+}
+
+async function teamVerb(url: string, method: string, token: string): Promise<ApiResult<null>> {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: null };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
 // ── Presets ─────────────────────────────────────────────────────────────────
 
 /** A saved run request: a name, plus the exact body `/runs` would have taken. */
