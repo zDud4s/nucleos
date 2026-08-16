@@ -35,7 +35,58 @@ import urllib.request
 # costs the guarantee.
 QUEUE_SUBCOMMANDS = ("merge", "push", "tag", "fetch", "branch", "rebase")
 
+# Where one command word can end and another begin, in sh or in PowerShell. Normalized to spaces
+# before the scan below, so `cd x&&git push` splits with no spaces in it anywhere.
+SEGMENT_SEPARATORS = "\n\r;|&()`{}"
+
+# Global flags that swallow the token after them. Everything else starting with `-` is either a
+# valueless flag or a `--flag=value`, and skipping one token is right for both.
+GIT_FLAGS_WITH_VALUES = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path")
+
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8791"
+
+
+def governed_git_verb(command: str) -> str:
+    """The queue verb this command would run, or `""`.
+
+    Scans the WHOLE command, not its first two words. The first version of this filter read
+    `tokens[0]` and `tokens[1]` and so governed a command only when it literally began `git
+    <verb>` — which `cd repo\\ngit push`, `true && git push`, and any leading `echo` walked
+    straight past into silence. That is the one direction this filter must not fail in, and it
+    failed in it: the file's own comment above says under-including costs the guarantee, while
+    the code under it under-included.
+
+    Deliberately over-broad, as that comment asks. `echo "run git push later"` matches and is
+    refused, and a quoted mention is the price of not needing a shell parser to be sure. The cost
+    of a false positive is one refusal a person can reword; the cost of a false negative is the
+    queue's whole promise, silently.
+    """
+    normalized = command
+    for separator in SEGMENT_SEPARATORS:
+        normalized = normalized.replace(separator, " ")
+    tokens = [token.strip("\"'") for token in normalized.split()]
+
+    for index, token in enumerate(tokens):
+        # `git`, `/usr/bin/git`, `C:\Program Files\Git\bin\git.exe` — the name it was invoked by
+        # says nothing about what it does.
+        name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if name not in ("git", "git.exe"):
+            continue
+        rest = index + 1
+        while rest < len(tokens):
+            candidate = tokens[rest]
+            if candidate in GIT_FLAGS_WITH_VALUES:
+                rest += 2
+                continue
+            if candidate.startswith("-"):
+                rest += 1
+                continue
+            if candidate.lower() in QUEUE_SUBCOMMANDS:
+                return candidate.lower()
+            # A git call that is not a queue operation. Keep looking: a command may hold more
+            # than one, and the second is as governed as the first.
+            break
+    return ""
 
 
 def approve(reason: str = "autopilot: allowed") -> None:
@@ -124,12 +175,7 @@ def interactive_session(payload: dict) -> None:
     if not isinstance(command, str):
         no_opinion()
 
-    tokens = command.split()
-    if (
-        len(tokens) < 2
-        or tokens[0].lower() != "git"
-        or tokens[1].lower() not in QUEUE_SUBCOMMANDS
-    ):
+    if not governed_git_verb(command):
         no_opinion()
 
     cwd = payload.get("cwd") or os.getcwd()
