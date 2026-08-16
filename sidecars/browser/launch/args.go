@@ -115,6 +115,22 @@ func Args(opts Options) ([]string, error) {
 		// the two mechanisms — the other one is auto-attach, which works but leaves a target to
 		// reason about.
 		"--block-new-web-contents",
+
+		// The startup page, and it is here for a measured reason rather than for tidiness. Without
+		// it Chrome opens the New Tab Page, whose OneGoogle module and logging reach
+		// ogads-pa.clients6.google.com and play.google.com/log — MEASURED 2026-08-16 inside a gate
+		// session that had visited nothing but 127.0.0.1, and NOT stopped by
+		// --disable-background-networking above, which does not cover the NTP's own modules.
+		//
+		// The fence refused all of it, so nothing left the machine. The damage was elsewhere: a
+		// refusal is recorded per session and the next act reports the head of that record (see
+		// chrome.Driver.newRefusal), so the browser's own traffic was being handed to the agent as
+		// the consequence of ITS click. Removing the source is the fix; there is no way for the
+		// fence to tell whose request it stopped once it has stopped it.
+		//
+		// Agent mode only. A person's window starting on a blank page instead of their New Tab Page
+		// would be taking something away from them to solve a problem that is not theirs.
+		"about:blank",
 	), nil
 }
 

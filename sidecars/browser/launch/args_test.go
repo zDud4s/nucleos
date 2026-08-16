@@ -64,6 +64,41 @@ func TestTheFenceIsTheDiff(t *testing.T) {
 	}
 }
 
+// TestAgentModeStartsOnABlankPage.
+//
+// MEASURED 2026-08-16, and the reason it is a test rather than a flag among flags: with no startup
+// URL Chrome opens the New Tab Page, whose own modules reach ogads-pa.clients6.google.com and
+// play.google.com/log. That happened inside a fenced session that had visited nothing but
+// 127.0.0.1, and --disable-background-networking did not stop it.
+//
+// The fence refused every one of those requests, so this is not about something leaving the machine.
+// It is about what the AGENT was told: refusals are recorded per session and the next act reports
+// the head of the record, so the browser's own chatter was being handed back as the consequence of
+// the agent's click. It made gate/fence_test.go's reporting assertion fail about one run in six, and
+// it would have made a live agent retry a click it had been told the wrong thing about.
+func TestAgentModeStartsOnABlankPage(t *testing.T) {
+	agent, err := Args(agentOptions())
+	if err != nil {
+		t.Fatalf("agent args: %v", err)
+	}
+	if !slices.Contains(agent, "about:blank") {
+		t.Error("agent mode has no startup page, so Chrome opens the New Tab Page and talks to Google")
+	}
+
+	// Not in human mode, and the asymmetry is the point: the person's New Tab Page is theirs, there
+	// is no fence in that window to confuse, and taking it away would be solving our problem with
+	// their browser.
+	human := agentOptions()
+	human.Mode = browser.ModeHuman
+	humanArgs, err := Args(human)
+	if err != nil {
+		t.Fatalf("human args: %v", err)
+	}
+	if slices.Contains(humanArgs, "about:blank") {
+		t.Error("human mode was given a blank startup page; the person's new tab is not ours to replace")
+	}
+}
+
 // TestHumanModeIsNotHeadless. Spec §4.1 forbids a hidden rendering state in both directions: agent
 // mode must not be visible, and human mode must not be invisible.
 func TestHumanModeIsNotHeadless(t *testing.T) {
