@@ -452,15 +452,160 @@ impl SeatKind {
     }
 }
 
-/// One seat of a roster: where it runs and which model answers.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// The one place the catalogue's vocabulary and the council's meet.
+///
+/// `agents.engine` says which program answers; `SeatKind` says which machine. They are two
+/// nomenclatures for overlapping facts, and the divergence is deliberate — renaming the council's
+/// columns to match would touch a shipped table to change no behaviour. What is NOT acceptable is
+/// two translations, so there is one, here, walked in both directions by a test.
+pub const ENGINE_SEAT_KINDS: &[(&str, SeatKind)] = &[
+    ("claude", SeatKind::Cloud),
+    ("codex", SeatKind::Cloud),
+    ("local", SeatKind::Local),
+];
+
+/// PURE: where an agent of the catalogue would run, or `None` for an engine no seat can host.
+pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
+    ENGINE_SEAT_KINDS
+        .iter()
+        .find(|(name, _)| *name == engine)
+        .map(|(_, kind)| *kind)
+}
+
+/// One seat as a roster DECLARES it: either a model, or an agent of the house catalogue.
+///
+/// Separate from `CouncilSeat` — the seat that will actually run — because the two are checked at
+/// different times by different things. The FORM is checked here, at load, and is pure. The
+/// REFERENCE is checked by `council::start` against a catalogue the owner edits while the daemon
+/// runs. Collapsing them into one type with everything optional would leave every later reader
+/// asking which half is set, and one of them would eventually guess.
+///
+/// Both forms are valid forever. The tempting cleanup — migrate the file, drop `{ kind, ref }` — is
+/// refused for a concrete reason: `.ai/council.yaml` is under `.ai/`, which is gitignored, so it is
+/// per-developer configuration and not a fact of the repository. A form retired here does not
+/// produce an error on the machines still using it; `load_council_config` returns `None` on a roster
+/// with faults, so it produces a council that silently stops existing at the next daemon start.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CouncilSeat {
-    pub kind: SeatKind,
+pub struct SeatSpec {
+    pub kind: Option<SeatKind>,
     /// Spelled `ref` in the file, because that is what the design and the Python it came from call
     /// it, and `model_ref` in Rust, because `ref` is a keyword.
     #[serde(rename = "ref")]
+    pub model_ref: Option<String>,
+    /// An `agents` row id. Never resolved here — see `council::resolve_seat`.
+    pub agent: Option<String>,
+}
+
+/// PURE: what a roster's nth position is called in a refusal, chairman first.
+///
+/// Shared with `council::start` rather than written twice, so a roster refused at load and the same
+/// roster refused at start name the same seat the same way. An owner correcting a file should not
+/// have to work out that "seat 1" and "the second member" are the same line.
+pub fn seat_name(index: usize) -> String {
+    if index == 0 {
+        "the chairman".to_string()
+    } else {
+        format!("seat {}", index - 1)
+    }
+}
+
+impl SeatSpec {
+    /// Everything wrong with this seat's FORM. Reads no database, by construction.
+    ///
+    /// `local_available` bears only on the model form: an agent's engine lives in a table, so
+    /// whether an agent seat wants this machine is not knowable from the file. `council::start`
+    /// asks that question where it can be answered, and refuses with the same words.
+    fn faults_in(&self, who: &str, local_available: bool) -> Vec<String> {
+        let mut faults = Vec::new();
+        let names_a_model = self.kind.is_some() || self.model_ref.is_some();
+        match (self.agent.as_deref(), names_a_model) {
+            (Some(agent), false) => {
+                if agent.trim().is_empty() {
+                    faults.push(format!("{who} names an empty agent"));
+                }
+            }
+            // Refused rather than resolved in favour of one of them. Two sources for the same fact
+            // is where they eventually disagree, and the disagreement would be silent: whichever
+            // half lost would still be sitting there, read by whoever edits the file next.
+            (Some(_), true) => faults.push(format!(
+                "{who} names both an agent and a model; a seat is filled by one or the other"
+            )),
+            (None, false) => faults.push(format!("{who} names neither a model nor an agent")),
+            (None, true) => match (self.kind, self.model_ref.as_deref()) {
+                (Some(kind), Some(model_ref)) => {
+                    if model_ref.trim().is_empty() {
+                        faults.push(format!("{who} names no model"));
+                    }
+                    // Refused rather than quietly re-routed to the cloud. An operator who wrote
+                    // `local` asked for a question that does not leave this machine, and answering
+                    // it in the cloud anyway is the one failure this check exists to prevent.
+                    if kind == SeatKind::Local && !local_available {
+                        faults.push(format!(
+                            "{who} asks for a local model and no local model is configured"
+                        ));
+                    }
+                }
+                (None, Some(_)) => {
+                    faults.push(format!("{who} names a model but not where it runs"))
+                }
+                (Some(_), None) => faults.push(format!("{who} names no model")),
+                (None, None) => {}
+            },
+        }
+        faults
+    }
+}
+
+/// What an agent brings to a seat, copied out of the catalogue when the council convenes.
+///
+/// A copy and not an id to look up later. The catalogue is editable while a deliberation runs, and
+/// a seat that re-read its own prompt between phase 1 and phase 3 would be two different seats
+/// wearing one `seat_idx`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatAgent {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    /// `mcp_only` | `none`. Only ever NARROWS what a seat may reach: `mcp_only` is exactly what
+    /// every seat gets today, `unrestricted` is refused at the catalogue, and `none` takes the box
+    /// away. Nothing here can hand a seat a tool a seat does not already have.
+    pub tool_policy: String,
+}
+
+/// One seat as it will RUN: where it runs, which model answers, and — when the catalogue filled it
+/// — who it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilSeat {
+    pub kind: SeatKind,
     pub model_ref: String,
+    /// Resolved at `council::start` and never before.
+    pub agent: Option<SeatAgent>,
+}
+
+impl CouncilSeat {
+    /// The seat a `{ kind, ref }` line resolves to: a model, and nobody in particular.
+    pub fn of_model(kind: SeatKind, model_ref: impl Into<String>) -> Self {
+        Self {
+            kind,
+            model_ref: model_ref.into(),
+            agent: None,
+        }
+    }
+
+    /// Whether this seat may hold tools AT ALL, before the phase decides whether it gets any.
+    ///
+    /// Two independent narrowings that meet with an `&&`: the phase says no to everything after
+    /// phase 1, and an agent may say no to everything full stop.
+    pub fn allows_tools(&self) -> bool {
+        self.agent
+            .as_ref()
+            .is_none_or(|agent| agent.tool_policy != "none")
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent.as_ref().map(|agent| agent.id.as_str())
+    }
 }
 
 /// `.ai/council.yaml`. Absent means there is no council — this pillar has no useful default,
@@ -474,8 +619,8 @@ pub struct CouncilSeat {
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
     pub timeout_seconds: u64,
-    pub chairman: CouncilSeat,
-    pub members: Vec<CouncilSeat>,
+    pub chairman: SeatSpec,
+    pub members: Vec<SeatSpec>,
 }
 
 fn default_council_timeout() -> u64 {
@@ -500,29 +645,14 @@ impl CouncilConfig {
             ));
         }
         for (index, seat) in self.seats().enumerate() {
-            let who = if index == 0 {
-                "the chairman".to_string()
-            } else {
-                format!("seat {}", index - 1)
-            };
-            if seat.model_ref.trim().is_empty() {
-                faults.push(format!("{who} names no model"));
-            }
-            // Refused rather than quietly re-routed to the cloud. An operator who wrote `local`
-            // asked for a question that does not leave this machine, and answering it in the cloud
-            // anyway is the one failure this check exists to prevent.
-            if seat.kind == SeatKind::Local && !local_available {
-                faults.push(format!(
-                    "{who} asks for a local model and no local model is configured"
-                ));
-            }
+            faults.extend(seat.faults_in(&seat_name(index), local_available));
         }
 
         faults
     }
 
     /// The chairman first, then the members, which is the order `faults` numbers them in.
-    fn seats(&self) -> impl Iterator<Item = &CouncilSeat> {
+    fn seats(&self) -> impl Iterator<Item = &SeatSpec> {
         std::iter::once(&self.chairman).chain(self.members.iter())
     }
 
@@ -992,8 +1122,80 @@ mod tests {
         let config = council_config_from(A_GOOD_ROSTER, false).expect("a cloud-only roster loads");
         assert_eq!(config.timeout_seconds, DEFAULT_COUNCIL_TIMEOUT_SECONDS);
         assert_eq!(config.members.len(), 2);
-        assert_eq!(config.chairman.kind, SeatKind::Cloud);
-        assert_eq!(config.members[1].model_ref, "gpt-5.6-terra");
+        assert_eq!(config.chairman.kind, Some(SeatKind::Cloud));
+        assert_eq!(
+            config.members[1].model_ref.as_deref(),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    /// The form is checked here; the reference is not. A roster naming an agent nobody has created
+    /// LOADS — `council::start` is what refuses it, against a catalogue that changes while the
+    /// daemon runs. See `council::resolve_roster`.
+    #[test]
+    fn a_seat_may_name_an_agent_and_the_file_does_not_check_it_exists() {
+        let config = council_config_from(
+            "chairman: { agent: sintetizador }\n\
+             members:\n\
+             \x20\x20- { agent: cetico }\n\
+             \x20\x20- { kind: local, ref: qwen3.5:4b }\n",
+            true,
+        )
+        .expect("both forms in one roster");
+        assert_eq!(config.chairman.agent.as_deref(), Some("sintetizador"));
+        assert_eq!(config.members[0].agent.as_deref(), Some("cetico"));
+        assert_eq!(config.members[0].kind, None);
+        assert_eq!(config.members[1].kind, Some(SeatKind::Local));
+    }
+
+    /// The faults a seat's FORM can have, each of them fatal to the whole roster and each of them
+    /// named, because an operator editing this file by hand gets more than one thing wrong at once.
+    #[test]
+    fn a_seat_names_one_thing_or_the_other_and_never_both_or_neither() {
+        let both = "chairman: { kind: cloud, ref: m }\n\
+                    members:\n\
+                    \x20\x20- { kind: cloud, ref: m, agent: cetico }\n";
+        assert!(
+            council_config_from(both, true).is_none(),
+            "a seat filled twice is refused rather than resolved in favour of one"
+        );
+        let neither = "chairman: { kind: cloud, ref: m }\nmembers:\n  - {}\n";
+        assert!(council_config_from(neither, true).is_none());
+        let no_kind = "chairman: { kind: cloud, ref: m }\nmembers:\n  - { ref: m }\n";
+        assert!(
+            council_config_from(no_kind, true).is_none(),
+            "a model with no `kind` names no machine"
+        );
+        // And the typo `deny_unknown_fields` is there to catch: a misspelt `agent` must be an
+        // arrest at startup, not a seat that quietly does not exist.
+        let typo = "chairman: { kind: cloud, ref: m }\nmembers:\n  - { agente: cetico }\n";
+        assert!(council_config_from(typo, true).is_none());
+    }
+
+    /// Both directions, because either gap is a bug that only shows at runtime: an engine with no
+    /// seat kind is an agent that cannot sit, and a seat kind no engine reaches is a machine the
+    /// catalogue can never target.
+    #[test]
+    fn every_catalogue_engine_maps_to_a_seat_kind_and_every_seat_kind_has_an_engine() {
+        for engine in crate::agent::ENGINES {
+            assert!(
+                seat_kind_for_engine(engine).is_some(),
+                "the catalogue accepts `{engine}` and no seat can host it"
+            );
+        }
+        for (engine, _) in ENGINE_SEAT_KINDS {
+            assert!(
+                crate::agent::ENGINES.contains(engine),
+                "`{engine}` translates to a seat and no agent may declare it"
+            );
+        }
+        for kind in [SeatKind::Cloud, SeatKind::Local] {
+            assert!(
+                ENGINE_SEAT_KINDS.iter().any(|(_, mapped)| *mapped == kind),
+                "no engine reaches {kind:?}"
+            );
+        }
+        assert_eq!(seat_kind_for_engine("gemini"), None);
     }
 
     #[test]

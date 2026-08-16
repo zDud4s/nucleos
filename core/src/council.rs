@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::config::{CouncilConfig, CouncilSeat, SeatKind};
+use crate::config::{CouncilConfig, CouncilSeat, SeatAgent, SeatKind, SeatSpec};
 
 /// A council's status. Text in the database, as `runs.status` is.
 pub const STATUS_RUNNING: &str = "running";
@@ -459,6 +459,10 @@ pub struct SeatRow {
     pub seat_idx: i64,
     pub kind: String,
     pub model_ref: String,
+    /// The catalogue agent that took the seat, or NULL for one declared as a bare model. The NAME
+    /// is deliberately not stored beside it: a name is editable and this column is a reference, so
+    /// the two would drift and the row would be the one that looked authoritative.
+    pub agent_id: Option<String>,
     pub stage1_run_id: Option<i64>,
     pub stage1_status: String,
     pub stage1_error: Option<String>,
@@ -483,6 +487,7 @@ pub struct CouncilRow {
     pub leaderboard: Option<String>,
     pub chairman_kind: String,
     pub chairman_ref: String,
+    pub chairman_agent_id: Option<String>,
     pub chairman_run_id: Option<i64>,
     pub error: Option<String>,
 }
@@ -503,8 +508,9 @@ pub async fn insert_council(
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "INSERT INTO council_runs
-           (id, created_at, question, status, stage, anon_seed, chairman_kind, chairman_ref)
-         VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+           (id, created_at, question, status, stage, anon_seed, chairman_kind, chairman_ref,
+            chairman_agent_id)
+         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(chrono::Utc::now().to_rfc3339())
@@ -514,20 +520,24 @@ pub async fn insert_council(
     // if what the seed is derived from ever changes.
     .bind(id)
     .bind(chairman.kind.as_db_str())
+    // The MODEL, beside the agent and not instead of it. An agent is editable and deletable; what
+    // answered in March has to keep reading as what answered in March.
     .bind(&chairman.model_ref)
+    .bind(chairman.agent_id())
     .execute(&mut *transaction)
     .await?;
 
     for (seat_idx, seat) in members.iter().enumerate() {
         sqlx::query(
             "INSERT INTO council_seats
-               (council_id, seat_idx, kind, model_ref, stage1_status, stage2_status)
-             VALUES (?, ?, ?, ?, ?, ?)",
+               (council_id, seat_idx, kind, model_ref, agent_id, stage1_status, stage2_status)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(seat_idx as i64)
         .bind(seat.kind.as_db_str())
         .bind(&seat.model_ref)
+        .bind(seat.agent_id())
         // Written rather than left to the column's DEFAULT, so the constant this module reads back
         // and the value the database writes cannot drift apart.
         .bind(SEAT_PENDING)
@@ -551,7 +561,7 @@ pub async fn get_council_row(
 
 pub async fn get_seat_rows(pool: &sqlx::SqlitePool, id: &str) -> sqlx::Result<Vec<SeatRow>> {
     sqlx::query_as::<_, SeatRow>(
-        "SELECT seat_idx, kind, model_ref, stage1_run_id, stage1_status, stage1_error,
+        "SELECT seat_idx, kind, model_ref, agent_id, stage1_run_id, stage1_status, stage1_error,
                 stage2_run_id, stage2_status, stage2_error, rankings
          FROM council_seats WHERE council_id = ? ORDER BY seat_idx",
     )
@@ -737,10 +747,114 @@ impl std::fmt::Display for StartError {
 }
 
 /// The roster a request may put in place of the configured one, for that question only.
+///
+/// Holds the DECLARED form, exactly as the file does, so an override may name catalogue agents too
+/// and gets the same refusals in the same words when it names them wrongly.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RosterOverride {
-    pub chairman: CouncilSeat,
-    pub members: Vec<CouncilSeat>,
+    pub chairman: SeatSpec,
+    pub members: Vec<SeatSpec>,
+}
+
+/// Turns a declared roster into the seats that will run, reading the catalogue as it is NOW.
+///
+/// **Not at load, and this is the decision that gets made wrong.** `load_council_config` is pure and
+/// runs at startup: it has no pool, and could not usefully have one, because the catalogue is
+/// mutable state — the owner may delete `cetico` at three in the afternoon with a daemon that has
+/// been up since nine. A roster validated at boot is a promise about a different afternoon.
+///
+/// The accepted cost: a roster naming a deleted agent is discovered only when somebody asks a
+/// question. That refusal happens before the budget check and before any row is written, so it
+/// costs the owner one clear error and nothing else. It is the same cost `.ai/autopilot.yaml`
+/// already pays by naming a project root that has since moved.
+async fn resolve_roster(
+    state: &crate::state::AppState,
+    chairman: &SeatSpec,
+    members: &[SeatSpec],
+) -> Result<(CouncilSeat, Vec<CouncilSeat>), StartError> {
+    let resolved_chairman = resolve_seat(state, chairman, &crate::config::seat_name(0)).await?;
+    let mut resolved_members = Vec::with_capacity(members.len());
+    for (index, spec) in members.iter().enumerate() {
+        resolved_members
+            .push(resolve_seat(state, spec, &crate::config::seat_name(index + 1)).await?);
+    }
+    Ok((resolved_chairman, resolved_members))
+}
+
+/// One declared seat, resolved. `who` is what a refusal calls it — see `config::seat_name`.
+async fn resolve_seat(
+    state: &crate::state::AppState,
+    spec: &SeatSpec,
+    who: &str,
+) -> Result<CouncilSeat, StartError> {
+    // Checked here and not only in `CouncilConfig::faults`, because an override never passes
+    // through the file's validation and this is the one fault whose consequence is silent: a seat
+    // naming both would otherwise run as whichever half this function happened to read first.
+    if spec.agent.is_some() && (spec.kind.is_some() || spec.model_ref.is_some()) {
+        return Err(StartError::Invalid(format!(
+            "{who} names both an agent and a model; a seat is filled by one or the other"
+        )));
+    }
+
+    let Some(agent_id) = spec.agent.as_deref() else {
+        let (Some(kind), Some(model_ref)) = (spec.kind, spec.model_ref.clone()) else {
+            return Err(StartError::Invalid(format!(
+                "{who} names neither a model nor an agent"
+            )));
+        };
+        if model_ref.trim().is_empty() {
+            return Err(StartError::Invalid("a seat names no model".to_string()));
+        }
+        // Deliberately NOT checking `local_assistant` here. A model seat's locality is legible from
+        // the file, so `CouncilConfig::faults` has already refused it at load and `start` refuses it
+        // for an override — asking a third time would refuse a configured roster that startup
+        // accepted, which is a daemon disagreeing with itself.
+        return Ok(CouncilSeat::of_model(kind, model_ref));
+    };
+
+    let agent = crate::agent::get(&state.pool, agent_id)
+        .await
+        .map_err(|error| StartError::Unavailable(error.to_string()))?
+        .ok_or_else(|| {
+            StartError::Invalid(format!(
+                "{who} names the agent `{agent_id}`, which is not in the catalogue"
+            ))
+        })?;
+
+    let kind = crate::config::seat_kind_for_engine(&agent.engine).ok_or_else(|| {
+        StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`, whose engine `{}` is not one a seat can run",
+            agent.engine
+        ))
+    })?;
+    // The check the file could not make: an agent's engine is a column, so only here is it known
+    // that this seat wants this machine. Same refusal and same words as a `{ kind: local }` line —
+    // where a seat came from does not change what the machine can serve.
+    if kind == SeatKind::Local && state.local_assistant.is_none() {
+        return Err(StartError::NoLocalModel);
+    }
+    // A seat's row records WHICH MODEL ANSWERED, `NOT NULL`, and that is the whole point of copying
+    // it instead of reading the roster back later. An agent may legitimately leave its model unset
+    // and let the CLI choose — a team keeps no such record and does not care — but a seat filled by
+    // one could only be written down blank. Refused before anything is spent, rather than stored as
+    // an empty string somebody would later have to guess the meaning of.
+    let model_ref = agent.model.clone().ok_or_else(|| {
+        StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`, which names no model — a seat records the model \
+             that answered"
+        ))
+    })?;
+
+    Ok(CouncilSeat {
+        kind,
+        model_ref,
+        agent: Some(SeatAgent {
+            id: agent.id,
+            name: agent.name,
+            prompt: agent.prompt,
+            tool_policy: agent.tool_policy,
+        }),
+    })
 }
 
 /// Deletes a council's throwaway MCP config however the council ends.
@@ -807,9 +921,9 @@ pub async fn start(
         return Err(StartError::Invalid("the question is empty".to_string()));
     }
 
-    let (chairman, members) = match roster {
+    let (chairman, members) = match &roster {
         Some(override_roster) => {
-            let (chairman, members) = (override_roster.chairman, override_roster.members);
+            let (chairman, members) = (&override_roster.chairman, &override_roster.members);
             if members.is_empty() {
                 return Err(StartError::Invalid("the roster has no members".to_string()));
             }
@@ -822,21 +936,18 @@ pub async fn start(
             // The same rule the file is validated against, applied to a roster that never touches
             // the file. An override is for ONE question and writes no configuration, so the
             // daemon's own limits have to be checked here rather than assumed from the file.
-            let wants_local = std::iter::once(&chairman)
+            //
+            // Only the declared-model seats: an agent seat's locality is a column, and
+            // `resolve_seat` refuses it there with this same variant.
+            let wants_local = std::iter::once(chairman)
                 .chain(members.iter())
-                .any(|seat| seat.kind == SeatKind::Local);
+                .any(|seat| seat.kind == Some(SeatKind::Local));
             if wants_local && state.local_assistant.is_none() {
                 return Err(StartError::NoLocalModel);
             }
-            if std::iter::once(&chairman)
-                .chain(members.iter())
-                .any(|seat| seat.model_ref.trim().is_empty())
-            {
-                return Err(StartError::Invalid("a seat names no model".to_string()));
-            }
-            (chairman, members)
+            resolve_roster(state, chairman, members).await?
         }
-        None => (configured.chairman.clone(), configured.members.clone()),
+        None => resolve_roster(state, &configured.chairman, &configured.members).await?,
     };
 
     if let crate::budget::BudgetDecision::Pause { reason, .. } =
@@ -1141,6 +1252,28 @@ impl Driver {
         prompt: String,
         with_tools: bool,
     ) -> SeatOutcome {
+        // The seat's own instructions, ahead of the phase's. Prepended to the prompt rather than
+        // sent as a system prompt because `RunRequest` has none, and because
+        // `team::specialist_prompt` already answers this exact question this exact way — the
+        // persona is the first thing the agent reads.
+        //
+        // This is the seat's OWN persona and it never travels. Phase 2 shows peers' ANSWERS and
+        // nothing else, so a seat knows who it is and never who the others are. What is not
+        // defensible, and is said rather than pretended away: a strong persona writes recognisably,
+        // and a reader may guess. That is already true between different models today. The system
+        // does not print the name; it does not promise the style will not give it away.
+        let prompt = match &seat.agent {
+            Some(agent) if !agent.prompt.trim().is_empty() => {
+                format!("{}\n\n{prompt}", agent.prompt)
+            }
+            _ => prompt,
+        };
+        // Two narrowings meeting at an `&&`: the phase says no to tools after phase 1, and an agent
+        // whose `tool_policy` is `none` says no to them full stop. Neither direction can ADD one —
+        // `mcp_only` is exactly what a seat gets today and `unrestricted` never reaches the
+        // catalogue.
+        let with_tools = with_tools && seat.allows_tools();
+
         let (run_id, session_id) = match self.open_run(&prompt).await {
             Ok(opened) => opened,
             Err(error) => {
@@ -1759,6 +1892,11 @@ pub struct SeatView {
     pub kind: String,
     #[serde(rename = "ref")]
     pub model_ref: String,
+    pub agent_id: Option<String>,
+    /// Read from the catalogue when the view is built, and `None` when the agent has since been
+    /// deleted. Not stored on the row: a name is editable, and a copy of one is a second version of
+    /// the truth that looks authoritative because it is older.
+    pub agent_name: Option<String>,
     pub stage1_status: String,
     pub stage1_error: Option<String>,
     /// The text the seat wrote, read from the transcript of the run that produced it. The client is
@@ -1780,6 +1918,8 @@ pub struct CouncilView {
     pub chairman_kind: String,
     #[serde(rename = "chairman_ref")]
     pub chairman_ref: String,
+    pub chairman_agent_id: Option<String>,
+    pub chairman_agent_name: Option<String>,
     /// The synthesis, once phase 3 has produced one.
     pub synthesis: Option<String>,
     pub anon_map: BTreeMap<String, usize>,
@@ -1856,6 +1996,17 @@ pub async fn get_council(
         None => None,
     };
 
+    // One read of a table that holds a handful of rows, rather than one lookup per seat. An agent
+    // the roster named and somebody has since deleted is simply absent from the map, and its seat
+    // shows the id it pointed at with no name beside it — which is the honest rendering of what the
+    // record actually says.
+    let names: BTreeMap<String, String> = crate::agent::list(&state.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|agent| (agent.id, agent.name))
+        .collect();
+
     Ok(axum::Json(CouncilView {
         seats: seats
             .into_iter()
@@ -1873,6 +2024,11 @@ pub async fn get_council(
                 seat_idx: seat.seat_idx,
                 kind: seat.kind,
                 model_ref: seat.model_ref,
+                agent_name: seat
+                    .agent_id
+                    .as_deref()
+                    .and_then(|id| names.get(id).cloned()),
+                agent_id: seat.agent_id,
                 stage1_status: seat.stage1_status,
                 stage1_error: seat.stage1_error,
                 stage2_status: seat.stage2_status,
@@ -1898,6 +2054,11 @@ pub async fn get_council(
         error: row.error,
         chairman_kind: row.chairman_kind,
         chairman_ref: row.chairman_ref,
+        chairman_agent_name: row
+            .chairman_agent_id
+            .as_deref()
+            .and_then(|id| names.get(id).cloned()),
+        chairman_agent_id: row.chairman_agent_id,
     }))
 }
 
@@ -2347,11 +2508,42 @@ mod tests {
         pool
     }
 
+    /// A resolved seat, for the writes that take one.
     fn seat(kind: SeatKind, model_ref: &str) -> CouncilSeat {
-        CouncilSeat {
-            kind,
-            model_ref: model_ref.to_string(),
+        CouncilSeat::of_model(kind, model_ref)
+    }
+
+    /// A DECLARED seat in the old form, for rosters and overrides.
+    fn spec(kind: SeatKind, model_ref: &str) -> SeatSpec {
+        SeatSpec {
+            kind: Some(kind),
+            model_ref: Some(model_ref.to_string()),
+            agent: None,
         }
+    }
+
+    /// A declared seat in the new form.
+    fn agent_spec(id: &str) -> SeatSpec {
+        SeatSpec {
+            agent: Some(id.to_string()),
+            ..SeatSpec::default()
+        }
+    }
+
+    fn agent_request(name: &str) -> crate::agent::AgentRequest {
+        crate::agent::AgentRequest {
+            name: name.to_string(),
+            speciality: format!("the speciality of {name}"),
+            prompt: format!("The standing instructions of {name}."),
+            engine: "claude".to_string(),
+            model: Some("claude-opus-5".to_string()),
+            tool_policy: "mcp_only".to_string(),
+        }
+    }
+
+    /// Puts one agent in the catalogue and returns its id.
+    async fn catalogue(pool: &sqlx::SqlitePool, request: crate::agent::AgentRequest) -> String {
+        crate::agent::create(pool, request).await.unwrap().id
     }
 
     #[tokio::test]
@@ -2638,9 +2830,9 @@ mod tests {
         CouncilConfig {
             // One second, so a hung seat is a fast test rather than a ten-minute one.
             timeout_seconds: 1,
-            chairman: seat(SeatKind::Cloud, "the-chairman"),
+            chairman: spec(SeatKind::Cloud, "the-chairman"),
             members: (0..members)
-                .map(|index| seat(SeatKind::Cloud, &format!("model-{index}")))
+                .map(|index| spec(SeatKind::Cloud, &format!("model-{index}")))
                 .collect(),
         }
     }
@@ -2890,12 +3082,12 @@ mod tests {
         *runner.stage1.lock().unwrap() = [Scripted::Answers("from the cloud".into())].into();
         let config = CouncilConfig {
             timeout_seconds: 1,
-            chairman: seat(SeatKind::Cloud, "the-chairman"),
+            chairman: spec(SeatKind::Cloud, "the-chairman"),
             members: vec![
-                seat(SeatKind::Cloud, "a-cloud-model"),
+                spec(SeatKind::Cloud, "a-cloud-model"),
                 // A model no Ollama has. Whether one is listening or not, this seat ends quickly
                 // and lands its row — which is the only thing being asserted.
-                seat(SeatKind::Local, "a-model-that-does-not-exist"),
+                spec(SeatKind::Local, "a-model-that-does-not-exist"),
             ],
         };
         let state = council_state(runner.clone(), Some(config)).await;
@@ -3208,8 +3400,8 @@ mod tests {
             &state,
             "why?",
             Some(RosterOverride {
-                chairman: seat(SeatKind::Cloud, "a-different-chairman"),
-                members: vec![seat(SeatKind::Cloud, "just-this-one")],
+                chairman: spec(SeatKind::Cloud, "a-different-chairman"),
+                members: vec![spec(SeatKind::Cloud, "just-this-one")],
             }),
         )
         .await
@@ -3224,8 +3416,14 @@ mod tests {
         // The configured roster is untouched, so the next council convenes the three it names.
         assert_eq!(state.council.config().unwrap().members.len(), 3);
         assert_eq!(
-            state.council.config().unwrap().chairman.model_ref,
-            "the-chairman"
+            state
+                .council
+                .config()
+                .unwrap()
+                .chairman
+                .model_ref
+                .as_deref(),
+            Some("the-chairman")
         );
 
         // And the daemon's own limits still apply to a roster that never touched the file.
@@ -3234,7 +3432,7 @@ mod tests {
                 &state,
                 "why?",
                 Some(RosterOverride {
-                    chairman: seat(SeatKind::Cloud, "c"),
+                    chairman: spec(SeatKind::Cloud, "c"),
                     members: Vec::new(),
                 }),
             )
@@ -3246,9 +3444,9 @@ mod tests {
                 &state,
                 "why?",
                 Some(RosterOverride {
-                    chairman: seat(SeatKind::Cloud, "c"),
+                    chairman: spec(SeatKind::Cloud, "c"),
                     members: (0..=crate::config::MAX_COUNCIL_SEATS)
-                        .map(|_| seat(SeatKind::Cloud, "m"))
+                        .map(|_| spec(SeatKind::Cloud, "m"))
                         .collect(),
                 }),
             )
@@ -3262,14 +3460,394 @@ mod tests {
                 &state,
                 "why?",
                 Some(RosterOverride {
-                    chairman: seat(SeatKind::Cloud, "c"),
-                    members: vec![seat(SeatKind::Local, "qwen3.5:4b")],
+                    chairman: spec(SeatKind::Cloud, "c"),
+                    members: vec![spec(SeatKind::Local, "qwen3.5:4b")],
                 }),
             )
             .await
             .unwrap_err(),
             StartError::NoLocalModel
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Seats filled from the house catalogue
+    // -----------------------------------------------------------------------------------------
+
+    /// The two forms sit in one roster, and neither is on the way out.
+    ///
+    /// `.ai/council.yaml` is under `.ai/`, which is gitignored — it is per-developer configuration,
+    /// not a fact of this repository. A form retired here would not error on the machines still
+    /// using it; it would give them a council that silently stops existing at the next daemon
+    /// start. So this asserts coexistence, not migration.
+    #[tokio::test]
+    async fn a_roster_may_name_an_agent_in_one_seat_and_a_model_in_the_next() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("from the agent".into()),
+            Scripted::Answers("from the model".into()),
+        ]
+        .into();
+        let state = council_state(
+            runner,
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("cetico"), spec(SeatKind::Cloud, "a-plain-model")],
+            }),
+        )
+        .await;
+        let mut asked = agent_request("Cetico");
+        asked.model = Some("claude-sonnet-5".to_string());
+        catalogue(&state.pool, asked).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats[0].agent_id.as_deref(), Some("cetico"));
+        assert_eq!(seats[0].model_ref, "claude-sonnet-5");
+        assert_eq!(
+            seats[1].agent_id, None,
+            "a seat declared as a model belongs to nobody"
+        );
+        assert_eq!(seats[1].model_ref, "a-plain-model");
+
+        let row = get_council_row(&state.pool, &id).await.unwrap().unwrap();
+        assert_eq!(row.chairman_agent_id, None);
+    }
+
+    /// Two sources for one fact is where they eventually disagree, and the disagreement would be
+    /// silent — whichever half lost would still be sitting in the file, read by whoever edits it
+    /// next. So a seat naming both is refused rather than resolved in favour of one.
+    #[tokio::test]
+    async fn a_seat_naming_both_an_agent_and_a_model_is_refused_rather_than_chosen_between() {
+        let state = council_state(
+            std::sync::Arc::new(ScriptedRunner::default()),
+            Some(roster(1)),
+        )
+        .await;
+        catalogue(&state.pool, agent_request("Cetico")).await;
+
+        let refusal = start(
+            &state,
+            "why?",
+            Some(RosterOverride {
+                chairman: spec(SeatKind::Cloud, "c"),
+                members: vec![SeatSpec {
+                    kind: Some(SeatKind::Cloud),
+                    model_ref: Some("a-model".to_string()),
+                    agent: Some("cetico".to_string()),
+                }],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("both an agent and a model")),
+            "got {refusal:?}"
+        );
+    }
+
+    /// The structural decision of this slice, asserted from both ends.
+    ///
+    /// `load_council_config` is pure and runs at startup, so it checks the FORM and accepts a roster
+    /// naming an agent nobody has created. `start` checks the REFERENCE against a catalogue the
+    /// owner edits with the daemon running. Validating at load would be a promise about a different
+    /// afternoon; the cost is that the refusal arrives at the question, and it costs nothing else —
+    /// no row, no key, no spend.
+    #[tokio::test]
+    async fn a_roster_naming_a_missing_agent_loads_and_is_refused_at_the_question() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("council.yaml");
+        std::fs::write(
+            &path,
+            "chairman: { kind: cloud, ref: the-chairman }\nmembers:\n  - { agent: cetico }\n",
+        )
+        .unwrap();
+        let config = crate::config::load_council_config(&path, false)
+            .expect("the form is right; only the reference is missing");
+
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(runner, Some(config)).await;
+
+        let refusal = start(&state, "why?", None).await;
+        assert!(
+            matches!(&refusal, Err(StartError::Invalid(why))
+                if why.contains("cetico") && why.contains("catalogue")),
+            "got {refusal:?}"
+        );
+        let councils: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM council_runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            councils, 0,
+            "a refusal before the budget check writes nothing"
+        );
+
+        // And the same roster works the moment the catalogue does.
+        catalogue(&state.pool, agent_request("Cetico")).await;
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+    }
+
+    /// A seat's row says WHICH MODEL ANSWERED, and keeps saying it after the agent is edited.
+    ///
+    /// The same argument `0065_council.sql` makes for copying the roster onto the row instead of
+    /// reading it back from configuration. A council from March whose seat pointed at `cetico` has
+    /// to keep reporting what actually spoke, whatever `cetico` has been reconfigured to since.
+    #[tokio::test]
+    async fn a_seat_records_the_model_that_answered_and_not_only_the_agent() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [Scripted::Answers("an answer".into())].into();
+        let state = council_state(
+            runner,
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("cetico")],
+            }),
+        )
+        .await;
+        let mut asked = agent_request("Cetico");
+        asked.model = Some("claude-sonnet-5".to_string());
+        catalogue(&state.pool, asked).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let mut moved = agent_request("Cetico");
+        moved.model = Some("something-else-entirely".to_string());
+        crate::agent::update(&state.pool, "cetico", moved)
+            .await
+            .unwrap();
+
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(
+            seats[0].model_ref, "claude-sonnet-5",
+            "history is what answered, not what the agent points at today"
+        );
+        assert_eq!(seats[0].agent_id.as_deref(), Some("cetico"));
+    }
+
+    /// An agent may leave its model unset and let the CLI choose — legitimate in a team, which keeps
+    /// no record of what ran. A seat keeps exactly that record, in a `NOT NULL` column, so the seat
+    /// is refused before anything is spent rather than written down blank.
+    #[tokio::test]
+    async fn an_agent_that_names_no_model_cannot_take_a_seat() {
+        let state = council_state(
+            std::sync::Arc::new(ScriptedRunner::default()),
+            Some(roster(1)),
+        )
+        .await;
+        let mut asked = agent_request("Cetico");
+        asked.model = None;
+        catalogue(&state.pool, asked).await;
+
+        let refusal = start(
+            &state,
+            "why?",
+            Some(RosterOverride {
+                chairman: spec(SeatKind::Cloud, "c"),
+                members: vec![agent_spec("cetico")],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("names no model")),
+            "got {refusal:?}"
+        );
+    }
+
+    /// `tool_policy: none` is the first seat with no tools, and it only ever NARROWS.
+    ///
+    /// `mcp_only` is exactly what every seat gets today and `unrestricted` never reaches the
+    /// catalogue, so nothing an agent can declare hands a seat something a seat does not already
+    /// have. The config file goes with the policy: a `None` policy beside an MCP config would
+    /// advertise a server the CLI is forbidden to reach.
+    #[tokio::test]
+    async fn an_agent_with_no_tool_policy_takes_a_seat_with_no_tools() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [Scripted::Answers("an answer".into())].into();
+        let state = council_state(
+            runner.clone(),
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("cetico")],
+            }),
+        )
+        .await;
+        let mut asked = agent_request("Cetico");
+        asked.tool_policy = "none".to_string();
+        catalogue(&state.pool, asked).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let seen = runner.seen.lock().unwrap();
+        assert!(
+            matches!(seen[0].tool_policy, crate::runner::ToolPolicy::None),
+            "phase 1 is the phase that HAS tools, and this agent asked for none"
+        );
+        assert!(seen[0].mcp_config.is_none());
+    }
+
+    /// Phase 2 is a blind vote, and giving seats identities put three new strings at risk of
+    /// leaking into it: an agent's name, its speciality, and its prompt.
+    ///
+    /// None of the three travels. A seat's own instructions go in front of its own prompt — it knows
+    /// who IT is — and what it is shown of its peers is their ANSWERS under shuffled labels, exactly
+    /// as before. This walks every request the whole council made and asserts each one carries at
+    /// most its own persona.
+    ///
+    /// What this does NOT promise, said rather than pretended away: a strong persona writes
+    /// recognisably. That is already true between different models today. The system does not print
+    /// the name.
+    #[tokio::test]
+    async fn no_seat_is_ever_shown_another_seats_name_speciality_or_prompt() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the first answer".into()),
+            Scripted::Answers("the second answer".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1\nB: 2".into()),
+            Scripted::Answers("A: 2\nB: 1".into()),
+        ]
+        .into();
+        let state = council_state(
+            runner.clone(),
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("cetico"), agent_spec("economista")],
+            }),
+        )
+        .await;
+        for (name, speciality, prompt) in [
+            ("Cetico", "doubts the premise", "Argue the case against."),
+            ("Economista", "counts the money", "Argue from the cost."),
+        ] {
+            catalogue(
+                &state.pool,
+                crate::agent::AgentRequest {
+                    name: name.to_string(),
+                    speciality: speciality.to_string(),
+                    prompt: prompt.to_string(),
+                    engine: "claude".to_string(),
+                    model: Some("claude-opus-5".to_string()),
+                    tool_policy: "mcp_only".to_string(),
+                },
+            )
+            .await;
+        }
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let seen = runner.seen.lock().unwrap();
+        assert!(seen.len() >= 5, "two phase-1, two phase-2 and a chairman");
+        for request in seen.iter() {
+            for forbidden in [
+                "Cetico",
+                "Economista",
+                "doubts the premise",
+                "counts the money",
+            ] {
+                assert!(
+                    !request.prompt.contains(forbidden),
+                    "`{forbidden}` reached a seat's prompt:\n{}",
+                    request.prompt
+                );
+            }
+            // A persona is the seat's own, so at most ONE of the two may appear, and only at the
+            // very start where `run_seat` puts it.
+            let carried: Vec<&str> = ["Argue the case against.", "Argue from the cost."]
+                .into_iter()
+                .filter(|persona| request.prompt.contains(persona))
+                .collect();
+            assert!(
+                carried.len() <= 1,
+                "a seat was shown a peer's instructions:\n{}",
+                request.prompt
+            );
+            if let Some(persona) = carried.first() {
+                assert!(
+                    request.prompt.starts_with(persona),
+                    "a persona belongs at the front of its own prompt and nowhere else"
+                );
+            }
+        }
+    }
+
+    /// The regression that says this slice is not a migration in disguise: a roster written the way
+    /// every roster was written yesterday behaves exactly as it did, down to the columns.
+    #[tokio::test]
+    async fn a_roster_of_plain_models_runs_with_no_agent_anywhere_on_the_record() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [Scripted::Answers("an answer".into())].into();
+        let state = council_state(runner, Some(roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let row = get_council_row(&state.pool, &id).await.unwrap().unwrap();
+        assert_eq!(row.chairman_agent_id, None);
+        assert!(
+            get_seat_rows(&state.pool, &id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|seat| seat.agent_id.is_none())
+        );
+
+        let view = get_council(axum::extract::State(state.clone()), axum::extract::Path(id))
+            .await
+            .unwrap();
+        assert!(view.seats.iter().all(|seat| seat.agent_name.is_none()));
+        assert_eq!(view.chairman_agent_name, None);
+    }
+
+    /// The name a client reads is looked up when the view is built, never copied onto the row: a
+    /// name is editable, and a stored copy is a second version of the truth that looks authoritative
+    /// because it is older. The corollary is that a deleted agent leaves the id with no name beside
+    /// it, which is the honest rendering of what the record says.
+    #[tokio::test]
+    async fn the_view_names_the_agent_and_survives_it_being_deleted() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [Scripted::Answers("an answer".into())].into();
+        let state = council_state(
+            runner,
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("cetico")],
+            }),
+        )
+        .await;
+        catalogue(&state.pool, agent_request("Cetico")).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let view = get_council(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.seats[0].agent_name.as_deref(), Some("Cetico"));
+
+        // A council roster is a file, not a table, so there is no foreign key to stand on and
+        // `agent::delete` does not learn to refuse this. The record degrades instead of lying.
+        crate::agent::delete(&state.pool, "cetico").await.unwrap();
+        let view = get_council(axum::extract::State(state), axum::extract::Path(id))
+            .await
+            .unwrap();
+        assert_eq!(view.seats[0].agent_id.as_deref(), Some("cetico"));
+        assert_eq!(view.seats[0].agent_name, None);
     }
 
     #[tokio::test]

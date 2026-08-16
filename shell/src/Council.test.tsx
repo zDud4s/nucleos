@@ -12,6 +12,8 @@ function seat(overrides: Partial<CouncilSeatView> = {}): CouncilSeatView {
     seat_idx: 0,
     kind: "cloud",
     ref: "claude-opus-4-8",
+    agent_id: null,
+    agent_name: null,
     stage1_status: "ok",
     stage1_error: null,
     answer: "the first answer",
@@ -32,6 +34,8 @@ function council(overrides: Partial<CouncilView> = {}): CouncilView {
     error: null,
     chairman_kind: "cloud",
     chairman_ref: "the-chairman",
+    chairman_agent_id: null,
+    chairman_agent_name: null,
     synthesis: null,
     anon_map: {},
     leaderboard: [],
@@ -107,6 +111,59 @@ describe("the council", () => {
     // A seat still working says so. Rendering it as an absence would make a slow model and a broken
     // one look identical.
     expect(screen.getByText(/Still working/)).toBeTruthy();
+  });
+
+  /**
+   * A seat filled from the catalogue shows BOTH, and in that order. Who answered is what the reader
+   * is looking for; what answered is what they reach for the moment the answer is bad. The old form
+   * is unchanged beside it — the two coexist in one roster, and so must the rendering.
+   */
+  it("names the agent that took a seat and keeps the model beside it", async () => {
+    await show(
+      [summary()],
+      council({
+        chairman_agent_id: "sintetizador",
+        chairman_agent_name: "Sintetizador",
+        seats: [
+          seat({
+            seat_idx: 0,
+            ref: "claude-sonnet-5",
+            agent_id: "cetico",
+            agent_name: "Cetico",
+          }),
+          seat({ seat_idx: 1, ref: "a-plain-model" }),
+        ],
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("why does it do that?"));
+    });
+
+    expect(screen.getByText("Cetico")).toBeTruthy();
+    expect(screen.getByText(/claude-sonnet-5/)).toBeTruthy();
+    expect(screen.getByText("a-plain-model")).toBeTruthy();
+    expect(screen.getByText(/Sintetizador/)).toBeTruthy();
+  });
+
+  /**
+   * A council roster is a file, not a table, so nothing stops the owner deleting an agent that one
+   * names. The record then holds an id pointing at nobody — and showing that id is more honest than
+   * falling back to the model as though no agent had ever been named.
+   */
+  it("shows the id of an agent that has since been deleted", async () => {
+    await show(
+      [summary()],
+      council({
+        seats: [seat({ ref: "claude-sonnet-5", agent_id: "cetico", agent_name: null })],
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("why does it do that?"));
+    });
+
+    expect(screen.getByText("cetico")).toBeTruthy();
   });
 
   /**

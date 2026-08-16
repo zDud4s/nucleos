@@ -70,6 +70,13 @@ impl std::error::Error for AgentError {
     }
 }
 
+/// The engines an agent may declare.
+///
+/// A constant rather than a `matches!` arm, because `council.rs` has to translate every one of them
+/// into a `SeatKind`: an engine added here with no translation there is a seat that cannot run, and
+/// the test that catches it needs both lists to be readable from one place.
+pub const ENGINES: &[&str] = &["claude", "codex", "local"];
+
 /// PURE: what an agent is allowed to declare about itself.
 ///
 /// `unrestricted` is refused rather than accepted-and-ignored. That policy exists for code runs
@@ -86,7 +93,7 @@ fn validate(request: &AgentRequest) -> Result<(), AgentError> {
             "speciality must not be empty — it is what a director reads to delegate",
         ));
     }
-    if !matches!(request.engine.as_str(), "claude" | "codex" | "local") {
+    if !ENGINES.contains(&request.engine.as_str()) {
         return Err(AgentError::Invalid("engine must be claude, codex or local"));
     }
     if !matches!(request.tool_policy.as_str(), "mcp_only" | "none") {

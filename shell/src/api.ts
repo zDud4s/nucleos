@@ -3664,6 +3664,14 @@ export interface CouncilSeatView {
   seat_idx: number;
   kind: string;
   ref: string;
+  /** The catalogue agent that filled the seat, or `null` for one declared as a bare model. */
+  agent_id: string | null;
+  /**
+   * Its name TODAY, looked up when the view was built — `null` when the agent has since been
+   * deleted. The id above still points at it, which is the honest rendering: the council did
+   * happen, and the agent no longer exists.
+   */
+  agent_name: string | null;
   /** pending | ok | error | timeout | cancelled. */
   stage1_status: string;
   stage1_error: string | null;
@@ -3692,6 +3700,8 @@ export interface CouncilView {
   error: string | null;
   chairman_kind: string;
   chairman_ref: string;
+  chairman_agent_id: string | null;
+  chairman_agent_name: string | null;
   synthesis: string | null;
   anon_map: Record<string, number>;
   leaderboard: CouncilLeaderboardEntry[];

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   cancelCouncil, createCouncil, getCouncil, listCouncils,
-  type ConnectionState, type CouncilSummary, type CouncilView,
+  type ConnectionState, type CouncilSeatView, type CouncilSummary, type CouncilView,
 } from "./api";
 import { relativeTime } from "./derive";
 import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
@@ -21,6 +21,19 @@ import { Badge, Button, ErrorNote, Panel, Teach } from "./ui";
 
 /** How long between reads while a council is still deliberating. */
 const POLL_MS = 2000;
+
+/**
+ * What to call a seat: the agent that took it, or the model that answered.
+ *
+ * Three cases and not two. A seat declared as a bare model has only a model name. A seat filled from
+ * the catalogue has a name. A seat whose agent has since been DELETED has neither — the record kept
+ * the id it pointed at, and showing that id is more honest than falling back to the model as if no
+ * agent had ever been named.
+ */
+function seatName(seat: CouncilSeatView): string {
+  if (seat.agent_id === null) return seat.ref;
+  return seat.agent_name ?? seat.agent_id;
+}
 
 function StatusBadge({ status }: { status: string }) {
   if (status === "running") return <Badge tone="pending">deliberating</Badge>;
@@ -206,7 +219,9 @@ export default function Council({ token, connection }: CouncilProps) {
           aside={<StatusBadge status={open.status} />}
         >
           <p className="faint">
-            Convened {relativeTime(open.created_at)}. Chairman: {open.chairman_ref}.
+            Convened {relativeTime(open.created_at)}. Chairman:{" "}
+            {open.chairman_agent_name ?? open.chairman_agent_id ?? open.chairman_ref}
+            {open.chairman_agent_id !== null && <> ({open.chairman_ref})</>}.
             {open.status === "running" && <> Phase {open.stage} of 3.</>}
           </p>
           {open.error !== null && <ErrorNote>{open.error}</ErrorNote>}
@@ -217,7 +232,15 @@ export default function Council({ token, connection }: CouncilProps) {
             {open.seats.map((seat) => (
               <li key={seat.seat_idx}>
                 <span className="council-seat__model">
-                  {seat.ref} <small>{seat.kind === "local" ? "on this machine" : "cloud"}</small>
+                  {/* Both, and in this order. WHO answered is what the reader is looking for, and
+                      WHAT answered is what they reach for the moment the answer is bad — so the
+                      model stays visible rather than being replaced by the name. A seat whose
+                      agent has since been deleted shows the id it pointed at. */}
+                  {seatName(seat)}{" "}
+                  <small>
+                    {seat.agent_id !== null && <>{seat.ref} · </>}
+                    {seat.kind === "local" ? "on this machine" : "cloud"}
+                  </small>
                 </span>
                 <SeatEnding status={seat.stage1_status} error={seat.stage1_error} />
                 <SeatAnswer status={seat.stage1_status} answer={seat.answer} />
@@ -236,8 +259,10 @@ export default function Council({ token, connection }: CouncilProps) {
             <ol className="council-board">
               {open.leaderboard.map((entry) => (
                 <li key={entry.seat_idx}>
-                  {open.seats.find((seat) => seat.seat_idx === entry.seat_idx)?.ref ??
-                    `seat ${entry.seat_idx}`}
+                  {(() => {
+                    const seat = open.seats.find((each) => each.seat_idx === entry.seat_idx);
+                    return seat === undefined ? `seat ${entry.seat_idx}` : seatName(seat);
+                  })()}
                   {" — "}
                   <span className="faint">
                     average rank {entry.avg_rank.toFixed(2)} from {entry.n}{" "}
