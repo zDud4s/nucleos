@@ -306,3 +306,50 @@ func TestUnknownSessionsAreNamed(t *testing.T) {
 func TestDriverSatisfiesTheContract(t *testing.T) {
 	var _ browser.Driver = (*Driver)(nil)
 }
+
+// TestActIsRefusedFromTheMomentTheWheelIsAskedFor — spec §4.4 rule 1, and the word "asked" is the
+// whole of it.
+//
+// An earlier reading refused only once the person was driving. But the handover kills one process
+// and starts another (§4.2), which is not atomic, and an act landing in that gap would touch a page
+// the person is about to inherit — after the headless browser it was aimed at had already been shut
+// down. So the refusal starts at the REQUEST, and it is a refusal rather than a queue: a queued
+// click lands somewhere the person has already navigated away from.
+func TestActIsRefusedFromTheMomentTheWheelIsAskedFor(t *testing.T) {
+	fake, conn := dial(t)
+	autoAttachOnCreate(fake)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	session, err := driver.Open(context.Background(), browser.OpenRequest{URL: "https://example.org/"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if _, err := driver.Handoff(context.Background(), session.ID, "there is a login here"); err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+
+	result, err := driver.Act(context.Background(), session.ID, browser.Action{
+		Kind: browser.ActionClick,
+		Ref:  "e1",
+	})
+	if err != nil {
+		t.Fatalf("a refusal is a value, not an error: %v", err)
+	}
+	if result.Outcome != browser.OutcomeRefused {
+		t.Fatalf("outcome = %q, want refused", result.Outcome)
+	}
+	if result.Refusal.Consequence != browser.ConsequenceWheelRequested {
+		t.Fatalf("consequence = %q, want %q", result.Refusal.Consequence, browser.ConsequenceWheelRequested)
+	}
+
+	// And nothing was clicked. The refusal has to precede the action, not describe it afterwards:
+	// this is the one refusal whose whole purpose is that the page must not move.
+	for _, method := range fake.Methods() {
+		if method == "Runtime.callFunctionOn" || method == "Input.insertText" {
+			t.Fatalf("the page was touched after the wheel was asked for: %v", fake.Methods())
+		}
+	}
+}

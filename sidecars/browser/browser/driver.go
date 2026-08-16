@@ -34,6 +34,12 @@ type SessionID string
 // Mode is who is holding the wheel. There are exactly two, and there is deliberately no third:
 // spec §4.1 forbids a hidden rendering state, so a session is either headless-and-agent-driven or
 // visible-and-person-driven, never rendering somewhere nobody can see.
+//
+// A session whose wheel has been ASKED for is already ModeHuman, before any window exists. That is
+// spec §4.4 rule 1 and not an approximation: the refusal is defined to hold "de volante_pedido em
+// diante", because the handover kills one process and starts another and an act in that gap would
+// land on a page the person is about to inherit. Two values are enough to say that; a third would be
+// a state in which it was unclear who the next click belonged to.
 type Mode string
 
 const (
@@ -156,6 +162,11 @@ const (
 	ConsequenceScheme Consequence = "schemeless-navigation"
 	// ConsequenceOffAllowlist — a document from a host the profile does not admit (spec §5.4).
 	ConsequenceOffAllowlist Consequence = "off-allowlist"
+	// ConsequenceWheelRequested — the agent asked for the wheel, so it no longer has it (spec §4.4
+	// rule 1). Refused and NOT queued, and refused from the REQUEST rather than from the window
+	// opening: spec §4.2 hands over by killing one process and starting another, which is not atomic,
+	// and an act landing in that gap would touch a page the person is about to inherit.
+	ConsequenceWheelRequested Consequence = "wheel-requested"
 	// ConsequenceLoopback — this machine's own services. Separate from off-allowlist because it is
 	// the only refusal aimed at US: the núcleo's HTTP API, the sidecars, and the browser's own
 	// debugging port all live on loopback behind a bearer token, and agent mode is launched with

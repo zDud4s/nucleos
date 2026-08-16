@@ -42,6 +42,13 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	mux.HandleFunc("/handoff", authorized(cfg.DaemonToken, handoffHandler(driver)))
 	mux.HandleFunc("/close", authorized(cfg.DaemonToken, closeHandler(driver)))
 
+	// The wheel (spec §4.4). Not agent verbs: no tool reaches these, and the only caller is the
+	// núcleo acting on a person's answer to a proposal. A driver that cannot swap processes does not
+	// implement Wheelhouse, and these answer 501 for it rather than pretending to hand over.
+	wheelhouse, _ := driver.(browser.Wheelhouse)
+	mux.HandleFunc("/wheel/take", authorized(cfg.DaemonToken, takeWheelHandler(wheelhouse)))
+	mux.HandleFunc("/wheel/return", authorized(cfg.DaemonToken, returnWheelHandler(wheelhouse)))
+
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           mux,
@@ -227,6 +234,71 @@ func closeHandler(driver browser.Driver) http.HandlerFunc {
 	}
 }
 
+// TakeWheelRequest is the núcleo saying a person accepted.
+//
+// The placement is here for the same reason it is on /open, and one more: the profile a handover
+// targets is NOT the one the agent's session was in (spec §4.5), so it cannot be inferred from the
+// session id. It has to be sent, and it has to be the núcleo that sends it.
+type TakeWheelRequest struct {
+	SessionID string            `json:"session_id"`
+	URL       string            `json:"url"`
+	Placement browser.Placement `json:"placement"`
+}
+
+func takeWheelHandler(wheelhouse browser.Wheelhouse) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request TakeWheelRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		if wheelhouse == nil {
+			http.Error(w, "this driver cannot hand over the wheel", http.StatusNotImplemented)
+			return
+		}
+		if strings.TrimSpace(request.URL) == "" {
+			http.Error(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		if err := request.Placement.Profile.Validate(); err != nil {
+			http.Error(w, "placement: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		wheel, err := wheelhouse.TakeWheel(r.Context(), browser.WheelRequest{
+			Session:   browser.SessionID(request.SessionID),
+			URL:       request.URL,
+			Placement: request.Placement,
+		})
+		if err != nil {
+			writeDriverError(w, "wheel/take", err)
+			return
+		}
+		writeJSON(w, wheel)
+	}
+}
+
+func returnWheelHandler(wheelhouse browser.Wheelhouse) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request SessionRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		if wheelhouse == nil {
+			http.Error(w, "this driver cannot hand over the wheel", http.StatusNotImplemented)
+			return
+		}
+		if request.SessionID == "" {
+			http.Error(w, "session_id is required", http.StatusBadRequest)
+			return
+		}
+		returned, err := wheelhouse.ReturnWheel(r.Context(), browser.SessionID(request.SessionID))
+		if err != nil {
+			writeDriverError(w, "wheel/return", err)
+			return
+		}
+		writeJSON(w, returned)
+	}
+}
+
 func parseKind(raw string) (browser.ActionKind, bool) {
 	switch browser.ActionKind(raw) {
 	case browser.ActionClick:
@@ -265,6 +337,14 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		http.Error(w, "fence is not attached: refusing to browse", http.StatusServiceUnavailable)
 	case errors.Is(err, browser.ErrUnsupported):
 		http.Error(w, "unsupported by this driver", http.StatusNotImplemented)
+	case errors.Is(err, browser.ErrPersonIsDriving):
+		// 409 and not 403: nothing is wrong with the request, and it may well succeed later. The
+		// wheel is with a person, and spec §4.4 rule 2 puts no bound on how long that lasts.
+		http.Error(w, "a person is driving this profile", http.StatusConflict)
+	case errors.Is(err, browser.ErrNoWheelToReturn):
+		http.Error(w, "this session is not a person's to give back", http.StatusConflict)
+	case errors.Is(err, browser.ErrNotAProjectProfile):
+		http.Error(w, "the wheel is only handed over into a project profile", http.StatusBadRequest)
 	default:
 		log.Printf("%s failed: %v", verb, err)
 		http.Error(w, verb+" failed", http.StatusBadGateway)

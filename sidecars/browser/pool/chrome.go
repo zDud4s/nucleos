@@ -87,6 +87,55 @@ func (l ChromeLauncher) Launch(ctx context.Context, dir string, policy fence.Pol
 	return instance, nil
 }
 
+// LaunchHuman starts a headful browser over a profile directory, with no fence at all.
+//
+// The missing proxy is spec §6.4 and not an oversight: the restrictions exist because an agent is
+// acting, and the whole point of a handover is that a person is. Fencing this window would block the
+// POST that submits the login the handover was requested for.
+//
+// The asymmetry with Launch is worth stating rather than inferring — one of these functions builds a
+// browser that may be trusted with the owner's cookies because nothing may act in it, and the other
+// builds one that may be trusted because only the owner can.
+func (l ChromeLauncher) LaunchHuman(ctx context.Context, dir string) (Instance, error) {
+	lifetime, cancel := context.WithCancel(context.Background())
+	instance := &humanInstance{cancel: cancel}
+
+	process, err := launch.Start(lifetime, launch.Options{
+		ExecutablePath: l.ExecutablePath,
+		ProfileDir:     dir,
+		Mode:           browser.ModeHuman,
+		CacheMB:        l.CacheMB,
+	}, l.startTimeout())
+	if err != nil {
+		instance.stop(ctx)
+		return nil, err
+	}
+	instance.process = process
+
+	wsURL, err := launch.DebuggerURL(process.Port, l.startTimeout())
+	if err != nil {
+		instance.stop(ctx)
+		return nil, err
+	}
+	conn, err := cdp.Dial(wsURL, l.startTimeout())
+	if err != nil {
+		instance.stop(ctx)
+		return nil, fmt.Errorf("dialling the browser: %w", err)
+	}
+	instance.conn = conn
+
+	human, err := chrome.ConnectHuman(ctx, conn)
+	if err != nil {
+		// A headful browser whose recorder never attached is a login whose chain cannot be granted
+		// (spec §5.3a). Refused rather than opened: the person would do the work and be offered
+		// nothing to keep, which is worse than being told to try again.
+		instance.stop(ctx)
+		return nil, err
+	}
+	instance.Human = human
+	return instance, nil
+}
+
 func (l ChromeLauncher) startTimeout() time.Duration {
 	if l.StartTimeout <= 0 {
 		return 45 * time.Second
@@ -137,6 +186,44 @@ func (i *chromeInstance) stop(ctx context.Context) {
 		// Last. Until the browser is gone it may still be finishing requests, and a proxy that
 		// disappeared underneath them would turn a graceful close into a page full of errors.
 		_ = i.proxy.Close()
+	}
+	if i.cancel != nil {
+		i.cancel()
+	}
+}
+
+// humanInstance is the person's browser: the same process management, none of the fence.
+//
+// Shutdown goes through the same graceful close for the reason spec §4.2 measured, and here it is the
+// one that pays: this is the process the login was made in, and a kill loses the cookie that login
+// produced.
+type humanInstance struct {
+	*chrome.Human
+	conn    *cdp.Conn
+	process *launch.Process
+	cancel  context.CancelFunc
+}
+
+func (i *humanInstance) Shutdown(ctx context.Context) { i.stop(ctx) }
+
+func (i *humanInstance) stop(ctx context.Context) {
+	if i.Human != nil {
+		// Before the connection goes, so nothing Chrome does on the way out is recorded as somewhere
+		// the person chose to go.
+		i.Human.Detach()
+	}
+	if i.conn != nil {
+		closing, cancel := context.WithTimeout(withoutCancel(ctx), 5*time.Second)
+		_, _ = i.conn.Call(closing, cdp.BrowserSession, "Browser.close", nil)
+		select {
+		case <-i.conn.Done():
+		case <-closing.Done():
+		}
+		cancel()
+		_ = i.conn.Close()
+	}
+	if i.process != nil {
+		i.process.Stop()
 	}
 	if i.cancel != nil {
 		i.cancel()

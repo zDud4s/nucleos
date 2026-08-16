@@ -22,6 +22,17 @@ type fakeInstance struct {
 	shutdowns int
 	dir       string
 	policy    fence.Policy
+	// headful records that this instance was built by LaunchHuman, which is the only observable
+	// difference between the two launches once the process is gone.
+	headful bool
+	chain   []string
+}
+
+// Chain makes a headful fakeInstance the kind of driver chainOf can read, mirroring chrome.Human.
+func (f *fakeInstance) Chain() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.chain...)
 }
 
 func (f *fakeInstance) Shutdown(context.Context) {
@@ -40,6 +51,10 @@ type fakeLauncher struct {
 	mu        sync.Mutex
 	instances []*fakeInstance
 	err       error
+	// humanErr, if set, is what LaunchHuman fails with — spec §4.4a's "the headful does not start".
+	humanErr error
+	// chain is what a headful instance reports as the navigation the person made.
+	chain []string
 	// delay makes a launch slow enough for a second caller to arrive during it, which is the case
 	// the per-profile serialisation exists for.
 	delay time.Duration
@@ -60,6 +75,25 @@ func (l *fakeLauncher) Launch(_ context.Context, dir string, policy fence.Policy
 		Fake:   &browser.Fake{FenceAttached: true},
 		dir:    dir,
 		policy: policy,
+	}
+	l.instances = append(l.instances, instance)
+	return instance, nil
+}
+
+func (l *fakeLauncher) LaunchHuman(_ context.Context, dir string) (Instance, error) {
+	if l.delay > 0 {
+		time.Sleep(l.delay)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.humanErr != nil {
+		return nil, l.humanErr
+	}
+	instance := &fakeInstance{
+		Fake:    &browser.Fake{FenceAttached: true},
+		dir:     dir,
+		headful: true,
+		chain:   l.chain,
 	}
 	l.instances = append(l.instances, instance)
 	return instance, nil
@@ -385,6 +419,14 @@ func (l *failingLauncher) Name() string { return "failing" }
 
 func (l *failingLauncher) Launch(context.Context, string, fence.Policy) (Instance, error) {
 	l.instance = &fakeInstance{Fake: &browser.Fake{FenceAttached: true, OpenErr: errors.New("dead site")}}
+	return l.instance, nil
+}
+
+func (l *failingLauncher) LaunchHuman(context.Context, string) (Instance, error) {
+	l.instance = &fakeInstance{
+		Fake:    &browser.Fake{FenceAttached: true, OpenErr: errors.New("dead site")},
+		headful: true,
+	}
 	return l.instance, nil
 }
 

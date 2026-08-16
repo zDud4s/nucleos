@@ -47,8 +47,16 @@ type Instance interface {
 
 // Launcher starts a browser over a prepared profile directory. The seam that keeps this package
 // testable without Chrome — the same role search.Provider plays in the web sidecar.
+//
+// Two methods and not one with a mode argument, because the two are not the same function with a
+// flag: one takes a fence policy and refuses to build a command line without a proxy, and the other
+// takes none and must not have one (spec §6.4). A single Launch(mode) would have a policy parameter
+// that is required half the time and ignored the other half, and "ignored" is how a fence goes
+// missing without anybody deleting it.
 type Launcher interface {
 	Launch(ctx context.Context, dir string, policy fence.Policy) (Instance, error)
+	// LaunchHuman starts a headful browser with no fence, for spec §4.2's handover.
+	LaunchHuman(ctx context.Context, dir string) (Instance, error)
 	Name() string
 }
 
@@ -106,6 +114,10 @@ type entry struct {
 	ready   chan struct{}
 	driver  Instance
 	err     error
+	// human marks the browser a person is driving. It is not a property of the session but of the
+	// BROWSER, because that is what spec §4.1 bounds: one process per profile, and while it is the
+	// headful one there is nowhere for an agent session on that profile to be put.
+	human bool
 
 	sessions map[browser.SessionID]struct{}
 }
@@ -291,6 +303,13 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			// The launch that owns this entry failed and has already removed it. Go round again
 			// rather than reporting somebody else's failure as this caller's.
 			continue
+		}
+		if existing.human {
+			// Spec §4.1 and §4.4: while a person is driving this profile, the agent does not get a
+			// browser in it. Refused rather than queued or relaunched — relaunching would take the
+			// window out from under someone mid-login, and queueing would hold an HTTP request open
+			// for as long as a person takes, which spec §4.4 rule 2 says has no bound at all.
+			return nil, fmt.Errorf("%w: %s", browser.ErrPersonIsDriving, placement.Profile)
 		}
 		if existing.origins == fingerprint {
 			return existing, nil

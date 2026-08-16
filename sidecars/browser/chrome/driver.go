@@ -421,7 +421,11 @@ func (d *Driver) Handoff(ctx context.Context, id browser.SessionID, reason strin
 	if err != nil {
 		return browser.HandoffTicket{}, err
 	}
+	// Under the lock, because Act reads it. Spec §4.4 rule 1 makes this write the thing that stops
+	// the agent, and a stop that races the act it is stopping is not one.
+	d.mu.Lock()
 	entry.mode = browser.ModeHuman
+	d.mu.Unlock()
 	return browser.HandoffTicket{
 		SessionID: id,
 		Mode:      browser.ModeHuman,

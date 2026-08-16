@@ -37,15 +37,23 @@ type Fake struct {
 	// Shot is what Screenshot returns.
 	Shot []byte
 
+	// Chain is what ReturnWheel reports as the navigation a person's window recorded (spec §5.3a).
+	Chain []string
+
 	// Recorded calls, so a test can assert what the driver actually received rather than what the
 	// caller believed it sent.
 	Opened    []OpenRequest
 	Actions   []Action
 	Snapshots []SessionID
 	Closed    []SessionID
+	Wheels    []WheelRequest
+	Handed    []SessionID
 
 	sessions map[SessionID]Session
 	counter  int
+	// human is the session a person is driving, if any. The Fake keeps it for the same reason the
+	// pool does: a return has to be refusable for a session nobody was ever handed.
+	human SessionID
 }
 
 func (f *Fake) Name() string { return "fake" }
@@ -94,8 +102,15 @@ func (f *Fake) Act(_ context.Context, id SessionID, action Action) (ActResult, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Actions = append(f.Actions, action)
-	if _, ok := f.sessions[id]; !ok {
+	session, ok := f.sessions[id]
+	if !ok {
 		return ActResult{}, ErrNoSuchSession
+	}
+	// Spec §4.4 rule 1, modelled here so everything above the driver meets it in tests: once the
+	// wheel has been ASKED for, the agent's actions are refused and not queued. A queued click lands
+	// on a page the person has already navigated away from.
+	if session.Mode != ModeAgent {
+		return Refused(ConsequenceWheelRequested, "the wheel has been asked for"), nil
 	}
 	if f.ActErr != nil {
 		return ActResult{}, f.ActErr
@@ -178,3 +193,13 @@ func (u Unavailable) Handoff(context.Context, SessionID, string) (HandoffTicket,
 	return HandoffTicket{}, u.err()
 }
 func (u Unavailable) Close(context.Context, SessionID) error { return u.err() }
+
+// Unavailable implements Wheelhouse too, so a handover into a sidecar with no browser reports WHY
+// there is none — Chromium not downloaded, the driver unknown — instead of the 501 an unimplemented
+// interface would produce, which says the wrong thing: the wheel is supported, the browser is missing.
+func (u Unavailable) TakeWheel(context.Context, WheelRequest) (Wheel, error) {
+	return Wheel{}, u.err()
+}
+func (u Unavailable) ReturnWheel(context.Context, SessionID) (Returned, error) {
+	return Returned{}, u.err()
+}

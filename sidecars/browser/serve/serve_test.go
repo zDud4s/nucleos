@@ -2,6 +2,7 @@ package serve
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -36,6 +37,9 @@ func testServer(t *testing.T, driver browser.Driver) *httptest.Server {
 	mux.HandleFunc("/screenshot", authorized(token, screenshotHandler(driver)))
 	mux.HandleFunc("/handoff", authorized(token, handoffHandler(driver)))
 	mux.HandleFunc("/close", authorized(token, closeHandler(driver)))
+	wheelhouse, _ := driver.(browser.Wheelhouse)
+	mux.HandleFunc("/wheel/take", authorized(token, takeWheelHandler(wheelhouse)))
+	mux.HandleFunc("/wheel/return", authorized(token, returnWheelHandler(wheelhouse)))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server
@@ -248,5 +252,122 @@ func TestServeConfigIsLoopbackOnly(t *testing.T) {
 	// the default the two agree on, so a change to one is visible from the other.
 	if config.DefaultAddr != "127.0.0.1:8795" {
 		t.Fatalf("default addr drifted: %q", config.DefaultAddr)
+	}
+}
+
+// halfADriver implements the six verbs and not the wheel — the shape a single chrome.Driver has, and
+// the reason serve type-asserts instead of assuming.
+//
+// Spelled out rather than embedding browser.Fake: the Fake DOES implement Wheelhouse, and an
+// embedded one would promote those methods and make this test assert nothing.
+type halfADriver struct{}
+
+func (halfADriver) Name() string { return "half" }
+func (halfADriver) Open(context.Context, browser.OpenRequest) (browser.Session, error) {
+	return browser.Session{}, browser.ErrUnsupported
+}
+func (halfADriver) Snapshot(context.Context, browser.SessionID) (browser.Snapshot, error) {
+	return browser.Snapshot{}, browser.ErrUnsupported
+}
+func (halfADriver) Act(context.Context, browser.SessionID, browser.Action) (browser.ActResult, error) {
+	return browser.ActResult{}, browser.ErrUnsupported
+}
+func (halfADriver) Screenshot(context.Context, browser.SessionID) ([]byte, error) {
+	return nil, browser.ErrUnsupported
+}
+func (halfADriver) Handoff(context.Context, browser.SessionID, string) (browser.HandoffTicket, error) {
+	return browser.HandoffTicket{}, browser.ErrUnsupported
+}
+func (halfADriver) Close(context.Context, browser.SessionID) error { return browser.ErrUnsupported }
+
+// TestTheWheelRoutesRefuseADriverThatCannotSwapProcesses.
+//
+// 501 and not 500: nothing failed. Handing the wheel over means closing one browser and starting
+// another over the same profile (spec §4.2), and a driver that is one browser cannot do it. Saying
+// so is better than a handover that appears to work and leaves the person looking at nothing.
+func TestTheWheelRoutesRefuseADriverThatCannotSwapProcesses(t *testing.T) {
+	server := testServer(t, halfADriver{})
+
+	response := post(t, server, "/wheel/take", TakeWheelRequest{
+		URL:       "https://jira.example.org/",
+		Placement: browser.Placement{Profile: profile.Ref{Kind: profile.Project, ID: "acme"}},
+	}, true)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", response.StatusCode)
+	}
+}
+
+// The wheel goes over the wire with the núcleo's placement on it, and comes back with the chain.
+func TestTheWheelCrossesTheWireWithThePlacementAndReturnsTheChain(t *testing.T) {
+	fake := &browser.Fake{
+		FenceAttached: true,
+		Chain: []string{
+			"https://jira.example.org/login",
+			"https://accounts.google.com/o/oauth2/auth",
+			"https://jira.example.org/browse/X-1",
+		},
+	}
+	server := testServer(t, fake)
+
+	taken := post(t, server, "/wheel/take", TakeWheelRequest{
+		URL:       "https://jira.example.org/login",
+		Placement: browser.Placement{Profile: profile.Ref{Kind: profile.Project, ID: "acme"}},
+	}, true)
+	defer taken.Body.Close()
+	if taken.StatusCode != http.StatusOK {
+		t.Fatalf("take: status = %d", taken.StatusCode)
+	}
+	var wheel browser.Wheel
+	if err := json.NewDecoder(taken.Body).Decode(&wheel); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if wheel.Mode != browser.ModeHuman {
+		t.Fatalf("mode = %q, want human", wheel.Mode)
+	}
+	if len(fake.Wheels) != 1 || fake.Wheels[0].Placement.Profile.ID != "acme" {
+		t.Fatalf("the placement did not cross the wire: %+v", fake.Wheels)
+	}
+
+	returned := post(t, server, "/wheel/return", SessionRequest{SessionID: string(wheel.Session)}, true)
+	defer returned.Body.Close()
+	if returned.StatusCode != http.StatusOK {
+		t.Fatalf("return: status = %d", returned.StatusCode)
+	}
+	var back browser.Returned
+	if err := json.NewDecoder(returned.Body).Decode(&back); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !slices.Equal(back.Chain, fake.Chain) {
+		t.Fatalf("chain = %v, want %v", back.Chain, fake.Chain)
+	}
+}
+
+// Spec §4.5, refused at the door. A handover into a throwaway asks a person to log in somewhere that
+// is deleted with the run.
+func TestAHandoverIntoAThrowawayIsRefusedAtTheDoor(t *testing.T) {
+	server := testServer(t, &browser.Fake{FenceAttached: true})
+
+	response := post(t, server, "/wheel/take", TakeWheelRequest{
+		URL:       "https://jira.example.org/",
+		Placement: browser.Placement{Profile: profile.Ref{Kind: profile.Ephemeral, ID: "r7"}},
+	}, true)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+}
+
+// The wheel routes need the token like everything else. Worth its own case because they were added
+// after the six verbs, and an unauthenticated one would let anything on this machine open a window
+// holding the owner's cookies.
+func TestTheWheelRoutesNeedTheToken(t *testing.T) {
+	server := testServer(t, &browser.Fake{FenceAttached: true})
+	for _, path := range []string{"/wheel/take", "/wheel/return"} {
+		response := post(t, server, path, map[string]any{}, false)
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s without a token: status = %d, want 401", path, response.StatusCode)
+		}
+		response.Body.Close()
 	}
 }

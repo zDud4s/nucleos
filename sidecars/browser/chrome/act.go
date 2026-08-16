@@ -35,8 +35,24 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	}
 
 	d.mu.Lock()
+	mode := entry.mode
 	backendNodeID, known := entry.refs[action.Ref]
 	d.mu.Unlock()
+
+	// Spec §4.4 rule 1. Refused and not queued, and refused from the moment the wheel was ASKED for
+	// rather than from the window opening — the two are separated by a process swap (§4.2), and an
+	// act that landed in between would touch a page the person is about to be handed.
+	//
+	// Second layer. The núcleo refuses this too, from its own record of the session, and neither
+	// layer is redundant: this one holds even if the núcleo's row and the browser disagree about who
+	// is driving, which is exactly the state a crash between the two produces.
+	if mode != browser.ModeAgent {
+		return browser.Refused(
+			browser.ConsequenceWheelRequested,
+			"the wheel has been asked for; this session is the person's now",
+		), nil
+	}
+
 	if !known {
 		// Not an error: the agent named something no snapshot showed it. That is exactly the case
 		// refs exist to make representable, so it comes back as a refusal it can act on — most
