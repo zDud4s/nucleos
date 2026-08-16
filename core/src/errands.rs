@@ -425,6 +425,98 @@ pub fn append_notebook(
     )
 }
 
+/// How many notebook entries a turn is shown, at most.
+///
+/// Twenty is roughly a month of an errand answering once a working day, which is the horizon over
+/// which "what has this errand been doing" is still a useful question. Older than that and the
+/// answer belongs in the file, which keeps everything.
+pub const NOTEBOOK_PREAMBLE_ENTRIES: usize = 20;
+
+/// And how many characters, which is the limit that actually binds.
+///
+/// Entries alone bound nothing: one turn can answer with a page, and twenty pages is a preamble
+/// larger than several context windows. Whichever limit is reached first wins.
+pub const NOTEBOOK_PREAMBLE_CHARS: usize = 12_000;
+
+/// As much of a notebook as a turn is shown, and how many entries were left out of it.
+pub struct NotebookExcerpt {
+    pub text: String,
+    /// Entries not shown. Zero is the ordinary answer and means the turn is reading the whole
+    /// notebook — which is what makes it worth reporting when it is not.
+    pub omitted: usize,
+}
+
+/// The newest end of a notebook, bounded.
+///
+/// **Cut from the old end**, the way `recent_exchanges` cuts. A notebook is a record of work still
+/// in progress and the last thing written is what the next turn continues from; dropping the newest
+/// entries to stay under a limit would leave an errand re-deciding what it had just decided, every
+/// turn, for ever.
+///
+/// This bounds the PREAMBLE and never the file. `read_notebook` keeps returning everything: the file
+/// is the person's, they opened the folder to read it, and a rotation that deleted an errand's
+/// history to save a model some tokens would be this module destroying the one artifact it exists
+/// to produce.
+///
+/// An entry begins at a line starting with `## `, which is what [`append_notebook`] writes. Text
+/// before the first such line — a note somebody typed into the file by hand — is an entry too, and
+/// the oldest one, so it is the first thing dropped rather than a header that survives for ever.
+fn push_entry<'a>(entries: &mut Vec<&'a str>, candidate: &'a str) {
+    // Blank fragments are not entries. `append_notebook` opens every entry with a newline, so the
+    // first split of a real notebook yields a lone `\n` — counted, it would report one more entry
+    // dropped than a person reading the file could find.
+    if !candidate.trim().is_empty() {
+        entries.push(candidate);
+    }
+}
+
+pub fn recent_notebook(notebook: &str) -> NotebookExcerpt {
+    let mut entries: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (offset, _) in notebook.match_indices("## ") {
+        // Only at the beginning of a line, or a `## ` heading inside an answer would split one
+        // entry into two and the count would drift from what a person reading the file sees.
+        if offset == 0 || notebook[..offset].ends_with('\n') {
+            push_entry(&mut entries, &notebook[start..offset]);
+            start = offset;
+        }
+    }
+    push_entry(&mut entries, &notebook[start..]);
+
+    let mut kept = 0;
+    let mut chars = 0;
+    for entry in entries.iter().rev().take(NOTEBOOK_PREAMBLE_ENTRIES) {
+        let length = entry.chars().count();
+        if chars + length > NOTEBOOK_PREAMBLE_CHARS {
+            break;
+        }
+        chars += length;
+        kept += 1;
+    }
+
+    // Nothing fits: the newest entry alone is over budget. Keeping it whole would mean the limit
+    // does not hold, and dropping it would hand the turn a notebook with nothing recent in it —
+    // which is worse than a cut one, because the turn cannot tell it is missing the part it needed.
+    if kept == 0 {
+        let Some(newest) = entries.last() else {
+            return NotebookExcerpt {
+                text: String::new(),
+                omitted: 0,
+            };
+        };
+        let text: String = newest.chars().take(NOTEBOOK_PREAMBLE_CHARS).collect();
+        return NotebookExcerpt {
+            text,
+            omitted: entries.len(),
+        };
+    }
+
+    NotebookExcerpt {
+        text: entries[entries.len() - kept..].concat(),
+        omitted: entries.len() - kept,
+    }
+}
+
 /// Records that a file was written, and what the turn that wrote it had already read.
 ///
 /// The `MAX` in the upsert is the rule in SQL: the mark rises and never falls. A clean turn
@@ -565,6 +657,110 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    /// A notebook of `count` entries in the shape `append_notebook` writes, numbered so a test can
+    /// say WHICH ones survived and not merely how many.
+    fn notebook_of(count: usize) -> String {
+        (1..=count)
+            .map(|n| format!("\n## 2026-08-16T10:0{n}:00Z — run {n}\n\nentrada {n}\n"))
+            .collect()
+    }
+
+    /// A notebook shorter than the bound reaches the turn as written.
+    ///
+    /// The bound exists for an errand that has been running for months; the common case is an
+    /// errand three days old, and paying for the rare case with a lossy common one would be the
+    /// wrong trade. Byte for byte over the content, so a cut off by an entry cannot hide here — the
+    /// only difference allowed is the leading newline `append_notebook` opens the file with, which
+    /// is a blank fragment and not an entry.
+    #[test]
+    fn a_short_notebook_is_shown_whole() {
+        let notebook = notebook_of(3);
+
+        let excerpt = recent_notebook(&notebook);
+
+        assert_eq!(excerpt.text, notebook.trim_start());
+        assert_eq!(excerpt.omitted, 0);
+    }
+
+    /// §13's last risk: "the notebook grows without limit. There is no rotation at this stage; an
+    /// errand of months fills the preamble." With piece 4 running errands unattended, an errand of
+    /// months stops being hypothetical.
+    ///
+    /// Cut from the OLD end, the way `recent_exchanges` cuts. A notebook is a record of work in
+    /// progress and the last thing written is the thing the next turn continues from; dropping the
+    /// newest entries to stay under a limit would leave the errand re-deciding what it had just
+    /// decided, every turn, for ever.
+    #[test]
+    fn a_long_notebook_keeps_its_newest_entries_and_says_what_it_dropped() {
+        let notebook = notebook_of(NOTEBOOK_PREAMBLE_ENTRIES + 5);
+
+        let excerpt = recent_notebook(&notebook);
+
+        assert_eq!(excerpt.omitted, 5);
+        assert!(
+            excerpt
+                .text
+                .contains(&format!("entrada {}", NOTEBOOK_PREAMBLE_ENTRIES + 5)),
+            "the newest entry must survive: {}",
+            excerpt.text
+        );
+        assert!(
+            !excerpt.text.contains("entrada 1\n"),
+            "the oldest must not: {}",
+            excerpt.text
+        );
+    }
+
+    /// Entries alone do not bound anything: one turn can answer with a page of text, and twenty of
+    /// those is a preamble larger than most context windows. Whichever limit is reached first wins.
+    ///
+    /// The sizes are deliberately unequal, oldest largest. Equal ones would let a budget measured
+    /// from the wrong end of the notebook keep exactly the same number of entries and pass — the
+    /// count would be right and the answer wrong, which is the shape of bug this whole function
+    /// exists to avoid.
+    #[test]
+    fn a_notebook_of_few_but_enormous_entries_is_cut_by_size() {
+        let enormous = "x".repeat(NOTEBOOK_PREAMBLE_CHARS);
+        let small = "y".repeat(NOTEBOOK_PREAMBLE_CHARS / 4);
+        let notebook = format!(
+            "\n## a — run 1\n\n{enormous}\n\n## b — run 2\n\n{small}\n\n## c — run 3\n\n{small}\n"
+        );
+
+        let excerpt = recent_notebook(&notebook);
+
+        assert!(
+            excerpt.text.chars().count() <= NOTEBOOK_PREAMBLE_CHARS,
+            "kept {} characters",
+            excerpt.text.chars().count()
+        );
+        // Both small ones fit and the enormous one does not, so the count is pinned as well as the
+        // size — a budget spent from the old end would have room for one entry, not two.
+        assert_eq!(excerpt.omitted, 1);
+        assert!(
+            excerpt.text.contains("run 2") && excerpt.text.contains("run 3"),
+            "the two newest are what stay: {}",
+            &excerpt.text[..excerpt.text.len().min(80)]
+        );
+    }
+
+    /// The pathological case, and the one a bound written carelessly gets wrong: a single entry
+    /// bigger than the whole budget. Keeping it whole would mean the limit does not hold; dropping
+    /// it would show the turn a notebook with nothing recent in it, which is worse than a cut one.
+    /// So it is kept and cut, and the cut is announced.
+    #[test]
+    fn one_entry_larger_than_the_whole_budget_is_cut_rather_than_dropped() {
+        let notebook = format!(
+            "\n## a — run 1\n\n{}\n",
+            "y".repeat(NOTEBOOK_PREAMBLE_CHARS * 3)
+        );
+
+        let excerpt = recent_notebook(&notebook);
+
+        assert!(excerpt.text.chars().count() <= NOTEBOOK_PREAMBLE_CHARS);
+        assert!(excerpt.text.contains('y'), "it must not come back empty");
+        assert!(excerpt.omitted > 0, "and it must say it was cut");
     }
 
     /// An errand for the tests that are about something else — the notebook, the artifacts.
