@@ -246,3 +246,45 @@ func TestAHeadfulThatWillNotStartLeavesNobodyDriving(t *testing.T) {
 		t.Fatalf("the profile stayed locked after a failed handover: %v", err)
 	}
 }
+
+// Spec §10's "Esquecer", and the counterweight to a list that only grows: the browser goes down and
+// the directory goes with it, project profile or not.
+//
+// The order matters on Windows and is asserted by the fact that the delete succeeds at all — a
+// running Chrome holds files under its --user-data-dir open, and a RemoveAll over them fails halfway.
+func TestForgettingAProfileStopsItsBrowserAndDeletesTheDirectory(t *testing.T) {
+	launcher := &fakeLauncher{}
+	pool, store := testPool(t, launcher, 4)
+
+	placement := project("acme", "https://jira.example.org")
+	session := mustOpen(t, pool, placement)
+	dir, err := store.Dir(placement.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDir(dir); err != nil {
+		t.Fatalf("the profile was never created: %v", err)
+	}
+
+	stopped, err := pool.Forget(context.Background(), placement.Profile)
+	if err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if len(stopped) != 1 || stopped[0] != session.ID {
+		t.Fatalf("stopped = %v, want [%s]", stopped, session.ID)
+	}
+	if launcher.launched()[0].stopped() != 1 {
+		t.Fatal("the browser was left running over a directory that no longer exists")
+	}
+	if _, err := readDir(dir); err == nil {
+		t.Fatal("the profile directory survived being forgotten")
+	}
+
+	// And the profile is free to be used again — forgetting is not a tombstone.
+	if _, err := pool.Open(context.Background(), browser.OpenRequest{
+		URL:       "https://jira.example.org/",
+		Placement: placement,
+	}); err != nil {
+		t.Fatalf("the profile stayed unusable after being forgotten: %v", err)
+	}
+}

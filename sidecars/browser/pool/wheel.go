@@ -105,6 +105,40 @@ func (p *Pool) ReturnWheel(ctx context.Context, id browser.SessionID) (browser.R
 	return browser.Returned{Chain: chain}, nil
 }
 
+// Forget deletes a profile and everything in it — spec §10's "Esquecer".
+//
+// The browser goes first and the directory second, and on Windows that order is not a preference: a
+// running Chrome holds files under its --user-data-dir open, and RemoveAll over them fails halfway,
+// leaving a profile that is neither there nor gone.
+//
+// It reports which sessions it took down for the same reason TakeWheel does: the núcleo has rows for
+// them, and rows saying "open" about a browser that has been stopped are rows the UI acts on.
+func (p *Pool) Forget(ctx context.Context, ref profile.Ref) ([]browser.SessionID, error) {
+	if err := ref.Validate(); err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	holder := p.running[ref]
+	var stopped []browser.SessionID
+	if holder != nil {
+		for id := range holder.sessions {
+			stopped = append(stopped, id)
+			delete(p.sessions, id)
+		}
+		delete(p.running, ref)
+	}
+	p.mu.Unlock()
+
+	if holder != nil {
+		<-holder.ready
+		if holder.driver != nil {
+			holder.driver.Shutdown(ctx)
+		}
+	}
+	return stopped, p.store.Forget(ref)
+}
+
 // beginHuman publishes the person's entry and evicts whatever held the profile, in one step.
 //
 // One step because spec §4.1 allows one browser per profile and no gap: if the eviction and the

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"nucleosbrowser/profile"
 )
 
 // Fake is the driver the tests drive. Like search.Fake in the web sidecar it ships in the binary
@@ -48,6 +50,7 @@ type Fake struct {
 	Closed    []SessionID
 	Wheels    []WheelRequest
 	Handed    []SessionID
+	Forgotten []profile.Ref
 
 	sessions map[SessionID]Session
 	counter  int

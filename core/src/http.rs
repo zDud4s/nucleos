@@ -208,6 +208,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/screenshot", post(crate::browser::post_screenshot))
         .route("/browser/close", post(crate::browser::post_close))
         .route("/browser/revoke", post(crate::browser::post_revoke))
+        .route("/browser/forget", post(crate::browser::post_forget))
         // The wheel (spec §4.4). `/handoff` is the agent asking; there is deliberately no route that
         // ACCEPTS — accepting is `POST /proposals/{id}/approve`, the same door every other decision
         // goes through, so the compare-and-set that settles a concurrent approve is also the write

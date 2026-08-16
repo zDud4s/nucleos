@@ -23,6 +23,7 @@ import (
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/config"
+	"nucleosbrowser/profile"
 )
 
 // HeaderTimeout bounds how long a client may take to send its headers. Small, because the only
@@ -48,6 +49,11 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	wheelhouse, _ := driver.(browser.Wheelhouse)
 	mux.HandleFunc("/wheel/take", authorized(cfg.DaemonToken, takeWheelHandler(wheelhouse)))
 	mux.HandleFunc("/wheel/return", authorized(cfg.DaemonToken, returnWheelHandler(wheelhouse)))
+
+	// Spec §10's "Esquecer". Also not an agent verb, and the only route in this process that deletes
+	// a profile a person put logins into.
+	profiles, _ := driver.(browser.Profiles)
+	mux.HandleFunc("/forget", authorized(cfg.DaemonToken, forgetHandler(profiles)))
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -296,6 +302,35 @@ func returnWheelHandler(wheelhouse browser.Wheelhouse) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, returned)
+	}
+}
+
+// ForgetRequest names the profile to delete. A `profile.Ref` and not a project id, so that this
+// route cannot be the one place in the system that invents a profile name of its own.
+type ForgetRequest struct {
+	Profile profile.Ref `json:"profile"`
+}
+
+func forgetHandler(profiles browser.Profiles) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request ForgetRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		if profiles == nil {
+			http.Error(w, "this driver does not own any profiles", http.StatusNotImplemented)
+			return
+		}
+		if err := request.Profile.Validate(); err != nil {
+			http.Error(w, "profile: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		stopped, err := profiles.Forget(r.Context(), request.Profile)
+		if err != nil {
+			writeDriverError(w, "forget", err)
+			return
+		}
+		writeJSON(w, map[string]any{"stopped": stopped})
 	}
 }
 

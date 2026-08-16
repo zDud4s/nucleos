@@ -73,6 +73,27 @@ func (s Store) Discard(ref Ref) error {
 	return nil
 }
 
+// Forget deletes a profile whatever its kind, and it is the ONLY way a project profile goes.
+//
+// Discard above refuses this on purpose, and the two functions exist as a pair rather than as one
+// with a flag: every routine caller — the end of a run, a pool releasing its last session, the
+// startup sweep — goes through Discard and cannot reach a person's logins by accident. This one is
+// reached from one place, spec §10's "Esquecer", where a person asked for it by name.
+//
+// It is the counterweight the whole design needs. A list that only grows by a human act would grow
+// for ever, and the thing given is a permanent right to load a host inside a profile holding live
+// session cookies. What is given has to be removable, in the same place and with the same certainty.
+func (s Store) Forget(ref Ref) error {
+	dir, err := s.Dir(ref)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("forgetting profile %s: %w", ref, err)
+	}
+	return nil
+}
+
 // Limits are spec §8's ceilings on the profiles directory. A zero field means no ceiling, which is
 // what a Store built without configuration gets: unbounded is the wrong default for a disk, but a
 // hard-coded number here would be a ceiling nobody chose and nobody could raise.

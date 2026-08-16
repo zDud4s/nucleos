@@ -586,6 +586,56 @@ pub async fn take_chain(
     ))
 }
 
+/// Forget a project's profile: the directory, the site list, and the record that it existed.
+///
+/// Spec §10's "Esquecer", and the counterweight the design needs rather than a convenience. The site
+/// list grows only by a person finishing a login (§5.2), so it grows for ever unless there is a way
+/// back — and what it grows by is a permanent right to load a host inside a profile holding live
+/// session cookies. What is given has to be removable, in the same place.
+///
+/// The order is deliberate and the failure is not fatal. The directory goes first, because that is
+/// where the cookies are and deleting the rows while the cookies stayed would be the dangerous half
+/// of the job done last. If the sidecar cannot be reached the rows still go: what remains then is a
+/// directory nobody has a list for, which the next `Admit` sweep and the ceiling both account for,
+/// and which no session can be placed into because the decision reads this table.
+pub async fn forget(
+    pool: &SqlitePool,
+    runtime: &BrowserRuntime,
+    project_id: &str,
+) -> sqlx::Result<Vec<String>> {
+    let placement = Placement::project(project_id, Vec::new());
+    let now = chrono::Utc::now().to_rfc3339();
+    let stopped = match runtime.client.forget(&placement).await {
+        Ok(stopped) => stopped,
+        Err(error) => {
+            tracing::warn!(project = project_id, %error, "the profile directory was not deleted");
+            Vec::new()
+        }
+    };
+    for sidecar_id in &stopped {
+        let _ = sqlx::query(
+            "UPDATE browser_sessions SET closed_at = ?, closed_reason = 'profile-forgotten' \
+             WHERE sidecar_id = ? AND closed_at IS NULL",
+        )
+        .bind(&now)
+        .bind(sidecar_id)
+        .execute(pool)
+        .await;
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("DELETE FROM browser_sites WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM browser_profiles WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(stopped)
+}
+
 /// Close a session's row from outside this module's own paths — the wheel's failures need it.
 pub async fn close_session_row(
     pool: &SqlitePool,
@@ -878,6 +928,26 @@ pub async fn post_revoke(
     match revoke(&state.pool, &body.project_id, &body.origin).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForgetBody {
+    pub project_id: String,
+}
+
+/// `POST /browser/forget` — delete a project's profile and everything granted to it.
+///
+/// The only route on this surface that destroys something a person made, and the reason it exists is
+/// spec §10's: "o que se dá tem de se poder tirar, no mesmo sítio". A revocation screen with no way
+/// to take back the whole profile would leave the cookies behind after the list said they were gone.
+pub async fn post_forget(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ForgetBody>,
+) -> axum::response::Response {
+    match forget(&state.pool, &state.browser, &body.project_id).await {
+        Ok(stopped) => axum::Json(serde_json::json!({ "stopped": stopped.len() })).into_response(),
         Err(error) => db_error(error),
     }
 }

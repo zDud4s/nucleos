@@ -355,6 +355,27 @@ impl BrowserClient {
         .await
     }
 
+    /// Delete a project's profile from disk — spec §10's "Esquecer".
+    ///
+    /// The counterweight to a list that only grows. Everything else in this client either reads a
+    /// page or moves a session; this is the one call that destroys something a person made, which is
+    /// why it takes a whole [`Placement`] rather than a project id — the profile name is built in one
+    /// place, and this is not a second one.
+    pub async fn forget(&self, placement: &Placement) -> Result<Vec<String>, BrowserError> {
+        #[derive(Deserialize)]
+        struct Stopped {
+            #[serde(default)]
+            stopped: Vec<String>,
+        }
+        let answer: Stopped = self
+            .call(
+                "/forget",
+                &serde_json::json!({ "profile": placement.profile }),
+            )
+            .await?;
+        Ok(answer.stopped)
+    }
+
     pub async fn close(&self, session_id: &str) -> Result<(), BrowserError> {
         let response = self
             .post("/close", &serde_json::json!({ "session_id": session_id }))

@@ -184,7 +184,10 @@ describe("App navigation and presence", () => {
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
     ).toEqual([
       "Home", "Fleet", "Autopilot", "Waiting", "Runs", "Projects", "Chats",
-      "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "Council", "System",
+      // Browser sits beside Web because the two are constantly mistaken for each other: Web is what
+      // has been READ — one fetch, no session, no cookies — and Browser is what has been BROWSED, in
+      // a profile that holds the owner's logins.
+      "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "Browser", "Council", "System",
     ]);
   });
 
