@@ -372,6 +372,12 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		http.Error(w, "fence is not attached: refusing to browse", http.StatusServiceUnavailable)
 	case errors.Is(err, browser.ErrUnsupported):
 		http.Error(w, "unsupported by this driver", http.StatusNotImplemented)
+	case errors.Is(err, browser.ErrNotInstalled):
+		// 503 with the REASON in the body, which is spec §9.5's distinction: 501 would say this build
+		// cannot browse, and what is true is that this machine cannot browse yet. The text names the
+		// revision and the path, so "still downloading" and "the download keeps failing" are
+		// different sentences rather than the same silence.
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, browser.ErrPersonIsDriving):
 		// 409 and not 403: nothing is wrong with the request, and it may well succeed later. The
 		// wheel is with a person, and spec §4.4 rule 2 puts no bound on how long that lasts.

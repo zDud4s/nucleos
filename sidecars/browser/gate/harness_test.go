@@ -39,10 +39,15 @@ func chromium(t *testing.T) string {
 	}
 	// The pinned install first: it is what production runs, and a gate that silently preferred the
 	// system browser would be proving things about a version nobody ships.
-	if local := os.Getenv("LOCALAPPDATA"); local != "" {
-		if matches, _ := filepath.Glob(filepath.Join(local, "NucleOS", "browser", "chromium-*", "chrome.exe")); len(matches) > 0 {
-			return matches[0]
-		}
+	//
+	// Asked of `launch.Install` rather than globbed. An earlier version built the path by hand as
+	// `chromium-*/chrome.exe` and was one directory short — the archive unpacks to
+	// `chromium-<rev>/chrome-win/chrome.exe` — so it never matched, and this fell through to the
+	// system Chrome every time WITHOUT SAYING SO. That is why every result this group produced before
+	// today was about a browser nobody ships. One source of truth for the path is the fix, and
+	// `TestTheGateRunsAgainstThePinnedBuild` is what stops it drifting back.
+	if install := (launch.Install{Root: installRoot(t), Pin: launch.DefaultPin()}); install.Present() {
+		return install.ExecutablePath()
 	}
 	for _, candidate := range systemCandidates() {
 		if _, err := os.Stat(candidate); err == nil {

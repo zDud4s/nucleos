@@ -14,7 +14,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -76,41 +75,63 @@ func selectDriver(cfg config.Config) (browser.Driver, func(), error) {
 		return &browser.Fake{FenceAttached: true}, func() {}, nil
 
 	case "chrome":
-		install := launch.Install{Root: cfg.Root}
+		install := launch.Install{Root: cfg.Root, Pin: launch.DefaultPin()}
 		executable := cfg.ExecutablePath
 		if executable == "" {
 			executable = install.ExecutablePath()
 		}
-		if _, err := os.Stat(executable); err != nil {
-			// Spec §9.5: the download happens when the pillar is activated, and until it finishes
-			// this is the state the health readout calls "not-installed" — a fresh installation, not
-			// a fault. Saying which path was looked at is the difference between that and a mystery.
-			return nil, nil, errors.New("no chromium at " + executable +
-				": the pinned browser has not been downloaded yet")
+		build := func() (deferrable, func(), error) { return chromePool(cfg, install, executable) }
+
+		if _, err := os.Stat(executable); err == nil {
+			return mustBuild(build)
 		}
 
-		store := profile.Store{Root: install.ProfilesDir()}
-		// Before anything opens. Every ephemeral profile on disk at this moment is a leftover from a
-		// crash, because this process is the only thing that creates them and it holds no state
-		// across restarts (spec §9.3).
-		if swept, err := store.SweepEphemeral(); err != nil {
-			log.Printf("sweeping orphaned profiles: %v", err)
-		} else if swept > 0 {
-			log.Printf("swept %d ephemeral profile(s) left by an earlier crash", swept)
-		}
-
-		browsers := pool.New(
-			pool.ChromeLauncher{ExecutablePath: executable, CacheMB: cfg.CacheMB},
-			store,
-			profile.Limits{
-				MaxProjects: cfg.MaxProfiles,
-				DiskBudget:  cfg.DiskBudgetMB << 20,
-			},
-			cfg.MaxSessions,
-		)
-		return browsers, func() { browsers.Shutdown(context.Background()) }, nil
+		// Spec §9.5: the download happens when the pillar is ACTIVATED, which is now — the daemon
+		// only starts this process once `.ai/browser.yaml` says so. It runs in the background and
+		// this process serves immediately, answering every request with a refusal that names the
+		// revision, the path and why the last attempt failed. That is §9.5's "indisponível com a
+		// razão", and it is why this is not a fatal error the way an unknown driver is.
+		deferred := newDeferredDriver(notInstalled(install, "not downloaded yet"))
+		fetching, cancel := context.WithCancel(context.Background())
+		go fetchUntilInstalled(fetching, install, deferred, build)
+		return deferred, func() {
+			cancel()
+			deferred.stop()
+		}, nil
 
 	default:
 		return nil, nil, browser.ErrUnsupported
 	}
+}
+
+// chromePool builds the pool over an installed Chromium.
+func chromePool(cfg config.Config, install launch.Install, executable string) (deferrable, func(), error) {
+	store := profile.Store{Root: install.ProfilesDir()}
+	// Before anything opens. Every ephemeral profile on disk at this moment is a leftover from a
+	// crash, because this process is the only thing that creates them and it holds no state across
+	// restarts (spec §9.3).
+	if swept, err := store.SweepEphemeral(); err != nil {
+		log.Printf("sweeping orphaned profiles: %v", err)
+	} else if swept > 0 {
+		log.Printf("swept %d ephemeral profile(s) left by an earlier crash", swept)
+	}
+
+	browsers := pool.New(
+		pool.ChromeLauncher{ExecutablePath: executable, CacheMB: cfg.CacheMB},
+		store,
+		profile.Limits{
+			MaxProjects: cfg.MaxProfiles,
+			DiskBudget:  cfg.DiskBudgetMB << 20,
+		},
+		cfg.MaxSessions,
+	)
+	return browsers, func() { browsers.Shutdown(context.Background()) }, nil
+}
+
+func mustBuild(build func() (deferrable, func(), error)) (browser.Driver, func(), error) {
+	driver, stop, err := build()
+	if err != nil {
+		return nil, nil, err
+	}
+	return driver, stop, nil
 }

@@ -235,6 +235,16 @@ var ErrFenceNotAttached = errors.New("browser: fence is not attached, refusing t
 // ErrNoSuchSession is returned for an unknown or already-closed SessionID.
 var ErrNoSuchSession = errors.New("browser: no such session")
 
+// ErrNotInstalled means the pinned Chromium is not on disk yet (spec §9.5).
+//
+// It is a state and not a fault: the download happens when the pillar is activated, takes minutes,
+// and retries on its own. Spec §9.5 asks for "indisponível COM A RAZÃO, que é diferente de responder
+// 501" — 501 would say browsing is not a thing this build does, and this says it is not a thing this
+// machine can do yet. The wrapped text names the revision and the path, because the difference
+// between "still downloading" and "the download keeps failing" is the whole of what a person can act
+// on.
+var ErrNotInstalled = errors.New("browser: the pinned chromium is not installed")
+
 // ErrUnsupported is returned by a driver that cannot do something the contract allows.
 var ErrUnsupported = errors.New("browser: unsupported by this driver")
 
