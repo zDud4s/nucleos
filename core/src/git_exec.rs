@@ -362,8 +362,23 @@ pub async fn compute_merge(
         // Best-effort: the next operation resets this worktree anyway, and a failure to abort must
         // not replace the conflict — the conflict is what the caller needs to read.
         let _ = git(&integration, &["merge", "--abort"], deadline).await;
+        // **The reason names the owner, because the asker's instinct is to fix it.** An agent that
+        // has just finished work and is told "merging failed" will reach for the conflict, and it
+        // is the one thing here that is not its to reach for: the merge happened in an integration
+        // worktree it does not have, was aborted, and left nothing conflicted anywhere. There is no
+        // conflicted state in its copy to resolve — only the temptation to manufacture one.
+        //
+        // What IS the asker's is the other direction, and the message says so rather than leaving
+        // it to be guessed: bringing the target INTO its branch is an ordinary queue operation, and
+        // resolving there is resolving in its own worktree, on its own branch, where it belongs.
         return Err(failed(
-            format!("merging {source} into {target} failed"),
+            format!(
+                "merging {source} into {target} conflicts, so nothing was published and no copy \
+                 was left conflicted. This is the queue's to report and not yours to fix from \
+                 here — the merge ran in an integration worktree you do not have. To clear it, \
+                 bring {target} into {source} in your own worktree (an ordinary queue operation), \
+                 resolve it there, and ask again."
+            ),
             &merge,
         ));
     }
@@ -1916,10 +1931,33 @@ pub(crate) mod tests {
             .expect_err("a conflict must not produce a merge commit");
 
         match outcome {
-            Outcome::Failed { output_tail, .. } => assert!(
-                output_tail.contains("CONFLICT"),
-                "the row must carry what git said: {output_tail}"
-            ),
+            Outcome::Failed {
+                output_tail,
+                reason,
+                ..
+            } => {
+                assert!(
+                    output_tail.contains("CONFLICT"),
+                    "the row must carry what git said: {output_tail}"
+                );
+                // The asker's instinct on reading "merging failed" is to go and fix it, and that is
+                // the one thing here that is not theirs: the merge ran in an integration worktree
+                // they do not have and was aborted, so there is no conflicted state anywhere to
+                // resolve — only the temptation to manufacture one. The reason has to say so, and
+                // has to say what IS theirs instead.
+                assert!(
+                    reason.contains("not yours to fix"),
+                    "the reason must name the owner: {reason}"
+                );
+                assert!(
+                    reason.contains("no copy was left conflicted"),
+                    "the reason must say there is nothing to resolve: {reason}"
+                );
+                assert!(
+                    reason.contains("in your own worktree"),
+                    "a refusal that names no alternative sends the asker looking: {reason}"
+                );
+            }
             other => panic!("a conflict is a Failed, got {other:?}"),
         }
 
