@@ -97,6 +97,20 @@ func TestDecide(t *testing.T) {
 			want:    browser.ConsequenceChannel,
 		},
 		{
+			name:   "a service worker script is code that would stay in the profile",
+			policy: listed,
+			request: Request{Method: "GET", URL: "https://example.org/sw.js", ResourceType: "Script",
+				Headers: map[string]string{"Service-Worker": "script"}},
+			want: browser.ConsequenceServiceWorker,
+		},
+		{
+			name:   "the same script without the header is an ordinary script",
+			policy: listed,
+			// The control, in the table. Without it the rule above could be "refuse every script",
+			// which passes the case above and breaks the whole web.
+			request: Request{Method: "GET", URL: "https://example.org/sw.js", ResourceType: "Script"},
+		},
+		{
 			name:    "file: is not a channel this browser speaks",
 			policy:  Policy{Profile: Ephemeral},
 			request: Request{Method: "GET", URL: "file:///etc/passwd", ResourceType: "Document"},

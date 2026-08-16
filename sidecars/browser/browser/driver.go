@@ -119,6 +119,12 @@ const (
 	ConsequenceForm Consequence = "form-submission"
 	// ConsequenceChannel — a channel that is not HTTP(S): WebSocket, WebRTC (spec §6.2, §6.2b).
 	ConsequenceChannel Consequence = "non-http-channel"
+	// ConsequenceServiceWorker — code that would stay in the profile (spec §5.8). Named apart from
+	// the method and the scheme because it is the only refusal whose damage OUTLIVES the session:
+	// a registered worker runs after the page closes and survives the headless→headful→headless
+	// cycle, so an agent shown "blocked" would have no way to tell that from a click that did
+	// nothing.
+	ConsequenceServiceWorker Consequence = "service-worker"
 	// ConsequenceDownload — a GET that would write to disk.
 	ConsequenceDownload Consequence = "download"
 	// ConsequenceNewTarget — a popup or new tab (spec §5.4).

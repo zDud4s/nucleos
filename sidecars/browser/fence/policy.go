@@ -165,6 +165,16 @@ func Decide(policy Policy, request Request) Verdict {
 		return refuse(browser.ConsequenceChannel, "websocket upgrade")
 	}
 
+	if isServiceWorkerScript(request.Headers) {
+		// Spec §5.8. Everything else about this request is allowed — it is a GET for a script, often
+		// from a listed origin — and letting it through installs code that keeps running after the
+		// page closes and survives into the person's headful session. The spike measured that failing
+		// THIS request is what stops the registration, and that it only works with the interception
+		// on the browser session: on the page session the request never appears and the worker
+		// installs regardless.
+		return refuse(browser.ConsequenceServiceWorker, "a service worker would stay in this profile")
+	}
+
 	switch strings.ToUpper(request.Method) {
 	case "GET", "HEAD":
 	default:
@@ -220,6 +230,16 @@ func DecideResponse(_ Policy, response Response) Verdict {
 // HTTP is refused, not just websocket, because the point is the channel and not the name.
 func isWebSocketUpgrade(headers map[string]string) bool {
 	return strings.TrimSpace(header(headers, "upgrade")) != ""
+}
+
+// isServiceWorkerScript reads the one thing that distinguishes a worker's script from any other
+// script: the Service-Worker header, which the fetch for a registration's script carries by
+// specification and nothing else does.
+//
+// Resource type would not do it — Chrome classifies the fetch as Script or Other depending on how it
+// was triggered — and neither would the path, which is whatever the site called the file.
+func isServiceWorkerScript(headers map[string]string) bool {
+	return strings.EqualFold(strings.TrimSpace(header(headers, "service-worker")), "script")
 }
 
 // header does a case-insensitive lookup. CDP hands headers back with whatever casing the origin

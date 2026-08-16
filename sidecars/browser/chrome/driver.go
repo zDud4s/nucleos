@@ -46,6 +46,12 @@ type Driver struct {
 
 	refusals     []recordedRefusal
 	refusalTotal int
+
+	// swept closes when the profile has been cleared of service workers, and sweepErr says whether
+	// that succeeded. Open waits on it — see waitForSweep. sweepErr is written before the close and
+	// read only after it, which is what makes it safe without a lock.
+	swept    chan struct{}
+	sweepErr error
 }
 
 type session struct {
@@ -108,9 +114,11 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		sessions:     map[browser.SessionID]*session{},
 		targets:      map[string]browser.SessionID{},
 		cdpToSession: map[cdp.SessionID]browser.SessionID{},
+		swept:        make(chan struct{}),
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)
+	driver.startSweep()
 	return driver, nil
 }
 
@@ -189,6 +197,13 @@ func (d *Driver) onEvent(event cdp.Event) {
 
 // Open creates a target, arms it while it is still paused, and only then navigates.
 func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Session, error) {
+	// Before a target exists, let alone navigates. Spec §5.8 says the profile is swept "ao abrir",
+	// and the reason it is here rather than in Connect is that this is the line the requirement is
+	// actually about: nothing may render while a worker somebody else registered is still live.
+	if err := d.waitForSweep(ctx); err != nil {
+		return browser.Session{}, err
+	}
+
 	attached := make(chan attachment, 4)
 	cancel := d.conn.OnEvent(func(event cdp.Event) {
 		if event.Method != "Target.attachedToTarget" {
