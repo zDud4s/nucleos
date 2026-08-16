@@ -950,6 +950,79 @@ pub fn branch_delete_from_command(command: &str) -> Option<Op> {
     })
 }
 
+/// PURE: why a command the parsers declined must still not be run by hand, or `None`.
+///
+/// **"Declined by the queue" and "fine to run directly" are not the same sentence, and treating
+/// them as one left the worst spelling of the worst verb wide open.** The session gate's rule was
+/// that anything the six parsers refuse passes through untouched, and that rule is right for
+/// `git merge --squash`: squash is a DIFFERENT operation, it stages instead of merging, and
+/// refusing it would make it impossible rather than governed. It is wrong for `git push --force`,
+/// which is the SAME operation in a worse spelling. Measured against the live gate before this
+/// existed: `git push --force origin master`, bare `git push`, and `git pull origin master` all
+/// came back `allow`.
+///
+/// The line drawn here is **does it write something other sessions share**. A push writes the
+/// remote; a pull writes the remote-tracking refs and then moves the local branch; `git branch -D`
+/// destroys a branch after asking git to stop answering whether that is safe. None of those can be
+/// left to race with the queue that exists to order exactly them. What stays silent is what touches
+/// only the caller's own worktree or index — `--squash`, `--abort`, `--continue` — and read-only
+/// spellings, which were never this queue's business.
+///
+/// This is a refusal and NOT an admission: there is nothing to queue, because the queue does not
+/// know how to perform the spelling either. The caller is told which spelling it does know.
+pub fn unqueueable_but_shared(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // **The segment must BEGIN with git, and that is what separates a command from a mention.**
+    // Scanning for `git` anywhere inside it is what the first version did, and it refused this
+    // feature's own commit message: segments split on newlines, so that `cd repo` and `git push` on
+    // two lines are judged apart — which also turns a line of prose reading "git push --force was
+    // allowed" into something shaped exactly like a command. Measured, not imagined: the commit
+    // could not be written, and neither could the probe that found it.
+    //
+    // Requiring the program first costs nothing real. `cd x && git push` has already become two
+    // segments by the time it arrives here, and the second begins with git. What it stops is every
+    // quoted and narrated occurrence — most of them, in a repository whose commit messages argue
+    // about git commands for a living.
+    let program = tokens
+        .first()?
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()?
+        .to_ascii_lowercase();
+    if program != "git" && program != "git.exe" {
+        return None;
+    }
+    let verb = tokens
+        .get(1..)?
+        .iter()
+        .find(|candidate| !candidate.starts_with('-'))
+        .map(|candidate| candidate.to_ascii_lowercase());
+
+    match verb.as_deref()? {
+        "push" => Some(
+            "a push writes the remote, which is the shared thing this queue orders — and this \
+             spelling is not one it can perform. Use `git push <remote>` or \
+             `git push <remote> <branch>`, which it queues."
+                .to_owned(),
+        ),
+        "pull" => Some(
+            "a pull is a fetch and then a merge, and it moves your branch on the way. It is two \
+             queue operations, not one: run `git fetch <remote>`, then `git merge <remote>/<branch>`."
+                .to_owned(),
+        ),
+        // `-D` only. `-d` reached a parser and never arrives here, and the difference is the whole
+        // reason deletion is offerable at all: `-d` asks git to refuse when the branch holds commits
+        // nothing else reaches, and `-D` asks git to stop answering that.
+        "branch" if tokens.contains(&"-D") => Some(
+            "`-D` deletes a branch whose commits may be reachable from nowhere else, and it is the \
+             spelling that asks git not to check. The queue performs `git branch -d <branch>`, where \
+             git's own refusal is the safety."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
 /// autonomous and start `awaiting_approval`.

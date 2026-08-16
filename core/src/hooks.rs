@@ -114,7 +114,17 @@ pub async fn session_git_decision(
                 .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
         })
     else {
-        return no_opinion();
+        // Declined by the queue is not the same sentence as fine to run by hand, and reading them
+        // as one left `git push --force` passing. A spelling that still writes something other
+        // sessions share is refused with NOTHING queued — there is nothing to queue, because the
+        // queue cannot perform that spelling either. Per segment, for the reason above.
+        return match crate::vcs::shell_segments(command)
+            .into_iter()
+            .find_map(crate::vcs::unqueueable_but_shared)
+        {
+            Some(reason) => Json(deny_with(&reason)),
+            None => no_opinion(),
+        };
     };
 
     // From here the command IS one the queue performs, so every remaining failure refuses rather
@@ -3501,10 +3511,55 @@ mod tests {
         }
     }
 
+    /// The worst spelling of the verb this queue most exists for, and it used to pass.
+    ///
+    /// "Declined by the queue" and "fine to run by hand" were read as one sentence. That reading is
+    /// right for `--squash`, which is a different operation touching only the caller's index, and
+    /// wrong for `--force`, which is the same operation in a worse spelling. Measured against the
+    /// live gate before the fix: all three of these came back `allow`.
+    ///
+    /// Refused, and NOTHING queued — the queue cannot perform these spellings either, so there is
+    /// nothing to admit. The refusal names the spelling it does know.
+    #[tokio::test]
+    async fn a_spelling_that_still_writes_what_others_share_is_refused_without_queueing() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-shared").await;
+
+        for command in [
+            "git push --force origin master",
+            "git push",
+            "git pull origin master",
+            "git branch -D stale",
+            "cd somewhere && git push --force origin master",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+        }
+
+        // And a MENTION is not a command. This refused its own commit message once: segments split
+        // on newlines, so a line of prose naming the spelling looked exactly like one being run.
+        for narrated in [
+            "git commit -m \"git push --force was allowed\"",
+            "echo remember to git push later",
+            "grep -rn \"git pull\" docs",
+        ] {
+            let decision = session_decision(&state, narrated, repo.path()).await;
+            assert_eq!(
+                decision.decision, "allow",
+                "a mention is not a command: {narrated} -> {}",
+                decision.reason
+            );
+        }
+        assert!(
+            queued_rows(&state).await.is_empty(),
+            "a refusal is not an admission: there is nothing the queue could perform here"
+        );
+    }
+
     /// The difference between a gate and a wall. The classifier sends everything not provably
     /// read-only for approval; refusing on THAT would stop a session at its second command. And a
-    /// spelling the queue declines has to keep working directly, or it becomes impossible rather
-    /// than governed — `--squash` does not merge, and no queue row would ever perform it.
+    /// spelling that touches only the caller's own index has to keep working directly, or it becomes
+    /// impossible rather than governed — `--squash` does not merge, it stages.
     #[tokio::test]
     async fn what_the_queue_will_not_perform_is_left_alone_rather_than_made_impossible() {
         let state = test_state().await;
@@ -3514,7 +3569,7 @@ mod tests {
             "cargo test",
             "git status",
             "git merge --squash feature",
-            "git branch -D stale",
+            "git merge --abort",
             "git log --oneline",
         ] {
             let decision = session_decision(&state, command, repo.path()).await;
