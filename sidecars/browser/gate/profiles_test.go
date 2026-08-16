@@ -43,6 +43,13 @@ func (l localLauncher) Launch(ctx context.Context, dir string, policy fence.Poli
 	return l.inner.Launch(ctx, dir, policy)
 }
 
+// LaunchHuman needs no amendment: a headful browser has no fence at all (spec §6.4), so there is no
+// loopback list to open. Straight through, which is also the honest thing for a gate to do — this is
+// the production launch, unmodified.
+func (l localLauncher) LaunchHuman(ctx context.Context, dir string) (pool.Instance, error) {
+	return l.inner.LaunchHuman(ctx, dir)
+}
+
 func pooled(t *testing.T, s *site) (*pool.Pool, profile.Store) {
 	t.Helper()
 	store := profile.Store{Root: filepath.Join(t.TempDir(), "profiles")}
