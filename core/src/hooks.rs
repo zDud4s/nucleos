@@ -391,7 +391,14 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
     // The `get_run`-names-a-triage-run rule lives in `mcp_tools::effect_of_call` rather than here,
     // because a second dispatcher needed the same answer and got a different one from the bare
     // table. One implementation is the only way two callers cannot disagree.
-    let effect = crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input).await;
+    //
+    // The errand is passed rather than read out of `tool_input`, so a call cannot say whose folder
+    // it is asking about; `errand_of_run` answers `None` for every run that has none and for every
+    // resolution that fails, which `effect_of_call` reads as "cannot say" and classifies as a
+    // stranger's words.
+    let errand = errand_of_run(&state.pool, payload.run_id).await;
+    let effect =
+        crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input, errand).await;
 
     match effect {
         crate::mcp_tools::ToolEffect::ReadsUntrusted => {
@@ -454,11 +461,44 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                 }
             }
         }
-        crate::mcp_tools::ToolEffect::ReadsOwn => Json(Decision {
-            decision: "allow".to_owned(),
-            reason: "orchestrator NucleOS tool".to_owned(),
-        }),
+        // `WritesOwn` sits with `ReadsOwn` and not with `Acts`, which is the entire reason the
+        // variant exists. An errand reads the web first and writes down what it found afterwards, so
+        // its every turn is already past the barrier by the time it records anything; refusing the
+        // write here would mean an errand that never records anything at all. It reaches no network,
+        // starts no work and lifts no approval, and the file it writes is marked with what the
+        // writing turn had read — so the words do not launder by passing through the disk.
+        crate::mcp_tools::ToolEffect::ReadsOwn | crate::mcp_tools::ToolEffect::WritesOwn => {
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "orchestrator NucleOS tool".to_owned(),
+            })
+        }
     }
+}
+
+/// The errand behind the run making this call, or `None`.
+///
+/// A run records the chat it answers in `chat_id`, and an errand's `chat_key` IS that same string —
+/// `errands::resolve` is keyed by it. Nothing guesses an errand from the shape of a chat key; the
+/// row is the answer, and its absence is the common one, because almost no run is an errand's.
+///
+/// Every failure — a run with no chat, a chat with no errand, a database that will not answer —
+/// answers `None`, which `effect_of_call` treats as "cannot say" and classifies as a stranger's
+/// words. That is the fail-closed direction: the alternative would let an unresolvable errand make
+/// an unrecorded file read as the owner's own notes.
+async fn errand_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<i64> {
+    let chat_id = sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()?;
+    crate::errands::resolve(pool, &chat_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|errand| errand.id)
 }
 
 /// What a council seat may call: the named list, and nothing else.
