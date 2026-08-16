@@ -71,7 +71,28 @@ type workerRegistration struct {
 	IsDeleted      bool   `json:"isDeleted"`
 }
 
+// sweepServiceWorkers clears the profile, from a scratch page.
+//
+// MEASURED, and it cost a gate run: ServiceWorker.enable does NOT exist on the browser session —
+// real Chrome answers -32601, "wasn't found". The unit tests passed anyway because a fake browser
+// answers everything, which is the failure mode gate/domains_test.go now exists to catch. So the
+// sweep opens a blank page it owns, enables the domain there, and closes it again.
+//
+// Note the asymmetry with the rest of the fence, because it is easy to read as an inconsistency: the
+// INTERCEPTION must be on the browser session (a page-session Fetch never sees a worker's script
+// fetch at all), and the SWEEP must be on a page session (the domain is not there otherwise). Both
+// are measurements, and they point in opposite directions.
 func (d *Driver) sweepServiceWorkers(ctx context.Context) error {
+	targetID, session, err := d.createPage(ctx)
+	if err != nil {
+		return fmt.Errorf("opening a page to sweep from: %w", err)
+	}
+	defer func() {
+		_, _ = d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{
+			"targetId": targetID,
+		})
+	}()
+
 	found := make(chan workerRegistration, 32)
 	cancel := d.conn.OnEvent(func(event cdp.Event) {
 		if event.Method != "ServiceWorker.workerRegistrationUpdated" {
@@ -95,9 +116,7 @@ func (d *Driver) sweepServiceWorkers(ctx context.Context) error {
 	})
 	defer cancel()
 
-	// On the browser session, like the rest of the fence. A page-session subscription would only
-	// ever see the workers of a page that is already open, and at this point none is.
-	if _, err := d.conn.Call(ctx, cdp.BrowserSession, "ServiceWorker.enable", nil); err != nil {
+	if _, err := d.conn.Call(ctx, session, "ServiceWorker.enable", nil); err != nil {
 		return err
 	}
 
@@ -115,7 +134,7 @@ func (d *Driver) sweepServiceWorkers(ctx context.Context) error {
 	}
 
 	for scope := range scopes {
-		if _, err := d.conn.Call(ctx, cdp.BrowserSession, "ServiceWorker.unregister", map[string]any{
+		if _, err := d.conn.Call(ctx, session, "ServiceWorker.unregister", map[string]any{
 			"scopeURL": scope,
 		}); err != nil {
 			// One that will not go is a fence failure, not a warning. The alternative is a browser

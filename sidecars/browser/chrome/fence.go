@@ -106,12 +106,16 @@ func (d *Driver) answerResponse(ctx context.Context, session cdp.SessionID, paus
 	}
 
 	params := map[string]any{"requestId": paused.RequestID}
-	if paused.ResponseStatusCode != nil {
-		params["responseCode"] = *paused.ResponseStatusCode
-	}
-	if isDocumentType(paused.ResourceType) && !fence.CarriesFence(paused.ResponseHeaders) {
+	if isDocumentType(paused.ResourceType) && !fence.CarriesFence(paused.ResponseHeaders) && paused.ResponseStatusCode != nil {
 		// The CSP goes on every document, in a frame or not. Spec §5.4's earlier version said "top
 		// level", and an iframe is a document that is not top level — which was the gap.
+		//
+		// Both fields together or neither, MEASURED: continueResponse answers "Cannot override only
+		// status or headers, both should be provided". An earlier version sent the status on every
+		// response and the headers only on documents, so every non-document response-stage pause was
+		// rejected and fell through to failRequest — which looked exactly like the fence working, and
+		// blocked the page it was supposed to let through.
+		params["responseCode"] = *paused.ResponseStatusCode
 		params["responseHeaders"] = fence.InjectCSP(paused.ResponseHeaders)
 	}
 	d.answerOrFail(ctx, session, paused.RequestID, "Fetch.continueResponse", params)
@@ -196,49 +200,60 @@ func (d *Driver) refusalCount() int {
 // refusalSettle is how long an act waits to see whether the fence stopped what it started.
 //
 // A click that triggers a request is not synchronous with the request, so there is no event to wait
-// on — only a window. 300ms is the price of spec §6.2's promise that "o act que o causou responde ao
-// agente", paid on every act that is NOT refused, and it is charged deliberately rather than
-// silently: the alternative is telling the agent "done" for something the fence stopped, and the
-// agent's next move is then based on a page that never changed.
-const refusalSettle = 300 * time.Millisecond
+// on — only a window. MEASURED against real Chrome: a form submission from a click takes well over
+// the 300ms this was first set to, and the first gate run duly reported "done" for a POST the fence
+// had stopped — the exact failure spec §6.2's second half exists to prevent.
+//
+// The window is not the whole answer, because no fixed window can be. A refusal that arrives after it
+// is carried over and reported on the session's NEXT act (see session.reportedUpTo), so the agent
+// learns late rather than never.
+const refusalSettle = 1500 * time.Millisecond
 
 // refusalFor waits briefly for a refusal newer than `since` belonging to this session.
 func (d *Driver) refusalFor(ctx context.Context, id browser.SessionID, since int) *recordedRefusal {
+	found, _ := d.refusalForAt(ctx, id, since)
+	return found
+}
+
+// refusalForAt is refusalFor with the absolute index of what it found, so a caller can record how
+// far it has consumed and not report the same refusal twice.
+func (d *Driver) refusalForAt(ctx context.Context, id browser.SessionID, since int) (*recordedRefusal, int) {
 	deadline := time.NewTimer(refusalSettle)
 	defer deadline.Stop()
 	tick := time.NewTicker(15 * time.Millisecond)
 	defer tick.Stop()
 
 	for {
-		if found := d.newRefusal(id, since); found != nil {
-			return found
+		if found, at := d.newRefusal(id, since); found != nil {
+			return found, at
 		}
 		select {
 		case <-deadline.C:
 			return d.newRefusal(id, since)
 		case <-ctx.Done():
-			return nil
+			return nil, since
 		case <-tick.C:
 		}
 	}
 }
 
-func (d *Driver) newRefusal(id browser.SessionID, since int) *recordedRefusal {
+func (d *Driver) newRefusal(id browser.SessionID, since int) (*recordedRefusal, int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.refusalTotal <= since {
-		return nil
+		return nil, since
 	}
 	// The slice is a bounded ring, so translate the absolute count into an index into what is left.
 	skip := since - (d.refusalTotal - len(d.refusals))
 	if skip < 0 {
 		skip = 0
 	}
-	for _, refusal := range d.refusals[skip:] {
+	first := d.refusalTotal - len(d.refusals)
+	for offset, refusal := range d.refusals[skip:] {
 		if refusal.Session == id || refusal.Session == "" {
 			found := refusal
-			return &found
+			return &found, first + skip + offset + 1
 		}
 	}
-	return nil
+	return nil, d.refusalTotal
 }

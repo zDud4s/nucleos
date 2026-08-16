@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"slices"
+
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp/cdptest"
 )
@@ -42,18 +44,27 @@ func TestTheSameScriptWithoutTheHeaderPasses(t *testing.T) {
 	}
 }
 
-// TestTheFenceGoesOnTheBrowserSessionForWorkers restates the spike's most consequential finding as a
-// regression test on the one call that proves it. On the page session the script request never
-// appears at all and the worker installs regardless — a fence that looked identical from every call
-// site and enforced nothing.
-func TestServiceWorkersAreEnabledOnTheBrowserSession(t *testing.T) {
+// TestTheSweepRunsOnAPageSessionAndTheFenceOnTheBrowserSession pins an asymmetry that reads as a
+// mistake and is not.
+//
+// The INTERCEPTION goes on the browser session: on a page session a worker's script fetch never
+// appears at all. The SWEEP goes on a page session: ServiceWorker.enable does not exist on the
+// browser session — real Chrome answers -32601, measured in gate/domains_test.go after this file's
+// first version asserted the opposite and passed, because a fake browser answers everything.
+func TestTheSweepRunsOnAPageSessionAndTheFenceOnTheBrowserSession(t *testing.T) {
 	fake, conn := dial(t)
+	autoAttachOnCreate(fake)
 	if _, err := Connect(context.Background(), conn, projectPolicy()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	call := waitForCall(t, fake, "ServiceWorker.enable")
-	if call.Session != "" {
-		t.Fatalf("ServiceWorker.enable went to session %q, not the browser session", call.Session)
+	sweep := waitForCall(t, fake, "ServiceWorker.enable")
+	if sweep.Session == "" {
+		t.Fatal("ServiceWorker.enable went to the browser session, where Chrome does not have it")
+	}
+	for _, call := range fake.Calls() {
+		if call.Method == "Fetch.enable" && call.Session != "" {
+			t.Fatalf("the interception went to session %q, not the browser session", call.Session)
+		}
 	}
 }
 
@@ -101,10 +112,16 @@ func TestARegisteredWorkerIsSweptBeforeAnythingOpens(t *testing.T) {
 	if len(scopes) != 1 || scopes[0] != "https://example.org/app/" {
 		t.Fatalf("unregistered %v, want only the live registration", scopes)
 	}
-	// The ORDER is the requirement. A sweep that happened alongside the navigation would leave a
-	// window in which the worker serves the page it is about to be removed for.
-	if createAt := fake.IndexOf("Target.createTarget"); unregisterAt > createAt {
-		t.Errorf("the profile was swept after a target existed: %v", fake.Methods())
+	// The ORDER is the requirement, and the thing it is measured against is the NAVIGATION rather
+	// than the first target: the sweep opens a blank page of its own to work from, because the
+	// ServiceWorker domain does not exist on the browser session. A sweep that ran alongside the
+	// navigation would leave a window in which the worker serves the page it is about to be removed
+	// for.
+	if navigateAt := fake.IndexOf("Page.navigate"); navigateAt >= 0 && unregisterAt > navigateAt {
+		t.Errorf("the profile was swept after the navigation: %v", fake.Methods())
+	}
+	if !slices.Contains(fake.Methods(), "Target.closeTarget") {
+		t.Error("the sweep left its scratch page open")
 	}
 }
 
@@ -126,8 +143,8 @@ func TestASweepThatFailsRefusesToOpen(t *testing.T) {
 	if !errors.Is(err, browser.ErrFenceNotAttached) {
 		t.Fatalf("got %v, want ErrFenceNotAttached", err)
 	}
-	if hasCall(fake, "Target.createTarget") {
-		t.Error("a target was created despite the profile not being swept")
+	if hasCall(fake, "Page.navigate") {
+		t.Error("a navigation happened despite the profile not being swept")
 	}
 }
 

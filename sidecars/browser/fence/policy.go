@@ -222,8 +222,15 @@ func Decide(policy Policy, request Request) Verdict {
 	// other sidecars, and the browser's own debugging port, all of which answer on 127.0.0.1. An
 	// allowlist entry is the only way in, so a profile that has business with a local service says so
 	// in configuration rather than by a page guessing a port.
-	if isLoopbackURL(request.URL) && !listedLoopback(loopbackOriginOf(request.URL), policy.Loopback) {
-		return refuse(browser.ConsequenceLoopback, "this machine's own services are not addressable from a page")
+	if isLoopbackURL(request.URL) {
+		if !listedLoopback(loopbackOriginOf(request.URL), policy.Loopback) {
+			return refuse(browser.ConsequenceLoopback, "this machine's own services are not addressable from a page")
+		}
+		// Admitted by name, so the site allowlist below does not also have to cover it — and could
+		// not, being https-only by design. This is what makes a local dev server on plain http
+		// reachable at all: it is not on the web, there is no session on it to spend, and the núcleo
+		// wrote its address down on purpose.
+		return allow()
 	}
 
 	if policy.Profile == Project && request.IsDocument() {

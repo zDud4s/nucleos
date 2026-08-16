@@ -62,6 +62,10 @@ type session struct {
 	requested string
 	final     string
 	title     string
+	// reportedUpTo is how far into the refusal record this session has already been told. It is what
+	// makes a refusal that lands after an act's settle window arrive on the NEXT act instead of being
+	// lost — no fixed window can catch every one, and silence is the wrong failure.
+	reportedUpTo int
 	// refs maps a snapshot ref ("e5") to the node it named. The agent may only act on something a
 	// snapshot actually showed it — see Act.
 	refs map[string]int64
@@ -204,48 +208,11 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		return browser.Session{}, err
 	}
 
-	attached := make(chan attachment, 4)
-	cancel := d.conn.OnEvent(func(event cdp.Event) {
-		if event.Method != "Target.attachedToTarget" {
-			return
-		}
-		var params struct {
-			SessionID  cdp.SessionID `json:"sessionId"`
-			TargetInfo struct {
-				TargetID string `json:"targetId"`
-				Type     string `json:"type"`
-			} `json:"targetInfo"`
-		}
-		if err := json.Unmarshal(event.Params, &params); err != nil {
-			return
-		}
-		if params.TargetInfo.Type != "page" {
-			return
-		}
-		select {
-		case attached <- attachment{session: params.SessionID, target: params.TargetInfo.TargetID}:
-		default:
-		}
-	})
-	defer cancel()
-
-	created, err := d.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
-		"url": "about:blank",
-	})
-	if err != nil {
-		return browser.Session{}, fmt.Errorf("creating target: %w", err)
-	}
-	var target struct {
-		TargetID string `json:"targetId"`
-	}
-	if err := json.Unmarshal(created, &target); err != nil {
-		return browser.Session{}, err
-	}
-
-	cdpSession, err := d.sessionFor(ctx, target.TargetID, attached)
+	targetID, cdpSession, err := d.createPage(ctx)
 	if err != nil {
 		return browser.Session{}, err
 	}
+	target := struct{ TargetID string }{TargetID: targetID}
 
 	if _, err := d.conn.Call(ctx, cdpSession, "Page.enable", nil); err != nil {
 		return browser.Session{}, fmt.Errorf("enabling page domain: %w", err)
@@ -261,6 +228,8 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		mode:      browser.ModeAgent,
 		requested: req.URL,
 		refs:      map[string]int64{},
+		// Anything refused before this session existed belongs to the sweep or to another session.
+		reportedUpTo: d.refusalTotal,
 	}
 	d.sessions[id] = entry
 	d.targets[target.TargetID] = id
@@ -339,6 +308,57 @@ func (d *Driver) readTargetInfo(ctx context.Context, entry *session) {
 type attachment struct {
 	session cdp.SessionID
 	target  string
+}
+
+// createPage opens a blank target and returns it once it is attached.
+//
+// Blank, and navigated afterwards. Creating the target with the destination url would race the
+// interception: the target would begin loading before there is a session to answer for it. Spec §5.4
+// calls that window TOCTOU, and this is the shape of code that closes it.
+func (d *Driver) createPage(ctx context.Context) (string, cdp.SessionID, error) {
+	attached := make(chan attachment, 4)
+	cancel := d.conn.OnEvent(func(event cdp.Event) {
+		if event.Method != "Target.attachedToTarget" {
+			return
+		}
+		var params struct {
+			SessionID  cdp.SessionID `json:"sessionId"`
+			TargetInfo struct {
+				TargetID string `json:"targetId"`
+				Type     string `json:"type"`
+			} `json:"targetInfo"`
+		}
+		if err := json.Unmarshal(event.Params, &params); err != nil {
+			return
+		}
+		if params.TargetInfo.Type != "page" {
+			return
+		}
+		select {
+		case attached <- attachment{session: params.SessionID, target: params.TargetInfo.TargetID}:
+		default:
+		}
+	})
+	defer cancel()
+
+	created, err := d.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
+		"url": "about:blank",
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("creating target: %w", err)
+	}
+	var target struct {
+		TargetID string `json:"targetId"`
+	}
+	if err := json.Unmarshal(created, &target); err != nil {
+		return "", "", err
+	}
+
+	session, err := d.sessionFor(ctx, target.TargetID, attached)
+	if err != nil {
+		return "", "", err
+	}
+	return target.TargetID, session, nil
 }
 
 // sessionFor waits for the auto-attach of a target we just created. It does NOT call

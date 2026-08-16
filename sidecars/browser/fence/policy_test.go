@@ -152,6 +152,23 @@ func TestDecide(t *testing.T) {
 			request: Request{Method: "GET", URL: "https://127.0.0.1:8443/", ResourceType: "Document"},
 		},
 		{
+			name: "an admitted local dev server on plain http opens, which the site list could never allow",
+			policy: Policy{Profile: Project,
+				Origins:  []string{"https://example.org"},
+				Loopback: []string{"http://localhost:3000"}},
+			request: Request{Method: "GET", URL: "http://localhost:3000/app", ResourceType: "Document"},
+		},
+		{
+			name: "and a POST to it is still a POST",
+			policy: Policy{Profile: Project,
+				Origins:  []string{"https://example.org"},
+				Loopback: []string{"http://localhost:3000"}},
+			// The loopback admission is not a way past the rest of the fence: the method, scheme and
+			// service-worker checks all run before it.
+			request: Request{Method: "POST", URL: "http://localhost:3000/api", ResourceType: "XHR"},
+			want:    browser.ConsequenceMethod,
+		},
+		{
 			name:    "a sub-resource from anywhere is allowed: spec §5.5",
 			policy:  listed,
 			request: Request{Method: "GET", URL: "https://cdn.elsewhere.net/app.js", ResourceType: "Script"},

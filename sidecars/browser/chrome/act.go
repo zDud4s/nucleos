@@ -18,10 +18,16 @@ import (
 //
 // The action itself is always allowed: clicking is not what has a consequence, the request the click
 // causes is. So Act does the thing, then asks whether the fence stopped anything on the way out, and
-// reports that instead of "done" (spec §6.2: "o act que o causou responde ao agente"). The cost is
-// [refusalSettle] on every act that is not refused, which is charged in the open rather than traded
-// away — telling the agent "done" for a click the fence swallowed leaves it reasoning about a page
-// that never changed.
+// reports that instead of "done" (spec §6.2: "o act que o causou responde ao agente").
+//
+// # The contract is "this act or the next", and it is not a weaker promise by accident
+//
+// A click and the request it causes are not synchronous, so the only thing available is a window —
+// and the gate measured a form submission missing a 1.5s one under load. A longer window would still
+// be a guess, so the guarantee is elsewhere: a refusal past the window is carried on the session's
+// cursor and reported by the following act (see session.reportedUpTo). The agent therefore learns
+// late rather than never, and "never" is the failure that matters — it would leave the agent
+// reasoning about a page that never changed.
 func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.Action) (browser.ActResult, error) {
 	entry, err := d.lookup(id)
 	if err != nil {
@@ -46,7 +52,9 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		return browser.ActResult{}, err
 	}
 
-	before := d.refusalCount()
+	d.mu.Lock()
+	before := entry.reportedUpTo
+	d.mu.Unlock()
 
 	switch action.Kind {
 	case browser.ActionClick:
@@ -65,7 +73,11 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		return browser.ActResult{}, err
 	}
 
-	if refused := d.refusalFor(ctx, id, before); refused != nil {
+	refused, consumed := d.refusalForAt(ctx, id, before)
+	d.mu.Lock()
+	entry.reportedUpTo = consumed
+	d.mu.Unlock()
+	if refused != nil {
 		return browser.Refused(refused.Consequence, refused.Detail), nil
 	}
 	return browser.Done(), nil
