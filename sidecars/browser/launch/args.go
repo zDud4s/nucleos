@@ -143,6 +143,20 @@ func Args(opts Options) ([]string, error) {
 // and the target paused before it runs), and --force-webrtc-ip-handling-policy=disable_non_proxied_udp
 // together with a working proxy — a UDP packet still reached a page-chosen address.
 //
+// RE-MEASURED 2026-08-16 against the pinned build, with an instrument the spike did not have:
+// gate.TestWebRTCUDPStillLeavesTheFence, which points a page's RTCPeerConnection at a UDP socket the
+// test owns and watches for the first STUN binding request. Two of the six were re-run through it —
+// --force-webrtc-ip-handling-policy=disable_non_proxied_udp (with the fence proxy attached, which is
+// the configuration the flag is supposed to need) and --disable-blink-features=PeerConnection, the
+// feature name the spike may have got wrong. Both let the packet through, three runs each. The
+// spike's conclusion stands.
+//
+// Two mechanisms remain untried and neither is a flag: a Windows Firewall rule on this executable,
+// and Chromium's WebRtcIPHandlingPolicy as an ENTERPRISE POLICY rather than a command line — a
+// different code path, and a plausible reason the flag above does nothing. Both change the machine
+// outside this repository, so both are the owner's call, and the test above is now what would score
+// them.
+//
 // It is a constant rather than a comment so that a future change that believes it has fixed this has
 // something to delete, and a reviewer has something to grep for.
 const WebRTCIsNotFencedHere = "spec §6.2b: WebRTC egress is an open hole; no command-line flag closes it"

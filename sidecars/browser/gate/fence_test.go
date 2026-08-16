@@ -4,6 +4,7 @@ package gate_test
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +213,75 @@ func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
 	}
 	if !admitted.reached("GET /page", settle) {
 		t.Fatal("the admitted link did not navigate either; the click never worked")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 2c — the hole. Spec §6.2b.
+// ---------------------------------------------------------------------------
+
+// TestWebRTCUDPStillLeavesTheFence measures the one thing this fence does not stop, and it is the
+// only test in this package that asserts a FAILURE of the design rather than a success.
+//
+// That shape is deliberate. `launch.WebRTCIsNotFencedHere` and THREAT_MODEL.md item 13 have said in
+// prose since the spike that a page can put bytes on the wire over UDP; prose does not notice when
+// the world changes underneath it. Six mechanisms were tried and rejected — CSP `webrtc 'block'`,
+// --disable-webrtc, --disable-features=WebRtc, --disable-blink-features=RTCPeerConnection, deleting
+// the global per document, and --force-webrtc-ip-handling-policy=disable_non_proxied_udp — so the
+// hole is not going to close because someone here fixes it. It will close, if it ever does, because
+// a Chromium revision bump changed the answer. THIS TEST GOING RED IS THAT NEWS ARRIVING, and it is
+// news worth a red suite: spec §6.1a classifies all six browser tools as ReadsUntrusted rather than
+// Acts, and that classification is an assertion about the fence.
+//
+// Both controls are load-bearing, and neither is ceremony. "No packet arrived" is what a closed hole
+// looks like and it is ALSO what a page whose script never ran looks like, and what a sink bound to
+// the wrong socket looks like. Today's other finding in this file was exactly that kind of mistake
+// read as a result, so: the sink is proved to receive before the browser starts, and the page is
+// proved to have reached setLocalDescription before the absence of a packet is allowed to mean
+// anything.
+func TestWebRTCUDPStillLeavesTheFence(t *testing.T) {
+	sink := newUDPSink(t)
+	site := newSite(t)
+
+	// Control one: the sink receives. Sent from this process, before a browser exists.
+	probe, err := net.Dial("udp", sink.addr())
+	if err != nil {
+		t.Fatalf("dialling the sink: %v", err)
+	}
+	if _, err := probe.Write([]byte("probe")); err != nil {
+		t.Fatalf("probing the sink: %v", err)
+	}
+	_ = probe.Close()
+	if !sink.gotPacket(settle) {
+		t.Fatal("the sink did not hear a packet this process sent it; it would not hear the browser either")
+	}
+
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if _, err := driver.Open(ctx, browser.OpenRequest{
+		URL: site.origin() + "/webrtc?stun=" + sink.addr(),
+	}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Control two: the page ran and ICE was actually started. The beacon is an image GET, which the
+	// fence allows and the CSP does not cover — see fence.Directives, which deliberately omits
+	// img-src.
+	if !site.reached("BEACON ran", settle) {
+		t.Fatal("the page's script never executed; this test measured nothing")
+	}
+	if !site.reached("BEACON offer", settle) {
+		t.Fatal("the script ran but never reached setLocalDescription; this test measured nothing")
+	}
+
+	if !sink.gotPacket(settle) {
+		t.Fatal("NO UDP LEFT THE FENCED BROWSER. This is good news and a red suite is how you are " +
+			"being told: something now closes spec §6.2b. Find out what — a Chromium revision, a " +
+			"flag in launch.Args — write it down, then delete launch.WebRTCIsNotFencedHere, this " +
+			"test, THREAT_MODEL.md item 13, and revisit whether the browser tools are still " +
+			"ReadsUntrusted for the reason §6.1a gives.")
 	}
 }
 

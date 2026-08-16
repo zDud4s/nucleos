@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -126,6 +127,32 @@ func newSite(t *testing.T) *site {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w, `<!doctype html><title>framing</title><iframe src=%q></iframe>`,
 			r.URL.Query().Get("src"))
+	})
+
+	// A page that points an RTCPeerConnection at whatever STUN address the query string names, and
+	// then does nothing else. Naming the address from outside is what makes this a measurement: the
+	// page chooses the destination, which is exactly the shape spec §6.2b describes.
+	//
+	// A data channel and no media, deliberately. Microphone and camera need a permission the fenced
+	// profile never grants; a data channel needs none, so this is the path that is actually open. The
+	// offer is what makes Chrome start ICE and send the first STUN binding request over UDP.
+	mux.HandleFunc("/webrtc", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>webrtc</title><h1 id=here>webrtc</h1><script>
+			const say = what => { new Image().src = "/beacon?what=" + what; };
+			say("ran");
+			try {
+				const pc = new RTCPeerConnection({iceServers: [{urls: "stun:%s"}]});
+				pc.createDataChannel("gate");
+				pc.createOffer()
+					.then(offer => pc.setLocalDescription(offer))
+					.then(() => say("offer"))
+					.catch(() => say("rejected"));
+			} catch (e) {
+				say("threw");
+			}
+		</script>`, r.URL.Query().Get("stun"))
 	})
 
 	// A page with one link to wherever the query string says. It exists for the reporting half of
@@ -271,6 +298,57 @@ func (s *site) reached(label string, within time.Duration) bool {
 }
 
 func (s *site) origin() string { return s.URL }
+
+// udpSink is a UDP socket that records that something arrived, and nothing else.
+//
+// It exists because UDP is the one egress path in this package that no HTTP server can observe.
+// Every other test here proves a negative by watching a *site — but WebRTC never speaks HTTP, so a
+// packet that leaves is invisible to all of them. This is the only listener in the group that would
+// notice.
+//
+// It does not answer. A real STUN server would reply and let ICE proceed; that would measure whether
+// a connection can be ESTABLISHED, which is a larger claim than the one that matters. The claim that
+// matters is that a byte chosen by the page reached an address chosen by the page, and the first
+// binding request already settles it.
+type udpSink struct {
+	conn    *net.UDPConn
+	arrived chan int
+}
+
+func newUDPSink(t *testing.T) *udpSink {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("udp sink: %v", err)
+	}
+	sink := &udpSink{conn: conn, arrived: make(chan int, 32)}
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			select {
+			case sink.arrived <- n:
+			default:
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = conn.Close() })
+	return sink
+}
+
+func (u *udpSink) addr() string { return u.conn.LocalAddr().String() }
+
+func (u *udpSink) gotPacket(within time.Duration) bool {
+	select {
+	case <-u.arrived:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
 
 // admitting is the policy a gate test runs under: a project profile whose only local admission is
 // this site. Everything else on loopback — including the browser's own debugging port — stays shut.
