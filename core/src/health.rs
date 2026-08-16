@@ -136,9 +136,10 @@ pub async fn readout(state: AppState) -> HealthReadout {
 async fn collect_readout(state: AppState) -> HealthReadout {
     let email_enabled = state.email.enabled;
     let web_enabled = state.web.enabled;
+    let browser_enabled = state.browser.enabled;
     let voice_armed = state.voice.armed;
     let stt_command = state.voice.stt_command.clone();
-    let (pool, cli, credentials, disk, echo, telegram, email, web, voice) = tokio::join!(
+    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
@@ -156,6 +157,16 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             "web_sidecar",
             sidecar_probe("web_sidecar", crate::sidecar::WEB, web_enabled),
         ),
+        // Spec §9.4 asks for three states rather than one — Chromium downloaded, sidecar running,
+        // browser reachable — and this is the second of the three. The first belongs to the sidecar,
+        // which is the only process that knows where the binary is, and it reports it by refusing to
+        // start with a message naming the path. Collapsing them here would make a fresh installation
+        // that has not downloaded 300MB yet look like a fault, which is the readout teaching people
+        // to ignore it.
+        run_subsystem(
+            "browser_sidecar",
+            sidecar_probe("browser_sidecar", crate::sidecar::BROWSER, browser_enabled),
+        ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
     );
     let subsystems = vec![
@@ -167,6 +178,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         telegram,
         email,
         web,
+        browser,
         voice,
     ];
 
