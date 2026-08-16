@@ -1699,13 +1699,39 @@ mod tests {
     /// hand-written list to `TOOL_EFFECTS`. The day somebody puts an acting tool in an errand's box,
     /// it fails here, before the code leaves the machine — and not in a Telegram topic anyone in the
     /// group can post to.
+    /// **This test used to be the only thing standing between a Telegram topic and the daemon's
+    /// controls, and it was standing there by luck.** It said "nothing in this box acts", which is
+    /// a statement about the LIST. The day somebody adds an acting tool — which piece 5 exists to
+    /// make possible — the honest response to a red test here is to widen it, and the protection
+    /// leaves with a green commit and nobody noticing.
+    ///
+    /// So it now asserts the thing that has to stay true regardless of the list: an errand's turn
+    /// is refused every acting tool and a person is told about it
+    /// (`hooks::an_errand_cannot_act_even_in_a_turn_that_has_read_nothing`). That rule is about
+    /// whose work it is, not about what the turn has read, so it survives the box being widened and
+    /// survives a clean first message in a topic.
+    ///
+    /// The old assertion is kept below it, unweakened, as the second independent reason — the
+    /// property `COUNCIL_TOOLS` calls "two independent reasons for the same refusal". When the box
+    /// does gain its first acting tool, THIS half comes out with the change that adds it, and the
+    /// half above does not move.
     #[test]
-    fn nenhuma_ferramenta_de_assunto_age() {
+    fn um_assunto_nao_age_sozinho_seja_qual_for_a_sua_caixa() {
+        // The rule that does not depend on the list, restated where the list lives. Its teeth are
+        // in `hooks.rs`; what this pins is that the two files still agree about which effect is the
+        // one a person has to stand in front of.
+        assert_eq!(
+            tool_effect("create_run"),
+            ToolEffect::Acts,
+            "the effect the errand rule keys on has been renamed or reclassified"
+        );
+
         for name in ERRAND_TOOLS {
             assert_ne!(
                 tool_effect(name),
                 ToolEffect::Acts,
-                "{name} is in the errand's box and acts"
+                "{name} is in the errand's box and acts — which is allowed only once approving a \
+                 refused action can carry it out, and today approving one carries out nothing"
             );
         }
     }

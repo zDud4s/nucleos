@@ -358,6 +358,16 @@ pub async fn pretooluse_decision(
 pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
     "this turn has read third-party content and can no longer act";
 
+/// The reason an errand's turn is refused a tool that would act.
+///
+/// Its own constant beside `UNTRUSTED_CONTEXT_DENY_REASON` and not a reuse of it, because the two
+/// say different things to the model and only one of them is true here. "You have read third-party
+/// content" is a statement about this turn that a clean first message would find simply false, and
+/// a model told something false about itself will try to work around it. This one is a standing
+/// rule it cannot satisfy by behaving differently, which is what stops it trying.
+pub const ERRAND_MAY_NOT_ACT: &str =
+    "an errand does not act on its own; this was written down for a person to decide on";
+
 /// The orchestrator turn's decision, and the only barrier standing between a mail body and the
 /// daemon's controls.
 ///
@@ -426,6 +436,27 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             })
         }
         crate::mcp_tools::ToolEffect::Acts => {
+            // An errand never acts on its own, and this is asked BEFORE the barrier because it is a
+            // different rule: the barrier is about what the turn has READ, and this is about whose
+            // work it is. An errand is a Telegram topic. Its first message is a turn that has read
+            // nothing, so the barrier would allow it — and the acting tools are the daemon's
+            // controls and, one day, an email nobody can unsend.
+            //
+            // What this buys is that the errand's box is safe to widen. Until now the box was safe
+            // because it happened to contain nothing that acts, and that property leaves the moment
+            // somebody adds a tool. This one does not.
+            if errand.is_some() {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool,
+                    "pretooluse-decision: an errand may not act without a person"
+                );
+                record_refused_action(state, payload, tool, errand).await;
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: ERRAND_MAY_NOT_ACT.to_owned(),
+                });
+            }
             match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
                 Ok(false) => Json(Decision {
                     decision: "allow".to_owned(),
@@ -2699,10 +2730,13 @@ mod tests {
 
     /// The guard. If this fails, piece 5 has put a human step in front of everything that worked
     /// before it — which is the failure mode of every approval mechanism ever added to anything.
+    ///
+    /// On a run that is NOT an errand's, which is the population this protects. An ordinary
+    /// orchestrator turn asked to start a run starts it, exactly as before errands existed.
     #[tokio::test]
-    async fn an_action_in_a_clean_turn_still_goes_straight_through() {
+    async fn an_action_in_an_ordinary_clean_turn_still_goes_straight_through() {
         let state = test_state().await;
-        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:9").await;
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
         let app = test_router(state.clone());
 
         let act = orchestrator_tool(
@@ -2721,6 +2755,47 @@ mod tests {
                 .is_empty(),
             "nothing was refused, so there is nothing to ask anybody about"
         );
+    }
+
+    /// An errand never acts on its own, whatever is in its box and whatever it has read.
+    ///
+    /// Until now the refusal came from the injection barrier, which is a rule about ORDER: read a
+    /// stranger's words and the acting tools shut. That made the errand's box safe by coincidence —
+    /// nothing in it acts, so the barrier never had to bite — and it left one gap that the day
+    /// somebody widens the box walks straight into: a turn that has read nothing yet is clean, and
+    /// a clean turn acts unconditionally. The first message in a topic is exactly that turn.
+    ///
+    /// So the rule here is about WHOSE work it is rather than what it has read. An errand is a
+    /// Telegram topic; the acting tools are the daemon's controls and, one day, an email nobody can
+    /// unsend. A person is between them, always, and the record from piece 5 is how they hear about
+    /// it. That is what makes the box safe to widen — the safety stops depending on the box being
+    /// empty of actions.
+    #[tokio::test]
+    async fn an_errand_cannot_act_even_in_a_turn_that_has_read_nothing() {
+        let state = test_state().await;
+        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:12").await;
+        let app = test_router(state.clone());
+
+        assert!(
+            !crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "this turn has read nothing, which is the whole point of the test"
+        );
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "deny");
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused.len(), 1, "and the person hears about it");
+        assert_eq!(refused[0].errand_id, Some(errand_id));
     }
 
     /// A turn that keeps reaching leaves ONE record, not one per attempt.
