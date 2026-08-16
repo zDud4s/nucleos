@@ -1773,6 +1773,31 @@ details.scoreboard th {
   border-radius: var(--r-sm);
 }
 
+/* ── A tela livre: a casa inteira numa superfície ────────────── */
+
+.fleet-canvas { display: grid; gap: var(--sp-3); }
+
+/* `relative` porque os nós são `absolute` contra ela. O tamanho mínimo vem do componente, calculado
+   de onde os nós estão: um cartão arrastado para o canto tem de continuar alcançável em vez de ser
+   cortado fora do mundo. */
+.fleet-surface {
+  position: relative;
+  overflow: auto;
+  padding: var(--sp-2);
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+
+/* `transform` e não `left`/`top`: das duas, só a transformação move um nó sem obrigar o browser a
+   refazer o layout da página a cada fotograma do arrasto. */
+.fleet-node {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 260px;
+}
+
 /* ── O zoom 2: a cadeia de itens de um job ────────────── */
 
 .item-chain {
