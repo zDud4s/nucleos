@@ -1857,6 +1857,34 @@ details.scoreboard th {
   box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
 }
 
+/* A linha a ser puxada: nem pedida nem em vigor — ainda não é pergunta nenhuma. Fica a ouro, que é
+   a cor de "pendente" no resto do sistema. */
+.fleet-wire.is-pulling line { stroke: var(--gold); stroke-dasharray: 4 4; }
+
+/* O bico de onde se puxa uma aresta. Pertence ao nó e não ao cartão: uma coluna não tem a que
+   ligar, e um cartão que trouxesse conector em todo o lado ofereceria um gesto que só funciona
+   numa das duas vistas. */
+.node-pull {
+  position: absolute;
+  top: 14px;
+  right: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg-raise);
+  border: 1px solid var(--faint);
+  cursor: crosshair;
+  touch-action: none;
+}
+.node-pull:hover { border-color: var(--gold); background: var(--gold-tint); }
+/* Aceso enquanto uma linha procura onde pousar, e só onde ela pode pousar.
+   Contorno e não fundo: o fundo do cartão na tela são duas camadas opacas por cima da cor de base,
+   e um `background-color` aqui ficava debaixo delas — aceso no CSS e invisível na fotografia. */
+.fleet-node.can-take .slot-card {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 2px var(--gold-line);
+}
+
 /* A pega é o cabeçalho, e só na tela. `touch-action: none` porque sem ele o browser trata o gesto
    como deslocamento da página e o arrasto nunca chega ao componente num ecrã táctil.
    `user-select: none` para não pintar o texto de seleção a meio do movimento. */

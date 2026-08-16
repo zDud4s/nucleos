@@ -4,7 +4,7 @@ import { fireEvent, render } from "@testing-library/react";
 import type { HeldSlot, ProjectConcurrency } from "./api";
 import FleetCanvas from "./FleetCanvas";
 import { fallbackPosition, readLayout, writeLayout } from "./fleet-layout";
-import { column, job, run } from "./test-fleet";
+import { column, fetchMock, job, respondWith, run, settle } from "./test-fleet";
 
 function slot(over: Partial<HeldSlot> = {}): HeldSlot {
   return {
@@ -78,7 +78,31 @@ function positionOf(container: HTMLElement, key: string) {
 
 beforeEach(() => {
   localStorage.clear();
+  fetchMock.mockReset();
 });
+
+/** The nub a line is pulled from. Only jobs have one: an exclusion names two jobs. */
+function nub(container: HTMLElement, key: string): Element {
+  const found = container.querySelector(`[data-node="${key}"] [data-pull]`);
+  if (found === null) throw new Error(`no nub on ${key}`);
+  return found;
+}
+
+/** Every exclusion the canvas asked the daemon for, as `[jobA, jobB]`. */
+function asked(): Array<[number, number]> {
+  return fetchMock.mock.calls
+    .filter((call) => {
+      const init = call[1] as RequestInit | undefined;
+      return String(call[0]).includes("/fleet/exclusions") && init?.method === "POST";
+    })
+    .map((call) => {
+      const body = JSON.parse(String((call[1] as RequestInit).body)) as {
+        job_a: number;
+        job_b: number;
+      };
+      return [body.job_a, body.job_b] as [number, number];
+    });
+}
 
 /**
  * The canvas is the whole house, not one project.
@@ -306,6 +330,88 @@ it("keeps a line attached to the node being dragged", () => {
   expect(container.querySelector('[data-edge="3"] line')?.getAttribute("x1")).toBe(
     String(Number(before) + 200),
   );
+});
+
+/**
+ * The gesture the canvas exists for: pull a line from one job to another and it asks.
+ *
+ * The same route the button takes — `POST /fleet/exclusions` — because a second way of asking that
+ * asked differently would be a second thing to keep in step. The button stays: it is the one that
+ * works without a fine mouse, and answering the request is still a decision, taken on the card.
+ */
+it("asks for the exclusion when a line is pulled from one job to another", async () => {
+  respondWith({ "POST /fleet/exclusions": { proposal_id: 9 } });
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] }),
+  ]);
+
+  fireEvent(nub(container, "job:41"), pointer("pointerdown", { x: 10, y: 10 }));
+  fireEvent(grip(container, "job:7"), pointer("pointermove", { x: 60, y: 60 }));
+  fireEvent(grip(container, "job:7"), pointer("pointerup", { x: 60, y: 60 }));
+  await settle();
+
+  expect(asked()).toEqual([[41, 7]]);
+});
+
+/** While the line is being pulled it follows the pointer, or there is nothing to aim. */
+it("draws a line following the pointer while it is being pulled", () => {
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_id: 7 })] }),
+  ]);
+
+  expect(container.querySelector('[data-edge="pulling"]')).toBeNull();
+
+  fireEvent(nub(container, "job:41"), pointer("pointerdown", { x: 10, y: 10 }));
+  fireEvent(grip(container, "job:7"), pointer("pointermove", { x: 60, y: 60 }));
+
+  expect(container.querySelector('[data-edge="pulling"]')).not.toBeNull();
+
+  fireEvent(grip(container, "job:7"), pointer("pointerup", { x: 60, y: 60 }));
+
+  expect(container.querySelector('[data-edge="pulling"]')).toBeNull();
+});
+
+/**
+ * A line dropped where it cannot become a rule asks nothing.
+ *
+ * All three refusals are the daemon's own — itself, another project, a pair that already has an
+ * edge — and a gesture whose only possible outcome is a 409 is the defect the visual pass caught in
+ * the columns, drawn instead of clicked.
+ */
+it("asks nothing when the line is dropped somewhere it cannot become a rule", async () => {
+  respondWith({ "POST /fleet/exclusions": { proposal_id: 9 } });
+  const { container } = renderCanvas(
+    [
+      column({
+        slots: [
+          slot({ owner_id: 41 }),
+          slot({ slot: 1, owner_id: 7 }),
+          slot({ slot: 2, owner_kind: "run", owner_id: 7 }),
+        ],
+      }),
+      column({
+        project_id: "beta",
+        slots: [slot({ project_id: "beta", owner_id: 51 })],
+      }),
+    ],
+    {
+      jobs: [job({ id: 41 }), job({ id: 7 }), job({ id: 51, project_id: "beta" })],
+      edges: [{ low: 7, high: 41, state: "active", id: 3 }],
+    },
+  );
+
+  const drop = (from: string, to: string) => {
+    fireEvent(nub(container, from), pointer("pointerdown", { x: 10, y: 10 }));
+    fireEvent(grip(container, to), pointer("pointerup", { x: 60, y: 60 }));
+  };
+
+  drop("job:41", "job:41"); // itself
+  drop("job:41", "job:7"); // already tied
+  drop("job:41", "job:51"); // another project
+  drop("job:41", "run:7"); // a run is not a job — and has no nub either
+  await settle();
+
+  expect(asked()).toEqual([]);
 });
 
 /**

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { edgeGeometry } from "./fleet-edges";
+import { edgeGeometry, pairable } from "./fleet-edges";
 import type { ExclusionEdge } from "./fleet-derive";
 
 const SIZE = { width: 200, height: 100 };
@@ -57,5 +57,36 @@ describe("where an exclusion line goes", () => {
     const positions = { "job:41": { x: 0, y: 0 }, "run:7": { x: 400, y: 200 } };
 
     expect(edgeGeometry(edges, positions, SIZE)).toEqual([]);
+  });
+});
+
+describe("whether a line could become a rule", () => {
+  /**
+   * The three refusals are the daemon's own, answered before the gesture rather than after it.
+   *
+   * A line that can only end in a 409 is the defect the visual pass already caught once in the
+   * columns: an action offered where it cannot succeed teaches the reader that the screen shows
+   * things that were never available.
+   */
+  it("refuses the three the daemon would refuse", () => {
+    const tied: ExclusionEdge[] = [{ low: 41, high: 42, state: "pending", id: 9 }];
+
+    expect(pairable(41, 42, true, [])).toBe(true);
+    // Itself: `pair()` in the core answers `None` for a == b.
+    expect(pairable(41, 41, true, [])).toBe(false);
+    // Another project: the core answers `DifferentProjects`.
+    expect(pairable(41, 42, false, [])).toBe(false);
+    // Already asked about — and a rule in force is refused just the same.
+    expect(pairable(41, 42, true, tied)).toBe(false);
+    expect(pairable(42, 41, true, tied)).toBe(false);
+  });
+
+  /** The pair is normalised before it is compared, as the core normalises it before it is stored. */
+  it("does not care which end the line was pulled from", () => {
+    const edges: ExclusionEdge[] = [{ low: 7, high: 41, state: "active", id: 3 }];
+
+    expect(pairable(41, 7, true, edges)).toBe(false);
+    expect(pairable(7, 41, true, edges)).toBe(false);
+    expect(pairable(41, 8, true, edges)).toBe(true);
   });
 });

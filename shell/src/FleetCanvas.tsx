@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { HeldSlot, Job, ProjectConcurrency, RunSearchResult } from "./api";
 import { useExclusionActions } from "./fleet-actions";
@@ -9,7 +9,7 @@ import {
   slotDetail,
   type ExclusionEdge,
 } from "./fleet-derive";
-import { edgeGeometry } from "./fleet-edges";
+import { edgeGeometry, pairable } from "./fleet-edges";
 import {
   clamped,
   positionsFor,
@@ -54,6 +54,21 @@ interface Drag {
   at: Point;
 }
 
+/**
+ * A line being pulled from one job towards another.
+ *
+ * Deliberately NOT a pointer capture, unlike the move drag. Captured, every pointer event goes to
+ * the nub that took the capture, and the node the line is dropped on would never hear the release —
+ * so the target is found the ordinary way, by which element the `pointerup` lands on.
+ */
+interface Pull {
+  from: number;
+  fromKey: string;
+  fromProject: string;
+  /** Where the pointer is, in surface coordinates, so the line has somewhere to end. */
+  at: Point;
+}
+
 interface FleetCanvasProps {
   /** Every project, because an exclusion is about two jobs and this is where both are visible. */
   projects: ProjectConcurrency[];
@@ -94,12 +109,33 @@ export default function FleetCanvas({
   onOpenRuns,
   refresh,
 }: FleetCanvasProps) {
-  const { pairing, failed, closed, roleFor, pick, neverMind, lift, decide } = useExclusionActions(
-    token,
-    refresh,
-  );
+  const { pairing, failed, closed, roleFor, ask, pick, neverMind, lift, decide } =
+    useExclusionActions(token, refresh);
   const [saved, setSaved] = useState<Layout>(() => readLayout(localStorage));
   const [drag, setDrag] = useState<Drag | null>(null);
+  const [pull, setPull] = useState<Pull | null>(null);
+  const surface = useRef<HTMLDivElement>(null);
+
+  /**
+   * A line ends when the button is let go, wherever that happens.
+   *
+   * On the WINDOW, and not on the surface leaving the pointer. The first attempt cancelled the pull
+   * on `pointerleave`, and a scroll under a stationary pointer counts as leaving: reaching for a
+   * far-off card with the wheel made the line vanish mid-gesture. Released outside the window
+   * altogether there is nothing to hear, and the line is left until the pointer comes back — which
+   * is the one case a person can see and undo by letting go again.
+   */
+  const pulling = pull !== null;
+  useEffect(() => {
+    if (!pulling) return;
+    const done = () => setPull(null);
+    window.addEventListener("pointerup", done);
+    window.addEventListener("pointercancel", done);
+    return () => {
+      window.removeEventListener("pointerup", done);
+      window.removeEventListener("pointercancel", done);
+    };
+  }, [pulling]);
 
   const nodes = projects.flatMap((project) =>
     project.slots
@@ -133,6 +169,10 @@ export default function FleetCanvas({
   }
 
   function move(event: React.PointerEvent<HTMLElement>) {
+    if (pull !== null) {
+      setPull({ ...pull, at: surfacePoint(event) });
+      return;
+    }
     if (drag === null) return;
     setDrag({
       ...drag,
@@ -141,6 +181,23 @@ export default function FleetCanvas({
         y: drag.from.y + (event.clientY - drag.origin.y),
       },
     });
+  }
+
+  /**
+   * The pointer, in the surface's own coordinates.
+   *
+   * The scroll is added because the surface scrolls: without it, a line pulled after scrolling down
+   * would trail somewhere above the pointer by exactly how far the surface had moved. Answers the
+   * origin when there is no box to measure, which is jsdom — where the line's coordinates are not
+   * what any test is asking about, because jsdom does no layout.
+   */
+  function surfacePoint(event: React.PointerEvent<HTMLElement>): Point {
+    const box = surface.current?.getBoundingClientRect();
+    if (box === undefined || surface.current === null) return { x: 0, y: 0 };
+    return {
+      x: event.clientX - box.left + surface.current.scrollLeft,
+      y: event.clientY - box.top + surface.current.scrollTop,
+    };
   }
 
   /**
@@ -172,6 +229,37 @@ export default function FleetCanvas({
     const found = neighbours.get(node.project.project_id) ?? [];
     found.push(node.detail.job.id);
     neighbours.set(node.project.project_id, found);
+  }
+
+  /**
+   * Starts a line from a job's nub. Not the header, which already means *move*: one gesture cannot
+   * mean two things, and a card that both moves and connects from the same grab does neither well.
+   */
+  function startPull(
+    jobId: number,
+    key: string,
+    projectId: string,
+    event: React.PointerEvent<HTMLElement>,
+  ) {
+    if (event.button !== 0) return;
+    // Without this the gesture paints the whole page in selection blue on its way across: the pull
+    // holds no pointer capture, so the browser reads the drag as somebody selecting text. The move
+    // drag never showed it because its handle carries `user-select: none`.
+    event.preventDefault();
+    setPull({ from: jobId, fromKey: key, fromProject: projectId, at: surfacePoint(event) });
+  }
+
+  /**
+   * The line was let go on a node. Asks, but only where asking can succeed — the same three
+   * refusals the daemon would give, answered before the gesture rather than after it.
+   *
+   * `ask` is the hook's, which is the route the button takes. Two gestures for one thing is fine;
+   * two ways of asking would be two things to keep in step.
+   */
+  function finishPull(jobId: number | null, projectId: string) {
+    if (pull === null || jobId === null) return;
+    if (!pairable(pull.from, jobId, pull.fromProject === projectId, edges)) return;
+    void ask(pull.from, jobId);
   }
 
   // Where every node is being drawn RIGHT NOW, including the one under the hand. The lines are
@@ -206,6 +294,7 @@ export default function FleetCanvas({
       {failed !== null && <ErrorNote>{failed}</ErrorNote>}
       {closed !== null && <p className="fleet-closed">{closed}</p>}
       <div
+        ref={surface}
         className="fleet-surface"
         style={{ minWidth: extent.width, minHeight: extent.height }}
         // The move and the release listen HERE rather than on the node: with the pointer captured
@@ -213,6 +302,9 @@ export default function FleetCanvas({
         // A cancel — the system taking the gesture away — puts the node back rather than saving a
         // move nobody finished making.
         onPointerMove={move}
+        // A line being pulled is ended by the window listener above; this one ends the move drag.
+        // The node's own handler runs before either, which is where a line finds its target: React
+        // dispatches to the target first and to the ancestors only on the way up.
         onPointerUp={drop}
         onPointerCancel={() => setDrag(null)}
       >
@@ -238,17 +330,40 @@ export default function FleetCanvas({
               <circle cx={line.to.x} cy={line.to.y} r={4} />
             </g>
           ))}
+          {pull !== null && drawn[pull.fromKey] !== undefined && (
+            <g data-edge="pulling" className="fleet-wire is-pulling">
+              <line
+                x1={drawn[pull.fromKey].x + NODE.width / 2}
+                y1={drawn[pull.fromKey].y + NODE.height / 2}
+                x2={pull.at.x}
+                y2={pull.at.y}
+              />
+            </g>
+          )}
         </svg>
         {nodes.map(({ project, slot, key, detail }) => {
           const jobId = detail.kind === "job" ? detail.job.id : null;
           const partners = jobId === null ? [] : partnersOf(edges, jobId);
           const at = positionOf(key);
+          // Lit while a line is looking for somewhere to land, and only where it could land: the
+          // same rule the button follows, drawn instead of clicked.
+          const canTake =
+            pull !== null &&
+            jobId !== null &&
+            pairable(pull.from, jobId, pull.fromProject === project.project_id, edges);
           return (
             <div
               key={key}
-              className={`fleet-node${drag !== null && drag.key === key ? " is-dragging" : ""}`}
+              className={[
+                "fleet-node",
+                drag !== null && drag.key === key ? "is-dragging" : "",
+                canTake ? "can-take" : "",
+              ]
+                .filter((part) => part !== "")
+                .join(" ")}
               data-node={key}
               style={{ transform: `translate(${at.x}px, ${at.y}px)` }}
+              onPointerUp={() => finishPull(jobId, project.project_id)}
             >
               <SlotCard
                 slot={slot}
@@ -266,6 +381,20 @@ export default function FleetCanvas({
                 onOpenRuns={onOpenRuns}
                 onGrab={(event) => grab(key, event)}
               />
+              {/* The nub belongs to the CANVAS and not to the card: a column has nothing to connect
+                  to, and a card that carried a connector everywhere would be offering a gesture
+                  that only works in one of the two views.
+                  Only a job has one — an exclusion names two jobs, and a run holds a slot without
+                  being one. `aria-hidden`, because it is a second way to do what the card's button
+                  already does, and that button is the one that works without a fine mouse. */}
+              {jobId !== null && (
+                <span
+                  className="node-pull"
+                  data-pull={jobId}
+                  aria-hidden="true"
+                  onPointerDown={(event) => startPull(jobId, key, project.project_id, event)}
+                />
+              )}
             </div>
           );
         })}

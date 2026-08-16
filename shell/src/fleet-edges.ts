@@ -50,3 +50,28 @@ export function edgeGeometry(
   }
   return drawn;
 }
+
+/**
+ * Whether a line pulled from one job to another could become a rule.
+ *
+ * The three refusals are the daemon's own, answered here so the gesture never ends in one. A line
+ * that can only finish in a 409 is the defect the visual pass already caught once in the columns:
+ * an action offered where it cannot succeed teaches the reader that the screen shows things that
+ * were never available.
+ *
+ * - **Itself.** `pair()` in the core returns `None` for `a == b`.
+ * - **Another project.** The core answers `DifferentProjects`.
+ * - **A pair that already has an edge**, in force or merely asked about. The core refuses a second
+ *   request for a pair that already has a rule, and a second question is not worth asking either.
+ */
+export function pairable(
+  from: number,
+  to: number,
+  sameProject: boolean,
+  edges: ExclusionEdge[],
+): boolean {
+  if (from === to || !sameProject) return false;
+  const low = Math.min(from, to);
+  const high = Math.max(from, to);
+  return !edges.some((edge) => edge.low === low && edge.high === high);
+}
