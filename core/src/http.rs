@@ -3,7 +3,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -135,6 +135,18 @@ pub fn build_router(state: AppState) -> Router {
             get(read_errand_file).put(write_errand_file),
         )
         .route("/errands/{id}/notebook", get(read_errand_notebook))
+        // What makes an errand STANDING work rather than a topic somebody has to keep typing into.
+        // A project keeps its schedule in `.ai/autopilot.yaml` inside its repository; an errand has
+        // no repository, so the rules live in the database and this is the only door to them.
+        //
+        // The rule id is scoped under the errand id on purpose. Both come out of the path, so
+        // nothing about a request pairs them correctly — `errands::delete_rule` keys on both, and a
+        // mismatched pair matches no row instead of reaching another errand's schedule.
+        .route(
+            "/errands/{id}/rules",
+            get(list_errand_rules).post(create_errand_rule),
+        )
+        .route("/errands/{id}/rules/{rule_id}", delete(delete_errand_rule))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
@@ -3200,6 +3212,107 @@ async fn close_errand(
             tracing::warn!(%error, "closing an errand failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// This errand's standing instructions, by name.
+///
+/// The errand is looked up first even though the query would answer an empty list on its own: an
+/// empty list about an errand that does not exist reads as "this errand has no rules", and a caller
+/// that mistyped an id would go on believing it disarmed something.
+async fn list_errand_rules(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::errands::Rule>>, StatusCode> {
+    errand_by_id(&state, id).await?;
+
+    crate::errands::list_rules(&state.pool, id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, id, "listing an errand's rules failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct CreateRuleRequest {
+    name: String,
+    cron: String,
+    prompt: String,
+    /// Absent means UTC, the same as `ScheduleRule.timezone`. A name nobody recognises is refused
+    /// rather than read as UTC — `scheduler.rs:62-67` gives the reason and it does not change here.
+    timezone: Option<String>,
+}
+
+/// Arms a standing instruction on this errand, answering with the id it was given.
+///
+/// Three refusals, and they are three different sentences on purpose. `404`: no such errand. `400`:
+/// the rule as written will never fire, and the body carries the reason. `409`: this errand already
+/// has a rule of that name.
+///
+/// The `400` is what an errand's rules have that a project's do not. `scheduler.rs` meets a project
+/// rule long after whoever wrote the YAML has gone, so an unreadable one is armed anyway and
+/// announced once to the feed; this one arrives with somebody still at the keyboard, and telling
+/// them now costs a status code.
+///
+/// The reason goes out as free text under `error` rather than as one of the `refusal` slugs the
+/// assistant route uses. A slug exists so a client can look up a sentence it already knows, and the
+/// set of ways a cron can be wrong is not a set anybody can enumerate in advance — here the reason
+/// IS the sentence, and it names the word that was wrong.
+async fn create_errand_rule(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let status_only = |status: StatusCode| (status, Json(serde_json::json!({})));
+
+    errand_by_id(&state, id).await.map_err(status_only)?;
+
+    match crate::errands::create_rule(
+        &state.pool,
+        id,
+        &body.name,
+        &body.cron,
+        &body.prompt,
+        body.timezone.as_deref(),
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(rule_id) => Ok(Json(serde_json::json!({ "rule_id": rule_id }))),
+        Err(crate::errands::RuleError::Unreadable(reason)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": reason })),
+        )),
+        Err(crate::errands::RuleError::Duplicate) => Err(status_only(StatusCode::CONFLICT)),
+        Err(error) => {
+            tracing::warn!(%error, id, "arming an errand's rule failed");
+            Err(status_only(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
+/// Disarms one rule of this errand.
+///
+/// `404` when nothing matched, which covers both an unknown rule and one belonging to a different
+/// errand — and the two are deliberately the same answer, because distinguishing them would confirm
+/// to a caller that some other errand holds that id. A `204` over a delete that matched nothing is
+/// the worse failure by far: it is the daemon agreeing that a rule is disarmed while it goes on
+/// firing.
+async fn delete_errand_rule(
+    State(state): State<AppState>,
+    Path((id, rule_id)): Path<(i64, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    errand_by_id(&state, id).await?;
+
+    match crate::errands::delete_rule(&state.pool, id, rule_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, id, rule_id, "disarming an errand's rule failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// What the errand's file surface answers when a path is refused or missing.
@@ -10133,6 +10246,193 @@ mod tests {
             .unwrap()
             .expect("the errand the route created does not resolve by its topic");
         assert_eq!(found.id, errand_id);
+    }
+
+    /// A rule written through the route comes back through the route.
+    ///
+    /// The round trip is the whole of piece 4's first half: a project keeps its schedule in a file
+    /// inside its repository and an errand has no repository, so if this does not survive a POST and
+    /// a GET there is nowhere for an errand's standing work to live.
+    #[tokio::test]
+    async fn a_rule_posted_to_an_errand_comes_back_in_its_list() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+
+        let (status, created) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(serde_json::json!({
+                "name": "manhã",
+                "cron": "0 8 * * *",
+                "prompt": "vê se apareceram anúncios novos",
+                "timezone": "Europe/Lisbon"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+
+        let (status, listed) = call(state, "GET", &format!("/errands/{errand}/rules"), None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let rules = listed.as_array().expect("the list is an array");
+        assert_eq!(rules.len(), 1, "{listed}");
+        assert_eq!(rules[0]["name"], "manhã");
+        assert_eq!(rules[0]["cron"], "0 8 * * *");
+        assert_eq!(rules[0]["prompt"], "vê se apareceram anúncios novos");
+        assert_eq!(rules[0]["timezone"], "Europe/Lisbon");
+    }
+
+    /// A cron nobody can read is the caller's mistake, said to the caller.
+    ///
+    /// `400` and not `500`, and the reason travels in the body. This is the one advantage an
+    /// errand's rules have over a project's: `.ai/autopilot.yaml` is read long after whoever wrote
+    /// it walked away, so `scheduler.rs` arms the broken rule and announces it once to the feed. A
+    /// rule arriving over a route can be refused to somebody's face, and a refusal that does not
+    /// quote the word that was wrong cannot be acted on from a phone.
+    #[tokio::test]
+    async fn a_cron_nobody_can_read_is_the_callers_mistake_and_not_the_daemons() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(serde_json::json!({
+                "name": "manhã",
+                "cron": "todas as manhãs",
+                "prompt": "vê os anúncios"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("todas as manhãs")),
+            "the refusal has to quote what was written: {body}"
+        );
+
+        let (_, listed) = call(state, "GET", &format!("/errands/{errand}/rules"), None).await;
+        assert!(listed.as_array().is_some_and(|rules| rules.is_empty()));
+    }
+
+    /// A name already in use is a conflict, not a fault.
+    ///
+    /// `409` is the same answer `POST /errands` gives a topic that already has one, and it means the
+    /// same thing: nothing is broken, the caller is asking for a state that is already occupied and
+    /// can pick another name. A `500` would invite them to retry the request unchanged, for ever.
+    #[tokio::test]
+    async fn a_second_rule_of_one_name_is_a_conflict_and_not_a_fault() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+        let rule = serde_json::json!({
+            "name": "manhã",
+            "cron": "0 8 * * *",
+            "prompt": "vê os anúncios"
+        });
+
+        let (first, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(rule.clone()),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+
+        let (second, _) = call(
+            state,
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(rule),
+        )
+        .await;
+
+        assert_eq!(second, StatusCode::CONFLICT);
+    }
+
+    /// A rule for an errand that does not exist is a `404`, and no row is written.
+    ///
+    /// The errand id arrives in the path, so nothing about the request proves the errand is there.
+    /// Without this check the insert would decide it — and with foreign keys on it would decide it
+    /// as a `500`, blaming the daemon for a path the caller made up.
+    ///
+    /// The same body goes to a real errand first, and that half is not decoration: an unrouted path
+    /// answers `404` all by itself, so without it this test passes against a daemon that has no such
+    /// route at all.
+    #[tokio::test]
+    async fn a_rule_for_an_errand_that_is_not_there_is_a_404() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+        let rule = serde_json::json!({
+            "name": "manhã",
+            "cron": "0 8 * * *",
+            "prompt": "vê os anúncios"
+        });
+
+        let (real, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(rule.clone()),
+        )
+        .await;
+        assert_eq!(real, StatusCode::OK, "the route itself has to exist");
+
+        let (invented, _) = call(state, "POST", "/errands/4321/rules", Some(rule)).await;
+
+        assert_eq!(invented, StatusCode::NOT_FOUND);
+    }
+
+    /// Deleting a rule that is not this errand's deletes nothing and says so.
+    ///
+    /// Both ids come out of the path, so a caller can pair any errand with any rule. `errands::
+    /// delete_rule` keys on both and the route turns "no row matched" into a `404` — the difference
+    /// between that and a `204` is the difference between finding out your rule is still armed and
+    /// believing you disarmed it.
+    #[tokio::test]
+    async fn deleting_another_errands_rule_deletes_nothing_and_says_so() {
+        let (state, _temp) = errand_state().await;
+        let carros = an_errand(&state, "carros", "-1001234:7").await.id;
+        let casa = an_errand(&state, "casa", "-1001234:9").await.id;
+
+        let (_, created) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{carros}/rules"),
+            Some(serde_json::json!({
+                "name": "manhã",
+                "cron": "0 8 * * *",
+                "prompt": "vê os anúncios"
+            })),
+        )
+        .await;
+        let rule = created["rule_id"].as_i64().unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "DELETE",
+            &format!("/errands/{casa}/rules/{rule}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, still_there) =
+            call(state.clone(), "GET", &format!("/errands/{carros}/rules"), None).await;
+        assert_eq!(still_there.as_array().unwrap().len(), 1);
+
+        let (status, _) = call(
+            state,
+            "DELETE",
+            &format!("/errands/{carros}/rules/{rule}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     /// The list is what `/assuntos` reads. An errand appears in it from the moment it is opened and

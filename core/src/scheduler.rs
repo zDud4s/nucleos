@@ -65,7 +65,17 @@ pub fn catch_up_preamble(late: chrono::Duration, head_moved: bool) -> String {
 /// nothing. An unknown name is an error rather than a fallback to UTC: silently reading
 /// `Europe/Lisbon` as UTC would fire the rule an hour off and look like it worked.
 pub fn rule_timezone(rule: &ScheduleRule) -> Result<Tz, String> {
-    match rule.timezone.as_deref() {
+    timezone_named(rule.timezone.as_deref())
+}
+
+/// The same question asked of a loose string, for a rule that is not a `ScheduleRule` yet.
+///
+/// An errand's rules arrive over a route as three fields and are refused before they are written
+/// down (`errands::create_rule`), so the check has to happen with nothing to hang it on. Split out
+/// rather than copied, because a second answer to "is this a zone" would be a second answer to
+/// whether a rule fires at 08:00 or at 09:00.
+pub fn timezone_named(name: Option<&str>) -> Result<Tz, String> {
+    match name {
         None => Ok(Tz::UTC),
         Some(name) => name
             .parse::<Tz>()
@@ -84,14 +94,29 @@ pub fn rule_timezone(rule: &ScheduleRule) -> Result<Tz, String> {
 /// therefore invisible: the rule simply never runs, and nothing anywhere says so. Returned here, it
 /// becomes something a person can read.
 pub fn next_fire(rule: &ScheduleRule, since: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
-    let cron = rule
-        .cron
+    next_occurrence(&rule.cron, rule.timezone.as_deref(), since)
+}
+
+/// [`next_fire`] over loose fields, for the same reason [`timezone_named`] exists: an errand's rule
+/// is checked before there is a rule.
+///
+/// This is what makes the refusal at creation worth having. "Is this cron readable" and "does this
+/// zone exist" are two of the three ways a rule never fires; the third is a cron that parses and has
+/// no next occurrence (`0 0 30 2 *` — the thirtieth of February), which only a search for the next
+/// one can tell you. All three arrive here as an error a person can read.
+pub fn next_occurrence(
+    cron: &str,
+    timezone: Option<&str>,
+    since: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
+    let parsed = cron
         .parse::<Cron>()
-        .map_err(|error| format!("'{}' is not a cron expression: {error}", rule.cron))?;
-    let zone = rule_timezone(rule)?;
-    cron.find_next_occurrence(&since.with_timezone(&zone), false)
+        .map_err(|error| format!("'{cron}' is not a cron expression: {error}"))?;
+    let zone = timezone_named(timezone)?;
+    parsed
+        .find_next_occurrence(&since.with_timezone(&zone), false)
         .map(|next| next.with_timezone(&Utc))
-        .map_err(|error| format!("no next occurrence for '{}': {error}", rule.cron))
+        .map_err(|error| format!("no next occurrence for '{cron}': {error}"))
 }
 
 /// Returns each due rule paired with the occurrence that made it due, so the caller can tell a run

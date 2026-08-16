@@ -640,6 +640,137 @@ pub fn list_files(files_root: &Path, errand: &Errand) -> std::io::Result<Vec<Str
         })
 }
 
+/// One standing instruction of an errand: when it fires, what it says, and where its window stands.
+///
+/// The rule and its scheduler state in one struct because they are one row — see migration 0076 for
+/// why they are one row. `last_fired_at` and the day's count go out on the wire with the rest: what
+/// a person wants from a list of rules is mostly "did it run", and answering that from a second
+/// route would be a second read of a fact this one already had in its hand.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct Rule {
+    pub id: i64,
+    pub errand_id: i64,
+    pub name: String,
+    pub cron: String,
+    pub prompt: String,
+    pub timezone: Option<String>,
+    /// Verbatim, never parsed and re-spelled, for the reason `scheduler::RuleState` gives: this is
+    /// the value the window claim compare-and-sets against, and a round trip through `DateTime` can
+    /// change the spelling without changing the instant — after which the claim matches nothing.
+    pub last_fired_at: String,
+    pub fires_date: Option<String>,
+    pub fires_today: i64,
+    pub created_at: String,
+}
+
+/// Why a rule was not written down.
+///
+/// Three outcomes and not one, because the caller owes three different answers: a cron nobody can
+/// read is the writer's to fix, a name already taken is a collision they can rename around, and a
+/// database that would not take the row is neither of those and is not their fault.
+#[derive(Debug)]
+pub enum RuleError {
+    /// The cron, the zone, or the pair of them mean a rule that never fires. Carries the reason
+    /// `scheduler::next_occurrence` gave, which quotes what was written — a refusal that does not
+    /// say which word was wrong cannot be acted on from a phone.
+    Unreadable(String),
+    /// This errand already has a rule of this name.
+    Duplicate,
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for RuleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(reason) => write!(formatter, "{reason}"),
+            Self::Duplicate => write!(formatter, "this errand already has a rule with that name"),
+            Self::Db(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// The rules of one errand, by name.
+///
+/// Alphabetical rather than by creation, because the name is the handle: it is what a person types
+/// to delete one, so the list they read to find it should be ordered the way they would look.
+pub async fn list_rules(pool: &sqlx::SqlitePool, errand_id: i64) -> sqlx::Result<Vec<Rule>> {
+    sqlx::query_as::<_, Rule>(
+        "SELECT id, errand_id, name, cron, prompt, timezone, last_fired_at, fires_date,
+                fires_today, created_at
+         FROM errand_rules WHERE errand_id = ? ORDER BY name",
+    )
+    .bind(errand_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Writes a standing instruction down, answering with its id — or refuses it.
+///
+/// The cron is proved to have a next occurrence BEFORE the row exists, which is the one thing an
+/// errand's rules can do that a project's cannot. `scheduler.rs` reads a project's rules out of a
+/// file long after whoever wrote it walked away, so an unreadable one is armed anyway and announced
+/// once to the feed; this one arrives over a route with somebody still there to be told.
+///
+/// Armed at `now`, not at the epoch: the scheduler calls a window due when the cron's next
+/// occurrence after `last_fired_at` has passed, so a column left to default would owe this rule
+/// every window since the beginning of time — and "every morning at eight", written at half past
+/// nine at night, would fire immediately.
+///
+/// `now` is a parameter rather than a call to the clock because this row is scheduler state and the
+/// scheduler is parameterised by `now` end to end. A test that cannot say WHICH instant a rule was
+/// armed at cannot test arming at all.
+pub async fn create_rule(
+    pool: &sqlx::SqlitePool,
+    errand_id: i64,
+    name: &str,
+    cron: &str,
+    prompt: &str,
+    timezone: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<i64, RuleError> {
+    crate::scheduler::next_occurrence(cron, timezone, now).map_err(RuleError::Unreadable)?;
+
+    let stamp = now.to_rfc3339();
+    sqlx::query(
+        "INSERT INTO errand_rules
+             (errand_id, name, cron, prompt, timezone, last_fired_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(errand_id)
+    .bind(name)
+    .bind(cron)
+    .bind(prompt)
+    .bind(timezone)
+    .bind(&stamp)
+    .bind(&stamp)
+    .execute(pool)
+    .await
+    .map(|done| done.last_insert_rowid())
+    .map_err(|error| match &error {
+        sqlx::Error::Database(database) if database.is_unique_violation() => RuleError::Duplicate,
+        _ => RuleError::Db(error),
+    })
+}
+
+/// Removes a rule of THIS errand, answering whether there was one to remove.
+///
+/// Keyed by the errand as well as by the rule, and that is the whole point of the second argument:
+/// both ids arrive from outside, so nothing stops a caller pairing one errand with another's rule.
+/// Keyed by both, such a pairing matches no row — and the `false` says so, rather than reporting a
+/// deletion that did not happen.
+pub async fn delete_rule(
+    pool: &sqlx::SqlitePool,
+    errand_id: i64,
+    rule_id: i64,
+) -> sqlx::Result<bool> {
+    sqlx::query("DELETE FROM errand_rules WHERE id = ? AND errand_id = ?")
+        .bind(rule_id)
+        .bind(errand_id)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,5 +1389,193 @@ mod tests {
         ] {
             assert_eq!(errand.chat_key, "-100200300:7", "{label}");
         }
+    }
+
+    /// A fixed instant, so a test about arming can say WHICH instant and not merely "recently".
+    fn at(text: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// A rule comes back the way it was written down.
+    ///
+    /// The whole of piece 4 in one assertion: a project's rules live in a YAML file inside its
+    /// repository, and an errand has no repository, so the rule has to survive in the database or
+    /// there is nowhere for it to be. The prompt is checked as carefully as the cron because the
+    /// prompt is the half that will be sent to a model with nobody watching.
+    #[tokio::test]
+    async fn a_rule_comes_back_the_way_it_was_written() {
+        let pool = test_pool().await;
+        let errand = create(&pool, "carros", "-100200300:7").await.unwrap();
+
+        let rule_id = create_rule(
+            &pool,
+            errand,
+            "manhã",
+            "0 8 * * *",
+            "vê se apareceram anúncios novos",
+            Some("Europe/Lisbon"),
+            at("2026-08-16T09:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let rules = list_rules(&pool, errand).await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, rule_id);
+        assert_eq!(rules[0].errand_id, errand);
+        assert_eq!(rules[0].name, "manhã");
+        assert_eq!(rules[0].cron, "0 8 * * *");
+        assert_eq!(rules[0].prompt, "vê se apareceram anúncios novos");
+        assert_eq!(rules[0].timezone.as_deref(), Some("Europe/Lisbon"));
+    }
+
+    /// A cron nothing can read is refused while a person is still holding the keyboard.
+    ///
+    /// This is the one thing an errand's rules can do that a project's cannot, and it is worth
+    /// having: a project rule with a typo is armed anyway and announced once to the feed
+    /// (`scheduler.rs`), because by the time the daemon sees the file the person who wrote it has
+    /// gone. A rule arrives here over a route, so the refusal reaches whoever typed it.
+    ///
+    /// Nothing is stored, which is the half that makes it a refusal rather than a warning.
+    #[tokio::test]
+    async fn a_cron_that_will_never_fire_is_refused_at_the_door() {
+        let pool = test_pool().await;
+        let errand = create(&pool, "carros", "-100200300:7").await.unwrap();
+
+        let refusal = create_rule(
+            &pool,
+            errand,
+            "manhã",
+            "todas as manhãs",
+            "vê os anúncios",
+            None,
+            at("2026-08-16T09:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(refusal, RuleError::Unreadable(_)),
+            "expected an unreadable rule, got {refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("todas as manhãs"),
+            "the refusal has to quote what was written, or it cannot be corrected: {refusal}"
+        );
+        assert!(list_rules(&pool, errand).await.unwrap().is_empty());
+    }
+
+    /// An unknown zone is an error, never a silent UTC.
+    ///
+    /// `scheduler.rs:62-67` gives the reason and it holds identically here: reading `Europe/Lisbon`
+    /// as UTC fires the rule an hour off and looks like it worked. The difference is that there the
+    /// rule is skipped at every tick, and here it never gets written at all.
+    #[tokio::test]
+    async fn a_zone_that_does_not_exist_is_refused_rather_than_read_as_utc() {
+        let pool = test_pool().await;
+        let errand = create(&pool, "carros", "-100200300:7").await.unwrap();
+
+        let refusal = create_rule(
+            &pool,
+            errand,
+            "manhã",
+            "0 8 * * *",
+            "vê os anúncios",
+            Some("Europe/Lisboa"),
+            at("2026-08-16T09:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(refusal, RuleError::Unreadable(_)),
+            "expected an unreadable rule, got {refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("Europe/Lisboa"),
+            "the refusal has to name the zone that was not found: {refusal}"
+        );
+        assert!(list_rules(&pool, errand).await.unwrap().is_empty());
+    }
+
+    /// One errand cannot hold two rules of one name; two errands can.
+    ///
+    /// The name is what the scheduler keys a rule's state by within its errand, and what a person
+    /// says to delete one. Two of them under one errand leaves both questions without an answer.
+    /// Across errands it is not ambiguous at all — "manhã" is what everyone calls the morning one.
+    #[tokio::test]
+    async fn one_errand_cannot_hold_two_rules_of_one_name_but_two_errands_can() {
+        let pool = test_pool().await;
+        let carros = create(&pool, "carros", "-100200300:7").await.unwrap();
+        let casa = create(&pool, "casa", "-100200300:9").await.unwrap();
+        let now = at("2026-08-16T09:00:00Z");
+
+        create_rule(&pool, carros, "manhã", "0 8 * * *", "anúncios", None, now)
+            .await
+            .unwrap();
+
+        let refusal = create_rule(&pool, carros, "manhã", "0 9 * * *", "outra", None, now)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refusal, RuleError::Duplicate),
+            "expected a duplicate name, got {refusal:?}"
+        );
+
+        create_rule(&pool, casa, "manhã", "0 8 * * *", "contas", None, now)
+            .await
+            .expect("the same name under another errand is not a collision");
+
+        assert_eq!(list_rules(&pool, carros).await.unwrap().len(), 1);
+        assert_eq!(list_rules(&pool, casa).await.unwrap().len(), 1);
+    }
+
+    /// A rule id from another errand is not yours to delete.
+    ///
+    /// The id arrives in a path and the errand arrives in the path beside it, so nothing stops a
+    /// caller pairing one errand with another's rule. Keyed by both, the pairing simply matches no
+    /// row — and the caller is told nothing was deleted rather than being told it succeeded.
+    #[tokio::test]
+    async fn a_rule_of_another_errand_is_not_yours_to_delete() {
+        let pool = test_pool().await;
+        let carros = create(&pool, "carros", "-100200300:7").await.unwrap();
+        let casa = create(&pool, "casa", "-100200300:9").await.unwrap();
+        let now = at("2026-08-16T09:00:00Z");
+        let rule = create_rule(&pool, carros, "manhã", "0 8 * * *", "anúncios", None, now)
+            .await
+            .unwrap();
+
+        assert!(
+            !delete_rule(&pool, casa, rule).await.unwrap(),
+            "another errand's rule must not be reachable through this one"
+        );
+        assert_eq!(list_rules(&pool, carros).await.unwrap().len(), 1);
+
+        assert!(delete_rule(&pool, carros, rule).await.unwrap());
+        assert!(list_rules(&pool, carros).await.unwrap().is_empty());
+    }
+
+    /// A new rule is armed at the moment it is written, and owes nothing for the windows before it.
+    ///
+    /// The same thing `scheduler.rs` does when it first sees a rule in a YAML file, and for a
+    /// sharper reason here: the scheduler counts a window as due when the cron's next occurrence
+    /// after `last_fired_at` has passed. Left unset, the rule would be owed every window since
+    /// whatever the column defaulted to — and a rule created this evening would fire immediately,
+    /// which is not what anybody means by "every morning at eight".
+    #[tokio::test]
+    async fn a_new_rule_is_armed_now_and_owes_nothing_for_the_windows_before_it() {
+        let pool = test_pool().await;
+        let errand = create(&pool, "carros", "-100200300:7").await.unwrap();
+        let now = at("2026-08-16T21:30:00Z");
+
+        create_rule(&pool, errand, "manhã", "0 8 * * *", "anúncios", None, now)
+            .await
+            .unwrap();
+
+        let rules = list_rules(&pool, errand).await.unwrap();
+        assert_eq!(rules[0].last_fired_at, now.to_rfc3339());
+        assert_eq!(rules[0].fires_today, 0);
     }
 }
