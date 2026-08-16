@@ -97,26 +97,22 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	}
 	button := findRef(t, snapshot, "Send")
 
-	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: button})
-	if err != nil {
+	if _, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: button}); err != nil {
 		t.Fatalf("act: %v", err)
 	}
 	if site.reached("POST /submit", settle) {
 		t.Fatal("the POST left the machine")
 	}
-	// "This act or the next" is the contract, not a hedge — see chrome.Act. A form submission
-	// routinely misses the settle window when several browsers are running at once, and an earlier
-	// version of this assertion failed about one run in three for that reason. What must never happen
-	// is the refusal being lost, so the test presses on and requires it to arrive.
-	if result.Outcome != browser.OutcomeRefused {
-		second, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionScroll, Ref: button})
-		if err != nil {
-			t.Fatalf("second act: %v", err)
-		}
-		if second.Outcome != browser.OutcomeRefused {
-			t.Errorf("neither act told the agent the fence stopped anything: %+v then %+v", result, second)
-		}
-	}
+	// There is deliberately NO assertion here about what the agent was told, and the absence is a
+	// measurement rather than a gap. This test used to require the refusal to arrive on the click or
+	// the act after it, and failed about one run in three; the comment blamed the settle window.
+	// MEASURED, 2026-08-16, against the pinned build: twelve consecutive acts over 16.5s never
+	// produced one either, so the window was never the reason. A form POST is stopped TWICE — by the
+	// method rule here, and by `form-action 'none'` in the CSP `fence.Directives` injects — and the
+	// two race inside Chrome. When the CSP wins, the renderer abandons the submission before a
+	// request exists, so Fetch never pauses and the fence has nothing to report. That is the
+	// STRONGER of the two outcomes, and demanding a message would have been demanding the weaker one
+	// win. The reporting half of §6.2 is proved next door, on a channel only the fence stops.
 
 	// Control: the same form, same server, fence off.
 	conn := control(t)
@@ -125,6 +121,97 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	evaluate(t, conn, page, `document.getElementById('f').submit()`)
 	if !site.reached("POST /submit", settle) {
 		t.Fatal("the POST did not arrive with the fence off either; the test proves nothing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b — the act that caused a refusal is the one that reports it.
+// ---------------------------------------------------------------------------
+
+// TestTheActThatCausedARefusalIsToldAboutIt is the second half of spec §6.2 — "o act que o causou
+// responde ao agente" — and the only place in this package that measures it against a real browser.
+//
+// It is a LINK and not the form above for a reason that took a measurement to find. Every other
+// channel in this file is stopped by two things at once: the fence, and a directive in the CSP the
+// fence injects. Two stops are what defence in depth is for, but they race, and a test that requires
+// a message can only pass when the half that produces one wins. A top-level navigation is the single
+// channel `fence.Directives` says nothing about — there is no `navigate-to` in it — so the fence's
+// own rule is the only thing standing here, and "the agent was told" becomes a fact rather than a
+// coin toss. MEASURED: six runs out of six, against the pinned build.
+//
+// What must never happen is the refusal being LOST, so the second act exists: a refusal that lands
+// after the settle window is carried on the session's cursor (see chrome.session.reportedUpTo), and
+// arriving late is the documented behaviour. Arriving never is the failure.
+func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
+	admitted := newSite(t)
+	stranger := newSite(t)
+
+	driver, _ := fenced(t, admitting(admitted))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{
+		URL: admitted.origin() + "/link?href=" + stranger.origin() + "/page",
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	snapshot, err := driver.Snapshot(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	link := findRef(t, snapshot, "Go")
+
+	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: link})
+	if err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if stranger.reached("GET /page", settle) {
+		t.Fatal("the navigation reached the stranger")
+	}
+	if result.Outcome != browser.OutcomeRefused {
+		second, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionScroll, Ref: link})
+		if err != nil {
+			t.Fatalf("second act: %v", err)
+		}
+		if second.Outcome != browser.OutcomeRefused {
+			t.Fatalf("neither act told the agent the fence stopped anything: %+v then %+v", result, second)
+		}
+		result = second
+	}
+	// The reason and not just the fact. An agent told "refused" with no reason retries the same
+	// click, which is the loop §6.2's second half exists to break.
+	//
+	// `loopback` and not `off-allowlist`, which is a property of the harness rather than of the
+	// rule: every site here is a 127.0.0.1 server, so a stranger is one of THIS MACHINE's own
+	// services, and that is the more specific of the two reasons — see browser.ConsequenceLoopback,
+	// which is kept separate precisely because it is the refusal aimed at us. Both are the fence and
+	// neither is the CSP, which is all this test needs to be about.
+	if result.Refusal == nil || result.Refusal.Consequence != browser.ConsequenceLoopback {
+		t.Fatalf("refused for the wrong reason: %+v", result.Refusal)
+	}
+
+	// Control: the same page, the same click, pointed somewhere the profile admits. Without it,
+	// "refused" would also be what a click that resolved to the wrong node produced, and the test
+	// would pass while proving that the browser cannot navigate at all.
+	allowed, err := driver.Open(ctx, browser.OpenRequest{
+		URL: admitted.origin() + "/link?href=" + admitted.origin() + "/page",
+	})
+	if err != nil {
+		t.Fatalf("open the control page: %v", err)
+	}
+	controlSnapshot, err := driver.Snapshot(ctx, allowed.ID)
+	if err != nil {
+		t.Fatalf("snapshot the control page: %v", err)
+	}
+	if _, err := driver.Act(ctx, allowed.ID, browser.Action{
+		Kind: browser.ActionClick,
+		Ref:  findRef(t, controlSnapshot, "Go"),
+	}); err != nil {
+		t.Fatalf("control act: %v", err)
+	}
+	if !admitted.reached("GET /page", settle) {
+		t.Fatal("the admitted link did not navigate either; the click never worked")
 	}
 }
 

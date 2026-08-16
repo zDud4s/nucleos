@@ -128,6 +128,19 @@ func newSite(t *testing.T) *site {
 			r.URL.Query().Get("src"))
 	})
 
+	// A page with one link to wherever the query string says. It exists for the reporting half of
+	// spec §6.2 and not for the blocking half, and the distinction is the whole reason it is a link
+	// and not the form above: the injected CSP carries `form-action 'none'`, so a form POST is
+	// stopped twice over and the two stops race. Nothing in `fence.Directives` bounds a top-level
+	// navigation — there is no `navigate-to` in it — so a click here leaves exactly one mechanism
+	// standing, which is the only way an assertion about WHAT THE AGENT IS TOLD can be deterministic.
+	mux.HandleFunc("/link", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>link</title><a id=go href=%q>Go</a>`,
+			r.URL.Query().Get("href"))
+	})
+
 	// Two pages for the profile group. They are about identity rather than the fence: one hands the
 	// browser a cookie, the other says which cookie came back — which is how "the profile is the
 	// identity" (spec §4.2) becomes something a test can observe from outside the browser.
