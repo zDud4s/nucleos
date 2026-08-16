@@ -35,6 +35,8 @@ import {
   type ExclusionEdge,
 } from "./fleet-derive";
 import { useExclusionActions } from "./fleet-actions";
+import { readView, writeView, type FleetView } from "./fleet-layout";
+import FleetCanvas from "./FleetCanvas";
 import { SlotCard } from "./SlotCard";
 import { Button, ErrorNote } from "./ui";
 
@@ -71,6 +73,7 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
   const [lastGood, setLastGood] = useState<string | null>(null);
   /** Owners whose card the user sent away, keyed `"job:41"`. */
   const [cancelled, setCancelled] = useState<Set<string>>(new Set());
+  const [view, setView] = useState<FleetView>(() => readView(localStorage));
 
   const inFlight = useRef(0);
   const batchSeq = useRef(0);
@@ -180,18 +183,54 @@ export default function Fleet({ token, connection, killEngaged, onOpenRuns }: Fl
   // screen is no longer the daemon's.
   const canStart = !stale && killEngaged !== true && token !== null;
 
+  function choose(next: FleetView) {
+    setView(next);
+    writeView(localStorage, next);
+  }
+
   return (
     <section className="fleet">
-      <HouseMeter
-        house={concurrency?.house ?? null}
-        budget={budget}
-        proposals={waiting}
-        staleSince={stale ? lastGood : null}
-      />
+      <div className="fleet-head">
+        <HouseMeter
+          house={concurrency?.house ?? null}
+          budget={budget}
+          proposals={waiting}
+          staleSince={stale ? lastGood : null}
+        />
+        {/* `aria-pressed` and not a class alone: which of the two is open has to be announced, not
+            only shaded. */}
+        <div className="fleet-views" role="group" aria-label="How to look at the fleet">
+          <Button
+            size="sm"
+            aria-pressed={view === "columns"}
+            onClick={() => choose("columns")}
+          >
+            Columns
+          </Button>
+          <Button size="sm" aria-pressed={view === "canvas"} onClick={() => choose("canvas")}>
+            Canvas
+          </Button>
+        </div>
+      </div>
       {concurrency !== null && concurrency.projects.length === 0 ? (
         <p className="empty">
           No projects are registered yet. Add one on the Projects tab, and its column appears here.
         </p>
+      ) : view === "canvas" ? (
+        // No form to start a job here, on purpose. Starting one is a decision about a PROJECT, and
+        // the column is where the project's capacity is written down; a new-job box on a free
+        // surface would be asking for work without showing whether there is room for it.
+        <FleetCanvas
+          projects={orderColumns(concurrency?.projects ?? [])}
+          jobs={jobs}
+          runs={runs}
+          edges={edges}
+          token={token ?? ""}
+          cancelled={cancelled}
+          onCancel={cancel}
+          onOpenRuns={onOpenRuns}
+          refresh={refresh}
+        />
       ) : (
         <div className="fleet-columns">
           {orderColumns(concurrency?.projects ?? []).map((project) => (

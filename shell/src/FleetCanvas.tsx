@@ -10,6 +10,7 @@ import {
   type ExclusionEdge,
 } from "./fleet-derive";
 import {
+  clamped,
   positionsFor,
   pruned,
   readLayout,
@@ -112,9 +113,11 @@ export default function FleetCanvas({
 
   const keys = nodes.map((node) => node.key);
   const positions = positionsFor(keys, saved);
-  // The node under the hand is drawn from the gesture, and everything else from the layout.
+  // The node under the hand is drawn from the gesture, and everything else from the layout. The
+  // gesture's own position is kept RAW in state and clamped only here: clamping the state would
+  // make a node dragged past the left edge and back again lag the pointer by however far it went.
   const positionOf = (key: string): Point =>
-    drag !== null && drag.key === key ? drag.at : positions[key];
+    drag !== null && drag.key === key ? clamped(drag.at) : positions[key];
 
   function grab(key: string, event: React.PointerEvent<HTMLElement>) {
     // Left button only. A right-click opens a menu, and a node that follows the pointer afterwards

@@ -236,6 +236,35 @@ it("ends the gesture on release, even far outside the surface", () => {
 });
 
 /**
+ * A card cannot be dragged out of the world.
+ *
+ * The surface scrolls into positive coordinates only, so a node left past the left or top edge is
+ * partly unreachable, and one far enough past it is gone with no way back short of clearing the
+ * browser's storage by hand. It stops at the edge instead — and keeps following the pointer on the
+ * way back, which is why the gesture's raw position is kept and only the drawing is clamped.
+ */
+it("stops a node at the edge instead of letting it off the surface", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  // A thousand pixels up and to the left, which is past both edges from anywhere on the grid.
+  fireEvent(grip(container, "job:41"), pointer("pointerdown", { x: 1000, y: 1000 }));
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 0, y: 0 }));
+
+  expect(positionOf(container, "job:41")).toEqual({ x: 0, y: 0 });
+
+  // Back the other way: the node follows again from where the pointer is, with no lag owed for the
+  // distance it spent beyond the edge.
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 1050, y: 1050 }));
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 50, y: from.y + 50 });
+
+  fireEvent(grip(container, "job:41"), pointer("pointermove", { x: 0, y: 0 }));
+  fireEvent(grip(container, "job:41"), pointer("pointerup", { x: 0, y: 0 }));
+
+  expect(readLayout(localStorage)["job:41"]).toEqual({ x: 0, y: 0 });
+});
+
+/**
  * A click on the header is not a drag, and must not write anything.
  *
  * Writing on every press would freeze the derived fallback into storage the first time anybody

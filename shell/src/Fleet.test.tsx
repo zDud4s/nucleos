@@ -28,6 +28,9 @@ function renderFleet() {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  // The chosen view and the node layout live here, and a test that switched view would otherwise
+  // decide what the next one opens on.
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -504,4 +507,37 @@ it("sends a run's card to the Runs tab instead of drawing a graph", async () => 
   fireEvent.click(screen.getByRole("button", { name: /open in runs/i }));
 
   expect(onOpenRuns).toHaveBeenCalled();
+});
+
+/**
+ * The two views are two ways of looking at the same fleet, and the screen remembers which.
+ *
+ * Not a replacement: the columns carry `n/limit`, the only thing on the whole screen that says
+ * there is no more room, and a free surface has nowhere to put that number without inventing a
+ * frame per project. What the canvas has instead is every project at once, which is the shape of
+ * the question it exists for.
+ *
+ * Remembered because it is a preference of whoever is looking, and being put back in the other view
+ * on every reload is how a second view stops being used.
+ */
+it("keeps the view you chose, across a reload", async () => {
+  respondWith({ [CONCURRENCY]: readout([column()]), [JOBS]: [job()] });
+  const first = renderFleet();
+  await settle();
+
+  // The columns are what a screen with no preference opens on.
+  expect(first.container.querySelector(".fleet-columns")).not.toBeNull();
+  expect(first.container.querySelector("[data-node]")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Canvas" }));
+
+  expect(first.container.querySelector(".fleet-columns")).toBeNull();
+  expect(first.container.querySelector('[data-node="job:41"]')).not.toBeNull();
+
+  // The reload.
+  first.unmount();
+  const second = renderFleet();
+  await settle();
+
+  expect(second.container.querySelector('[data-node="job:41"]')).not.toBeNull();
 });

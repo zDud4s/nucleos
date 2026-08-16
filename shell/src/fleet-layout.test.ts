@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  clamped,
   fallbackPosition,
   positionsFor,
   pruned,
   readLayout,
+  readView,
   withMoved,
   writeLayout,
+  writeView,
   type Layout,
 } from "./fleet-layout";
 
@@ -110,6 +113,19 @@ describe("where a node sits", () => {
     expect(after["job:42"]).toEqual({ x: 30, y: 40 });
     expect(before["job:41"]).toEqual({ x: 10, y: 20 });
   });
+
+  /**
+   * Nothing is ever left where the surface cannot scroll to it.
+   *
+   * The surface only has positive coordinates, so a card dropped past the top or the left edge is
+   * partly unreachable, and one dropped far enough past it is gone — with no way back short of
+   * clearing the browser's storage by hand. Found by dragging a card off the left edge in a real
+   * browser: jsdom has no edges to fall off.
+   */
+  it("never leaves a node where the surface cannot scroll", () => {
+    expect(withMoved({}, "job:41", { x: -80, y: -0.4 })["job:41"]).toEqual({ x: 0, y: 0 });
+    expect(clamped({ x: -1, y: 12.6 })).toEqual({ x: 0, y: 13 });
+  });
 });
 
 describe("what is on disk", () => {
@@ -146,6 +162,25 @@ describe("what is on disk", () => {
     ).toEqual({ good: { x: 1, y: 2 } });
   });
 
+  /**
+   * The view is remembered, and anything unrecognised means the columns.
+   *
+   * Not merely a default: the columns are the view that already existed and the only one carrying
+   * `n/limit`, so a preference that got corrupted costs a click rather than opening a screen the
+   * reader cannot get capacity out of.
+   */
+  it("remembers the view, and reads nonsense as the columns", () => {
+    const storage = fakeStorage();
+    expect(readView(storage)).toBe("columns");
+
+    writeView(storage, "canvas");
+    expect(readView(storage)).toBe("canvas");
+
+    writeView(storage, "columns");
+    expect(readView(storage)).toBe("columns");
+    expect(readView(fakeStorage({ "nucleos.fleet.view": "hexagons" }))).toBe("columns");
+  });
+
   /** A storage that refuses to write is not worth taking the canvas down over. */
   it("says nothing when it cannot save", () => {
     const refusing = {
@@ -155,5 +190,6 @@ describe("what is on disk", () => {
     };
 
     expect(() => writeLayout(refusing, { "job:41": { x: 1, y: 2 } })).not.toThrow();
+    expect(() => writeView(refusing, "canvas")).not.toThrow();
   });
 });

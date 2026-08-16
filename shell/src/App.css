@@ -1650,6 +1650,21 @@ details.scoreboard th {
 
 .fleet { display: grid; gap: var(--sp-4); }
 
+/* O medidor à esquerda, a escolha da vista à direita. */
+.fleet-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+.fleet-views { display: flex; gap: var(--sp-1); }
+/* Qual das duas está aberta diz-se com `aria-pressed`; isto é a segunda pista, não a única. */
+.fleet-views .btn[aria-pressed="true"] {
+  background: var(--glass);
+  color: var(--text);
+}
+
 .fleet-meter {
   display: flex;
   align-items: baseline;

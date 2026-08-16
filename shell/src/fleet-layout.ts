@@ -112,9 +112,21 @@ export function positionsFor(keys: string[], saved: Layout): Layout {
   return layout;
 }
 
+/**
+ * A whole-pixel position no node can be lost at.
+ *
+ * **Nothing lives in negative space.** The surface scrolls into positive coordinates only, so a card
+ * dropped past the top or the left edge is partly unreachable — and one dropped far enough past it
+ * is gone altogether, with no way back short of clearing the browser's storage by hand. Caught by
+ * dragging a card off the left edge in a real browser; jsdom has no edges to fall off.
+ */
+export function clamped(at: Point): Point {
+  return { x: Math.max(0, Math.round(at.x)), y: Math.max(0, Math.round(at.y)) };
+}
+
 /** The saved layout with one node moved. Returns a new object; the input is not touched. */
 export function withMoved(layout: Layout, key: string, to: Point): Layout {
-  return { ...layout, [key]: { x: Math.round(to.x), y: Math.round(to.y) } };
+  return { ...layout, [key]: clamped(to) };
 }
 
 /**
@@ -173,5 +185,31 @@ export function writeLayout(storage: Pick<Storage, "setItem">, layout: Layout): 
   } catch {
     // Private mode, a full quota, a locked-down profile. Losing an arrangement is not worth taking
     // the canvas down over, and there is nothing the person could do about it if told.
+  }
+}
+
+/** Which of the two ways of looking at the fleet is open. */
+export type FleetView = "columns" | "canvas";
+
+const VIEW_KEY = "nucleos.fleet.view";
+
+/**
+ * Which view was open last time, kept beside the layout because it is the same kind of thing: a
+ * preference of whoever is looking, not something the daemon has an opinion about.
+ *
+ * **Anything unrecognised reads as `columns`**, and that is not merely a default. The columns are
+ * the view that already existed and the only one carrying `n/limit`, so a corrupted preference costs
+ * a click rather than opening a screen the reader cannot get capacity out of.
+ */
+export function readView(storage: Pick<Storage, "getItem">): FleetView {
+  return storage.getItem(VIEW_KEY) === "canvas" ? "canvas" : "columns";
+}
+
+/** Remembers the view, and says nothing when it cannot — same reasoning as the layout. */
+export function writeView(storage: Pick<Storage, "setItem">, view: FleetView): void {
+  try {
+    storage.setItem(VIEW_KEY, view);
+  } catch {
+    // A preference is worth even less than an arrangement; it is certainly not worth an exception.
   }
 }
