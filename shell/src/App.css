@@ -1816,6 +1816,13 @@ details.scoreboard th {
   left: 0;
   width: 260px;
 }
+/* O nó é focável para se poder mover pelo teclado: o foco tem de se ver, e o anel fica por fora
+   do cartão para não se confundir com o contorno de "pode receber a linha". */
+.fleet-node:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 4px;
+  border-radius: var(--r-sm);
+}
 /* Numa coluna os cartões nunca se sobrepõem e o vidro translúcido é bonito; numa tela sobrepõem-se
    sempre, e dois cartões translúcidos um em cima do outro leem-se ao mesmo tempo — apanhado na
    fotografia do arrasto, onde o `running` do cartão de baixo atravessava o de cima.

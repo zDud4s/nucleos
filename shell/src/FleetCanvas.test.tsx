@@ -1,5 +1,5 @@
 import { beforeEach, expect, it } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 
 import type { HeldSlot, ProjectConcurrency } from "./api";
 import FleetCanvas from "./FleetCanvas";
@@ -412,6 +412,58 @@ it("asks nothing when the line is dropped somewhere it cannot become a rule", as
   await settle();
 
   expect(asked()).toEqual([]);
+});
+
+/**
+ * A canvas that only answers a mouse closes the arrangement to anyone who does not use one.
+ *
+ * The *Not at the same time as…* button is already there for exactly that reason, and it is the
+ * reason the button stays now that a line can be pulled. MOVING a node had no equivalent at all
+ * until this: the layout is the one thing on the canvas a person owns, and a person who cannot
+ * point precisely was locked out of it.
+ */
+it("moves a node with the arrow keys, and remembers that too", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const node = container.querySelector<HTMLElement>('[data-node="job:41"]');
+  if (node === null) throw new Error("no node");
+  const from = positionOf(container, "job:41");
+
+  node.focus();
+  expect(document.activeElement).toBe(node);
+
+  fireEvent.keyDown(node, { key: "ArrowRight" });
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 20, y: from.y });
+
+  // Held down, shift covers ground: nudging a card across a canvas twenty pixels at a time is a
+  // gesture nobody finishes.
+  fireEvent.keyDown(node, { key: "ArrowDown", shiftKey: true });
+  expect(positionOf(container, "job:41")).toEqual({ x: from.x + 20, y: from.y + 100 });
+
+  expect(readLayout(localStorage)["job:41"]).toEqual({ x: from.x + 20, y: from.y + 100 });
+});
+
+/** The card is full of buttons, and an arrow key aimed at one of them is not aimed at the node. */
+it("leaves the node alone when the key was meant for something on the card", () => {
+  const { container } = renderCanvas([column({ slots: [slot({ owner_id: 41 })] })]);
+  const from = positionOf(container, "job:41");
+
+  fireEvent.keyDown(screen.getByRole("button", { name: "Show items" }), { key: "ArrowRight" });
+
+  expect(positionOf(container, "job:41")).toEqual(from);
+});
+
+/** Focus lands on something that says whose node it is, not on an anonymous box. */
+it("says whose node it is", () => {
+  const { container } = renderCanvas([
+    column({ slots: [slot({ owner_id: 41 }), slot({ slot: 1, owner_kind: "run", owner_id: 7 })] }),
+  ]);
+
+  expect(container.querySelector('[data-node="job:41"]')?.getAttribute("aria-label")).toContain(
+    "job 41",
+  );
+  expect(container.querySelector('[data-node="run:7"]')?.getAttribute("aria-label")).toContain(
+    "run 7",
+  );
 });
 
 /**

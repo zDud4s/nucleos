@@ -40,6 +40,22 @@ const NODE = { width: 280, height: 320 };
 const FLOOR = { width: 640, height: 520 };
 
 /**
+ * How far an arrow key moves a node, and how far it moves with shift held.
+ *
+ * Two sizes because one is not enough: fine for placing a card exactly beside another, coarse
+ * because crossing a canvas twenty pixels at a time is a gesture nobody finishes.
+ */
+const NUDGE = { fine: 20, coarse: 100 };
+
+/** Which way each arrow goes. Anything else is somebody else's key and is left alone. */
+const ARROWS: Record<string, Point> = {
+  ArrowLeft: { x: -1, y: 0 },
+  ArrowRight: { x: 1, y: 0 },
+  ArrowUp: { x: 0, y: -1 },
+  ArrowDown: { x: 0, y: 1 },
+};
+
+/**
  * A gesture in progress.
  *
  * `from` is where the node was when the hand closed on it and `origin` is where the pointer was;
@@ -232,6 +248,29 @@ export default function FleetCanvas({
   }
 
   /**
+   * The keyboard's version of the drag.
+   *
+   * A canvas that only answers a mouse closes the arrangement to anyone who does not use one — and
+   * the layout is the one thing on this surface a person owns. It writes on every press because a
+   * press IS the whole gesture here; there is no drop to wait for.
+   *
+   * Only when the node itself has focus. The card is full of buttons, and an arrow key aimed at one
+   * of them was not aimed at the node.
+   */
+  function nudge(key: string, event: React.KeyboardEvent<HTMLElement>) {
+    if (event.target !== event.currentTarget) return;
+    const way = ARROWS[event.key];
+    if (way === undefined) return;
+    // Or the page scrolls underneath at the same time as the card moves.
+    event.preventDefault();
+    const step = event.shiftKey ? NUDGE.coarse : NUDGE.fine;
+    const at = positionOf(key);
+    const next = withMoved(saved, key, { x: at.x + way.x * step, y: at.y + way.y * step });
+    setSaved(next);
+    writeLayout(localStorage, pruned(next, keys));
+  }
+
+  /**
    * Starts a line from a job's nub. Not the header, which already means *move*: one gesture cannot
    * mean two things, and a card that both moves and connects from the same grab does neither well.
    */
@@ -364,6 +403,13 @@ export default function FleetCanvas({
               data-node={key}
               style={{ transform: `translate(${at.x}px, ${at.y}px)` }}
               onPointerUp={() => finishPull(jobId, project.project_id)}
+              // Focusable, named, and movable without a mouse. `group` rather than `button`: the
+              // node is not a thing to press, it is a thing that CONTAINS the pressable ones, and
+              // the label is what a reader hears instead of "group".
+              tabIndex={0}
+              role="group"
+              aria-label={`${slot.owner_kind} ${slot.owner_id} on the canvas — arrow keys move it`}
+              onKeyDown={(event) => nudge(key, event)}
             >
               <SlotCard
                 slot={slot}
