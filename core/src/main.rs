@@ -4,6 +4,7 @@ mod auth;
 mod autopilot;
 mod autostart;
 mod backup;
+mod browser_policy;
 mod budget;
 mod calendar;
 mod chats;
