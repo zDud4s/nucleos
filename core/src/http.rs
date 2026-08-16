@@ -278,6 +278,15 @@ pub fn build_router(state: AppState) -> Router {
             post(post_file_upload).layer(DefaultBodyLimit::max(crate::files::MAX_UPLOAD_BYTES)),
         )
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
+        // construction rather than by a list: `permits` gives `Control` everything and answers every
+        // other scope from an allowlist, so a route absent from all of them is reachable by the
+        // control token alone. `Scope::Run` must never arrive here — a run has its own route, whose
+        // handler checks the claimed run against the token, and this one has no run to check.
+        .route(
+            "/hooks/session-git-decision",
+            post(crate::hooks::session_git_decision),
+        )
         .route("/api-tokens", get(list_api_tokens).post(create_api_token))
         .route(
             "/api-tokens/{name}",

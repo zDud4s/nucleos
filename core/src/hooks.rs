@@ -30,6 +30,142 @@ pub struct Decision {
     pub reason: String,
 }
 
+#[derive(Deserialize)]
+pub struct SessionGitPayload {
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_input: Value,
+    /// Where the session is standing. Not necessarily a repository root — see `git_exec::toplevel`.
+    pub cwd: String,
+}
+
+/// The decision for a session nobody launched: a person's own editor, in a worktree, with no run
+/// behind it.
+///
+/// **This exists because the pillar was governing the wrong half of its own purpose.** The queue is
+/// there to order git operations *between sessions*, and the sessions doing the most work are the
+/// ones a person opens by hand. Those carry no `NUCLEOS_RUN_ID`, so `ask_daemon.py` expressed no
+/// opinion and git ran directly — measured, not theorised: an editor session was asked to
+/// `git merge master` and it merged, with no hook, no proposal and no row. Every guarantee the queue
+/// offers is a guarantee about requests that reach the queue.
+///
+/// **It answers with `deny` or with nothing, never with `allow`**, and that is what makes it safe to
+/// add where the old code chose silence. The comment it replaces was right about its own case:
+/// registered repo-wide, an `allow` emitted by a daemon that does not know what the person is doing
+/// would auto-approve their tools. A refusal grants nothing.
+///
+/// **Only what the queue can actually perform is refused** — the same six parsers that decide it for
+/// runs, not the classifier's much wider `pending_approval` net. That distinction is the difference
+/// between a gate and a wall: the classifier sends everything not provably read-only for approval, so
+/// refusing on its verdict would stop a session at its second command. And a spelling the queue
+/// declines (`git merge --squash`, `git branch -D`) must keep working directly, or it becomes
+/// impossible rather than governed.
+///
+/// The refusal is not a redirect: the operation is admitted here, in the daemon, and the session is
+/// told the ticket. The alternative was to answer "ask the queue yourself", which would have meant
+/// telling every editor session how to obtain the control token — handing out the master key to
+/// avoid one round trip.
+pub async fn session_git_decision(
+    State(state): State<AppState>,
+    Json(payload): Json<SessionGitPayload>,
+) -> Json<Decision> {
+    let no_opinion = || {
+        Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "not an operation this queue performs".to_owned(),
+        })
+    };
+
+    if !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell") {
+        return no_opinion();
+    }
+    let Some(command) = payload.tool_input.get("command").and_then(Value::as_str) else {
+        return no_opinion();
+    };
+
+    // One deadline for the whole decision. A hook runs in front of every tool call, so this path
+    // spends git subprocesses on a person's keystrokes — which is why the caller filters first and
+    // only asks about commands that could possibly be queueable.
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let Ok(root) = crate::git_exec::toplevel(Path::new(&payload.cwd), deadline).await else {
+        // Standing outside a working tree, so no git command from here reaches a repository this
+        // queue serves. Silence rather than refusal: this hook is registered for one repository and
+        // a session that has wandered out of it is not the case being governed.
+        return no_opinion();
+    };
+    let Ok(branch) = crate::git_exec::current_branch(&root, deadline).await else {
+        return no_opinion();
+    };
+
+    let Some(op) = crate::vcs::merge_from_command(command, &branch)
+        .or_else(|| crate::vcs::push_from_command(command, &branch))
+        .or_else(|| crate::vcs::tag_from_command(command, &branch))
+        .or_else(|| crate::vcs::fetch_from_command(command))
+        .or_else(|| crate::vcs::branch_delete_from_command(command))
+        .or_else(|| crate::vcs::rebase_from_command(command, &branch))
+    else {
+        return no_opinion();
+    };
+
+    // From here the command IS one the queue performs, so every remaining failure refuses rather
+    // than falls through. The direction is deliberately the opposite of `runs::queueable_operation`,
+    // and the two are right for opposite reasons: there, a person has already approved an action and
+    // being unable to queue it must not strand them holding it; here, nobody has approved anything,
+    // and falling through would hand back the very bypass this function closes.
+    let project_id = match crate::vcs::project_for_worktree(&state.pool, &root, deadline).await {
+        Ok(project_id) => project_id,
+        Err(reason) => {
+            return Json(deny_with(&format!(
+                "{} goes through the queue, and {reason}",
+                op.kind()
+            )));
+        }
+    };
+    let repo = match crate::vcs::resolve_repo(&state.pool, &project_id).await {
+        Ok(repo) => repo,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                ?error,
+                "session-git: could not resolve the repository"
+            );
+            return Json(deny_with(&format!(
+                "{} goes through the queue, and {project_id}'s repository could not be resolved",
+                op.kind()
+            )));
+        }
+    };
+
+    match crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await {
+        Ok(id) => Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!(
+                "queued as vcs request #{id} ({}) — this repository takes one git operation at a \
+                 time, across every session in every worktree, so it is performed by the queue \
+                 rather than here. Do not run it again and do not run it another way: watch \
+                 GET /vcs/requests/{id}/wait, and expect your worktree to be moved under you when \
+                 it lands.",
+                op.kind()
+            ),
+        }),
+        Err(error) => {
+            tracing::error!(?error, "session-git: could not admit the request");
+            Json(deny_with(&format!(
+                "{} goes through the queue, and admitting it failed",
+                op.kind()
+            )))
+        }
+    }
+}
+
+/// A refusal that never becomes an approval, however its caller fails.
+fn deny_with(reason: &str) -> Decision {
+    Decision {
+        decision: "deny".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -3275,5 +3411,166 @@ mod tests {
 
         let pending = proposals::list_pending(&state.pool).await.unwrap();
         assert!(pending.is_empty());
+    }
+
+    /// A repository on the roster, and the path a session would be standing in.
+    async fn rostered_repo(state: &AppState, prefix: &str) -> tempfile::TempDir {
+        let dir = crate::git_exec::tests::space_free_tempdir(prefix);
+        crate::git_exec::tests::initialize_repo(dir.path());
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+        )
+        .bind("p")
+        .bind(dir.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        dir
+    }
+
+    async fn session_decision(state: &AppState, command: &str, cwd: &Path) -> Decision {
+        session_git_decision(
+            State(state.clone()),
+            Json(SessionGitPayload {
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": command }),
+                cwd: cwd.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .0
+    }
+
+    async fn queued_rows(state: &AppState) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT op, origin FROM vcs_requests ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// **The whole point, and the behaviour that was missing.** A session nobody launched asked for
+    /// a merge and got it, because the hook had no opinion without a run id.
+    #[tokio::test]
+    async fn an_editor_sessions_merge_is_queued_and_the_command_refused() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-merge").await;
+
+        let decision = session_decision(&state, "git merge feature", repo.path()).await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("queued as vcs request #1"),
+            "the refusal has to name the ticket, or the session has nothing to watch: {}",
+            decision.reason
+        );
+        assert_eq!(
+            queued_rows(&state).await,
+            vec![("merge".to_owned(), "shell".to_owned())],
+            "an editor session is `shell`: a person's agent redirected here, not a person acting"
+        );
+    }
+
+    /// The asymmetry that makes it safe to speak at all. Nothing this function does may end in an
+    /// approval — the old silence was chosen because an `allow` from a daemon that cannot see what
+    /// the person is doing would auto-approve their own tools.
+    #[tokio::test]
+    async fn a_session_decision_is_never_an_approval() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-never-allow").await;
+
+        for command in [
+            "git merge feature",
+            "git push origin",
+            "git tag v1",
+            "git fetch origin",
+            "git branch -d stale",
+            "git rebase main",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+        }
+    }
+
+    /// The difference between a gate and a wall. The classifier sends everything not provably
+    /// read-only for approval; refusing on THAT would stop a session at its second command. And a
+    /// spelling the queue declines has to keep working directly, or it becomes impossible rather
+    /// than governed — `--squash` does not merge, and no queue row would ever perform it.
+    #[tokio::test]
+    async fn what_the_queue_will_not_perform_is_left_alone_rather_than_made_impossible() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-declined").await;
+
+        for command in [
+            "cargo test",
+            "git status",
+            "git merge --squash feature",
+            "git branch -D stale",
+            "git log --oneline",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "allow", "{command}: {}", decision.reason);
+        }
+        assert!(
+            queued_rows(&state).await.is_empty(),
+            "no opinion must also mean no row"
+        );
+    }
+
+    /// The direction this function fails, and it is the opposite of `runs::queueable_operation`'s.
+    /// There, a person has already approved an action and being unable to queue it must not strand
+    /// them holding it. Here nobody has approved anything, so falling through would hand back
+    /// exactly the bypass this exists to close.
+    #[tokio::test]
+    async fn a_repository_no_project_claims_is_refused_rather_than_waved_through() {
+        let state = test_state().await;
+        let dir = crate::git_exec::tests::space_free_tempdir("hook-session-unclaimed");
+        crate::git_exec::tests::initialize_repo(dir.path());
+
+        let decision = session_decision(&state, "git merge feature", dir.path()).await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("no project on the roster"),
+            "the refusal has to say which precondition failed: {}",
+            decision.reason
+        );
+        assert!(queued_rows(&state).await.is_empty());
+    }
+
+    /// A session standing outside any repository is not the case being governed, and refusing there
+    /// would block tools in every directory a person wanders into.
+    ///
+    /// The system temp directory, NOT `space_free_tempdir` — which builds inside the checkout on
+    /// purpose, and is therefore inside a git repository. Writing this test the other way asserted
+    /// nothing about being outside a working tree and failed by finding this very repo, which is a
+    /// better outcome than the version that would have passed for the wrong reason.
+    #[tokio::test]
+    async fn a_session_outside_a_working_tree_gets_no_opinion() {
+        let state = test_state().await;
+        let dir = tempfile::tempdir().expect("create a tempdir outside any repository");
+        assert!(
+            !dir.path().join(".git").exists(),
+            "the premise of this test is that nothing here is a repository"
+        );
+
+        let decision = session_decision(&state, "git merge feature", dir.path()).await;
+
+        assert_eq!(decision.decision, "allow", "{}", decision.reason);
+    }
+
+    /// `cwd` is wherever the person was standing, which is a subdirectory more often than not.
+    /// `current_branch` and `repo_key` both refuse a non-root path, and reading that refusal as
+    /// "nothing to govern" is the bypass `git_exec::toplevel` exists to close.
+    #[tokio::test]
+    async fn a_session_standing_in_a_subdirectory_is_governed_just_the_same() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-subdir").await;
+        let inside = repo.path().join("core");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let decision = session_decision(&state, "git merge feature", &inside).await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert_eq!(queued_rows(&state).await.len(), 1);
     }
 }
