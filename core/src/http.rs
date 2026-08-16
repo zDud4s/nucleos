@@ -156,6 +156,10 @@ pub fn build_router(state: AppState) -> Router {
             "/vcs/requests",
             post(submit_vcs_request).get(list_vcs_requests),
         )
+        // Beside `/vcs/requests` because it admits one, and apart from it because the caller knows
+        // something different: a worktree knows where it is standing and nothing else, while
+        // `/vcs/requests` is for a caller that already names a project and an operation.
+        .route("/vcs/land", post(land_worktree))
         // Two spellings of one read, separated only by how long the caller is willing to hold the
         // line. `/wait` blocks up to `vcs::DEFAULT_WAIT`; the bare route is the same read with a
         // zero deadline, which `wait_for` answers from its first look at the row.
@@ -2534,6 +2538,110 @@ fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
 /// proposal, which is what the approval chunk adds. A disconnect between them would leave a request
 /// that can never be approved. Whoever writes that second write moves this through `uncancellable`
 /// at the same time.
+#[derive(serde::Deserialize)]
+struct LandBody {
+    /// Anywhere inside the worktree that is asking. Resolved to its root, so a session standing
+    /// in a subdirectory asks the same question as one standing at the top.
+    cwd: String,
+}
+
+/// "I am finished — take this branch." The one request a worktree could not previously express.
+///
+/// **A session can only ever have asked for merges INTO its own branch**, because
+/// `merge_from_command` takes the target from the worktree it is standing in and there is no other
+/// branch it could name. The reverse — landing the work — has no git spelling from inside the
+/// worktree at all: you would have to check out the integration branch, which is the isolation
+/// violation a worktree session must not commit, and which its harness blocks outright. So this is
+/// not a command to be intercepted; it is a request, and it needed a door of its own.
+///
+/// **Asking is authorisation; it is not scheduling.** The session's own completion is the decision
+/// that the work is ready — a person commanding it, or the agent when it has finished — so the row
+/// enters `queued` rather than `awaiting_approval`, and no second approval is invented for a
+/// judgement that has already been made. What stays with the queue is WHEN, which is the part a
+/// session cannot know: one operation per repository, in order, against a repository that may have
+/// moved since the asking.
+///
+/// **Re-evaluation is not added here because it is already how the queue works.** The merge is
+/// computed fresh in the integration worktree at the moment of execution, not at the moment of
+/// asking, so a branch that has diverged or a merge that has come to conflict aborts before
+/// publishing and the row records `failed` with git's own output. A request that can no longer land
+/// says so and stops, which is the behaviour wanted rather than a new mechanism.
+///
+/// The target is the branch the project's MAIN worktree has open, not a configured name. It is the
+/// branch the project is standing on, which is what "land it" means to whoever asks, and it is read
+/// rather than assumed so a project that works on something other than `master` needs no setting.
+async fn land_worktree(
+    State(state): State<AppState>,
+    Json(body): Json<LandBody>,
+) -> Result<Json<vcs::Ticket>, (StatusCode, String)> {
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let refuse = |code: StatusCode, reason: String| (code, reason);
+
+    let root = crate::git_exec::toplevel(std::path::Path::new(&body.cwd), deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    let source = crate::git_exec::current_branch(&root, deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    if source.trim() == "HEAD" {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this worktree is on a detached HEAD, so there is no branch to land".to_owned(),
+        ));
+    }
+
+    let project_id = crate::vcs::project_for_worktree(&state.pool, &root, deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::NOT_FOUND, reason))?;
+    let repo = crate::vcs::resolve_repo(&state.pool, &project_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(project_id, ?error, "land: could not resolve the repository");
+            refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{project_id}'s repository could not be resolved"),
+            )
+        })?;
+
+    let target = crate::git_exec::current_branch(std::path::Path::new(repo.root()), deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    // Standing on the integration branch itself. Refused rather than admitted as a no-op, because
+    // the request means "take my work" and there is no separate work to take — and `Merge` with one
+    // branch named twice is a shape the executor should never be handed.
+    if source.trim() == target.trim() {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("this worktree is already on {target}, which is where work lands"),
+        ));
+    }
+
+    let op = crate::vcs::Op::Merge {
+        source: crate::vcs::Branch::new(source.trim())
+            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
+        target: crate::vcs::Branch::new(target.trim())
+            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
+    };
+    let id = crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "land: admitting the request failed");
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the request could not be admitted".to_owned(),
+            )
+        })?;
+
+    vcs_ticket(&state, id, std::time::Duration::ZERO)
+        .await
+        .map_err(|code| {
+            refuse(
+                code,
+                "the request was admitted but could not be read back".to_owned(),
+            )
+        })
+}
+
 async fn submit_vcs_request(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -4219,6 +4327,93 @@ mod tests {
         );
 
         db.close().await;
+    }
+
+    /// **The target is read, never assumed.** A constant `master` would be wrong for any project
+    /// working on something else, and wrong silently — it would queue a merge into a branch nobody
+    /// asked about. So the test builds a repository whose integration branch is deliberately NOT
+    /// called master, and the landed request has to name it.
+    ///
+    /// It also pins the direction, which is the whole point of this route existing: a session could
+    /// already ask for merges INTO its own branch, and this is the only way it can ask for the
+    /// reverse.
+    #[tokio::test]
+    async fn landing_a_worktree_queues_its_branch_into_the_branch_the_project_is_on() {
+        let (state, _db) = file_test_state().await;
+        let container = crate::git_exec::tests::space_free_tempdir("http-land-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        // Not `master`, on purpose — see the doc comment.
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
+        assert!(git_in(&repo, &["branch", "feature"]));
+        let worktree = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
+        ));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let landed = land_worktree(
+            State(state.clone()),
+            Json(LandBody {
+                cwd: worktree.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .expect("a worktree on its own branch can land");
+        assert_eq!(landed.0.status, "queued");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(landed.0.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let op: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(op["op"], "merge");
+        assert_eq!(
+            op["source"], "feature",
+            "the worktree's own branch is what lands"
+        );
+        assert_eq!(
+            op["target"], "trunk",
+            "the target is the branch the project's main checkout is on, not a constant"
+        );
+
+        // Standing on the integration branch, there is no separate work to take. Refused rather
+        // than admitted as a merge naming one branch twice.
+        let refused = land_worktree(
+            State(state),
+            Json(LandBody {
+                cwd: repo.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .expect_err("the main checkout has nothing to land");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("already on trunk"), "{}", refused.1);
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start")
+            .success()
     }
 
     /// A request submitted over HTTP comes back as a ticket, and the same ticket is readable after.

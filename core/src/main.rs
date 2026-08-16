@@ -118,6 +118,54 @@ async fn main() {
         return;
     }
 
+    // `nucleos-core --land`, run from inside a worktree: "I am finished, take this branch."
+    //
+    // A subcommand rather than a documented `curl`, for the reason `--print-token` is one: the
+    // token lives in Credential Manager, and the alternative is teaching every session how to
+    // fetch the master key in order to ask a question about itself. Here the binary reads it, and
+    // the session runs one word.
+    //
+    // It asks; it does not wait. The queue decides when, and the ticket is how to follow it —
+    // printing the id and returning is the honest shape for a request whose whole point is that
+    // somebody else schedules it.
+    if std::env::args().any(|a| a == "--land") {
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = serde_json::json!({ "cwd": cwd }).to_string();
+        let response = reqwest::Client::new()
+            .post("http://127.0.0.1:8791/vcs/land")
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{text}");
+                } else {
+                    eprintln!("the queue refused: {text}");
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if std::env::args().any(|a| a == "--set-telegram-token") {
         match read_secret_from_stdin("paste the bot token, then press Enter:") {
             Some(value) => match secrets::store_secret(TELEGRAM_TOKEN_KEY, &value) {
