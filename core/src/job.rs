@@ -5889,6 +5889,72 @@ mod tests {
         .unwrap();
     }
 
+    /// The whole journey, with nothing along it faked.
+    ///
+    /// Every other test here inserts the rule straight into `fleet_exclusions`, which is right for
+    /// testing the brake and wrong for testing the FEATURE: those would pass unchanged if `propose`
+    /// filed the wrong pair or `approve` wrote a row nothing reads. This one walks the path a person
+    /// walks — ask, approve, watch one job hold and the other wait, and watch the wait end by itself
+    /// — through the same functions the routes call.
+    ///
+    /// The two jobs are asked about BACKWARDS (`high` first) on purpose: the ordering that makes the
+    /// tie-break work has to survive the request, not just the table.
+    #[tokio::test]
+    async fn asking_approving_and_waiting_is_one_unbroken_chain() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        // 1. Somebody draws the edge. Nothing about scheduling changes yet.
+        let proposal = crate::exclusion::propose(&pool, high, low, &[])
+            .await
+            .unwrap();
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        let high_row = load_job(&pool, high).await.unwrap();
+        assert!(
+            matches!(brakes(&state, &high_row, Utc::now()).await, Brake::Go),
+            "a request that nobody has approved must not hold anything"
+        );
+
+        // 2. Somebody approves it. Only now is there a rule.
+        let approved = crate::exclusion::approve(&pool, proposal).await.unwrap();
+        assert!(
+            matches!(approved, crate::exclusion::Approved::Written(_)),
+            "got {approved:?}"
+        );
+
+        // 3. The higher job waits, and the reason names what to wait for.
+        let Brake::Park { reason, detail } = brakes(&state, &high_row, Utc::now()).await else {
+            panic!("the higher job must wait while its partner holds a slot");
+        };
+        assert_eq!(reason, "excluded");
+        assert!(detail.contains(&format!("job {low}")), "got: {detail}");
+        // And it is written on the job itself, which is what the card reads.
+        park(&state, &high_row, reason, &detail).await;
+        let parked = load_job(&pool, high).await.unwrap();
+        assert_eq!(parked.status, "waiting");
+        assert_eq!(parked.wait_reason.as_deref(), Some("excluded"));
+
+        // 4. The partner finishes. Nobody presses anything.
+        crate::concurrency::release(&pool, crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        resume(&pool, high).await.unwrap();
+        let woken = load_job(&pool, high).await.unwrap();
+        assert_eq!(
+            woken.wait_reason, None,
+            "the note outlives the pause it explains"
+        );
+        assert!(matches!(
+            brakes(&state, &woken, Utc::now()).await,
+            Brake::Go
+        ));
+    }
+
     /// One of the two waits, and it is always the same one.
     ///
     /// The asymmetry is the deadlock argument, not a detail of the query: the low id is never parked

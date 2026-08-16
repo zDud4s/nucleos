@@ -436,6 +436,45 @@ it("offers the pairing action only where it can be used", async () => {
 });
 
 /**
+ * And it goes away once there is nobody left to ask about.
+ *
+ * Found by looking at the rendered page rather than at the DOM: with two jobs already tied to each
+ * other, both cards still offered to pair, and the only thing that click could produce was the
+ * daemon's 409. An action whose sole outcome is a refusal is worse than a missing one — the person
+ * learns the screen was offering something that was never there.
+ */
+it("takes the pairing action away when every neighbour is already paired", async () => {
+  respondWith({
+    ...TWO_JOBS,
+    "/fleet/exclusions": [
+      {
+        id: 3,
+        project_id: "alpha",
+        job_low: 41,
+        job_high: 42,
+        proposal_id: 9,
+        paths: null,
+        created_at: "t",
+      },
+    ],
+  });
+  renderFleet();
+  await settle();
+
+  expect(screen.getAllByRole("button", { name: /^lift$/i }).length).toBe(2);
+  expect(screen.queryByRole("button", { name: /not at the same time as…/i })).toBeNull();
+});
+
+/** A request that is still only a request closes the offer just the same: asking twice is a 409. */
+it("takes it away for a pair that has already been asked about", async () => {
+  respondWith({ ...TWO_JOBS, "/fleet/exclusions/requests": [REQUEST] });
+  renderFleet();
+  await settle();
+
+  expect(screen.queryByRole("button", { name: /not at the same time as…/i })).toBeNull();
+});
+
+/**
  * A run's card has no graph: it has a way through to the Runs tab.
  *
  * The `RUNS` key and the `run()` factory are load-bearing — without them `slotDetail` answers

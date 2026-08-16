@@ -318,7 +318,26 @@ export function ProjectColumn({
   const [closed, setClosed] = useState<string | null>(null);
 
   const cards = drawn.map((slot) => ({ slot, detail: slotDetail(slot, jobs, runs) }));
-  const jobCards = cards.filter((card) => card.detail.kind === "job");
+  const jobIds = cards.flatMap((card) =>
+    card.detail.kind === "job" ? [card.detail.job.id] : [],
+  );
+
+  /**
+   * What this card may do about pairing, which is never "whatever the others may do".
+   *
+   * The rule is that an action is only offered where it can SUCCEED. A run holds a slot but is not
+   * a job; a job whose every neighbour it is already tied to has nobody left to ask about; and a
+   * card already tied to the one being picked from cannot be its target. Each of those, offered
+   * anyway, is a button whose only possible outcome is the daemon's 409 — and a person who clicks
+   * it learns that the screen was showing them something that was never available.
+   */
+  function roleFor(jobId: number | null, partners: Partner[]): PairingRole {
+    if (jobId === null) return "none";
+    if (pairing === jobId) return "picking";
+    const tied = new Set(partners.map((partner) => partner.partner));
+    if (pairing !== null) return tied.has(pairing) ? "none" : "target";
+    return jobIds.some((other) => other !== jobId && !tied.has(other)) ? "offer" : "none";
+  }
 
   async function askFor(other: number) {
     if (pairing === null) return;
@@ -388,24 +407,15 @@ export function ProjectColumn({
       {closed !== null && <p className="fleet-closed">{closed}</p>}
       {cards.map(({ slot, detail }) => {
         const jobId = detail.kind === "job" ? detail.job.id : null;
+        const partners = jobId === null ? [] : partnersOf(edges, jobId);
         return (
           <SlotCard
             key={ownerKey(slot)}
             slot={slot}
             detail={detail}
             badges={collisionBadges(project, { kind: slot.owner_kind, id: slot.owner_id })}
-            partners={jobId === null ? [] : partnersOf(edges, jobId)}
-            // Offered only where it can be used: a run holds a slot but is not a job, and with one
-            // job in the column there is nothing to pair it with.
-            pairing={
-              jobId === null || jobCards.length < 2
-                ? "none"
-                : pairing === null
-                  ? "offer"
-                  : pairing === jobId
-                    ? "picking"
-                    : "target"
-            }
+            partners={partners}
+            pairing={roleFor(jobId, partners)}
             onPair={() => {
               if (jobId === null) return;
               if (pairing === null) setPairing(jobId);
