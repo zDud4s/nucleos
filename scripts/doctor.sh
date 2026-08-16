@@ -54,6 +54,31 @@ need go    go    "install Go 1.2x from https://go.dev/dl"
 need node  node  "install Node.js 20+ from https://nodejs.org"
 need npm   npm   "ships with Node.js"
 
+# Python is part of the definition of green, which is easy to miss because none of the product is
+# written in it. `scripts/gates.sh hooks` runs the cover for `.claude/hooks/ask_daemon.py` — a file
+# `core/src/triage.rs` compiles INTO the daemon and which decides what a person's git commands are
+# allowed to do. Checked under both names: `python3` on Linux and CI, `python` on most Windows
+# installs, and a machine with neither cannot run the gate.
+#
+# RUN it rather than locate it. Windows ships an App Execution Alias named `python3` that is not an
+# interpreter — it prints "Python was not found", points at the Microsoft Store, and exits 49.
+# `command -v` finds it happily, and the first version of these three lines reported
+# `ok python Python não foi encontrado...`, which is a false green with the failure text sitting
+# inside it.
+python_found=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+    python_found="$candidate"
+    break
+  fi
+done
+if [ -n "$python_found" ]; then
+  printf 'ok   python %s (%s)\n' "$("$python_found" --version 2>&1 | head -n1)" "$python_found"
+else
+  printf 'MISS python no working interpreter as python3 or python — scripts/gates.sh hooks needs one; install from https://python.org\n'
+  fail=1
+fi
+
 # Nine tests in `gate::` and `transcribe::` spawn `echo` as a PROGRAM. A shell builtin does not
 # satisfy them, and on Windows the only real echo.exe is Git's, under /usr/bin. Checked with
 # `type -P`, which reports the external executable and ignores the builtin — the whole distinction
