@@ -9,6 +9,9 @@
 //
 // The interception goes on the BROWSER session (see cdp.SessionID). The spike measured that a
 // page-session fence never sees a service worker's script fetch at all.
+//
+// The policy the fence enforces lives in the fence package, pure and table-tested. This package is
+// the wiring: it decides nothing, and every rule it applies comes from there.
 package chrome
 
 import (
@@ -22,11 +25,13 @@ import (
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
+	"nucleosbrowser/fence"
 )
 
 // Driver drives one browser. Holding one means the fence is attached.
 type Driver struct {
-	conn *cdp.Conn
+	conn   *cdp.Conn
+	policy fence.Policy
 
 	mu       sync.Mutex
 	sessions map[browser.SessionID]*session
@@ -34,6 +39,13 @@ type Driver struct {
 	// targets maps a CDP target to the session that owns it, so a popup can be traced back to the
 	// session whose page opened it.
 	targets map[string]browser.SessionID
+	// cdpToSession maps an attached CDP session to ours, so a refusal raised by the fence can be
+	// reported against the act that caused it. Not every CDP session has an entry — see
+	// recordedRefusal.
+	cdpToSession map[cdp.SessionID]browser.SessionID
+
+	refusals     []recordedRefusal
+	refusalTotal int
 }
 
 type session struct {
@@ -51,11 +63,18 @@ type session struct {
 
 // Connect attaches the fence and returns a Driver.
 //
-// The order below is the security argument, and it is asserted by a test rather than trusted:
-// interception first, auto-attach second, and no target is created by this function at all. A
-// Driver that returned successfully without both calls landing would be an unfenced browser wearing
-// the type that promises otherwise.
-func Connect(ctx context.Context, conn *cdp.Conn) (*Driver, error) {
+// The order below is the security argument, and it is asserted by a test rather than trusted: the
+// policy is checked before a single call goes out, interception is armed before auto-attach, and no
+// target is created by this function at all. A Driver that returned successfully without all of that
+// landing would be an unfenced browser wearing the type that promises otherwise.
+func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver, error) {
+	// First, and before touching the browser. A driver that armed the interception and then found
+	// out it had no policy to enforce would be holding an open fence for as long as it took to
+	// notice — and the tempting fix, a default policy, is the permissive one.
+	if err := policy.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+	}
+
 	if _, err := conn.Call(ctx, cdp.BrowserSession, "Fetch.enable", map[string]any{
 		"patterns": []map[string]any{{"urlPattern": "*"}},
 	}); err != nil {
@@ -72,16 +91,33 @@ func Connect(ctx context.Context, conn *cdp.Conn) (*Driver, error) {
 		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
 
+	// Downloads (spec §6.2, test 8). Fatal rather than best-effort, and the trade-off is deliberate:
+	// the response-stage Content-Disposition check would still catch most of them, so refusing to
+	// start here costs availability on a Chrome that renamed this method. §6.2a says a fence that is
+	// not fully there does not get to look like one, and this is that rule applied to the one
+	// mechanism that covers a download the interception never sees.
+	if _, err := conn.Call(ctx, cdp.BrowserSession, "Browser.setDownloadBehavior", map[string]any{
+		"behavior": "deny",
+	}); err != nil {
+		return nil, fmt.Errorf("%w: downloads not denied: %v", browser.ErrFenceNotAttached, err)
+	}
+
 	driver := &Driver{
-		conn:     conn,
-		sessions: map[browser.SessionID]*session{},
-		targets:  map[string]browser.SessionID{},
+		conn:         conn,
+		policy:       policy,
+		sessions:     map[browser.SessionID]*session{},
+		targets:      map[string]browser.SessionID{},
+		cdpToSession: map[cdp.SessionID]browser.SessionID{},
 	}
 	conn.OnEvent(driver.onEvent)
+	conn.OnEvent(driver.onFetchPaused)
 	return driver, nil
 }
 
 func (d *Driver) Name() string { return "chrome" }
+
+// Policy returns the fence this driver enforces, for a health readout to show.
+func (d *Driver) Policy() fence.Policy { return d.policy }
 
 // onEvent services targets that are born paused.
 //
@@ -122,12 +158,28 @@ func (d *Driver) onEvent(event cdp.Event) {
 	// arrival order: the spike watched Chrome raise three page attaches for one window.open, and a
 	// "first new target" heuristic bound the fence to the wrong one — silently, which is the worst
 	// way for a fence to be wrong.
+	owner := browser.SessionID("")
 	if params.TargetInfo.OpenerID != "" {
 		d.mu.Lock()
-		if owner, ok := d.targets[params.TargetInfo.OpenerID]; ok {
-			d.targets[params.TargetInfo.TargetID] = owner
+		if known, ok := d.targets[params.TargetInfo.OpenerID]; ok {
+			owner = known
+			d.targets[params.TargetInfo.TargetID] = known
+			d.cdpToSession[params.SessionID] = known
 		}
 		d.mu.Unlock()
+	}
+
+	// Spec §5.4: in agent mode a new target is BLOCKED, not opened and then watched. A headless
+	// popup is invisible by construction (§4.1), so there is no mode in which showing it would be
+	// honest. --block-new-web-contents already makes window.open return null; this is the second
+	// mechanism, and it is the one a test can assert without trusting a command-line flag.
+	if params.TargetInfo.Type == "page" && params.TargetInfo.OpenerID != "" {
+		d.recordSessionRefusal(owner, browser.ConsequenceNewTarget,
+			"a page tried to open a new window; agent mode does not have one to show")
+		_, _ = d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{
+			"targetId": params.TargetInfo.TargetID,
+		})
+		return
 	}
 
 	if params.WaitingForDebugger {
@@ -197,19 +249,76 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	}
 	d.sessions[id] = entry
 	d.targets[target.TargetID] = id
+	d.cdpToSession[cdpSession] = id
 	d.mu.Unlock()
 
-	if _, err := d.conn.Call(ctx, cdpSession, "Page.navigate", map[string]any{"url": req.URL}); err != nil {
+	// Counted BEFORE the navigation, so a refusal the fence raises while the navigation is in
+	// flight is attributable to it and not lost.
+	before := d.refusalCount()
+
+	navigated, err := d.conn.Call(ctx, cdpSession, "Page.navigate", map[string]any{"url": req.URL})
+	if err != nil {
 		return browser.Session{}, fmt.Errorf("navigating: %w", err)
 	}
+	var outcome struct {
+		ErrorText string `json:"errorText"`
+	}
+	if err := json.Unmarshal(navigated, &outcome); err != nil {
+		return browser.Session{}, err
+	}
 
-	entry.final = req.URL
+	if outcome.ErrorText != "" {
+		if refused := d.refusalFor(ctx, id, before); refused != nil {
+			// The session exists and is empty. Reported as a value rather than an error because it
+			// is an ANSWER: the agent asked for a url this profile does not admit, and the useful
+			// next move is to ask for it in an ephemeral one — not to retry.
+			return browser.Session{
+				ID:           id,
+				Mode:         entry.mode,
+				RequestedURL: entry.requested,
+				Refusal:      &browser.Refusal{Consequence: refused.Consequence, Detail: refused.Detail},
+			}, nil
+		}
+		return browser.Session{}, fmt.Errorf("navigating to %s: %s", req.URL, outcome.ErrorText)
+	}
+
+	d.readTargetInfo(ctx, entry)
 	return browser.Session{
 		ID:           id,
 		Mode:         entry.mode,
 		RequestedURL: entry.requested,
 		FinalURL:     entry.final,
+		Title:        entry.title,
 	}, nil
+}
+
+// readTargetInfo asks the browser where the target actually ended up.
+//
+// Not cosmetic: spec §5.3 makes the trust decision a conjunction over the requested url AND the
+// final one, and a redirect is the case that rule exists for. Reporting back the url we asked for
+// would make that decision impossible to take, and would do it while looking correct.
+func (d *Driver) readTargetInfo(ctx context.Context, entry *session) {
+	result, err := d.conn.Call(ctx, cdp.BrowserSession, "Target.getTargetInfo", map[string]any{
+		"targetId": entry.target,
+	})
+	if err != nil {
+		return
+	}
+	var info struct {
+		TargetInfo struct {
+			URL   string `json:"url"`
+			Title string `json:"title"`
+		} `json:"targetInfo"`
+	}
+	if err := json.Unmarshal(result, &info); err != nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if info.TargetInfo.URL != "" {
+		entry.final = info.TargetInfo.URL
+	}
+	entry.title = info.TargetInfo.Title
 }
 
 type attachment struct {
@@ -298,6 +407,7 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	d.mu.Lock()
 	delete(d.sessions, id)
 	delete(d.targets, entry.target)
+	delete(d.cdpToSession, entry.cdp)
 	d.mu.Unlock()
 	return callErr
 }

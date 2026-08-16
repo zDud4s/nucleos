@@ -48,12 +48,17 @@ type OpenRequest struct {
 // decision is a conjunction over the two (spec §5.3) — a redirect that lands somewhere else is the
 // case the allowlist exists for, and a driver that reported only one of them would make that
 // decision impossible to take.
+// Refusal is non-nil when the fence stopped the navigation this session was opened for. The session
+// still exists and is still addressable — it is simply empty. That is a value and not an error for
+// the same reason ActResult separates the two: "this profile does not admit that host" is an answer
+// the agent can act on, and the action it should take is to ask elsewhere rather than to retry.
 type Session struct {
 	ID           SessionID `json:"id"`
 	Mode         Mode      `json:"mode"`
 	RequestedURL string    `json:"requested_url"`
 	FinalURL     string    `json:"final_url"`
 	Title        string    `json:"title"`
+	Refusal      *Refusal  `json:"refusal,omitempty"`
 }
 
 // Element is one thing on the page the agent may refer to.

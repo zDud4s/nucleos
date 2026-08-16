@@ -11,7 +11,14 @@ import (
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
 	"nucleosbrowser/cdp/cdptest"
+	"nucleosbrowser/fence"
 )
+
+// projectPolicy is the harder of the two profiles: one that carries a session, so an off-list
+// document is refused rather than merely rendered somewhere harmless.
+func projectPolicy() fence.Policy {
+	return fence.Policy{Profile: fence.Project, Origins: []string{"https://example.org"}}
+}
 
 func dial(t *testing.T) (*cdptest.Browser, *cdp.Conn) {
 	t.Helper()
@@ -46,6 +53,17 @@ func autoAttachOnCreate(fake *cdptest.Browser) {
 		}()
 		return map[string]any{"targetId": "T1"}, nil
 	})
+	// Where the target actually ended up. The fake answers with a DIFFERENT url from the one Open
+	// asked for, because that is the case spec §5.3's conjunction exists for: a driver that echoed
+	// back the requested url would look right in every test and make the redirect decision
+	// impossible to take.
+	fake.Handle("Target.getTargetInfo", func(cdptest.Call) (any, error) {
+		return map[string]any{"targetInfo": map[string]any{
+			"targetId": "T1",
+			"url":      "https://example.org/landed",
+			"title":    "Example",
+		}}, nil
+	})
 }
 
 // TestConnectAttachesTheFenceBeforeAnythingElse.
@@ -55,7 +73,7 @@ func autoAttachOnCreate(fake *cdptest.Browser) {
 // leaving a window in which a page runs unfenced.
 func TestConnectAttachesTheFenceBeforeAnythingElse(t *testing.T) {
 	fake, conn := dial(t)
-	if _, err := Connect(context.Background(), conn); err != nil {
+	if _, err := Connect(context.Background(), conn, projectPolicy()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 
@@ -77,7 +95,7 @@ func TestConnectAttachesTheFenceBeforeAnythingElse(t *testing.T) {
 // page-session fence never sees a service worker's script fetch.
 func TestTheFenceGoesOnTheBrowserSession(t *testing.T) {
 	fake, conn := dial(t)
-	if _, err := Connect(context.Background(), conn); err != nil {
+	if _, err := Connect(context.Background(), conn, projectPolicy()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	for _, call := range fake.Calls() {
@@ -94,7 +112,7 @@ func TestTheFenceGoesOnTheBrowserSession(t *testing.T) {
 // a new target navigates before the interception is on it (spec §5.4).
 func TestAutoAttachPausesNewTargets(t *testing.T) {
 	fake, conn := dial(t)
-	if _, err := Connect(context.Background(), conn); err != nil {
+	if _, err := Connect(context.Background(), conn, projectPolicy()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	for _, call := range fake.Calls() {
@@ -126,7 +144,7 @@ func TestAFenceThatWillNotArmRefusesToProduceADriver(t *testing.T) {
 		return nil, errors.New("'Fetch.enable' wasn't found")
 	})
 
-	driver, err := Connect(context.Background(), conn)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if !errors.Is(err, browser.ErrFenceNotAttached) {
 		t.Fatalf("got %v, want ErrFenceNotAttached", err)
 	}
@@ -143,7 +161,7 @@ func TestAutoAttachFailureAlsoRefuses(t *testing.T) {
 	fake.Handle("Target.setAutoAttach", func(cdptest.Call) (any, error) {
 		return nil, errors.New("nope")
 	})
-	if _, err := Connect(context.Background(), conn); !errors.Is(err, browser.ErrFenceNotAttached) {
+	if _, err := Connect(context.Background(), conn, projectPolicy()); !errors.Is(err, browser.ErrFenceNotAttached) {
 		t.Fatalf("got %v, want ErrFenceNotAttached", err)
 	}
 }
@@ -153,7 +171,7 @@ func TestAutoAttachFailureAlsoRefuses(t *testing.T) {
 func TestOpenArmsTheTargetBeforeNavigating(t *testing.T) {
 	fake, conn := dial(t)
 	autoAttachOnCreate(fake)
-	driver, err := Connect(context.Background(), conn)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -188,7 +206,7 @@ func TestOpenArmsTheTargetBeforeNavigating(t *testing.T) {
 func TestAPausedTargetIsReleased(t *testing.T) {
 	fake, conn := dial(t)
 	autoAttachOnCreate(fake)
-	driver, err := Connect(context.Background(), conn)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -214,7 +232,7 @@ func TestAPausedTargetIsReleased(t *testing.T) {
 func TestEachAttachedSessionReArmsOnItsOwnChildren(t *testing.T) {
 	fake, conn := dial(t)
 	autoAttachOnCreate(fake)
-	driver, err := Connect(context.Background(), conn)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -242,7 +260,7 @@ func TestEachAttachedSessionReArmsOnItsOwnChildren(t *testing.T) {
 func TestActRefusesARefNoSnapshotShowed(t *testing.T) {
 	fake, conn := dial(t)
 	autoAttachOnCreate(fake)
-	driver, err := Connect(context.Background(), conn)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -268,7 +286,7 @@ func TestActRefusesARefNoSnapshotShowed(t *testing.T) {
 
 func TestUnknownSessionsAreNamed(t *testing.T) {
 	_, conn := dial(t)
-	driver, err := Connect(context.Background(), conn)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
