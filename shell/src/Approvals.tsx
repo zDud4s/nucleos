@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  approveProposal, dismissSkippedItem, getAwaitingApproval, getSkippedItems,
-  getTeamActionProposals, getVcsRequest, listVcsRequests, rejectProposal,
-  type AwaitingRun, type ConnectionState, type Proposal, type VcsRequestSummary, type VcsTicket,
+  approveProposal, dismissSkippedItem, getAwaitingApproval, getRecruitProposals, getSkippedItems,
+  getTeamActionProposals, getVcsRequest, hireRecruit, listVcsRequests, rejectProposal,
+  type AwaitingRun, type ConnectionState, type Proposal, type RecruitDraft,
+  type VcsRequestSummary, type VcsTicket,
 } from "./api";
 import {
   relativeTime, vcsIsSettled, vcsOriginLabel, vcsPending, vcsStatusLabel, vcsStatusTone,
@@ -379,6 +380,206 @@ function TeamActionsPanel({
   );
 }
 
+/**
+ * The specialists directors asked for, with the six fields in front of the person deciding.
+ *
+ * **Editable, unlike everything else on this page**, and that is the whole reason it is a panel of
+ * its own rather than another row in the queue above. A director knows the name, the speciality and
+ * the prompt well — it has just found the gap — and knows the engine, the model and the tool policy
+ * badly, because those are what cost money per turn and what widen a surface. The button says
+ * "Hire" rather than "Approve" because what it does is different: nothing is released, somebody
+ * permanent joins the house.
+ */
+function RecruitsPanel({
+  recruits, loading, token, refresh,
+}: {
+  recruits: Proposal[] | null;
+  loading: boolean;
+  token: string;
+  refresh: () => Promise<void>;
+}) {
+  const [drafts, setDrafts] = useState<Record<number, RecruitDraft>>({});
+  const [busy, setBusy] = useState<Set<number>>(new Set());
+  const [errors, setErrors] = useState<Record<number, string>>({});
+
+  /** The proposal's own fields until somebody edits one, then theirs. */
+  function draftFor(proposal: Proposal): RecruitDraft {
+    const existing = drafts[proposal.id];
+    if (existing !== undefined) return existing;
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = JSON.parse(proposal.tool_input ?? "{}") as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+    const text = (field: string, fallback = "") =>
+      typeof parsed[field] === "string" ? (parsed[field] as string) : fallback;
+    return {
+      name: text("name"),
+      speciality: text("speciality"),
+      prompt: text("prompt"),
+      engine: text("engine", "claude"),
+      model: typeof parsed.model === "string" ? parsed.model : null,
+      tool_policy: text("tool_policy", "mcp_only"),
+    };
+  }
+
+  function edit(id: number, patch: Partial<RecruitDraft>, base: RecruitDraft) {
+    setDrafts((current) => ({ ...current, [id]: { ...base, ...patch } }));
+  }
+
+  async function decide(proposal: Proposal, verdict: "hire" | "no") {
+    const id = proposal.id;
+    setBusy((current) => new Set(current).add(id));
+    setErrors((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    const failure: string | null =
+      verdict === "hire"
+        ? await hireRecruit(token, id, draftFor(proposal)).then((result) =>
+            result.ok
+              ? null
+              : result.status === 409
+                ? "That name is taken, or somebody answered this already. Try another name."
+                : result.status === 422
+                  ? "The daemon will not accept those settings. A local engine needs a model, and " +
+                    "an unrestricted tool policy is never allowed."
+                  : "Could not hire them.",
+          )
+        : await rejectProposal(token, id).then((ok) =>
+            ok ? null : "Could not record that refusal — it may already have been answered.",
+          );
+    if (failure === null) {
+      await refresh();
+    } else {
+      setErrors((current) => ({ ...current, [id]: failure }));
+    }
+    setBusy((current) => {
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+  }
+
+  return (
+    <Panel title="New specialists" aside={recruits === null ? undefined : `${recruits.length}`}>
+      {recruits === null ? (
+        !loading && <ErrorNote>Could not read the recruitment requests from the daemon.</ErrorNote>
+      ) : recruits.length === 0 ? (
+        <Teach title="No director is short of anybody.">
+          When a department needs a skill nobody in the catalogue has, its director says so and the
+          request lands here. Hiring adds them to your catalogue permanently and to that
+          department's roster — from its next run, never the one that asked.
+        </Teach>
+      ) : (
+        <ul className="skipped-list">
+          {recruits.map((proposal) => {
+            const draft = draftFor(proposal);
+            return (
+              <li key={proposal.id} className="skipped-row">
+                <div className="skipped-row__head">
+                  <b>#{proposal.id}</b>
+                  <time dateTime={proposal.created_at} title={proposal.created_at}>
+                    {relativeTime(proposal.created_at)}
+                  </time>
+                </div>
+                {/* The director's reason, above the form. It is the only part a person cannot
+                    reconstruct from the fields, and the one they are actually judging. */}
+                <p className="skipped-row__why">{proposal.reasoning}</p>
+                <div className="form-grid">
+                  <label>
+                    Name
+                    <input
+                      value={draft.name}
+                      onChange={(event) => edit(proposal.id, { name: event.target.value }, draft)}
+                    />
+                  </label>
+                  <label>
+                    Engine
+                    <select
+                      value={draft.engine}
+                      onChange={(event) => edit(proposal.id, { engine: event.target.value }, draft)}
+                    >
+                      <option value="claude">claude</option>
+                      <option value="codex">codex</option>
+                      <option value="local">local</option>
+                    </select>
+                  </label>
+                  <label>
+                    Model
+                    <input
+                      value={draft.model ?? ""}
+                      placeholder="(the engine's default)"
+                      onChange={(event) =>
+                        edit(
+                          proposal.id,
+                          { model: event.target.value.trim() === "" ? null : event.target.value },
+                          draft,
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Tools
+                    <select
+                      value={draft.tool_policy}
+                      onChange={(event) =>
+                        edit(proposal.id, { tool_policy: event.target.value }, draft)
+                      }
+                    >
+                      <option value="mcp_only">the usual set</option>
+                      <option value="none">none at all</option>
+                    </select>
+                  </label>
+                  <label className="wide">
+                    Speciality
+                    <input
+                      value={draft.speciality}
+                      onChange={(event) =>
+                        edit(proposal.id, { speciality: event.target.value }, draft)
+                      }
+                    />
+                  </label>
+                  <label className="wide">
+                    Instructions
+                    <textarea
+                      rows={4}
+                      value={draft.prompt}
+                      onChange={(event) => edit(proposal.id, { prompt: event.target.value }, draft)}
+                    />
+                  </label>
+                </div>
+                <div className="a-actions">
+                  <Button
+                    size="sm"
+                    variant="approve"
+                    disabled={busy.has(proposal.id) || draft.name.trim() === ""}
+                    onClick={() => void decide(proposal, "hire")}
+                  >
+                    Hire
+                  </Button>
+                  <ConfirmButton
+                    size="sm"
+                    variant="danger"
+                    confirmLabel="Turn them down?"
+                    disabled={busy.has(proposal.id)}
+                    onConfirm={() => void decide(proposal, "no")}
+                  >
+                    No
+                  </ConfirmButton>
+                </div>
+                {errors[proposal.id] !== undefined && <ErrorNote>{errors[proposal.id]}</ErrorNote>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
 interface ApprovalsProps {
   token: string | null;
   connection: ConnectionState;
@@ -389,6 +590,7 @@ export default function Approvals({ token, connection }: ApprovalsProps) {
   const [runs, setRuns] = useState<AwaitingRun[] | null>(null);
   const [items, setItems] = useState<Proposal[] | null>(null);
   const [teamActions, setTeamActions] = useState<Proposal[] | null>(null);
+  const [recruits, setRecruits] = useState<Proposal[] | null>(null);
   const [loading, setLoading] = useState(true);
   /**
    * Mirrors what the last load found still moving, for the poll's own use.
@@ -401,16 +603,18 @@ export default function Approvals({ token, connection }: ApprovalsProps) {
 
   const load = useCallback(async () => {
     if (token === null) return;
-    const [nextRequests, nextRuns, nextItems, nextTeamActions] = await Promise.all([
+    const [nextRequests, nextRuns, nextItems, nextTeamActions, nextRecruits] = await Promise.all([
       listVcsRequests(token),
       getAwaitingApproval(token),
       getSkippedItems(token),
       getTeamActionProposals(token),
+      getRecruitProposals(token),
     ]);
     setRequests(nextRequests);
     setRuns(nextRuns);
     setItems(nextItems);
     setTeamActions(nextTeamActions);
+    setRecruits(nextRecruits);
     inFlight.current = (nextRequests === null ? 0 : vcsPending(nextRequests)) + (nextRuns?.length ?? 0);
     setLoading(false);
   }, [token]);
@@ -445,6 +649,7 @@ export default function Approvals({ token, connection }: ApprovalsProps) {
       <GitQueuePanel requests={requests} loading={loading} token={token} refresh={load} />
       <WaitingRunsPanel runs={runs} loading={loading} />
       <TeamActionsPanel actions={teamActions} loading={loading} token={token} refresh={load} />
+      <RecruitsPanel recruits={recruits} loading={loading} token={token} refresh={load} />
       <SkippedItemsPanel items={items} loading={loading} token={token} refresh={load} />
     </>
   );

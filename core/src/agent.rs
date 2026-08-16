@@ -84,6 +84,20 @@ pub const ENGINES: &[&str] = &["claude", "codex", "local"];
 /// catalogue has no worktree and no hook wired — accepting it would name a barrier that is not
 /// there. A `local` engine without a model is refused for the sibling reason: silently falling back
 /// to cloud would swap the model the owner chose for one that spends.
+///
+/// Public because a recruitment is validated TWICE and by two callers: once when a director
+/// proposes, so the refusal reaches a model that can still fix it, and once over whatever the owner
+/// edited at approval — which is the one that decides. Two copies of these rules would be two
+/// answers to "what may an agent declare about itself".
+pub fn validate_request(request: &AgentRequest) -> Result<(), &'static str> {
+    validate(request).map_err(|error| match error {
+        AgentError::Invalid(message) => message,
+        // `validate` returns nothing else, and a total mapping beats an `unreachable!` in a path a
+        // background approval walks.
+        _ => "that is not an agent this daemon will accept",
+    })
+}
+
 fn validate(request: &AgentRequest) -> Result<(), AgentError> {
     if request.name.trim().is_empty() {
         return Err(AgentError::Invalid("name must not be empty"));

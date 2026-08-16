@@ -1217,6 +1217,60 @@ export async function getTeamActionProposals(token: string): Promise<Proposal[] 
   }
 }
 
+/** What a director asked for, and what an owner may edit before agreeing to it. */
+export interface RecruitDraft {
+  name: string;
+  speciality: string;
+  prompt: string;
+  engine: string;
+  model: string | null;
+  tool_policy: string;
+}
+
+/** The specialists directors have asked for and nobody has answered. */
+export async function getRecruitProposals(token: string): Promise<Proposal[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/recruits`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Hires the person a director asked for, over whatever the owner corrected.
+ *
+ * The one approval in the house that carries a BODY, and the reason is #5 of the design: a director
+ * knows the name, the speciality and the prompt well — it has just found the gap — and knows the
+ * engine, the model and the tool policy badly, because those are what cost money per turn and what
+ * widen a surface. The daemon validates what is sent here, never what was proposed.
+ */
+export async function hireRecruit(
+  token: string,
+  id: number,
+  hire: RecruitDraft,
+): Promise<ApiResult<{ agent_id: string }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/${id}/approve`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ hire }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { agent_id: string } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
 /**
  * Puts a read skipped item away.
  *

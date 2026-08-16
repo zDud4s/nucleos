@@ -2713,7 +2713,7 @@ mod tests {
             // to be typed out by whoever adds it. Calling `propose_action` performs nothing — it
             // records a request the core carries out later if a human agrees — and its `Acts`
             // grading exists so the taint rule closes it once the turn has read a stranger's words.
-            if tool == "propose_action" {
+            if tool == "propose_action" || tool == "propose_teammate" {
                 continue;
             }
             acting += 1;

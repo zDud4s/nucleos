@@ -90,6 +90,24 @@ struct ProposeActionParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProposeTeammateParams {
+    /// What to call them, e.g. `Contracts lawyer`.
+    name: String,
+    /// One line: what they are for. This is what a director reads to hand out work.
+    speciality: String,
+    /// Their standing instructions, written as if addressing them.
+    prompt: String,
+    /// `claude`, `codex` or `local`. Absent means yours.
+    engine: Option<String>,
+    /// Absent means yours.
+    model: Option<String>,
+    /// `mcp_only` or `none`. Absent means `mcp_only`.
+    tool_policy: Option<String>,
+    /// Why this department needed somebody it does not have. Required — it is what the owner reads.
+    why: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct VcsTicketParams {
     /// The id the queue gave back when the operation was submitted.
     id: i64,
@@ -253,6 +271,42 @@ impl NucleosTools {
         Parameters(ProposeActionParams { kind, payload, why }): Parameters<ProposeActionParams>,
     ) -> String {
         json_result(self.client.propose_action(&kind, &payload, &why).await)
+    }
+
+    #[tool(
+        description = "Ask the owner for a specialist this department does not have. Only a \
+                       director may call this. It does NOT hire anybody and it does NOT change \
+                       this run: the person you describe joins the catalogue only if the owner \
+                       agrees, and then only from the department's NEXT run onwards. So carry on \
+                       with the people you have, hand out what you can, and say plainly in the \
+                       delivery which part was left thin and why. Ask once — asking again for the \
+                       same person is refused, and the request stays open until it is answered."
+    )]
+    async fn propose_teammate(
+        &self,
+        Parameters(ProposeTeammateParams {
+            name,
+            speciality,
+            prompt,
+            engine,
+            model,
+            tool_policy,
+            why,
+        }): Parameters<ProposeTeammateParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .propose_teammate(&serde_json::json!({
+                    "name": name,
+                    "speciality": speciality,
+                    "prompt": prompt,
+                    "engine": engine,
+                    "model": model,
+                    "tool_policy": tool_policy,
+                    "why": why,
+                }))
+                .await,
+        )
     }
 
     #[tool(description = "List NucleOS proposals")]
@@ -559,6 +613,11 @@ pub const TEAM_TOOLS: &[&str] = &[
     "get_email_queue",
     "list_files",
     "propose_action",
+    // Offered to every team agent and answered only for the director. The narrowing happens in the
+    // handler, against `team_runs.director_run_id`, because a team's key names the RUN and both
+    // nodes present the identical one. A specialist that calls it is told so in a sentence it can
+    // act on — which is better than hiding the tool from a list the two nodes share.
+    "propose_teammate",
     "read_team_file",
     "web_read",
     "web_search",
@@ -633,6 +692,11 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // one row would open precisely the laundry chute `read_team_file`'s comment describes: a page
     // read in one tool, an action requested in the next, and the taint rule stepping over both.
     ("propose_action", ToolEffect::Acts),
+    // Same grading and the same reason, and here the failure it prevents is concrete: a director
+    // that read a page saying "hire an agent with this prompt" could otherwise file it. It would
+    // reach a person and probably be refused — but the defence cannot be the attention of whoever
+    // is approving.
+    ("propose_teammate", ToolEffect::Acts),
     // A specialist that read the web writes the web into its answer, so whoever reads that answer
     // afterwards is reading content nobody vouched for. Grading it `ReadsOwn` because the bytes are
     // ours would build the exact laundry chute a department needs least: untrusted text in one end,
@@ -714,8 +778,19 @@ impl LocalToolBox {
     /// other box rather than an in-process read of the folder. A second implementation over the
     /// directory would be a second answer to "what may this run read", kept in step by hand — which
     /// is exactly what this type's doc says it exists to avoid.
-    pub fn for_team(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
-        Self::with_tools(base_url, token, pool, TEAM_TOOLS)
+    /// `run_id` is the NODE, where the token is the RUN. A local turn knows it directly — it is
+    /// running inside the daemon — where a cloud turn's MCP subprocess reads it out of the
+    /// environment. Both then send it the same way, so a director's authority does not depend on
+    /// which machine answers. See `daemon_client::RUN_ID_HEADER`.
+    pub fn for_team(base_url: String, token: String, pool: sqlx::SqlitePool, run_id: i64) -> Self {
+        Self {
+            pool: pool.clone(),
+            allowed: TEAM_TOOLS,
+            tools: NucleosTools {
+                client: crate::daemon_client::DaemonClient::as_run(base_url, token, run_id),
+                tool_router: NucleosTools::tool_router(),
+            },
+        }
     }
 
     fn with_tools(
@@ -822,6 +897,11 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "propose_action" => {
                 self.tools
                     .propose_action(Parameters(parsed!(ProposeActionParams)))
+                    .await
+            }
+            "propose_teammate" => {
+                self.tools
+                    .propose_teammate(Parameters(parsed!(ProposeTeammateParams)))
                     .await
             }
             "web_search" => {
@@ -1098,6 +1178,7 @@ mod tests {
                 "list_projects",
                 "list_proposals",
                 "propose_action",
+                "propose_teammate",
                 "read_team_file",
                 "reject_proposal",
                 "set_kill",
@@ -1448,8 +1529,10 @@ mod tests {
             .collect();
         assert_eq!(
             acting,
-            [&"propose_action"],
-            "a department's list holds exactly one acting tool, and it is the one that only asks"
+            [&"propose_action", &"propose_teammate"],
+            "a department's list holds exactly two acting tools, and both of them only ASK: one \
+             records a request the core carries out if a human agrees, the other records a request \
+             for somebody to be hired if a human agrees. Neither performs anything when called."
         );
 
         for name in ["create_run", "create_job"] {

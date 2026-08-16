@@ -71,17 +71,44 @@ function asked(overrides: Partial<Proposal> = {}): Proposal {
   };
 }
 
+function wanted(overrides: Partial<Proposal> = {}): Proposal {
+  return {
+    id: 52,
+    kind: "agent-recruit",
+    status: "pending",
+    run_id: null,
+    session_id: null,
+    project_id: null,
+    tool_name: "contracts-lawyer",
+    reasoning: "the launch has a distribution agreement nobody here can read",
+    tool_input: JSON.stringify({
+      team_id: "marketing",
+      name: "Contracts lawyer",
+      speciality: "reads contracts and flags what binds us",
+      prompt: "You are a lawyer.",
+      engine: "claude",
+      model: "claude-sonnet-5",
+      tool_policy: "mcp_only",
+    }),
+    created_at: "2026-08-16T11:30:00Z",
+    decided_at: null,
+    ...overrides,
+  };
+}
+
 /** A daemon holding one of each, answering every route this page reads. */
 function daemonWith({
   requests = [request()],
   runs = [parked()],
   items = [skipped()],
   actions = [asked()],
+  recruits = [wanted()],
 }: {
   requests?: VcsRequestSummary[];
   runs?: AwaitingRun[];
   items?: Proposal[];
   actions?: Proposal[];
+  recruits?: Proposal[];
 } = {}) {
   fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
     const target = String(url);
@@ -90,6 +117,9 @@ function daemonWith({
     }
     if (target.includes("/proposals/team-actions")) {
       return { ok: true, status: 200, json: async () => actions };
+    }
+    if (target.includes("/proposals/recruits")) {
+      return { ok: true, status: 200, json: async () => recruits };
     }
     if (/\/proposals\/\d+\/(approve|reject)$/.test(target)) {
       return {
@@ -178,8 +208,43 @@ describe("the waiting page", () => {
   });
 
   it("says nothing is waiting rather than showing an empty box", async () => {
-    await show({ actions: [] });
+    await show({ actions: [], recruits: [] });
     expect(screen.getByText("No department is waiting on you.")).toBeTruthy();
+    expect(screen.getByText("No director is short of anybody.")).toBeTruthy();
+  });
+
+  /**
+   * The one decision on this page that is EDITABLE, and the reason it is a panel of its own. A
+   * director knows the name, the speciality and the prompt well; it knows the engine, the model and
+   * the tool policy badly, because those are what cost money per turn. What is sent is what the
+   * owner left in the fields — never what was proposed.
+   */
+  it("hires the corrected specialist and not the proposed one", async () => {
+    await show();
+
+    expect(screen.getByText(/the launch has a distribution agreement/)).toBeTruthy();
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Contracts lawyer");
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "House counsel" } });
+    fireEvent.change(screen.getByLabelText("Tools"), { target: { value: "none" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Hire"));
+    });
+
+    const posted = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url).endsWith("/proposals/52/approve") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posted).toBeTruthy();
+    const body = JSON.parse(String((posted?.[1] as RequestInit).body));
+    expect(body.hire).toMatchObject({
+      name: "House counsel",
+      tool_policy: "none",
+      // Untouched fields travel as proposed — the form is a correction, not a re-entry.
+      speciality: "reads contracts and flags what binds us",
+      engine: "claude",
+    });
   });
 
   it("shows a git request with who asked for it and which repository it locked", async () => {

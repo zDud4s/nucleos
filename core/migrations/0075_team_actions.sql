@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS team_grants (
 CREATE TABLE IF NOT EXISTS team_actions (
     id           INTEGER PRIMARY KEY,
     team_run_id  TEXT NOT NULL REFERENCES team_runs(id),
+    -- Which item of the run asked, or NULL when the director did. Resolved from the calling node's
+    -- run id — see `team::calling_node` — and never from anything the model supplies.
+    ordinal      INTEGER,
     kind         TEXT NOT NULL,
     -- JSON, validated by kind AT THE MOMENT IT IS WRITTEN and not at execution. A `send_email` with
     -- no recipient has to be refused to the agent, which is still in its turn and can still fix it,
@@ -67,12 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_team_actions_run ON team_actions (team_run_id, id
 -- alternative is a department sitting in `working` until somebody opens a laptop — holding a
 -- `max_parallel` slot and counting against the four-hour ceiling the whole time.
 
--- There is no `ordinal` column naming the item that asked, though the design sketched one.
--- The core cannot know: a team's key is `Scope::TeamRun`, minted per RUN, and `NUCLEOS_RUN_ID`
--- reaches the MCP subprocess's environment but is never forwarded on the wire. The only way to
--- populate it would be to let the caller name itself in the body — which is exactly what
--- `team::post_read_file` refuses on principle, one route over. A column that is always NULL is
--- worse than no column: it reads as "this action had no author" rather than "nobody recorded one".
+-- `ordinal` is NOT the model naming itself, which `team::post_read_file` refuses on principle one
+-- route over. It comes from `NUCLEOS_RUN_ID`, which the daemon puts in the node's environment and
+-- its own MCP client puts on the wire — the model never builds the request and cannot touch it. It
+-- is exactly as trustworthy as `NUCLEOS_DAEMON_TOKEN`, which travels the same way: anything able to
+-- forge one already has the other. The daemon still checks that the node named belongs to the team
+-- run the key authenticated, so a value from somewhere else names nothing.
 
 -- How many actions one team may leave waiting for a decision.
 --

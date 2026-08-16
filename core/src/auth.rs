@@ -400,6 +400,12 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
     // Its GET twin, which lists the queue, is deliberately absent: a department may ask, and may not
     // read what every other department has asked for.
     (Method::POST, "/team-actions"),
+    // The second and last. Like the one above it, it records a request rather than performing one:
+    // nobody joins the catalogue until a person says so. Unlike it, the daemon answers differently
+    // depending on WHICH NODE of the run is calling — a specialist is refused — and that is decided
+    // inside the handler against `team_runs.director_run_id`, because `permits` answers about keys
+    // and a key belongs to the run rather than to a node.
+    (Method::POST, "/team-recruits"),
     (Method::GET, "/email/queue"),
     (Method::GET, "/email/{id}"),
     (Method::GET, "/files"),
@@ -711,6 +717,7 @@ mod tests {
             // an action and may not LIST the queue — is answered by `permits` rather than by the
             // router not knowing the path.
             .route("/team-actions", post(|| async {}).get(|| async {}))
+            .route("/team-recruits", post(|| async {}).get(|| async {}))
             .route("/files", get(|| async {}).delete(|| async {}))
             .route("/files/folder", post(|| async {}))
             .route("/files/download", get(|| async {}))
@@ -1601,6 +1608,7 @@ mod tests {
             // A department asks for an action and does not read the queue of them. Same path, other
             // method — the pair-shaped table again.
             ("GET", "/team-actions"),
+            ("GET", "/team-recruits"),
             ("GET", "/autopilot/budget"),
             ("GET", "/autopilot/kill"),
             ("GET", "/projects"),
@@ -1654,6 +1662,7 @@ mod tests {
             ("get_email_queue", Method::GET, "/email/queue"),
             ("list_files", Method::GET, "/files"),
             ("propose_action", Method::POST, "/team-actions"),
+            ("propose_teammate", Method::POST, "/team-recruits"),
             ("read_team_file", Method::POST, "/team-files/read"),
             ("web_read", Method::POST, "/web/read"),
             ("web_search", Method::POST, "/web/search"),

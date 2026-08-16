@@ -138,6 +138,7 @@ pub fn build_router(state: AppState) -> Router {
             "/team-actions",
             post(crate::team::post_team_action).get(crate::team::list_open_actions),
         )
+        .route("/team-recruits", post(crate::team::post_team_recruit))
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -183,6 +184,7 @@ pub fn build_router(state: AppState) -> Router {
         // that `/runs/awaiting-approval` raises does not arise here.
         .route("/proposals/skipped-items", get(get_skipped_items))
         .route("/proposals/team-actions", get(get_team_action_proposals))
+        .route("/proposals/recruits", get(get_recruit_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
         .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
@@ -886,6 +888,24 @@ async fn get_team_action_proposals(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "reading pending team actions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The specialists directors asked for and nobody has answered.
+///
+/// A fourth door, and separate for the reason the third is: the button says "Hire", not "Approve",
+/// because what it does is different from the rest of the queue — and unlike every other proposal
+/// in the house, this one is EDITABLE at the moment of decision. Sharing a list with things that
+/// are not editable would mean one form that pretends the fields are read-only half the time.
+async fn get_recruit_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending_recruits(&state.pool, None)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending recruitments failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -3484,10 +3504,27 @@ fn merge_decision_response(
 /// The case that made it worth doing is real rather than hypothetical: `mode: "real"` is the API's
 /// DEFAULT and creates no worktree, so approving a merge in such a run is refused by a mechanism
 /// nobody can see, and the refusal is indistinguishable from a button that did not fire.
+/// The body `approve` accepts, and the only kind that reads one.
+///
+/// `Option` and last in the argument list, so every existing caller — which sends no body at all —
+/// is unaffected. A recruitment is a SUGGESTION: the director knows the name, the speciality and
+/// the prompt well, and knows the engine, the model and the tool policy badly, because those are
+/// what cost money per turn and what widen a surface. So the person approving may correct them, and
+/// `agent::validate` runs over the correction.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ApproveBody {
+    hire: Option<crate::agent::AgentRequest>,
+}
+
 async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    // Last, because axum requires a body extractor to be — and optional, because four of the five
+    // kinds through this door send nothing.
+    body: Option<Json<ApproveBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let edited = body.and_then(|Json(body)| body.hire);
     // Two kinds of proposal share this table and this door, and they are decided by entirely
     // different machinery: an action approval resumes a paused run, a contact merge joins two
     // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
@@ -3598,6 +3635,48 @@ async fn post_proposal_approve(
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "the rule could not be written".to_owned(),
+                ))
+            }
+        };
+    }
+
+    if kind == "agent-recruit" {
+        // The sixth kind, and the only one that grows the house rather than releasing something:
+        // approving writes an `agents` row and a `team_members` row in one transaction with the
+        // decision. Uncancellable for the reason all of them are — a dropped request must not leave
+        // an agent hired into a team nobody agreed to.
+        let state = state.clone();
+        let hired =
+            uncancellable(
+                async move { crate::team::approve_recruit(&state.pool, id, edited).await },
+            )
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match hired {
+            Ok(agent_id) => Ok(Json(serde_json::json!({ "agent_id": agent_id }))),
+            Err(crate::team::HireError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::team::HireError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::team::HireError::Malformed) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this request does not describe an agent this daemon can create".to_owned(),
+            )),
+            // 409 and a sentence: the team went away while the request waited, and the person can
+            // still dismiss the proposal or recreate the team. Neither is obvious from a bare code.
+            Err(crate::team::HireError::NoSuchTeam(team_id)) => Err((
+                StatusCode::CONFLICT,
+                format!("`{team_id}` no longer exists, so there is no team to hire them into"),
+            )),
+            Err(crate::team::HireError::Refused(why)) => Err((StatusCode::CONFLICT, why)),
+            Err(crate::team::HireError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "hiring an agent failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the agent could not be written".to_owned(),
                 ))
             }
         };
@@ -3744,6 +3823,26 @@ async fn post_proposal_reject(
             }
             Err(crate::exclusion::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "agent-recruit" {
+        // Refusing leaves nothing behind, because nothing was created: no agent, no roster row, no
+        // run held. And it is deliberately not a permanent no — the NEXT run of that department
+        // meets the same gap and may ask again, which is right. Nobody said the director should
+        // stop asking; they said not this one.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "rejected", "not hired").await
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "refusing a recruitment failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
