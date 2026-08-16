@@ -123,6 +123,31 @@ func newSite(t *testing.T) *site {
 			r.URL.Query().Get("src"))
 	})
 
+	// Two pages for the profile group. They are about identity rather than the fence: one hands the
+	// browser a cookie, the other says which cookie came back — which is how "the profile is the
+	// identity" (spec §4.2) becomes something a test can observe from outside the browser.
+	mux.HandleFunc("/set-cookie", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		// Persistent, not a session cookie: spec §4.2 measured that a session cookie is exactly the
+		// thing that does NOT survive, and a test built on one would measure the browser's memory
+		// instead of the profile on disk.
+		http.SetCookie(w, &http.Cookie{Name: "gate", Value: "1", Path: "/", MaxAge: 3600})
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>set-cookie</title><h1>set</h1>`)
+	})
+	mux.HandleFunc("/whoami", func(w http.ResponseWriter, r *http.Request) {
+		value := "none"
+		if cookie, err := r.Cookie("gate"); err == nil {
+			value = cookie.Value
+		}
+		select {
+		case s.arrived <- "WHOAMI " + value:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>whoami</title><h1>%s</h1>`, value)
+	})
+
 	mux.HandleFunc("/beacon", func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case s.arrived <- "BEACON " + r.URL.Query().Get("what"):
@@ -358,7 +383,7 @@ func control(t *testing.T) *cdp.Conn {
 
 func dial(t *testing.T, port int) *cdp.Conn {
 	t.Helper()
-	wsURL, err := debuggerURL(port)
+	wsURL, err := launch.DebuggerURL(port, 10*time.Second)
 	if err != nil {
 		t.Fatalf("finding the debugger url: %v", err)
 	}
@@ -368,29 +393,6 @@ func dial(t *testing.T, port int) *cdp.Conn {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
-}
-
-// debuggerURL asks the browser where its WebSocket endpoint is.
-//
-// Deliberately NOT through the fence's proxy: this is our own control channel and it is the one
-// thing on loopback the fence refuses to let a page reach.
-func debuggerURL(port int) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	var payload struct {
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	if payload.WebSocketDebuggerURL == "" {
-		return "", fmt.Errorf("gate: the browser reported no debugger url")
-	}
-	return payload.WebSocketDebuggerURL, nil
 }
 
 // openIn navigates a raw connection with no fence on it, and returns the page session.
