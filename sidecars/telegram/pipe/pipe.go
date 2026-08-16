@@ -3,6 +3,7 @@ package pipe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -425,10 +426,38 @@ func handleIntent(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, inte
 	}
 }
 
+// refusalMessage says what was refused and what undoes it.
+//
+// The núcleo names the refusal and this says the sentence, which is the only split that works:
+// `/retomar` and `/kill off` are Telegram commands and the núcleo must not know they exist, while
+// the reason a topic went quiet is a fact only the núcleo has. Each of the four is undone
+// differently and one of them is undone by doing nothing at all — told the wrong one, a person
+// waits forever on a paused topic or cancels a turn that was about to answer.
+//
+// A refusal the sidecar does not recognise keeps the old wording. That covers a núcleo newer than
+// this binary as well as a cut cable, and both are better served by "something failed, here it is"
+// than by a remedy invented to fill the gap.
+func refusalMessage(err error) string {
+	var refused *daemon.StatusError
+	if errors.As(err, &refused) {
+		switch refused.Refusal {
+		case "errand_not_answering":
+			return "Este assunto está em pausa ou fechado, por isso não respondo aqui. /retomar acorda-o."
+		case "kill_switch":
+			return "O travão de emergência está engatado, e um assunto respeita-o. /kill off solta-o."
+		case "no_local_model":
+			return "Este assunto está no modelo local e não há nenhum configurado. /cerebro cloud passa-o para o outro."
+		case "turn_in_progress":
+			return "Ainda estou a responder à mensagem anterior. Ou esperas, ou /cancel."
+		}
+	}
+	return "couldn't start turn: " + err.Error()
+}
+
 func startTurn(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, text string) {
 	turnID, err := dc.SendAssistantMessage(ChatKey(to), text)
 	if err != nil {
-		logSend("turn start failure", bot.SendMessage(to, "couldn't start turn: "+err.Error()))
+		logSend("turn start failure", bot.SendMessage(to, refusalMessage(err)))
 		return
 	}
 	tr.Set(ChatKey(to), turnID)

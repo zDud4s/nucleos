@@ -3,6 +3,7 @@ package pipe
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1166,3 +1167,62 @@ func (d *recordingDaemon) CreateErrand(string, string) (int64, error) { return 0
 func (d *recordingDaemon) SetErrandStatus(int64, string) error        { return nil }
 func (d *recordingDaemon) SetErrandBrain(int64, string) error         { return nil }
 func (d *recordingDaemon) CloseErrand(int64) error                    { return nil }
+
+// The half a person sees. A status code on a phone screen is a fault report; what they need is the
+// gesture that undoes it, and each of these four is undone differently — one of them by waiting and
+// doing nothing at all. Told the wrong one, they either wait forever on a paused topic or cancel a
+// turn that was going to answer.
+func TestATurnRefusedSaysWhatUndoesIt(t *testing.T) {
+	for _, tc := range []struct {
+		refusal string
+		status  int
+		want    string
+	}{
+		{"errand_not_answering", http.StatusConflict, "/retomar"},
+		{"kill_switch", http.StatusLocked, "/kill off"},
+		{"no_local_model", http.StatusServiceUnavailable, "/cerebro cloud"},
+		{"turn_in_progress", http.StatusConflict, "/cancel"},
+	} {
+		t.Run(tc.refusal, func(t *testing.T) {
+			bot := &recordingBot{}
+			dc := &recordingDaemon{sendAssistantErr: &daemon.StatusError{
+				Operation: "send assistant message",
+				Status:    tc.status,
+				Refusal:   tc.refusal,
+			}}
+
+			startTurn(bot, dc, NewTracker(), topic(-100123, 7), "procura")
+
+			got := lastMessage(t, bot)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("message = %q, want the gesture %q that undoes this refusal", got, tc.want)
+			}
+			if strings.Contains(got, "status code") {
+				t.Errorf("message = %q, want a sentence rather than a number", got)
+			}
+			// A refusal costs nothing and leaves nothing to cancel. Recording a turn id here would
+			// point `/cancel` at the turn before this one, in a chat that is already confused about
+			// why nothing happened.
+			if len(bot.htmlMessages) != 0 {
+				t.Errorf("html = %v, want the refusal sent as plain text", bot.htmlMessages)
+			}
+		})
+	}
+}
+
+// A failure that is not a stated refusal — the daemon down, the socket cut — keeps the old wording.
+// Inventing a gesture for it would send somebody to /retomar over a network cable.
+func TestATurnThatFailedForNoStatedReasonStillSaysSo(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &recordingDaemon{sendAssistantErr: errors.New("perform request: connection refused")}
+
+	startTurn(bot, dc, NewTracker(), topic(-100123, 7), "procura")
+
+	got := lastMessage(t, bot)
+	if !strings.Contains(got, "couldn't start turn") {
+		t.Errorf("message = %q, want the unexplained-failure wording", got)
+	}
+	if strings.Contains(got, "/retomar") {
+		t.Errorf("message = %q, want no invented remedy", got)
+	}
+}

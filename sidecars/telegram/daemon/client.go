@@ -246,11 +246,45 @@ func (c *Client) postNoContent(operation, path string, request any) error {
 	return statusError(operation, status, body)
 }
 
+// StatusError is a refusal the núcleo stated, kept as data rather than folded into a sentence.
+//
+// Refusal is the núcleo's own name for what it refused, and it exists because the status code is
+// not enough: `/assistant/message` alone refuses four different ways across three codes, and two of
+// them are 409. A chat mid-turn clears by waiting; a paused errand never clears on its own. A
+// caller holding only the number has to guess, and the cheap guess leaves a topic silent with an
+// explanation that was never true.
+//
+// It is empty for any refusal that arrived without one — an older núcleo, a route that does not
+// name them, an HTML error page from something in between. That is a normal answer and not a parse
+// failure: the caller falls back to reporting what it has. Turning a stated refusal into a broken
+// client would be strictly worse than saying less about it.
+type StatusError struct {
+	Operation string
+	Status    int
+	Refusal   string
+	Body      string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s: status code %d: %s", e.Operation, e.Status, e.Body)
+}
+
 func statusError(operation string, status int, body []byte) error {
 	if status >= http.StatusOK && status < http.StatusMultipleChoices {
 		return nil
 	}
-	return fmt.Errorf("%s: status code %d: %s", operation, status, bytes.TrimSpace(body))
+	// Decoded best-effort and never checked: see the type's note on why an unnamed refusal is an
+	// answer. A body that is not JSON leaves Refusal empty, which is exactly the fallback.
+	var named struct {
+		Refusal string `json:"refusal"`
+	}
+	_ = json.Unmarshal(body, &named)
+	return &StatusError{
+		Operation: operation,
+		Status:    status,
+		Refusal:   named.Refusal,
+		Body:      string(bytes.TrimSpace(body)),
+	}
 }
 
 // VoiceTranscriber is the daemon's voice pillar, when it is armed.

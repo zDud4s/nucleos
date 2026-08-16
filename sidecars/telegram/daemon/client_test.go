@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -195,5 +197,55 @@ func TestClientErrandRoutes(t *testing.T) {
 	}
 	if closedPath != "/errands/4" {
 		t.Errorf("CloseErrand path = %q", closedPath)
+	}
+}
+
+// A refusal arrives as data, not as a sentence. The núcleo names what it refused in the body, and
+// four of its refusals share three status codes — so a client that keeps only the number cannot
+// tell a paused errand (which clears when somebody resumes it) from a chat mid-turn (which clears
+// on its own). Both are 409.
+func TestARefusalCarriesTheNucleosOwnNameForIt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"refusal":"errand_not_answering"}`))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, "tok").SendAssistantMessage("-100123:7", "procura")
+
+	var refused *StatusError
+	if !errors.As(err, &refused) {
+		t.Fatalf("error = %v (%T), want a *StatusError", err, err)
+	}
+	if refused.Status != http.StatusConflict {
+		t.Errorf("Status = %d, want 409", refused.Status)
+	}
+	if refused.Refusal != "errand_not_answering" {
+		t.Errorf("Refusal = %q, want the name the núcleo gave it", refused.Refusal)
+	}
+}
+
+// An older núcleo, or any refusal on a route that does not name them, still has to arrive as a
+// refusal. An empty name is an answer here — the caller falls back to saying what it can — and
+// never a parse failure that turns a stated refusal into a broken client.
+func TestARefusalWithNoNameIsStillARefusal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("something went wrong"))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, "tok").SendAssistantMessage("chat-9", "olá")
+
+	var refused *StatusError
+	if !errors.As(err, &refused) {
+		t.Fatalf("error = %v (%T), want a *StatusError", err, err)
+	}
+	if refused.Refusal != "" {
+		t.Errorf("Refusal = %q, want empty for a body that names none", refused.Refusal)
+	}
+	if !strings.Contains(refused.Error(), "something went wrong") {
+		t.Errorf("Error() = %q, want the body it could not name", refused.Error())
 	}
 }

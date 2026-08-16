@@ -1614,10 +1614,27 @@ async fn post_email_requeue(
         })
 }
 
+/// A refusal, named so the caller can answer it.
+///
+/// The status code is the coarse signal and stays honest for anything between here and the caller;
+/// the slug is the fine one, because this route has more refusals than HTTP has codes that fit
+/// them. Four, against three — 403 is spent by `auth.rs` on token level and would read as a
+/// rejected token, which is the one thing this never is.
+///
+/// A slug and not the sentence, for the reason `assistant.rs` records around `NO_LOCAL_MODEL`: a
+/// refusal recognised by its prose stops being recognised the day somebody improves the wording,
+/// and it fails silently — a deliberate refusal starts reading as a crash. And the sentence is not
+/// this crate's to write anyway. What undoes a paused errand is `/retomar`, a Telegram command; the
+/// núcleo says which refusal happened and whoever is talking to the person says what to do about
+/// it, in the language they are being spoken to in.
+fn refusal(status: StatusCode, name: &'static str) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "refusal": name })))
+}
+
 async fn post_assistant_message(
     State(state): State<AppState>,
     Json(body): Json<AssistantMessageRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Uncancellable for the same reason `create_run` is: `send_message` writes the turn's `running`
     // row and only then spawns the task that will finish it. A client that disconnects mid-request
     // drops this future exactly the way `abort()` drops a run's, and a drop landing between those
@@ -1628,29 +1645,39 @@ async fn post_assistant_message(
         let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
         crate::assistant::send_message(&state, &body.chat_id, &body.text, origin).await
     })
-    .await?;
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
 
     match outcome {
         Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
-        Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
+        // Clears by waiting, which is what makes it the one refusal here that needs no gesture from
+        // anybody — and what makes it dangerous to confuse with the one below.
+        Err(msg) if msg.contains("already in progress") => {
+            Err(refusal(StatusCode::CONFLICT, "turn_in_progress"))
+        }
         // Not a 500: nothing broke. The conversation asked to be answered on this machine and this
         // machine has nothing that can — a fact about how it is configured, which the caller can
         // act on by choosing the other model. A 500 would send them looking for a crash.
-        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => {
+            Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "no_local_model"))
+        }
         // Also not a 500, and for the same reason: the topic has an errand somebody paused or
         // closed. That is a state this request conflicts with, which is what 409 already means here
         // for a chat that is mid-turn — and it is what lets the sidecar answer "that topic is on
-        // hold" instead of reporting a fault that did not happen.
+        // hold" instead of reporting a fault that did not happen. The slug is what keeps it from
+        // being READ as the other 409: this one never clears on its own.
         Err(msg) if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
-            Err(StatusCode::CONFLICT)
+            Err(refusal(StatusCode::CONFLICT, "errand_not_answering"))
         }
         // 423 and not a third 409, because 409 already carries two meanings on this route — a chat
         // mid-turn and an errand on hold — and this is a third with a different undoing. A topic
         // that has gone quiet is answered with `/retomar` when it is paused and `/kill off` when it
         // is this, and one number for both leaves the sidecar to guess. Locked is the accurate word:
         // the errand is active and conflicts with nothing; a decision taken elsewhere holds it shut.
-        Err(msg) if msg == crate::assistant::KILL_ENGAGED => Err(StatusCode::LOCKED),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(msg) if msg == crate::assistant::KILL_ENGAGED => {
+            Err(refusal(StatusCode::LOCKED, "kill_switch"))
+        }
+        Err(_) => Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")),
     }
 }
 
@@ -6536,7 +6563,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (status, _) = call(
+        let (status, body) = call(
             state,
             "POST",
             "/assistant/message",
@@ -6545,6 +6572,65 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// The two 409s on this route are not one answer, and the caller cannot tell them apart.
+    ///
+    /// A chat mid-turn clears by waiting. A paused errand clears by somebody resuming it, and never
+    /// on its own — so a sidecar that guesses "still working, hold on" leaves a topic silent
+    /// forever with an explanation that was never true. The status code cannot carry the
+    /// difference: this route now has four refusals and HTTP has three honest codes for them, with
+    /// 403 already spent by `auth.rs` on token level. So the body names which refusal it was.
+    ///
+    /// A slug and not the sentence, for the reason `NO_LOCAL_MODEL` already records one file over:
+    /// prose stops being recognised the day somebody improves it, silently. And the sentence is not
+    /// the núcleo's to write — the remedy is `/retomar`, a Telegram command this crate must not
+    /// know.
+    #[tokio::test]
+    async fn the_two_conflicts_on_this_route_do_not_read_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = with_files_root(test_state().await, dir.path().to_path_buf());
+        state.runner = Arc::new(ParkedRunner);
+        let errand = crate::errands::create(&state.pool, "carros", "-1:97")
+            .await
+            .unwrap();
+        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
+            .await
+            .unwrap();
+
+        let (paused_status, paused) = call(
+            state.clone(),
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": "-1:97", "text": "procura", "origin": "telegram"})),
+        )
+        .await;
+
+        // A chat whose turn is genuinely still running, which is the other 409.
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat,
+            "take your time",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+        let (busy_status, busy) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": chat, "text": "again", "origin": "shell"})),
+        )
+        .await;
+
+        assert_eq!(paused_status, StatusCode::CONFLICT);
+        assert_eq!(busy_status, StatusCode::CONFLICT);
+        assert_eq!(paused["refusal"], "errand_not_answering");
+        assert_eq!(busy["refusal"], "turn_in_progress");
     }
 
     #[tokio::test]
@@ -6782,22 +6868,16 @@ mod tests {
             .await
             .unwrap();
 
-        let response = build_router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/assistant/message")
-                    .header("Authorization", "Bearer test-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "chat_id": id, "text": "olá" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({ "chat_id": id, "text": "olá" })),
+        )
+        .await;
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["refusal"], "no_local_model");
     }
 
     #[tokio::test]
