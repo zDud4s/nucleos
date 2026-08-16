@@ -50,20 +50,54 @@ function skipped(overrides: Partial<Proposal> = {}): Proposal {
   };
 }
 
+function asked(overrides: Partial<Proposal> = {}): Proposal {
+  return {
+    id: 41,
+    kind: "team-action",
+    status: "pending",
+    run_id: null,
+    session_id: null,
+    // NULL, and that is why the per-project wip ceiling never counts these — a department has no
+    // project. What bounds them is `teams.max_open_actions`.
+    project_id: null,
+    // The ACTION's kind. "team-action" alone would make a person open every row to find out what
+    // they were agreeing to.
+    tool_name: "send_email",
+    reasoning: "the launch is tomorrow and the list asked to be told",
+    tool_input: JSON.stringify({ to: "list@example.com", subject: "we launch tomorrow" }),
+    created_at: "2026-08-16T11:00:00Z",
+    decided_at: null,
+    ...overrides,
+  };
+}
+
 /** A daemon holding one of each, answering every route this page reads. */
 function daemonWith({
   requests = [request()],
   runs = [parked()],
   items = [skipped()],
+  actions = [asked()],
 }: {
   requests?: VcsRequestSummary[];
   runs?: AwaitingRun[];
   items?: Proposal[];
+  actions?: Proposal[];
 } = {}) {
   fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
     const target = String(url);
     if (target.includes("/proposals/skipped-items")) {
       return { ok: true, status: 200, json: async () => items };
+    }
+    if (target.includes("/proposals/team-actions")) {
+      return { ok: true, status: 200, json: async () => actions };
+    }
+    if (/\/proposals\/\d+\/(approve|reject)$/.test(target)) {
+      return {
+        ok: init?.method === "POST",
+        status: 200,
+        json: async () => ({ queued: "the department's action will be carried out shortly" }),
+        text: async () => "",
+      };
     }
     if (/\/proposals\/\d+\/dismiss$/.test(target)) {
       return { ok: init?.method === "POST", status: 204 };
@@ -111,12 +145,41 @@ afterEach(() => {
 });
 
 describe("the waiting page", () => {
-  it("reads all three lists the daemon has", async () => {
+  it("reads all four lists the daemon has", async () => {
     await show();
-    const asked = fetchMock.mock.calls.map((call) => String(call[0]));
-    expect(asked.some((url) => url.endsWith("/vcs/requests"))).toBe(true);
-    expect(asked.some((url) => url.includes("/runs/awaiting-approval"))).toBe(true);
-    expect(asked.some((url) => url.includes("/proposals/skipped-items"))).toBe(true);
+    const read = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(read.some((url) => url.endsWith("/vcs/requests"))).toBe(true);
+    expect(read.some((url) => url.includes("/runs/awaiting-approval"))).toBe(true);
+    expect(read.some((url) => url.includes("/proposals/skipped-items"))).toBe(true);
+    expect(read.some((url) => url.includes("/proposals/team-actions"))).toBe(true);
+  });
+
+  /**
+   * The one queue here where saying yes causes something OUT IN THE WORLD rather than releasing
+   * something that had stopped. It shows what the department asked for and why, and it is decided
+   * through the same `/approve` every other proposal uses — there is no second decision mechanism.
+   */
+  it("shows what a department asked for and decides it through the ordinary door", async () => {
+    await show();
+
+    expect(screen.getByText(/#41 · send_email/)).toBeTruthy();
+    expect(screen.getByText("the launch is tomorrow and the list asked to be told")).toBeTruthy();
+    expect(screen.getByText(/list@example.com/)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Do it"));
+    });
+    const posted = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url).endsWith("/proposals/41/approve") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posted).toBeTruthy();
+  });
+
+  it("says nothing is waiting rather than showing an empty box", async () => {
+    await show({ actions: [] });
+    expect(screen.getByText("No department is waiting on you.")).toBeTruthy();
   });
 
   it("shows a git request with who asked for it and which repository it locked", async () => {

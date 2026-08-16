@@ -213,6 +213,75 @@ pub async fn create_calendar_event(
     Ok(proposal_id)
 }
 
+/// A department asked to do something, and this is the question a human answers.
+///
+/// The fifth `kind`, the third that touches no run, and the first that is filed by an agent about
+/// an action the AGENT will not perform. Approving it does not resume anything and does not act:
+/// it marks the proposal, and `team_tick` picks the action up on its next pass. That separation is
+/// the point — see `team::execute_due_actions` and the design's #7.
+///
+/// **Written inside the caller's transaction, on purpose.** `team.rs` writes the `team_actions` row
+/// and this proposal together or writes neither: an action with no proposal is an action nobody
+/// will ever decide, and a proposal with no action is a button that approves nothing. That is why
+/// this takes a transaction where its four siblings take a pool.
+///
+/// `project_id` is NULL, like `calendar-event` and `contact-merge` before it, and the consequence is
+/// deliberate: `wip::OPEN_REVIEW_ITEMS_SQL` filters by project, so these never reach the per-project
+/// ceiling. The ceiling that governs them is `teams.max_open_actions`, which is per team, because a
+/// department has no project to be counted against.
+pub(crate) async fn create_team_action_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    kind: &str,
+    why: &str,
+    payload: &str,
+    now: &str,
+) -> sqlx::Result<i64> {
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('team-action', 'pending', NULL, NULL, NULL, ?, ?, ?, ?, NULL)",
+    )
+    // `tool_name` carries the ACTION's kind — `send_email`, `file_document`. It is the one column
+    // the approvals list already renders, and a queue that says only "team-action" would make the
+    // person open every row to find out what they are agreeing to.
+    .bind(kind)
+    .bind(why)
+    .bind(payload)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(proposal_id)
+}
+
+/// The queue a person works through for departments.
+///
+/// A door of its own rather than a `kind` argument on `list_pending`, for the reason
+/// `list_skipped_items` gives: those two lists are answered by different actions. `list_pending` is
+/// work stopped mid-stride that `approve` lets through; this is work that will START when approved,
+/// and the run that asked has usually finished by then.
+pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals
+         WHERE status = 'pending' AND kind = 'team-action'
+         ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Whether a message already has a calendar proposal waiting on a decision.
 ///
 /// Without this, every triage pass over the same `action` message would file another one, and the

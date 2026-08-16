@@ -124,16 +124,23 @@ pub struct Team {
     pub max_rounds: i64,
     pub max_parallel: i64,
     pub budget_usd: Option<f64>,
+    /// How many actions this team may leave waiting for a human at once. See
+    /// `DEFAULT_MAX_OPEN_ACTIONS`.
+    pub max_open_actions: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
-/// A team with its roster, which is how the shell reads one: the membership is the team.
+/// A team with its roster and its alçada, which is how the shell reads one: the membership and what
+/// it may ask for ARE the team.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TeamView {
     #[serde(flatten)]
     pub team: Team,
     pub members: Vec<String>,
+    /// Only the kinds this team was granted. An empty list is a department that can only write
+    /// memos, which is what every team is until somebody decides otherwise.
+    pub grants: Vec<TeamGrant>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -144,8 +151,21 @@ pub struct TeamRequest {
     pub max_rounds: i64,
     pub max_parallel: i64,
     pub budget_usd: Option<f64>,
+    /// Defaulted rather than required, so a client written before this column existed still saves a
+    /// team instead of 400ing on a field it has never heard of.
+    #[serde(default = "default_max_open_actions")]
+    pub max_open_actions: i64,
     #[serde(default)]
     pub members: Vec<String>,
+    /// Replaced wholesale, exactly as `members` is, and for the same reason: the editor sends the
+    /// alçada as the owner left it, and a merge would make revoking one impossible through the only
+    /// surface that edits it.
+    #[serde(default)]
+    pub grants: Vec<TeamGrant>,
+}
+
+fn default_max_open_actions() -> i64 {
+    DEFAULT_MAX_OPEN_ACTIONS
 }
 
 #[derive(Debug)]
@@ -209,6 +229,23 @@ fn validate(request: &TeamRequest) -> Result<(), TeamError> {
             "a budget of zero or less is a team that can never run; leave it unset instead",
         ));
     }
+    // Zero is allowed and means something: a team that may hold no action open is one whose grants
+    // are all `allow` or none, which is a legitimate thing to configure deliberately.
+    if !(0..=MAX_OPEN_ACTIONS_CEILING).contains(&request.max_open_actions) {
+        return Err(TeamError::Invalid(
+            "max_open_actions is outside what a daemon allows",
+        ));
+    }
+    for grant in &request.grants {
+        if !GRANTABLE_ACTIONS.contains(&grant.kind.as_str()) {
+            return Err(TeamError::Invalid(
+                "that is not an action a department may be granted",
+            ));
+        }
+        if !GRANT_MODES.contains(&grant.mode.as_str()) {
+            return Err(TeamError::Invalid("a grant is either propose or allow"));
+        }
+    }
     Ok(())
 }
 
@@ -266,8 +303,8 @@ pub async fn create(pool: &sqlx::SqlitePool, request: TeamRequest) -> Result<Tea
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
-                            budget_usd, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            budget_usd, max_open_actions, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&request.name)
@@ -276,6 +313,7 @@ pub async fn create(pool: &sqlx::SqlitePool, request: TeamRequest) -> Result<Tea
     .bind(request.max_rounds)
     .bind(request.max_parallel)
     .bind(request.budget_usd)
+    .bind(request.max_open_actions)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -286,7 +324,81 @@ pub async fn create(pool: &sqlx::SqlitePool, request: TeamRequest) -> Result<Tea
         Err(error) => return Err(TeamError::Db(error)),
     }
     replace_roster(pool, &id, &request.members).await?;
+    replace_grants(pool, &id, &request.grants).await?;
     get(pool, &id).await?.ok_or(TeamError::NotFound)
+}
+
+/// What a department may ask the core to do on its behalf.
+///
+/// **Not "the `Acts` tools".** Those are `approve_proposal`, `cancel_run`, `create_job`,
+/// `create_run`, `reject_proposal`, `set_kill`, `triage_email`, `vcs_request` and `send_email` —
+/// which is to say, the controls of the daemon itself. A department holding `set_kill` turns off the
+/// house's autonomy; one holding `approve_proposal` approves its own proposals and thereby holds
+/// every other authority by transitivity, without anybody having written that down anywhere.
+///
+/// So an alçada is not about tools. It is about ACTIONS, and this list is short, explicit, and
+/// checked before the table is: a row in `team_grants` naming something absent from here grants
+/// nothing (`a_kind_outside_the_list_is_refused_even_with_a_grant_in_the_table`).
+///
+/// `vcs_ticket` was in the design and is deliberately NOT here. The design called it "the cheapest
+/// of the four to undo", and that was written down wrongly: `TOOL_EFFECTS` records `vcs_request` as
+/// "the sharpest `Acts` on the list… the only effect on this list that outlives the daemon, and the
+/// only one its owner cannot take back from here". It moves a branch in a repository other people
+/// build on. Handing a department the one irreversible effect in the house as its first authority
+/// is exactly backwards, and choosing WHICH git operations a department may request is a design
+/// decision no spec has made. Refused until one does — asserted by
+/// `no_grantable_action_is_a_control_of_the_daemon`.
+pub const GRANTABLE_ACTIONS: &[&str] = &["calendar_event", "file_document", "send_email"];
+
+/// `propose` puts a human in the middle; `allow` does not.
+///
+/// There is no `deny`, and its absence is the design: a team with no row for a kind may not ask for
+/// it, exactly as `auth::permits` refuses anything not listed. Two ways of saying no is where they
+/// eventually disagree.
+const GRANT_MODES: &[&str] = &["propose", "allow"];
+
+/// How many actions a team may leave waiting for a decision, absent an owner's opinion.
+pub const DEFAULT_MAX_OPEN_ACTIONS: i64 = 5;
+
+/// And the ceiling on that opinion. A queue nobody can work through is a queue that gets approved
+/// unread, which is worse than one that refuses to grow.
+pub const MAX_OPEN_ACTIONS_CEILING: i64 = 20;
+
+/// One line of a team's alçada: an action, and whether a human sees it first.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct TeamGrant {
+    pub kind: String,
+    pub mode: String,
+}
+
+pub async fn grants(pool: &sqlx::SqlitePool, team_id: &str) -> Result<Vec<TeamGrant>, TeamError> {
+    sqlx::query_as("SELECT kind, mode FROM team_grants WHERE team_id = ? ORDER BY kind")
+        .bind(team_id)
+        .fetch_all(pool)
+        .await
+        .map_err(TeamError::Db)
+}
+
+/// Replaced wholesale, for `replace_roster`'s reason: the editor sends the alçada as the owner left
+/// it, and a merge would make revoking one impossible through the only surface that edits it.
+async fn replace_grants(
+    pool: &sqlx::SqlitePool,
+    team_id: &str,
+    grants: &[TeamGrant],
+) -> Result<(), TeamError> {
+    sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
+        .bind(team_id)
+        .execute(pool)
+        .await?;
+    for grant in grants {
+        sqlx::query("INSERT OR REPLACE INTO team_grants (team_id, kind, mode) VALUES (?, ?, ?)")
+            .bind(team_id)
+            .bind(&grant.kind)
+            .bind(&grant.mode)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// The roster is REPLACED and not merged, because that is what the editor sends: the whole
@@ -314,7 +426,7 @@ async fn replace_roster(
 pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<TeamView>, TeamError> {
     let teams: Vec<Team> = sqlx::query_as(
         "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
-                created_at, updated_at
+                max_open_actions, created_at, updated_at
          FROM teams ORDER BY name",
     )
     .fetch_all(pool)
@@ -323,7 +435,12 @@ pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<TeamView>, TeamError> {
     let mut views = Vec::with_capacity(teams.len());
     for team in teams {
         let members = roster(pool, &team.id).await?;
-        views.push(TeamView { team, members });
+        let grants = grants(pool, &team.id).await?;
+        views.push(TeamView {
+            team,
+            members,
+            grants,
+        });
     }
     Ok(views)
 }
@@ -331,7 +448,7 @@ pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<TeamView>, TeamError> {
 pub async fn get(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<TeamView>, TeamError> {
     let team: Option<Team> = sqlx::query_as(
         "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
-                created_at, updated_at
+                max_open_actions, created_at, updated_at
          FROM teams WHERE id = ?",
     )
     .bind(id)
@@ -342,7 +459,12 @@ pub async fn get(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<TeamView>, 
         None => Ok(None),
         Some(team) => {
             let members = roster(pool, &team.id).await?;
-            Ok(Some(TeamView { team, members }))
+            let grants = grants(pool, &team.id).await?;
+            Ok(Some(TeamView {
+                team,
+                members,
+                grants,
+            }))
         }
     }
 }
@@ -367,7 +489,7 @@ pub async fn update(
     let affected = sqlx::query(
         "UPDATE teams
          SET name = ?, mission = ?, director_agent_id = ?, max_rounds = ?, max_parallel = ?,
-             budget_usd = ?, updated_at = ?
+             budget_usd = ?, max_open_actions = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&request.name)
@@ -376,6 +498,7 @@ pub async fn update(
     .bind(request.max_rounds)
     .bind(request.max_parallel)
     .bind(request.budget_usd)
+    .bind(request.max_open_actions)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
@@ -387,6 +510,9 @@ pub async fn update(
         Err(error) => return Err(TeamError::Db(error)),
     }
     replace_roster(pool, id, &request.members).await?;
+    // Revoking here does NOT cancel an action already proposed. The alçada is read when the agent
+    // asks, not when the core executes — see `execute_due_actions`, and the design's risk 1.
+    replace_grants(pool, id, &request.grants).await?;
     get(pool, id).await?.ok_or(TeamError::NotFound)
 }
 
@@ -417,6 +543,14 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     }
 
     sqlx::query("DELETE FROM team_members WHERE team_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    // The alçada goes with the team it described. There is no equivalent worry about
+    // `team_actions`: an action belongs to a RUN, and the check above already refuses to delete a
+    // team that has ever had one — so a team reaching this line has no runs and therefore no
+    // actions, pending or otherwise.
+    sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
         .bind(id)
         .execute(pool)
         .await?;
@@ -842,6 +976,509 @@ fn files_root(state: &AppState) -> Result<std::path::PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Alçada: what a department asks for, and what the core does about it
+// ---------------------------------------------------------------------------------------------
+
+/// One thing a department asked the core to do.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct TeamAction {
+    pub id: i64,
+    pub team_run_id: String,
+    pub kind: String,
+    pub payload: String,
+    pub why: String,
+    pub proposal_id: Option<i64>,
+    pub state: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub executed_at: Option<String>,
+}
+
+/// Why an action could not even be asked for. Every variant is a refusal handed back to the AGENT,
+/// mid-turn, while it can still do something about it.
+#[derive(Debug)]
+pub enum ActionError {
+    /// Not a `Scope::TeamRun` at all.
+    NotADepartment,
+    /// The run named by the key is gone.
+    NoSuchRun,
+    /// `kind` is not in `GRANTABLE_ACTIONS`. Nobody can ask for this, granted or not.
+    Unknown(String),
+    /// This team has no grant for it.
+    Ungranted(String),
+    /// The payload is not a well-formed request of that kind, with the fault named.
+    Malformed(String),
+    /// The team already holds as many undecided actions as it may.
+    QueueFull(String),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ActionError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADepartment => {
+                formatter.write_str("only a department asks the core to act for it")
+            }
+            Self::NoSuchRun => formatter.write_str("no such team run"),
+            Self::Unknown(kind) => write!(formatter, "nobody can do `{kind}`"),
+            Self::Ungranted(kind) => {
+                write!(formatter, "this department may not do `{kind}`")
+            }
+            Self::Malformed(why) | Self::QueueFull(why) => formatter.write_str(why),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProposeActionRequest {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub why: String,
+}
+
+/// What the agent is told. **A sentence, not a status code**, because the reader is a model that has
+/// to decide what to do next: "filed for approval as #41" and "this department may not send email"
+/// lead to different paragraphs, and a 403 leads to a retry.
+#[derive(Debug, serde::Serialize)]
+pub struct ProposeActionResponse {
+    pub id: i64,
+    pub proposal_id: Option<i64>,
+    pub outcome: String,
+}
+
+/// PURE: whether this payload is a well-formed request of this kind, and its canonical form.
+///
+/// **Validated when it is WRITTEN and never when it is executed.** A `send_email` with no recipient
+/// has to be refused to the agent, which is still mid-turn and can still fix it — not to a human
+/// three hours later, who can fix nothing and whose only options are to approve something broken or
+/// throw away work already paid for.
+///
+/// Returns the JSON to store, re-serialised from the fields this understands rather than passed
+/// through. A payload carrying extra keys stores without them, so what a human reads when approving
+/// is exactly what the executor will act on.
+fn validate_payload(kind: &str, payload: &serde_json::Value) -> Result<String, String> {
+    // Trimmed, for the fields where surrounding space is a typo: an address, a subject, a path, a
+    // timezone name.
+    let text = |field: &str| -> Result<String, String> {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("a `{kind}` needs a non-empty `{field}`"))
+    };
+    // NOT trimmed, for the fields where it is the content: a document's trailing newline is part of
+    // the document, and a body's leading blank line may be deliberate. Still required to have
+    // something in it — an empty file and an empty message are both requests worth refusing — but
+    // what is stored is what was written.
+    let body = |field: &str| -> Result<String, String> {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("a `{kind}` needs a non-empty `{field}`"))
+    };
+
+    let canonical = match kind {
+        "send_email" => {
+            let (to, subject, body) = (text("to")?, text("subject")?, body("body")?);
+            // The house's own rule, borrowed rather than restated: a header ends at the first line
+            // break, so a `\n` in `to` or `subject` does not corrupt a message — it ends that header
+            // and starts one nobody approved. Asking `mailsend` means a department and the owner's
+            // own send button cannot come to disagree about what an address is.
+            crate::mailsend::validate(&to, &subject).map_err(str::to_owned)?;
+            serde_json::json!({ "to": to, "subject": subject, "body": body })
+        }
+        "file_document" => {
+            let (path, content) = (text("path")?, body("content")?);
+            // Shape only, here. Whether the path stays inside the files root is decided by
+            // `files::resolve_within` at execution, against a root this function does not have —
+            // and that is the check that matters, so this one only refuses the obviously wrong.
+            if path.starts_with('/') || path.starts_with('\\') || path.contains("..") {
+                return Err(
+                    "a `file_document` path is relative and stays inside the folder".into(),
+                );
+            }
+            serde_json::json!({ "path": path, "content": content })
+        }
+        "calendar_event" => {
+            let title = text("title")?;
+            let starts_at_local = text("starts_at_local")?;
+            let tz = text("tz")?;
+            let minutes = payload
+                .get("duration_minutes")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|minutes| *minutes > 0)
+                .ok_or("a `calendar_event` needs a `duration_minutes` above zero")?;
+            // Both parsed HERE and stored as strings, so an unparseable date is the agent's problem
+            // and not a `failed` row a human approved in good faith.
+            chrono::NaiveDateTime::parse_from_str(&starts_at_local, crate::calendar::LOCAL_FORMAT)
+                .map_err(|_| {
+                    format!(
+                        "`starts_at_local` is written {}, e.g. 2026-08-17T09:30:00",
+                        crate::calendar::LOCAL_FORMAT
+                    )
+                })?;
+            tz.parse::<chrono_tz::Tz>()
+                .map_err(|_| format!("`{tz}` is not a timezone name, e.g. Europe/Lisbon"))?;
+            serde_json::json!({
+                "title": title,
+                "starts_at_local": starts_at_local,
+                "duration_minutes": minutes,
+                "tz": tz,
+            })
+        }
+        // Unreachable in production: `propose_action` checks `GRANTABLE_ACTIONS` first. Kept total
+        // rather than `unreachable!` so that adding a kind to the constant and forgetting this
+        // function is a refusal, not a panic in a background loop.
+        _ => return Err(format!("nobody can do `{kind}`")),
+    };
+    Ok(canonical.to_string())
+}
+
+/// A department asks the core to do something. **It does not happen here.**
+///
+/// This is the whole of the design's decision #2, and the reason `TEAM_TOOLS` stays read-only
+/// forever: the agent declares an intention and gets a sentence back, the turn carries on, nothing
+/// blocks and nothing is resumed. `proposals::create_calendar_event` had already written the shape
+/// — *"The agent never writes the event itself. This row is the whole mechanism"* — and this is that
+/// mechanism with a second table in front of it.
+///
+/// **Which run is asking comes from the key, not from the body**, exactly as `post_read_file` insists
+/// one route over. A department is the one scope in the house that names its caller.
+///
+/// The order of the five refusals is not arbitrary. The constant is asked before the table, so a row
+/// somebody put in `team_grants` by hand cannot grant an action the house does not have. The payload
+/// is checked before the ceiling, so a malformed request is a fault the agent can fix rather than
+/// one that eats a slot in the queue.
+pub async fn propose_action(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    request: &ProposeActionRequest,
+) -> Result<ProposeActionResponse, ActionError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(ActionError::NotADepartment);
+    };
+
+    if !GRANTABLE_ACTIONS.contains(&request.kind.as_str()) {
+        return Err(ActionError::Unknown(request.kind.clone()));
+    }
+
+    let team_id: String = sqlx::query_scalar("SELECT team_id FROM team_runs WHERE id = ?")
+        .bind(team_run_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(ActionError::NoSuchRun)?;
+
+    let mode: Option<String> =
+        sqlx::query_scalar("SELECT mode FROM team_grants WHERE team_id = ? AND kind = ?")
+            .bind(&team_id)
+            .bind(&request.kind)
+            .fetch_optional(&state.pool)
+            .await?;
+    // Default deny. The absence of a row is the refusal — there is no `mode = 'deny'` to disagree
+    // with it.
+    let mode = mode.ok_or_else(|| ActionError::Ungranted(request.kind.clone()))?;
+
+    let payload =
+        validate_payload(&request.kind, &request.payload).map_err(ActionError::Malformed)?;
+    let why = request.why.trim();
+    if why.is_empty() {
+        return Err(ActionError::Malformed(
+            "say why, in one line — it is what the person deciding will read".to_owned(),
+        ));
+    }
+
+    // Only `propose` actions occupy the queue: an `allow` action is decided already and executes on
+    // the next pass, so counting it would let a fast-clearing kind block a slow one.
+    if mode == "propose" {
+        let ceiling: i64 = sqlx::query_scalar("SELECT max_open_actions FROM teams WHERE id = ?")
+            .bind(&team_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(DEFAULT_MAX_OPEN_ACTIONS);
+        let open = open_actions_of(&state.pool, &team_id).await?;
+        if open >= ceiling {
+            return Err(ActionError::QueueFull(format!(
+                "this department already has {open} action(s) waiting for approval, and may hold \
+                 {ceiling}; the person deciding has not got to them yet"
+            )));
+        }
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = state.pool.begin().await?;
+    // The proposal FIRST, so its id can go on the action row. One transaction and not two writes:
+    // an action with no proposal is one nobody will ever decide, and a proposal with no action is a
+    // button that approves nothing. `ingest_director` learned this at cost in the pillar before —
+    // saving only the last write leaves the earlier ones unsaved.
+    let proposal_id = if mode == "propose" {
+        Some(
+            crate::proposals::create_team_action_in_transaction(
+                &mut transaction,
+                &request.kind,
+                why,
+                &payload,
+                &now,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let id = sqlx::query(
+        "INSERT INTO team_actions
+           (team_run_id, kind, payload, why, proposal_id, state, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+    )
+    .bind(team_run_id)
+    .bind(&request.kind)
+    .bind(&payload)
+    .bind(why)
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?
+    .last_insert_rowid();
+    transaction.commit().await?;
+
+    let outcome = match proposal_id {
+        Some(proposal_id) => format!(
+            "filed for approval as #{proposal_id}. It will happen if the person says yes; carry on \
+             without waiting."
+        ),
+        None => "queued — this department may do that without asking, and the core will do it \
+                 shortly."
+            .to_owned(),
+    };
+    Ok(ProposeActionResponse {
+        id,
+        proposal_id,
+        outcome,
+    })
+}
+
+/// How many of this team's actions are still waiting for somebody to decide.
+///
+/// Counted across the team's RUNS and not within one, because the ceiling is the owner's attention
+/// and the owner has one queue. It clears the moment somebody decides — the same self-limiting
+/// property `wip.rs` has, in the axis `wip.rs` cannot reach: that one counts
+/// `proposals WHERE project_id = ?`, and a department has no project.
+async fn open_actions_of(pool: &sqlx::SqlitePool, team_id: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM team_actions
+           JOIN team_runs ON team_runs.id = team_actions.team_run_id
+           JOIN proposals ON proposals.id = team_actions.proposal_id
+          WHERE team_runs.team_id = ?
+            AND team_actions.state = 'pending'
+            AND proposals.status = 'pending'",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Everything decided and not yet done, oldest first.
+///
+/// `proposal_id IS NULL` is an `allow` action, which was decided when it was written. Otherwise the
+/// proposal has to read `approved`: `rejected` is handled by `refuse_action`, and `pending` means
+/// nobody has answered.
+const DUE_ACTIONS_SQL: &str = "SELECT id, team_run_id, kind, payload, why, proposal_id, state,
+                                      error, created_at, executed_at
+                                 FROM team_actions
+                                WHERE state = 'pending'
+                                  AND (proposal_id IS NULL
+                                       OR proposal_id IN (SELECT id FROM proposals
+                                                           WHERE status = 'approved'))
+                                ORDER BY id";
+
+/// Does what the department asked and a human agreed to, one action at a time.
+///
+/// **In the tick and not in the approve handler**, for the two reasons this house always gives: an
+/// HTTP handler that sends an email holds the connection open while a slow SMTP thinks, and a daemon
+/// restarted in the middle of that loses the action with no trace. A `pending` row survives a
+/// restart and is reconcilable by construction; an `await` inside a handler is neither. It is the
+/// same decision that makes a team run driven by the database rather than by a `JoinHandle`.
+///
+/// Claimed by compare-and-swap BEFORE the work, so two passes overlapping cannot send one email
+/// twice. `ingest_director` uses the identical pattern for the identical reason.
+pub async fn execute_due_actions(state: &AppState) {
+    let due: Vec<TeamAction> = match sqlx::query_as(DUE_ACTIONS_SQL).fetch_all(&state.pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the team actions waiting to be done");
+            return;
+        }
+    };
+
+    for action in due {
+        // The claim. A row moved to `working` by another pass is skipped here, and the pass that
+        // moved it owns it — an email that may already have gone must not be sent again.
+        let claimed = sqlx::query(
+            "UPDATE team_actions SET state = 'working' WHERE id = ? AND state = 'pending'",
+        )
+        .bind(action.id)
+        .execute(&state.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .unwrap_or(false);
+        if !claimed {
+            continue;
+        }
+
+        let outcome = perform(state, &action).await;
+        let (final_state, error) = match &outcome {
+            Ok(()) => ("done", None),
+            Err(why) => ("failed", Some(why.clone())),
+        };
+        if let Err(error) = sqlx::query(
+            "UPDATE team_actions SET state = ?, error = ?, executed_at = ? WHERE id = ?",
+        )
+        .bind(final_state)
+        .bind(error.as_deref())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(action.id)
+        .execute(&state.pool)
+        .await
+        {
+            // The action HAPPENED and the record says `working`. Loud, because the next pass will
+            // not retry it — `working` matches no claim — and a human reading the row needs to know
+            // why it is stuck there.
+            tracing::error!(
+                action = action.id,
+                %error,
+                "a team action was performed and its outcome could not be recorded"
+            );
+            continue;
+        }
+
+        // The feed is where a person reads what the daemon did while nobody was looking, and both
+        // endings belong in it: a `done` nobody sees is an email that went out unannounced.
+        let _ = crate::feed::append(
+            &state.pool,
+            None,
+            "team_action",
+            &match &outcome {
+                Ok(()) => format!("a department's `{}` was carried out", action.kind),
+                Err(why) => format!("a department's `{}` failed: {why}", action.kind),
+            },
+            None,
+        )
+        .await;
+    }
+}
+
+/// The four lines that actually touch the world. Everything above decides whether to reach here.
+///
+/// Each arm delegates: `team.rs` knows what was asked and who may ask it, and knows nothing about
+/// how a message is submitted or where a folder lives. The `Err` string is what a person reads
+/// beside a `failed` row the morning after, so it says what did not happen rather than which
+/// function returned what.
+async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
+    let payload: serde_json::Value = serde_json::from_str(&action.payload)
+        .map_err(|error| format!("the stored request could not be read back: {error}"))?;
+    let text = |field: &str| -> String {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    match action.kind.as_str() {
+        "send_email" => crate::mailsend::send(
+            state,
+            &crate::mailsend::SendRequest {
+                to: text("to"),
+                subject: text("subject"),
+                body: text("body"),
+            },
+        )
+        .await
+        .map_err(|failure| failure.to_string()),
+
+        "file_document" => {
+            // The one action that leaves the sandbox the pillar built: it writes into the owner's
+            // files root rather than into the run's own folder, which is the whole point — a
+            // delivery nobody opens has not been delivered. Contained by `files::resolve_within`
+            // against that root, the same check the Files tab makes, and by nothing else.
+            let root = files_root(state)?;
+            let target = crate::files::resolve_within(&root, &text("path"))
+                .map_err(|_| "that path is not inside the files folder".to_owned())?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("the folder could not be made: {error}"))?;
+            }
+            crate::storage::write_atomic(&target, text("content").as_bytes())
+                .map_err(|error| format!("the file could not be written: {error}"))
+        }
+
+        "calendar_event" => {
+            // Parsed again rather than trusted, though `validate_payload` already parsed it: the row
+            // has been sitting in a table since, and this is the last moment before it becomes an
+            // event somebody's week is arranged around.
+            let starts_at_local = chrono::NaiveDateTime::parse_from_str(
+                &text("starts_at_local"),
+                crate::calendar::LOCAL_FORMAT,
+            )
+            .map_err(|_| "the stored start time is not a date and time".to_owned())?;
+            let tz: chrono_tz::Tz = text("tz")
+                .parse()
+                .map_err(|_| "the stored timezone is not one".to_owned())?;
+            let minutes = payload
+                .get("duration_minutes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            crate::calendar::insert_event(
+                &state.pool,
+                &text("title"),
+                starts_at_local,
+                minutes,
+                tz,
+                // The source column says WHO put it there, which is what a person scanning their
+                // week wants to know about an entry they do not remember making.
+                "team",
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("the event could not be written: {error}"))
+        }
+
+        other => Err(format!("nobody can do `{other}`")),
+    }
+}
+
+/// A rejected proposal closes its action.
+///
+/// `failed` with `error = 'rejected'` and not a `rejected` state of its own. A third state would say
+/// the same thing `proposals.status` already says, in a second place, and the two would eventually
+/// disagree — while `state` here answers only one question: is there anything left to do about this
+/// row? There is not.
+pub async fn refuse_action(pool: &sqlx::SqlitePool, proposal_id: i64) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE team_actions SET state = 'failed', error = 'rejected', executed_at = ?
+          WHERE proposal_id = ? AND state = 'pending'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(proposal_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+// ---------------------------------------------------------------------------------------------
 // The tick
 // ---------------------------------------------------------------------------------------------
 
@@ -850,6 +1487,12 @@ fn files_root(state: &AppState) -> Result<std::path::PathBuf, String> {
 /// Runs are advanced independently and a failure in one is logged rather than propagated: a
 /// department that cannot be moved must not stop the sweep that moves the others.
 pub async fn team_tick(state: &AppState, now: chrono::DateTime<chrono::Utc>) {
+    // Before the runs, and independently of them. An action outlives the run that asked for it —
+    // people decide overnight, and by morning that department has usually finished — so this loop
+    // reads `team_actions` rather than walking the live runs. It is also why a pending action never
+    // holds a run open: nothing here is waiting for anything there.
+    execute_due_actions(state).await;
+
     let live: Vec<TeamRun> = match sqlx::query_as(
         "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
                 next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
@@ -1388,7 +2031,7 @@ async fn team_and_director(
 ) -> Result<Option<(Team, crate::agent::Agent)>, sqlx::Error> {
     let team: Option<Team> = sqlx::query_as(
         "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
-                created_at, updated_at
+                max_open_actions, created_at, updated_at
          FROM teams WHERE id = ?",
     )
     .bind(&run.team_id)
@@ -2206,6 +2849,74 @@ pub struct FileView {
     pub content: String,
 }
 
+/// `POST /team-actions` — **the only route of this design a department may call**, and the only one
+/// it will ever gain.
+///
+/// It does not perform the action. See `propose_action`: the surface stops growing here because
+/// what arrives is a `kind` and a payload rather than a route per action, and what leaves is a
+/// sentence rather than a result.
+///
+/// The status codes carry the same distinction the sentences do. 400 is "nobody can do this", 403 is
+/// "you may not", 422 is "you asked wrongly", 429 is "come back when somebody has decided" — and a
+/// model reading only the code would still pick the right next move for three of the four.
+pub async fn post_team_action(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    Json(request): Json<ProposeActionRequest>,
+) -> Result<Json<ProposeActionResponse>, (StatusCode, String)> {
+    propose_action(&state, &scope, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                ActionError::NotADepartment | ActionError::Ungranted(_) => StatusCode::FORBIDDEN,
+                ActionError::NoSuchRun => StatusCode::NOT_FOUND,
+                ActionError::Unknown(_) => StatusCode::BAD_REQUEST,
+                ActionError::Malformed(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                // 429 and not 403: the ceiling is a queue that drains, and the caller — or the next
+                // run of this department — should come back.
+                ActionError::QueueFull(_) => StatusCode::TOO_MANY_REQUESTS,
+                ActionError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        })
+}
+
+/// `GET /team-runs/{id}/actions` — what that department asked for, and what became of it.
+pub async fn list_team_run_actions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<TeamAction>>, (StatusCode, String)> {
+    sqlx::query_as(
+        "SELECT id, team_run_id, kind, payload, why, proposal_id, state, error, created_at,
+                executed_at
+         FROM team_actions WHERE team_run_id = ? ORDER BY id",
+    )
+    .bind(&id)
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| refuse(TeamError::Db(error)))
+}
+
+/// `GET /team-actions` — everything still waiting on somebody, across every department.
+///
+/// Includes the `allow` actions that have not run yet, which are waiting on the tick rather than on
+/// a person. Both are "asked for and not yet done", which is the question this list answers.
+pub async fn list_open_actions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TeamAction>>, (StatusCode, String)> {
+    sqlx::query_as(
+        "SELECT id, team_run_id, kind, payload, why, proposal_id, state, error, created_at,
+                executed_at
+         FROM team_actions WHERE state IN ('pending', 'working') ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| refuse(TeamError::Db(error)))
+}
+
 /// `POST /team-files/read` — one file out of the calling run's own folder.
 ///
 /// **Which run is reading comes from the key, not from the body.** A `team_run_id` field here would
@@ -2677,6 +3388,8 @@ mod tests {
                 max_rounds: 3,
                 max_parallel: 2,
                 budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                grants: Vec::new(),
                 members: vec!["copywriter".to_owned(), "researcher".to_owned()],
             },
         )
@@ -2714,6 +3427,8 @@ mod tests {
                 max_rounds: 3,
                 max_parallel: 2,
                 budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                grants: Vec::new(),
                 members: vec!["copywriter".to_owned()],
             },
         )
@@ -2737,6 +3452,8 @@ mod tests {
                 max_rounds: 2,
                 max_parallel: 1,
                 budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                grants: Vec::new(),
                 members: vec!["nobody".to_owned()],
             },
         )
@@ -2766,6 +3483,8 @@ mod tests {
                     max_rounds: rounds,
                     max_parallel: parallel,
                     budget_usd: None,
+                    max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                    grants: Vec::new(),
                     members: Vec::new(),
                 },
             )
@@ -2775,6 +3494,556 @@ mod tests {
                 "{rounds} rounds x {parallel} parallel should be refused"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Alçada
+    // -----------------------------------------------------------------------------------------
+
+    /// Grants a team an alçada and starts a run, returning that run's id.
+    async fn team_with_grant(state: &AppState, kind: &str, mode: &str) -> String {
+        marketing(state).await;
+        sqlx::query("INSERT INTO team_grants (team_id, kind, mode) VALUES ('marketing', ?, ?)")
+            .bind(kind)
+            .bind(mode)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        start(state, "marketing", "write the launch post")
+            .await
+            .unwrap()
+    }
+
+    fn an_email() -> serde_json::Value {
+        serde_json::json!({
+            "to": "list@example.com",
+            "subject": "we launch tomorrow",
+            "body": "Details inside.",
+        })
+    }
+
+    async fn ask(
+        state: &AppState,
+        run_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<ProposeActionResponse, ActionError> {
+        propose_action(
+            state,
+            &Scope::TeamRun(run_id.to_owned()),
+            &ProposeActionRequest {
+                kind: kind.to_owned(),
+                payload,
+                why: "the launch is tomorrow and the list asked to be told".to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Default deny, and it is the ABSENCE of a row that denies — there is no `mode = 'deny'` for a
+    /// second opinion to disagree with.
+    #[tokio::test]
+    async fn a_department_with_no_alcada_may_ask_for_nothing() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        for kind in GRANTABLE_ACTIONS {
+            let refusal = ask(&state, &run_id, kind, an_email()).await;
+            assert!(
+                matches!(&refusal, Err(ActionError::Ungranted(named)) if named == kind),
+                "{kind}: got {refusal:?}"
+            );
+        }
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_actions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "a refusal leaves no row to decide");
+    }
+
+    /// The constant is asked BEFORE the table, so a row somebody wrote into `team_grants` by hand
+    /// cannot grant an action the house does not have.
+    #[tokio::test]
+    async fn a_kind_outside_the_list_is_refused_even_with_a_grant_in_the_table() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "set_kill", "allow").await;
+
+        let refusal = ask(&state, &run_id, "set_kill", serde_json::json!({})).await;
+        assert!(
+            matches!(&refusal, Err(ActionError::Unknown(named)) if named == "set_kill"),
+            "got {refusal:?}"
+        );
+    }
+
+    /// The list of what a department may be granted, held against the list of what it must never
+    /// be. Written out by hand on both sides: "everything that is not `Acts`" would have handed a
+    /// marketing department the controls of the daemon, decided by whoever added the next tool.
+    #[test]
+    fn no_grantable_action_is_a_control_of_the_daemon() {
+        // A department holding `set_kill` turns off the house's autonomy. One holding
+        // `approve_proposal` approves its own proposals, and thereby holds every other authority by
+        // transitivity, without anybody having written that down.
+        for forbidden in [
+            "approve_proposal",
+            "reject_proposal",
+            "set_kill",
+            "cancel_run",
+            "create_run",
+            "create_job",
+            "triage_email",
+            // The sharpest of all, and the one the design named and this refuses: `TOOL_EFFECTS`
+            // records it as the only effect in the house that outlives the daemon and that its
+            // owner cannot take back from here.
+            "vcs_request",
+            "vcs_ticket",
+        ] {
+            assert!(
+                !GRANTABLE_ACTIONS.contains(&forbidden),
+                "`{forbidden}` is a control of the daemon and no department may be granted it"
+            );
+        }
+        // And every grantable kind is understood by the validator, so a grant cannot name something
+        // the writer would refuse and the owner would only discover mid-run.
+        for kind in GRANTABLE_ACTIONS {
+            let refusal = validate_payload(kind, &serde_json::json!({}))
+                .expect_err("an empty payload is not a request");
+            assert!(
+                !refusal.contains("nobody can do"),
+                "`{kind}` is grantable and `validate_payload` does not know it"
+            );
+        }
+    }
+
+    /// **The test that decides whether this design is safe.**
+    ///
+    /// A specialist reads a web page. The page contains text asking for an email to be sent. Two
+    /// independent things stop it, and this asserts the second: `propose_action` is `Acts`, so the
+    /// turn that called a `ReadsUntrusted` tool cannot reach it for the rest of that turn. (The
+    /// first is that the page arrived summarised by a local model rather than raw — `web.rs`.)
+    #[tokio::test]
+    async fn a_specialist_that_read_the_web_may_not_ask_for_an_action_in_that_turn() {
+        use crate::mcp_tools::{ToolEffect, tool_effect};
+
+        assert_eq!(
+            tool_effect("web_read"),
+            ToolEffect::ReadsUntrusted,
+            "the premise: reading a page marks the turn"
+        );
+        assert_eq!(
+            tool_effect("read_team_file"),
+            ToolEffect::ReadsUntrusted,
+            "and so does reading what another specialist wrote out of one"
+        );
+        // The conclusion, and the whole reason `propose_action` is classified as an action despite
+        // performing none: `hooks.rs` refuses every `Acts` tool once the run is marked, so a page
+        // that asks for an email reaches a turn that can no longer ask for one.
+        assert_eq!(
+            tool_effect("propose_action"),
+            ToolEffect::Acts,
+            "if this ever becomes ReadsOwn, a web page can send mail"
+        );
+    }
+
+    /// A `propose` grant writes the action AND the proposal, or neither. An action with no proposal
+    /// is one nobody will ever decide; a proposal with no action is a button that approves nothing.
+    #[tokio::test]
+    async fn a_propose_grant_files_the_action_and_the_question_together() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+
+        let filed = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        let proposal_id = filed.proposal_id.expect("a propose grant asks somebody");
+        assert!(filed.outcome.contains(&format!("#{proposal_id}")));
+
+        let action: TeamAction = sqlx::query_as(
+            "SELECT id, team_run_id, kind, payload, why, proposal_id, state, error, created_at,
+                    executed_at
+             FROM team_actions WHERE id = ?",
+        )
+        .bind(filed.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(action.state, "pending");
+        assert_eq!(action.proposal_id, Some(proposal_id));
+
+        let proposal = crate::proposals::get(&state.pool, proposal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.kind, "team-action");
+        assert_eq!(proposal.status, "pending");
+        // The action's kind, so a person scanning the queue knows what they are agreeing to without
+        // opening the row.
+        assert_eq!(proposal.tool_name.as_deref(), Some("send_email"));
+        assert_eq!(
+            proposal.project_id, None,
+            "a department has no project, which is why the per-project wip ceiling never sees this"
+        );
+        // Nothing has happened yet, and nothing will until somebody says so.
+        execute_due_actions(&state).await;
+        let still: String = sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+            .bind(filed.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(still, "pending", "an undecided action is not carried out");
+    }
+
+    /// `allow` is the owner saying they do not want to be in the middle. No proposal is written, and
+    /// the next pass of the tick does it.
+    #[tokio::test]
+    async fn an_allow_grant_asks_nobody_and_runs_on_the_next_pass() {
+        let (state, root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+
+        let filed = ask(
+            &state,
+            &run_id,
+            "file_document",
+            serde_json::json!({ "path": "launch/post.md", "content": "# Launch\n" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filed.proposal_id, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM proposals")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        execute_due_actions(&state).await;
+
+        let action: (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(action, ("done".to_owned(), None), "{action:?}");
+        let written = std::fs::read_to_string(
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("launch")
+                .join("post.md"),
+        )
+        .unwrap();
+        assert_eq!(written, "# Launch\n");
+    }
+
+    /// Two passes overlapping must not do the same thing twice. The claim is a compare-and-swap
+    /// before the work, exactly as `ingest_director` does it — an email that may already have gone
+    /// is not sent again.
+    #[tokio::test]
+    async fn an_approved_action_is_carried_out_once_and_once_only() {
+        let (state, root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+        let filed = ask(
+            &state,
+            &run_id,
+            "file_document",
+            serde_json::json!({ "path": "note.md", "content": "once" }),
+        )
+        .await
+        .unwrap();
+
+        let (first, second) =
+            tokio::join!(execute_due_actions(&state), execute_due_actions(&state));
+        let _ = (first, second);
+
+        let executed: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(executed, ["done"]);
+        assert!(
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("note.md")
+                .exists()
+        );
+    }
+
+    /// Two fields and not one. `proposals.status` says what the human decided; `team_actions.state`
+    /// says what the world answered. Merged, `failed` would read as "the person refused" and
+    /// `approved` would be a lie about a message that never left.
+    #[tokio::test]
+    async fn an_action_that_fails_does_not_contradict_the_approval() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        let filed = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        let proposal_id = filed.proposal_id.unwrap();
+
+        crate::proposals::transition(&state.pool, proposal_id, "approved", "approved by user")
+            .await
+            .unwrap();
+        // No submission host is configured in a test state, so the send fails at the first check
+        // and nothing leaves the process.
+        execute_due_actions(&state).await;
+
+        let action: (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(action.0, "failed");
+        assert!(action.1.is_some_and(|why| !why.is_empty()));
+        assert_eq!(
+            crate::proposals::get(&state.pool, proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved",
+            "the person did say yes, and a failure afterwards does not unsay it"
+        );
+    }
+
+    /// The ceiling is per TEAM — `wip.rs` counts per project and a department has none — and it
+    /// clears the moment somebody decides.
+    #[tokio::test]
+    async fn the_open_action_ceiling_is_per_team_and_frees_when_somebody_decides() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        sqlx::query("UPDATE teams SET max_open_actions = 2 WHERE id = 'marketing'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let first = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        let refusal = ask(&state, &run_id, "send_email", an_email()).await;
+        assert!(
+            matches!(&refusal, Err(ActionError::QueueFull(why)) if why.contains('2')),
+            "got {refusal:?}"
+        );
+
+        // A department next door is untouched by a queue it did not fill.
+        insert_agent(&state, "engineer", "claude").await;
+        create(
+            &state.pool,
+            TeamRequest {
+                name: "Support".to_owned(),
+                mission: "answer people".to_owned(),
+                director_agent_id: "engineer".to_owned(),
+                max_rounds: 2,
+                max_parallel: 1,
+                budget_usd: None,
+                max_open_actions: 1,
+                grants: vec![TeamGrant {
+                    kind: "send_email".to_owned(),
+                    mode: "propose".to_owned(),
+                }],
+                members: vec!["engineer".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+        let support_run = start(&state, "support", "answer the backlog")
+            .await
+            .unwrap();
+        ask(&state, &support_run, "send_email", an_email())
+            .await
+            .expect("another department's queue is not this one's");
+
+        // Deciding frees the slot, which is the self-limiting property `wip.rs` has in the other
+        // axis: the queue cannot grow past what somebody is willing to work through.
+        crate::proposals::transition(
+            &state.pool,
+            first.proposal_id.unwrap(),
+            "rejected",
+            "rejected by user",
+        )
+        .await
+        .unwrap();
+        ask(&state, &run_id, "send_email", an_email())
+            .await
+            .expect("a decided action no longer holds a slot");
+    }
+
+    /// A malformed request is refused to the AGENT, mid-turn, while it can still fix it — and not to
+    /// a person three hours later whose only options are approving something broken or throwing away
+    /// work already paid for.
+    #[tokio::test]
+    async fn a_malformed_payload_is_refused_to_the_agent_and_never_reaches_a_person() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+
+        for broken in [
+            serde_json::json!({ "subject": "no recipient", "body": "x" }),
+            serde_json::json!({ "to": "", "subject": "empty recipient", "body": "x" }),
+            serde_json::json!({ "to": "nobody", "subject": "no domain", "body": "x" }),
+            // The header-injection rule, borrowed from `mailsend::validate` rather than restated.
+            serde_json::json!({ "to": "a@b.c\nBcc: c@d.e", "subject": "x", "body": "x" }),
+            serde_json::json!({ "to": "a@b.c", "subject": "no body", "body": "  " }),
+        ] {
+            let refusal = ask(&state, &run_id, "send_email", broken.clone()).await;
+            assert!(
+                matches!(refusal, Err(ActionError::Malformed(_))),
+                "{broken} should not be a message"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM proposals")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0,
+            "nothing malformed reached the queue"
+        );
+
+        // And a request with no reason is refused too: the sentence is what the person deciding
+        // reads, and a queue whose entries do not explain themselves gets approved unread.
+        let unexplained = propose_action(
+            &state,
+            &Scope::TeamRun(run_id.clone()),
+            &ProposeActionRequest {
+                kind: "send_email".to_owned(),
+                payload: an_email(),
+                why: "   ".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(unexplained, Err(ActionError::Malformed(_))));
+    }
+
+    /// A run may finish with actions nobody has decided, and they outlive it. The opposite would
+    /// hold a department in `working` until somebody opened a laptop — occupying a `max_parallel`
+    /// slot and counting against the four-hour ceiling the whole time.
+    #[tokio::test]
+    async fn a_run_may_end_with_actions_still_undecided() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        let filed = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+
+        cancel(&state, &run_id).await.unwrap();
+        let run_state: String = sqlx::query_scalar("SELECT state FROM team_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(TERMINAL_STATES.contains(&run_state.as_str()), "{run_state}");
+
+        let action: String = sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+            .bind(filed.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            action, "pending",
+            "the question outlives the run that asked"
+        );
+    }
+
+    /// The path is contained by `files::resolve_within` against the files root, which is the one
+    /// thing standing between a department and the rest of the disk.
+    #[tokio::test]
+    async fn a_filed_document_cannot_leave_the_files_folder() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+
+        for escape in ["../outside.md", "/etc/passwd", "a/../../outside.md"] {
+            let refusal = ask(
+                &state,
+                &run_id,
+                "file_document",
+                serde_json::json!({ "path": escape, "content": "x" }),
+            )
+            .await;
+            assert!(
+                matches!(refusal, Err(ActionError::Malformed(_))),
+                "{escape} should not be a path inside the folder"
+            );
+        }
+    }
+
+    /// An event the department asked for, written by the core after a person said yes — the shape
+    /// `proposals::create_calendar_event` established, with a department in place of the triage.
+    #[tokio::test]
+    async fn an_approved_calendar_event_is_written_by_the_core() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "calendar_event", "propose").await;
+        let filed = ask(
+            &state,
+            &run_id,
+            "calendar_event",
+            serde_json::json!({
+                "title": "launch review",
+                "starts_at_local": "2026-08-17T09:30:00",
+                "duration_minutes": 45,
+                "tz": "Europe/Lisbon",
+            }),
+        )
+        .await
+        .unwrap();
+
+        crate::proposals::transition(
+            &state.pool,
+            filed.proposal_id.unwrap(),
+            "approved",
+            "approved by user",
+        )
+        .await
+        .unwrap();
+        execute_due_actions(&state).await;
+
+        let event: (String, String, i64, String) =
+            sqlx::query_as("SELECT title, tz, duration_minutes, source FROM calendar_events")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            event,
+            (
+                "launch review".to_owned(),
+                "Europe/Lisbon".to_owned(),
+                45,
+                "team".to_owned()
+            )
+        );
+    }
+
+    /// Only a department asks, and which one comes from the KEY. A `team_run_id` in the body would
+    /// be the caller naming what it may do, which is what `post_read_file` refuses one route over.
+    #[tokio::test]
+    async fn only_a_team_run_may_ask_and_the_key_says_which() {
+        let (state, _root) = state_with_root().await;
+        team_with_grant(&state, "send_email", "allow").await;
+
+        for scope in [Scope::Control, Scope::Run(1)] {
+            let refusal = propose_action(
+                &state,
+                &scope,
+                &ProposeActionRequest {
+                    kind: "send_email".to_owned(),
+                    payload: an_email(),
+                    why: "because".to_owned(),
+                },
+            )
+            .await;
+            assert!(matches!(refusal, Err(ActionError::NotADepartment)));
+        }
+
+        let refusal = ask(&state, "never-existed", "send_email", an_email()).await;
+        assert!(matches!(refusal, Err(ActionError::NoSuchRun)));
     }
 
     /// A team halfway through being assembled is a legitimate thing to save; asking it to work is
@@ -2792,6 +4061,8 @@ mod tests {
                 max_rounds: 2,
                 max_parallel: 1,
                 budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                grants: Vec::new(),
                 members: Vec::new(),
             },
         )
@@ -2821,6 +4092,8 @@ mod tests {
                 max_rounds: 2,
                 max_parallel: 1,
                 budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                grants: Vec::new(),
                 members: vec!["localist".to_owned()],
             },
         )
@@ -3387,6 +4660,8 @@ mod tests {
                 max_rounds: 3,
                 max_parallel: 2,
                 budget_usd: Some(1.0),
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                grants: Vec::new(),
                 members: vec!["copywriter".to_owned()],
             },
         )

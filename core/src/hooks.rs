@@ -2690,7 +2690,8 @@ mod tests {
         );
     }
 
-    /// Every acting tool this server has, refused to a department one by one.
+    /// Every acting tool this server has, refused to a department one by one — bar the one it holds
+    /// on purpose.
     ///
     /// Enumerated from `TOOL_EFFECTS` rather than listed, so a tool classified `Acts` in future is
     /// covered the day it is added instead of the day somebody remembers this test. The second
@@ -2706,6 +2707,13 @@ mod tests {
         let mut acting = 0;
         for tool in crate::mcp_tools::every_tool_name() {
             if crate::mcp_tools::tool_effect(&tool) != crate::mcp_tools::ToolEffect::Acts {
+                continue;
+            }
+            // The single exception, named rather than filtered by a predicate so a second one has
+            // to be typed out by whoever adds it. Calling `propose_action` performs nothing — it
+            // records a request the core carries out later if a human agrees — and its `Acts`
+            // grading exists so the taint rule closes it once the turn has read a stranger's words.
+            if tool == "propose_action" {
                 continue;
             }
             acting += 1;

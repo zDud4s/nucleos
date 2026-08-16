@@ -1197,6 +1197,27 @@ export async function getSkippedItems(
 }
 
 /**
+ * The things departments have asked for and nobody has answered yet.
+ *
+ * A third list beside `getProposals` and `getSkippedItems`, and separate for the same reason those
+ * two are: a pending `action-approval` is a run holding still with a worktree; this is a request
+ * from a department that usually finished hours ago, and approving it starts something rather than
+ * releasing something. `reasoning` carries the agent's one-line why and `tool_input` the action's
+ * own fields as JSON — a person who cannot read what they are approving is not approving anything.
+ */
+export async function getTeamActionProposals(token: string): Promise<Proposal[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/proposals/team-actions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Puts a read skipped item away.
  *
  * Deliberately NOT `rejectProposal` with a different label. `reject_proposal` guards on
@@ -2159,10 +2180,21 @@ export interface Team {
   max_rounds: number;
   max_parallel: number;
   budget_usd: number | null;
+  /** How many requests this department may leave waiting for a person at once. */
+  max_open_actions: number;
   created_at: string;
   updated_at: string;
   /** The roster, flattened onto the team by the daemon: the membership IS the team. */
   members: string[];
+  /** Only the actions this department was granted. Empty is a department that can only write. */
+  grants: TeamGrant[];
+}
+
+/** One line of a department's alçada: an action, and whether a person sees it first. */
+export interface TeamGrant {
+  kind: string;
+  /** `propose` puts a person in the middle; `allow` does not. */
+  mode: string;
 }
 
 export interface TeamInput {
@@ -2172,7 +2204,25 @@ export interface TeamInput {
   max_rounds: number;
   max_parallel: number;
   budget_usd: number | null;
+  max_open_actions: number;
   members: string[];
+  grants: TeamGrant[];
+}
+
+/** One thing a department asked the core to do, and what became of it. */
+export interface TeamAction {
+  id: number;
+  team_run_id: string;
+  kind: string;
+  /** JSON, as the daemon stored it. Rendered per kind — see `Teams.tsx`. */
+  payload: string;
+  why: string;
+  proposal_id: number | null;
+  /** pending | working | done | failed. */
+  state: string;
+  error: string | null;
+  created_at: string;
+  executed_at: string | null;
 }
 
 /** One piece of work a director handed to one specialist. */
@@ -2212,6 +2262,23 @@ export interface TeamRunDetail extends TeamRun {
   items: TeamItem[];
   cost_usd: number;
 }
+
+/**
+ * What a department may be granted, in the order the editor lists them.
+ *
+ * Mirrored from `team::GRANTABLE_ACTIONS`, which is the authority: a kind absent there is refused
+ * by the daemon whatever this array says, so the worst a stale copy does is offer a switch that
+ * does not work. `vcs_ticket` is deliberately not on either list — queueing a git operation is the
+ * one effect in the house that outlives the daemon.
+ */
+export const TEAM_GRANTABLE_ACTIONS = [
+  { kind: "send_email", label: "Send email", note: "goes out under the owner's address" },
+  { kind: "file_document", label: "File a document", note: "writes into the files folder" },
+  { kind: "calendar_event", label: "Put time in the calendar", note: "adds one event" },
+] as const;
+
+export const TEAM_MAX_OPEN_ACTIONS_CEILING = 20;
+export const TEAM_DEFAULT_MAX_OPEN_ACTIONS = 5;
 
 /**
  * The daemon's own ceilings, mirrored so the form refuses out of range at the field rather than by
@@ -2322,6 +2389,22 @@ export async function getTeamRun(token: string, id: string): Promise<TeamRunDeta
     });
     if (!res.ok) return null;
     return (await res.json()) as TeamRunDetail;
+  } catch {
+    return null;
+  }
+}
+
+/** What that run asked the core to do, and what became of each. */
+export async function listTeamRunActions(
+  token: string,
+  id: string,
+): Promise<TeamAction[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/team-runs/${encodeURIComponent(id)}/actions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TeamAction[];
   } catch {
     return null;
   }

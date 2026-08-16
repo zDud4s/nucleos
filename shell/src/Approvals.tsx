@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  dismissSkippedItem, getAwaitingApproval, getSkippedItems, getVcsRequest, listVcsRequests,
+  approveProposal, dismissSkippedItem, getAwaitingApproval, getSkippedItems,
+  getTeamActionProposals, getVcsRequest, listVcsRequests, rejectProposal,
   type AwaitingRun, type ConnectionState, type Proposal, type VcsRequestSummary, type VcsTicket,
 } from "./api";
 import {
@@ -267,6 +268,117 @@ function SkippedItemsPanel({
   );
 }
 
+/**
+ * What departments have asked for and nobody has answered.
+ *
+ * The payload is rendered as what it would DO rather than as the JSON it is stored as: an email
+ * shows its recipient, subject and body. **A person who cannot read what they are approving is not
+ * approving anything**, and this is the one queue in the house where saying yes causes something to
+ * happen out in the world rather than releasing something that had stopped.
+ */
+function TeamActionsPanel({
+  actions, loading, token, refresh,
+}: {
+  actions: Proposal[] | null;
+  loading: boolean;
+  token: string;
+  refresh: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState<Set<number>>(new Set());
+  const [errors, setErrors] = useState<Record<number, string>>({});
+
+  async function decide(id: number, verdict: "approve" | "reject") {
+    setBusy((current) => new Set(current).add(id));
+    setErrors((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    // The two return different shapes — approving may carry a resume run id, refusing carries
+    // nothing — so they are normalised here rather than in the branches below. `rejectProposal`
+    // gives a bare boolean, which is why a refusal that lost a race says less than an approval
+    // that did.
+    const failure: string | null =
+      verdict === "approve"
+        ? await approveProposal(token, id).then((outcome) =>
+            outcome.ok
+              ? null
+              : outcome.status === 409
+                ? "Somebody answered this one already."
+                : outcome.reason,
+          )
+        : await rejectProposal(token, id).then((ok) =>
+            ok ? null : "Could not record that refusal — it may already have been answered.",
+          );
+    if (failure === null) {
+      await refresh();
+    } else {
+      setErrors((current) => ({ ...current, [id]: failure }));
+    }
+    setBusy((current) => {
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+  }
+
+  return (
+    <Panel title="Departments" aside={actions === null ? undefined : `${actions.length}`}>
+      {actions === null ? (
+        !loading && <ErrorNote>Could not read the departments' requests from the daemon.</ErrorNote>
+      ) : actions.length === 0 ? (
+        <Teach title="No department is waiting on you.">
+          A department writes documents into its own folder on its own. Anything outside that — an
+          email, a file in your folder, an hour in your calendar — it asks for, and the request
+          lands here. None has.
+        </Teach>
+      ) : (
+        <>
+          <p className="faint">
+            Nothing is held up by these: the department that asked has usually finished. Approving
+            one makes the core do it on its next pass, which is a change out in the world rather
+            than a run let through.
+          </p>
+          <ul className="skipped-list">
+            {actions.map((action) => (
+              <li key={action.id} className="skipped-row">
+                <div className="skipped-row__head">
+                  <b>#{action.id} · {action.tool_name ?? "an action"}</b>
+                  <time dateTime={action.created_at} title={action.created_at}>
+                    {relativeTime(action.created_at)}
+                  </time>
+                </div>
+                <p className="skipped-row__why">{action.reasoning}</p>
+                {action.tool_input !== null && <pre className="a-note">{action.tool_input}</pre>}
+                <div className="a-actions">
+                  <Button
+                    size="sm"
+                    variant="approve"
+                    disabled={busy.has(action.id)}
+                    onClick={() => void decide(action.id, "approve")}
+                  >
+                    Do it
+                  </Button>
+                  <ConfirmButton
+                    size="sm"
+                    variant="danger"
+                    confirmLabel="Refuse it?"
+                    disabled={busy.has(action.id)}
+                    onConfirm={() => void decide(action.id, "reject")}
+                  >
+                    No
+                  </ConfirmButton>
+                </div>
+                {errors[action.id] !== undefined && <ErrorNote>{errors[action.id]}</ErrorNote>}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </Panel>
+  );
+}
+
 interface ApprovalsProps {
   token: string | null;
   connection: ConnectionState;
@@ -276,6 +388,7 @@ export default function Approvals({ token, connection }: ApprovalsProps) {
   const [requests, setRequests] = useState<VcsRequestSummary[] | null>(null);
   const [runs, setRuns] = useState<AwaitingRun[] | null>(null);
   const [items, setItems] = useState<Proposal[] | null>(null);
+  const [teamActions, setTeamActions] = useState<Proposal[] | null>(null);
   const [loading, setLoading] = useState(true);
   /**
    * Mirrors what the last load found still moving, for the poll's own use.
@@ -288,14 +401,16 @@ export default function Approvals({ token, connection }: ApprovalsProps) {
 
   const load = useCallback(async () => {
     if (token === null) return;
-    const [nextRequests, nextRuns, nextItems] = await Promise.all([
+    const [nextRequests, nextRuns, nextItems, nextTeamActions] = await Promise.all([
       listVcsRequests(token),
       getAwaitingApproval(token),
       getSkippedItems(token),
+      getTeamActionProposals(token),
     ]);
     setRequests(nextRequests);
     setRuns(nextRuns);
     setItems(nextItems);
+    setTeamActions(nextTeamActions);
     inFlight.current = (nextRequests === null ? 0 : vcsPending(nextRequests)) + (nextRuns?.length ?? 0);
     setLoading(false);
   }, [token]);
@@ -322,12 +437,14 @@ export default function Approvals({ token, connection }: ApprovalsProps) {
     <>
       <Teach title="What is not moving">
         Work that stopped and is waiting on a person. The git queue is what agents have asked to do
-        to a repository; the runs are parked until you answer them on Autopilot; the skipped items
-        are what a job put down so one stuck task would not end the night.
+        to a repository; the runs are parked until you answer them on Autopilot; the departments'
+        requests are things a team would like the core to do outside its own folder; the skipped
+        items are what a job put down so one stuck task would not end the night.
       </Teach>
 
       <GitQueuePanel requests={requests} loading={loading} token={token} refresh={load} />
       <WaitingRunsPanel runs={runs} loading={loading} />
+      <TeamActionsPanel actions={teamActions} loading={loading} token={token} refresh={load} />
       <SkippedItemsPanel items={items} loading={loading} token={token} refresh={load} />
     </>
   );

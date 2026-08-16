@@ -391,6 +391,15 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
     // The run's own folder, and the only route of the teams design that this scope opens. Which
     // folder is decided by the token, never by an argument — see `team.rs`.
     (Method::POST, "/team-files/read"),
+    // **The only route in this table that is not a read, and the only one there will ever be.** It
+    // does not perform anything: it records what the department asked for, and the core acts later
+    // if a human agrees (`team::propose_action`). That is what keeps this table from growing one
+    // entry per action a department might want — a `POST /email/send` here would have been the
+    // first of six, and by the sixth this scope would no longer be describable in a sentence.
+    //
+    // Its GET twin, which lists the queue, is deliberately absent: a department may ask, and may not
+    // read what every other department has asked for.
+    (Method::POST, "/team-actions"),
     (Method::GET, "/email/queue"),
     (Method::GET, "/email/{id}"),
     (Method::GET, "/files"),
@@ -698,6 +707,10 @@ mod tests {
             .route("/web/search", post(|| async {}))
             .route("/web/read", post(|| async {}))
             .route("/team-files/read", post(|| async {}))
+            // Registered with both methods, so the negative assertion below — a department may POST
+            // an action and may not LIST the queue — is answered by `permits` rather than by the
+            // router not knowing the path.
+            .route("/team-actions", post(|| async {}).get(|| async {}))
             .route("/files", get(|| async {}).delete(|| async {}))
             .route("/files/folder", post(|| async {}))
             .route("/files/download", get(|| async {}))
@@ -1585,6 +1598,9 @@ mod tests {
             // and a DELETE on the same path, so a table of paths alone would have handed a
             // department the deleting of the owner's folder along with the listing of it.
             ("DELETE", "/files"),
+            // A department asks for an action and does not read the queue of them. Same path, other
+            // method — the pair-shaped table again.
+            ("GET", "/team-actions"),
             ("GET", "/autopilot/budget"),
             ("GET", "/autopilot/kill"),
             ("GET", "/projects"),
@@ -1637,6 +1653,7 @@ mod tests {
             ("get_email", Method::GET, "/email/{id}"),
             ("get_email_queue", Method::GET, "/email/queue"),
             ("list_files", Method::GET, "/files"),
+            ("propose_action", Method::POST, "/team-actions"),
             ("read_team_file", Method::POST, "/team-files/read"),
             ("web_read", Method::POST, "/web/read"),
             ("web_search", Method::POST, "/web/search"),

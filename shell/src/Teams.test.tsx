@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import Teams from "./Teams";
-import type { Agent, Team, TeamRun, TeamRunDetail } from "./api";
+import type { Agent, Team, TeamAction, TeamRun, TeamRunDetail } from "./api";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -31,9 +31,11 @@ function team(overrides: Partial<Team> = {}): Team {
     max_rounds: 3,
     max_parallel: 2,
     budget_usd: null,
+    max_open_actions: 5,
     created_at: "2026-08-16T10:00:00Z",
     updated_at: "2026-08-16T10:00:00Z",
     members: ["copywriter"],
+    grants: [],
     ...overrides,
   };
 }
@@ -84,6 +86,7 @@ interface DaemonState {
   agents?: Agent[];
   runs?: TeamRun[];
   detail?: TeamRunDetail;
+  actions?: TeamAction[];
   write?: { ok: boolean; status: number };
 }
 
@@ -98,6 +101,11 @@ function daemonHolding(state: DaemonState) {
         ...write,
         json: async () => (path.endsWith("/runs") ? { id: "run-new" } : (state.teams?.[0] ?? team())),
       });
+    }
+    // Before the detail branch: `/team-runs/{id}/actions` also contains `/team-runs/`, and a
+    // detail object handed to a list would be a crash rather than an empty panel.
+    if (path.endsWith("/actions")) {
+      return Promise.resolve({ ok: true, status: 200, json: async () => state.actions ?? [] });
     }
     if (path.includes("/team-runs/")) {
       return Promise.resolve({ ok: true, status: 200, json: async () => state.detail ?? detail() });
@@ -232,6 +240,46 @@ describe("the departments tab", () => {
     expect(writeCalls()).toHaveLength(0);
   });
 
+  /**
+   * A department may only write documents into its own folder until somebody says otherwise, so
+   * the default the form sends is an EMPTY grants list. The absence of a row is the denial: there
+   * is no `deny` mode for a second opinion to disagree with.
+   */
+  it("grants nothing unless the owner chooses it, and sends only what was chosen", async () => {
+    await show({ teams: [], agents: [agent({ id: "director", name: "director" })] });
+
+    fireEvent.click(screen.getByText("New team"));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Marketing" } });
+    fireEvent.change(screen.getByLabelText("Mission"), { target: { value: "sell" } });
+    fireEvent.change(screen.getByLabelText("Director"), { target: { value: "director" } });
+    fireEvent.change(screen.getByLabelText(/Send email/), { target: { value: "propose" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Save team"));
+    });
+
+    const saved = writeCalls().find(([url]) => String(url).endsWith("/teams"));
+    const body = JSON.parse(String((saved?.[1] as { body?: string }).body));
+    expect(body.grants).toEqual([{ kind: "send_email", mode: "propose" }]);
+    expect(body.max_open_actions).toBe(5);
+  });
+
+  it("says on the card what a department may do, and says nothing when it may do nothing", async () => {
+    await show({
+      teams: [
+        team(),
+        team({
+          id: "support",
+          name: "Support",
+          grants: [{ kind: "file_document", mode: "allow" }],
+        }),
+      ],
+      agents: [agent()],
+    });
+
+    expect(screen.getByText(/may file_document freely/)).toBeTruthy();
+    expect(screen.queryByText(/^may send_email/)).toBeNull();
+  });
+
   /** The ceilings belong to the daemon; the form only refuses one round trip earlier. */
   it("will not save a team past the daemon's ceilings", async () => {
     await show({ teams: [], agents: [agent({ id: "director", name: "director" })] });
@@ -269,6 +317,45 @@ describe("one run", () => {
   it("points at the folder rather than growing a second file browser", async () => {
     await open();
     expect(screen.getByText("Delivery: teams/marketing/run-1/")).toBeTruthy();
+  });
+
+  /**
+   * An email is shown as a recipient, a subject and a body — not as the JSON it is stored as. A
+   * person who cannot read what a department asked for cannot judge whether to allow it.
+   */
+  it("shows what a department asked for as the thing it would do", async () => {
+    await show({
+      teams: [team()],
+      agents: [agent()],
+      runs: [run()],
+      actions: [
+        {
+          id: 4,
+          team_run_id: "run-1",
+          kind: "send_email",
+          payload: JSON.stringify({
+            to: "list@example.com",
+            subject: "we launch tomorrow",
+            body: "Details inside.",
+          }),
+          why: "the list asked to be told",
+          proposal_id: 41,
+          state: "pending",
+          error: null,
+          created_at: "2026-08-16T11:00:00Z",
+          executed_at: null,
+        },
+      ],
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Open"));
+    });
+
+    expect(screen.getByText("list@example.com")).toBeTruthy();
+    expect(screen.getByText("we launch tomorrow")).toBeTruthy();
+    expect(screen.getByText("Details inside.")).toBeTruthy();
+    expect(screen.getByText("the list asked to be told")).toBeTruthy();
+    expect(screen.getByText("proposal #41")).toBeTruthy();
   });
 
   it("offers cancel while the run is live and delete once it is not", async () => {

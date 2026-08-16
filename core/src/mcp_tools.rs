@@ -77,6 +77,19 @@ struct VcsRequestParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProposeActionParams {
+    /// What to do: `send_email`, `file_document` or `calendar_event`.
+    kind: String,
+    /// The action's own fields. `send_email` takes `to`, `subject` and `body`; `file_document`
+    /// takes `path` and `content`; `calendar_event` takes `title`, `starts_at_local`
+    /// (`2026-08-17T09:30:00`, local time, no offset), `duration_minutes` and `tz`
+    /// (`Europe/Lisbon`).
+    payload: serde_json::Value,
+    /// One line saying why, for the person who decides. Required.
+    why: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct VcsTicketParams {
     /// The id the queue gave back when the operation was submitted.
     id: i64,
@@ -223,6 +236,23 @@ impl NucleosTools {
         Parameters(PathParams { path }): Parameters<PathParams>,
     ) -> String {
         json_result(self.client.read_team_file(&path.unwrap_or_default()).await)
+    }
+
+    #[tool(
+        description = "Ask the core to do something on your department's behalf. This does NOT do \
+                       it: it records the request and answers you immediately, so carry on with \
+                       your work rather than waiting. Depending on what your department has been \
+                       granted, the request either goes to a person to approve or is carried out \
+                       shortly — the reply says which, and says so plainly if your department may \
+                       not do that at all. Say why in one line: it is the sentence the person \
+                       deciding will read, and a request that does not explain itself is one that \
+                       gets refused."
+    )]
+    async fn propose_action(
+        &self,
+        Parameters(ProposeActionParams { kind, payload, why }): Parameters<ProposeActionParams>,
+    ) -> String {
+        json_result(self.client.propose_action(&kind, &payload, &why).await)
     }
 
     #[tool(description = "List NucleOS proposals")]
@@ -518,10 +548,17 @@ pub const COUNCIL_TOOLS: &[&str] = &[
 /// because a department is not convened to answer about the machine, and `list_projects` and
 /// `list_proposals` with them: those are the state of the house, a council's subject and not a
 /// marketing department's.
+/// The seventh entry is the alçada, and it is the only `Acts` a department will ever hold.
+/// `propose_action` performs nothing — it records an intention the core carries out later, if a
+/// human agrees — which is what lets one name cover every action a department may ever be granted
+/// instead of one name per action. It is graded `Acts` all the same, and that grading is the
+/// point: a specialist that has read a web page or a colleague's file loses it for the rest of the
+/// turn, which is exactly the door that must close.
 pub const TEAM_TOOLS: &[&str] = &[
     "get_email",
     "get_email_queue",
     "list_files",
+    "propose_action",
     "read_team_file",
     "web_read",
     "web_search",
@@ -590,6 +627,12 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("list_files", ToolEffect::ReadsUntrusted),
     ("list_projects", ToolEffect::ReadsOwn),
     ("list_proposals", ToolEffect::ReadsOwn),
+    // `Acts` even though it acts on nothing at the moment it is called. The classification answers
+    // "what does this do to the turn that called it", and what this does is put an email, a file or
+    // a calendar entry on a path to happening. Grading it `ReadsOwn` because the immediate effect is
+    // one row would open precisely the laundry chute `read_team_file`'s comment describes: a page
+    // read in one tool, an action requested in the next, and the taint rule stepping over both.
+    ("propose_action", ToolEffect::Acts),
     // A specialist that read the web writes the web into its answer, so whoever reads that answer
     // afterwards is reading content nobody vouched for. Grading it `ReadsOwn` because the bytes are
     // ours would build the exact laundry chute a department needs least: untrusted text in one end,
@@ -771,6 +814,14 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "read_team_file" => {
                 self.tools
                     .read_team_file(Parameters(parsed!(PathParams)))
+                    .await
+            }
+            // No `spend_is_permitted` guard, unlike `create_run` below: asking for an action starts
+            // no model and costs nothing. What governs it is the alçada and the queue ceiling, both
+            // read by the daemon on the other side of this call.
+            "propose_action" => {
+                self.tools
+                    .propose_action(Parameters(parsed!(ProposeActionParams)))
                     .await
             }
             "web_search" => {
@@ -1046,6 +1097,7 @@ mod tests {
                 "list_files",
                 "list_projects",
                 "list_proposals",
+                "propose_action",
                 "read_team_file",
                 "reject_proposal",
                 "set_kill",
@@ -1385,14 +1437,20 @@ mod tests {
     /// boundary, and the two names asserted absent below are the ones that would turn a department
     /// into a machine that starts runs.
     #[test]
-    fn every_team_tool_only_reads() {
-        for name in TEAM_TOOLS {
-            assert_ne!(
-                tool_effect(name),
-                ToolEffect::Acts,
-                "{name} is on a department's list and acts"
-            );
-        }
+    fn a_department_reads_and_declares_and_does_nothing_else() {
+        // The exception is written out rather than derived, so a SECOND acting tool cannot arrive
+        // quietly on the coat-tails of the first. `propose_action` performs nothing when called: it
+        // records what the department would like done, and the core does it later if a human
+        // agrees. It is graded `Acts` deliberately, so the taint rule shuts it after a page is read.
+        let acting: Vec<&&str> = TEAM_TOOLS
+            .iter()
+            .filter(|name| tool_effect(name) == ToolEffect::Acts)
+            .collect();
+        assert_eq!(
+            acting,
+            [&"propose_action"],
+            "a department's list holds exactly one acting tool, and it is the one that only asks"
+        );
 
         for name in ["create_run", "create_job"] {
             assert!(

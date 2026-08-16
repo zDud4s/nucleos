@@ -256,6 +256,40 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Ask the core to do something on the calling department's behalf.
+    ///
+    /// **The run is not an argument**, for `read_team_file`'s reason one method up: the department
+    /// is named by the key that authenticated the call, never by the body.
+    ///
+    /// Unlike every other method here, a refusal is READ AND RETURNED rather than reduced to a
+    /// status. Every refusal on this route carries a sentence written for the model — "this
+    /// department may not send email", "you already have five waiting for approval" — and each one
+    /// leads somewhere different: rewrite the request, ask for something else, or say plainly in the
+    /// deliverable that it could not be done. A bare `403` leads to a retry.
+    pub async fn propose_action(
+        &self,
+        kind: &str,
+        payload: &Value,
+        why: &str,
+    ) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/team-actions")
+            .json(&serde_json::json!({ "kind": kind, "payload": payload, "why": why }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
     /// What is in the files folder. Reading only — there is deliberately no client method here for
     /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
     /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.

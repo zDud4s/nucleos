@@ -126,7 +126,18 @@ pub fn build_router(state: AppState) -> Router {
             "/team-runs/{id}/cancel",
             post(crate::team::post_team_run_cancel),
         )
+        .route(
+            "/team-runs/{id}/actions",
+            get(crate::team::list_team_run_actions),
+        )
         .route("/team-files/read", post(crate::team::post_read_file))
+        // Two callers, two methods, two scopes. A department POSTs what it would like done; only
+        // the owner reads the queue of them. `auth::TEAM_ROUTES` lists the POST and not the GET, and
+        // that pair is the whole of a department's authority to act.
+        .route(
+            "/team-actions",
+            post(crate::team::post_team_action).get(crate::team::list_open_actions),
+        )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -171,6 +182,7 @@ pub fn build_router(state: AppState) -> Router {
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
         .route("/proposals/skipped-items", get(get_skipped_items))
+        .route("/proposals/team-actions", get(get_team_action_proposals))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
         .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
@@ -856,6 +868,24 @@ async fn get_contacts(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "reading the contact roster failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The things departments have asked for and nobody has answered yet.
+///
+/// A door of its own rather than a slice of `/proposals`, which filters to `action-approval` and
+/// would need widening — and widening it would put two decisions with the same button next to each
+/// other: one resumes a paused run holding a worktree, the other authorises an email from a
+/// department that finished hours ago. `list_skipped_items` split off for exactly this reason.
+async fn get_team_action_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending_team_actions(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending team actions failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -3573,6 +3603,39 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "team-action" {
+        // Fifth kind through this door, and the only one where approving DOES NOTHING but say yes.
+        // The action is carried out by `team::execute_due_actions` on the next tick, and that is the
+        // design rather than an omission: an HTTP handler that sends an email holds the connection
+        // open while a slow SMTP thinks, and a daemon restarted in the middle loses the action with
+        // no trace. A `pending` row survives a restart; an `await` in a handler does not.
+        //
+        // Uncancellable all the same, for the reason the four above are: the decision commits.
+        let state = state.clone();
+        let decided = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "approved", "approved by user").await
+        })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match decided {
+            Ok(true) => Ok(Json(serde_json::json!({
+                "queued": "the department's action will be carried out shortly",
+            }))),
+            // The compare-and-set lost: somebody decided this while the request was in flight.
+            Ok(false) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "approving a team action failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the approval could not be recorded".to_owned(),
+                ))
+            }
+        };
+    }
+
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
@@ -3681,6 +3744,32 @@ async fn post_proposal_reject(
             }
             Err(crate::exclusion::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "team-action" {
+        // Refusing closes the action as well as the proposal, in that order: the proposal is the
+        // decision and the action is what is left to do about it, and leaving the second `pending`
+        // would keep it in the department's queue ceiling forever, blocking the next request over a
+        // question already answered.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            let decided =
+                crate::proposals::transition(&state.pool, id, "rejected", "rejected by user")
+                    .await?;
+            if decided {
+                crate::team::refuse_action(&state.pool, id).await?;
+            }
+            Ok::<bool, sqlx::Error>(decided)
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting a team action failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
