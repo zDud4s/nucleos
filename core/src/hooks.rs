@@ -2416,6 +2416,143 @@ mod tests {
         );
     }
 
+    /// An assistant run answering an errand's topic: the errand row, and a run whose `chat_id` is
+    /// the key that row is registered under.
+    ///
+    /// Nothing on the run says "errand" — the join is the chat key and only the chat key, which is
+    /// the walk `errand_of_run` has to make on every single tool call an errand's turn produces.
+    ///
+    /// Returns `(errand_id, run_id)`.
+    async fn errand_bound_run(state: &AppState, chat_key: &str) -> (i64, i64) {
+        let errand_id = crate::errands::create(&state.pool, "carros", chat_key)
+            .await
+            .unwrap();
+        let run_id = in_flight_run(state, "assistant", None, None, None).await;
+        sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
+            .bind(chat_key)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        (errand_id, run_id)
+    }
+
+    /// `WritesOwn` on the far side of the barrier, which is the whole reason the variant exists.
+    ///
+    /// The order here is the order every errand actually runs in: read its own notes, read the open
+    /// web, write down what it found. The web read drops the barrier — `create_run` at the end
+    /// proves the barrier is genuinely down and not merely untested — and the write still has to go
+    /// through, because an errand that researches and can never record is not an errand.
+    ///
+    /// If `errand_files_write` were ever moved to `Acts`, or the `WritesOwn` arm folded into the
+    /// `Acts` arm, this test is what says so: the third assertion flips and nothing else does.
+    #[tokio::test]
+    async fn an_errand_still_writes_its_own_notes_after_reading_the_web() {
+        let state = test_state().await;
+        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:7").await;
+        let app = test_router(state.clone());
+
+        // A file this errand recorded, written by a turn that had read nothing third-party: the one
+        // shape `errand_file_read_effect` lets back as own.
+        crate::errands::record_artifact(&state.pool, errand_id, "notas.md", false, None)
+            .await
+            .unwrap();
+        let own = orchestrator_tool(
+            &app,
+            run_id,
+            "errand_files_read",
+            serde_json::json!({"path": "notas.md"}),
+        )
+        .await;
+        assert_eq!(own.decision, "allow");
+        assert!(
+            !crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "reading back a file this errand itself wrote clean is not reading a stranger"
+        );
+
+        let web = orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        assert_eq!(
+            web.decision, "allow",
+            "reading the web is what an errand is for"
+        );
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "the turn now has a stranger's words in it and must be on record as having them"
+        );
+
+        let write = orchestrator_tool(
+            &app,
+            run_id,
+            "errand_files_write",
+            serde_json::json!({"path": "notas.md", "content": "1998 Golf, 3200 EUR"}),
+        )
+        .await;
+        assert_eq!(
+            write.decision, "allow",
+            "an errand that cannot record what it found is not an errand"
+        );
+
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+        assert_eq!(
+            act.decision, "deny",
+            "the allow above must be WritesOwn passing the barrier, not a barrier that never closed"
+        );
+    }
+
+    /// A run with no chat has no errand, and `errand_of_run` says so rather than guessing.
+    ///
+    /// The path asked for is a real one, recorded clean under a real errand — so if this walk ever
+    /// answered `Some` for a run that names no chat, the read would come back `ReadsOwn` and the
+    /// turn would stay unmarked. That is the laundering direction: one errand's marks vouching for
+    /// a turn that was never that errand's. `None` is read as "cannot say", and cannot-say is a
+    /// stranger.
+    #[tokio::test]
+    async fn a_run_with_no_chat_borrows_no_errands_marks() {
+        let state = test_state().await;
+        let errand_id = crate::errands::create(&state.pool, "carros", "-1002003004:7")
+            .await
+            .unwrap();
+        crate::errands::record_artifact(&state.pool, errand_id, "notas.md", false, None)
+            .await
+            .unwrap();
+
+        // Same mode, same tool, same path as the test above — the only difference is the missing
+        // `chat_id`, so that is the only thing the different outcome can be attributed to.
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let read = orchestrator_tool(
+            &app,
+            run_id,
+            "errand_files_read",
+            serde_json::json!({"path": "notas.md"}),
+        )
+        .await;
+        assert_eq!(read.decision, "allow", "the read itself is not the refusal");
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "a file classified against an errand this run does not belong to must count as a stranger's words"
+        );
+    }
+
     /// One NucleOS tool call in an orchestrator turn, named the way the CLI names it.
     async fn orchestrator_tool(
         app: &Router,
