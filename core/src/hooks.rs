@@ -441,7 +441,11 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                         tool,
                         "pretooluse-decision: refused an action in a turn that has read third-party content"
                     );
-                    record_refused_action(state, payload, tool).await;
+                    // The errand this arm already resolved, rather than a second walk: the two
+                    // could disagree only by being asked at different moments, and a record naming
+                    // a different errand than the one the barrier judged is worse than an unnamed
+                    // one.
+                    record_refused_action(state, payload, tool, errand).await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -490,7 +494,12 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
 /// morning is answering a different question from the model's: not "may I", but "should I do this
 /// myself". The tool input travels with it for the same reason — an errand asking to email a dealer
 /// is a decision nobody can take from the tool name alone.
-async fn record_refused_action(state: &AppState, payload: &PreToolUsePayload, tool: &str) {
+async fn record_refused_action(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    tool: &str,
+    errand: Option<i64>,
+) {
     let session_id =
         sqlx::query_scalar::<_, Option<String>>("SELECT session_id FROM runs WHERE id = ?")
             .bind(payload.run_id)
@@ -504,7 +513,7 @@ async fn record_refused_action(state: &AppState, payload: &PreToolUsePayload, to
         &state.pool,
         payload.run_id,
         session_id.as_deref(),
-        None,
+        errand,
         tool,
         UNTRUSTED_CONTEXT_DENY_REASON,
         Some(&payload.tool_input.to_string()),
@@ -2649,6 +2658,43 @@ mod tests {
             "with enough of it to decide on: {:?}",
             refused[0].tool_input
         );
+    }
+
+    /// A record that does not say which errand it came from is a record nobody can decide on.
+    ///
+    /// "Approve: send_email" tells a person the verb and nothing else. Approving it anyway is what
+    /// turns an approval step into a formality, which is the worst thing an approval step can be —
+    /// it costs the interruption and buys none of the safety. The errand is the missing half: what
+    /// this is about, and therefore whether the answer is yes.
+    ///
+    /// The name and not only the id, because an id is a thing to go and look up, and a step that
+    /// requires a lookup before it can be answered is a step that gets answered without one.
+    #[tokio::test]
+    async fn a_refused_action_says_which_errand_wanted_it() {
+        let state = test_state().await;
+        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:11").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused[0].errand_id, Some(errand_id));
+        assert_eq!(refused[0].errand_name.as_deref(), Some("carros"));
     }
 
     /// The guard. If this fails, piece 5 has put a human step in front of everything that worked

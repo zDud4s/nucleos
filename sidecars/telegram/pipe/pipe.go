@@ -67,6 +67,10 @@ type Daemon interface {
 	SendAssistantMessage(chatKey, text string) (int64, error)
 	GetRun(id int64) (map[string]any, error)
 	GetProposals() ([]map[string]any, error)
+	// GetRefusedActions is what the injection barrier turned away. A separate route from the one
+	// above, because these carry no approve and no reject — nothing is held, so there is nothing to
+	// let through or release.
+	GetRefusedActions() ([]map[string]any, error)
 	GetProjects() ([]map[string]any, error)
 	ApproveProposal(id int64) (map[string]any, error)
 	RejectProposal(id int64) error
@@ -571,8 +575,19 @@ func formatProposal(p map[string]any) string {
 	if reasoning, ok := p["reasoning"].(string); ok && reasoning != "" {
 		result += "\nwhy: " + reasoning
 	}
-	if project, ok := p["project_id"]; ok {
-		result += "\nproject: " + fmt.Sprint(project)
+	// Type assertion and not key presence. The field is always THERE — serde writes
+	// `"project_id": null` for anything that has none — so testing presence printed
+	// "project: <nil>" under every errand proposal and every machine-wide one. It looks like a
+	// cosmetic slip and it is not: this is the line somebody reads to decide what they are
+	// approving, and a rendered null is noise in exactly the place that has to be legible.
+	if project, ok := p["project_id"].(string); ok && project != "" {
+		result += "\nproject: " + project
+	}
+	// An errand has no project, so this is the only thing in the row that says whose work it was.
+	// The name and not the id: a step that needs a lookup before it can be answered is a step that
+	// gets answered without one.
+	if errand, ok := p["errand_name"].(string); ok && errand != "" {
+		result += "\nassunto: " + errand
 	}
 	return result
 }
@@ -624,12 +639,30 @@ func sendProposals(bot Bot, dc Daemon, to telegram.Destination) {
 		logSend("proposals error", bot.SendMessage(to, "couldn't fetch proposals: "+err.Error()))
 		return
 	}
-	if len(props) == 0 {
+	// Read before the early return below, so a machine with nothing to approve and something
+	// refused does not answer "no pending proposals" and hide the second list entirely.
+	//
+	// A failure here is reported and does not take the approvable ones down with it: the two lists
+	// are separate routes and the one that answered is still worth showing.
+	refused, refusedErr := dc.GetRefusedActions()
+	if refusedErr != nil {
+		logSend("refused actions error", bot.SendMessage(to,
+			"couldn't fetch what the barrier refused: "+refusedErr.Error()))
+	}
+
+	if len(props) == 0 && len(refused) == 0 {
 		logSend("no proposals", bot.SendMessage(to, "no pending proposals"))
 		return
 	}
 	for _, p := range props {
 		logSend("proposal", bot.SendMessageWithButtons(to, formatProposal(p), approveRejectRow(idOf(p))))
+	}
+	// No buttons. Neither /approve nor /reject works on one of these — both answer 409 for anything
+	// that is not an action-approval — and there is nothing held to release: the turn was denied and
+	// carried on. What this is for is that somebody finds out, does the thing themselves, or asks
+	// the errand again in a turn that starts clean and may act.
+	for _, r := range refused {
+		logSend("refused action", bot.SendMessage(to, "recusado pela barreira — "+formatProposal(r)))
 	}
 }
 

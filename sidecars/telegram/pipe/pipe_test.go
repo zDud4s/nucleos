@@ -65,6 +65,8 @@ func (b *recordingBot) AnswerCallbackQuery(callbackID, text string) error {
 type recordingDaemon struct {
 	sendAssistantErr   error
 	sendAssistantCalls int
+	// refused is what the injection barrier turned away and nobody has read yet.
+	refused []map[string]any
 	// lastChatID is the key the daemon was told to route on, which is the string an errand is
 	// registered under — so a test can prove the topic survived the trip.
 	lastChatID string
@@ -113,6 +115,10 @@ func (d *recordingDaemon) GetRun(int64) (map[string]any, error) {
 
 func (d *recordingDaemon) GetProposals() ([]map[string]any, error) {
 	return nil, nil
+}
+
+func (d *recordingDaemon) GetRefusedActions() ([]map[string]any, error) {
+	return d.refused, nil
 }
 
 func (d *recordingDaemon) GetProjects() ([]map[string]any, error) {
@@ -902,6 +908,78 @@ func TestAReplyGoesBackToTheTopicItCameFrom(t *testing.T) {
 	}
 	if dc.lastChatID != "-100123:7" {
 		t.Errorf("the daemon was told chat %q, want the topic key", dc.lastChatID)
+	}
+}
+
+// A proposal with no project must not claim one.
+//
+// `project_id` is always PRESENT in the JSON and null for anything that is not a project's — serde
+// writes the field either way — and the old check tested presence, so every errand proposal and
+// every machine-wide one rendered "project: <nil>". Harmless-looking, and it is the line a person
+// reads to decide what they are approving.
+func TestAProposalWithoutAProjectDoesNotInventOne(t *testing.T) {
+	got := formatProposal(map[string]any{
+		"id":         float64(4),
+		"tool_name":  "send_email",
+		"reasoning":  "this turn has read third-party content and can no longer act",
+		"project_id": nil,
+		"errand_id":  nil,
+	})
+
+	if strings.Contains(got, "project") {
+		t.Errorf("formatProposal = %q, want no project line for a proposal that has none", got)
+	}
+	if strings.Contains(got, "nil") || strings.Contains(got, "null") {
+		t.Errorf("formatProposal = %q, want no rendered null", got)
+	}
+}
+
+// And one that DOES belong to an errand says which.
+//
+// "approve: send_email" is a verb with its subject missing. Answered without the subject, the
+// approval step costs the interruption and buys none of the safety, which is the worst thing an
+// approval step can be.
+func TestAProposalFromAnErrandSaysWhichErrand(t *testing.T) {
+	got := formatProposal(map[string]any{
+		"id":          float64(4),
+		"tool_name":   "send_email",
+		"reasoning":   "this turn has read third-party content and can no longer act",
+		"project_id":  nil,
+		"errand_id":   float64(2),
+		"errand_name": "carros usados",
+	})
+
+	if !strings.Contains(got, "carros usados") {
+		t.Errorf("formatProposal = %q, want the errand's name", got)
+	}
+}
+
+// The record has to reach the person, and the person is here.
+//
+// Listed under /proposals with the approvable ones because that is the command somebody already
+// types, and separated from them by having no buttons: /approve and /reject answer 409 for anything
+// that is not an action-approval, so a button here would be one that cannot work.
+func TestProposalsAlsoShowsWhatTheBarrierRefused(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &recordingDaemon{refused: []map[string]any{{
+		"id":          float64(9),
+		"tool_name":   "send_email",
+		"reasoning":   "this turn has read third-party content and can no longer act",
+		"errand_id":   float64(2),
+		"errand_name": "carros usados",
+	}}}
+
+	HandleMessage(bot, dc, NewTracker(), topic(-100123, 7), "/proposals")
+
+	all := ""
+	for _, m := range bot.messages {
+		all += m.text + "\n"
+	}
+	if !strings.Contains(all, "send_email") || !strings.Contains(all, "carros usados") {
+		t.Errorf("messages = %q, want the refused action and its errand", all)
+	}
+	if bot.buttonCalls != 0 {
+		t.Errorf("button sends = %d, want none: neither approve nor reject works on this", bot.buttonCalls)
 	}
 }
 

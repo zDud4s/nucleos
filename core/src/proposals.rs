@@ -9,6 +9,19 @@ pub struct Proposal {
     pub run_id: Option<i64>,
     pub session_id: Option<String>,
     pub project_id: Option<String>,
+    /// The errand this came from, when it came from one — which is almost never.
+    ///
+    /// Not derivable from `project_id`: an errand HAS no project, so an errand's proposal and a
+    /// machine-wide one both carry `project_id IS NULL` and nothing else in the row tells them
+    /// apart.
+    pub errand_id: Option<i64>,
+    /// The errand's name, joined in by the queries whose readers need it and `NULL` in the rest.
+    ///
+    /// Carried on the same struct rather than in a second type, because the alternative was a
+    /// near-copy of eleven fields that would drift the first time one of them changed. The `NULL AS
+    /// errand_name` in the other queries is what keeps that honest: a reader that gets `None` is
+    /// being told this query did not ask, and the id is still there to ask with.
+    pub errand_name: Option<String>,
     pub tool_name: Option<String>,
     pub reasoning: String,
     pub tool_input: Option<String>,
@@ -90,7 +103,7 @@ pub async fn create_refused_action(
     pool: &SqlitePool,
     run_id: i64,
     session_id: Option<&str>,
-    project_id: Option<&str>,
+    errand_id: Option<i64>,
     tool_name: &str,
     reasoning: &str,
     tool_input: Option<&str>,
@@ -99,12 +112,12 @@ pub async fn create_refused_action(
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         "INSERT INTO proposals
-         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         (kind, status, run_id, session_id, errand_id, tool_name, reasoning, tool_input, created_at, decided_at)
          VALUES ('refused-action', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
     )
     .bind(run_id)
     .bind(session_id)
-    .bind(project_id)
+    .bind(errand_id)
     .bind(tool_name)
     .bind(reasoning)
     .bind(tool_input)
@@ -133,11 +146,17 @@ pub async fn create_refused_action(
 /// for anything that is not an `action-approval`.
 pub async fn list_refused_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
-                tool_input, created_at, decided_at
-         FROM proposals
-         WHERE status = 'pending' AND kind = 'refused-action'
-         ORDER BY id ASC",
+        // The one query that joins. A person reading this list is deciding whether to do the thing
+        // themselves, and "send_email" without the errand is not a decidable question — it is the
+        // verb with the subject missing. LEFT, so a refused action with no errand (an ordinary chat
+        // that read its mail and then reached for a control) still appears, unnamed.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
+                e.name AS errand_name, p.tool_name, p.reasoning,
+                p.tool_input, p.created_at, p.decided_at
+         FROM proposals p
+         LEFT JOIN errands e ON e.id = p.errand_id
+         WHERE p.status = 'pending' AND p.kind = 'refused-action'
+         ORDER BY p.id ASC",
     )
     .fetch_all(pool)
     .await
@@ -306,7 +325,8 @@ pub async fn calendar_proposal_pending_for(pool: &SqlitePool, email_id: i64) -> 
 
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals WHERE id = ?",
     )
@@ -317,7 +337,8 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
 
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'action-approval'
@@ -341,7 +362,8 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
 /// queue is worked front to back, and this is read the morning after.
 pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'skipped-item'

@@ -103,6 +103,27 @@ func (c *Client) GetProposals() ([]map[string]any, error) {
 	return proposals, nil
 }
 
+// GetRefusedActions reads what the injection barrier turned away and nobody has put away yet.
+//
+// Its own route rather than a filter on `/proposals`: that list feeds approve and reject, and both
+// answer 409 for anything that is not an action-approval. A refused action was never held — the
+// turn was denied and carried on — so there is nothing to let through and nothing to release.
+func (c *Client) GetRefusedActions() ([]map[string]any, error) {
+	body, status, err := c.do(http.MethodGet, "/proposals/refused-actions", nil)
+	if err != nil {
+		return nil, fmt.Errorf("get refused actions: %w", err)
+	}
+	if err := statusError("get refused actions", status, body); err != nil {
+		return nil, err
+	}
+
+	var refused []map[string]any
+	if err := json.Unmarshal(body, &refused); err != nil {
+		return nil, fmt.Errorf("parse refused actions response: %w", err)
+	}
+	return refused, nil
+}
+
 func (c *Client) GetProjects() ([]map[string]any, error) {
 	body, status, err := c.do(http.MethodGet, "/projects", nil)
 	if err != nil {
