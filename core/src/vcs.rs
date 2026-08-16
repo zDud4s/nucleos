@@ -697,6 +697,48 @@ pub async fn resolve_repo(
 /// A `target` of `HEAD` is refused rather than passed on. It is what `rev-parse --abbrev-ref` says
 /// for a detached HEAD, and it is meaningless as a merge target besides — the integration worktree's
 /// own HEAD is always detached, so publishing "into HEAD" names nothing.
+/// PURE: the command segments a shell string holds, in order, with any leading environment
+/// assignments stripped.
+///
+/// **Every parser below matches the WHOLE token list as an exact shape, which is right for what
+/// they are and wrong for what they were being handed.** `merge_from_command` accepts
+/// `[program, subcommand, source]` and nothing longer — a deliberate strictness, argued at length
+/// in its own comment, so that a spelling the queue cannot perform keeps working directly instead
+/// of becoming impossible. But `cd repo && git merge feature` is not a different spelling of merge.
+/// It is the same operation with a shell in front of it, and the exact-shape match cannot see it:
+/// five tokens, no match, `None` — and `session_git_decision` reads `None` as "not mine", which is
+/// an ALLOW. Every guarantee the queue makes was one `cd` away from being optional.
+///
+/// Splitting here rather than loosening the parsers keeps that strictness intact: each segment is
+/// still matched as a whole shape, there are just more of them. A segment that is not a git command
+/// matches nothing, exactly as an unrecognised command does today.
+///
+/// Not a shell parser, and it must not become one. Quoting is ignored, so
+/// `echo "a; git merge x"` yields a segment that parses as a merge and is refused. That direction is
+/// the safe one — the refusal is a sentence a person can reword, and the caller cannot approve
+/// anything with it — and it is the same trade `ask_daemon.py`'s own filter makes for the same
+/// reason.
+pub fn shell_segments(command: &str) -> Vec<&str> {
+    command
+        .split(['\n', '\r', ';', '&', '|', '(', ')'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            // `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and
+            // leaving them in makes `program` read `FOO=bar` and the whole segment parse as nothing.
+            let mut rest = segment;
+            while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+                if head.contains('=') && !head.starts_with('-') {
+                    rest = tail.trim_start();
+                } else {
+                    break;
+                }
+            }
+            rest
+        })
+        .collect()
+}
+
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     // Matched as whole shapes rather than by filtering the flag out of the token list, and the
@@ -2791,6 +2833,71 @@ mod tests {
             "git merge --no-ff feature other",
         ] {
             assert_eq!(merge_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// The bypass every parser in this file was open to, and it needed no cleverness to use.
+    ///
+    /// Each of them matches the whole token list as an exact shape, so a shell operator in front of
+    /// the git command makes the list longer and the match fail — `None`, which
+    /// `session_git_decision` reads as "not an operation this queue performs" and ALLOWS. A `cd` was
+    /// enough. Measured on the running daemon before this existed: `cd repo && git merge master`
+    /// came back `allow` from the route whose whole purpose is to refuse exactly that.
+    ///
+    /// The asserted cases are the shapes that actually occur — a directory change first, a chained
+    /// `&&`, one per line — plus an environment assignment, which breaks the match for a different
+    /// reason (`program` reads `FOO=bar`) and would otherwise be a second bypass wearing the same
+    /// clothes.
+    #[test]
+    fn a_git_command_behind_a_shell_operator_is_still_the_operation_it_names() {
+        let wrapped = [
+            "cd /repo && git merge feature",
+            "cd /repo\ngit merge feature",
+            "true; git merge feature",
+            "echo hi | git merge feature",
+            "FOO=bar git merge feature",
+            "cd /repo && git merge feature && echo done",
+        ];
+        for command in wrapped {
+            // The defect itself, pinned rather than described: handed the whole command, the parser
+            // still answers `None`. That is not a thing to fix in the parser — its exact-shape match
+            // is what keeps `--squash` working directly — so this line must keep passing, and it is
+            // what makes the assertion below about the SPLIT rather than about merge parsing.
+            assert_eq!(
+                merge_from_command(command, "master"),
+                None,
+                "unsplit, this is the bypass: {command}"
+            );
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(
+                found,
+                Some(Op::Merge {
+                    source: Branch::new("feature").unwrap(),
+                    target: Branch::new("master").unwrap(),
+                }),
+                "{command}"
+            );
+        }
+    }
+
+    /// And splitting must not turn a command that is NOT a queue operation into one, which is the
+    /// cost a looser parser would have carried. The strictness stays where it was: each segment is
+    /// still matched as a whole shape, so every spelling the queue declines keeps working directly.
+    #[test]
+    fn splitting_a_command_does_not_invent_an_operation() {
+        for command in [
+            "cd /repo && git status",
+            "cd /repo && git merge --squash feature",
+            "echo git && echo merge && echo feature",
+            "cd /repo",
+            "",
+        ] {
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(found, None, "{command}");
         }
     }
 

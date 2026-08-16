@@ -97,12 +97,22 @@ pub async fn session_git_decision(
         return no_opinion();
     };
 
-    let Some(op) = crate::vcs::merge_from_command(command, &branch)
-        .or_else(|| crate::vcs::push_from_command(command, &branch))
-        .or_else(|| crate::vcs::tag_from_command(command, &branch))
-        .or_else(|| crate::vcs::fetch_from_command(command))
-        .or_else(|| crate::vcs::branch_delete_from_command(command))
-        .or_else(|| crate::vcs::rebase_from_command(command, &branch))
+    // Per SEGMENT, not per command. Every parser below matches its whole token list as an exact
+    // shape, so a shell operator in front of the git call made the list longer and the match fail —
+    // and a failed match here is an ALLOW. `cd repo && git merge master` was permitted by the route
+    // whose entire purpose is to refuse it, measured against the running daemon. The strictness of
+    // the parsers is not what was wrong and is not touched; they are simply asked about each command
+    // in the line rather than about the line.
+    let Some(op) = crate::vcs::shell_segments(command)
+        .into_iter()
+        .find_map(|segment| {
+            crate::vcs::merge_from_command(segment, &branch)
+                .or_else(|| crate::vcs::push_from_command(segment, &branch))
+                .or_else(|| crate::vcs::tag_from_command(segment, &branch))
+                .or_else(|| crate::vcs::fetch_from_command(segment))
+                .or_else(|| crate::vcs::branch_delete_from_command(segment))
+                .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
+        })
     else {
         return no_opinion();
     };
