@@ -137,10 +137,95 @@ measured in the email pillar, recorded in `.ai/memory.md` — so a local model c
 into its own `summary` field. Quarantine reduces the surface from a whole page to a few hundred structured tokens; it
 does not reach zero. The barrier that does the work is the turn marking above, not the summary.
 
-**When `render: true` stops answering 501, this section has to be rewritten first, not after.** A browser driving real
-sessions is a different threat model, and the University of Washington's July 2026 study found four of seven agentic
-browsers letting attackers bypass the same-origin policy. The seam is in `sidecars/web/serve/serve.go` and
-`web_client::fetch`.
+## The browser
+
+The previous version of this file said, of the `render: true` seam, *"when this stops answering 501, this section has to
+be rewritten first, not after."* This is that rewrite, and it lands before the fence is built rather than after — the
+pillar is still `enabled: false`.
+
+A browser driving real sessions is a different threat model from reading a page. The University of Washington's July 2026
+study found four of seven agentic browsers letting attackers bypass the same-origin policy, and the honest reading of
+that is not that those teams were careless. **An agentic browser cannot stop a page from convincing the agent.** The page
+is the input; persuasion is what text does. So this pillar does not try to bound the deception. It bounds the
+CONSEQUENCE: being fooled must not be able to leave the browser.
+
+That claim is worth exactly as much as the fence behind it, which is why every hole below is named rather than implied.
+
+### What the fence is, after measurement
+
+The design originally named one mechanism and got it wrong. A spike against Chrome 151 (2026-08-15) measured each one,
+and the fence is now three things, none of which is sufficient alone:
+
+1. **`Fetch` interception on the BROWSER session** — not a page session. With the interception on a page, a service
+   worker's script fetch never appears at all: the origin serves it and the worker installs into the profile. On the
+   browser session the same request is intercepted and the registration does not happen. This was never a limit of
+   Chrome; it was where the fence hung.
+2. **A loopback proxy the browser is launched behind.** `Network.setBlockedURLs` does NOT stop a WebSocket handshake —
+   measured, with a control — and `Fetch` never sees a `ws://` url at all. The proxy sees it as `CONNECT host:port` and
+   can refuse. `setBlockedURLs` is no longer relied on for anything.
+3. **CSP injected by rewriting response headers**, which is what covers the channels the other two cannot see.
+
+Plus `--block-new-web-contents`, which makes `window.open` return null, and `Target.setAutoAttach` with
+`waitForDebuggerOnStart`, which is what closes the window in which a new target could navigate before the interception
+was on it. A popup is identified by `openerId` and never by arrival order: Chrome raises several page attaches for one
+`window.open`, and binding the fence to the wrong one fails silently.
+
+**If the interception cannot be attached, the browser does not navigate.** In the code there is no unfenced state to
+forget: `chrome.Connect` is the only constructor, it arms the fence first, and it returns an error instead of a driver.
+
+### Holes, named
+
+- **WebRTC egress is open.** A page can point `RTCPeerConnection` at a STUN server of its choosing and put bytes in the
+  username; that is a UDP packet to an address the page picked, and it touches neither HTTP nor the proxy. Measured
+  against a real STUN responder on a LAN address: the packet arrives. CSP `webrtc 'block'` is ignored by this Chrome;
+  `--disable-webrtc`, `--disable-features=WebRtc` and `--disable-blink-features=RTCPeerConnection` do not remove the
+  global; deleting the global on every new document survives in a cross-site iframe even with recursive auto-attach and
+  the target paused before it runs; and `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` with a working proxy
+  still lets the packet out. **The bound is same-origin:** the page exfiltrates what is already its own, not another
+  origin's data in the profile. The remaining mechanism is outside the browser — a firewall rule on the process — and is
+  untested.
+- **An arbitrary `GET` under the person's authenticated identity.** `browser_open(url)` reaches any path of a permitted
+  host, and `/logout`, `/unsubscribe?token=…`, `/approve?id=…` are all `GET`s that change things. Nothing mitigates this
+  in v1; the designed path is a proposal the person approves.
+- **`blob:` and `javascript:` navigate without the fence seeing them.** `Page.setControlNavigations` was removed with no
+  successor, and top-level `data:` is refused by Chrome itself. What contains the other two is that a `blob:` document
+  **inherits the parent's CSP** — measured, with a control that escapes when the parent carries none. So the residual is
+  that the agent can be reading a document the URL bar misdescribes. It is not a path for data to leave.
+- **Sub-resources are not filtered.** A permitted site that loads a script from a compromised CDN exposes the profile.
+  This is equally true in the person's own browser; it is stated rather than solved.
+- **Chromium talks to Google on its own.** A `crashpad-handler` runs with `--url=https://clients2.google.com/cr/report`
+  and survives `--disable-crash-reporter`, `--disable-breakpad`, `--no-report-upload` and
+  `--disable-background-networking`. **No upload was demonstrated** — the process carrying a url is not a report being
+  sent, and sending depends on a consent that is off in a fresh profile. It is an open verification, not a known leak.
+
+### The partition, and what the agent may never choose
+
+Profiles are per project, and a session's profile is chosen by the núcleo — `browser_policy::decide` in Rust, pure and
+table-tested. The wire type the agent reaches has **no profile field**, guarded by a test, because a caller that could
+name its own profile could name the identity it browses under and every list above would be decoration.
+
+Matching is on the whole origin: scheme, host and port, exactly. This is deliberately stricter than `trust.rs`, which
+covers subdomains — inside a profile holding live session cookies a subdomain is a different principal, and one XSS
+anywhere in the zone would otherwise reach the session. A host that is not on the list is not refused; it is handed to a
+throwaway profile, where a stranger's page runs with no login to steal. A login the person completes grants the whole
+chain it traversed, once, at return, because real SSO is not one host and granting only the destination would leave every
+later login looking like a broken allowlist.
+
+**Reach: the v1 serves the assistant.** An autonomous pillar is refused structurally (`reach-undesigned`, not
+recoverable); an assistant turn with nobody in the foreground is refused situationally (`no-one-present`, recoverable by
+opening the shell). Those are two rules and not one because the requester is derived from owner presence, which cannot
+tell a cron job from a Telegram message at midnight — and telling that person "autonomous reach is not designed" would
+send them to fix something that is not broken.
+
+### What this does not solve
+
+Prompt injection. The agent reads text a stranger wrote and can be talked into anything that text can express. Everything
+above is about what happens next, and there is no line in it that makes the agent harder to persuade.
+
+The tool classification depends on the fence being real. The browser tools are registered as non-`Acts` — they do not
+mark a run's taint barrier — **because** the fence means they cannot act off the machine. That is an assertion about the
+fence, not about the tools, and it is why the tools are registered last, after the fence's tests are green. If a hole
+above is ever found to be wider than stated, the classification is what has to be revisited, not just the hole.
 
 ## The council
 
@@ -232,3 +317,7 @@ typo in a list of model names cannot stop the daemon and take mail, autopilot an
 
    What is NOT part of this residual is a secret carried out of the mailbox: `redact_rendered` runs on every tool result on both paths a seat can take — inside `filter_outgoing` for a cloud seat's MCP call, and inside `LocalToolBox::call` for a local one — so a key that happened to be in a message does not reach the answer, let alone the chairman's prompt. That filter recognises shapes it knows and is not a reader of meaning, which is exactly why the residual above is stated in terms of prose. Prose is what it lets through, and prose is what this entry is about.
 12. Nothing in the council has been exercised against a real model. Every integration test drives a scripted `CommandRunner`, and a local seat is proved only as far as landing its `runs` row — no seat, cloud or local, has produced an answer. There is no `.ai/council.yaml` on this machine, so the pillar is dark; the first roster written is the first contact, and the phase-2 and phase-3 prompts are the part with no evidence behind them yet.
+13. **WebRTC leaves the browser pillar's fence open**, and nothing inside Chrome closes it — see "The browser" above for the six mechanisms measured and rejected. The bound is same-origin: a page exfiltrates what is already its own. The remaining mechanism is a firewall rule on the Chromium process, which nobody has written or tested. This is the one hole that would, if it turned out to be wider than stated, require the browser tools' non-`Acts` classification to be revisited.
+14. **An arbitrary `GET` under the owner's authenticated identity** is reachable by `browser_open(url)` on any path of a permitted host. `GET` is not a safe verb in practice — `/logout`, `/unsubscribe?token=…`, `/approve?id=…`. Nothing mitigates it in v1. The designed path is a human-approved proposal, which is not built.
+15. **Nothing in the browser pillar has been exercised against a real browser under the fence.** The driver is tested against a fake CDP endpoint; the mechanisms were measured by a throwaway spike harness, not by the shipped code. The pillar is `enabled: false` and the first `true` is the first contact — the same shape as gaps 10 and 12, recorded before it can be forgotten rather than after.
+16. **The Chromium is pinned but the patching has no owner.** The install refuses an archive without a pinned sha256, and a revision bump is a new directory rather than an overwrite. What does not exist is the process that decides when to bump: a browser that never updates is a browser accumulating known holes, and "we own the version" is only an advantage while somebody moves it.
