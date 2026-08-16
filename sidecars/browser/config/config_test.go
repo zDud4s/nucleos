@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -77,5 +78,58 @@ func TestLoadRejectsNonsenseNumbers(t *testing.T) {
 	t.Setenv("BROWSER_MAX_SESSIONS", "0")
 	if _, err := Load(); err == nil {
 		t.Fatal("zero sessions should be refused, not silently clamped")
+	}
+}
+
+// TestTheCeilingsDefaultToTheOnesTheSpecShips. A sidecar started with nothing but a token must
+// behave the way the documented `.ai/browser.yaml` says it does — otherwise the file people read is
+// not the configuration people run.
+func TestTheCeilingsDefaultToTheOnesTheSpecShips(t *testing.T) {
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.CacheMB != 100 || cfg.MaxProfiles != 20 || cfg.DiskBudgetMB != 3000 {
+		t.Errorf("ceilings: cache %d, profiles %d, disk %d", cfg.CacheMB, cfg.MaxProfiles, cfg.DiskBudgetMB)
+	}
+	if cfg.Root == "" {
+		t.Error("no install root, so the profiles would land wherever the daemon was started from")
+	}
+	if cfg.ExecutablePath != "" {
+		t.Errorf("an executable override appeared from nowhere: %q", cfg.ExecutablePath)
+	}
+}
+
+// TestACeilingOfZeroIsRefused. profile.Limits reads zero as "no ceiling", so a config that let a
+// zero through would turn a typo into an unbounded disk — the one failure spec §8 says this project
+// does not commit anywhere else.
+func TestACeilingOfZeroIsRefused(t *testing.T) {
+	for _, name := range []string{"BROWSER_CACHE_MB", "BROWSER_MAX_PROFILES", "BROWSER_DISK_BUDGET_MB"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
+			t.Setenv(name, "0")
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=0 was accepted", name)
+			}
+			t.Setenv(name, "not a number")
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=nonsense was accepted", name)
+			}
+		})
+	}
+}
+
+// TestTheRootCanBeMoved, because the tests and the gate need somewhere that is not the owner's real
+// profile directory — and because a machine with a small system drive is a real thing.
+func TestTheRootCanBeMoved(t *testing.T) {
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
+	t.Setenv("BROWSER_ROOT", filepath.Join(t.TempDir(), "elsewhere"))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if filepath.Base(cfg.Root) != "elsewhere" {
+		t.Errorf("root: got %q", cfg.Root)
 	}
 }

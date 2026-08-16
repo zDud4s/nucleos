@@ -2,8 +2,10 @@ package launch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,6 +81,31 @@ func waitForPort(marker string, wait time.Duration) (int, error) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return 0, ErrInheritedInstance
+}
+
+// DebuggerURL asks the browser where its WebSocket endpoint is.
+//
+// Deliberately with Proxy: nil. This is our own control channel to a port that asks for no token at
+// all, and it is the one thing on loopback the fence refuses to let a page reach (spec §6.2). Sending
+// it through the fence's own proxy would either fail or, worse, make the proxy the thing that decides
+// whether the driver can talk to its browser.
+func DebuggerURL(port int, timeout time.Duration) (string, error) {
+	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil}}
+	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return "", fmt.Errorf("asking the browser for its debugger url: %w", err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("reading the browser's version payload: %w", err)
+	}
+	if payload.WebSocketDebuggerURL == "" {
+		return "", errors.New("launch: the browser reported no debugger url")
+	}
+	return payload.WebSocketDebuggerURL, nil
 }
 
 // Stop reaps the whole process tree.
