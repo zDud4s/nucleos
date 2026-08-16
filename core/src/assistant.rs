@@ -714,6 +714,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     ambient_mcp: false,
                     // An orchestrator turn is not a job node, so it has no role to route.
                     model: None,
+                    // The wildcard, on purpose: an orchestrator turn acts for the person watching
+                    // the chat and carries the control token, so narrowing what it is offered would
+                    // only take away tools it is entitled to call.
+                    allowed_mcp_tools: None,
                 },
                 session_tx,
                 // Unread here, deliberately. An assistant turn's product is the reply that

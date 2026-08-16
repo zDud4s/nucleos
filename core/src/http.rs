@@ -102,6 +102,31 @@ pub fn build_router(state: AppState) -> Router {
             "/agents/{id}",
             get(get_agent).put(update_agent).delete(delete_agent),
         )
+        // The teams pillar. Everything here is the owner's except the last line: `/team-files/read`
+        // is the only one a team run's own key opens, and which folder it reads is decided by that
+        // key and never by the body — see `team::post_read_file`. `auth::TEAM_ROUTES` is where that
+        // split is actually enforced; this is only where the names appear.
+        .route(
+            "/teams",
+            get(crate::team::list_teams).post(crate::team::create_team),
+        )
+        .route(
+            "/teams/{id}",
+            get(crate::team::get_team)
+                .put(crate::team::update_team)
+                .delete(crate::team::delete_team),
+        )
+        .route("/teams/{id}/runs", post(crate::team::post_team_run))
+        .route("/team-runs", get(crate::team::list_team_runs))
+        .route(
+            "/team-runs/{id}",
+            get(crate::team::get_team_run).delete(crate::team::delete_team_run),
+        )
+        .route(
+            "/team-runs/{id}/cancel",
+            post(crate::team::post_team_run_cancel),
+        )
+        .route("/team-files/read", post(crate::team::post_read_file))
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -1252,7 +1277,14 @@ fn folder_status(error: crate::files::PathError) -> StatusCode {
 }
 
 /// The folder root, or a refusal when startup could not create it.
-fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
+/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
+/// thing worth sharing is the 503: an installation with no files folder configured must answer the
+/// same way whichever route asked.
+///
+/// The teams design asks for more than this — for the root to be promoted out of `EmailRuntime`
+/// now that it is not the mail pillar's alone. That is tidying with a wide diff (every `AppState`
+/// literal in the crate's tests) and no behaviour in it, so it is deliberately not done here.
+pub(crate) fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
     if state.email.files_root.as_os_str().is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -2494,14 +2526,20 @@ struct VcsRequestBody {
 ///
 /// `Run` cannot reach this route today — a run token opens exactly one route, the safety gate — but
 /// mapping it costs nothing and is what the MCP tools will need once a run can submit directly.
-/// `Service` and the lesser API levels are refused rather than guessed at: `permits` should already
-/// have turned them away, so a scope arriving here unaccounted for is a routing bug, and defaulting
-/// it would mean guessing about approval.
+/// `Service`, `TeamRun` and the lesser API levels are refused rather than guessed at: `permits`
+/// should already have turned them away, so a scope arriving here unaccounted for is a routing bug,
+/// and defaulting it would mean guessing about approval.
+///
+/// `TeamRun` is the sharpest of the three. A department has no `vcs::Origin` because it is not
+/// allowed to want one: queueing a merge is the act that makes work survive on a branch other
+/// people build on, and the teams design gives a department no authority to act at all. When that
+/// authority arrives it arrives as its own spec, with a value here chosen on purpose — which is
+/// exactly what a default would have taken away.
 fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
     match scope {
         Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Human),
         Scope::Run(id) => Ok(vcs::Origin::Run(*id)),
-        Scope::Service(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
+        Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
     }
 }
 

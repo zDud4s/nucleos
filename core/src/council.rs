@@ -1296,6 +1296,9 @@ impl Driver {
             messages: None,
             ambient_mcp: false,
             model: Some(seat.model_ref.clone()),
+            // The wildcard: a seat's `mcp_config` is written per council and already advertises
+            // only `COUNCIL_TOOLS`, so there is nothing here left to narrow.
+            allowed_mcp_tools: None,
         };
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<SeatOutcome>();
@@ -1427,7 +1430,7 @@ impl Driver {
             self.token.clone(),
             self.state.pool.clone(),
         );
-        let no_tools = NoTools;
+        let no_tools = crate::local_agent::NoTools;
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<SeatOutcome>();
         let pool = self.state.pool.clone();
@@ -1528,34 +1531,6 @@ impl Driver {
             answer: String::new(),
             error: None,
         })
-    }
-}
-
-/// An empty tool box, for the two phases that have none.
-///
-/// A type rather than an `Option` threaded through `run_turn`, because "no tools" and "tools that
-/// are all refused" are different things to a model: an empty schema list means it is never offered
-/// one, and never offered is never called.
-struct NoTools;
-
-#[async_trait::async_trait]
-impl crate::local_agent::ToolBox for NoTools {
-    fn schemas(&self) -> Vec<serde_json::Value> {
-        Vec::new()
-    }
-
-    /// `ToolAnswer::own`, and it is not a formality: an empty box advertises nothing, so the only
-    /// way to reach this is a name the model invented — and an invented name brings no stranger's
-    /// words into the turn, because no tool ran.
-    async fn call(
-        &self,
-        name: &str,
-        _arguments: &serde_json::Value,
-    ) -> crate::local_agent::ToolAnswer {
-        crate::local_agent::ToolAnswer::own(
-            serde_json::json!({"error": format!("{name} is not a tool this turn can use")})
-                .to_string(),
-        )
     }
 }
 

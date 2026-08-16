@@ -234,6 +234,28 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Read one file out of the calling team run's own workspace.
+    ///
+    /// **The run is not an argument, and that is the whole design of this call.** Which folder gets
+    /// opened comes from the `Scope::TeamRun` that authenticated the request, so the caller names a
+    /// path inside its delivery and nothing else. A `team_run_id` parameter would be the caller
+    /// naming what it may read, which is not a permission anything here grants itself.
+    ///
+    /// Reading only, like `list_files` and `web_read` beside it: the specialists do not write their
+    /// answers, `team.rs` does. A write verb here would reintroduce the collision between two
+    /// specialists choosing the same filename that naming the files from the core removes by
+    /// construction.
+    pub async fn read_team_file(&self, path: &str) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/team-files/read")
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// What is in the files folder. Reading only — there is deliberately no client method here for
     /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
     /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.

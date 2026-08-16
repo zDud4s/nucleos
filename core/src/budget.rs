@@ -242,7 +242,7 @@ async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
                 created_at, completed_at
          FROM runs
-         WHERE mode IN ('shadow', 'worktree', 'email_triage', 'council')",
+         WHERE mode IN ('shadow', 'worktree', 'email_triage', 'council', 'team')",
     )
     .fetch_all(pool)
     .await?;
@@ -752,6 +752,49 @@ mod tests {
         let before = autonomous_rows(&pool).await.unwrap();
         let after = autonomous_rows(&pool).await.unwrap();
         assert_eq!(after.len(), before.len());
+    }
+
+    /// Every mode the house spends money on without being watched, and the one it does not.
+    ///
+    /// A department is up to `max_parallel` cloud specialists times `max_rounds`, which makes it
+    /// the fastest way to spend in this codebase — leaving it out of the count would have made the
+    /// house budget silently stop measuring the largest thing it governs. Asserted mode by mode so
+    /// that adding an autonomous mode and forgetting the `WHERE` fails here.
+    #[tokio::test]
+    async fn every_autonomous_mode_is_counted_and_an_attended_one_is_not() {
+        let pool = test_pool().await;
+        for (index, mode) in ["shadow", "worktree", "email_triage", "council", "team"]
+            .into_iter()
+            .enumerate()
+        {
+            insert_run(
+                &pool,
+                mode,
+                Some(&format!("session-{index}")),
+                Some(1.0),
+                "2026-07-10T09:00:00Z",
+                Some("2026-07-10T09:10:00Z"),
+            )
+            .await;
+        }
+        // The desktop app's own turns: somebody is at the screen paying attention, so they are the
+        // person's spending and not the machine's.
+        insert_run(
+            &pool,
+            "assistant",
+            Some("session-attended"),
+            Some(1.0),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+
+        let rows = autonomous_rows(&pool).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "five autonomous modes should be counted and the attended one left out"
+        );
     }
 
     #[tokio::test]

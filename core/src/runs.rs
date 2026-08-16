@@ -382,8 +382,19 @@ pub(crate) async fn read_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> 
 /// exists to read words nobody vouches for, so it is the last run that may be spoken to — and the day
 /// a second such mode appears, both answers have to change together or the barrier narrows to one
 /// mode without anyone deciding to narrow it.
+/// `'team'` answers `None` and that is a deliberate under-statement rather than the truth about
+/// every team run.
+///
+/// A specialist may well hold `McpOnly` — its agent's `tool_policy` decides, and `team.rs` builds
+/// the `RunRequest` itself, so this function never launches one. What it is actually asked, by both
+/// its other readers, is whether a run of this mode may gain a SECOND AUTHOR: `http::post_run_message`
+/// refuses `None`, and `create_run_inner` refuses to create such a run `steerable`. For a
+/// department the answer is no in every case, so the most restrictive value is the honest one to
+/// return — and the alternative, `Unrestricted`, is worse than merely wrong: it is what this
+/// function returns for everything it does not recognise, and it would have handed a team run Bash,
+/// Edit and Write on any path that ever did read it to launch.
 pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
-    if mode == crate::email::TRIAGE_MODE {
+    if mode == crate::email::TRIAGE_MODE || mode == crate::team::TEAM_MODE {
         crate::runner::ToolPolicy::None
     } else {
         crate::runner::ToolPolicy::Unrestricted
@@ -400,8 +411,13 @@ pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
 ///
 /// One definition rather than the same `if` at each reader, because the day a fourth unattended
 /// mode appears, three policies have to learn about it together or two of them quietly won't.
+///
+/// That day arrived with `'team'`, and it is here for the reason the sentence above predicted:
+/// inside a team run there is nobody to answer the CLI. The third policy does not fire on it all
+/// the same — `classifier_governs_tools` also demands `Unrestricted`, and a department never is
+/// (`tool_policy_for_mode` above) — which is the AND doing its job rather than an exception.
 pub(crate) fn runs_unattended(mode: &str) -> bool {
-    mode == "shadow" || mode == "worktree"
+    mode == "shadow" || mode == "worktree" || mode == crate::team::TEAM_MODE
 }
 
 /// Whether this run's actions are governed by the classifier rather than by the CLI's allow-list.
@@ -1103,6 +1119,9 @@ fn spawn_run(
                 ambient_mcp: false,
                 // Cloned rather than moved: the request is built once per attempt.
                 model: model.clone(),
+                // Nothing to narrow: `create_run_inner` never sets `mcp_config`, so the branch
+                // that reads this does not run for a run started here.
+                allowed_mcp_tools: None,
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
             // be spoken to is settled where its argument vector is chosen, not by whatever later
@@ -4762,7 +4781,12 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     async fn a_toolless_run_cannot_be_created_steerable() {
         let state = test_state().await;
 
-        for mode in ["real", "shadow", crate::email::TRIAGE_MODE] {
+        for mode in [
+            "real",
+            "shadow",
+            crate::email::TRIAGE_MODE,
+            crate::team::TEAM_MODE,
+        ] {
             let toolless =
                 tool_policy_for_mode(mode) == crate::runner::ToolPolicy::None;
             let result =
@@ -4774,6 +4798,33 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 "{mode}: a run launched with no tools is the one run that must not be steerable"
             );
         }
+    }
+
+    /// The three policies that read `runs_unattended`, and what a department is to each of them.
+    ///
+    /// Written as one test because the comment above the function says the three have to learn
+    /// about a new mode together — and the third deliberately does NOT fire, which is the part that
+    /// reads like a bug when met in isolation. `classifier_governs_tools` also demands
+    /// `Unrestricted`, and a department never is: the AND refusing is the design, not an omission.
+    #[test]
+    fn a_department_is_unattended_and_still_not_governed_by_the_classifier() {
+        assert!(runs_unattended(crate::team::TEAM_MODE));
+        assert_eq!(
+            tool_policy_for_mode(crate::team::TEAM_MODE),
+            crate::runner::ToolPolicy::None
+        );
+        // No `dir` at all, which is a team run's actual state — `team.rs` launches with `cwd: None`
+        // — and two of the three conditions refuse before the disk is ever read.
+        assert!(!classifier_governs_tools(
+            crate::team::TEAM_MODE,
+            crate::runner::ToolPolicy::Unrestricted,
+            None
+        ));
+        assert!(!classifier_governs_tools(
+            crate::team::TEAM_MODE,
+            tool_policy_for_mode(crate::team::TEAM_MODE),
+            None
+        ));
     }
 
     /// Selecting the local runner by mode keeps message bodies on-machine without accidentally

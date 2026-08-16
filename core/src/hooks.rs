@@ -156,6 +156,19 @@ pub async fn pretooluse_decision(
         return council_decision(&state, &payload).await;
     }
 
+    // A department is in the same position as a seat, and this branch is the SECOND layer rather
+    // than the first. `team.rs` launches with `cwd: None`, so no `.claude/settings.json` of the
+    // owner's resolves and this hook may never fire at all — which is why `auth::TEAM_ROUTES` is
+    // the barrier that has to hold alone, and does.
+    //
+    // It is kept anyway for a reason of its own: it is the layer that carries "having read
+    // untrusted text, act no more" for the day a department is given something to act with. Today
+    // there is no `Acts` on `TEAM_TOOLS` for that rule to bite on, and two independent refusals of
+    // the same call is what one wants at a boundary.
+    if mode == crate::team::TEAM_MODE {
+        return team_decision(&payload);
+    }
+
     let classification = classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
@@ -638,6 +651,42 @@ async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json
     Json(Decision {
         decision: "deny".to_owned(),
         reason: "a council seat may only read NucleOS state".to_owned(),
+    })
+}
+
+/// PURE: what a team agent may call, by name alone.
+///
+/// Narrower than the council's sibling and simpler for it: `TEAM_TOOLS` carries no `Acts`, so there
+/// is no ordering rule to apply, and there is no `get_run` on the list to ask a second question
+/// about. What a specialist may read of its own run's folder is decided by the key it holds, in
+/// `team::post_read_file`, and not here — so this branch has nothing stateful left to get wrong.
+///
+/// Whole segment and not a prefix, for the reason `assistant_decision` records: an MCP server named
+/// `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test and is not this server.
+fn team_decision(payload: &PreToolUsePayload) -> Json<Decision> {
+    let permitted = payload
+        .tool_name
+        .strip_prefix("mcp__nucleos__")
+        .filter(|tool| !tool.contains("__"))
+        .is_some_and(|tool| crate::mcp_tools::TEAM_TOOLS.contains(&tool));
+
+    if permitted {
+        return Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "team agents may read".to_owned(),
+        });
+    }
+
+    // Debug and not warn, for the reason the council's branch gives: a specialist reaching for
+    // `create_run` is a model being a model, not a symptom of anything.
+    tracing::debug!(
+        run_id = payload.run_id,
+        tool = %payload.tool_name,
+        "pretooluse-decision: refused a tool a team agent may not call"
+    );
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: "a team agent may only read".to_owned(),
     })
 }
 
@@ -2638,6 +2687,77 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Every acting tool this server has, refused to a department one by one.
+    ///
+    /// Enumerated from `TOOL_EFFECTS` rather than listed, so a tool classified `Acts` in future is
+    /// covered the day it is added instead of the day somebody remembers this test. The second
+    /// layer only — `auth::TEAM_ROUTES` refuses these without anybody's cooperation, and this hook
+    /// may never fire at all, since a team run launches with no working directory to resolve a
+    /// `.claude/settings.json` from.
+    #[tokio::test]
+    async fn a_team_agent_is_refused_every_acting_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        let mut acting = 0;
+        for tool in crate::mcp_tools::every_tool_name() {
+            if crate::mcp_tools::tool_effect(&tool) != crate::mcp_tools::ToolEffect::Acts {
+                continue;
+            }
+            acting += 1;
+            let decision = orchestrator_tool(&app, run_id, &tool, serde_json::json!({})).await;
+            assert_eq!(decision.decision, "deny", "a department reached {tool}");
+        }
+        assert!(acting >= 7, "only {acting} acting tools were exercised");
+
+        // And the reads it exists to do are allowed, so the loop above is refusing the actions
+        // rather than the whole server.
+        for tool in crate::mcp_tools::TEAM_TOOLS {
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(
+                decision.decision, "allow",
+                "a department was refused {tool}"
+            );
+        }
+    }
+
+    /// The refusals that are not about `Acts` at all: a tool of another server whose name passes a
+    /// prefix test, and a NucleOS tool a department is simply not offered.
+    #[tokio::test]
+    async fn a_team_agent_is_refused_a_lookalike_server_and_an_unoffered_read() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        for tool_name in [
+            // `nucleos__x` is a different server, and `mcp__nucleos__x__list_files` is what it
+            // produces — which passes a prefix test and must not pass this one.
+            "mcp__nucleos__x__list_files",
+            "mcp__other__list_files",
+            "Bash",
+            "Write",
+            // Classified `ReadsOwn`, on no `Acts` list, and still not a department's business.
+            "mcp__nucleos__list_projects",
+            "mcp__nucleos__get_budget",
+        ] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": tool_name,
+                    "tool_input": {}
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(
+                decision.decision, "deny",
+                "a department reached {tool_name}"
+            );
+        }
     }
 
     /// One NucleOS tool call in an orchestrator turn, named the way the CLI names it.

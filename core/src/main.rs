@@ -50,6 +50,7 @@ mod shadow;
 mod sidecar;
 mod state;
 mod storage;
+mod team;
 mod token_efficiency;
 mod transcribe;
 mod triage;
@@ -692,6 +693,19 @@ async fn main() {
     // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
     // one project's test suite.
     tokio::spawn(job::run_job_loop(state.clone()));
+    // AFTER `runs::reconcile_orphaned_runs`, which ran near the top of this function and is what
+    // marks the abandoned subprocesses `interrupted` — the ordering this depends on, and the same
+    // one `job::reconcile_orphaned_jobs` respects. Awaited rather than spawned, so the loop below
+    // never meets a half-reconciled run.
+    if let Err(error) = team::reconcile_orphaned_team_runs(&state).await {
+        tracing::warn!(%error, "could not reconcile the team runs a previous daemon left behind");
+    }
+    // Its own loop again, and for this pillar's own reason rather than the job's: a team pass
+    // launches up to `max_parallel` subprocesses and writes files at a cadence nothing else in the
+    // house shares. It runs no gate, so the argument above does not transfer — this one stands on
+    // its own.
+    tokio::spawn(team::run_team_loop(state.clone()));
+    tokio::spawn(team::run_workspace_gc_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run
