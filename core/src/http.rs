@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::agent;
 use crate::attention::{self, AttentionScope};
 use crate::auth::{ApiTokenLevel, Scope, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
@@ -95,6 +96,11 @@ pub fn build_router(state: AppState) -> Router {
             "/webhooks/push",
             post(post_webhook_push)
                 .layer(DefaultBodyLimit::max(crate::webhook::WEBHOOK_BODY_LIMIT)),
+        )
+        .route("/agents", get(list_agents).post(create_agent))
+        .route(
+            "/agents/{id}",
+            get(get_agent).put(update_agent).delete(delete_agent),
         )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
@@ -2600,6 +2606,78 @@ async fn vcs_ticket(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+fn agent_status(error: &agent::AgentError) -> StatusCode {
+    match error {
+        agent::AgentError::DuplicateName => StatusCode::CONFLICT,
+        // The agent exists and the request is well formed; what refuses is the team standing on it.
+        agent::AgentError::InUse => StatusCode::CONFLICT,
+        agent::AgentError::Invalid(_) => StatusCode::BAD_REQUEST,
+        agent::AgentError::NotFound => StatusCode::NOT_FOUND,
+        agent::AgentError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<agent::Agent>>, StatusCode> {
+    agent::list(&state.pool).await.map(Json).map_err(|error| {
+        tracing::warn!(%error, "listing agents failed");
+        agent_status(&error)
+    })
+}
+
+async fn create_agent(
+    State(state): State<AppState>,
+    Json(request): Json<agent::AgentRequest>,
+) -> Result<Json<agent::Agent>, StatusCode> {
+    agent::create(&state.pool, request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "creating agent failed");
+            agent_status(&error)
+        })
+}
+
+async fn get_agent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<agent::Agent>, StatusCode> {
+    match agent::get(&state.pool, &id).await {
+        Ok(Some(found)) => Ok(Json(found)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(agent_id = %id, %error, "reading agent failed");
+            Err(agent_status(&error))
+        }
+    }
+}
+
+async fn update_agent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<agent::AgentRequest>,
+) -> Result<Json<agent::Agent>, StatusCode> {
+    agent::update(&state.pool, &id, request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(agent_id = %id, %error, "updating agent failed");
+            agent_status(&error)
+        })
+}
+
+async fn delete_agent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    agent::delete(&state.pool, &id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(agent_id = %id, %error, "deleting agent failed");
+            agent_status(&error)
+        })
 }
 
 fn preset_status(error: &presets::PresetError) -> StatusCode {
