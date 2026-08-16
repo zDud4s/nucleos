@@ -474,20 +474,22 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Human,
-    // **Nothing maps to this, and that is a decision rather than an omission.** `http.rs`'s
-    // `vcs_origin` argues the whole case: in this repo "shell" means the Tauri desktop app, which
-    // holds the *control* token and therefore already arrives as `Human`, and an admin API token is
-    // deliberately NOT recorded as `shell` because that would name the one client that did not make
-    // the call. An arm here would need a scope that means something no scope means today — a
-    // credential belonging to an external session in its own right, distinct from both the desktop
-    // app's control token and a run's.
+    // **A person's own editor session, asking through its safety hook** — `hooks::session_git_decision`.
     //
-    // It survives anyway, because the schema outranks the mapping: the `origin` column's CHECK
-    // constraint accepts `'shell'`, and `Ticket` and `RequestSummary` hand a row's columns back
-    // verbatim rather than parsing them, so such a row can exist and be listed whether or not this
-    // variant does. Deleting it would leave the one enum that is meant to be the authority on that
-    // column unable to name a value the column permits, which is the wrong way round.
-    #[allow(dead_code)]
+    // This said "nothing maps to this, and that is a decision rather than an omission", and it
+    // survived on the argument that the schema outranks the mapping. The caller it was waiting for
+    // is the one it described almost exactly: *"a credential belonging to an external session in its
+    // own right, distinct from both the desktop app's control token and a run's"*. What arrived is
+    // one step off that description and the difference is worth keeping straight — the hook presents
+    // the control token, so the credential is not a session's own; what is a session's own is the
+    // ASKING. `Human` would have been a lie of a readable kind: nobody clicked anything.
+    //
+    // It stays distinct from `Human` for the reason the audit exists. A `human` row means a person
+    // acted in the app; a `shell` row means a person's agent tried to act and was redirected here
+    // instead. Those are different events and the queue is the only place that records the second.
+    //
+    // The Tauri app is NOT this, despite owning the `shell/` directory: it holds the control token
+    // and arrives through `vcs_origin` as `Human`, which is why the name was free.
     Shell,
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
@@ -578,6 +580,63 @@ pub enum ResolveError {
 // No `Display`: the one consumer, `http.rs`, destructures every arm and formats the inner value
 // itself, so a `Display` here would be dead code that clippy cannot see — trait impls are exempt
 // from dead-code analysis. Whoever gains a caller that wants to print one whole writes it then.
+
+/// The project a directory belongs to, for a caller that knows only where it is standing.
+///
+/// `resolve_repo` goes the other way, from a name the caller already had. This is for the caller that
+/// has no name at all: an interactive session's safety hook, which knows its `cwd` and nothing else.
+/// Both ends meet at the same `ResolvedRepo`, because this returns a project id and hands it straight
+/// back to `resolve_repo` rather than building one — the type has one production constructor for a
+/// reason, and a second would be free to let `root` and `key` disagree.
+///
+/// **The match is on the repository, not on the path**, and that is the whole reason a session in a
+/// linked worktree resolves at all. `C:\Projects\nucleos-assuntos` is not under `C:\Projects\nucleos`
+/// and no prefix test would ever relate them; what relates them is `--git-common-dir`, which both
+/// answer identically. Measured on this repo: thirteen worktrees, thirteen different top levels, one
+/// common dir. That is also precisely why the queue serialises across them for free — the key it
+/// locks on IS that common dir, so `one_running_vcs_request_per_repo` was already counting every
+/// session in every worktree before any of them could reach it.
+///
+/// The parent of the common dir is the main working tree's root. That holds for every repository this
+/// queue can serve and fails only for a bare one, which `repo_key` has already refused by here.
+pub async fn project_for_worktree(
+    pool: &sqlx::SqlitePool,
+    worktree_root: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let key = crate::git_exec::repo_key(worktree_root, deadline).await?;
+    let main_root = std::path::Path::new(&key)
+        .parent()
+        .ok_or_else(|| format!("{key} has no parent, so it names no working tree"))?
+        .to_owned();
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL
+         ORDER BY project_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("could not read the project roster: {error}"))?;
+
+    for (project_id, root) in &rows {
+        // Canonicalised on both sides rather than compared as written. `canonical` returns a Windows
+        // verbatim path and a recorded root is whatever a person typed, so the two spellings reach
+        // one directory and compare unequal — the failure `canonical`'s own doc comment warns about.
+        // A root that has since been deleted canonicalises to an error and is skipped, not fatal:
+        // one stale roster row must not stop the rest of the roster from answering.
+        if let Ok(canonical_root) = crate::git_exec::canonical(std::path::Path::new(root)).await
+            && std::path::Path::new(&canonical_root) == main_root
+        {
+            return Ok(project_id.clone());
+        }
+    }
+
+    Err(format!(
+        "no project on the roster is rooted at {} — the queue takes work for projects it knows, and \
+         a project in `off` mode has its root cleared, so that is the first thing to check",
+        main_root.display()
+    ))
+}
 
 /// The single production path from a project id to a repository the queue may lock.
 ///

@@ -210,6 +210,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// email pillar's design forbids for content nobody vouches for, so speaking into a run stays its own
 /// authorization rather than a consequence of being allowed to start one.
 ///
+/// `POST /jobs/{id}/notes` is deliberately absent for the `POST /runs/{id}/message` reason exactly,
+/// and it is the entry most likely to be added here by mistake: `POST /jobs` is on the list below,
+/// and a note lives at a URL one segment from it, so filing the two together reads as consistency.
+/// It is not. Creating a job authorises the prompt supplied at that moment, before the work exists;
+/// a note adds a second author to work already running past every check its creation went through,
+/// and the wait between leaving it and its being read is the only difference from steering. Leaving
+/// one is Admin's.
+///
 /// `POST /email/send` is deliberately absent from this table and from `READ_ONLY_ROUTES` both, for
 /// the same shape of reason. A run-creating key buys the prompt it supplies at the moment it
 /// supplies it; a message leaving this machine under the mailbox owner's own address is not

@@ -1975,6 +1975,28 @@ async fn spawn_node(
     }
 
     let (path, branch) = worktree;
+
+    // What the owner said to this job while it was running, appended to the brief this node was
+    // handed rather than put in its place. Here and not in each caller because this is the one seam
+    // every node kind passes through — plan, implement, gate retry, replan, review — and a note
+    // addressed to "whichever node comes next" must not depend on which kind that turned out to be.
+    //
+    // Read AFTER the claim and marked delivered only once a run exists, which is the whole order:
+    // a note spent on a node that never started is lost silently, and the owner learns about it by
+    // watching the job finish without doing what they asked. Best-effort on the way in — a queue
+    // that cannot be read is not a reason to refuse to start the node, only a reason to say so.
+    let waiting = match crate::notes::pending(pool, job.id).await {
+        Ok(waiting) => waiting,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read a job's notes");
+            Vec::new()
+        }
+    };
+    let mut prompt = prompt;
+    if let Some(block) = crate::notes::render(&waiting) {
+        prompt.push_str(&block);
+    }
+
     let created = crate::runs::create_job_node_run(
         state,
         prompt,
@@ -1991,6 +2013,17 @@ async fn spawn_node(
 
     match created {
         Ok(run_id) => {
+            // The run exists, so the words are in a prompt something will read: only now do they
+            // leave the queue. Unconsumed, one sentence typed at midnight would be appended to item
+            // 4, item 5, the replan and the review, each of them reading it as something newly said
+            // about the work in front of it.
+            let delivered = waiting.iter().map(|note| note.id).collect::<Vec<_>>();
+            if let Err(error) = crate::notes::mark_delivered(pool, &delivered, run_id).await {
+                // Said out loud rather than swallowed: the failure this leaves is a note delivered
+                // again to the next node, which is confusing but not silent, and there is nothing
+                // to undo — the run is already started.
+                tracing::warn!(job_id = job.id, run_id, %error, "could not mark a job's notes delivered");
+            }
             if let Some(ItemClaim { ordinal, .. }) = item {
                 let _ =
                     sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = ?")
@@ -3008,6 +3041,14 @@ pub struct JobDetail {
     /// The branch the work is on, so a stopped job's partial can be found. `None` once the GC has
     /// taken the worktree.
     pub branch: Option<String>,
+    /// What the owner has said to this job, delivered or still waiting.
+    ///
+    /// Every note and not only the pending ones, because both states answer a question the owner
+    /// actually asks. Before delivery this is the only thing separating a note that is queued from
+    /// one that was dropped — and an owner who cannot tell those apart leaves it a second time.
+    /// After delivery, `delivered_to_run_id` is the join back to the prompt it was appended to,
+    /// which is how "did it arrive in time" gets answered at all.
+    pub notes: Vec<crate::notes::Note>,
 }
 
 /// The owner-kind predicate belongs in the `ON` clause and not in a `WHERE`. In a `WHERE` it would
@@ -3136,7 +3177,14 @@ pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDe
     .fetch_optional(pool)
     .await?;
 
-    Ok(Some(JobDetail { job, items, branch }))
+    let notes = crate::notes::all(pool, job_id).await?;
+
+    Ok(Some(JobDetail {
+        job,
+        items,
+        branch,
+        notes,
+    }))
 }
 
 /// What cancelling a job did.
@@ -6747,5 +6795,198 @@ mod tests {
         // commits is worse than naming a sha and better than reviewing a guess.
         let without = review_prompt(None, "/wt/.nucleos");
         assert!(without.contains("git log --oneline"));
+    }
+
+    /// The words an owner would leave on a job in flight, and the item they arrive beside.
+    ///
+    /// Distinctive strings on purpose. `seed_items` writes `'an item'` for every description, which
+    /// appears inside `implement_prompt`'s own boilerplate often enough that asserting on it would
+    /// pass whether or not the item's brief survived.
+    const A_NOTE: &str = "when you get to item 3, update the docs too";
+    const AN_ITEM: &str = "rename the cursor helper";
+
+    /// The one seam a job's words have to cross, driven end to end.
+    ///
+    /// Every other test of this feature stops inside `notes`, which is pure or nearly so and which
+    /// will happily store and return a note nobody ever reads. The wiring is the part that can be
+    /// missing while all of that passes: `advance` selects the item, builds the brief and hands it
+    /// to `spawn_node`, and unless the pending notes are appended THERE the owner's sentence is a
+    /// row in a table with no reader. A node is born with a clean context window and no steering
+    /// channel — `create_job_node_run` passes `steerable: false` on purpose — so the prompt is the
+    /// only door, and this test opens it from the outside.
+    ///
+    /// It asserts on the STORED prompt, read back out of `runs`, and not on a string the test built.
+    /// The chain is long — note left, queue read, text rendered, brief appended, run created, row
+    /// written — and a test that composed those pieces itself would be checking its own arithmetic
+    /// while any one of the links could be missing.
+    ///
+    /// The item's own description is asserted for beside it, because "the note reached the prompt"
+    /// is satisfied by a `render` that returned the note INSTEAD of the brief. A node whose item
+    /// vanished would go and do what the note said and nothing else, which is the failure the whole
+    /// wording of `render` is written to avoid.
+    ///
+    /// And the queue is asserted empty afterwards. Delivery is what makes a note a message rather
+    /// than a standing order: unconsumed, one sentence typed at midnight would be appended to item
+    /// 4, item 5, the replan and the review, each of them reading it as something newly said about
+    /// the work in front of it.
+    ///
+    /// A real repository and a real worktree, for the reason
+    /// `a_retriable_item_is_claimed_and_started_not_merely_asked_for` gives: a node that could not
+    /// be provisioned leaves the item exactly where a node that was never told about the note would,
+    /// and the two would be indistinguishable here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_note_left_on_a_job_reaches_the_next_nodes_prompt() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-note-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        seed_items(&pool, job_id, &["pending"]).await;
+        sqlx::query("UPDATE job_items SET description = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(AN_ITEM)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "duarte")
+            .await
+            .expect("the owner leaves a note on a job already running");
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let run_id: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id = run_id.expect("the item's node started, so there is a prompt to look at");
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            prompt.contains(A_NOTE),
+            "the note never reached the node it was left for: {prompt}"
+        );
+        assert!(
+            prompt.contains(AN_ITEM),
+            "the note took the place of the item's brief instead of being added to it: {prompt}"
+        );
+        assert_eq!(
+            crate::notes::pending(&pool, job_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            Vec::<i64>::new(),
+            "note {note_id} is still queued after being read out, so every later node of this job \
+             gets told the same thing again"
+        );
+    }
+
+    /// A node that never started was told nothing, and the note has to still be waiting.
+    ///
+    /// `spawn_node` has an exit before the run exists, and it is not an exotic one: the item claim
+    /// is a compare-and-swap that stops two passes starting two nodes on one tree, and losing it is
+    /// the ordinary outcome of a second pass arriving while the first is still working. The `Busy`
+    /// and provisioning-failure arms below it end the same way — no run, no prompt, nobody told.
+    ///
+    /// So the order inside `spawn_node` is the behaviour: read the queue, render, append, create the
+    /// run, and only THEN mark the notes delivered. A `mark_delivered` at the top reads as harmless
+    /// — the words were rendered, after all — and loses the owner's sentence in exactly the case
+    /// nothing reports. The run is never created, the prompt is thrown away, the note is gone from
+    /// the queue, and the owner learns about it by watching the job finish without doing what they
+    /// asked.
+    ///
+    /// `spawn_node` is called directly rather than through `advance`, because `advance` derives the
+    /// status it claims against from the view it just loaded and therefore cannot lose the swap
+    /// inside one pass. Driving the seam itself is the only way to stand in the moment this is about.
+    /// The run count is asserted as well as the note, because "no node started" is this test's
+    /// premise and a premise the test assumed rather than checked would make the rest of it vacuous.
+    #[tokio::test]
+    async fn a_note_is_not_consumed_by_a_node_that_failed_to_start() {
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        // The race the compare-and-swap exists to lose: another pass claimed this item first, so its
+        // row already says `running` and the claim below — which expects `pending`, the status the
+        // caller last saw — matches nothing.
+        seed_items(&pool, job_id, &["running"]).await;
+
+        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "duarte")
+            .await
+            .expect("the owner leaves a note on a job already running");
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        let step = spawn_node(
+            &state,
+            &job,
+            "implement",
+            "the brief this node would have been given".to_owned(),
+            Some(ItemClaim {
+                ordinal: 0,
+                held: "pending",
+            }),
+            (PathBuf::from("/project/a/worktree"), "nucleos/job".into()),
+        )
+        .await;
+
+        assert_eq!(
+            step,
+            Step::Stopped,
+            "an item that could not be claimed has to end the pass"
+        );
+        let started: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            started, 0,
+            "the premise of this test is that no node started, and one did"
+        );
+
+        assert_eq!(
+            crate::notes::pending(&pool, job_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            vec![note_id],
+            "the note was spent on a node that never read it, and nothing will say so"
+        );
     }
 }
