@@ -752,6 +752,134 @@ pub async fn create_rule(
     })
 }
 
+/// One rule of an errand still answering, with everything firing it needs.
+///
+/// Flat rather than a [`Rule`] with the errand beside it, because `sqlx::FromRow` does not flatten
+/// and a hand-written mapping of eleven columns is the drift `from_row` above exists to prevent. The
+/// errand's name and topic ride along because the scheduler needs both and neither is worth a second
+/// query per rule per tick.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ArmedRule {
+    pub id: i64,
+    pub errand_id: i64,
+    pub errand_name: String,
+    /// Where the turn goes. Opaque here, as everywhere in this module.
+    pub chat_key: String,
+    pub name: String,
+    pub cron: String,
+    pub prompt: String,
+    pub timezone: Option<String>,
+    pub last_fired_at: String,
+    pub fires_date: Option<String>,
+    pub fires_today: i64,
+}
+
+/// Every rule of every errand that is still answering.
+///
+/// `status = 'active'` is the whole of "a paused errand does not fire" and "a closed one does not
+/// either", and it is here rather than in the scheduler on purpose: the status is this module's
+/// fact, and a filter applied by the caller is a filter the next caller forgets. A pause that
+/// stopped the answers reaching the topic but not the work reaching the model would keep spending
+/// the bill with its one visible sign switched off.
+pub async fn armed_rules(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<ArmedRule>> {
+    sqlx::query_as::<_, ArmedRule>(
+        "SELECT r.id, r.errand_id, e.name AS errand_name, e.chat_key, r.name, r.cron, r.prompt,
+                r.timezone, r.last_fired_at, r.fires_date, r.fires_today
+         FROM errand_rules r
+         JOIN errands e ON e.id = r.errand_id
+         WHERE e.status = 'active'
+         ORDER BY r.errand_id, r.id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Spends a rule's window, answering whether this caller is the one that got it.
+///
+/// A compare-and-set against the `last_fired_at` the caller read, so two ticks racing over one rule
+/// cannot both fire it. Claimed BEFORE anything starts, which is the ordering `scheduler.rs` argues
+/// for at length and which matters more here: an autonomous turn repeated is not a retry, it is the
+/// same question asked twice and paid for twice.
+///
+/// The daily allowance is spent in the same statement, for the same reason it is in the project
+/// path — two writes leave a window where the rule is claimed and not counted, and a daemon that
+/// dies in it comes back with the allowance intact. `fires_date` carries the day the count belongs
+/// to, so yesterday's count resets by comparison rather than by a midnight sweep nobody runs.
+pub async fn claim_rule_window(
+    pool: &sqlx::SqlitePool,
+    rule_id: i64,
+    previous_fired_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    today: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query(
+        "UPDATE errand_rules
+         SET last_fired_at = ?,
+             fires_today = CASE WHEN fires_date = ? THEN fires_today + 1 ELSE 1 END,
+             fires_date = ?
+         WHERE id = ? AND last_fired_at = ?",
+    )
+    .bind(now.to_rfc3339())
+    .bind(today)
+    .bind(today)
+    .bind(rule_id)
+    .bind(previous_fired_at)
+    .execute(pool)
+    .await
+    .map(|done| done.rows_affected() == 1)
+}
+
+/// Hands a claimed window back, count and all, when nothing was started.
+///
+/// The count goes back too, which is where this parts company with `scheduler::release_window`. That
+/// one restores the timestamp and leaves the day's allowance spent — an asymmetry a project can
+/// afford because it releases only on the two errors decided before any row exists, which are rare.
+/// An errand releases whenever its owner happens to be mid-conversation with it, which is not rare
+/// at all, and a cap that counted windows nothing came of would quietly starve a busy errand of the
+/// schedule it was given.
+///
+/// Compare-and-set on the value just written, so a concurrent tick that has already claimed the next
+/// window is not clobbered. Only ever called where nothing started: past that point the window stays
+/// spent, because re-firing on a maybe is the duplicate the claim-first ordering exists to prevent.
+pub async fn release_rule_window(
+    pool: &sqlx::SqlitePool,
+    rule_id: i64,
+    previous: &ArmedRule,
+    claimed_at: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE errand_rules
+         SET last_fired_at = ?, fires_date = ?, fires_today = ?
+         WHERE id = ? AND last_fired_at = ?",
+    )
+    .bind(&previous.last_fired_at)
+    .bind(previous.fires_date.as_deref())
+    .bind(previous.fires_today)
+    .bind(rule_id)
+    .bind(claimed_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Re-arms a rule whose stored timestamp cannot be read.
+///
+/// Only reachable by a hand edit — `create_rule` and `claim_rule_window` both write RFC 3339 — but
+/// the failure mode if it happens is the silent one: `due_rules` skips a rule it cannot date, so the
+/// rule simply never fires again and nothing anywhere says so.
+pub async fn rearm_rule(
+    pool: &sqlx::SqlitePool,
+    rule_id: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE errand_rules SET last_fired_at = ? WHERE id = ?")
+        .bind(now.to_rfc3339())
+        .bind(rule_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
 /// Removes a rule of THIS errand, answering whether there was one to remove.
 ///
 /// Keyed by the errand as well as by the rule, and that is the whole point of the second argument:

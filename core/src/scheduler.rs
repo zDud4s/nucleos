@@ -804,6 +804,251 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             }
         }
     }
+
+    // After the projects, and inside the same tick, so both kinds of owner pass the brakes at the
+    // top exactly once. It is also why this is a call and not a second loop task: every `return`
+    // above — the mid-tick emergency stop, a global attention brake — is a decision that the machine
+    // starts nothing more this tick, and an errand pass running independently would go on starting
+    // things after one of them had said not to.
+    errand_tick(state, now).await;
+}
+
+/// An errand's rule in the shape the pure functions above take.
+///
+/// A struct literal rather than a `..Default::default()`, so a new field on `ScheduleRule` stops
+/// this compiling and somebody has to decide what it means for an owner with no repository. `cwd`
+/// and `graph` are `None` and always will be: the first is a directory inside a repository, and the
+/// second starts a plan → implement → gate → review job over a worktree.
+fn schedule_rule_of(rule: &crate::errands::ArmedRule) -> ScheduleRule {
+    ScheduleRule {
+        name: rule.name.clone(),
+        cron: rule.cron.clone(),
+        prompt: rule.prompt.clone(),
+        cwd: None,
+        timezone: rule.timezone.clone(),
+        graph: None,
+    }
+}
+
+/// The half of the tick that serves owners with no repository.
+///
+/// Everything specific to a project is absent here, and that absence is the design rather than an
+/// omission: there is no HEAD to read, so no catch-up re-triage; no `Mode`, so no shadow and no
+/// demotion; no worktree, so no `graph:` job; and no project id, so none of the per-project brakes.
+/// What remains is the part that was never about repositories — a cron, a window claimed before
+/// anything starts, and a daily cap.
+///
+/// A missed window fires late and says nothing extra about it. `catch_up_preamble` warns that the
+/// repository may have moved and that the run is demoted to plan-only, and neither is true of an
+/// errand: it has no repository, and it may not act at any time. The one true half — "you are
+/// late" — the notebook already carries, since every entry in it is dated.
+async fn errand_tick(state: &AppState, now: DateTime<Utc>) {
+    let armed = match crate::errands::armed_rules(&state.pool).await {
+        Ok(armed) => armed,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load errand schedule rules");
+            return;
+        }
+    };
+    if armed.is_empty() {
+        return;
+    }
+
+    let today = now.date_naive().to_string();
+
+    // Grouped by errand because `due_rules` keys its maps by rule NAME, and a rule name is unique
+    // within an errand and deliberately not across them — "manhã" is what everyone calls the morning
+    // one. Fed the whole list at once, two errands' morning rules would be one entry, and the
+    // second would inherit the first's last-fired time.
+    let mut by_errand: HashMap<i64, Vec<&crate::errands::ArmedRule>> = HashMap::new();
+    for rule in &armed {
+        by_errand.entry(rule.errand_id).or_default().push(rule);
+    }
+
+    for rules in by_errand.values() {
+        let schedule: Vec<ScheduleRule> = rules.iter().map(|rule| schedule_rule_of(rule)).collect();
+
+        let mut last_fired = HashMap::new();
+        for rule in rules {
+            match DateTime::parse_from_rfc3339(&rule.last_fired_at) {
+                Ok(timestamp) => {
+                    last_fired.insert(rule.name.clone(), timestamp.with_timezone(&Utc));
+                }
+                // Only a hand edit can produce this, and the failure it causes is the silent kind:
+                // `due_rules` skips a rule it cannot date, so the rule stops firing for ever and
+                // nothing says so. Re-armed rather than skipped, exactly as the project path does.
+                Err(error) => {
+                    tracing::warn!(
+                        errand_id = rule.errand_id,
+                        rule_name = %rule.name,
+                        last_fired_at = %rule.last_fired_at,
+                        %error,
+                        "re-arming malformed errand schedule timestamp"
+                    );
+                    if let Err(error) = crate::errands::rearm_rule(&state.pool, rule.id, now).await
+                    {
+                        tracing::warn!(
+                            errand_id = rule.errand_id,
+                            rule_name = %rule.name,
+                            %error,
+                            "failed to re-arm malformed errand schedule timestamp"
+                        );
+                    }
+                }
+            }
+        }
+
+        // From the row and not from a counter this loop holds, for the reason migration 0026 gives:
+        // a map rebuilt on every daemon start is a cap the crashing daemon it exists for rearms.
+        let fires_today: HashMap<String, u32> = rules
+            .iter()
+            .filter(|rule| rule.fires_date.as_deref() == Some(today.as_str()))
+            .map(|rule| (rule.name.clone(), rule.fires_today.max(0) as u32))
+            .collect();
+
+        let due = due_rules(
+            &schedule,
+            &last_fired,
+            &fires_today,
+            now,
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+
+        for (due_rule, _) in due {
+            let Some(rule) = rules.iter().find(|rule| rule.name == due_rule.name) else {
+                continue;
+            };
+
+            // Re-read immediately before committing to this turn, exactly as the project loop does
+            // and for the same reason: the preamble asked once, and one tick can spend a long time
+            // between there and here. A stop that keeps starting work for another minute is not a
+            // stop. Fails closed.
+            if crate::autopilot::kill_switch_engaged(&state.pool)
+                .await
+                .unwrap_or(true)
+            {
+                tracing::info!(
+                    errand_id = rule.errand_id,
+                    rule_name = %rule.name,
+                    "kill switch engaged mid-tick; not firing"
+                );
+                return;
+            }
+
+            match crate::errands::claim_rule_window(
+                &state.pool,
+                rule.id,
+                &rule.last_fired_at,
+                now,
+                &today,
+            )
+            .await
+            {
+                Ok(true) => {}
+                // Another tick moved this rule on. Not an error: the window is served.
+                Ok(false) => {
+                    tracing::info!(
+                        errand_id = rule.errand_id,
+                        rule_name = %rule.name,
+                        "errand schedule window already claimed; not firing"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        errand_id = rule.errand_id,
+                        rule_name = %rule.name,
+                        %error,
+                        "could not claim the errand schedule window; not firing"
+                    );
+                    continue;
+                }
+            }
+
+            // Through `send_message` and not around it, which is what makes a scheduled turn the
+            // same thing as a typed one: the same brain precedence, the same notebook in the
+            // preamble, the same taint mark on the way in, the same errand toolbox, and the same
+            // notebook entry on the way out. A second path into an errand turn would be a second
+            // set of answers to every one of those.
+            //
+            // `Origin` is not consulted on this path — it decides the brain only for a conversation
+            // with no errand row, and this one has one by construction — so it says what is true of
+            // the destination: a Telegram topic.
+            match crate::assistant::send_message(
+                state,
+                &rule.chat_key,
+                &rule.prompt,
+                crate::assistant::Origin::Telegram,
+            )
+            .await
+            {
+                Ok(run_id) => {
+                    tracing::info!(
+                        errand_id = rule.errand_id,
+                        rule_name = %rule.name,
+                        run_id,
+                        "fired a scheduled errand turn"
+                    );
+                    let _ = crate::feed::append_for_errand(
+                        &state.pool,
+                        rule.errand_id,
+                        "errand_rule_fired",
+                        &format!(
+                            "the rule {:?} of the errand {:?} started a turn",
+                            rule.name, rule.errand_name
+                        ),
+                        Some(run_id),
+                    )
+                    .await;
+                }
+                // The owner is mid-conversation with this errand. Nothing started, so the window
+                // goes back and the rule tries again on the next tick — the same trade
+                // `CreateRunError::Busy` gets above, and the reason an errand does not skip its
+                // morning because somebody happened to be talking to it at the time.
+                Err(reason) if reason == crate::assistant::TURN_IN_PROGRESS => {
+                    if let Err(error) =
+                        crate::errands::release_rule_window(&state.pool, rule.id, rule, now).await
+                    {
+                        tracing::warn!(
+                            errand_id = rule.errand_id,
+                            rule_name = %rule.name,
+                            %error,
+                            "could not give the errand schedule window back; it stays spent"
+                        );
+                    }
+                    tracing::info!(
+                        errand_id = rule.errand_id,
+                        rule_name = %rule.name,
+                        "the errand is mid-turn; window released for the next tick"
+                    );
+                }
+                // Everything else is kept spent, and said out loud. This is the only place a
+                // scheduled errand can fail where there is nobody watching the topic, so the feed is
+                // where it has to land — a rule that silently stops is indistinguishable from one
+                // that was never armed.
+                Err(reason) => {
+                    tracing::warn!(
+                        errand_id = rule.errand_id,
+                        rule_name = %rule.name,
+                        reason = %reason,
+                        "a scheduled errand turn did not start — this window is spent"
+                    );
+                    let _ = crate::feed::append_for_errand(
+                        &state.pool,
+                        rule.errand_id,
+                        "errand_rule_failed",
+                        &format!(
+                            "the rule {:?} of the errand {:?} did not start: {reason}",
+                            rule.name, rule.errand_name
+                        ),
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1888,5 +2133,270 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_count, 0);
+    }
+
+    /// A state an errand can actually run in: the scheduler's own, plus somewhere for the folder to
+    /// be. A project is rows and a repository; an errand is rows and a directory, and `errand_turn`
+    /// refuses a turn whose folder will not resolve.
+    async fn errand_state() -> (AppState, tempfile::TempDir) {
+        let temp = tempfile::tempdir().expect("create files root");
+        let root = crate::files::ensure_root(temp.path()).expect("prepare files root");
+        let state = test_state(None).await;
+        let mut email = (*state.email).clone();
+        email.files_root = root;
+        (
+            AppState {
+                email: Arc::new(email),
+                ..state
+            },
+            temp,
+        )
+    }
+
+    /// A topic no other test in this process is using.
+    ///
+    /// `ChatSlot::acquire` is a process-global lock keyed by chat id, and cargo runs these tests in
+    /// parallel inside one process. Two tests sharing a topic take each other's slot: one fires, the
+    /// other is told a turn is already in progress, hands its window back and reports that an errand
+    /// did not fire — on a machine that was merely busy. Production cannot reach that state, because
+    /// `chat_key` is UNIQUE and one topic IS one errand; the tests have to earn the same guarantee
+    /// for themselves rather than inherit it.
+    fn a_topic() -> String {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        format!(
+            "-100200300:{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// An active errand with one rule, armed at `armed`.
+    ///
+    /// On the cloud brain deliberately. `local` is the column default and the right one in
+    /// production, but this state has no local assistant, so a local errand would refuse with
+    /// `NO_LOCAL_MODEL` before the scheduler's own work could be seen at all.
+    async fn seed_errand(state: &AppState, chat_key: &str, cron: &str, armed: &str) -> i64 {
+        let id = crate::errands::create(&state.pool, "carros", chat_key)
+            .await
+            .expect("open the errand");
+        crate::errands::set_brain(&state.pool, id, crate::errands::Brain::Cloud)
+            .await
+            .expect("put the errand on the cloud brain");
+        crate::errands::create_rule(
+            &state.pool,
+            id,
+            "manhã",
+            cron,
+            "vê se apareceram anúncios novos",
+            None,
+            timestamp(armed),
+        )
+        .await
+        .expect("arm the rule");
+        id
+    }
+
+    async fn errand_runs(state: &AppState) -> Vec<String> {
+        sqlx::query_scalar("SELECT chat_id FROM runs WHERE chat_id IS NOT NULL ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The rule's window as the tick left it: the stamp it is armed at, and the day's count.
+    ///
+    /// Asserted alongside the absence of a run wherever an errand must not fire, and the reason is a
+    /// mutation that survived without it. `send_message` refuses a paused errand on its own, so
+    /// "no run row" stays true even if the scheduler never filtered on status at all — and the
+    /// difference between the two is not academic: filtered, nothing happens; unfiltered, the window
+    /// is claimed and spent, the daily allowance goes down, and a line lands in the feed saying the
+    /// turn did not start, every hour, for as long as the pause lasts.
+    async fn rule_window(state: &AppState) -> (String, i64) {
+        sqlx::query_as("SELECT last_fired_at, fires_today FROM errand_rules")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The point of the whole piece: an errand does something without anybody typing into its topic.
+    ///
+    /// The turn is asserted by the chat it landed in and not merely by a count, because the one way
+    /// this can go wrong quietly is by firing into the wrong conversation — and a count of one is
+    /// equally true of a turn sent to the General.
+    #[tokio::test]
+    async fn an_errand_with_a_due_rule_gets_a_turn_with_nobody_typing() {
+        let (state, _temp) = errand_state().await;
+        let topic = a_topic();
+        seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        assert_eq!(errand_runs(&state).await, vec![topic]);
+    }
+
+    /// A paused errand does not fire, which is the difference between a pause and a mute.
+    ///
+    /// `/pausa` is what somebody types when an errand has gone noisy or wrong. If the schedule kept
+    /// running underneath it, the pause would stop the answers reaching the topic and not the work
+    /// reaching the model — the bill, the web requests and the notebook entries would all carry on,
+    /// and the one visible sign of it would be gone.
+    #[tokio::test]
+    async fn a_paused_errand_does_not_fire() {
+        let (state, _temp) = errand_state().await;
+        let topic = a_topic();
+        let errand = seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
+            .await
+            .unwrap();
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        assert!(errand_runs(&state).await.is_empty());
+        assert_eq!(
+            rule_window(&state).await,
+            (timestamp("2026-08-16T10:00:00Z").to_rfc3339(), 0),
+            "the window must not even be claimed: a pause that spends the day's allowance is a \
+             pause that costs the errand its schedule for the day it is lifted"
+        );
+    }
+
+    /// A closed errand does not fire either, and this is the one that would be worst to get wrong.
+    ///
+    /// `/fim` deletes nothing — the row stays and the folder stays, because what was found is worth
+    /// keeping after the question stops being asked. A schedule that kept firing on it would turn
+    /// that deliberate keeping into an errand nobody can switch off except by deleting the record,
+    /// which is precisely what closing was designed to avoid.
+    #[tokio::test]
+    async fn a_closed_errand_does_not_fire() {
+        let (state, _temp) = errand_state().await;
+        let topic = a_topic();
+        let errand = seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+        crate::errands::close(&state.pool, errand).await.unwrap();
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        assert!(errand_runs(&state).await.is_empty());
+        assert_eq!(
+            rule_window(&state).await,
+            (timestamp("2026-08-16T10:00:00Z").to_rfc3339(), 0),
+            "a closed errand's rule must be untouched: claiming its window writes to a record \
+             `/fim` promised to leave alone"
+        );
+    }
+
+    /// The runaway guard counts an errand's rule exactly as it counts a project's.
+    ///
+    /// The cap is what stands between one badly written cron and an unbounded number of turns, and
+    /// an errand needs it more than a project does, not less: a project rule starts work inside a
+    /// repository somebody is watching, and an errand rule spends money on a topic on a phone.
+    #[tokio::test]
+    async fn the_daily_cap_holds_for_an_errand_too() {
+        let (state, _temp) = errand_state().await;
+        let topic = a_topic();
+        seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+        sqlx::query("UPDATE errand_rules SET fires_date = ?, fires_today = ?")
+            .bind("2026-08-16")
+            .bind(DAILY_CAP as i64)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        assert!(errand_runs(&state).await.is_empty());
+    }
+
+    /// The regression half, and the reason it is one tick and not two files: a project's rules go on
+    /// firing exactly as they did, in the same pass that now serves errands.
+    ///
+    /// Both in one tick because that is where a mistake would live — an early `return` down the
+    /// errand path that swallows the projects, or a project loop that falls out before reaching the
+    /// errands. Two separate tests would each pass while the pair was broken.
+    #[tokio::test]
+    async fn a_project_rule_and_an_errand_rule_both_fire_in_one_tick() {
+        let (state, _temp) = errand_state().await;
+        let project = tempfile::tempdir().expect("create shadow project");
+        seed_project(
+            &state,
+            project.path(),
+            "shadow",
+            &timestamp("2026-08-16T10:00:00Z").to_rfc3339(),
+        )
+        .await;
+        let topic = a_topic();
+        seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        let modes: Vec<String> = sqlx::query_scalar("SELECT mode FROM runs ORDER BY mode")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(modes, vec!["assistant".to_owned(), "shadow".to_owned()]);
+        assert_eq!(errand_runs(&state).await, vec![topic]);
+    }
+
+    /// A scheduled turn does not begin on the far side of the injection barrier.
+    ///
+    /// The prompt is the owner's own words, written when the rule was created, so there is no
+    /// stranger in it — and starting tainted anyway would be a refusal with nothing to refuse. What
+    /// taints an errand turn is the notebook it is handed and the web it goes and reads, both of
+    /// which happen after this point and both of which already have their own mark.
+    #[tokio::test]
+    async fn a_scheduled_turn_does_not_start_tainted() {
+        let (state, _temp) = errand_state().await;
+        let topic = a_topic();
+        seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        let tainted: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(tainted, 0);
+    }
+
+    /// Two errands whose rules share a name both fire, and this is the sharpest edge in the piece.
+    ///
+    /// `due_rules` keys its maps by rule NAME, because a project's rules come out of one file where
+    /// the name is unique. An errand's name is unique only within its errand — deliberately, since
+    /// "manhã" is what everyone calls the morning one. Handed the two lists at once, the two morning
+    /// rules would collapse into one map entry and the second errand would inherit the first's
+    /// last-fired time: it would fire on some mornings, skip others, and look like a cron bug.
+    #[tokio::test]
+    async fn two_errands_with_a_rule_of_the_same_name_both_fire() {
+        let (state, _temp) = errand_state().await;
+        let first = a_topic();
+        let second = a_topic();
+        seed_errand(&state, &first, "* * * * *", "2026-08-16T10:00:00Z").await;
+        seed_errand(&state, &second, "* * * * *", "2026-08-16T10:00:00Z").await;
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+
+        let mut fired = errand_runs(&state).await;
+        fired.sort();
+        assert_eq!(fired, {
+            let mut want = vec![first, second];
+            want.sort();
+            want
+        });
+    }
+
+    /// A window that fired is spent, so a second tick in the same minute does not fire it again.
+    ///
+    /// The claim-before-firing ordering, seen from the outside. `scheduler_tick` is called twice
+    /// here exactly as the daemon calls it twice a minute, and the second call must find nothing
+    /// due — an autonomous turn repeated is not a retry, it is the same work done twice and paid
+    /// for twice.
+    #[tokio::test]
+    async fn a_window_already_served_is_not_served_again() {
+        let (state, _temp) = errand_state().await;
+        let topic = a_topic();
+        seed_errand(&state, &topic, "* * * * *", "2026-08-16T10:00:00Z").await;
+
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:00Z")).await;
+        scheduler_tick(&state, timestamp("2026-08-16T10:10:20Z")).await;
+
+        assert_eq!(errand_runs(&state).await.len(), 1);
     }
 }

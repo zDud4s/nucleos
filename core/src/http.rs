@@ -1669,7 +1669,7 @@ async fn post_assistant_message(
         Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
         // Clears by waiting, which is what makes it the one refusal here that needs no gesture from
         // anybody — and what makes it dangerous to confuse with the one below.
-        Err(msg) if msg.contains("already in progress") => {
+        Err(msg) if msg == crate::assistant::TURN_IN_PROGRESS => {
             Err(refusal(StatusCode::CONFLICT, "turn_in_progress"))
         }
         // Not a 500: nothing broke. The conversation asked to be answered on this machine and this

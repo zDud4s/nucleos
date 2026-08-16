@@ -528,15 +528,7 @@ mod tests {
         assert_eq!(global.len(), 1, "{global:?}");
         assert_eq!(global[0].summary, "the stop was released");
 
-        let searched = search(
-            &pool,
-            &SearchFilter {
-                scope: FeedScope::Global,
-                ..query("")
-            },
-        )
-        .await
-        .unwrap();
+        let searched = search(&pool, &scoped(FeedScope::Global)).await.unwrap();
         assert_eq!(searched.len(), 1, "{searched:?}");
         assert_eq!(searched[0].summary, "the stop was released");
     }
@@ -556,15 +548,7 @@ mod tests {
             .await
             .unwrap();
 
-        let carros = search(
-            &pool,
-            &SearchFilter {
-                scope: FeedScope::Errand(1),
-                ..query("")
-            },
-        )
-        .await
-        .unwrap();
+        let carros = search(&pool, &scoped(FeedScope::Errand(1))).await.unwrap();
 
         assert_eq!(carros.len(), 1, "{carros:?}");
         assert_eq!(carros[0].summary, "carros");
@@ -590,16 +574,7 @@ mod tests {
 
         assert_eq!(list_all(&pool, 50).await.unwrap().len(), 3);
         assert_eq!(
-            search(
-                &pool,
-                &SearchFilter {
-                    scope: FeedScope::All,
-                    ..query("")
-                }
-            )
-            .await
-            .unwrap()
-            .len(),
+            search(&pool, &scoped(FeedScope::All)).await.unwrap().len(),
             3
         );
     }

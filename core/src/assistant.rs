@@ -296,6 +296,19 @@ impl ErrandTurn {
     }
 }
 
+/// Why a turn was refused before it cost anything: this conversation is already answering one.
+///
+/// A constant because two callers now have to recognise it and act differently on it. `http.rs`
+/// turns it into the one status a client can retry on, and `scheduler.rs` reads it as "nothing was
+/// started" and hands the window back so the rule tries again on the next tick — the difference
+/// between an errand that skips a morning because its owner happened to be talking to it, and one
+/// that does not.
+///
+/// Matched by value at both, never by substring. A refusal recognised by a fragment of its wording
+/// stops being recognised the moment somebody improves the sentence, and the two behaviours that
+/// depend on it would fail apart and silently.
+pub const TURN_IN_PROGRESS: &str = "a turn is already in progress for this chat";
+
 /// The marker every "this errand is not answering" refusal starts with.
 ///
 /// A prefix rather than a whole message, because the message has to name the errand and the state
@@ -421,8 +434,7 @@ pub async fn send_message(
 ) -> Result<i64, String> {
     // Held from here on: every early return, error, and dropped future below releases the chat by
     // dropping this, which is why none of them needs a cleanup statement of its own.
-    let slot = ChatSlot::acquire(chat_id)
-        .ok_or("a turn is already in progress for this chat".to_string())?;
+    let slot = ChatSlot::acquire(chat_id).ok_or(TURN_IN_PROGRESS.to_string())?;
 
     // Resolved before anything else, because both refusals it can produce have to happen while the
     // turn still costs nothing.
