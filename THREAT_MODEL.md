@@ -195,8 +195,19 @@ forget: `chrome.Connect` is the only constructor, it arms the fence first, and i
   global; deleting the global on every new document survives in a cross-site iframe even with recursive auto-attach and
   the target paused before it runs; and `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` with a working proxy
   still lets the packet out. **The bound is same-origin:** the page exfiltrates what is already its own, not another
-  origin's data in the profile. The remaining mechanism is outside the browser — a firewall rule on the process — and is
-  untested.
+  origin's data in the profile.
+
+  Since 2026-08-16 this is a test rather than a paragraph: `gate.TestWebRTCUDPStillLeavesTheFence` points a page's
+  `RTCPeerConnection` at a UDP socket it owns and watches for the first STUN binding request. It passes today, which
+  means the hole is open; **it going red is how anyone finds out that has stopped being true**, and that will happen on
+  a Chromium bump rather than on a change here. Two of the mechanisms above were re-run through it against the pinned
+  build — the IP-handling policy with the fence proxy attached, and the Blink feature under the name the spike may have
+  got wrong — and both still leak, so the list is confirmed rather than inherited.
+
+  Two mechanisms remain untried, and neither is a command-line flag: a Windows Firewall rule on this executable, and
+  Chromium's `WebRtcIPHandlingPolicy` as an **enterprise policy** rather than a switch — a different code path, and a
+  plausible reason the switch does nothing. Both change the machine outside this repository, so both are the owner's
+  call; what has changed is that either can now be scored in about twenty seconds instead of argued about.
 - **An arbitrary `GET` under the person's authenticated identity.** `browser_open(url)` reaches any path of a permitted
   host, and `/logout`, `/unsubscribe?token=…`, `/approve?id=…` are all `GET`s that change things. Nothing mitigates this
   in v1; the designed path is a proposal the person approves.
@@ -340,7 +351,9 @@ typo in a list of model names cannot stop the daemon and take mail, autopilot an
 
    What is NOT part of this residual is a secret carried out of the mailbox: `redact_rendered` runs on every tool result on both paths a seat can take — inside `filter_outgoing` for a cloud seat's MCP call, and inside `LocalToolBox::call` for a local one — so a key that happened to be in a message does not reach the answer, let alone the chairman's prompt. That filter recognises shapes it knows and is not a reader of meaning, which is exactly why the residual above is stated in terms of prose. Prose is what it lets through, and prose is what this entry is about.
 12. Nothing in the council has been exercised against a real model. Every integration test drives a scripted `CommandRunner`, and a local seat is proved only as far as landing its `runs` row — no seat, cloud or local, has produced an answer. There is no `.ai/council.yaml` on this machine, so the pillar is dark; the first roster written is the first contact, and the phase-2 and phase-3 prompts are the part with no evidence behind them yet.
-13. **WebRTC leaves the browser pillar's fence open**, and nothing inside Chrome closes it — see "The browser" above for the six mechanisms measured and rejected. The bound is same-origin: a page exfiltrates what is already its own. The remaining mechanism is a firewall rule on the Chromium process, which nobody has written or tested. This is the one hole that would, if it turned out to be wider than stated, require the browser tools' non-`Acts` classification to be revisited.
+13. **WebRTC leaves the browser pillar's fence open**, and nothing inside Chrome closes it — see "The browser" above for the six mechanisms measured and rejected. The bound is same-origin: a page exfiltrates what is already its own. This is the one hole that would, if it turned out to be wider than stated, require the browser tools' non-`Acts` classification to be revisited.
+
+    **The entry now has an instrument** (2026-08-16): `gate.TestWebRTCUDPStillLeavesTheFence` watches a UDP socket of its own for the STUN request a page's `RTCPeerConnection` sends. It passes, so the hole is open, and it turning red is how anyone learns otherwise. Two of the six were re-run through it and still leak. **Trigger:** the two remaining mechanisms — a Windows Firewall rule on the executable, and `WebRtcIPHandlingPolicy` as an enterprise policy rather than a switch — both change the machine outside this repository and are the owner's decision; the test is what would score either in about twenty seconds. Until one lands, this entry stays open and the classification stands on the same-origin bound alone.
 14. **An arbitrary `GET` under the owner's authenticated identity** is reachable by `browser_open(url)` on any path of a permitted host. `GET` is not a safe verb in practice — `/logout`, `/unsubscribe?token=…`, `/approve?id=…`. Nothing mitigates it in v1. The designed path is a human-approved proposal, which is not built.
 15. **The browser pillar's fence is now exercised against a real browser, and the first run found two defects the unit tests could not.** `ServiceWorker.enable` does not exist on the browser session — real Chrome answers -32601 — and `Fetch.continueResponse` rejects a status without headers, which sent every non-document response down the failure path and blocked pages the fence meant to allow. Both passed the unit tests, because a fake CDP endpoint answers everything. The gap that remains is narrower and worth stating in its own terms: what runs against Chrome is a small group behind a build tag, it needs a browser present or it skips, and the pinned Chromium is not installed on any machine yet — so the group has only ever run against a system Chrome of the same major version.
 16. **A page can address this machine unless the profile's loopback list says otherwise.** The fence refuses loopback by default and the browser's own debugging port is the destination that matters, but the defence is a list somebody has to keep right: an entry added to reach a local dev server admits every path on that origin, and the entry outlives the reason it was added. Nothing expires it and nothing warns when a listed port starts answering as something else.
