@@ -13,6 +13,14 @@
 //! 4. **The person gives it back** — the window closes, and they are shown where they went and asked
 //!    whether to keep it. That answer is the only way `browser_sites` ever grows.
 //!
+//! There is a fifth way in, and it is deliberately not one of the four: `open_window`, where a
+//! person opens a window themselves without an agent having asked for anything. It skips step 1 and
+//! step 2 entirely — there is no proposal, because the dialogue in those steps defends against an
+//! agent choosing a destination, and here nobody did. It joins at step 3 and leaves through step 4
+//! like any other, so what a session may GRANT is unchanged; only who may start one is wider. It
+//! exists because until it did, a profile could not be prepared, only repaired: the sole way to log
+//! in was to wait for the agent to fail at the login first.
+//!
 //! # Why this module holds no SQL
 //!
 //! `browser_sessions` has exactly one module that writes to it, and that is `browser.rs`. This one is
@@ -51,6 +59,8 @@ pub enum WheelError {
     Disabled,
     /// The sidecar said no, or could not be reached.
     Sidecar(BrowserError),
+    /// Nobody is at the machine, and this is a window only a person may ask for.
+    NoOnePresent,
     Db(sqlx::Error),
 }
 
@@ -67,9 +77,79 @@ impl std::fmt::Display for WheelError {
             WheelError::WrongState(why) => write!(f, "{why}"),
             WheelError::Disabled => write!(f, "the browser pillar is off"),
             WheelError::Sidecar(error) => write!(f, "{error}"),
+            WheelError::NoOnePresent => write!(
+                f,
+                "a window is opened for somebody to sit at, and nobody is at this machine"
+            ),
             WheelError::Db(error) => write!(f, "database error: {error}"),
         }
     }
+}
+
+/// A person opens a window of their own, on a project's profile.
+///
+/// # Why this is not a handover, and has no proposal
+///
+/// Everything in §4.4 — the proposal, the literal punycode origin, "who asked and how they got
+/// there" — exists because an AGENT chose the destination while carrying a stranger's words in its
+/// context. That is the confused deputy the dialogue is built against. Here the person typed the
+/// address. There is nobody to be confused, so asking them to approve their own request would be
+/// ceremony, and ceremony is what teaches people to click through the dialogues that do matter.
+///
+/// # Why it exists at all
+///
+/// Spec §5.2 lets a host into a profile's list only when a person logs in, and until this function
+/// the ONLY way to log in was for the agent to walk into the wall first: it asks, you accept, you
+/// sign in. So a profile could not be prepared, only repaired. Wanting the agent to read your Jira
+/// meant waiting for it to fail at Jira. The list still grows by exactly the same mechanism — the
+/// window records where it went, and `keep` answers yes or no on the way out — so this widens who
+/// may START a session and changes nothing about what a session may GRANT.
+///
+/// # The presence check is the security control
+///
+/// Without it this is a route that opens a real window over the profile holding the owner's live
+/// cookies, reachable by anything holding the daemon token — which includes every run. `Requester`
+/// is not enough on its own here: `browser.rs` uses it to decide a PLACEMENT, and being wrong there
+/// costs a throwaway profile. Being wrong here costs a browser nobody is watching, logged in as the
+/// owner. So it refuses rather than degrades.
+pub async fn open_window(
+    state: &AppState,
+    project_id: &str,
+    url: &str,
+) -> Result<SessionRow, WheelError> {
+    if !state.browser.enabled {
+        return Err(WheelError::Disabled);
+    }
+    if !crate::attention::owner_is_present(&state.pool, chrono::Utc::now()).await {
+        return Err(WheelError::NoOnePresent);
+    }
+
+    // The project's profile, never a throwaway — the same reason `accept` re-places a handover
+    // (§4.5). A login made in a directory that is deleted afterwards is a login nobody keeps, and
+    // this function's whole point is the login.
+    let sites = browser::admitted_origins(&state.pool, project_id).await?;
+    let placement = Placement::project(project_id, sites);
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let row_id = browser::insert_person_window(&state.pool, project_id, url, &now).await?;
+
+    // An empty session id, and the sidecar already understands it: `pool.TakeWheel` guards its
+    // "close the agent's browser first" step behind `req.Session != ""`, so with nothing to displace
+    // it goes straight to opening a headful browser on the profile. Nothing was added there for this.
+    let wheel = match state.browser.client.take_wheel("", url, &placement).await {
+        Ok(wheel) => wheel,
+        Err(error) => {
+            // Spec §4.4a's shape, for the same reason: a launch that failed is reported as a failed
+            // delivery rather than cleaned away, so the person sees that their window did not open
+            // instead of a click that did nothing.
+            let _ =
+                browser::set_mode(&state.pool, row_id, mode::HUMAN, mode::DELIVERY_FAILED).await;
+            return Err(WheelError::Sidecar(error));
+        }
+    };
+
+    browser::rebind_sidecar(&state.pool, row_id, &wheel.session, &placement.profile.id).await?;
+    live(&state.pool, row_id).await
 }
 
 /// The agent asks for the wheel (spec §4.4 rule 3).
@@ -324,6 +404,27 @@ pub struct KeepBody {
     pub keep: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WindowBody {
+    pub project_id: String,
+    pub url: String,
+}
+
+/// `POST /browser/window` — a person opens one for themselves.
+///
+/// No `run_id` field, and its absence is the point: a run cannot ask for this. The refusal is
+/// `open_window`'s presence check rather than a missing field, but a field a run could fill would
+/// invite exactly the caller this must not have.
+pub async fn post_window(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<WindowBody>,
+) -> axum::response::Response {
+    match open_window(&state, &body.project_id, &body.url).await {
+        Ok(row) => axum::Json(row).into_response(),
+        Err(error) => wheel_error(error),
+    }
+}
+
 /// `POST /browser/handoff` — the agent asks for the wheel.
 pub async fn post_handoff(
     State(state): State<AppState>,
@@ -362,7 +463,9 @@ fn wheel_error(error: WheelError) -> axum::response::Response {
         WheelError::NoSuchSession => StatusCode::NOT_FOUND,
         // 409, like every other refusal on this surface: nothing about the credentials is wrong, and
         // the machine is simply not in a state where this can be carried out.
-        WheelError::WrongState(_) | WheelError::Disabled => StatusCode::CONFLICT,
+        WheelError::WrongState(_) | WheelError::Disabled | WheelError::NoOnePresent => {
+            StatusCode::CONFLICT
+        }
         WheelError::Sidecar(BrowserError::FenceDown(_)) => StatusCode::SERVICE_UNAVAILABLE,
         WheelError::Sidecar(_) => StatusCode::BAD_GATEWAY,
         WheelError::Db(ref db) => {
@@ -733,6 +836,76 @@ mod tests {
             request(&state, 9999, "x").await,
             Err(WheelError::NoSuchSession)
         ));
+        db.close().await;
+    }
+
+    /// A person opens a window with no agent involved, and it arrives ready to be given back.
+    ///
+    /// The assertions to care about are the two that say what this is NOT. No proposal is raised —
+    /// the §4.4 dialogue defends against an agent having chosen the destination, and asking somebody
+    /// to approve an address they just typed is the ceremony that teaches people to click through
+    /// the dialogues that matter. And the profile is the project's, never a throwaway, because the
+    /// whole point of this door is a login that outlives the session.
+    #[tokio::test]
+    async fn a_person_opens_a_window_with_no_agent_and_no_proposal() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let row = open_window(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+
+        assert_eq!(row.mode, mode::HUMAN, "it is the person's from the start");
+        assert_eq!(row.profile_kind, "project");
+        assert_eq!(row.rule, "person-opened");
+        assert_eq!(row.run_id, None, "no run asked for this and none may");
+        assert_eq!(
+            row.proposal_id, None,
+            "a person approving their own address is ceremony, not consent"
+        );
+        assert!(
+            seen.lock().unwrap().iter().any(|verb| verb == "wheel/take"),
+            "the sidecar was asked for a headful browser: {:?}",
+            seen.lock().unwrap()
+        );
+
+        // It leaves by the ordinary door: this is the same `give_back` the handover uses, which is
+        // what makes the grant rule identical for both ways in.
+        assert!(give_back(&state, row.id).await.is_ok());
+        db.close().await;
+    }
+
+    /// Nobody at the machine gets no window, and gets no row either.
+    ///
+    /// This is the security half of `open_window`. Without the check it is a route that opens a real
+    /// browser over the profile holding the owner's live cookies, and every run holds the token that
+    /// would reach it. The second assertion matters as much as the first: a refusal that still wrote
+    /// a row would leave the sessions list advertising a browser to hand over.
+    #[tokio::test]
+    async fn nobody_present_gets_no_window() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+
+        assert!(matches!(
+            open_window(&state, "nucleos", "https://jira.example.org/login").await,
+            Err(WheelError::NoOnePresent)
+        ));
+        assert!(
+            !seen.lock().unwrap().iter().any(|verb| verb == "wheel/take"),
+            "no browser should have been asked for"
+        );
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refusal must not leave a row offering a handover"
+        );
         db.close().await;
     }
 }

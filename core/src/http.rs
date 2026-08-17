@@ -281,6 +281,11 @@ pub fn build_router(state: AppState) -> Router {
         // `/keep` is the closest thing to a grant on this surface, and it names no host: it answers
         // yes or no to a chain a browser recorded under a person's own hands.
         .route("/browser/handoff", post(crate::browser_wheel::post_handoff))
+        // A window a person opens for themselves. It skips the proposal that `/handoff` raises,
+        // because the dialogue there defends against an AGENT having chosen the destination and here
+        // nobody did — and it refuses outright when nobody is at the machine, which is the check that
+        // stops it being a route any run could use to open a browser over the owner's live cookies.
+        .route("/browser/window", post(crate::browser_wheel::post_window))
         .route("/browser/return", post(crate::browser_wheel::post_return))
         .route("/browser/keep", post(crate::browser_wheel::post_keep))
         .route("/browser/sessions", get(crate::browser::list_open_sessions))
@@ -2736,15 +2741,26 @@ async fn land_worktree(
         target: crate::vcs::Branch::new(target.trim())
             .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
     };
-    let id = crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "land: admitting the request failed");
-            refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the request could not be admitted".to_owned(),
-            )
-        })?;
+    // **A landing that came out of a conflict resolution is marked as it is admitted**, and the mark
+    // is what makes the queue verify it before publishing — a two-parent tip, no conflict markers.
+    // Asked here rather than at execution time because the answer is only reliable now: it is read
+    // from the worktree the asker is standing in, which exists precisely because they are standing
+    // in it.
+    let from_resolution =
+        crate::resolver::landing_is_a_resolution(&state.pool, repo.project_id(), source.trim())
+            .await;
+    let admitted = if from_resolution {
+        crate::vcs::submit_resolution(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
+    } else {
+        crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
+    };
+    let id = admitted.map_err(|error| {
+        tracing::warn!(%error, "land: admitting the request failed");
+        refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the request could not be admitted".to_owned(),
+        )
+    })?;
 
     vcs_ticket(&state, id, std::time::Duration::ZERO)
         .await

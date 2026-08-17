@@ -3714,6 +3714,41 @@ export async function returnBrowserWheel(
 }
 
 /**
+ * Open a real window, on a project's profile, because you want to.
+ *
+ * The one door into the pillar that no agent asked for. It raises no proposal: the dialogue in
+ * `Waiting` exists because an agent chose the address while holding a stranger's words, and here the
+ * person typed it, so there is nobody to approve. The daemon refuses with 409 when nobody is at the
+ * machine â€” a window is opened for somebody to sit at.
+ *
+ * It exists because until it did, a profile could only be repaired and never prepared: the sole way
+ * to log in was to wait for the agent to walk into the login first. What it grants is unchanged â€”
+ * the window records where it goes and `keepBrowserChain` still answers on the way out.
+ */
+export async function openBrowserWindow(
+  token: string,
+  projectId: string,
+  url: string,
+): Promise<ApiResult<BrowserSession>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/window`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project_id: projectId, url }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as BrowserSession };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
  * The answer to "keep these?" â€” the only way a host ever enters a profile's list.
  *
  * It names no origin. The set is whatever the person's own window recorded, held on the session row,
