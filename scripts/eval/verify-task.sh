@@ -224,7 +224,8 @@ printf '%s\n' "${results[@]}" | column -t -s "$(printf '\t')" 2>/dev/null \
   || printf '%s\n' "${results[@]}"
 echo
 if [ $overall -eq 0 ]; then
-  echo "every task verified: base compiles, test fails on base, test passes on reference."
+  echo "every task verified: base compiles, test fails on base, test passes on reference,"
+  echo "and the project's own gate is green on the base."
 else
   echo "at least one task is NOT valid. A row that fails here must not appear in a"
   echo "results table — it produces verdicts that mean nothing."
