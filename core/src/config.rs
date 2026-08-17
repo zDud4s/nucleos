@@ -651,7 +651,9 @@ pub fn load_council_config(path: &Path, local_available: bool) -> Option<Council
 /// project silently stops. That direction is fail-closed, which is precisely why nobody notices —
 /// the contract this module advertises is "error on malformed YAML rather than guess", and a
 /// misspelt key is malformed.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`: `GraphConfig` carries an `Option<f64>` now, and floats are not `Eq`.
+// Nothing outside this module ever needed the total equality.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleRule {
     pub name: String,
@@ -676,6 +678,18 @@ pub struct ScheduleRule {
 /// that no review ever sees. A number in it therefore cannot be the only thing standing between one
 /// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
 pub const MAX_ITEMS_CEILING: usize = 5;
+
+/// The ceiling the daemon puts on how many EXTRA implement runs one red gate may buy.
+///
+/// The same argument `MAX_ITEMS_CEILING` makes, against the same file. A retry is a whole run, and
+/// `.ai/autopilot.yaml` is per-developer configuration no review ever sees — a number in it cannot
+/// be the only thing standing between one red gate and an unbounded number of re-implements. It may
+/// lower the budget; it may not raise it past what the daemon is willing to spend on one item.
+///
+/// Three rather than five, and lower than the fan-out ceiling on purpose: past the third attempt the
+/// evidence is that the item cannot be made to pass, and every further run is taken from the items
+/// queued behind it that were never the ones that broke.
+pub const MAX_GATE_RETRIES_CEILING: usize = 3;
 
 /// The ceiling the daemon puts on how many ROUNDS one job may run.
 ///
@@ -736,13 +750,30 @@ fn default_max_items() -> usize {
     MAX_ITEMS_CEILING
 }
 
+/// What a rule that said nothing about retries asks for: one.
+///
+/// The default that costs something, and deliberately so — a red gate is most often a near miss, and
+/// one more implement run told what the gate said is cheaper than the item it saves. One and not
+/// more, because the second retry is where an item that cannot be made to pass starts eating the
+/// runs the items behind it were queued for.
+///
+/// The `jobs.gate_retries` COLUMN defaults to 0 instead, and the two disagree on purpose: this is
+/// what a rule asks for when it says nothing, and 0 is what a job already scheduled keeps when
+/// nobody asked at all.
+pub const DEFAULT_GATE_RETRIES: usize = 1;
+
+fn default_gate_retries() -> usize {
+    DEFAULT_GATE_RETRIES
+}
+
 fn default_true() -> bool {
     true
 }
 
 /// Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a
 /// single run capped by one context window.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`: `budget_usd` is an `Option<f64>`, and floats have no total equality.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphConfig {
     #[serde(default = "default_max_items")]
@@ -751,6 +782,24 @@ pub struct GraphConfig {
     pub gate_after_each_item: bool,
     #[serde(default = "default_true")]
     pub review: bool,
+    #[serde(default = "default_gate_retries")]
+    gate_retries: usize,
+    /// The most this one job may spend, in USD, before its own brakes stop it.
+    ///
+    /// `None` — the key absent — means what every `graph:` rule has always meant: only the house
+    /// limit governs this job. That is the behaviour of every rule already sitting in somebody's
+    /// gitignored `.ai/autopilot.yaml`, and it must stay theirs, so there is no default number here.
+    ///
+    /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
+    /// accessor because the accessor applies a CEILING against a per-developer file no review sees.
+    /// A budget has no ceiling to apply: it runs UNDER the house limit rather than instead of it, so
+    /// whatever the file writes here can only ever tighten what this job is allowed to spend. There
+    /// is no number a rule could put in this key that buys it more than the daemon already allows.
+    ///
+    /// The value must be a finite, non-negative number; `load_schedule_rules` refuses the rest
+    /// rather than clamping, for the reasons written at `validate_rules`.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
 }
 
 impl GraphConfig {
@@ -760,6 +809,16 @@ impl GraphConfig {
     /// struct would silently honour whatever the file said, and the ceiling would be advisory.
     pub fn max_items(&self) -> usize {
         self.max_items.min(MAX_ITEMS_CEILING)
+    }
+
+    /// The retries actually allowed, after the daemon's own ceiling.
+    ///
+    /// Private field plus this accessor for the same reason `max_items` has one, and it is worth
+    /// saying twice because the failure is silent: a caller that read `gate_retries` straight off
+    /// the struct would honour whatever `.ai/autopilot.yaml` asked for, and the ceiling above would
+    /// be decorative — present in the code, absent from every job that actually runs.
+    pub fn gate_retries(&self) -> usize {
+        self.gate_retries.min(MAX_GATE_RETRIES_CEILING)
     }
 }
 
@@ -771,7 +830,8 @@ pub struct RepoTrigger {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AutopilotRules {
     #[serde(default)]
@@ -796,8 +856,63 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
     if contents.trim().is_empty() {
         return Ok(AutopilotRules::default());
     }
-    serde_yaml::from_str(&contents)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let rules: AutopilotRules = serde_yaml::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    validate_rules(&rules)?;
+    Ok(rules)
+}
+
+/// Refuses the values that parse as numbers but that no rule could have meant.
+///
+/// Here rather than in a `Deserialize` detail on purpose: serde's job is the shape of the file, and
+/// this is a range check on a value whose shape was fine. `load_schedule_rules` is already the place
+/// where "the file says something impossible" becomes `InvalidData`, so it stays the one place a
+/// caller has to look, and a hand-built `GraphConfig` in a test is not silently held to a rule that
+/// only the file-reading path enforces.
+///
+/// Refused rather than clamped, both times, because `.ai/autopilot.yaml` is gitignored per-developer
+/// configuration no review ever sees. A number quietly corrected there is a number nobody learns was
+/// wrong: the file would keep reading as though it had asked for something, and the job would behave
+/// as though it had asked for something else.
+///
+/// - **Negative.** A negative allowance is not a number anyone meant to write. Clamped to zero it
+///   would stop the job at its first node, which is a real behaviour change bought by a typo.
+/// - **Non-finite.** The sharp one, and the reason "reject negatives" is not the whole rule. Every
+///   comparison against NaN is false, and `job::job_over_budget` decides with
+///   `spent + reserve <= limit`: a NaN limit makes that false for ever, so the brake reads as
+///   already blown and the job stops at its FIRST node while the file reads as though it had asked
+///   for something generous. An infinity is the same class of answer from the other end — a ceiling
+///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
+///   by leaving the key out, which is what `None` already means.
+fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+    for rule in &rules.schedules {
+        let Some(budget) = rule.graph.as_ref().and_then(|graph| graph.budget_usd) else {
+            continue;
+        };
+        if !budget.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "schedule `{}`: budget_usd must be a finite number, got `{budget}`; a ceiling \
+                     that cannot be compared against is not a ceiling — leave the key out to run \
+                     under the house limit alone",
+                    rule.name
+                ),
+            ));
+        }
+        if budget < 0.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "schedule `{}`: budget_usd must not be negative, got `{budget}`; it is not \
+                     clamped to zero because that would stop the job at its first node while the \
+                     file still read as though it had asked for something",
+                    rule.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -851,6 +966,53 @@ mod tests {
         assert_eq!(rules.schedules[0].graph.as_ref().unwrap().max_items(), 2);
     }
 
+    /// One retry, for a rule that said nothing about retries.
+    ///
+    /// The default that costs something, and deliberately so: a red gate is most often a near miss —
+    /// an import the node forgot, a test it did not know to update — and one more implement run told
+    /// what the gate said is cheaper than the item it saves. One and not more, because the second
+    /// retry is where an item that cannot be made to pass starts eating the runs the items behind it
+    /// were queued for.
+    ///
+    /// The `jobs.gate_retries` COLUMN defaults to 0, not to this. The two disagree on purpose: this
+    /// is what a rule asks for when it says nothing, and that is what a job already scheduled keeps
+    /// when nobody asked at all.
+    #[test]
+    fn gate_retries_defaults_to_one() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph: {}\n",
+        )
+        .expect("an empty graph block is valid and fully defaulted");
+        assert_eq!(
+            rules.schedules[0]
+                .graph
+                .as_ref()
+                .expect("graph present")
+                .gate_retries(),
+            1
+        );
+    }
+
+    /// The same argument `max_items` is guarded by, against the same file.
+    ///
+    /// `.ai/autopilot.yaml` is gitignored per-developer configuration no review ever sees, and a
+    /// retry is a whole run: a number in that file cannot be the only thing standing between one red
+    /// gate and an unbounded number of re-implements. It may lower the budget; it may not raise it
+    /// past what the daemon is willing to spend on one item.
+    #[test]
+    fn an_oversized_gate_retries_is_cut_by_the_ceiling() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      gate_retries: 99\n",
+        )
+        .expect("an oversized gate_retries parses");
+        assert_eq!(
+            rules.schedules[0].graph.as_ref().unwrap().gate_retries(),
+            3,
+            "the ceiling is what governs, not the file"
+        );
+        assert_eq!(MAX_GATE_RETRIES_CEILING, 3);
+    }
+
     #[test]
     fn a_misspelt_graph_key_is_malformed_rather_than_ignored() {
         // Same fail-closed contract the rest of this module keeps: a typo that parsed cleanly would
@@ -860,6 +1022,97 @@ mod tests {
         )
         .expect_err("an unknown key inside graph is an error");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The overnight case is the one this field exists for. A job fired at 03:00 with nobody
+    /// watching is precisely the job that can eat the whole house allowance before morning, and
+    /// until now it was the only kind that could not be given a ceiling of its own: `POST /jobs`
+    /// has taken `budget_usd` since the column did, and the scheduler hard-coded `None` because
+    /// there was nowhere in a rule to write one.
+    ///
+    /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
+    /// accessor because the accessor applies a CEILING; a budget has no ceiling to apply, because
+    /// it runs UNDER the house limit rather than instead of it and can therefore only ever tighten.
+    /// Public is what `gate_after_each_item` and `review` already are, for the same reason.
+    #[test]
+    fn a_graph_block_may_name_its_own_budget() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: 5.0\n",
+        )
+        .expect("a graph block naming a budget parses");
+        assert_eq!(
+            rules.schedules[0].graph.as_ref().unwrap().budget_usd,
+            Some(5.0),
+            "the number the file asked for is the number the rule carries"
+        );
+    }
+
+    /// Absent means absent, and never zero. A rule that says nothing about money keeps exactly
+    /// today's behaviour — only the house limit governs — and every `graph:` rule already sitting in
+    /// somebody's gitignored `.ai/autopilot.yaml` says nothing about money. Defaulting this to a
+    /// number would put a ceiling on all of them overnight, and the first evidence would be a job
+    /// stopping for a limit nobody set.
+    ///
+    /// The block here is non-empty on purpose: what must yield `None` is the absence of this one
+    /// key inside a `graph:` block that is otherwise present and saying things.
+    #[test]
+    fn a_graph_block_without_a_budget_leaves_the_house_limit_alone() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_items: 2\n",
+        )
+        .expect("a graph block that says nothing about money parses");
+        assert_eq!(rules.schedules[0].graph.as_ref().unwrap().budget_usd, None);
+    }
+
+    /// Malformed, not clamped. The posture this module advertises is that it falls back to defaults
+    /// when the file is ABSENT but errors on malformed YAML rather than guessing, and a negative
+    /// allowance is not a number anyone meant to write.
+    ///
+    /// Clamping it silently to zero would be the worse of the two failures: the job would stop at
+    /// its first node while `.ai/autopilot.yaml` still read as though it had asked for something,
+    /// and the file is gitignored per-developer configuration that no review ever sees.
+    #[test]
+    fn a_negative_budget_is_malformed_rather_than_clamped() {
+        let error = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: -1.0\n",
+        )
+        .expect_err("a negative allowance is not a number anyone meant");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        // Refused for the RIGHT reason. Before `budget_usd` existed as a field, `deny_unknown_fields`
+        // refused this same YAML as an unknown key — so without this line the assertion above is
+        // green on both sides of what the test claims, and would stay green if the field were added
+        // and the range check forgotten.
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "the key must be recognised and its VALUE refused: {error}"
+        );
+    }
+
+    /// NaN is the sharp case, and the reason "reject negatives" is not the whole rule.
+    ///
+    /// Every comparison against NaN is false. `job::job_over_budget` decides with
+    /// `spent + reserve <= limit`, so a NaN limit makes that false forever: the brake reads as
+    /// already blown and the job stops at its FIRST node, while the file reads as though it had
+    /// asked for something generous. An infinity is the same class of answer from the other end — a
+    /// ceiling that can never be reached is not a ceiling, and a rule that wanted no ceiling says so
+    /// by leaving the key out.
+    #[test]
+    fn a_budget_that_is_not_a_finite_number_is_refused() {
+        for value in [".nan", ".inf"] {
+            let error = rules_from(&format!(
+                "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: {value}\n"
+            ))
+            .err()
+            .unwrap_or_else(|| panic!("{value} must be refused, not accepted as a budget"));
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{value}");
+            // As in the negative case: `deny_unknown_fields` refuses this YAML today for a reason
+            // that has nothing to do with the value, so the kind check alone would pass before the
+            // field exists and after a finiteness check was left out.
+            assert!(
+                !error.to_string().contains("unknown field"),
+                "{value} must be recognised as a budget and refused as a number: {error}"
+            );
+        }
     }
 
     fn email_config_from(yaml: &str) -> EmailConfig {

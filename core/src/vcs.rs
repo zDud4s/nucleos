@@ -474,20 +474,22 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Human,
-    // **Nothing maps to this, and that is a decision rather than an omission.** `http.rs`'s
-    // `vcs_origin` argues the whole case: in this repo "shell" means the Tauri desktop app, which
-    // holds the *control* token and therefore already arrives as `Human`, and an admin API token is
-    // deliberately NOT recorded as `shell` because that would name the one client that did not make
-    // the call. An arm here would need a scope that means something no scope means today — a
-    // credential belonging to an external session in its own right, distinct from both the desktop
-    // app's control token and a run's.
+    // **A person's own editor session, asking through its safety hook** — `hooks::session_git_decision`.
     //
-    // It survives anyway, because the schema outranks the mapping: the `origin` column's CHECK
-    // constraint accepts `'shell'`, and `Ticket` and `RequestSummary` hand a row's columns back
-    // verbatim rather than parsing them, so such a row can exist and be listed whether or not this
-    // variant does. Deleting it would leave the one enum that is meant to be the authority on that
-    // column unable to name a value the column permits, which is the wrong way round.
-    #[allow(dead_code)]
+    // This said "nothing maps to this, and that is a decision rather than an omission", and it
+    // survived on the argument that the schema outranks the mapping. The caller it was waiting for
+    // is the one it described almost exactly: *"a credential belonging to an external session in its
+    // own right, distinct from both the desktop app's control token and a run's"*. What arrived is
+    // one step off that description and the difference is worth keeping straight — the hook presents
+    // the control token, so the credential is not a session's own; what is a session's own is the
+    // ASKING. `Human` would have been a lie of a readable kind: nobody clicked anything.
+    //
+    // It stays distinct from `Human` for the reason the audit exists. A `human` row means a person
+    // acted in the app; a `shell` row means a person's agent tried to act and was redirected here
+    // instead. Those are different events and the queue is the only place that records the second.
+    //
+    // The Tauri app is NOT this, despite owning the `shell/` directory: it holds the control token
+    // and arrives through `vcs_origin` as `Human`, which is why the name was free.
     Shell,
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
@@ -579,6 +581,63 @@ pub enum ResolveError {
 // itself, so a `Display` here would be dead code that clippy cannot see — trait impls are exempt
 // from dead-code analysis. Whoever gains a caller that wants to print one whole writes it then.
 
+/// The project a directory belongs to, for a caller that knows only where it is standing.
+///
+/// `resolve_repo` goes the other way, from a name the caller already had. This is for the caller that
+/// has no name at all: an interactive session's safety hook, which knows its `cwd` and nothing else.
+/// Both ends meet at the same `ResolvedRepo`, because this returns a project id and hands it straight
+/// back to `resolve_repo` rather than building one — the type has one production constructor for a
+/// reason, and a second would be free to let `root` and `key` disagree.
+///
+/// **The match is on the repository, not on the path**, and that is the whole reason a session in a
+/// linked worktree resolves at all. `C:\Projects\nucleos-assuntos` is not under `C:\Projects\nucleos`
+/// and no prefix test would ever relate them; what relates them is `--git-common-dir`, which both
+/// answer identically. Measured on this repo: thirteen worktrees, thirteen different top levels, one
+/// common dir. That is also precisely why the queue serialises across them for free — the key it
+/// locks on IS that common dir, so `one_running_vcs_request_per_repo` was already counting every
+/// session in every worktree before any of them could reach it.
+///
+/// The parent of the common dir is the main working tree's root. That holds for every repository this
+/// queue can serve and fails only for a bare one, which `repo_key` has already refused by here.
+pub async fn project_for_worktree(
+    pool: &sqlx::SqlitePool,
+    worktree_root: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let key = crate::git_exec::repo_key(worktree_root, deadline).await?;
+    let main_root = std::path::Path::new(&key)
+        .parent()
+        .ok_or_else(|| format!("{key} has no parent, so it names no working tree"))?
+        .to_owned();
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL
+         ORDER BY project_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("could not read the project roster: {error}"))?;
+
+    for (project_id, root) in &rows {
+        // Canonicalised on both sides rather than compared as written. `canonical` returns a Windows
+        // verbatim path and a recorded root is whatever a person typed, so the two spellings reach
+        // one directory and compare unequal — the failure `canonical`'s own doc comment warns about.
+        // A root that has since been deleted canonicalises to an error and is skipped, not fatal:
+        // one stale roster row must not stop the rest of the roster from answering.
+        if let Ok(canonical_root) = crate::git_exec::canonical(std::path::Path::new(root)).await
+            && std::path::Path::new(&canonical_root) == main_root
+        {
+            return Ok(project_id.clone());
+        }
+    }
+
+    Err(format!(
+        "no project on the roster is rooted at {} — the queue takes work for projects it knows, and \
+         a project in `off` mode has its root cleared, so that is the first thing to check",
+        main_root.display()
+    ))
+}
+
 /// The single production path from a project id to a repository the queue may lock.
 ///
 /// Both halves are needed: `autopilot_state` is the only place a root is recorded, and git is what
@@ -638,6 +697,48 @@ pub async fn resolve_repo(
 /// A `target` of `HEAD` is refused rather than passed on. It is what `rev-parse --abbrev-ref` says
 /// for a detached HEAD, and it is meaningless as a merge target besides — the integration worktree's
 /// own HEAD is always detached, so publishing "into HEAD" names nothing.
+/// PURE: the command segments a shell string holds, in order, with any leading environment
+/// assignments stripped.
+///
+/// **Every parser below matches the WHOLE token list as an exact shape, which is right for what
+/// they are and wrong for what they were being handed.** `merge_from_command` accepts
+/// `[program, subcommand, source]` and nothing longer — a deliberate strictness, argued at length
+/// in its own comment, so that a spelling the queue cannot perform keeps working directly instead
+/// of becoming impossible. But `cd repo && git merge feature` is not a different spelling of merge.
+/// It is the same operation with a shell in front of it, and the exact-shape match cannot see it:
+/// five tokens, no match, `None` — and `session_git_decision` reads `None` as "not mine", which is
+/// an ALLOW. Every guarantee the queue makes was one `cd` away from being optional.
+///
+/// Splitting here rather than loosening the parsers keeps that strictness intact: each segment is
+/// still matched as a whole shape, there are just more of them. A segment that is not a git command
+/// matches nothing, exactly as an unrecognised command does today.
+///
+/// Not a shell parser, and it must not become one. Quoting is ignored, so
+/// `echo "a; git merge x"` yields a segment that parses as a merge and is refused. That direction is
+/// the safe one — the refusal is a sentence a person can reword, and the caller cannot approve
+/// anything with it — and it is the same trade `ask_daemon.py`'s own filter makes for the same
+/// reason.
+pub fn shell_segments(command: &str) -> Vec<&str> {
+    command
+        .split(['\n', '\r', ';', '&', '|', '(', ')'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            // `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and
+            // leaving them in makes `program` read `FOO=bar` and the whole segment parse as nothing.
+            let mut rest = segment;
+            while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+                if head.contains('=') && !head.starts_with('-') {
+                    rest = tail.trim_start();
+                } else {
+                    break;
+                }
+            }
+            rest
+        })
+        .collect()
+}
+
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     // Matched as whole shapes rather than by filtering the flag out of the token list, and the
@@ -847,6 +948,79 @@ pub fn branch_delete_from_command(command: &str) -> Option<Op> {
     Some(Op::BranchDelete {
         branch: Branch::new(branch).ok()?,
     })
+}
+
+/// PURE: why a command the parsers declined must still not be run by hand, or `None`.
+///
+/// **"Declined by the queue" and "fine to run directly" are not the same sentence, and treating
+/// them as one left the worst spelling of the worst verb wide open.** The session gate's rule was
+/// that anything the six parsers refuse passes through untouched, and that rule is right for
+/// `git merge --squash`: squash is a DIFFERENT operation, it stages instead of merging, and
+/// refusing it would make it impossible rather than governed. It is wrong for `git push --force`,
+/// which is the SAME operation in a worse spelling. Measured against the live gate before this
+/// existed: `git push --force origin master`, bare `git push`, and `git pull origin master` all
+/// came back `allow`.
+///
+/// The line drawn here is **does it write something other sessions share**. A push writes the
+/// remote; a pull writes the remote-tracking refs and then moves the local branch; `git branch -D`
+/// destroys a branch after asking git to stop answering whether that is safe. None of those can be
+/// left to race with the queue that exists to order exactly them. What stays silent is what touches
+/// only the caller's own worktree or index — `--squash`, `--abort`, `--continue` — and read-only
+/// spellings, which were never this queue's business.
+///
+/// This is a refusal and NOT an admission: there is nothing to queue, because the queue does not
+/// know how to perform the spelling either. The caller is told which spelling it does know.
+pub fn unqueueable_but_shared(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // **The segment must BEGIN with git, and that is what separates a command from a mention.**
+    // Scanning for `git` anywhere inside it is what the first version did, and it refused this
+    // feature's own commit message: segments split on newlines, so that `cd repo` and `git push` on
+    // two lines are judged apart — which also turns a line of prose reading "git push --force was
+    // allowed" into something shaped exactly like a command. Measured, not imagined: the commit
+    // could not be written, and neither could the probe that found it.
+    //
+    // Requiring the program first costs nothing real. `cd x && git push` has already become two
+    // segments by the time it arrives here, and the second begins with git. What it stops is every
+    // quoted and narrated occurrence — most of them, in a repository whose commit messages argue
+    // about git commands for a living.
+    let program = tokens
+        .first()?
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()?
+        .to_ascii_lowercase();
+    if program != "git" && program != "git.exe" {
+        return None;
+    }
+    let verb = tokens
+        .get(1..)?
+        .iter()
+        .find(|candidate| !candidate.starts_with('-'))
+        .map(|candidate| candidate.to_ascii_lowercase());
+
+    match verb.as_deref()? {
+        "push" => Some(
+            "a push writes the remote, which is the shared thing this queue orders — and this \
+             spelling is not one it can perform. Use `git push <remote>` or \
+             `git push <remote> <branch>`, which it queues."
+                .to_owned(),
+        ),
+        "pull" => Some(
+            "a pull is a fetch and then a merge, and it moves your branch on the way. It is two \
+             queue operations, not one: run `git fetch <remote>`, then `git merge <remote>/<branch>`."
+                .to_owned(),
+        ),
+        // `-D` only. `-d` reached a parser and never arrives here, and the difference is the whole
+        // reason deletion is offerable at all: `-d` asks git to refuse when the branch holds commits
+        // nothing else reaches, and `-D` asks git to stop answering that.
+        "branch" if tokens.contains(&"-D") => Some(
+            "`-D` deletes a branch whose commits may be reachable from nowhere else, and it is the \
+             spelling that asks git not to check. The queue performs `git branch -d <branch>`, where \
+             git's own refusal is the safety."
+                .to_owned(),
+        ),
+        _ => None,
+    }
 }
 
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
@@ -1981,6 +2155,23 @@ struct FakeVcsExecutor {
     /// fields: two adjacent `String`s destructured positionally can be swapped with every assertion
     /// still passing, which is the hazard `claim_next`'s own 5-tuple carries a warning about.
     seen: std::sync::Mutex<Vec<ClaimedRequest>>,
+    /// One permit per execution entered, so a test can wait for the operation to *begin*.
+    ///
+    /// A semaphore rather than a `Notify` because permits accumulate: an execution that starts
+    /// before anyone is waiting still counts, so there is no wake-up to lose and no order the two
+    /// halves have to arrive in. `entered` is what reads it.
+    started: tokio::sync::Semaphore,
+    /// A latch the test opens when it is ready for the operation to answer. One permit per
+    /// execution — each waits for its own release rather than sharing one.
+    ///
+    /// `delay` is the other way to hold an operation open, and for a test that has work to do
+    /// *inside* that window it is a bet: the window is a slice of wall clock, and the bet is that
+    /// the work fits. On a loaded machine one SQLite write does not always fit —
+    /// `an_outcome_the_row_refuses...` lost that bet 8 runs in 20 while a full build ran beside it,
+    /// and failed on an assertion about a log line, which is not what went wrong. `started` fixed
+    /// the near edge of that window and this fixes the far one; between them the test names its own
+    /// interleaving instead of buying it by the millisecond.
+    held: Option<tokio::sync::Semaphore>,
 }
 
 #[cfg(test)]
@@ -1999,6 +2190,19 @@ impl FakeVcsExecutor {
     fn succeeding_slowly(sha: &str, delay: std::time::Duration) -> Self {
         Self {
             delay,
+            ..Self::succeeding_with(sha)
+        }
+    }
+
+    /// Does not answer until the test says so — and never, if it never does.
+    ///
+    /// Prefer this to `succeeding_slowly` whenever the test does anything while the operation is
+    /// running. The duration in `succeeding_slowly` then has to be long enough for that work on
+    /// every machine the suite runs on, which is a number nobody can pick; a latch is that number
+    /// being unnecessary.
+    fn succeeding_until_released(sha: &str) -> Self {
+        Self {
+            held: Some(tokio::sync::Semaphore::new(0)),
             ..Self::succeeding_with(sha)
         }
     }
@@ -2034,7 +2238,40 @@ impl FakeVcsExecutor {
             delay: std::time::Duration::ZERO,
             barrier: None,
             seen: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            held: None,
         }
+    }
+
+    /// Lets one held execution answer. Panics on a fake that was not built to be held, because a
+    /// test releasing an executor that never waits is asserting an ordering it does not have.
+    fn release(&self) {
+        self.held
+            .as_ref()
+            .expect("only a `succeeding_until_released` fake has anything to release")
+            .add_permits(1);
+    }
+
+    /// Resolves once at least `n` executions have been entered.
+    ///
+    /// What it replaces, and why that mattered: a test that has to act *while* an operation runs
+    /// used to `sleep` a fixed 10ms first and assume the drain had got there. That is a real-time
+    /// budget for a reap and a claim — two SQLite writes — and on a machine also compiling and
+    /// running the other thousand tests it is occasionally missed. The test then acts BEFORE the
+    /// operation begins: a different scenario wearing the test's name, failing on an assertion that
+    /// says nothing about what actually went wrong. The flake was never about how long the suite
+    /// took; it was about jitter, and no larger sleep fixes that.
+    ///
+    /// Waiting on the event itself has no budget to miss. The permits are handed back on the way
+    /// out — dropping a `SemaphorePermit` returns it — so this reads the count without consuming it
+    /// and a second caller sees the same answer.
+    async fn entered(&self, n: usize) {
+        drop(
+            self.started
+                .acquire_many(n as u32)
+                .await
+                .expect("the fake's semaphore is never closed"),
+        );
     }
 
     /// Derived from `seen` rather than kept beside it: a separate counter can drift from the list it
@@ -2057,7 +2294,19 @@ impl VcsExecutor for FakeVcsExecutor {
         // The guard is a temporary so it is dropped at the end of this statement — held across the
         // await it would make this future non-`Send`, which `async_trait` requires.
         self.seen.lock().unwrap().push(request.clone());
+        // Signalled here for the same reason `seen` is written here: what a waiting test needs to
+        // know is that the operation BEGAN, and after the delay is too late to be that signal.
+        self.started.add_permits(1);
         tokio::time::sleep(self.delay).await;
+        // Before the barrier rather than after: the barrier is about executions releasing each
+        // other, and a held one has not really started until the test lets it. `forget` because the
+        // permit is spent — one release, one execution, so a second is held again.
+        if let Some(held) = &self.held {
+            held.acquire()
+                .await
+                .expect("the fake's latch is never closed")
+                .forget();
+        }
         // Held here rather than before the delay so it is the last thing between being entered and
         // answering: whatever else an execution does, it does not finish until its peers arrive.
         if let Some(barrier) = &self.barrier {
@@ -2657,6 +2906,71 @@ mod tests {
             "git merge --no-ff feature other",
         ] {
             assert_eq!(merge_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// The bypass every parser in this file was open to, and it needed no cleverness to use.
+    ///
+    /// Each of them matches the whole token list as an exact shape, so a shell operator in front of
+    /// the git command makes the list longer and the match fail — `None`, which
+    /// `session_git_decision` reads as "not an operation this queue performs" and ALLOWS. A `cd` was
+    /// enough. Measured on the running daemon before this existed: `cd repo && git merge master`
+    /// came back `allow` from the route whose whole purpose is to refuse exactly that.
+    ///
+    /// The asserted cases are the shapes that actually occur — a directory change first, a chained
+    /// `&&`, one per line — plus an environment assignment, which breaks the match for a different
+    /// reason (`program` reads `FOO=bar`) and would otherwise be a second bypass wearing the same
+    /// clothes.
+    #[test]
+    fn a_git_command_behind_a_shell_operator_is_still_the_operation_it_names() {
+        let wrapped = [
+            "cd /repo && git merge feature",
+            "cd /repo\ngit merge feature",
+            "true; git merge feature",
+            "echo hi | git merge feature",
+            "FOO=bar git merge feature",
+            "cd /repo && git merge feature && echo done",
+        ];
+        for command in wrapped {
+            // The defect itself, pinned rather than described: handed the whole command, the parser
+            // still answers `None`. That is not a thing to fix in the parser — its exact-shape match
+            // is what keeps `--squash` working directly — so this line must keep passing, and it is
+            // what makes the assertion below about the SPLIT rather than about merge parsing.
+            assert_eq!(
+                merge_from_command(command, "master"),
+                None,
+                "unsplit, this is the bypass: {command}"
+            );
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(
+                found,
+                Some(Op::Merge {
+                    source: Branch::new("feature").unwrap(),
+                    target: Branch::new("master").unwrap(),
+                }),
+                "{command}"
+            );
+        }
+    }
+
+    /// And splitting must not turn a command that is NOT a queue operation into one, which is the
+    /// cost a looser parser would have carried. The strictness stays where it was: each segment is
+    /// still matched as a whole shape, so every spelling the queue declines keeps working directly.
+    #[test]
+    fn splitting_a_command_does_not_invent_an_operation() {
+        for command in [
+            "cd /repo && git status",
+            "cd /repo && git merge --squash feature",
+            "echo git && echo merge && echo feature",
+            "cd /repo",
+            "",
+        ] {
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(found, None, "{command}");
         }
     }
 
@@ -3986,12 +4300,18 @@ mod tests {
         submit(&pool, &repo(), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
 
         let logged = logged_during(async {
             tokio::join!(drain_once(&pool, "alpha", &executor), async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                reconcile_interrupted(&pool).await.unwrap()
+                // The reconcile has to land while the operation is running, and both edges of that
+                // window are named rather than timed: `entered` is the operation beginning, and it
+                // cannot end until `release`. This was a 10ms sleep inside a 100ms delay, which is
+                // the same sentence written as a wager on two SQLite writes.
+                executor.entered(1).await;
+                let reconciled = reconcile_interrupted(&pool).await.unwrap();
+                executor.release();
+                reconciled
             })
         })
         .await;
@@ -4025,13 +4345,16 @@ mod tests {
             .await
             .unwrap();
 
-        // A 10x margin over the reconcile's own wait, so which lands first is not a race: an
-        // in-memory claim takes microseconds, and `reconciled == 1` below fails loudly rather than
-        // passing quietly if that ever stops being true.
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(100));
+        // The reconcile must land strictly inside the operation, so the operation is held open
+        // around it rather than given a duration long enough to probably cover it. `reconciled == 1`
+        // below is what would fail if that ever stopped being true — loudly, which is how the old
+        // 10ms-sleep-inside-100ms version was caught.
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
         let (drained, reconciled) = tokio::join!(drain_once(&pool, "alpha", &executor), async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            reconcile_interrupted(&pool).await.unwrap()
+            executor.entered(1).await;
+            let reconciled = reconcile_interrupted(&pool).await.unwrap();
+            executor.release();
+            reconciled
         });
 
         assert_eq!(
@@ -4102,8 +4425,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Far longer than the guard below, so which of the two fires is not a race.
-        let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_secs(30));
+        // Never released, so the operation cannot finish at all — as opposed to the 30s this used
+        // to sleep, which was a duration chosen to be longer than a guard rather than a statement
+        // that finishing is not one of the things that may happen here.
+        let executor = FakeVcsExecutor::succeeding_until_released("abc123");
         {
             let drain = drain_once(&pool, "alpha", &executor);
             tokio::pin!(drain);
@@ -4111,29 +4436,26 @@ mod tests {
             // Polled until the executor has actually been ENTERED, and abandoned there — rather
             // than after a fixed slice of wall clock.
             //
-            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. The
-            // executor's 30s makes it a non-race only for the half AFTER the operation begins;
-            // before that, `drain_once` still has a reap and a claim to get through, and 50ms was a
-            // real-time budget for two SQLite writes. On a machine also compiling and running the
-            // other thousand tests that budget is occasionally missed, and the drain is then
-            // abandoned BEFORE the operation — a different scenario wearing this test's name, which
-            // is why the flake read `calls(): 0 != 1` rather than anything about jamming.
+            // This was `timeout(50ms, drain)`, which reads like the same thing and is not. Holding
+            // the executor open settles only the half AFTER the operation begins; before that,
+            // `drain_once` still has a reap and a claim to get through, and 50ms was a real-time
+            // budget for two SQLite writes. On a machine also compiling and running the other
+            // thousand tests that budget is occasionally missed, and the drain is then abandoned
+            // BEFORE the operation — a different scenario wearing this test's name, which is why
+            // the flake read `calls(): 0 != 1` rather than anything about jamming.
             //
-            // `calls()` is the property this test is about, so it is what is waited on. The outer
-            // timeout is not a budget: it is reached only if the drain never arrives at all, and it
-            // is there so that failure is a message rather than a hung suite.
+            // Entering the executor is the property this test is about, so it is what is waited on.
+            // The `select!` is still needed to keep the drain being polled — nothing else drives
+            // it — and its first arm turns "the drain finished" into a message rather than a
+            // confusing later assertion. The outer timeout is not a budget: it is reached only if
+            // the drain never arrives at all, and it is there so that failure is a message rather
+            // than a hung suite.
             tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    tokio::select! {
-                        _ = &mut drain => {
-                            panic!("the executor sleeps for 30s — the drain cannot have finished")
-                        }
-                        () = tokio::time::sleep(Duration::from_millis(1)) => {
-                            if executor.calls() == 1 {
-                                break;
-                            }
-                        }
+                tokio::select! {
+                    _ = &mut drain => {
+                        panic!("the executor is never released — the drain cannot have finished")
                     }
+                    () = executor.entered(1) => {}
                 }
             })
             .await

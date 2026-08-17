@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { collisionBadges, orderColumns, slotDetail } from "./fleet-derive";
+import {
+  collisionBadges,
+  exclusionEdges,
+  orderColumns,
+  partnersOf,
+  slotDetail,
+} from "./fleet-derive";
 import {
   LIVE_LIST_LIMIT,
+  type FleetExclusion,
   type HeldSlot,
   type Job,
   type ProjectConcurrency,
+  type Proposal,
   type RunSearchResult,
 } from "./api";
 
@@ -176,5 +184,88 @@ describe("collisionBadges", () => {
     });
 
     expect(collisionBadges(alone, owner)).toEqual([]);
+  });
+});
+
+describe("the edges: what somebody asked, and what is in force", () => {
+  function rule(over: Partial<FleetExclusion> = {}): FleetExclusion {
+    return {
+      id: 1,
+      project_id: "alpha",
+      job_low: 41,
+      job_high: 42,
+      proposal_id: 9,
+      paths: null,
+      created_at: "2026-08-15T00:00:00Z",
+      ...over,
+    };
+  }
+
+  function request(low: number, high: number, over: Partial<Proposal> = {}): Proposal {
+    return {
+      id: 9,
+      kind: "fleet-exclusion",
+      status: "pending",
+      run_id: null,
+      session_id: null,
+      project_id: "alpha",
+      tool_name: null,
+      reasoning: "they both touch it",
+      tool_input: JSON.stringify({ pair: `${low}:${high}`, job_low: low, job_high: high }),
+      created_at: "2026-08-15T00:00:00Z",
+      decided_at: null,
+      ...over,
+    };
+  }
+
+  /**
+   * Asked and in force are two drawings because they are two situations. A pending edge constrains
+   * nothing yet, and showing it as a rule leaves somebody asking why both jobs are still running.
+   */
+  it("keeps a request apart from a rule", () => {
+    const edges = exclusionEdges([rule()], [request(7, 8)]);
+
+    expect(edges).toEqual([
+      { low: 41, high: 42, state: "active", id: 1 },
+      { low: 7, high: 8, state: "pending", id: 9 },
+    ]);
+  });
+
+  /** One pair is one edge, and of the two readings the rule is the one doing something. */
+  it("draws a pair once when it is both asked about and in force", () => {
+    const edges = exclusionEdges([rule()], [request(41, 42)]);
+
+    expect(edges).toEqual([{ low: 41, high: 42, state: "active", id: 1 }]);
+  });
+
+  /** Other kinds, decided ones, and anything unreadable are not edges. */
+  it("draws nothing from what it cannot read", () => {
+    const decided = request(1, 2, { status: "approved" });
+    const otherKind = request(3, 4, { kind: "action-approval" });
+    const malformed = request(5, 6, { tool_input: "not json" });
+    const empty = request(5, 6, { tool_input: null });
+    const noPair = request(5, 6, { tool_input: JSON.stringify({ pair: "5:6" }) });
+
+    expect(exclusionEdges([], [decided, otherKind, malformed, empty, noPair])).toEqual([]);
+    // A failed read of either list is not an empty one: it draws nothing and claims nothing.
+    expect(exclusionEdges(null, null)).toEqual([]);
+  });
+
+  /**
+   * The same edge reads differently from its two ends.
+   *
+   * Only the higher id is ever held, so a card saying "waiting for the other one" at both ends
+   * would describe a deadlock the daemon cannot produce.
+   */
+  it("says which end of an edge is the one that waits", () => {
+    const edges = exclusionEdges([rule({ job_low: 41, job_high: 42 })], []);
+
+    expect(partnersOf(edges, 42)).toEqual([
+      { low: 41, high: 42, state: "active", id: 1, partner: 41, waits: true },
+    ]);
+    expect(partnersOf(edges, 41)).toEqual([
+      { low: 41, high: 42, state: "active", id: 1, partner: 42, waits: false },
+    ]);
+    expect(partnersOf(edges, 99)).toEqual([]);
   });
 });

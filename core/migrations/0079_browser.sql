@@ -7,6 +7,13 @@
 --
 -- Nothing here decides anything. The decision is `browser_policy::decide`, which is pure and takes
 -- the site list as an argument; these tables are where that argument comes from.
+--
+-- 0079 and not 0073, with a deliberate gap. 0073 through 0078 are claimed by branches that are not
+-- merged yet — `feat/equipas-de-agentes` holds 0073-0076 and `feat/assuntos` holds 0074-0078 — and
+-- this file has already been renumbered twice by landing behind one of them. sqlx orders by version
+-- and does not require them to be contiguous, so the gap costs nothing and closing it would put this
+-- file back into contention with work that has not landed. Whoever lands next: take the number above
+-- everything any branch claims, not the number above master.
 
 -- One row per project that has ever had a browser profile.
 --

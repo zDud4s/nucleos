@@ -6,6 +6,7 @@
 #                 `bases/<id>.patch` applied (synthetic base). See base.sh.
 # test_path       the full Rust path of that test, as `cargo test -- --exact` wants it
 # test_file       the file the test lives in, relative to the repo root, in the reference
+# prompt          what the agent is asked, identical in every layer
 #
 # The reference commit is the only place the test is ever read from. A candidate tree's
 # own copy of it -- however it got there -- is deleted before the reference version is
@@ -15,7 +16,27 @@
 # running them: the base compiles, the held-out test FAILS on the base, and it PASSES
 # on the reference. Two earlier rows were removed for being neither.
 #
-# id	reference	test_path	test_file
-T1	41e9a56	triage::tests::an_exhausted_budget_blocks_triage	core/src/triage.rs
-T2	58e4864	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs
-T3	41e9a56	runs::tests::a_triage_run_uses_the_local_runner_when_one_is_configured	core/src/runs.rs
+# WRITING A PROMPT. It is the experimental input, and the protocol says model and prompt
+# are fixed while only the layer varies -- but for two attempts no prompt existed anywhere
+# in this repository, so whoever ran the ablation would have invented one per run and the
+# comparison between layers would have been between prompts. Three rules, and each one is
+# a way a prompt can quietly decide the result:
+#
+#   1. Say what a person wants, not where the fix goes. A prompt naming the function or
+#      the file hands over the search, which is most of what the harness is being measured
+#      on.
+#   2. Never name the held-out test or quote its assertions. An agent that can read the
+#      test can satisfy it without fixing anything -- the same family of defect as a
+#      candidate writing its own test, which score.sh already guards against by deleting
+#      the candidate's copy.
+#   3. Describe the symptom, including how someone would notice. A prompt that states the
+#      bug as a fact the agent need not confirm measures implementation alone; the layers
+#      differ most in how well an agent can investigate.
+#
+# Changing a prompt invalidates comparison with every row already recorded against the old
+# one, exactly as changing a task does. Record which prompt a result was produced under.
+#
+# id	reference	test_path	test_file	prompt
+T1	9affc9e	triage::tests::an_exhausted_budget_blocks_triage	core/src/triage.rs	Autonomous runs in this project share one spend window, and the budget brake is meant to stop new autonomous work once that window is exhausted. Email triage runs are autonomous, but their spend is not counting against that window, so triage keeps starting after the budget should already have closed. Make a triage run's spend count the way every other autonomous run's does.
+T2	3c9c309	worktree::tests::create_does_not_run_a_command_the_target_repository_names	core/src/worktree.rs	Every git command in the worktree module runs inside a project root the daemon does not control. Git reads some of its configuration from the repository it is pointed at, and some of that configuration names programs git will execute. A repository the daemon provisions a worktree for can therefore get the daemon to run a program of the repository's choosing, as the daemon's own user. Close that.
+T3	190efff	runs::tests::a_triage_run_uses_the_local_runner_when_one_is_configured	core/src/runs.rs	This daemon can be configured to send a run to a locally hosted model instead of to the CLI. Triage runs ignore that configuration: they go to the CLI even when a local runner is configured. Make a triage run use the configured local runner when there is one.

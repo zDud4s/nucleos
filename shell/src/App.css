@@ -629,8 +629,12 @@ details.scoreboard th {
 .form-grid .wide,
 .filters .wide { grid-column: 1 / -1; }
 
+/* `.fleet-new-job input` entra nesta lista em vez de repetir o bloco: era o único campo da
+   interface sem estilo nenhum, e aparecia BRANCO contra o escuro de tudo o resto — o sinal de que
+   nunca passou por aqui. */
 .form-grid input, .form-grid select, .form-grid textarea,
-.filters input, .filters select, .filters textarea {
+.filters input, .filters select, .filters textarea,
+.fleet-new-job input {
   width: 100%;
   background: var(--bg-raise);
   border: 1px solid var(--line);
@@ -719,6 +723,14 @@ details.scoreboard th {
 .rd-gate { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .rd-gate > pre { flex-basis: 100%; }
 .rd-out > summary { color: var(--muted); font-size: var(--fs-xs); cursor: pointer; }
+
+/* A cauda ao vivo. Aberta sempre, ao contrário do `output` logo abaixo: o registo consulta-se, isto
+   vê-se acontecer, e um bloco fechado por omissão nunca mostraria uma linha a aparecer. */
+.rd-tail { display: grid; gap: var(--sp-1); }
+.rd-tail__state { font-size: var(--fs-xs); color: var(--muted); }
+/* Mais baixa que o `.rd-stream` comum, e com um mínimo: esta caixa cresce a cada tique, e sem o
+   tecto mais cedo empurraria os botões por baixo do cursor de quem está a ler. */
+.rd-tail__stream { min-height: 6rem; max-height: 18rem; }
 
 /* Separado por uma linha do resto do detalhe: o botão que está aqui apaga uma worktree, e não deve
    parecer o próximo item de uma lista de factos sobre o run. */
@@ -1642,6 +1654,21 @@ details.scoreboard th {
 
 .fleet { display: grid; gap: var(--sp-4); }
 
+/* O medidor à esquerda, a escolha da vista à direita. */
+.fleet-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+.fleet-views { display: flex; gap: var(--sp-1); }
+/* Qual das duas está aberta diz-se com `aria-pressed`; isto é a segunda pista, não a única. */
+.fleet-views .btn[aria-pressed="true"] {
+  background: var(--glass);
+  color: var(--text);
+}
+
 .fleet-meter {
   display: flex;
   align-items: baseline;
@@ -1680,8 +1707,8 @@ details.scoreboard th {
 /* `n/limit` conta os slots que o núcleo diz existirem, não os cartões desenhados. */
 .fleet-count { font-size: var(--fs-xs); color: var(--muted); }
 
+/* A caixa de texto herda o estilo dos outros campos, lá acima. */
 .fleet-new-job { display: grid; gap: var(--sp-2); }
-.fleet-new-job input { width: 100%; }
 
 .slot-card {
   display: grid;
@@ -1728,6 +1755,156 @@ details.scoreboard th {
   border: 1px dashed var(--line);
   color: var(--faint);
 }
+
+/* As arestas: "estes dois não correm ao mesmo tempo". Pedida e em vigor são dois desenhos, e a
+   diferença é tracejado contra cheio — a mesma distinção que `is-unmeasured` faz acima, porque é a
+   mesma ideia: ainda não é um facto. */
+.exclude-edge {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  overflow-wrap: anywhere;
+}
+.exclude-edge.is-active { border: 1px solid var(--line); background: var(--code-bg); }
+.exclude-edge.is-pending { border: 1px dashed var(--line); color: var(--faint); }
+
+/* Uma aprovação que não escreveu regra. Não é erro — não leva as cores de um. */
+.fleet-closed {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  padding: var(--sp-1) var(--sp-2);
+}
+
+/* O modo de escolher o par. Vive no topo da coluna e não no cartão: o cartão de onde se começou pode
+   sair da coluna a meio da escolha, e a saída tem de sobreviver a isso. */
+.fleet-pairing {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  padding: var(--sp-2);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+}
+
+/* ── A tela livre: a casa inteira numa superfície ────────────── */
+
+.fleet-canvas { display: grid; gap: var(--sp-3); }
+
+/* `relative` porque os nós são `absolute` contra ela. O tamanho mínimo vem do componente, calculado
+   de onde os nós estão: um cartão arrastado para o canto tem de continuar alcançável em vez de ser
+   cortado fora do mundo. */
+.fleet-surface {
+  position: relative;
+  overflow: auto;
+  padding: var(--sp-2);
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+
+/* `transform` e não `left`/`top`: das duas, só a transformação move um nó sem obrigar o browser a
+   refazer o layout da página a cada fotograma do arrasto. */
+.fleet-node {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 260px;
+}
+/* O nó é focável para se poder mover pelo teclado: o foco tem de se ver, e o anel fica por fora
+   do cartão para não se confundir com o contorno de "pode receber a linha". */
+.fleet-node:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 4px;
+  border-radius: var(--r-sm);
+}
+/* Numa coluna os cartões nunca se sobrepõem e o vidro translúcido é bonito; numa tela sobrepõem-se
+   sempre, e dois cartões translúcidos um em cima do outro leem-se ao mesmo tempo — apanhado na
+   fotografia do arrasto, onde o `running` do cartão de baixo atravessava o de cima.
+   As camadas repetem a pilha que a coluna já dá (vidro sobre painel sobre fundo), só que opaca: a
+   cor é a mesma, o que muda é o que está por trás deixar de se ver. */
+.fleet-node .slot-card {
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(var(--glass), var(--glass)),
+    linear-gradient(var(--bg-raise), var(--bg-raise));
+}
+
+/* As arestas ficam POR CIMA dos cartões e surdas ao ponteiro.
+   Por baixo liam-se ao contrário: com um terceiro cartão entre as duas pontas, a linha entrava de
+   um lado do cartão inocente e saía do outro, e o que se via era uma exclusão entre o par errado —
+   na única funcionalidade cujo assunto inteiro é QUAIS DOIS. `pointer-events: none` é o que mantém
+   os botões por baixo clicáveis, e era esse o argumento todo para pôr a camada em baixo. */
+.fleet-wires {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  pointer-events: none;
+  overflow: visible;
+}
+/* Tracejada = pedida, cheia = em vigor. É o mesmo par de desenhos que os cartões já usam para
+   `is-pending` contra `is-active`, para não haver duas linguagens no mesmo ecrã. */
+.fleet-wire line { stroke-width: 2; stroke: var(--line); }
+/* O ponto em cada ponta diz onde a linha pertence, para um cartão que ela apenas atravessa nunca
+   ser confundido com um que ela liga. */
+.fleet-wire circle { fill: var(--line); }
+.fleet-wire.is-active line { stroke: var(--faint); }
+.fleet-wire.is-active circle { fill: var(--faint); }
+/* Pedida: tracejada, e a ponta é um anel em vez de um ponto cheio — a mesma ideia de "ainda não é
+   um facto" que o cartão já diz com o tracejado. */
+.fleet-wire.is-pending line { stroke-dasharray: 6 5; }
+.fleet-wire.is-pending circle { fill: none; stroke: var(--line); stroke-width: 2; }
+
+/* O nó debaixo da mão vai à frente dos outros e larga a sombra: sem isto, arrastar um cartão para
+   cima de outro esconde-o por baixo e parece que se perdeu. */
+.fleet-node.is-dragging {
+  z-index: 2;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+}
+
+/* A linha a ser puxada: nem pedida nem em vigor — ainda não é pergunta nenhuma. Fica a ouro, que é
+   a cor de "pendente" no resto do sistema. */
+.fleet-wire.is-pulling line { stroke: var(--gold); stroke-dasharray: 4 4; }
+
+/* O bico de onde se puxa uma aresta. Pertence ao nó e não ao cartão: uma coluna não tem a que
+   ligar, e um cartão que trouxesse conector em todo o lado ofereceria um gesto que só funciona
+   numa das duas vistas. */
+.node-pull {
+  position: absolute;
+  top: 14px;
+  right: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg-raise);
+  border: 1px solid var(--faint);
+  cursor: crosshair;
+  touch-action: none;
+}
+.node-pull:hover { border-color: var(--gold); background: var(--gold-tint); }
+/* Aceso enquanto uma linha procura onde pousar, e só onde ela pode pousar.
+   Contorno e não fundo: o fundo do cartão na tela são duas camadas opacas por cima da cor de base,
+   e um `background-color` aqui ficava debaixo delas — aceso no CSS e invisível na fotografia. */
+.fleet-node.can-take .slot-card {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 2px var(--gold-line);
+}
+
+/* A pega é o cabeçalho, e só na tela. `touch-action: none` porque sem ele o browser trata o gesto
+   como deslocamento da página e o arrasto nunca chega ao componente num ecrã táctil.
+   `user-select: none` para não pintar o texto de seleção a meio do movimento. */
+.slot-card > header.is-grab {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.fleet-node.is-dragging .slot-card > header.is-grab { cursor: grabbing; }
 
 /* ── O zoom 2: a cadeia de itens de um job ────────────── */
 

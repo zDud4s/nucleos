@@ -143,6 +143,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // companion — but written in by hand, because this table is not "every GET" and the comment
     // above says why.
     (Method::GET, "/concurrency"),
+    // Watching a run work is watching. It returns the same bytes `GET /runs/{id}` already hands a
+    // read-only key in `stdout`, only sooner — so withholding it would protect nothing and would
+    // make the live view the one thing a reader had to be an admin to see.
+    (Method::GET, "/runs/{id}/tail"),
+    // The rules in force, beside `/concurrency` for the same reason it is here: it describes the
+    // shape of the fleet and changes nothing. Asking for one is Admin's; reading which exist is not.
+    (Method::GET, "/fleet/exclusions"),
+    (Method::GET, "/fleet/exclusions/requests"),
     (Method::GET, "/projects/{id}/ls"),
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),
@@ -201,6 +209,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// nobody reviewed reaching a process nothing is about to review again. That is precisely what the
 /// email pillar's design forbids for content nobody vouches for, so speaking into a run stays its own
 /// authorization rather than a consequence of being allowed to start one.
+///
+/// `POST /jobs/{id}/notes` is deliberately absent for the `POST /runs/{id}/message` reason exactly,
+/// and it is the entry most likely to be added here by mistake: `POST /jobs` is on the list below,
+/// and a note lives at a URL one segment from it, so filing the two together reads as consistency.
+/// It is not. Creating a job authorises the prompt supplied at that moment, before the work exists;
+/// a note adds a second author to work already running past every check its creation went through,
+/// and the wait between leaving it and its being read is the only difference from steering. Leaving
+/// one is Admin's.
 ///
 /// `POST /email/send` is deliberately absent from this table and from `READ_ONLY_ROUTES` both, for
 /// the same shape of reason. A run-creating key buys the prompt it supplies at the moment it
@@ -533,6 +549,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -822,6 +839,26 @@ mod tests {
             status_of(&app, "GET", "/jobs", &run_token).await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// The agent catalogue is the owner's, and stays that way by being in no scope table. Asserted
+    /// rather than left to the absence of a line, because an absence does not fail when it ends.
+    #[test]
+    fn no_scoped_key_reaches_the_agent_catalogue() {
+        for path in ["/agents", "/agents/copywriter"] {
+            assert!(!permits(&Scope::Run(1), &Method::GET, path));
+            assert!(!permits(
+                &Scope::Service(Service::Council),
+                &Method::GET,
+                path
+            ));
+            assert!(!permits(
+                &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                &Method::GET,
+                path
+            ));
+            assert!(!permits(&Scope::Run(1), &Method::DELETE, path));
+        }
     }
 
     /// The grant that this change actually makes, and the one that failed before it.

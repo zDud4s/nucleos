@@ -281,6 +281,25 @@ pub struct Classification {
     pub reason: String,
 }
 
+/// Whether this tool can only READ this machine — it changes nothing, anywhere.
+///
+/// Deliberately NOT the same question as `action_class == "read-local"`, and this exists because the
+/// two look interchangeable and are not. That class is about APPROVAL, and it covers ordinary
+/// in-workspace writes as well, for the good reason that an ordinary write does not need approving —
+/// its own message says so: "local reads and ordinary file writes are allowed".
+///
+/// The read-untrusted barrier asks the other question: once a turn has a stranger's words in it,
+/// what may it still do? Answering that with the approval class hands `Write` and `Edit` straight
+/// through, which is exactly the hole it exists to close. Found by a test that expected a refusal
+/// and got an allow.
+///
+/// `Bash` is absent and stays absent even though a read-only command classifies as `read-local`:
+/// whether a command reads or writes is a judgement about its text, and this is a list of tools that
+/// cannot write whatever they are handed.
+pub fn only_reads(tool_name: &str) -> bool {
+    READ_LOCAL_TOOLS.contains(&tool_name)
+}
+
 pub fn classify(tool_name: &str, tool_input: &Value, cwd: Option<&Path>) -> Classification {
     if WRITE_TOOLS.contains(&tool_name) && writes_outside_cwd(tool_input, cwd) {
         return classification(
