@@ -1107,6 +1107,15 @@ pub struct ClaimedRequest {
     pub op: Op,
     pub project_id: String,
     pub project_root: String,
+    /// Whether a conflict resolver produced the branch this request wants merged.
+    ///
+    /// **It travels with the claim because the executor's behaviour differs on it**, which is the
+    /// bar for widening this struct: a resolution's source branch has to be VERIFIED before it is
+    /// merged — a two-parent tip and no conflict markers left in the tree — and an ordinary landing
+    /// must not be, because neither is true of one. An executor that could not tell the two apart
+    /// would either skip the check that exists to catch a flattened resolution, or apply it to every
+    /// branch anybody ever asked to land.
+    pub from_resolution: bool,
 }
 
 /// How a claimed request ended.
@@ -1258,7 +1267,7 @@ pub async fn claim_next(
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
-    let claimed: Option<(i64, String, String, String, String)> = sqlx::query_as(
+    let claimed: Option<(i64, String, String, String, String, bool)> = sqlx::query_as(
         "UPDATE vcs_requests
             SET status = 'running', started_at = ?1
           WHERE id = (
@@ -1269,14 +1278,14 @@ pub async fn claim_next(
             AND NOT EXISTS (
               SELECT 1 FROM vcs_requests WHERE repo_key = ?2 AND status = 'running'
             )
-         RETURNING id, op, args, project_id, project_root",
+         RETURNING id, op, args, project_id, project_root, from_resolution",
     )
     .bind(started_at)
     .bind(repo_key)
     .fetch_optional(&mut *transaction)
     .await?;
 
-    let Some((id, op, args, project_id, project_root)) = claimed else {
+    let Some((id, op, args, project_id, project_root, from_resolution)) = claimed else {
         // Nothing was changed, so the rollback this drop performs is the same as a commit.
         return Ok(None);
     };
@@ -1295,6 +1304,7 @@ pub async fn claim_next(
                 op,
                 project_id,
                 project_root,
+                from_resolution,
             }))
         }
         Err(error) => {
