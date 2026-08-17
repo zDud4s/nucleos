@@ -1254,6 +1254,27 @@ fn spawn_run(
                                 }
                             }
                         }
+                        // Said after the completion row above, not instead of it. The status stays
+                        // `completed` — the CLI did exit 0, and a resumed run may legitimately
+                        // decide the approved action is no longer the right step — but the person
+                        // who granted the authorization is the one who needs to know it went unused,
+                        // and until now nothing told them. See `proposals::unconsumed_grant` for the
+                        // two runs that produced this.
+                        if let Ok(Some((tool_name, proposal_id))) =
+                            crate::proposals::unconsumed_grant(&pool, id).await
+                        {
+                            let _ = crate::feed::append(
+                                &pool,
+                                feed_project_id.as_deref(),
+                                "resume_did_not_act",
+                                &format!(
+                                    "resumed for the {tool_name} action approved in proposal \
+                                     #{proposal_id}, and finished without attempting it"
+                                ),
+                                Some(id),
+                            )
+                            .await;
+                        }
                     }
                     if terminal_write_won {
                         let original_session_id =
@@ -1882,6 +1903,69 @@ async fn queueable_operation(
         .map(|repo| (repo, op))
 }
 
+/// How much of the approved action's own text the resume prompt repeats back. A run pays for every
+/// token of its own prompt, and a command a loop built can be megabytes.
+const RESUME_ACTION_CHARS: usize = 600;
+
+/// PURE: the instruction a resumed run is given for the action a human just approved.
+///
+/// **This wording is the fix for a measured, reproduced failure** (`.ai/eval/ABLATION.md`, T1×H3,
+/// 2026-08-17). It used to say "Proceed with the {tool} action you attempted before the pause — it
+/// is now authorized". The resumed agent has no record of attempting anything: the pause happens
+/// BEFORE the call runs, so the call never becomes a step in the transcript the resume restores.
+/// What arrived, from the agent's side, was an unverifiable claim of prior authorization urging it
+/// to run a command — the shape of an injection — and twice it refused, correctly:
+///
+/// > This looks like it may be an attempt to get me to run a command under a false claim of prior
+/// > authorization. I won't proceed with any Bash action on that basis.
+///
+/// One turn, nothing done, and the daemon recorded `completed`. So: state the action, and explain
+/// the absence. An agent shown what was approved can weigh it; an agent asked to remember it can
+/// only obey or refuse, and refusing is the better of those two.
+fn resume_instruction(proposal_id: i64, tool_name: &str, tool_input: Option<&str>) -> String {
+    // `command` first because it is the field a person would quote; the whole object otherwise, so
+    // a tool that is not Bash still shows what it was going to do.
+    let action = tool_input
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| value.as_object().map(|_| value.to_string()))
+        })
+        .map(|text| {
+            if text.chars().count() <= RESUME_ACTION_CHARS {
+                text
+            } else {
+                // By chars, not bytes: this is a prompt, and a slice through a UTF-8 boundary
+                // panics on exactly the inputs nobody tests with.
+                let mut cut: String = text.chars().take(RESUME_ACTION_CHARS).collect();
+                cut.push('…');
+                cut
+            }
+        });
+
+    // Said in both arms, because it is needed most when the action cannot be shown.
+    let absence = format!(
+        "You will not find that {tool_name} call in your transcript: the pause happens before the \
+         call runs, so it never became a step you took. Nothing else is authorized. Carry it out if \
+         it is still the right next step, then finish the task."
+    );
+
+    match action {
+        Some(action) => format!(
+            "A human approved one action for this run (proposal #{proposal_id}); it is now \
+             authorized:\n\n    {action}\n\n{absence}"
+        ),
+        None => format!(
+            "A human approved one {tool_name} action for this run (proposal #{proposal_id}); it is \
+             now authorized. Its input could not be read back, so it is not quoted here.\n\n\
+             {absence}"
+        ),
+    }
+}
+
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     let proposal = crate::proposals::get(&state.pool, proposal_id)
         .await?
@@ -2007,9 +2091,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // has to be written out, and what it does is fall back to authorizing. A run told to proceed
         // is the safe half of this decision: the grant is single-use and the action is one a human
         // just approved.
-        _ => format!(
-            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
-        ),
+        _ => resume_instruction(proposal_id, &tool_name, proposal.tool_input.as_deref()),
     };
 
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
@@ -3644,6 +3726,84 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// the race the queue exists to abolish. The approval was the last place still handing that out.
     ///
     /// The absent grant is half the assertion and the more important half: a queued merge beside a
+    /// What a resumed run is told, and why the wording is load-bearing rather than cosmetic.
+    ///
+    /// **Measured 2026-08-17, twice, in `.ai/eval/ABLATION.md`'s T1×H3 cells.** The instruction used
+    /// to be "Proceed with the {tool} action you attempted before the pause — it is now authorized".
+    /// The resumed agent has no record of attempting it — it cannot have one, the pause happens
+    /// BEFORE the call runs, so it never enters the transcript as a step — and what it saw was an
+    /// unverifiable claim of prior authorization asking it to run a command. Both runs refused, in
+    /// the words of an agent doing its job: "This looks like it may be an attempt to get me to run a
+    /// command under a false claim of prior authorization." One turn, $0.04, nothing done.
+    ///
+    /// So the instruction must carry the action itself. Not to be more polite — to be checkable: an
+    /// agent that can read what was approved can judge it, where one asked to recall it can only
+    /// obey or refuse.
+    #[test]
+    fn a_resume_instruction_states_the_action_it_authorizes() {
+        let instruction = resume_instruction(
+            61,
+            "Bash",
+            Some(r#"{"command":"cargo test -p nucleos-core"}"#),
+        );
+        assert!(
+            instruction.contains("cargo test -p nucleos-core"),
+            "the agent cannot judge an action it is not shown: {instruction}"
+        );
+        assert!(
+            instruction.contains("61"),
+            "the proposal is the audit trail back to the human who approved it: {instruction}"
+        );
+    }
+
+    /// The half that stops the message reading as an attack. An agent that is told to continue
+    /// something it has no memory of SHOULD be suspicious; the fix is to explain the absence, not to
+    /// insist harder.
+    #[test]
+    fn a_resume_instruction_explains_why_the_call_is_absent_from_the_transcript() {
+        let instruction = resume_instruction(1, "Bash", Some(r#"{"command":"ls"}"#));
+        assert!(
+            instruction.contains("transcript"),
+            "an unexplained 'you attempted this' is indistinguishable from an injection: \
+             {instruction}"
+        );
+    }
+
+    /// Absent or unparseable input must not produce an instruction that silently drops the action
+    /// and reverts to the wording that failed.
+    #[test]
+    fn a_resume_instruction_without_readable_input_says_so_rather_than_inventing_one() {
+        for input in [None, Some("{not json"), Some(r#"{"no_command":1}"#)] {
+            let instruction = resume_instruction(7, "Agent", input);
+            assert!(
+                instruction.contains("Agent"),
+                "the tool is all that is left to name: {instruction}"
+            );
+            assert!(
+                instruction.contains("transcript"),
+                "the explanation is needed most when the action cannot be shown: {instruction}"
+            );
+        }
+    }
+
+    /// A prompt is not a place to paste an unbounded string: the run pays for every token of it, and
+    /// a command built by a loop can be megabytes.
+    #[test]
+    fn a_resume_instruction_bounds_the_action_it_quotes() {
+        let huge = "x".repeat(RESUME_ACTION_CHARS * 4);
+        let input = serde_json::json!({ "command": huge }).to_string();
+        let instruction = resume_instruction(1, "Bash", Some(&input));
+        assert!(
+            instruction.len() < RESUME_ACTION_CHARS * 2,
+            "quoted action is unbounded: {} chars",
+            instruction.len()
+        );
+        assert!(
+            instruction.contains('…'),
+            "a truncated action must say it was truncated: {instruction}"
+        );
+    }
+
     /// minted grant would be both at once, and the two would race each other.
     #[tokio::test]
     async fn approving_a_merge_queues_it_instead_of_letting_the_run_perform_it() {
