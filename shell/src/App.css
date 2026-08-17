@@ -1942,3 +1942,60 @@ details.scoreboard th {
 }
 
 .item-why, .item-note { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+
+/* --- Browser: quem está a conduzir, e onde é que cada projeto entrou -------------------------- */
+
+/* Um pedido de volante é uma pergunta, não uma linha de lista. Fica em grelha e não em flex porque a
+   origem tem de ficar sozinha na primeira linha: é a informação que decide a resposta, e ao lado de
+   qualquer outra coisa lê-se em diagonal. */
+.browser-asks { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.browser-ask {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--line);
+  justify-items: start;
+}
+.browser-ask:first-child { border-top: 0; }
+
+/* Monoespaçada e por partir onde for preciso. É punycode e leva a porta explícita — `xn--exemp1o-…`
+   É a informação, e uma fonte proporcional a encolher para caber é meio caminho para a esconder. */
+.browser-ask__origin {
+  font: 500 var(--fs-sm) var(--mono);
+  overflow-wrap: anywhere;
+}
+.browser-ask__why { font-size: var(--fs-sm); }
+.browser-ask__buttons { display: flex; gap: var(--sp-2); }
+
+.browser-sessions { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.browser-sessions li {
+  display: grid;
+  gap: 2px;
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--line);
+  justify-items: start;
+}
+.browser-sessions li:first-child { border-top: 0; }
+.browser-session__url {
+  font: 400 var(--fs-xs) var(--mono);
+  overflow-wrap: anywhere;
+}
+.browser-session__meta { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
+.browser-session__buttons { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); }
+
+/* A cadeia é uma lista para ser LIDA antes de se responder, portanto uma origem por linha e nada a
+   competir com elas. Conceder é um ato permanente sobre o perfil que tem as sessões do dono. */
+.browser-chain { list-style: none; margin: var(--sp-3) 0; padding: 0; display: grid; gap: var(--sp-2); }
+.browser-chain code { font-size: var(--fs-xs); overflow-wrap: anywhere; }
+
+.browser-sites { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+.browser-sites li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.browser-sites li:first-child { border-top: 0; }
+.browser-sites code { font-size: var(--fs-xs); overflow-wrap: anywhere; }

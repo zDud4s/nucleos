@@ -371,16 +371,17 @@ pub async fn compute_merge(
         // What IS the asker's is the other direction, and the message says so rather than leaving
         // it to be guessed: bringing the target INTO its branch is an ordinary queue operation, and
         // resolving there is resolving in its own worktree, on its own branch, where it belongs.
-        return Err(failed(
-            format!(
+        return Err(Outcome::Escalated {
+            reason: format!(
                 "merging {source} into {target} conflicts, so nothing was published and no copy \
-                 was left conflicted. This is the queue's to report and not yours to fix from \
+                 was left conflicted. This is the queue's to carry and not yours to fix from \
                  here — the merge ran in an integration worktree you do not have. To clear it, \
                  bring {target} into {source} in your own worktree (an ordinary queue operation), \
                  resolve it there, and ask again."
             ),
-            &merge,
-        ));
+            exit_code: merge.exit_code,
+            output_tail: merge.output_tail.clone(),
+        });
     }
 
     let new = revision(&integration, "HEAD", deadline).await?;
@@ -1884,10 +1885,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Spec §7, first row. A conflict is a reported failure, not a problem this module solves — and
-    /// the point of computing on the side is that the user's copy is not where it happens.
+    /// Spec §7, first row. A conflict is not a problem this module solves — and the point of
+    /// computing on the side is that the user's copy is not where it happens.
+    ///
+    /// **It is `Escalated` and no longer `Failed`.** The distinction is who is left holding it:
+    /// `failed` says the operation did not happen and that is the end, which leaves the conflict
+    /// with whoever asked — and for a landing that is the agent which had just finished its work,
+    /// the one actor this queue exists to spare from other sessions' integration.
     #[tokio::test]
-    async fn a_conflicted_merge_fails_without_touching_the_user_s_copy() {
+    async fn a_conflicted_merge_escalates_without_touching_the_user_s_copy() {
         let _lock = crate::worktree::test_env_lock();
         let (_container, repo) = init_contained_repo("nucleos-gitexec-conflict-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -1931,7 +1937,7 @@ pub(crate) mod tests {
             .expect_err("a conflict must not produce a merge commit");
 
         match outcome {
-            Outcome::Failed {
+            Outcome::Escalated {
                 output_tail,
                 reason,
                 ..
@@ -1958,7 +1964,7 @@ pub(crate) mod tests {
                     "a refusal that names no alternative sends the asker looking: {reason}"
                 );
             }
-            other => panic!("a conflict is a Failed, got {other:?}"),
+            other => panic!("a conflict is an Escalated, got {other:?}"),
         }
 
         assert_eq!(sha_of(&repo, "master"), before);

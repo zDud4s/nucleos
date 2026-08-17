@@ -15,6 +15,7 @@ pub const ECHO: &str = "echo";
 pub const TELEGRAM: &str = "telegram";
 pub const EMAIL: &str = "email";
 pub const WEB: &str = "web";
+pub const BROWSER: &str = "browser";
 
 /// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
 const RUNNING: &str = "running";
@@ -376,6 +377,56 @@ pub const EMAIL_FETCH_ADDR: &str = "127.0.0.1:8793";
 /// because a process that fetches arbitrary URLs and listens off-machine is an open proxy with the
 /// owner's address on it.
 pub const WEB_ADDR: &str = "127.0.0.1:8794";
+
+/// Where the browser sidecar answers the núcleo. 8795 follows the web sidecar (8794).
+///
+/// A constant for the same reason the two above are, with the stake raised: this process drives
+/// browsers holding the owner's logged-in profiles, so `requireLoopback` on the Go side refuses to
+/// bind anything else. A listener off this machine would hand those sessions to whoever asked.
+pub const BROWSER_ADDR: &str = "127.0.0.1:8795";
+
+/// The browser sidecar's environment (spec §8).
+///
+/// The site lists are deliberately ABSENT, exactly as the trust allowlist is absent from
+/// [`web_env`] and for a sharper version of the same reason. The sidecar enforces a fence per
+/// session, against the list the núcleo sends WITH that session — so there is one list, in one
+/// place, read at the moment it is used. A copy in the environment would be a second allowlist that
+/// only changes when the process restarts, and the one that drifts is always the one nobody reads.
+pub fn browser_env(
+    daemon_url: &str,
+    daemon_token: &str,
+    config: &crate::config::BrowserConfig,
+) -> Vec<(String, String)> {
+    vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
+        ("BROWSER_ADDR".to_string(), BROWSER_ADDR.to_string()),
+        // The real driver. "fake" is what the sidecar defaults to, and a browser pillar that ran on
+        // the fake would answer every question with an invented page — so the daemon names the one
+        // it means rather than relying on a default it did not choose.
+        ("BROWSER_DRIVER".to_string(), "chrome".to_string()),
+        (
+            "BROWSER_MAX_SESSIONS".to_string(),
+            config.max_sessions.to_string(),
+        ),
+        (
+            "BROWSER_CACHE_MB".to_string(),
+            config.cache_size_mb.to_string(),
+        ),
+        (
+            "BROWSER_MAX_PROFILES".to_string(),
+            config.max_profiles.to_string(),
+        ),
+        (
+            "BROWSER_DISK_BUDGET_MB".to_string(),
+            config.disk_budget_mb.to_string(),
+        ),
+        (
+            "BROWSER_OPEN_TIMEOUT_SECS".to_string(),
+            config.load_timeout_seconds.to_string(),
+        ),
+    ]
+}
 
 /// The web sidecar's environment (spec §3.4).
 ///

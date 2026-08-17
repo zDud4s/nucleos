@@ -20,6 +20,7 @@ import System from "./System";
 import Voice from "./Voice";
 import Calendar from "./Calendar";
 import Web from "./Web";
+import Browser from "./Browser";
 import Council from "./Council";
 import { Button, ConfirmButton } from "./ui";
 import "./App.css";
@@ -27,7 +28,7 @@ import "./calendar.css";
 
 type Tab =
   | "home" | "fleet" | "autopilot" | "approvals" | "runs" | "projects" | "chats"
-  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "agents" | "council"
+  | "mail" | "files" | "contacts" | "voice" | "calendar" | "web" | "browser" | "agents" | "council"
   | "system";
 
 const TABS: { key: Tab; label: string }[] = [
@@ -54,6 +55,11 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "voice", label: "Voice" },
   { key: "calendar", label: "Calendar" },
   { key: "web", label: "Web" },
+  // Straight after Web, because the two are constantly mistaken for each other and the difference is
+  // the whole point: Web is what has been READ — one fetch, no session, no cookies — and this is what
+  // has been BROWSED, in a profile that holds the owner's logins. Adjacent so the distinction is made
+  // by comparison rather than by a paragraph.
+  { key: "browser", label: "Browser" },
   // Immediately before Council because it is the piece Council stands on: a seat is an agent
   // borrowed for one question. Nothing here runs or spends — it is a catalogue — which is also why
   // it does not break the sentence below about Council being the tab that spends on purpose.
@@ -421,6 +427,7 @@ function App() {
           {tab === "voice" && <Voice token={token} connection={connection} />}
           {tab === "calendar" && <Calendar token={token} connection={connection} />}
           {tab === "web" && <Web token={token} connection={connection} />}
+          {tab === "browser" && <Browser token={token} connection={connection} />}
           {tab === "agents" && <Agents token={token} connection={connection} />}
           {tab === "council" && <Council token={token} connection={connection} />}
           {tab === "system" && <System token={token} connection={connection} />}
