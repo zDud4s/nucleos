@@ -60,6 +60,15 @@ The right one is the other direction: bring the target branch into yours (`git m
 an ordinary queue operation), resolve it in your own worktree on your own branch, and ask
 again.
 
+You may not have to. The daemon picks a conflicting merge up by itself, creates a worktree
+on the target branch, stages the conflict there, and starts one session on it — once, never
+twice. If you are that session you will know: the conflict is **already in your files** when
+you arrive, with git's markers in them, and your instructions say so. Resolve, commit, and
+`nucleos-core --land`; do not merge, and do not reach for `-X ours`, `-X theirs` or
+`checkout --ours`. A resolution whose commit has one parent, or that still has markers in
+it, is refused before anything is published — without its content being read, because the
+content of a resolution that threw half the work away looks perfect.
+
 A rebase of your own branch is always blocked for the same reason in reverse. The queue
 publishes with a command that refuses rather than destroys; a rebase has no such command,
 and the branch it would rewrite is the one your session resumes onto.

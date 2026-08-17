@@ -109,6 +109,24 @@ impl Owner {
 }
 
 pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInfo> {
+    create_at(project_root, owner, None).await
+}
+
+/// `create`, on a named starting point instead of wherever the project's checkout happens to stand.
+///
+/// **One caller needs this and the reason is not convenience.** A conflict resolver's tree has to be
+/// born on the merge's TARGET, and two things follow from that which follow from nothing else: the
+/// conflict staged in it is exactly the one the queue met — a tree born on some other commit would
+/// present a different conflict, or none — and the branch the resolver produces has the target's tip
+/// as an ancestor, so landing it does not reopen the question it was made to settle.
+///
+/// `None` keeps git's own default, which is the project checkout's HEAD, and that is what every
+/// other run wants: work starts from where the project is.
+pub async fn create_at(
+    project_root: &Path,
+    owner: Owner,
+    base: Option<&str>,
+) -> io::Result<WorktreeInfo> {
     let root = worktree_root(project_root);
     if root.to_string_lossy().contains(' ') {
         return Err(io::Error::new(
@@ -136,16 +154,21 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
     let path = root.join(&name);
     tokio::fs::create_dir_all(&root).await?;
 
-    let output = git()
+    let mut command = git();
+    command
         .arg("-C")
         .arg(project_root)
         .arg("worktree")
         .arg("add")
         .arg("-b")
         .arg(&branch)
-        .arg(&path)
-        .output()
-        .await?;
+        .arg(&path);
+    // Last, because that is where `worktree add` takes its commit-ish, and only when one was asked
+    // for — an empty argument here is not "the default", it is a ref that does not resolve.
+    if let Some(base) = base {
+        command.arg(base);
+    }
+    let output = command.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
@@ -168,6 +191,62 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
         branch,
         base_sha,
     })
+}
+
+/// Leaves `source` merged half-way into this worktree: markers in the files, MERGE_HEAD set.
+///
+/// **This is the inversion the resolver design turns on: the daemon stages the conflict, the agent
+/// only resolves it.** The obvious shape — hand the agent the two branches and let it merge — cannot
+/// work here, because any `git merge` an agent runs goes to the queue, and the queue is what just
+/// refused that merge for conflicting. It would circle, and no wording in a prompt gets it out,
+/// because the refusal is structural and correct. With the merge already staged, the agent does only
+/// what any agent does: edits files and commits. No exception to the gate, and therefore no exception
+/// for anybody to abuse.
+///
+/// It also buys the resolution's two-parent tip for free — a plain `git commit` on top of a staged
+/// merge carries both parents, so the resolver cannot flatten the merge by accident, and
+/// `git_exec::verify_resolution` refuses the deliberate ones.
+///
+/// **A clean merge is an error here, not a success.** It means the conflict was gone by the time the
+/// resolver looked — other work landed in between — and there is nothing for an agent to resolve.
+/// Launching one anyway would spend a session to produce a merge the queue can compute by itself.
+///
+/// Conflicted is told apart from broken by `ls-files --unmerged` rather than by the exit code, which
+/// is 1 for both. A merge refused before it started — an unknown ref, a dirty tree — leaves no
+/// unmerged paths, and staging nothing while reporting a staged conflict would put an agent in a
+/// worktree with no work in it and no way to tell.
+pub async fn stage_conflict(worktree: &Path, source: &str) -> io::Result<()> {
+    let merged = git()
+        .arg("-C")
+        .arg(worktree)
+        .arg("merge")
+        // Never an editor: this runs with no terminal, and on the clean-merge path git would
+        // otherwise wait for one that is never coming.
+        .arg("--no-edit")
+        .arg(source)
+        .output()
+        .await?;
+    if merged.status.success() {
+        return Err(io::Error::other(format!(
+            "{source} merged cleanly, so there is no conflict left to resolve — \
+             the repository moved between the escalation and now"
+        )));
+    }
+
+    let unmerged = git()
+        .arg("-C")
+        .arg(worktree)
+        .arg("ls-files")
+        .arg("--unmerged")
+        .output()
+        .await?;
+    if !unmerged.status.success() || unmerged.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&merged.stderr);
+        return Err(io::Error::other(format!(
+            "merging {source} left no conflicted paths to resolve: {stderr}"
+        )));
+    }
+    Ok(())
 }
 
 /// Where a job's nodes hand work to each other, relative to the worktree they share.
@@ -3751,6 +3830,173 @@ mod tests {
         assert_eq!(
             registration(repo.path(), &info.path).await.unwrap(),
             Registration::Absent
+        );
+    }
+
+    /// A repository standing on `master`, where `feat/x` has changed the same line. Merging either
+    /// way conflicts.
+    fn repo_with_a_conflict() -> tempfile::TempDir {
+        let repo = init_space_free_repo();
+        let path = repo.path();
+        assert!(git_ok(
+            path,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        std::fs::write(path.join("seed.txt"), "theirs\n").expect("write their side");
+        assert!(git_ok(
+            path,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("theirs")
+            ]
+        ));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(path.join("seed.txt"), "ours\n").expect("write our side");
+        assert!(git_ok(
+            path,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+        repo
+    }
+
+    /// The base is the whole reason `create_at` exists: a resolution's tree has to be born on the
+    /// branch the merge was going INTO, and the project is by definition standing somewhere else —
+    /// it is standing on whatever the person using it is working on.
+    #[tokio::test]
+    async fn a_worktree_can_be_born_on_a_branch_the_project_is_not_standing_on() {
+        let _lock = env_lock();
+        let repo = repo_with_a_conflict();
+        let roots = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(roots.path()));
+
+        let info = create_at(repo.path(), Owner::Run(41), Some("feat/x"))
+            .await
+            .expect("create the worktree on a named base");
+
+        assert_eq!(
+            git_stdout(&info.path, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]),
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("rev-parse"), OsStr::new("feat/x")]
+            ),
+            "the tree has to be born where it was told, not where the project happens to stand"
+        );
+    }
+
+    /// **The claim `git_exec::verify_resolution` is built on**: a resolver that does nothing but edit
+    /// the conflicted files and commit produces a two-parent merge commit, with no step of its own to
+    /// earn it. That is what makes "one parent means the merge was thrown away" a safe thing to
+    /// refuse on — if the resolver had to do something special for the second parent, refusing would
+    /// punish forgetting rather than catch discarding.
+    #[tokio::test]
+    async fn a_staged_conflict_commits_with_both_parents_and_the_resolver_does_nothing_to_earn_it()
+    {
+        let _lock = env_lock();
+        let repo = repo_with_a_conflict();
+        let roots = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(roots.path()));
+
+        let info = create_at(repo.path(), Owner::Run(42), Some("master"))
+            .await
+            .expect("create the worktree on the target");
+        stage_conflict(&info.path, "feat/x")
+            .await
+            .expect("a conflicting merge is what this stages");
+
+        let conflicted = std::fs::read_to_string(info.path.join("seed.txt")).expect("read");
+        assert!(
+            conflicted.contains("<<<<<<<") && conflicted.contains(">>>>>>>"),
+            "both sides have to be in front of whoever resolves them: {conflicted}"
+        );
+        assert_eq!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("rev-parse"), OsStr::new("MERGE_HEAD")]
+            ),
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("rev-parse"), OsStr::new("feat/x")]
+            ),
+            "the half-finished merge has to name the branch that was being brought in"
+        );
+
+        // Exactly what a resolver does and nothing more: edit the file, add, commit.
+        std::fs::write(info.path.join("seed.txt"), "ours and theirs\n").expect("resolve");
+        assert!(git_ok(&info.path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &info.path,
+            &[OsStr::new("commit"), OsStr::new("--no-edit")]
+        ));
+
+        let parents = git_stdout(
+            &info.path,
+            &[
+                OsStr::new("rev-list"),
+                OsStr::new("--parents"),
+                OsStr::new("-1"),
+                OsStr::new("HEAD"),
+            ],
+        );
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "the commit itself plus two parents: {parents}"
+        );
+    }
+
+    /// A conflict that has evaporated is not work, and an agent started against one would be asked to
+    /// resolve an empty worktree. The queue can compute this merge by itself; whoever wants it
+    /// published asks again.
+    #[tokio::test]
+    async fn a_merge_that_comes_out_clean_is_refused_rather_than_handed_to_an_agent() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let path = repo.path();
+        assert!(git_ok(
+            path,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/elsewhere")
+            ]
+        ));
+        std::fs::write(path.join("theirs.txt"), "theirs\n").expect("write their file");
+        assert!(git_ok(path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("theirs")]
+        ));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(path.join("ours.txt"), "ours\n").expect("write our file");
+        assert!(git_ok(path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("ours")]
+        ));
+
+        let roots = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(roots.path()));
+        let info = create_at(path, Owner::Run(43), Some("master"))
+            .await
+            .expect("create the worktree on the target");
+
+        let refused = stage_conflict(&info.path, "feat/elsewhere")
+            .await
+            .expect_err("a clean merge is not a conflict to resolve");
+        assert!(
+            refused.to_string().contains("merged cleanly"),
+            "the refusal has to say the conflict was gone, not that staging broke: {refused}"
         );
     }
 }

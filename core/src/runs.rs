@@ -1481,6 +1481,21 @@ pub struct JobNode {
     pub branch: String,
 }
 
+/// A conflict the daemon is about to hand an agent: which escalated request it came from, and the
+/// two branches that would not merge.
+///
+/// It travels as a struct rather than as a closure taking the fresh worktree, because the two things
+/// it changes about a run happen at two different moments — where the tree is BORN (on the target)
+/// and what is staged in it before the agent exists (the conflict) — and a hook at one of those
+/// moments cannot reach the other.
+pub struct Resolution {
+    /// The escalated `vcs_requests` row. Claimed by writing this run's id into its
+    /// `resolution_run_id`, which is what makes the attempt happen once and never again.
+    pub request_id: i64,
+    pub source: String,
+    pub target: String,
+}
+
 pub async fn create_run_inner(
     state: &AppState,
     prompt: String,
@@ -1490,6 +1505,33 @@ pub async fn create_run_inner(
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
     create_run_with(state, prompt, project_id, cwd, mode, steerable, None).await
+}
+
+/// Starts the one run that is given its work already staged: a merge conflict, put there by the
+/// daemon, in a worktree born on the branch the merge was going into.
+///
+/// `mode = "worktree"` and nothing else, like every other autonomous run that touches code — it
+/// carries the tool policy, the gate, and migration 0009's exclusivity, none of which a fourth mode
+/// would inherit. Never steerable, for `create_job_node_run`'s reason and one of its own: the work
+/// is a conflict the queue found, and text typed into it mid-flight would change what gets published
+/// with nothing recording the substitution.
+pub async fn create_resolution_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    resolution: Resolution,
+) -> Result<i64, CreateRunError> {
+    create_run_with(
+        state,
+        prompt,
+        Some(project_id),
+        Some(project_root),
+        "worktree",
+        false,
+        Some(Provisioning::Resolution(resolution)),
+    )
+    .await
 }
 
 /// Starts one node of a job inside that job's existing worktree.
@@ -1515,9 +1557,41 @@ pub async fn create_job_node_run(
         // queue would still claim the item it was given. Steering belongs to a run somebody started
         // and is watching.
         false,
-        Some(node),
+        Some(Provisioning::Node(node)),
     )
     .await
+}
+
+/// What a run is handed to start from, when it is handed anything at all.
+///
+/// **An enum and not two `Option`s, because the two are mutually exclusive and the type should say
+/// so.** A pair of options admits both-at-once, and the code would resolve that combination
+/// silently rather than refuse it: the node arm would win the worktree, so the conflict would be
+/// staged inside a JOB's tree — on the job's branch, over whatever the previous node left there.
+/// Nothing would report it. Clippy asking for fewer arguments is what sent this looking; the
+/// combination it removes is the reason it stayed.
+enum Provisioning {
+    /// One node of a job, inside the worktree the job already owns.
+    Node(JobNode),
+    /// A conflict resolution: a worktree of its own, born on the merge's target, with the conflict
+    /// already staged in it.
+    Resolution(Resolution),
+}
+
+impl Provisioning {
+    fn node(&self) -> Option<&JobNode> {
+        match self {
+            Self::Node(node) => Some(node),
+            Self::Resolution(_) => None,
+        }
+    }
+
+    fn resolution(&self) -> Option<&Resolution> {
+        match self {
+            Self::Resolution(resolution) => Some(resolution),
+            Self::Node(_) => None,
+        }
+    }
 }
 
 async fn create_run_with(
@@ -1527,8 +1601,10 @@ async fn create_run_with(
     cwd: Option<String>,
     mode: &str,
     steerable: bool,
-    node: Option<JobNode>,
+    provisioning: Option<Provisioning>,
 ) -> Result<i64, CreateRunError> {
+    let node = provisioning.as_ref().and_then(Provisioning::node);
+    let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
             "worktree mode requires project_id and cwd (the project root)",
@@ -1690,7 +1766,15 @@ async fn create_run_with(
                     }
                 }
 
-                match crate::worktree::create(std::path::Path::new(project_root), owner).await {
+                // A resolution's tree is born on the merge's TARGET; everything else starts where
+                // the project stands. `worktree::create_at` carries why that is not a preference.
+                match crate::worktree::create_at(
+                    std::path::Path::new(project_root),
+                    owner,
+                    resolution.map(|it| it.target.as_str()),
+                )
+                .await
+                {
                     Ok(info) => info,
                     Err(error) => {
                         fail_provisioning(
@@ -1753,6 +1837,70 @@ async fn create_run_with(
             )
             .await;
             return Err(CreateRunError::Db(error));
+        }
+        // A conflict's one attempt is claimed HERE: after the row exists, because the claim IS this
+        // run's id, and before the agent does, because the whole point is that no second agent can
+        // ever be minted against the same escalation. Losing the compare-and-set means something
+        // else got there first, and the run is retired rather than allowed to become that second
+        // agent — the failure migration 0081 describes as exploding rather than degrading.
+        //
+        // Claimed BEFORE the conflict is staged, and the order is not arbitrary. Staging can fail
+        // for two reasons and both should spend the attempt: the merge came out clean, so there is
+        // nothing left to resolve, or it could not run at all, which a second attempt would hit
+        // identically. The reverse order fails much worse — a staged conflict whose claim was then
+        // lost leaves a worktree of real work behind while another agent is already editing the
+        // same two branches.
+        if let Some(resolution) = resolution {
+            match sqlx::query(
+                "UPDATE vcs_requests SET resolution_run_id = ?
+                  WHERE id = ? AND resolution_run_id IS NULL",
+            )
+            .bind(id)
+            .bind(resolution.request_id)
+            .execute(&state.pool)
+            .await
+            {
+                Ok(claimed) if claimed.rows_affected() == 1 => {}
+                Ok(_) => {
+                    fail_provisioning(
+                        state,
+                        id,
+                        project_id.as_deref(),
+                        &format!(
+                            "vcs request {} has already had its one resolution attempt",
+                            resolution.request_id
+                        ),
+                    )
+                    .await;
+                    return Err(CreateRunError::Invalid(
+                        "this conflict has already had its one resolution attempt",
+                    ));
+                }
+                Err(error) => {
+                    fail_provisioning(
+                        state,
+                        id,
+                        project_id.as_deref(),
+                        &format!("the conflict could not be claimed for resolution: {error}"),
+                    )
+                    .await;
+                    return Err(CreateRunError::Db(error));
+                }
+            }
+            // The daemon does the merging; the agent only resolves. `worktree::stage_conflict`
+            // carries why the other way round cannot work at all.
+            if let Err(error) =
+                crate::worktree::stage_conflict(&info.path, &resolution.source).await
+            {
+                fail_provisioning(
+                    state,
+                    id,
+                    project_id.as_deref(),
+                    &format!("the conflict could not be staged for resolution: {error}"),
+                )
+                .await;
+                return Err(CreateRunError::Worktree(error));
+            }
         }
         // The handoff directory, and the exclusion that keeps it out of both the preservation commit
         // and anything a node commits itself. Prepared per node rather than once per job because a
@@ -3209,6 +3357,222 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let repo = container.path().join("repo");
         initialize_repo(&repo);
         (container, repo)
+    }
+
+    /// The same, standing on `master`, with `feat/x` having changed the same line — so the merge a
+    /// resolution is started for is a merge that really does conflict.
+    fn init_conflicted_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+        let (container, repo) = init_contained_repo(prefix);
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        std::fs::write(repo.join("seed.txt"), "theirs\n").expect("write their side");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("theirs")]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(repo.join("seed.txt"), "ours\n").expect("write our side");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+        (container, repo)
+    }
+
+    /// A merge the queue escalated, admitted through the real INSERT and then moved to the status the
+    /// executor would have written. Hand-writing the row would let the stored operation drift from
+    /// what `Op` actually serialises, which is the one thing the launcher parses back.
+    async fn escalated_merge(pool: &sqlx::SqlitePool, root: &FsPath) -> i64 {
+        let repo = crate::vcs::ResolvedRepo::synthetic("proj", &root.to_string_lossy(), "proj");
+        let id = crate::vcs::submit(
+            pool,
+            &repo,
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Shell,
+        )
+        .await
+        .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("escalate it");
+        id
+    }
+
+    async fn resolution_run_id_of(pool: &sqlx::SqlitePool, request: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT resolution_run_id FROM vcs_requests WHERE id = ?",
+        )
+        .bind(request)
+        .fetch_one(pool)
+        .await
+        .expect("read the request back")
+    }
+
+    /// The launcher's whole contribution, end to end: the tree is born on the TARGET, the conflict is
+    /// already staged in it when the agent arrives, and the escalation records that it has had its
+    /// attempt.
+    ///
+    /// The agent is given a conflicted worktree rather than two branches and an instruction to merge,
+    /// and that inversion is the design. Any `git merge` a session runs goes to the queue — the same
+    /// queue that refused this merge for conflicting — so an agent told to merge would circle for
+    /// ever against a refusal that is structural and correct.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolution_starts_on_the_target_with_the_conflict_already_in_front_of_it() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_container, repo) = init_conflicted_repo("nucleos-runs-resolve-");
+        // A runner that takes its time, so the assertions below read a worktree the run has not
+        // finished with yet.
+        let state = test_state_with(Some(Duration::from_secs(30)), Duration::from_secs(120)).await;
+        let request = escalated_merge(&state.pool, &repo).await;
+
+        let run = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "feat/x".to_owned(),
+                target: "master".to_owned(),
+            },
+        )
+        .await
+        .expect("the resolution should start");
+
+        assert_eq!(
+            resolution_run_id_of(&state.pool, request).await,
+            Some(run),
+            "the escalation has to record which run had its one attempt"
+        );
+
+        let worktree: String = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
+            .bind(run)
+            .fetch_one(&state.pool)
+            .await
+            .expect("the run should have been given its worktree");
+        let worktree = FsPath::new(&worktree);
+        let conflicted =
+            std::fs::read_to_string(worktree.join("seed.txt")).expect("read the conflicted file");
+        assert!(
+            conflicted.contains("<<<<<<<"),
+            "the agent has to find the conflict already staged: {conflicted}"
+        );
+    }
+
+    /// One attempt, never a second. Repeating is where an agent burns budget insisting on the same
+    /// wall, and whoever reads an escalation should find one attempt to read rather than seven —
+    /// without the claim, a tick every minute would mint a fresh agent per tick against the same two
+    /// branches, which does not degrade, it explodes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_that_already_had_its_attempt_gets_no_second_agent() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_container, repo) = init_conflicted_repo("nucleos-runs-resolve-twice-");
+        let state = test_state().await;
+        let request = escalated_merge(&state.pool, &repo).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 4242 WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .expect("record an earlier attempt");
+
+        let refused = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "feat/x".to_owned(),
+                target: "master".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a conflict that has been attempted must not be handed out again");
+
+        assert!(
+            matches!(refused, CreateRunError::Invalid(_)),
+            "losing the claim is a refusal, not a database failure: {refused:?}"
+        );
+        assert_eq!(
+            resolution_run_id_of(&state.pool, request).await,
+            Some(4242),
+            "the first attempt's record must not be overwritten by the one that lost"
+        );
+        // Past the INSERT, so a run row exists and has to have been retired — a `running` row with no
+        // task holds one of the project's slots until the daemon restarts.
+        let status: String = sqlx::query_scalar("SELECT status FROM runs ORDER BY id DESC LIMIT 1")
+            .fetch_one(&state.pool)
+            .await
+            .expect("the run that lost should still be on the table");
+        assert_eq!(status, "failed");
+    }
+
+    /// A conflict can evaporate between the escalation and the tick that picks it up — other work
+    /// lands, and the two branches merge cleanly after all. No agent is started for that, because
+    /// there would be nothing in its worktree to resolve; the queue can compute this merge by itself
+    /// the next time somebody asks for it.
+    ///
+    /// The attempt is still spent, and that is the ordering being pinned: the claim is written before
+    /// the conflict is staged. The other order loses much worse — a staged conflict whose claim was
+    /// then lost leaves real work in a worktree while a second agent edits the same branches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_that_resolved_itself_spends_its_attempt_without_starting_an_agent() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        // No conflict in this one: `feat/x` never diverges from what `master` says.
+        let (_container, repo) = init_contained_repo("nucleos-runs-resolve-clean-");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("feat/x"),
+                OsStr::new("master")
+            ]
+        ));
+        let state = test_state().await;
+        let request = escalated_merge(&state.pool, &repo).await;
+
+        let refused = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "feat/x".to_owned(),
+                target: "master".to_owned(),
+            },
+        )
+        .await
+        .expect_err("there is no conflict here to hand anybody");
+
+        assert!(
+            matches!(refused, CreateRunError::Worktree(_)),
+            "staging is what failed, and the error has to say so: {refused:?}"
+        );
+        assert!(
+            resolution_run_id_of(&state.pool, request).await.is_some(),
+            "the attempt is spent even though no agent started — a second try hits the same wall"
+        );
     }
 
     /// Wires this daemon's classifier hook into `dir`, the way a project that has onboarded has it:
