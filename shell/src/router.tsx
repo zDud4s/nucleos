@@ -12,6 +12,7 @@ import { Home } from "./pages/Home";
 import { Placeholder } from "./pages/Placeholder";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
+import { Waiting } from "./pages/Waiting";
 
 /**
  * Memory history, in the real app as well as in the tests.
@@ -35,6 +36,7 @@ import { Runs, validateRunSearch } from "./pages/Runs";
 const PAGES: Record<string, () => ReactNode> = {
   "/": Home,
   "/fleet": Fleet,
+  "/waiting": Waiting,
   "/runs": Runs,
 };
 
