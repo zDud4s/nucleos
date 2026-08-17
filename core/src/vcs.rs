@@ -1145,8 +1145,35 @@ pub enum Outcome {
     /// costs one merge in a worktree nobody is standing in — while the alternative, a terminal row
     /// holding a sha that is on no branch, is something somebody would eventually try to publish.
     Blocked { reason: String, output_tail: String },
-    /// Ran and failed. A conflicted merge is this, and so is a raced publish.
+    /// Ran and failed. A raced publish is this.
+    ///
+    /// **A conflicted merge used to be this and is now `Escalated`**, which is the difference
+    /// between an operation that did not happen and one that did not happen and still has an owner.
     Failed {
+        reason: String,
+        exit_code: Option<i32>,
+        output_tail: String,
+    },
+    /// Ran, could not complete, and **a person now owns it**. A conflicting merge is this.
+    ///
+    /// Terminal, and the terminality is the point rather than a limitation: nothing here resumes on
+    /// its own, so the escalation ends THIS request and whatever a person decides arrives as a new
+    /// one. A status that meant "paused, pending a human" would have to be excluded from the
+    /// retention sweep and from `wait_for`'s terminal list, and would give the queue a second kind
+    /// of liveness to reason about.
+    ///
+    /// **Why not `Failed`.** `failed` says the operation did not happen and that is the end of it,
+    /// so the only actor left holding the conflict was whoever asked — which, for a landing, is the
+    /// agent that had just finished its work and is precisely the actor this queue exists to spare
+    /// from other sessions' integration. Telling it "failed" sends it looking for a conflict to fix,
+    /// and the only way to find one is to manufacture it.
+    ///
+    /// **What is recorded is what makes the conflict reproducible, not the conflict itself.**
+    /// Leaving the integration worktree conflicted was the obvious alternative and is worse: the
+    /// next operation on that repository resets it, so the evidence would survive for however many
+    /// seconds the queue happened to be idle. Git's own output plus the two commits it named can be
+    /// replayed at any point instead, by anyone, in a worktree of their own.
+    Escalated {
         reason: String,
         exit_code: Option<i32>,
         output_tail: String,
@@ -1182,6 +1209,7 @@ impl Outcome {
         match self {
             Outcome::Succeeded { .. } => "succeeded",
             Outcome::Blocked { .. } => "blocked",
+            Outcome::Escalated { .. } => "escalated",
             Outcome::Failed { .. } | Outcome::Unexecutable { .. } => "failed",
         }
     }
@@ -1339,7 +1367,16 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
             reason,
             output_tail,
         } => (None, Some(reason), None, Some(output_tail)),
+        // Written identically to `Failed`, and only the status differs. That is deliberate: an
+        // escalation IS a failure of the operation, and the columns a reader queries — the reason,
+        // git's own output, the exit code — are the same ones. What changes is who is expected to
+        // do something about it, and that belongs in the status rather than in a second shape.
         Outcome::Failed {
+            reason,
+            exit_code,
+            output_tail,
+        }
+        | Outcome::Escalated {
             reason,
             exit_code,
             output_tail,
@@ -1520,13 +1557,20 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// list want it there before that happens: a wait on a rejected row would otherwise run to the
 /// deadline on a row that can never change, and its tail would never age out. Neither is observable
 /// today, and both become wrong silently on the day the status is first written.
-pub const TERMINAL_STATUSES: [&str; 6] = [
+/// **`escalated` is terminal, and that is a decision rather than a technicality.** A person owning
+/// a conflict is the END of this request: nothing resumes it, and what they decide arrives as a new
+/// one. Had it been non-terminal it would need excluding from the retention sweep and from
+/// `wait_for`, and the queue would have gained a second kind of liveness to reason about — one where
+/// a row is neither finished nor going to move without a human, which is exactly the state that
+/// accumulates unnoticed.
+pub const TERMINAL_STATUSES: [&str; 7] = [
     "succeeded",
     "failed",
     "blocked",
     "rejected",
     "cancelled",
     "interrupted",
+    "escalated",
 ];
 
 /// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
@@ -2034,11 +2078,24 @@ pub async fn drain_once(
         // (`reconcile_interrupted` and `reap_requests_of_ended_runs` do attach one, because they
         // read whole rows rather than a claim.)
         Ok(()) => {
+            // **An escalation carries its reason into the summary; nothing else does.** The other
+            // statuses are answers to a question somebody asked and is waiting on, so the id and
+            // the word are enough to send them to the row. An escalation is the opposite: it says a
+            // person now owns something they did not ask about and are not waiting for, and
+            // "vcs request 21 escalated" gives them no way to know whether it is theirs without
+            // going to look. The feed is the only surface spec §2.1 gives this module, so it is
+            // where the reason has to be legible or it is nowhere.
+            let summary = match &outcome {
+                Outcome::Escalated { reason, .. } => {
+                    format!("vcs request {id} escalated — {reason}")
+                }
+                other => format!("vcs request {id} {}", other.status()),
+            };
             let _ = crate::feed::append(
                 pool,
                 Some(claimed.project_id.as_str()),
                 "vcs_request_finished",
-                &format!("vcs request {id} {}", outcome.status()),
+                &summary,
                 None,
             )
             .await;
@@ -2235,6 +2292,14 @@ impl FakeVcsExecutor {
             reason: reason.into(),
             exit_code: Some(1),
             output_tail: format!("git printed this while failing: {reason}"),
+        })
+    }
+
+    fn escalating_with(reason: &str) -> Self {
+        Self::reporting(Outcome::Escalated {
+            reason: reason.into(),
+            exit_code: Some(1),
+            output_tail: format!("CONFLICT (content): {reason}"),
         })
     }
 
@@ -4261,6 +4326,52 @@ mod tests {
                 .unwrap();
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].contains("succeeded"), "got: {}", summaries[0]);
+    }
+
+    /// An escalation is the one outcome whose reason has to reach the feed, and the one whose
+    /// reader did not ask for it.
+    ///
+    /// Every other status answers a question somebody is waiting on, so the id and the word send
+    /// them to the row. This one tells a person they now own something they never asked about and
+    /// are not watching for — and `vcs request 1 escalated` gives them no way to tell whether it is
+    /// theirs without going to look. Spec §2.1 leaves this module no view of its own, so if the
+    /// reason is not legible here it is legible nowhere.
+    #[tokio::test]
+    async fn an_escalation_carries_its_reason_into_the_feed_and_the_others_do_not() {
+        let pool = test_pool().await;
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        drain_once(
+            &pool,
+            "alpha",
+            &FakeVcsExecutor::escalating_with("Merge conflict in seed.txt"),
+        )
+        .await;
+
+        let summaries: Vec<String> =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'vcs_request_finished'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("escalated"), "got: {}", summaries[0]);
+        assert!(
+            summaries[0].contains("Merge conflict in seed.txt"),
+            "the reason has to travel with it: {}",
+            summaries[0]
+        );
+
+        // And the row says a person owns it, which `failed` could not say.
+        let status: String = sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "escalated");
+        assert!(
+            TERMINAL_STATUSES.contains(&status.as_str()),
+            "terminal on purpose: nothing resumes an escalation, so a waiter must not hang on one"
+        );
     }
 
     /// Everything the daemon logged while `body` ran.
