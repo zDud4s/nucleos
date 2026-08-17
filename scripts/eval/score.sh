@@ -116,8 +116,12 @@ command -v git >/dev/null 2>&1 || die "git is not on PATH"
 command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH (see ENVIRONMENT in --help)"
 command -v awk >/dev/null 2>&1 || die "awk is not on PATH"
 
-if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-  echo "score.sh: warning: CARGO_TARGET_DIR is unset — cargo will build a target dir inside the work dir (~15 GB)" >&2
+# The tree may carry its own answer. `layer.py` writes `.cargo/config.toml` into every candidate it
+# prepares, and it survives the copy into the work dir, so from 2026-08-17 the environment variable
+# is one of two ways this gets set and no longer the only one. Warning regardless taught the reader
+# to ignore the warning, which is worse than not having it.
+if [ -z "${CARGO_TARGET_DIR:-}" ] && ! grep -qs 'target-dir' "$tree/.cargo/config.toml"; then
+  echo "score.sh: warning: no CARGO_TARGET_DIR and no target-dir in the candidate's .cargo/config.toml — cargo will build a target dir inside the work dir (~15 GB)" >&2
 fi
 
 # ---------------------------------------------------------------- task lookup

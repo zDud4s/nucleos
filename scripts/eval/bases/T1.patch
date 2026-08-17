@@ -72,13 +72,13 @@ index 6488341..7f947f6 100644
      #[tokio::test]
      async fn a_budget_with_room_still_lets_triage_run() {
          let state = triage_state().await;
-@@ -1830,8 +1799,7 @@ mod tests {
+@@ -1830,8 +1799,4 @@ mod tests {
              .is_some();
-         assert!(
-             launched,
+-        assert!(
+-            launched,
 -            "a budget with room left must not block triage — otherwise the blocking test above \
 -             proves nothing about spend"
-+            "a budget with room left must not block triage"
-         );
+-        );
++        assert!(launched, "a budget with room left must not block triage");
      }
  
