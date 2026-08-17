@@ -16,14 +16,22 @@ import type { BadgeTone } from "./Badge";
  * the fourteenth page from quietly picking a different colour for `expired`.
  *
  * **This table covers only the domains whose states have been verified against
- * the núcleo.** It is deliberately incomplete: the remaining §7 rows (collision,
- * slot, council, team run, browser, e-mail, voice, web, VCS) arrive with the
- * slices that build those pages, each with its literals checked against the
- * core rather than guessed. An unmapped state is rendered as itself — see
- * `StateBadge` — because showing the literal admits ignorance, while assigning
- * it a tone would be a claim.
+ * the núcleo.** It is deliberately incomplete: the remaining §7 rows (council,
+ * team run, browser, e-mail, voice, web) arrive with the slices that build
+ * those pages, each with its literals checked against the core rather than
+ * guessed. An unmapped state is rendered as itself — see `StateBadge` — because
+ * showing the literal admits ignorance, while assigning it a tone would be a
+ * claim.
  */
-export type StateDomain = "run" | "job" | "gate" | "wait_reason" | "pillar";
+export type StateDomain =
+  | "run"
+  | "job"
+  | "gate"
+  | "wait_reason"
+  | "pillar"
+  | "collision"
+  | "slot"
+  | "vcs";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -85,10 +93,75 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * Why a job is parked. Budget and slot contention ask for opposite answers —
    * one wants you to raise a ceiling, the other wants you to wait or to stop
    * something else — so they never share a tone or a sentence.
+   *
+   * `excluded` is the third, and it is neither: the job is not short of money
+   * and not short of a slot. A rule somebody approved says it may not run while
+   * its partner does (`core/src/job.rs`, `Brake::Park { reason: "excluded" }`),
+   * and the only thing that changes it is lifting the rule or letting the
+   * partner finish. Reading it as slot contention would send somebody looking
+   * for capacity that is already there.
    */
   wait_reason: {
     budget: { tone: "paused", label: "held by budget" },
     slot: { tone: "pending", label: "waiting for a slot" },
+    excluded: { tone: "paused", label: "held by an exclusion" },
+  },
+
+  /**
+   * What is known about a coincidence between two trees.
+   *
+   * `not_measured` exists so that `clean` is never said in vain, and it is the
+   * one row on this table that can do active damage if collapsed: somebody
+   * trusting a `clean` nobody computed lets two jobs run at the same file. It
+   * takes the informational tone for the same reason the errored gate does —
+   * a fact with no verdict attached is not a verdict.
+   *
+   * Which *source* said it — declared or observed — is not in here. That is one
+   * distinction up: §7 asks for two badges, and a card renders one of these per
+   * source with the source named beside it.
+   */
+  collision: {
+    collide: { tone: "danger", label: "trees overlap" },
+    clean: { tone: "active", label: "no overlap" },
+    not_measured: { tone: "info", label: "overlap not measured" },
+  },
+
+  /**
+   * What is known about a slot's owner, when the answer is *not much*.
+   *
+   * Two entries, and they are the whole row: a listing that failed or came back
+   * full is ordinary and reads as *detail unavailable*; a listing that answered
+   * in full without the owner in it is a **leaked slot**, waiting on
+   * `reconcile_orphaned_slots`, and it is a defect. Collapsing the two teaches
+   * the reader to ignore the second — which is exactly the one worth seeing,
+   * because it silently lowers a project's effective ceiling.
+   *
+   * A slot whose owner *is* described has no reading here: the card shows the
+   * job or the run, which is a better answer than a badge.
+   */
+  slot: {
+    unknown: { tone: "info", label: "detail unavailable" },
+    orphaned: { tone: "danger", label: "awaiting reconciliation" },
+  },
+
+  /**
+   * A request in the git queue.
+   *
+   * Two distinctions, both load-bearing. `blocked` is terminal but **not** a
+   * failure: the queue will not retry it, and the answer is to fix the tree and
+   * submit again — so it takes the held tone rather than the red one. And
+   * `escalated` is a *normal outcome*: a person owns the conflict now, which is
+   * the queue working, not the queue breaking. Dressing either as `failed`
+   * sends somebody to debug a merge that behaved exactly as designed.
+   */
+  vcs: {
+    succeeded: { tone: "active", label: "landed" },
+    failed: { tone: "danger", label: "failed" },
+    blocked: { tone: "paused", label: "blocked — submit it again" },
+    escalated: { tone: "pending", label: "escalated to you" },
+    rejected: { tone: "off", label: "rejected" },
+    cancelled: { tone: "off", label: "cancelled" },
+    interrupted: { tone: "paused", label: "interrupted" },
   },
 
   /**

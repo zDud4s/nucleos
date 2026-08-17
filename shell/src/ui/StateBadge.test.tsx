@@ -107,6 +107,61 @@ describe("StateBadge — wait_reason", () => {
     expect(badge("wait_reason", "budget")?.text).toMatch(/budget/i);
     expect(badge("wait_reason", "slot")?.text).toMatch(/slot/i);
   });
+
+  it("keeps an exclusion apart from both, and never calls it a missing slot", () => {
+    // The third literal (`core/src/job.rs`, `Brake::Park { reason: "excluded" }`).
+    // A job held by an approved rule is not short of capacity: reading it as
+    // slot contention sends somebody looking for room that is already there.
+    assertAllDistinct("wait_reason", ["budget", "slot", "excluded"]);
+    expect(badge("wait_reason", "excluded")?.text).toMatch(/exclusion/i);
+    expect(badge("wait_reason", "excluded")?.text).not.toMatch(/slot/i);
+  });
+});
+
+describe("StateBadge — collision", () => {
+  it("never reads an unmeasured overlap as a clean one", () => {
+    // The one row on this table that can do active damage if collapsed:
+    // somebody trusting a `clean` nobody computed lets two jobs run at the same
+    // file.
+    assertAllDistinct("collision", ["collide", "clean", "not_measured"]);
+    const unmeasured = badge("collision", "not_measured");
+    expect(unmeasured?.text).toMatch(/not measured/i);
+    expect(unmeasured?.text).not.toMatch(/no overlap/i);
+    // Not a verdict either way — so not the red of a real collision.
+    expect(unmeasured?.className).not.toContain("ui-badge-danger");
+  });
+});
+
+describe("StateBadge — slot", () => {
+  it("keeps a slot with no description apart from a slot nothing is working in", () => {
+    // A listing that failed is ordinary. A listing that answered in full
+    // without the owner in it is a leaked slot, and it quietly lowers the
+    // project's ceiling until the daemon reconciles it.
+    assertAllDistinct("slot", ["unknown", "orphaned"]);
+    expect(badge("slot", "unknown")?.text).toMatch(/detail unavailable/i);
+    expect(badge("slot", "unknown")?.className).not.toContain("ui-badge-danger");
+    expect(badge("slot", "orphaned")?.text).toMatch(/reconciliation/i);
+  });
+});
+
+describe("StateBadge — vcs", () => {
+  it("does not dress a blocked request as a failure", () => {
+    // Terminal, but the answer is to fix the tree and submit again — which is
+    // not what a person does about a failure.
+    assertAllDistinct("vcs", ["succeeded", "failed", "blocked", "escalated"]);
+    const blocked = badge("vcs", "blocked");
+    expect(blocked?.className).not.toContain("ui-badge-danger");
+    expect(blocked?.text).not.toMatch(/fail/i);
+    expect(blocked?.text).toMatch(/again/i);
+  });
+
+  it("presents an escalated request as a normal outcome, not a fault", () => {
+    // A person owns the conflict now. That is the queue working.
+    const escalated = badge("vcs", "escalated");
+    expect(escalated?.className).not.toContain("ui-badge-danger");
+    expect(escalated?.text).not.toMatch(/fail|error/i);
+    expect(escalated?.text).toMatch(/escalated/i);
+  });
 });
 
 describe("StateBadge — pillar", () => {

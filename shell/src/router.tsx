@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   createMemoryHistory,
   createRootRoute,
@@ -6,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
+import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Placeholder } from "./pages/Placeholder";
 
@@ -19,6 +21,20 @@ import { Placeholder } from "./pages/Placeholder";
  * bundler never emitted a file for. Keeping the location in memory means the
  * route is state, which is what it actually is.
  */
+/**
+ * The pages that exist, by the path the nav gave them.
+ *
+ * A table rather than a chain of ternaries in the map below: this list grows by
+ * one entry per slice, and a conditional expression that grows to fourteen
+ * branches is a conditional expression nobody reads. A path that is not here
+ * gets the placeholder, which is what makes an unbuilt page a *stated* absence
+ * rather than a missing route.
+ */
+const PAGES: Record<string, () => ReactNode> = {
+  "/": Home,
+  "/fleet": Fleet,
+};
+
 export function createAppRouter(initialPath = "/") {
   /**
    * Built inside the factory rather than at module scope, and that matters:
@@ -40,7 +56,7 @@ export function createAppRouter(initialPath = "/") {
     createRoute({
       getParentRoute: () => rootRoute,
       path: item.path,
-      component: item.path === "/" ? Home : placeholderFor(item),
+      component: PAGES[item.path] ?? placeholderFor(item),
     }),
   );
 
