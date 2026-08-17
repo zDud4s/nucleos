@@ -1,6 +1,7 @@
 package pipe
 
 import (
+	"nucleostelegram/telegram"
 	"strings"
 	"testing"
 )
@@ -11,7 +12,7 @@ func TestMailShortcutTriagesOnceAndSaysWhatItStarted(t *testing.T) {
 	bot := &recordingBot{}
 	dc := &recordingDaemon{}
 
-	HandleMessage(bot, dc, NewTracker(), 42, "/mail")
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/mail")
 
 	if dc.triageCalls != 1 {
 		t.Fatalf("TriageEmail calls = %d, want exactly 1", dc.triageCalls)
@@ -33,7 +34,7 @@ func TestInboxShortcutSpendsNothing(t *testing.T) {
 		{"from_name": "Ana", "subject": "notas", "triage_class": "info", "triage_summary": "sem ação"},
 	}}
 
-	HandleMessage(bot, dc, NewTracker(), 42, "/inbox")
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/inbox")
 
 	if dc.triageCalls != 0 {
 		t.Fatalf("looking at the inbox must not trigger a run: %d call(s)", dc.triageCalls)
@@ -56,7 +57,7 @@ func TestInboxShortcutSpendsNothing(t *testing.T) {
 // An empty mailbox is a normal state, not an error, and must not read like one.
 func TestInboxWithNothingSaysSo(t *testing.T) {
 	bot := &recordingBot{}
-	HandleMessage(bot, &recordingDaemon{}, NewTracker(), 42, "/inbox")
+	HandleMessage(bot, &recordingDaemon{}, NewTracker(), telegram.Destination{ChatID: 42}, "/inbox")
 
 	if len(bot.messages) != 1 || !strings.Contains(bot.messages[0].text, "nothing in the mailbox") {
 		t.Errorf("messages = %v, want a plain empty-mailbox reply", bot.messages)

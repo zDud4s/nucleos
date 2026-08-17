@@ -950,6 +950,85 @@ pub fn branch_delete_from_command(command: &str) -> Option<Op> {
     })
 }
 
+/// PURE: why a command the parsers declined must still not be run by hand, or `None`.
+///
+/// **"Declined by the queue" and "fine to run directly" are not the same sentence, and treating
+/// them as one left the worst spelling of the worst verb wide open.** The session gate's rule was
+/// that anything the six parsers refuse passes through untouched, and that rule is right for
+/// `git merge --squash`: squash is a DIFFERENT operation, it stages instead of merging, and
+/// refusing it would make it impossible rather than governed. It is wrong for `git push --force`,
+/// which is the SAME operation in a worse spelling. Measured against the live gate before this
+/// existed: `git push --force origin master`, bare `git push`, and `git pull origin master` all
+/// came back `allow`.
+///
+/// The line drawn here is **does it write something other sessions share**. A push writes the
+/// remote; a pull writes the remote-tracking refs and then moves the local branch; `git branch -D`
+/// destroys a branch after asking git to stop answering whether that is safe. None of those can be
+/// left to race with the queue that exists to order exactly them. What stays silent is what touches
+/// only the caller's own worktree or index — `--squash`, `--abort`, `--continue` — and read-only
+/// spellings, which were never this queue's business.
+///
+/// This is a refusal and NOT an admission: there is nothing to queue, because the queue does not
+/// know how to perform the spelling either. The caller is told which spelling it does know.
+pub fn unqueueable_but_shared(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // **The segment must BEGIN with git, and that is what separates a command from a mention.**
+    // Scanning for `git` anywhere inside it is what the first version did, and it refused this
+    // feature's own commit message: segments split on newlines, so that `cd repo` and `git push` on
+    // two lines are judged apart — which also turns a line of prose reading "git push --force was
+    // allowed" into something shaped exactly like a command. Measured, not imagined: the commit
+    // could not be written, and neither could the probe that found it.
+    //
+    // Requiring the program first costs nothing real. `cd x && git push` has already become two
+    // segments by the time it arrives here, and the second begins with git. What it stops is every
+    // quoted and narrated occurrence — most of them, in a repository whose commit messages argue
+    // about git commands for a living.
+    let program = tokens
+        .first()?
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()?
+        .to_ascii_lowercase();
+    if program != "git" && program != "git.exe" {
+        return None;
+    }
+    let verb = tokens
+        .get(1..)?
+        .iter()
+        .find(|candidate| !candidate.starts_with('-'))
+        .map(|candidate| candidate.to_ascii_lowercase());
+
+    match verb.as_deref()? {
+        "push" => Some(
+            // The pointer to `--land` lives here because this is where a finishing agent arrives.
+            // "Deliver this work" and "push it somewhere" are the same thought to most callers, and
+            // a refusal that only says what is wrong sends them looking for another way to push.
+            "a push writes the remote, which is the shared thing this queue orders — and this \
+             spelling is not one it can perform. Use `git push <remote>` or \
+             `git push <remote> <branch>`, which it queues. If what you actually want is to \
+             deliver this branch, that is `nucleos-core --land`: it asks the queue to merge your \
+             branch into the branch the project is on, in order, and reports conflicts rather than \
+             leaving you to resolve them."
+                .to_owned(),
+        ),
+        "pull" => Some(
+            "a pull is a fetch and then a merge, and it moves your branch on the way. It is two \
+             queue operations, not one: run `git fetch <remote>`, then `git merge <remote>/<branch>`."
+                .to_owned(),
+        ),
+        // `-D` only. `-d` reached a parser and never arrives here, and the difference is the whole
+        // reason deletion is offerable at all: `-d` asks git to refuse when the branch holds commits
+        // nothing else reaches, and `-D` asks git to stop answering that.
+        "branch" if tokens.contains(&"-D") => Some(
+            "`-D` deletes a branch whose commits may be reachable from nowhere else, and it is the \
+             spelling that asks git not to check. The queue performs `git branch -d <branch>`, where \
+             git's own refusal is the safety."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 /// Admits a request into the queue and returns its row id. Provenance alone decides the initial
 /// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
 /// autonomous and start `awaiting_approval`.
@@ -1028,6 +1107,15 @@ pub struct ClaimedRequest {
     pub op: Op,
     pub project_id: String,
     pub project_root: String,
+    /// Whether a conflict resolver produced the branch this request wants merged.
+    ///
+    /// **It travels with the claim because the executor's behaviour differs on it**, which is the
+    /// bar for widening this struct: a resolution's source branch has to be VERIFIED before it is
+    /// merged — a two-parent tip and no conflict markers left in the tree — and an ordinary landing
+    /// must not be, because neither is true of one. An executor that could not tell the two apart
+    /// would either skip the check that exists to catch a flattened resolution, or apply it to every
+    /// branch anybody ever asked to land.
+    pub from_resolution: bool,
 }
 
 /// How a claimed request ended.
@@ -1066,8 +1154,35 @@ pub enum Outcome {
     /// costs one merge in a worktree nobody is standing in — while the alternative, a terminal row
     /// holding a sha that is on no branch, is something somebody would eventually try to publish.
     Blocked { reason: String, output_tail: String },
-    /// Ran and failed. A conflicted merge is this, and so is a raced publish.
+    /// Ran and failed. A raced publish is this.
+    ///
+    /// **A conflicted merge used to be this and is now `Escalated`**, which is the difference
+    /// between an operation that did not happen and one that did not happen and still has an owner.
     Failed {
+        reason: String,
+        exit_code: Option<i32>,
+        output_tail: String,
+    },
+    /// Ran, could not complete, and **a person now owns it**. A conflicting merge is this.
+    ///
+    /// Terminal, and the terminality is the point rather than a limitation: nothing here resumes on
+    /// its own, so the escalation ends THIS request and whatever a person decides arrives as a new
+    /// one. A status that meant "paused, pending a human" would have to be excluded from the
+    /// retention sweep and from `wait_for`'s terminal list, and would give the queue a second kind
+    /// of liveness to reason about.
+    ///
+    /// **Why not `Failed`.** `failed` says the operation did not happen and that is the end of it,
+    /// so the only actor left holding the conflict was whoever asked — which, for a landing, is the
+    /// agent that had just finished its work and is precisely the actor this queue exists to spare
+    /// from other sessions' integration. Telling it "failed" sends it looking for a conflict to fix,
+    /// and the only way to find one is to manufacture it.
+    ///
+    /// **What is recorded is what makes the conflict reproducible, not the conflict itself.**
+    /// Leaving the integration worktree conflicted was the obvious alternative and is worse: the
+    /// next operation on that repository resets it, so the evidence would survive for however many
+    /// seconds the queue happened to be idle. Git's own output plus the two commits it named can be
+    /// replayed at any point instead, by anyone, in a worktree of their own.
+    Escalated {
         reason: String,
         exit_code: Option<i32>,
         output_tail: String,
@@ -1103,6 +1218,7 @@ impl Outcome {
         match self {
             Outcome::Succeeded { .. } => "succeeded",
             Outcome::Blocked { .. } => "blocked",
+            Outcome::Escalated { .. } => "escalated",
             Outcome::Failed { .. } | Outcome::Unexecutable { .. } => "failed",
         }
     }
@@ -1151,7 +1267,7 @@ pub async fn claim_next(
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
-    let claimed: Option<(i64, String, String, String, String)> = sqlx::query_as(
+    let claimed: Option<(i64, String, String, String, String, bool)> = sqlx::query_as(
         "UPDATE vcs_requests
             SET status = 'running', started_at = ?1
           WHERE id = (
@@ -1162,14 +1278,14 @@ pub async fn claim_next(
             AND NOT EXISTS (
               SELECT 1 FROM vcs_requests WHERE repo_key = ?2 AND status = 'running'
             )
-         RETURNING id, op, args, project_id, project_root",
+         RETURNING id, op, args, project_id, project_root, from_resolution",
     )
     .bind(started_at)
     .bind(repo_key)
     .fetch_optional(&mut *transaction)
     .await?;
 
-    let Some((id, op, args, project_id, project_root)) = claimed else {
+    let Some((id, op, args, project_id, project_root, from_resolution)) = claimed else {
         // Nothing was changed, so the rollback this drop performs is the same as a commit.
         return Ok(None);
     };
@@ -1188,6 +1304,7 @@ pub async fn claim_next(
                 op,
                 project_id,
                 project_root,
+                from_resolution,
             }))
         }
         Err(error) => {
@@ -1260,7 +1377,16 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
             reason,
             output_tail,
         } => (None, Some(reason), None, Some(output_tail)),
+        // Written identically to `Failed`, and only the status differs. That is deliberate: an
+        // escalation IS a failure of the operation, and the columns a reader queries — the reason,
+        // git's own output, the exit code — are the same ones. What changes is who is expected to
+        // do something about it, and that belongs in the status rather than in a second shape.
         Outcome::Failed {
+            reason,
+            exit_code,
+            output_tail,
+        }
+        | Outcome::Escalated {
             reason,
             exit_code,
             output_tail,
@@ -1441,13 +1567,20 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// list want it there before that happens: a wait on a rejected row would otherwise run to the
 /// deadline on a row that can never change, and its tail would never age out. Neither is observable
 /// today, and both become wrong silently on the day the status is first written.
-pub const TERMINAL_STATUSES: [&str; 6] = [
+/// **`escalated` is terminal, and that is a decision rather than a technicality.** A person owning
+/// a conflict is the END of this request: nothing resumes it, and what they decide arrives as a new
+/// one. Had it been non-terminal it would need excluding from the retention sweep and from
+/// `wait_for`, and the queue would have gained a second kind of liveness to reason about — one where
+/// a row is neither finished nor going to move without a human, which is exactly the state that
+/// accumulates unnoticed.
+pub const TERMINAL_STATUSES: [&str; 7] = [
     "succeeded",
     "failed",
     "blocked",
     "rejected",
     "cancelled",
     "interrupted",
+    "escalated",
 ];
 
 /// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
@@ -1955,11 +2088,24 @@ pub async fn drain_once(
         // (`reconcile_interrupted` and `reap_requests_of_ended_runs` do attach one, because they
         // read whole rows rather than a claim.)
         Ok(()) => {
+            // **An escalation carries its reason into the summary; nothing else does.** The other
+            // statuses are answers to a question somebody asked and is waiting on, so the id and
+            // the word are enough to send them to the row. An escalation is the opposite: it says a
+            // person now owns something they did not ask about and are not waiting for, and
+            // "vcs request 21 escalated" gives them no way to know whether it is theirs without
+            // going to look. The feed is the only surface spec §2.1 gives this module, so it is
+            // where the reason has to be legible or it is nowhere.
+            let summary = match &outcome {
+                Outcome::Escalated { reason, .. } => {
+                    format!("vcs request {id} escalated — {reason}")
+                }
+                other => format!("vcs request {id} {}", other.status()),
+            };
             let _ = crate::feed::append(
                 pool,
                 Some(claimed.project_id.as_str()),
                 "vcs_request_finished",
-                &format!("vcs request {id} {}", outcome.status()),
+                &summary,
                 None,
             )
             .await;
@@ -2156,6 +2302,14 @@ impl FakeVcsExecutor {
             reason: reason.into(),
             exit_code: Some(1),
             output_tail: format!("git printed this while failing: {reason}"),
+        })
+    }
+
+    fn escalating_with(reason: &str) -> Self {
+        Self::reporting(Outcome::Escalated {
+            reason: reason.into(),
+            exit_code: Some(1),
+            output_tail: format!("CONFLICT (content): {reason}"),
         })
     }
 
@@ -4182,6 +4336,52 @@ mod tests {
                 .unwrap();
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].contains("succeeded"), "got: {}", summaries[0]);
+    }
+
+    /// An escalation is the one outcome whose reason has to reach the feed, and the one whose
+    /// reader did not ask for it.
+    ///
+    /// Every other status answers a question somebody is waiting on, so the id and the word send
+    /// them to the row. This one tells a person they now own something they never asked about and
+    /// are not watching for — and `vcs request 1 escalated` gives them no way to tell whether it is
+    /// theirs without going to look. Spec §2.1 leaves this module no view of its own, so if the
+    /// reason is not legible here it is legible nowhere.
+    #[tokio::test]
+    async fn an_escalation_carries_its_reason_into_the_feed_and_the_others_do_not() {
+        let pool = test_pool().await;
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        drain_once(
+            &pool,
+            "alpha",
+            &FakeVcsExecutor::escalating_with("Merge conflict in seed.txt"),
+        )
+        .await;
+
+        let summaries: Vec<String> =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'vcs_request_finished'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("escalated"), "got: {}", summaries[0]);
+        assert!(
+            summaries[0].contains("Merge conflict in seed.txt"),
+            "the reason has to travel with it: {}",
+            summaries[0]
+        );
+
+        // And the row says a person owns it, which `failed` could not say.
+        let status: String = sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "escalated");
+        assert!(
+            TERMINAL_STATUSES.contains(&status.as_str()),
+            "terminal on purpose: nothing resumes an escalation, so a waiter must not hang on one"
+        );
     }
 
     /// Everything the daemon logged while `body` ran.

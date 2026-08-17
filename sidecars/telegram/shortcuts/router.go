@@ -17,6 +17,21 @@ const (
 	// Inbox shows what the pillar knows without spending anything.
 	Inbox
 	Help
+	// OpenErrand turns the topic it was typed in into a place to work: a folder, a notebook, and a
+	// model of its own. Arg is the name, kept in the case it was typed in — it is what the folder
+	// is minted from and what gets read back in a listing.
+	OpenErrand
+	// ListErrands shows the errands and which topic each one is on.
+	ListErrands
+	// PauseErrand and ResumeErrand are one switch turned in both directions. A paused errand
+	// answers nothing; without a way back, a topic gone noisy could only be ended.
+	PauseErrand
+	ResumeErrand
+	// CloseErrand ends the asking and keeps the answer: the folder and its notebook stay.
+	CloseErrand
+	// SetBrain moves one errand between the model on this machine and the cloud. Arg is `local` or
+	// `cloud`, and nothing else — see the routing below.
+	SetBrain
 	// Refused is a command that was recognised but must not run from where it came — today, one
 	// spoken into a voice note.
 	Refused
@@ -55,6 +70,20 @@ func Route(text string) Intent {
 		return Intent{Kind: Mail}
 	case "/inbox":
 		return Intent{Kind: Inbox}
+	case "/assunto":
+		return Intent{Kind: OpenErrand}
+	case "/assuntos":
+		return Intent{Kind: ListErrands}
+	case "/pausa":
+		return Intent{Kind: PauseErrand}
+	case "/retomar":
+		return Intent{Kind: ResumeErrand}
+	case "/fim":
+		return Intent{Kind: CloseErrand}
+	case "/cerebro local":
+		return Intent{Kind: SetBrain, Arg: "local"}
+	case "/cerebro cloud":
+		return Intent{Kind: SetBrain, Arg: "cloud"}
 	}
 
 	// Prefix checks run against `trimmed` rather than `lowered`: lowercasing can change a string's
@@ -64,6 +93,17 @@ func Route(text string) Intent {
 	}
 	if hasPrefixFold(trimmed, "/proj ") {
 		return Intent{Kind: Proj, Arg: strings.TrimSpace(trimmed[len("/proj "):])}
+	}
+	// The trailing space is what keeps `/assuntos` out of here: it is a different command, and one
+	// of these two opens something.
+	if hasPrefixFold(trimmed, "/assunto ") {
+		return Intent{Kind: OpenErrand, Arg: strings.TrimSpace(trimmed[len("/assunto "):])}
+	}
+	// A brain this daemon does not know comes back with no Arg rather than being passed on.
+	// `Brain::from_wire` on the other side resolves anything unrecognised to a default, so a typo
+	// sent through would move the errand and say nothing about it.
+	if hasPrefixFold(trimmed, "/cerebro ") {
+		return Intent{Kind: SetBrain}
 	}
 
 	return Intent{Kind: SendToAgent, Text: text}

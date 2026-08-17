@@ -362,10 +362,26 @@ pub async fn compute_merge(
         // Best-effort: the next operation resets this worktree anyway, and a failure to abort must
         // not replace the conflict — the conflict is what the caller needs to read.
         let _ = git(&integration, &["merge", "--abort"], deadline).await;
-        return Err(failed(
-            format!("merging {source} into {target} failed"),
-            &merge,
-        ));
+        // **The reason names the owner, because the asker's instinct is to fix it.** An agent that
+        // has just finished work and is told "merging failed" will reach for the conflict, and it
+        // is the one thing here that is not its to reach for: the merge happened in an integration
+        // worktree it does not have, was aborted, and left nothing conflicted anywhere. There is no
+        // conflicted state in its copy to resolve — only the temptation to manufacture one.
+        //
+        // What IS the asker's is the other direction, and the message says so rather than leaving
+        // it to be guessed: bringing the target INTO its branch is an ordinary queue operation, and
+        // resolving there is resolving in its own worktree, on its own branch, where it belongs.
+        return Err(Outcome::Escalated {
+            reason: format!(
+                "merging {source} into {target} conflicts, so nothing was published and no copy \
+                 was left conflicted. This is the queue's to carry and not yours to fix from \
+                 here — the merge ran in an integration worktree you do not have. To clear it, \
+                 bring {target} into {source} in your own worktree (an ordinary queue operation), \
+                 resolve it there, and ask again."
+            ),
+            exit_code: merge.exit_code,
+            output_tail: merge.output_tail.clone(),
+        });
     }
 
     let new = revision(&integration, "HEAD", deadline).await?;
@@ -660,6 +676,16 @@ async fn revision(repo: &Path, rev: &str, deadline: std::time::Instant) -> Resul
 /// answer, which is the only diagnostic the row will carry.
 fn failed(reason: String, result: &CommandResult) -> Outcome {
     Outcome::Failed {
+        reason,
+        exit_code: result.exit_code,
+        output_tail: result.output_tail.clone(),
+    }
+}
+
+/// `failed`'s sibling for the outcomes a person has to look at. Same columns, different status —
+/// see `Outcome::Escalated` for why that distinction is the whole point rather than a label.
+fn escalated(reason: String, result: &CommandResult) -> Outcome {
+    Outcome::Escalated {
         reason,
         exit_code: result.exit_code,
         output_tail: result.output_tail.clone(),
@@ -1024,6 +1050,81 @@ async fn publish_by_fast_forward(
     }
 }
 
+/// Whether a conflict resolver's branch may be merged at all, checked before it is.
+///
+/// **The gate protects against "it broke" and never against "it threw work away".** A resolution
+/// that keeps one side and discards the other compiles, passes every test, and is indistinguishable
+/// from a good one by any measure the suite has. So the two things that cannot be checked afterwards
+/// are checked here, and both are structural rather than about content — neither asks what the right
+/// answer was, only whether this could possibly be one.
+///
+/// **A two-parent tip.** The daemon left a merge half-finished in the resolver's worktree, so an
+/// ordinary `git commit` on top of that produces a merge commit with both parents and the resolver
+/// has to do nothing special to earn it. One parent therefore does not mean "resolved differently";
+/// it means the merge was thrown away and something else was committed in its place — a flattened
+/// branch, a reset, a cherry-pick. That is refused without looking at the content at all, because
+/// the content of a flattened resolution can look perfect.
+///
+/// **No conflict markers left in the tree.** `git diff --check` reports them, and an agent that
+/// stopped halfway commits them without noticing: the file has both sides in it, the tests may even
+/// pass if the markers land in a comment or a string, and the merge would publish something no
+/// human wrote.
+///
+/// Refusing here is `Escalated` rather than `Failed` for the same reason a conflict is: somebody has
+/// to look, and the row is what tells them so.
+async fn verify_resolution(
+    project_root: &Path,
+    source: &str,
+    deadline: std::time::Instant,
+) -> Result<(), Outcome> {
+    let parents = git(
+        project_root,
+        &["rev-list", "--parents", "-1", source],
+        deadline,
+    )
+    .await?;
+    if !parents.succeeded() {
+        return Err(escalated(
+            format!("could not read {source}'s tip to verify the resolution"),
+            &parents,
+        ));
+    }
+    // `rev-list --parents -1` prints "<commit> <parent>..." — so the parent count is the field count
+    // minus the commit itself.
+    if parents.stdout.split_whitespace().count() - 1 < 2 {
+        return Err(Outcome::Escalated {
+            reason: format!(
+                "{source} was supposed to be a resolved merge and its tip has fewer than two \
+                 parents, so the merge it was asked to resolve is not in it. Nothing was merged. A \
+                 flattened resolution can look entirely correct and still be one side of the work \
+                 thrown away, which is why this is refused without reading the content."
+            ),
+            exit_code: parents.exit_code,
+            output_tail: parents.output_tail,
+        });
+    }
+
+    let markers = git(
+        project_root,
+        &["diff", "--check", &format!("{source}^1"), source],
+        deadline,
+    )
+    .await?;
+    // Non-zero here is `--check` reporting, not git failing: it exits 2 when it finds markers or
+    // whitespace errors. The tail is what says which, and it goes in the row.
+    if !markers.succeeded() && markers.output_tail.contains("conflict marker") {
+        return Err(Outcome::Escalated {
+            reason: format!(
+                "{source} still has conflict markers committed in it, so the resolution was left \
+                 half-done. Nothing was merged."
+            ),
+            exit_code: markers.exit_code,
+            output_tail: markers.output_tail,
+        });
+    }
+    Ok(())
+}
+
 /// The worktree that has `target` checked out, if any.
 ///
 /// Read out of `git worktree list --porcelain`, whose blocks are `worktree <path>` / `HEAD <sha>` /
@@ -1137,6 +1238,14 @@ impl crate::vcs::VcsExecutor for GitExecutor {
         // success having done nothing.
         match &request.op {
             crate::vcs::Op::Merge { source, target } => {
+                // A resolver's output is verified BEFORE it is merged, and only a resolver's. See
+                // `verify_resolution` for what is checked and why the checks are shaped that way.
+                if request.from_resolution
+                    && let Err(outcome) =
+                        verify_resolution(project_root, source.as_str(), deadline).await
+                {
+                    return outcome;
+                }
                 match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
                 {
                     Ok(computed) => {
@@ -1869,10 +1978,189 @@ pub(crate) mod tests {
         );
     }
 
-    /// Spec §7, first row. A conflict is a reported failure, not a problem this module solves — and
-    /// the point of computing on the side is that the user's copy is not where it happens.
+    /// Two branches that changed the same line, and a `feat/x` that will be asked to land as a
+    /// resolution. What each test does to `feat/x` before asking is what it is testing.
+    fn repo_with_a_conflict(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+        let (container, repo) = init_contained_repo(prefix);
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("branch"), OsStr::new("-M"), OsStr::new("master")]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        std::fs::write(repo.join("seed.txt"), "theirs\n").expect("write");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("theirs")
+            ]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(repo.join("seed.txt"), "ours\n").expect("write");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+        (container, repo)
+    }
+
+    async fn land_as_resolution(repo: &Path) -> Outcome {
+        use crate::vcs::VcsExecutor;
+        GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: true,
+            })
+            .await
+    }
+
+    /// **The failure the whole verification exists for.** A resolver that keeps one side and throws
+    /// the other away produces a branch that compiles, passes every test, and is indistinguishable
+    /// from a good resolution by any measure the suite has. What it cannot fake is the shape: the
+    /// daemon left a merge half-finished, so a real resolution commits on top of it and carries two
+    /// parents for free. One parent means the merge was discarded and something else put in its
+    /// place, and that is refused **without reading the content**, because the content is exactly
+    /// what a flattened resolution gets right.
     #[tokio::test]
-    async fn a_conflicted_merge_fails_without_touching_the_user_s_copy() {
+    async fn a_resolution_that_flattened_the_merge_is_refused_without_reading_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_conflict("nucleos-gitexec-flat-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // A single-parent commit on `feat/x` holding content that looks perfectly resolved.
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("feat/x")]
+        ));
+        std::fs::write(repo.join("seed.txt"), "ours\ntheirs\n").expect("write");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("looks resolved, is not a merge")
+            ]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        let before = sha_of(&repo, "master");
+
+        match land_as_resolution(&repo).await {
+            Outcome::Escalated { reason, .. } => assert!(
+                reason.contains("fewer than two parents"),
+                "the reason has to say what was wrong with the SHAPE: {reason}"
+            ),
+            other => panic!("a flattened resolution must not merge, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "master"),
+            before,
+            "nothing may be published when the resolution is refused"
+        );
+    }
+
+    /// An agent that stopped halfway commits the markers without noticing. The file then holds both
+    /// sides, the suite may well pass — markers landing inside a comment or a string break nothing —
+    /// and the merge would publish something no human wrote.
+    #[tokio::test]
+    async fn a_resolution_that_committed_its_conflict_markers_is_refused() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_conflict("nucleos-gitexec-markers-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // A real merge, left conflicted, then committed as-is: two parents AND markers.
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("feat/x")]
+        ));
+        assert!(!git_ok(&repo, &[OsStr::new("merge"), OsStr::new("master")],));
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("--no-edit")]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        let before = sha_of(&repo, "master");
+
+        match land_as_resolution(&repo).await {
+            Outcome::Escalated { reason, .. } => assert!(
+                reason.contains("conflict markers"),
+                "the reason has to name what is still in the tree: {reason}"
+            ),
+            other => panic!("committed markers must not merge, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before);
+    }
+
+    /// And the check applies to resolutions ONLY. An ordinary landing has one parent on its tip as a
+    /// matter of course, so applying this to every branch anybody asked to land would refuse almost
+    /// all of them — which is why `from_resolution` travels with the claim at all.
+    #[tokio::test]
+    async fn an_ordinary_landing_is_not_held_to_the_resolution_shape() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_conflict("nucleos-gitexec-ordinary-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // `feat/x` as any session leaves it: one parent, no merge in it. Its content conflicts with
+        // master, so the expected answer is the ordinary escalation for a conflict — reached by
+        // computing the merge, NOT by the shape check refusing it first.
+        use crate::vcs::VcsExecutor;
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+            })
+            .await;
+
+        match outcome {
+            Outcome::Escalated { reason, .. } => assert!(
+                !reason.contains("fewer than two parents"),
+                "an ordinary landing must never be judged on the resolution shape: {reason}"
+            ),
+            other => panic!("a conflict is an Escalated, got {other:?}"),
+        }
+    }
+
+    /// Spec §7, first row. A conflict is not a problem this module solves — and the point of
+    /// computing on the side is that the user's copy is not where it happens.
+    ///
+    /// **It is `Escalated` and no longer `Failed`.** The distinction is who is left holding it:
+    /// `failed` says the operation did not happen and that is the end, which leaves the conflict
+    /// with whoever asked — and for a landing that is the agent which had just finished its work,
+    /// the one actor this queue exists to spare from other sessions' integration.
+    #[tokio::test]
+    async fn a_conflicted_merge_escalates_without_touching_the_user_s_copy() {
         let _lock = crate::worktree::test_env_lock();
         let (_container, repo) = init_contained_repo("nucleos-gitexec-conflict-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -1916,11 +2204,34 @@ pub(crate) mod tests {
             .expect_err("a conflict must not produce a merge commit");
 
         match outcome {
-            Outcome::Failed { output_tail, .. } => assert!(
-                output_tail.contains("CONFLICT"),
-                "the row must carry what git said: {output_tail}"
-            ),
-            other => panic!("a conflict is a Failed, got {other:?}"),
+            Outcome::Escalated {
+                output_tail,
+                reason,
+                ..
+            } => {
+                assert!(
+                    output_tail.contains("CONFLICT"),
+                    "the row must carry what git said: {output_tail}"
+                );
+                // The asker's instinct on reading "merging failed" is to go and fix it, and that is
+                // the one thing here that is not theirs: the merge ran in an integration worktree
+                // they do not have and was aborted, so there is no conflicted state anywhere to
+                // resolve — only the temptation to manufacture one. The reason has to say so, and
+                // has to say what IS theirs instead.
+                assert!(
+                    reason.contains("not yours to fix"),
+                    "the reason must name the owner: {reason}"
+                );
+                assert!(
+                    reason.contains("no copy was left conflicted"),
+                    "the reason must say there is nothing to resolve: {reason}"
+                );
+                assert!(
+                    reason.contains("in your own worktree"),
+                    "a refusal that names no alternative sends the asker looking: {reason}"
+                );
+            }
+            other => panic!("a conflict is an Escalated, got {other:?}"),
         }
 
         assert_eq!(sha_of(&repo, "master"), before);
@@ -2387,6 +2698,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -2749,6 +3061,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: project_root.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3065,6 +3378,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3125,6 +3439,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3194,6 +3509,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3274,6 +3590,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3321,6 +3638,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3366,6 +3684,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3405,6 +3724,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3442,6 +3762,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3487,6 +3808,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3525,6 +3847,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 
@@ -3625,6 +3948,7 @@ pub(crate) mod tests {
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
             })
             .await;
 

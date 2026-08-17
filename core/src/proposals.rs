@@ -9,6 +9,19 @@ pub struct Proposal {
     pub run_id: Option<i64>,
     pub session_id: Option<String>,
     pub project_id: Option<String>,
+    /// The errand this came from, when it came from one — which is almost never.
+    ///
+    /// Not derivable from `project_id`: an errand HAS no project, so an errand's proposal and a
+    /// machine-wide one both carry `project_id IS NULL` and nothing else in the row tells them
+    /// apart.
+    pub errand_id: Option<i64>,
+    /// The errand's name, joined in by the queries whose readers need it and `NULL` in the rest.
+    ///
+    /// Carried on the same struct rather than in a second type, because the alternative was a
+    /// near-copy of eleven fields that would drift the first time one of them changed. The `NULL AS
+    /// errand_name` in the other queries is what keeps that honest: a reader that gets `None` is
+    /// being told this query did not ask, and the id is still there to ask with.
+    pub errand_name: Option<String>,
     pub tool_name: Option<String>,
     pub reasoning: String,
     pub tool_input: Option<String>,
@@ -67,6 +80,86 @@ pub async fn create_action_approval(
 
     transaction.commit().await?;
     Ok(proposal_id)
+}
+
+/// An action the injection barrier refused, kept where a person can read it.
+///
+/// The fifth `kind`, and it exists because of what `approve` means. §6 closes acting tools once a
+/// turn has read a stranger's words — which, for an errand, is every turn that did any research.
+/// Until this row existed the refusal was the end of the line: the model was stopped and the owner
+/// never learned what it had wanted to do, so an errand could spend an afternoon finding the right
+/// car and have no way to say so.
+///
+/// **Not `action-approval`, and the reason is mechanical rather than aesthetic.** Approving one of
+/// those calls `runs::resume_approved_run`, which looks up a live worktree for the paused run and
+/// answers `NotResumable` without one. An errand turn has no worktree and was never paused — it was
+/// denied and carried on. Filed as an action approval, this would appear under a button that cannot
+/// work, which is worse than appearing under none.
+///
+/// So nothing resumes here either, exactly as for [`create_skipped_item`]. What the record buys is
+/// that somebody finds out: they do the thing themselves, or they ask the errand again, and the new
+/// turn starts clean and may act. The door is a person, not a button.
+pub async fn create_refused_action(
+    pool: &SqlitePool,
+    run_id: i64,
+    session_id: Option<&str>,
+    errand_id: Option<i64>,
+    tool_name: &str,
+    reasoning: &str,
+    tool_input: Option<&str>,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, errand_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('refused-action', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(session_id)
+    .bind(errand_id)
+    .bind(tool_name)
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
+/// What the barrier refused and nobody has read yet.
+///
+/// Its own door rather than a `kind` filter on `list_pending`, for the reason `list_skipped_items`
+/// gives: that list feeds a screen with approve and reject buttons, and both of those answer 409
+/// for anything that is not an `action-approval`.
+pub async fn list_refused_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        // The one query that joins. A person reading this list is deciding whether to do the thing
+        // themselves, and "send_email" without the errand is not a decidable question — it is the
+        // verb with the subject missing. LEFT, so a refused action with no errand (an ordinary chat
+        // that read its mail and then reached for a control) still appears, unnamed.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
+                e.name AS errand_name, p.tool_name, p.reasoning,
+                p.tool_input, p.created_at, p.decided_at
+         FROM proposals p
+         LEFT JOIN errands e ON e.id = p.errand_id
+         WHERE p.status = 'pending' AND p.kind = 'refused-action'
+         ORDER BY p.id ASC",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// A job put an item down because it asked for a decision, and this is the record of it.
@@ -213,6 +306,91 @@ pub async fn create_calendar_event(
     Ok(proposal_id)
 }
 
+/// Everything a wheel request has to say, as one value.
+///
+/// A struct rather than seven arguments, and the grouping is not only length: three of these are
+/// `&str` and one of them is the thing the person will read and decide on. Two same-typed arguments
+/// swapped in a call would compile, and the swap that mattered would put the wrong host in the
+/// dialogue — which is exactly the failure spec §5.2's measures exist to prevent.
+#[derive(Debug, Clone, Copy)]
+pub struct WheelAsk<'a> {
+    pub run_id: Option<i64>,
+    pub project_id: &'a str,
+    /// The row in `browser_sessions` this is about.
+    pub session_id: i64,
+    pub requested_url: &'a str,
+    pub final_url: &'a str,
+    /// The complete, literal origin — punycode as stored, never prettified.
+    pub origin: &'a str,
+    pub reasoning: &'a str,
+}
+
+/// An agent hit a wall and is asking for the wheel (spec §4.4 rule 3).
+///
+/// It lands here and not in `attention.rs` for a reason the spec calls out by name: that module is
+/// the owner-presence brake, and what it holds expires in two minutes — the exact opposite of what
+/// this needs. A wheel request has to survive the shell being closed, the run ending, and the person
+/// going away for a day. **It never expires**, because §4.4 rule 2 says the wheel does not come back
+/// by time; only a person decides.
+///
+/// # What goes into `tool_input`, and why each field is there
+///
+/// The three measures of spec §5.2 against the confused deputy are all dialogue content, and this is
+/// where the dialogue gets its facts:
+///
+/// - `origin` is the **complete and literal** origin, in the punycode form the policy stored, never
+///   abbreviated. `xn--exemp1o-...` is the information; prettifying it is the attack.
+/// - `requested_url` and `final_url` are how the agent got there. A permission asked for from a page
+///   the agent followed a link to is not the same request as one from a url a person typed, and the
+///   only way for a person to tell is to be shown both.
+/// - `session_id` is the row in `browser_sessions`, so accepting can find the session without the
+///   caller naming it — and so a proposal cannot be pointed at a different session after the fact.
+pub async fn create_wheel_request(pool: &SqlitePool, ask: WheelAsk<'_>) -> sqlx::Result<i64> {
+    let WheelAsk {
+        run_id,
+        project_id,
+        session_id,
+        requested_url,
+        final_url,
+        origin,
+        reasoning,
+    } = ask;
+    let now = chrono::Utc::now().to_rfc3339();
+    let tool_input = serde_json::json!({
+        "session_id": session_id,
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "origin": origin,
+    })
+    .to_string();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('browser-wheel', 'pending', ?, NULL, ?, 'browser_handoff', ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
 /// Whether a message already has a calendar proposal waiting on a decision.
 ///
 /// Without this, every triage pass over the same `action` message would file another one, and the
@@ -232,7 +410,8 @@ pub async fn calendar_proposal_pending_for(pool: &SqlitePool, email_id: i64) -> 
 
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals WHERE id = ?",
     )
@@ -243,7 +422,8 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
 
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'action-approval'
@@ -267,7 +447,8 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
 /// queue is worked front to back, and this is read the morning after.
 pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'skipped-item'
@@ -276,6 +457,16 @@ pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>
     .fetch_all(pool)
     .await
 }
+
+/// The kinds that are read and put away rather than decided.
+///
+/// Both name work that never happened and cannot be made to happen from here: a job item skipped
+/// hours ago in a tree that has moved on, and an action the barrier refused in a turn that has
+/// ended. Neither has anything to resume, which is what separates them from `action-approval`.
+///
+/// An allow-list and not "anything that is not an action-approval", so a sixth kind arriving later
+/// has to say out loud that dismissing it is the right verb.
+const DISMISSABLE_KINDS: [&str; 2] = ["skipped-item", "refused-action"];
 
 /// Puts a skipped item away once it has been read.
 ///
@@ -292,13 +483,38 @@ pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>
 /// tell apart — gone, already decided, and the database said no — are the same three.
 pub async fn dismiss_skipped_item(pool: &SqlitePool, id: i64) -> Result<(), RejectError> {
     let proposal = get(pool, id).await?.ok_or(RejectError::NotFound)?;
-    if proposal.kind != "skipped-item" || proposal.status != "pending" {
+    if !DISMISSABLE_KINDS.contains(&proposal.kind.as_str()) || proposal.status != "pending" {
         return Err(RejectError::NotPending);
     }
     // Compare-and-set, so a second dismissal racing this one is reported rather than answered 204.
     if !transition(pool, id, "dismissed", "dismissed by user").await? {
         return Err(RejectError::NotPending);
     }
+    Ok(())
+}
+
+/// Add a line to a proposal's history without changing its status.
+///
+/// For the case spec §4.4a describes: a wheel request that was accepted and whose window then failed
+/// to open. The proposal is no longer pending, so `transition` cannot carry the news, and the person
+/// needs to be told why the window they asked for is not there. The event is written with the same
+/// status on both sides, which is what says "nothing was decided here, something happened".
+pub async fn note(pool: &SqlitePool, id: i64, note: &str) -> sqlx::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let Some(proposal) = get(pool, id).await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(&proposal.status)
+    .bind(&proposal.status)
+    .bind(note)
+    .bind(&now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

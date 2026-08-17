@@ -23,7 +23,6 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PORT = 8799
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # One of each thing the filter has to tell apart: the run we asked about, another run entirely, a
@@ -71,13 +70,16 @@ class Stub(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    server = HTTPServer(("127.0.0.1", PORT), Stub)
+    # Port 0: the OS picks a free one. A fixed port makes a gate fail for the one reason that has
+    # nothing to do with the code — somebody else already listening.
+    server = HTTPServer(("127.0.0.1", 0), Stub)
+    port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     log = os.path.join(tempfile.mkdtemp(prefix="nucleos-approve-"), "approvals.jsonl")
     result = subprocess.run(
         [sys.executable, os.path.join(ROOT, "scripts/eval/auto-approve.py"),
-         "--run", "111", "--daemon-url", f"http://127.0.0.1:{PORT}",
+         "--run", "111", "--daemon-url", f"http://127.0.0.1:{port}",
          "--until-idle", "1", "--interval", "0.1", "--log", log],
         capture_output=True, text=True, cwd=ROOT,
     )
