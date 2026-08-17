@@ -77,3 +77,52 @@ func TestAVoiceTranscriptCannotFireADeterministicCommand(t *testing.T) {
 		t.Errorf("RouteTranscript(prose) = %+v, want it sent to the orchestrator", got)
 	}
 }
+
+func TestRouteErrandCommands(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want Intent
+	}{
+		{"/assunto carros usados", Intent{Kind: OpenErrand, Arg: "carros usados"}},
+		// Capitalised by a phone's keyboard, and the argument keeps its own case: the name is what
+		// the folder is minted from and what the person will read back in `/assuntos`.
+		{"/Assunto Carros", Intent{Kind: OpenErrand, Arg: "Carros"}},
+		{"/assunto", Intent{Kind: OpenErrand}},
+		{"/assuntos", Intent{Kind: ListErrands}},
+		{"/pausa", Intent{Kind: PauseErrand}},
+		{"/retomar", Intent{Kind: ResumeErrand}},
+		{"/fim", Intent{Kind: CloseErrand}},
+		{"/cerebro local", Intent{Kind: SetBrain, Arg: "local"}},
+		{"/cerebro cloud", Intent{Kind: SetBrain, Arg: "cloud"}},
+		{"/CEREBRO Cloud", Intent{Kind: SetBrain, Arg: "cloud"}},
+		// A brain this daemon does not know is not silently sent on to be interpreted: `from_wire`
+		// on the other side resolves anything unknown to a default, so a typo would move the errand
+		// without saying so.
+		{"/cerebro nuvem", Intent{Kind: SetBrain}},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			if got := Route(tc.text); got != tc.want {
+				t.Errorf("Route(%q) = %+v, want %+v", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+// `/assuntos` must not be swallowed by a prefix test for `/assunto`. They are different commands and
+// one of them opens something.
+func TestListErrandsIsNotAPrefixOfOpenErrand(t *testing.T) {
+	if got := Route("/assuntos").Kind; got != ListErrands {
+		t.Errorf("Route(\"/assuntos\") = %v, want ListErrands", got)
+	}
+}
+
+// A command heard in a voice note is a guess made over a noisy channel. `/fim` closes an errand and
+// `/assunto` opens one; neither is a thing to do on a misheard word, with nothing typed and nothing
+// to point at afterwards.
+func TestATranscriptCannotOpenOrCloseAnErrand(t *testing.T) {
+	for _, text := range []string{"/assunto carros", "/assuntos", "/pausa", "/retomar", "/fim", "/cerebro cloud"} {
+		if got := RouteTranscript(text).Kind; got != Refused {
+			t.Errorf("RouteTranscript(%q) = %v, want Refused", text, got)
+		}
+	}
+}

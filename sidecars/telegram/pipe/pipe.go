@@ -3,6 +3,7 @@ package pipe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"nucleostelegram/config"
+	"nucleostelegram/daemon"
 	"nucleostelegram/format"
 	"nucleostelegram/notifier"
 	"nucleostelegram/shortcuts"
@@ -45,19 +47,30 @@ const helpText = `Talk normally to reach the orchestrator.
 /proj [name] — list registered projects, optionally filtered by name
 /inbox — show what is waiting in the mailbox (free)
 /mail — read and classify what is waiting (costs a run)
-/help — show this help`
+/help — show this help
+
+Numa conversa de grupo com tópicos, cada tópico pode ser um assunto:
+/assunto <nome> — abre um assunto neste tópico
+/assuntos — lista os assuntos e em que tópico está cada um
+/pausa, /retomar — cala e volta a acordar o assunto deste tópico
+/fim — fecha o assunto (a pasta e o caderno ficam)
+/cerebro local|cloud — escolhe quem responde a este assunto`
 
 type Bot interface {
-	SendMessage(chatID int64, text string) error
-	SendHTML(chatID int64, html string) error
-	SendMessageWithButtons(chatID int64, text string, rows [][]telegram.Button) error
+	SendMessage(to telegram.Destination, text string) error
+	SendHTML(to telegram.Destination, html string) error
+	SendMessageWithButtons(to telegram.Destination, text string, rows [][]telegram.Button) error
 	AnswerCallbackQuery(callbackID, text string) error
 }
 
 type Daemon interface {
-	SendAssistantMessage(chatID, text string) (int64, error)
+	SendAssistantMessage(chatKey, text string) (int64, error)
 	GetRun(id int64) (map[string]any, error)
 	GetProposals() ([]map[string]any, error)
+	// GetRefusedActions is what the injection barrier turned away. A separate route from the one
+	// above, because these carry no approve and no reject — nothing is held, so there is nothing to
+	// let through or release.
+	GetRefusedActions() ([]map[string]any, error)
 	GetProjects() ([]map[string]any, error)
 	ApproveProposal(id int64) (map[string]any, error)
 	RejectProposal(id int64) error
@@ -68,6 +81,14 @@ type Daemon interface {
 	GetEmailQueue() ([]map[string]any, error)
 	SetKill(engaged bool) error
 	CancelRun(id int64) error
+	ListErrands() ([]daemon.Errand, error)
+	// ErrandOfChat answers with (_, false, nil) for a topic that has no errand, which is almost
+	// every topic — the absence is an answer here and never an error.
+	ErrandOfChat(chatKey string) (daemon.Errand, bool, error)
+	CreateErrand(name, chatKey string) (int64, error)
+	SetErrandStatus(id int64, status string) error
+	SetErrandBrain(id int64, brain string) error
+	CloseErrand(id int64) error
 }
 
 type Downloader interface {
@@ -75,37 +96,99 @@ type Downloader interface {
 	DownloadFile(filePath string) ([]byte, error)
 }
 
+// Tracker remembers the last turn of each conversation, so `/cancel` knows what to cancel.
+//
+// Keyed on the chat KEY and not on the chat id: two topics of one group are two conversations, the
+// núcleo hands each its own turn, and a `/cancel` typed in one of them must not reach into the
+// other. It is the same string the daemon routes on, so the two cannot disagree about what "this
+// conversation" means.
 type Tracker struct {
 	mu       sync.Mutex
-	lastTurn map[int64]int64
+	lastTurn map[string]int64
 }
 
 func NewTracker() *Tracker {
-	return &Tracker{lastTurn: map[int64]int64{}}
+	return &Tracker{lastTurn: map[string]int64{}}
 }
 
-func (t *Tracker) Set(chatID, turnID int64) {
+func (t *Tracker) Set(key string, turnID int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.lastTurn[chatID] = turnID
+	t.lastTurn[key] = turnID
 }
 
-func (t *Tracker) Get(chatID int64) (int64, bool) {
+func (t *Tracker) Get(key string) (int64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	v, ok := t.lastTurn[chatID]
+	v, ok := t.lastTurn[key]
 	return v, ok
 }
 
-// ChatOf is the chat an update belongs to, which is the key updates are serialised by.
-func ChatOf(u telegram.Update) int64 {
+// ChatKey is how a conversation is named everywhere outside Telegram: in the daemon's `chat_id`, in
+// an errand's `chat_key`, in the tracker, and as the queue an update is serialised on.
+//
+// A topic gets `<chat>:<thread>`. Everything else gets the bare chat id — byte for byte the key
+// this sidecar has always sent. That is not a tidiness point: a one-to-one chat that started
+// answering to `-100…:0` on deploy day would have lost its session and its history, and nothing
+// would have failed loudly enough to notice.
+func ChatKey(to telegram.Destination) string {
+	key := strconv.FormatInt(to.ChatID, 10)
+	if to.ThreadID != 0 {
+		key += ":" + strconv.FormatInt(to.ThreadID, 10)
+	}
+	return key
+}
+
+// DestinationFromKey is ChatKey read backwards: the topic a key names, or a refusal.
+//
+// It exists because keys now travel in the other direction. Every key this sidecar held used to come
+// from an update it had just received, so a `telegram.Destination` was always at hand; an errand's
+// `chat_key` arrives from the daemon with no update behind it, and it is the only thing that says
+// which topic that errand's work belongs to.
+//
+// Split on the LAST colon, though neither half can contain one — a chat id and a thread id are both
+// integers. Taking the last is what makes a malformed key with two colons fail on the parse instead
+// of silently reading `-100:7` as a chat id, which is the shape a wrong answer would take.
+//
+// The refusal is the point of the second return value. The fallback nobody writes on purpose is
+// "send it to the usual place", and the usual place is the configured chat — a group's General,
+// where an errand's working notes do not belong. A missing notification is a thing somebody
+// notices; a notification in the wrong room is not.
+func DestinationFromKey(key string) (telegram.Destination, bool) {
+	chat, thread := key, ""
+	if cut := strings.LastIndex(key, ":"); cut >= 0 {
+		chat, thread = key[:cut], key[cut+1:]
+	}
+
+	chatID, err := strconv.ParseInt(chat, 10, 64)
+	if err != nil {
+		return telegram.Destination{}, false
+	}
+	if thread == "" {
+		// No colon at all: a one-to-one chat or a group's General, exactly as `ChatKey` writes it.
+		// A key ENDING in a colon is a different thing and lands in the parse below, where it fails.
+		if !strings.Contains(key, ":") {
+			return telegram.Destination{ChatID: chatID}, true
+		}
+		return telegram.Destination{}, false
+	}
+
+	threadID, err := strconv.ParseInt(thread, 10, 64)
+	if err != nil {
+		return telegram.Destination{}, false
+	}
+	return telegram.Destination{ChatID: chatID, ThreadID: threadID}, true
+}
+
+// DestinationOf is where an update came from, and therefore where its answer goes.
+func DestinationOf(u telegram.Update) telegram.Destination {
 	switch {
 	case u.CallbackQuery != nil && u.CallbackQuery.Message != nil:
-		return u.CallbackQuery.Message.Chat.ID
+		return u.CallbackQuery.Message.Destination()
 	case u.Message != nil:
-		return u.Message.Chat.ID
+		return u.Message.Destination()
 	default:
-		return 0
+		return telegram.Destination{}
 	}
 }
 
@@ -137,20 +220,20 @@ func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Trac
 		return
 	}
 
-	chatID := u.Message.Chat.ID
+	to := u.Message.Destination()
 	text := resolveIncoming(dl, dc, cfg.TranscribeCmd, u.Message)
 	if strings.TrimSpace(text) == "" {
 		// A sticker, a location, a poll: none of them carries a prompt, and a turn started on an
 		// empty one spends a run to answer nothing.
-		logSend("unreadable message", bot.SendMessage(chatID,
+		logSend("unreadable message", bot.SendMessage(to,
 			"I can only read text, voice notes, photos and documents."))
 		return
 	}
 	if u.Message.Voice != nil {
-		handleTranscript(bot, dc, tr, chatID, text)
+		handleTranscript(bot, dc, tr, to, text)
 		return
 	}
-	HandleMessage(bot, dc, tr, chatID, text)
+	HandleMessage(bot, dc, tr, to, text)
 }
 
 // buildAttachmentPrompt returns the orchestrator prompt for a saved attachment. A document takes
@@ -315,87 +398,127 @@ func docSuffix(name string) string {
 	return ""
 }
 
-func HandleMessage(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
-	handleIntent(bot, dc, tr, chatID, shortcuts.Route(text))
+func HandleMessage(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, text string) {
+	handleIntent(bot, dc, tr, to, shortcuts.Route(text))
 }
 
 // handleTranscript routes what a speech model heard rather than what someone typed. The difference
 // is that a transcript cannot fire a command — see shortcuts.RouteTranscript.
-func handleTranscript(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
-	handleIntent(bot, dc, tr, chatID, shortcuts.RouteTranscript(text))
+func handleTranscript(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, text string) {
+	handleIntent(bot, dc, tr, to, shortcuts.RouteTranscript(text))
 }
 
-func handleIntent(bot Bot, dc Daemon, tr *Tracker, chatID int64, intent shortcuts.Intent) {
+func handleIntent(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, intent shortcuts.Intent) {
 	switch intent.Kind {
 	case shortcuts.Help:
-		logSend("help", bot.SendMessage(chatID, helpText))
+		logSend("help", bot.SendMessage(to, helpText))
 	case shortcuts.Refused:
 		// Said out loud, never silently: a person who spoke `/kill off` and heard nothing back
 		// would reasonably believe the kill switch is now off.
-		logSend("refused spoken command", bot.SendMessage(chatID,
+		logSend("refused spoken command", bot.SendMessage(to,
 			"I heard a command in that voice note and did not run it — type it instead: "+
 				strings.TrimSpace(intent.Text)))
 	case shortcuts.Kill:
 		if err := dc.SetKill(intent.On); err != nil {
-			logSend("kill switch error", bot.SendMessage(chatID, "kill switch error: "+err.Error()))
+			logSend("kill switch error", bot.SendMessage(to, "kill switch error: "+err.Error()))
 			return
 		}
 		if intent.On {
-			logSend("kill switch engaged", bot.SendMessage(chatID, "kill switch ENGAGED"))
+			logSend("kill switch engaged", bot.SendMessage(to, "kill switch ENGAGED"))
 		} else {
-			logSend("kill switch disengaged", bot.SendMessage(chatID, "kill switch disengaged"))
+			logSend("kill switch disengaged", bot.SendMessage(to, "kill switch disengaged"))
 		}
 	case shortcuts.Cancel:
-		id, ok := tr.Get(chatID)
+		id, ok := tr.Get(ChatKey(to))
 		if !ok {
-			logSend("nothing to cancel", bot.SendMessage(chatID, "nothing to cancel"))
+			logSend("nothing to cancel", bot.SendMessage(to, "nothing to cancel"))
 			return
 		}
 		if err := dc.CancelRun(id); err != nil {
-			logSend("cancel error", bot.SendMessage(chatID, err.Error()))
+			logSend("cancel error", bot.SendMessage(to, err.Error()))
 			return
 		}
-		logSend("cancel confirmation", bot.SendMessage(chatID, fmt.Sprintf("cancelled turn %d", id)))
+		logSend("cancel confirmation", bot.SendMessage(to, fmt.Sprintf("cancelled turn %d", id)))
 	case shortcuts.Budget:
 		budget, err := dc.GetBudget()
 		if err != nil {
-			logSend("budget error", bot.SendMessage(chatID, err.Error()))
+			logSend("budget error", bot.SendMessage(to, err.Error()))
 			return
 		}
-		logSend("budget", bot.SendMessage(chatID, formatBudget(budget)))
+		logSend("budget", bot.SendMessage(to, formatBudget(budget)))
 	case shortcuts.Proposals:
-		sendProposals(bot, dc, chatID)
+		sendProposals(bot, dc, to)
 	case shortcuts.Proj:
-		sendProjects(bot, dc, chatID, intent.Arg)
+		sendProjects(bot, dc, to, intent.Arg)
 	case shortcuts.Mail:
-		sendTriage(bot, dc, chatID)
+		sendTriage(bot, dc, to)
 	case shortcuts.Inbox:
-		sendInbox(bot, dc, chatID)
+		sendInbox(bot, dc, to)
+	case shortcuts.OpenErrand:
+		openErrand(bot, dc, to, intent.Arg)
+	case shortcuts.ListErrands:
+		listErrands(bot, dc, to)
+	case shortcuts.PauseErrand:
+		setErrandStatus(bot, dc, to, "paused", "em pausa")
+	case shortcuts.ResumeErrand:
+		setErrandStatus(bot, dc, to, "active", "a responder outra vez")
+	case shortcuts.CloseErrand:
+		closeErrand(bot, dc, to)
+	case shortcuts.SetBrain:
+		setErrandBrain(bot, dc, to, intent.Arg)
 	default:
-		startTurn(bot, dc, tr, chatID, intent.Text)
+		startTurn(bot, dc, tr, to, intent.Text)
 	}
 }
 
-func startTurn(bot Bot, dc Daemon, tr *Tracker, chatID int64, text string) {
-	turnID, err := dc.SendAssistantMessage(strconv.FormatInt(chatID, 10), text)
+// refusalMessage says what was refused and what undoes it.
+//
+// The núcleo names the refusal and this says the sentence, which is the only split that works:
+// `/retomar` and `/kill off` are Telegram commands and the núcleo must not know they exist, while
+// the reason a topic went quiet is a fact only the núcleo has. Each of the four is undone
+// differently and one of them is undone by doing nothing at all — told the wrong one, a person
+// waits forever on a paused topic or cancels a turn that was about to answer.
+//
+// A refusal the sidecar does not recognise keeps the old wording. That covers a núcleo newer than
+// this binary as well as a cut cable, and both are better served by "something failed, here it is"
+// than by a remedy invented to fill the gap.
+func refusalMessage(err error) string {
+	var refused *daemon.StatusError
+	if errors.As(err, &refused) {
+		switch refused.Refusal {
+		case "errand_not_answering":
+			return "Este assunto está em pausa ou fechado, por isso não respondo aqui. /retomar acorda-o."
+		case "kill_switch":
+			return "O travão de emergência está engatado, e um assunto respeita-o. /kill off solta-o."
+		case "no_local_model":
+			return "Este assunto está no modelo local e não há nenhum configurado. /cerebro cloud passa-o para o outro."
+		case "turn_in_progress":
+			return "Ainda estou a responder à mensagem anterior. Ou esperas, ou /cancel."
+		}
+	}
+	return "couldn't start turn: " + err.Error()
+}
+
+func startTurn(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, text string) {
+	turnID, err := dc.SendAssistantMessage(ChatKey(to), text)
 	if err != nil {
-		logSend("turn start failure", bot.SendMessage(chatID, "couldn't start turn: "+err.Error()))
+		logSend("turn start failure", bot.SendMessage(to, refusalMessage(err)))
 		return
 	}
-	tr.Set(chatID, turnID)
-	logSend("turn acknowledgement", bot.SendMessage(chatID, fmt.Sprintf("working… (turn %d)", turnID)))
+	tr.Set(ChatKey(to), turnID)
+	logSend("turn acknowledgement", bot.SendMessage(to, fmt.Sprintf("working… (turn %d)", turnID)))
 	GoGuarded("turn watcher", func() {
 		reply := pollTurnAndReply(dc, turnID, pollInterval, maxPollAttempts)
-		sendReply(bot, chatID, reply)
+		sendReply(bot, to, reply)
 	})
 }
 
 // sendReply renders the orchestrator's Markdown reply to Telegram HTML, splits it under the 4096
 // cap, and sends each chunk with parse_mode=HTML; if a chunk is rejected (invalid entities), it
 // falls back to plain text so the user always receives the content.
-func sendReply(bot Bot, chatID int64, reply string) {
+func sendReply(bot Bot, to telegram.Destination, reply string) {
 	for _, chunk := range format.Chunk(format.ToHTML(reply), 4096) {
-		err := bot.SendHTML(chatID, chunk)
+		err := bot.SendHTML(to, chunk)
 		if err == nil {
 			continue
 		}
@@ -408,7 +531,7 @@ func sendReply(bot Bot, chatID int64, reply string) {
 			continue
 		}
 		logSend("reply chunk (retrying as plain text)", err)
-		logSend("reply chunk fallback", bot.SendMessage(chatID, format.StripTags(chunk)))
+		logSend("reply chunk fallback", bot.SendMessage(to, format.StripTags(chunk)))
 	}
 }
 
@@ -493,8 +616,19 @@ func formatProposal(p map[string]any) string {
 	if reasoning, ok := p["reasoning"].(string); ok && reasoning != "" {
 		result += "\nwhy: " + reasoning
 	}
-	if project, ok := p["project_id"]; ok {
-		result += "\nproject: " + fmt.Sprint(project)
+	// Type assertion and not key presence. The field is always THERE — serde writes
+	// `"project_id": null` for anything that has none — so testing presence printed
+	// "project: <nil>" under every errand proposal and every machine-wide one. It looks like a
+	// cosmetic slip and it is not: this is the line somebody reads to decide what they are
+	// approving, and a rendered null is noise in exactly the place that has to be legible.
+	if project, ok := p["project_id"].(string); ok && project != "" {
+		result += "\nproject: " + project
+	}
+	// An errand has no project, so this is the only thing in the row that says whose work it was.
+	// The name and not the id: a step that needs a lookup before it can be answered is a step that
+	// gets answered without one.
+	if errand, ok := p["errand_name"].(string); ok && errand != "" {
+		result += "\nassunto: " + errand
 	}
 	return result
 }
@@ -540,28 +674,46 @@ func approveRejectRow(id int64) [][]telegram.Button {
 	}}
 }
 
-func sendProposals(bot Bot, dc Daemon, chatID int64) {
+func sendProposals(bot Bot, dc Daemon, to telegram.Destination) {
 	props, err := dc.GetProposals()
 	if err != nil {
-		logSend("proposals error", bot.SendMessage(chatID, "couldn't fetch proposals: "+err.Error()))
+		logSend("proposals error", bot.SendMessage(to, "couldn't fetch proposals: "+err.Error()))
 		return
 	}
-	if len(props) == 0 {
-		logSend("no proposals", bot.SendMessage(chatID, "no pending proposals"))
+	// Read before the early return below, so a machine with nothing to approve and something
+	// refused does not answer "no pending proposals" and hide the second list entirely.
+	//
+	// A failure here is reported and does not take the approvable ones down with it: the two lists
+	// are separate routes and the one that answered is still worth showing.
+	refused, refusedErr := dc.GetRefusedActions()
+	if refusedErr != nil {
+		logSend("refused actions error", bot.SendMessage(to,
+			"couldn't fetch what the barrier refused: "+refusedErr.Error()))
+	}
+
+	if len(props) == 0 && len(refused) == 0 {
+		logSend("no proposals", bot.SendMessage(to, "no pending proposals"))
 		return
 	}
 	for _, p := range props {
-		logSend("proposal", bot.SendMessageWithButtons(chatID, formatProposal(p), approveRejectRow(idOf(p))))
+		logSend("proposal", bot.SendMessageWithButtons(to, formatProposal(p), approveRejectRow(idOf(p))))
+	}
+	// No buttons. Neither /approve nor /reject works on one of these — both answer 409 for anything
+	// that is not an action-approval — and there is nothing held to release: the turn was denied and
+	// carried on. What this is for is that somebody finds out, does the thing themselves, or asks
+	// the errand again in a turn that starts clean and may act.
+	for _, r := range refused {
+		logSend("refused action", bot.SendMessage(to, "recusado pela barreira — "+formatProposal(r)))
 	}
 }
 
 // sendTriage spends a run, deliberately and only here: `/mail` is the whole point of the pillar
 // being on demand. It answers with what it STARTED, not with verdicts — a run takes minutes, and
 // the verdicts arrive by themselves through the feed notifier.
-func sendTriage(bot Bot, dc Daemon, chatID int64) {
+func sendTriage(bot Bot, dc Daemon, to telegram.Destination) {
 	outcome, err := dc.TriageEmail()
 	if err != nil {
-		logSend("triage error", bot.SendMessage(chatID, "couldn't triage the mailbox: "+err.Error()))
+		logSend("triage error", bot.SendMessage(to, "couldn't triage the mailbox: "+err.Error()))
 		return
 	}
 	queued := 0
@@ -573,23 +725,23 @@ func sendTriage(bot Bot, dc Daemon, chatID int64) {
 		if r, ok := outcome["reason"].(string); ok && r != "" {
 			reason = r
 		}
-		logSend("triage not started", bot.SendMessage(chatID, "no triage started: "+reason))
+		logSend("triage not started", bot.SendMessage(to, "no triage started: "+reason))
 		return
 	}
-	logSend("triage started", bot.SendMessage(chatID, fmt.Sprintf(
+	logSend("triage started", bot.SendMessage(to, fmt.Sprintf(
 		"reading %d message(s) — the verdicts arrive here in a few minutes", queued)))
 }
 
 // sendInbox costs nothing: it reports what is already known, which is what makes it safe to ask
 // for at any time.
-func sendInbox(bot Bot, dc Daemon, chatID int64) {
+func sendInbox(bot Bot, dc Daemon, to telegram.Destination) {
 	queue, err := dc.GetEmailQueue()
 	if err != nil {
-		logSend("mailbox error", bot.SendMessage(chatID, "couldn't read the mailbox: "+err.Error()))
+		logSend("mailbox error", bot.SendMessage(to, "couldn't read the mailbox: "+err.Error()))
 		return
 	}
 	if len(queue) == 0 {
-		logSend("empty mailbox", bot.SendMessage(chatID, "nothing in the mailbox yet"))
+		logSend("empty mailbox", bot.SendMessage(to, "nothing in the mailbox yet"))
 		return
 	}
 
@@ -620,13 +772,13 @@ func sendInbox(bot Bot, dc Daemon, chatID int64) {
 		out = append(out, "", "already read:")
 		out = append(out, judged...)
 	}
-	logSend("inbox", bot.SendMessage(chatID, strings.Join(out, "\n")))
+	logSend("inbox", bot.SendMessage(to, strings.Join(out, "\n")))
 }
 
-func sendProjects(bot Bot, dc Daemon, chatID int64, filter string) {
+func sendProjects(bot Bot, dc Daemon, to telegram.Destination, filter string) {
 	projects, err := dc.GetProjects()
 	if err != nil {
-		logSend("projects error", bot.SendMessage(chatID, "couldn't fetch projects: "+err.Error()))
+		logSend("projects error", bot.SendMessage(to, "couldn't fetch projects: "+err.Error()))
 		return
 	}
 	var records []string
@@ -648,20 +800,20 @@ func sendProjects(bot Bot, dc Daemon, chatID int64, filter string) {
 	}
 	if len(records) == 0 {
 		if filter != "" {
-			logSend("no matching projects", bot.SendMessage(chatID, fmt.Sprintf("Nenhum projeto corresponde a %q.", filter)))
+			logSend("no matching projects", bot.SendMessage(to, fmt.Sprintf("Nenhum projeto corresponde a %q.", filter)))
 		} else {
-			logSend("no projects", bot.SendMessage(chatID, "Sem projetos registados no NucleOS."))
+			logSend("no projects", bot.SendMessage(to, "Sem projetos registados no NucleOS."))
 		}
 		return
 	}
-	sendReply(bot, chatID, "Projetos registados:\n\n"+strings.Join(records, "\n\n"))
+	sendReply(bot, to, "Projetos registados:\n\n"+strings.Join(records, "\n\n"))
 }
 
 func HandleCallback(bot Bot, dc Daemon, cb telegram.CallbackQuery) {
 	action, id, ok := parseCallback(cb.Data)
-	chatID := int64(0)
+	to := telegram.Destination{}
 	if cb.Message != nil {
-		chatID = cb.Message.Chat.ID
+		to = cb.Message.Destination()
 	}
 	if !ok {
 		logSend("unknown callback action", bot.AnswerCallbackQuery(cb.ID, "unknown action"))
@@ -672,23 +824,23 @@ func HandleCallback(bot Bot, dc Daemon, cb telegram.CallbackQuery) {
 	case "approve":
 		if _, err := dc.ApproveProposal(id); err != nil {
 			logSend("approve failure answer", bot.AnswerCallbackQuery(cb.ID, "approve failed"))
-			logSend("approve failure", bot.SendMessage(chatID, fmt.Sprintf("approve of proposal %d failed: %s", id, err)))
+			logSend("approve failure", bot.SendMessage(to, fmt.Sprintf("approve of proposal %d failed: %s", id, err)))
 			return
 		}
 		logSend("approve answer", bot.AnswerCallbackQuery(cb.ID, "approved"))
-		logSend("approve confirmation", bot.SendMessage(chatID, fmt.Sprintf("proposal %d approved", id)))
+		logSend("approve confirmation", bot.SendMessage(to, fmt.Sprintf("proposal %d approved", id)))
 	case "reject":
 		if err := dc.RejectProposal(id); err != nil {
 			logSend("reject failure answer", bot.AnswerCallbackQuery(cb.ID, "reject failed"))
-			logSend("reject failure", bot.SendMessage(chatID, fmt.Sprintf("reject of proposal %d failed: %s", id, err)))
+			logSend("reject failure", bot.SendMessage(to, fmt.Sprintf("reject of proposal %d failed: %s", id, err)))
 			return
 		}
 		logSend("reject answer", bot.AnswerCallbackQuery(cb.ID, "rejected"))
-		logSend("reject confirmation", bot.SendMessage(chatID, fmt.Sprintf("proposal %d rejected", id)))
+		logSend("reject confirmation", bot.SendMessage(to, fmt.Sprintf("proposal %d rejected", id)))
 	}
 }
 
-func RunNotifier(ctx context.Context, bot Bot, dc Daemon, chatID int64, interval time.Duration) {
+func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destination, interval time.Duration) {
 	state := notifier.NewState()
 
 	// Seeding has to succeed before anything is announced, and at boot the daemon is usually not up
@@ -704,7 +856,7 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, chatID int64, interval
 	for sleepUntil(ctx, interval) {
 		if props, err := dc.GetProposals(); err == nil {
 			for _, p := range state.NewProposals(props) {
-				err := bot.SendMessageWithButtons(chatID, "🆕 "+formatProposal(p), approveRejectRow(idOf(p)))
+				err := bot.SendMessageWithButtons(to, "🆕 "+formatProposal(p), approveRejectRow(idOf(p)))
 				logSend("new proposal", err)
 				if err != nil {
 					// Marked as announced before anyone was announced to: without this the prompt
@@ -716,8 +868,20 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, chatID int64, interval
 			}
 		}
 		if feed, err := dc.GetFeed(); err == nil {
+			// Read once per round, not once per line: an errand's topic does not change between
+			// two lines of a single poll.
+			topics := errandTopics(dc)
 			for _, f := range state.NewFeedItems(feed) {
-				err := bot.SendMessage(chatID, "📣 "+formatFeed(f))
+				where, ok := feedDestination(f, topics, to)
+				if !ok {
+					// An errand line with nowhere to go. Left marked as seen rather than forgotten:
+					// the reasons it has nowhere to go — the errand was closed, or its topic is not
+					// a topic — do not clear by looking again, so retrying would only repeat the log
+					// line for ever. What is NOT allowed is the other resolution, which is to send
+					// it to `to` and put an errand's notes in the group's General.
+					continue
+				}
+				err := bot.SendMessage(where, "📣 "+formatFeed(f))
 				logSend("feed item", err)
 				if err != nil {
 					state.Forget(idOf(f))
@@ -729,16 +893,74 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, chatID int64, interval
 			if kill {
 				word = "ENGAGED"
 			}
-			err := bot.SendMessage(chatID, "kill switch "+word)
+			err := bot.SendMessage(to, "kill switch "+word)
 			logSend("kill switch alert", err)
 			if err != nil {
 				state.ForgetKill(kill)
 			}
 		}
 		if budget, err := dc.GetBudget(); err == nil && state.BudgetChanged(budget) {
-			logSend("budget alert", bot.SendMessage(chatID, formatBudget(budget)))
+			logSend("budget alert", bot.SendMessage(to, formatBudget(budget)))
 		}
 	}
+}
+
+// errandTopics is where each errand still answering can be reached.
+//
+// Only the active ones, and only those whose key reads as a topic. Both exclusions are the same
+// decision as an omission: an errand that is paused or closed has nothing to say in its topic — the
+// núcleo already stopped its schedule for the same reason — and a key that will not parse has
+// nowhere to say it. Absent from this map means the line is dropped, which is the whole point of
+// building the map from what is reachable rather than checking each line against a list.
+//
+// An error reading the errands returns an empty map, and so drops that round's errand lines. The
+// alternative would be to fall back to the configured chat while the daemon is briefly unreachable,
+// which is exactly the disclosure this routing exists to prevent.
+func errandTopics(dc Daemon) map[int64]telegram.Destination {
+	topics := map[int64]telegram.Destination{}
+	errands, err := dc.ListErrands()
+	if err != nil {
+		log.Printf("notifier: could not read the errands; their lines wait for the next look: %v", err)
+		return topics
+	}
+	for _, errand := range errands {
+		if errand.Status != "active" {
+			continue
+		}
+		where, ok := DestinationFromKey(errand.ChatKey)
+		if !ok {
+			log.Printf("notifier: errand %d (%q) has a topic that cannot be read (%q); it stays quiet",
+				errand.ID, errand.Name, errand.ChatKey)
+			continue
+		}
+		topics[errand.ID] = where
+	}
+	return topics
+}
+
+// feedDestination is where one feed line belongs: its errand's topic, or the configured chat.
+//
+// `errand_id` is read by TYPE and not by presence, which is not pedantry — serde writes the field on
+// every row whether or not it holds anything, so a presence check would call every machine-wide line
+// an errand's and route the kill switch into a topic. That exact mistake was live in
+// `formatProposal` until this branch, where it printed `project: <nil>` on every proposal without a
+// project.
+//
+// The `false` means "nowhere", never "the usual place". A caller that treated it as a fallback would
+// undo the routing in the one case it exists for.
+func feedDestination(
+	item map[string]any,
+	topics map[int64]telegram.Destination,
+	configured telegram.Destination,
+) (telegram.Destination, bool) {
+	raw, ok := item["errand_id"].(float64)
+	if !ok {
+		// The machine's own line: the kill switch, the budget, a run that finished. It goes where
+		// somebody is watching for it.
+		return configured, true
+	}
+	where, ok := topics[int64(raw)]
+	return where, ok
 }
 
 // seedNotifier records what already exists so it is never announced. It is all-or-nothing: a
@@ -771,4 +993,125 @@ func sleepUntil(ctx context.Context, interval time.Duration) bool {
 
 func formatFeed(f map[string]any) string {
 	return strOr(f, "kind", "event") + ": " + strOr(f, "summary", "")
+}
+
+// openErrand turns the topic this was typed in into a place to work.
+//
+// A topic and nothing else. An errand answers every message in the conversation it owns, so one
+// opened on a whole chat would take over that chat — including every message that has nothing to do
+// with it. In a forum that is a choice a person makes by opening a topic; in a one-to-one chat there
+// is no way to unmake it, so it is refused.
+func openErrand(bot Bot, dc Daemon, to telegram.Destination, name string) {
+	if to.ThreadID == 0 {
+		logSend("errand needs a topic", bot.SendMessage(to,
+			"Um assunto vive num tópico. Abre um tópico neste grupo e escreve lá /assunto <nome>."))
+		return
+	}
+	if name = strings.TrimSpace(name); name == "" {
+		logSend("errand needs a name", bot.SendMessage(to, "Falta o nome: /assunto <nome>."))
+		return
+	}
+
+	id, err := dc.CreateErrand(name, ChatKey(to))
+	if err != nil {
+		// One topic holds one errand — the daemon says so with a 409, which is the answer worth
+		// translating. The status code itself means nothing to whoever typed the command.
+		if strings.Contains(err.Error(), "409") {
+			logSend("errand already open", bot.SendMessage(to,
+				"Este tópico já tem um assunto. /assuntos mostra quais é que há."))
+			return
+		}
+		logSend("errand open failed", bot.SendMessage(to, "Não consegui abrir o assunto: "+err.Error()))
+		return
+	}
+
+	logSend("errand opened", bot.SendMessage(to, fmt.Sprintf(
+		"Assunto %q aberto neste tópico (nº %d). Tudo o que escreveres aqui é este assunto; "+
+			"/pausa para o calar, /fim para o fechar.", name, id)))
+}
+
+func listErrands(bot Bot, dc Daemon, to telegram.Destination) {
+	errands, err := dc.ListErrands()
+	if err != nil {
+		logSend("errand list failed", bot.SendMessage(to, "Não consegui ler os assuntos: "+err.Error()))
+		return
+	}
+	if len(errands) == 0 {
+		logSend("no errands", bot.SendMessage(to, "Ainda não há assuntos. /assunto <nome> abre um."))
+		return
+	}
+
+	lines := make([]string, 0, len(errands))
+	for _, errand := range errands {
+		// The topic is on the line for the same reason the daemon carries it: a name with no topic
+		// does not tell you where to go and type the next thing.
+		lines = append(lines, fmt.Sprintf("• %s — %s, %s (tópico %s)",
+			errand.Name, errand.Status, errand.Brain, errand.ChatKey))
+	}
+	logSend("errands", bot.SendMessage(to, strings.Join(lines, "\n")))
+}
+
+// errandHere is the errand of the topic a command was typed in.
+//
+// Says so out loud when there is none, rather than returning quietly. Every command below changes
+// something, and a command that changed nothing and said nothing reads exactly like one that worked.
+func errandHere(bot Bot, dc Daemon, to telegram.Destination) (daemon.Errand, bool) {
+	errand, found, err := dc.ErrandOfChat(ChatKey(to))
+	if err != nil {
+		logSend("errand lookup failed", bot.SendMessage(to, "Não consegui ver os assuntos: "+err.Error()))
+		return daemon.Errand{}, false
+	}
+	if !found {
+		logSend("no errand here", bot.SendMessage(to,
+			"Este tópico não tem assunto. /assunto <nome> abre um."))
+		return daemon.Errand{}, false
+	}
+	return errand, true
+}
+
+func setErrandStatus(bot Bot, dc Daemon, to telegram.Destination, status, said string) {
+	errand, ok := errandHere(bot, dc, to)
+	if !ok {
+		return
+	}
+	if err := dc.SetErrandStatus(errand.ID, status); err != nil {
+		logSend("errand status failed", bot.SendMessage(to, "Não consegui mudar o assunto: "+err.Error()))
+		return
+	}
+	logSend("errand status", bot.SendMessage(to, fmt.Sprintf("Assunto %q %s.", errand.Name, said)))
+}
+
+func closeErrand(bot Bot, dc Daemon, to telegram.Destination) {
+	errand, ok := errandHere(bot, dc, to)
+	if !ok {
+		return
+	}
+	if err := dc.CloseErrand(errand.ID); err != nil {
+		logSend("errand close failed", bot.SendMessage(to, "Não consegui fechar o assunto: "+err.Error()))
+		return
+	}
+	// Said plainly, because closing is not deleting and the difference matters: the folder and the
+	// notebook stay, and somebody who believes otherwise will go looking for what they wrote.
+	logSend("errand closed", bot.SendMessage(to, fmt.Sprintf(
+		"Assunto %q fechado. A pasta e o caderno ficam.", errand.Name)))
+}
+
+func setErrandBrain(bot Bot, dc Daemon, to telegram.Destination, brain string) {
+	// Empty means the router did not recognise the word. It refuses here rather than passing it on,
+	// because the daemon resolves an unknown brain to a default — so a typo sent through would move
+	// the errand and report success.
+	if brain == "" {
+		logSend("unknown brain", bot.SendMessage(to, "Só há dois: /cerebro local ou /cerebro cloud."))
+		return
+	}
+	errand, ok := errandHere(bot, dc, to)
+	if !ok {
+		return
+	}
+	if err := dc.SetErrandBrain(errand.ID, brain); err != nil {
+		logSend("errand brain failed", bot.SendMessage(to, "Não consegui mudar o modelo: "+err.Error()))
+		return
+	}
+	logSend("errand brain", bot.SendMessage(to, fmt.Sprintf(
+		"Assunto %q passa a ser respondido por: %s.", errand.Name, brain)))
 }

@@ -39,6 +39,13 @@ type Update struct {
 type Message struct {
 	MessageID int64 `json:"message_id"`
 	Chat      Chat  `json:"chat"`
+	// MessageThreadID is set for forum topics AND for plain reply chains in a supergroup, which is
+	// why it is never read on its own — see IsTopicMessage.
+	MessageThreadID int64 `json:"message_thread_id"`
+	// IsTopicMessage is Telegram saying this really is a forum topic. Reading MessageThreadID
+	// without it would give every reply chain in an ordinary group a key of its own, and on the day
+	// that ships every one of those conversations loses its session.
+	IsTopicMessage bool `json:"is_topic_message"`
 	// From is who typed it, which is not the same question as which chat it arrived in: a group
 	// chat id authorises a room, and a room's membership changes without anyone reconfiguring
 	// this sidecar.
@@ -85,6 +92,45 @@ type File struct {
 
 type Chat struct {
 	ID int64 `json:"id"`
+}
+
+// Destination is where a message goes: the chat, and the forum topic inside it when there is one.
+//
+// A struct rather than a second int64 parameter on every send. Two adjacent int64s is the signature
+// you transpose without the compiler noticing, and the symptom of transposing these two is a reply
+// delivered to a topic id used as a chat id — a 400 from Telegram at best, and at worst a message in
+// somewhere else entirely. It also keeps the ~forty call sites in `pipe` compiling unchanged: they
+// pass one value that already knows both halves.
+//
+// A zero ThreadID means "no topic" and is omitted from the request rather than sent as 0, which
+// Telegram reads as a topic that does not exist.
+type Destination struct {
+	ChatID   int64
+	ThreadID int64
+}
+
+// Destination is where a reply to this message belongs.
+//
+// The topic is taken only when Telegram says it IS a topic. Everything else — a one-to-one chat, a
+// group's General, a reply chain in a non-forum supergroup — comes back as the bare chat, which is
+// the key this sidecar has always used.
+func (m *Message) Destination() Destination {
+	if m == nil {
+		return Destination{}
+	}
+	if !m.IsTopicMessage {
+		return Destination{ChatID: m.Chat.ID}
+	}
+	return Destination{ChatID: m.Chat.ID, ThreadID: m.MessageThreadID}
+}
+
+// body starts the JSON for a send, with the topic present only when there is one.
+func (d Destination) body() map[string]any {
+	request := map[string]any{"chat_id": d.ChatID}
+	if d.ThreadID != 0 {
+		request["message_thread_id"] = d.ThreadID
+	}
+	return request
 }
 
 type CallbackQuery struct {
@@ -337,25 +383,23 @@ func (c *Client) DownloadFile(filePath string) ([]byte, error) {
 	return data, nil
 }
 
-func (c *Client) SendMessage(chatID int64, text string) error {
-	_, err := c.call("sendMessage", map[string]any{
-		"chat_id": chatID,
-		"text":    text,
-	})
+func (c *Client) SendMessage(to Destination, text string) error {
+	request := to.body()
+	request["text"] = text
+	_, err := c.call("sendMessage", request)
 	return err
 }
 
 // SendHTML sends a message with parse_mode=HTML (Telegram renders <b>/<i>/<code>/<pre>/<a>).
-func (c *Client) SendHTML(chatID int64, html string) error {
-	_, err := c.call("sendMessage", map[string]any{
-		"chat_id":    chatID,
-		"text":       html,
-		"parse_mode": "HTML",
-	})
+func (c *Client) SendHTML(to Destination, html string) error {
+	request := to.body()
+	request["text"] = html
+	request["parse_mode"] = "HTML"
+	_, err := c.call("sendMessage", request)
 	return err
 }
 
-func (c *Client) SendMessageWithButtons(chatID int64, text string, rows [][]Button) error {
+func (c *Client) SendMessageWithButtons(to Destination, text string, rows [][]Button) error {
 	inlineKeyboard := make([][]map[string]string, len(rows))
 	for rowIndex, row := range rows {
 		inlineKeyboard[rowIndex] = make([]map[string]string, len(row))
@@ -367,13 +411,10 @@ func (c *Client) SendMessageWithButtons(chatID int64, text string, rows [][]Butt
 		}
 	}
 
-	_, err := c.call("sendMessage", map[string]any{
-		"chat_id": chatID,
-		"text":    text,
-		"reply_markup": map[string]any{
-			"inline_keyboard": inlineKeyboard,
-		},
-	})
+	request := to.body()
+	request["text"] = text
+	request["reply_markup"] = map[string]any{"inline_keyboard": inlineKeyboard}
+	_, err := c.call("sendMessage", request)
 	return err
 }
 

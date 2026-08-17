@@ -9,6 +9,19 @@ pub struct Proposal {
     pub run_id: Option<i64>,
     pub session_id: Option<String>,
     pub project_id: Option<String>,
+    /// The errand this came from, when it came from one — which is almost never.
+    ///
+    /// Not derivable from `project_id`: an errand HAS no project, so an errand's proposal and a
+    /// machine-wide one both carry `project_id IS NULL` and nothing else in the row tells them
+    /// apart.
+    pub errand_id: Option<i64>,
+    /// The errand's name, joined in by the queries whose readers need it and `NULL` in the rest.
+    ///
+    /// Carried on the same struct rather than in a second type, because the alternative was a
+    /// near-copy of eleven fields that would drift the first time one of them changed. The `NULL AS
+    /// errand_name` in the other queries is what keeps that honest: a reader that gets `None` is
+    /// being told this query did not ask, and the id is still there to ask with.
+    pub errand_name: Option<String>,
     pub tool_name: Option<String>,
     pub reasoning: String,
     pub tool_input: Option<String>,
@@ -67,6 +80,86 @@ pub async fn create_action_approval(
 
     transaction.commit().await?;
     Ok(proposal_id)
+}
+
+/// An action the injection barrier refused, kept where a person can read it.
+///
+/// The fifth `kind`, and it exists because of what `approve` means. §6 closes acting tools once a
+/// turn has read a stranger's words — which, for an errand, is every turn that did any research.
+/// Until this row existed the refusal was the end of the line: the model was stopped and the owner
+/// never learned what it had wanted to do, so an errand could spend an afternoon finding the right
+/// car and have no way to say so.
+///
+/// **Not `action-approval`, and the reason is mechanical rather than aesthetic.** Approving one of
+/// those calls `runs::resume_approved_run`, which looks up a live worktree for the paused run and
+/// answers `NotResumable` without one. An errand turn has no worktree and was never paused — it was
+/// denied and carried on. Filed as an action approval, this would appear under a button that cannot
+/// work, which is worse than appearing under none.
+///
+/// So nothing resumes here either, exactly as for [`create_skipped_item`]. What the record buys is
+/// that somebody finds out: they do the thing themselves, or they ask the errand again, and the new
+/// turn starts clean and may act. The door is a person, not a button.
+pub async fn create_refused_action(
+    pool: &SqlitePool,
+    run_id: i64,
+    session_id: Option<&str>,
+    errand_id: Option<i64>,
+    tool_name: &str,
+    reasoning: &str,
+    tool_input: Option<&str>,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, errand_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('refused-action', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(run_id)
+    .bind(session_id)
+    .bind(errand_id)
+    .bind(tool_name)
+    .bind(reasoning)
+    .bind(tool_input)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
+/// What the barrier refused and nobody has read yet.
+///
+/// Its own door rather than a `kind` filter on `list_pending`, for the reason `list_skipped_items`
+/// gives: that list feeds a screen with approve and reject buttons, and both of those answer 409
+/// for anything that is not an `action-approval`.
+pub async fn list_refused_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        // The one query that joins. A person reading this list is deciding whether to do the thing
+        // themselves, and "send_email" without the errand is not a decidable question — it is the
+        // verb with the subject missing. LEFT, so a refused action with no errand (an ordinary chat
+        // that read its mail and then reached for a control) still appears, unnamed.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
+                e.name AS errand_name, p.tool_name, p.reasoning,
+                p.tool_input, p.created_at, p.decided_at
+         FROM proposals p
+         LEFT JOIN errands e ON e.id = p.errand_id
+         WHERE p.status = 'pending' AND p.kind = 'refused-action'
+         ORDER BY p.id ASC",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// A job put an item down because it asked for a decision, and this is the record of it.
@@ -317,7 +410,8 @@ pub async fn calendar_proposal_pending_for(pool: &SqlitePool, email_id: i64) -> 
 
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals WHERE id = ?",
     )
@@ -328,7 +422,8 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
 
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'action-approval'
@@ -352,7 +447,8 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
 /// queue is worked front to back, and this is read the morning after.
 pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
                 tool_input, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'skipped-item'
@@ -361,6 +457,16 @@ pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>
     .fetch_all(pool)
     .await
 }
+
+/// The kinds that are read and put away rather than decided.
+///
+/// Both name work that never happened and cannot be made to happen from here: a job item skipped
+/// hours ago in a tree that has moved on, and an action the barrier refused in a turn that has
+/// ended. Neither has anything to resume, which is what separates them from `action-approval`.
+///
+/// An allow-list and not "anything that is not an action-approval", so a sixth kind arriving later
+/// has to say out loud that dismissing it is the right verb.
+const DISMISSABLE_KINDS: [&str; 2] = ["skipped-item", "refused-action"];
 
 /// Puts a skipped item away once it has been read.
 ///
@@ -377,7 +483,7 @@ pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>
 /// tell apart — gone, already decided, and the database said no — are the same three.
 pub async fn dismiss_skipped_item(pool: &SqlitePool, id: i64) -> Result<(), RejectError> {
     let proposal = get(pool, id).await?.ok_or(RejectError::NotFound)?;
-    if proposal.kind != "skipped-item" || proposal.status != "pending" {
+    if !DISMISSABLE_KINDS.contains(&proposal.kind.as_str()) || proposal.status != "pending" {
         return Err(RejectError::NotPending);
     }
     // Compare-and-set, so a second dismissal racing this one is reported rather than answered 204.
