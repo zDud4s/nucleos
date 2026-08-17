@@ -280,12 +280,22 @@ async fn start_job(
             max_items: graph.max_items() as i64,
             gate_each: graph.gate_after_each_item,
             review: graph.review,
+            // The accessor and never the field, for the same reason `max_items` reads one: the raw
+            // number is what the gitignored file asked for, and a retry is a whole run.
+            gate_retries: graph.gate_retries() as i64,
             head_sha,
             // A scheduled job asks for neither, which keeps it at one round under the house limit —
             // exactly what a `graph:` rule did before rounds existed. Rounds are opt-in per request,
             // not something a rule already in somebody's `.ai/autopilot.yaml` acquires overnight.
             max_rounds: None,
-            budget_usd: None,
+            // The file's number, and here that is safe where `max_rounds` above is not. Both would
+            // come from the same gitignored, unreviewed, per-developer `.ai/autopilot.yaml`; the
+            // difference is direction. A budget runs UNDER the house limit rather than instead of
+            // it, so the only thing this key can do is tighten what the job may spend — there is no
+            // value it could hold that buys the job more than the daemon already allows. Rounds
+            // loosen: a number there raises how much the daemon will do, which is exactly the kind
+            // of decision an unreviewed file does not get to make.
+            budget_usd: graph.budget_usd,
         },
     )
     .await
@@ -1285,6 +1295,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -1362,6 +1373,17 @@ mod tests {
             "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n",
         )
         .expect("write autopilot schedule with a graph block");
+    }
+
+    /// The same graph rule again, this time naming a ceiling of its own. The number is deliberately
+    /// nothing any default or house limit would produce, so a row carrying it can only have got it
+    /// from this file.
+    fn write_budgeted_graph_schedule(project_root: &FsPath) {
+        std::fs::write(
+            project_root.join(".ai").join("autopilot.yaml"),
+            "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n      budget_usd: 2.5\n",
+        )
+        .expect("write autopilot schedule with a budgeted graph block");
     }
 
     async fn job_count(state: &AppState) -> i64 {
@@ -1454,6 +1476,7 @@ mod tests {
                 max_items: 3,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
@@ -1540,6 +1563,72 @@ mod tests {
         .unwrap();
         assert!(worktree_path.ends_with(&format!("job-{job_id}")));
 
+        let _ = crate::worktree::remove(&repo, &PathBuf::from(worktree_path), &[]).await;
+    }
+
+    /// The autonomous path is the one that needed this. A job started from `POST /jobs` has had a
+    /// `budget_usd` since the column existed, but a job fired by a SCHEDULE could not be given one —
+    /// `start_job` hard-coded `None` — and the overnight run with nobody watching is exactly the
+    /// case where a job that goes wrong spends the whole house allowance before anyone sees it.
+    ///
+    /// Asserted on the stored ROW and not on the request struct, because the row is what
+    /// `job::brakes` reads on every node: a number that reached `StartRequest` and stopped there
+    /// would brake nothing, and a test that watched the struct would call that a pass.
+    ///
+    /// Re-executed in a child process like its two neighbours: `NUCLEOS_WORKTREE_ROOT` is
+    /// process-wide, and a real `git worktree add` runs here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_scheduled_job_carries_the_budget_its_rule_asked_for() {
+        if std::env::var_os(ACTIVE_TEST_CHILD_ENV).is_none() {
+            let _lock = env_lock();
+            let repo_container = space_free_tempdir("nucleos-scheduler-budget-");
+            let repo = repo_container.path().join("repo");
+            initialize_repo(&repo);
+            let worktree_root = space_free_tempdir("nucleos-wt-test-budget-");
+            let status = Command::new(std::env::current_exe().expect("resolve test executable"))
+                .args([
+                    "--exact",
+                    "scheduler::tests::a_scheduled_job_carries_the_budget_its_rule_asked_for",
+                    "--nocapture",
+                ])
+                .env(ACTIVE_TEST_CHILD_ENV, "1")
+                .env(ACTIVE_TEST_REPO_ENV, &repo)
+                .env(WORKTREE_ROOT_ENV, worktree_root.path())
+                .status()
+                .expect("start isolated scheduler test process");
+            assert!(status.success(), "isolated scheduler test process failed");
+            return;
+        }
+
+        let repo = PathBuf::from(
+            std::env::var_os(ACTIVE_TEST_REPO_ENV).expect("active test repository is set"),
+        );
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, &repo, "active", &old).await;
+        write_budgeted_graph_schedule(&repo);
+
+        scheduler_tick(&state, now).await;
+
+        let (job_id, budget_usd): (i64, Option<f64>) =
+            sqlx::query_as("SELECT id, budget_usd FROM jobs")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            budget_usd,
+            Some(2.5),
+            "the ceiling the rule asked for must be on the row the brakes read"
+        );
+
+        let worktree_path: String = sqlx::query_scalar(
+            "SELECT path FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
         let _ = crate::worktree::remove(&repo, &PathBuf::from(worktree_path), &[]).await;
     }
 

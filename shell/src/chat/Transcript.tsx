@@ -24,6 +24,28 @@ function modelChange(previous: Turn | undefined, turn: Turn): string | null {
     : "Switched to the local model — it re-reads the recent turns of this conversation.";
 }
 
+/**
+ * Whether the conversation started over here — a new context, with nothing above it in memory.
+ *
+ * The daemon refuses to resume a session once it has passed its context ceiling, or once anything in
+ * it read third-party text, and the next turn then runs in a fresh one. That is a deliberate policy
+ * and not a fault; what was wrong was that it happened in silence, so the transcript above and below
+ * the line read as one unbroken conversation while the model had forgotten all of it.
+ *
+ * It bites hardest on the conversations picked up from the IDE. Those arrive carrying a context
+ * somebody else's session already filled — often past the ceiling on the very first turn — so
+ * continuing one can mean exactly one continued turn, and then this.
+ *
+ * A restart is only claimed when BOTH turns name a session. A null is not a new session, it is no
+ * evidence, and drawing the line there would announce a restart on every turn from before the daemon
+ * recorded one.
+ */
+function contextRestart(previous: Turn | undefined, turn: Turn): boolean {
+  if (previous === undefined) return false;
+  if (previous.sessionId === null || turn.sessionId === null) return false;
+  return previous.sessionId !== turn.sessionId;
+}
+
 interface TranscriptProps {
   turns: Turn[];
   /**
@@ -62,10 +84,20 @@ function Transcript({ turns, loaded }: TranscriptProps) {
   return (
     <div className="chat">
       {turns.map((turn, index) => {
-        const changed = modelChange(turns[index - 1], turn);
+        const previous = turns[index - 1];
+        const changed = modelChange(previous, turn);
+        // Only one line is drawn. A model change already says "no memory of what is above", which is
+        // the same sentence this one would add — and two rules stacked read as two separate events.
+        const restarted = changed === null && contextRestart(previous, turn);
         return (
           <div className="turn" key={turn.id}>
             {changed !== null && <p className="brain-cut">{changed}</p>}
+            {restarted && (
+              <p className="brain-cut">
+                The conversation restarted here — this turn began a new context, with no memory of
+                what is above.
+              </p>
+            )}
             <div className="bubble asked">
               <span className="b-who">you</span>
               <p>{turn.asked}</p>

@@ -134,6 +134,18 @@ pub enum ItemState {
     /// work broke" and "you stopped it", and the two read as opposite things in a feed.
     Cancelled,
     GateFailed,
+    /// The gate said no and this item still has a retry to spend, so it is going round again.
+    ///
+    /// **NOT terminal**, and that is the whole of what it means: the queue owes this item another
+    /// implement run, in the tree exactly as the rejected attempt left it, with what the gate printed
+    /// in its prompt. `next_step` picks it up by the same positional search that picks up `Pending`,
+    /// and neither `ending()` nor `close_the_round` counts it — a job is not `gate_failed` for a
+    /// verdict it has not finished answering.
+    ///
+    /// Never stored. `job_items.status` says `gate_failed` either way; this state is what
+    /// `item_state_from` makes of that status once it has read the attempt count beside the job's
+    /// budget, and neither number means anything alone.
+    GateRetriable,
     GateErrored,
     /// This item asked for a decision, so the job put it down and moved on.
     ///
@@ -339,10 +351,15 @@ pub fn next_step(job: &JobView) -> Next {
     {
         return Next::RunGate { ordinal };
     }
+    // A retriable item is work to do, found by the SAME positional search that finds a pending one,
+    // so an earlier red-gated item outranks a later untouched one. Running the pending item first
+    // would build it on a tree that still stands where the red gate left it, and the next gate could
+    // no longer say which of the two broke it — which is the whole reason gating happens between
+    // items rather than at the end.
     if let Some(ordinal) = job
         .items
         .iter()
-        .position(|item| *item == ItemState::Pending)
+        .position(|item| matches!(item, ItemState::Pending | ItemState::GateRetriable))
     {
         return Next::SpawnImplement { ordinal };
     }
@@ -435,13 +452,27 @@ impl Outcome {
     }
 }
 
-fn item_state_from(status: &str) -> ItemState {
+/// PURE: what an item's row means, read as the three numbers it takes to mean anything.
+///
+/// `gate_attempts` counts how many times THIS item's gate has gone red; `gate_retries` is what the
+/// job allows. Neither says anything alone, and the pair is the only thing that can tell "try again"
+/// from "give up" — which is why the status is not enough and this takes all three.
+///
+/// `gate_errored` is deliberately outside that arithmetic, whatever the budget says. A non-zero exit
+/// is a verdict about the code and is worth another attempt; a gate that would not run measured
+/// nothing, so there is nothing to attempt again, and buying past it with a retry would mean
+/// building on work nothing has looked at.
+fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
     match status {
         "running" => ItemState::Running,
         "implemented" => ItemState::Implemented,
         "passed" => ItemState::Passed,
         "failed" => ItemState::Failed,
         STATUS_CANCELLED => ItemState::Cancelled,
+        // `<=` and not `<`: the budget is EXTRA implement runs, and the attempt that has just been
+        // counted is the one being answered. One attempt against a budget of one is the first red
+        // gate of a job allowed one retry, which is exactly the case the retry exists for.
+        "gate_failed" if gate_attempts <= gate_retries => ItemState::GateRetriable,
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
         STATUS_SKIPPED => ItemState::Skipped,
@@ -449,6 +480,39 @@ fn item_state_from(status: &str) -> ItemState {
         // "not finished" costs a repeated item; erring the other way silently skips work the job
         // was created to perform and reports it complete.
         _ => ItemState::Pending,
+    }
+}
+
+impl ItemState {
+    /// PURE: the `job_items.status` a startable item is sitting in, or `None` if it is not startable.
+    ///
+    /// The inverse of [`item_state_from`], and kept against it rather than anywhere near the SQL on
+    /// purpose. `spawn_node` claims an item with a compare-and-swap that has to name the status it
+    /// expects to find, and there are now two of those — `pending` for an item nobody has attempted,
+    /// `gate_failed` for one going round again. The claim gets that answer from the verdict already
+    /// reached by `item_state_from`, which is the ONE place the rule about which red gates are
+    /// retriable (`gate_attempts <= gate_retries`) is written. Every caller asks it rather than
+    /// restating it — this one and `record_gate`, which passes it the two numbers it has just read
+    /// back and believes the answer. A `WHERE` clause or an inline comparison that recomputed the
+    /// rule would be the same rule in two places, agreeing only until one of them was edited, and
+    /// this repository has been bitten by that three times — each time under a comment asserting the
+    /// two agreed.
+    ///
+    /// `None` for everything else, including the terminal states. An item that is not work cannot be
+    /// claimed, and answering with a status for one would let a caller start a node on finished work.
+    fn claimable_as(self) -> Option<&'static str> {
+        match self {
+            ItemState::Pending => Some("pending"),
+            ItemState::GateRetriable => Some("gate_failed"),
+            ItemState::Running
+            | ItemState::Implemented
+            | ItemState::Passed
+            | ItemState::Failed
+            | ItemState::Cancelled
+            | ItemState::GateFailed
+            | ItemState::GateErrored
+            | ItemState::Skipped => None,
+        }
     }
 }
 
@@ -489,8 +553,8 @@ pub const STATUS_AWAITING_APPROVAL: &str = "awaiting_approval";
 
 /// Assembles what `next_step` needs from the two tables.
 pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> {
-    let (status, resume_status, review_wanted): (String, Option<String>, i64) =
-        sqlx::query_as("SELECT status, resume_status, review FROM jobs WHERE id = ?")
+    let (status, resume_status, review_wanted, gate_retries): (String, Option<String>, i64, i64) =
+        sqlx::query_as("SELECT status, resume_status, review, gate_retries FROM jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(pool)
             .await?;
@@ -519,11 +583,16 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     //
     // It also keeps `ending()` right across rounds: a red gate in round 1 still makes the job
     // `gate_failed` when round 3 finishes, which is what a reader of the branch needs to know.
-    let items: Vec<String> =
-        sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
-            .bind(job_id)
-            .fetch_all(pool)
-            .await?;
+    //
+    // `gate_attempts` travels with the status because the status alone cannot say what `gate_failed`
+    // means any more: read against the job's budget it is either an item to try again or an item
+    // that is over, and reading it without the count would make every red gate terminal again.
+    let items: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, gate_attempts FROM job_items WHERE job_id = ? ORDER BY ordinal",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
 
     // Both node states are read by stage, not from the job's status: the job can be sitting in
     // `waiting` for budget while a node is the thing that has yet to run.
@@ -594,7 +663,10 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         // spawning a second planner on top of a queue that already exists.
         planned: stage != "planning" || !items.is_empty(),
         planning: plan_run.as_deref().is_some_and(node_in_flight),
-        items: items.iter().map(|s| item_state_from(s)).collect(),
+        items: items
+            .iter()
+            .map(|(status, attempts)| item_state_from(status, *attempts, gate_retries))
+            .collect(),
         review,
         rounds: RoundState {
             round,
@@ -768,6 +840,15 @@ pub struct NewJob<'a> {
     pub max_items: i64,
     pub gate_each: bool,
     pub review: bool,
+    /// How many EXTRA implement runs each item may buy with a red gate. Beside `max_items`,
+    /// `gate_each` and `review` because it is the same kind of thing: the shape the rule asked for,
+    /// copied onto the job when it starts rather than re-read per node.
+    ///
+    /// Arrives already cut by `GraphConfig::gate_retries()`. The raw config field is private and
+    /// must never reach here — a budget that travelled uncut would make the ceiling decorative at
+    /// the one point where it is the only thing standing between a per-developer file and an
+    /// unbounded number of re-implements.
+    pub gate_retries: i64,
     /// The repository HEAD the job starts from. `None` when git would not answer, which crash
     /// recovery reads as "cannot prove the tree stayed put" and therefore as not resumable.
     pub head_sha: Option<&'a str>,
@@ -792,8 +873,8 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     let result = sqlx::query(
         "INSERT INTO jobs
            (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
-            head_sha, max_rounds, budget_usd, created_at)
-         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)",
+            gate_retries, head_sha, max_rounds, budget_usd, created_at)
+         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.project_id)
     .bind(job.project_root)
@@ -802,6 +883,7 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .bind(job.max_items)
     .bind(i64::from(job.gate_each))
     .bind(i64::from(job.review))
+    .bind(job.gate_retries)
     .bind(job.head_sha)
     // Cut HERE, at the write, and not where it is read. A ceiling applied at read time is one a
     // forgetful caller walks past; stored already cut, the row itself is the promise.
@@ -927,6 +1009,8 @@ pub struct StartRequest<'a> {
     pub max_items: i64,
     pub gate_each: bool,
     pub review: bool,
+    /// Already cut by whoever asked, exactly as `max_items` is. See [`NewJob::gate_retries`].
+    pub gate_retries: i64,
     pub head_sha: Option<&'a str>,
     /// Both `None` for a scheduled job: a `graph:` rule asks for neither, which keeps it at one
     /// round under the house limit — exactly what it did before rounds existed.
@@ -972,6 +1056,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             max_items: request.max_items,
             gate_each: request.gate_each,
             review: request.review,
+            gate_retries: request.gate_retries,
             head_sha: request.head_sha,
             max_rounds: request.max_rounds,
             budget_usd: request.budget_usd,
@@ -1301,12 +1386,21 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
 /// `files` is the plan node's guess, appended only when it made one: a node with no hint is given
 /// the brief it has always been given, word for word, rather than a paragraph about a mechanism it
 /// has nothing to put in.
+///
+/// `gate_output` is appended on the same terms and for the same reason: the tail of what the gate
+/// printed when it rejected a PREVIOUS attempt at this item, or `None` on a first attempt — which is
+/// every attempt of every job that never retries anything, and which therefore has to produce the
+/// prompt this function has always produced, word for word. It is what makes a retry a retry rather
+/// than a second independent guess at the same item, because §5.4 keeps the second node from ever
+/// seeing the first one's session: without the output travelling in the prompt, a whole run is spent
+/// rediscovering what the gate already printed.
 pub fn implement_prompt(
     description: &str,
     ordinal: usize,
     total: usize,
     artifacts: &str,
     files: &[String],
+    gate_output: Option<&str>,
 ) -> String {
     let mut prompt = format!(
         "You are item {} of {total} in an autonomous job. The working tree already holds the work \
@@ -1327,6 +1421,17 @@ pub fn implement_prompt(
              possibly incomplete or wrong — it was guessed before any of the work was done. Edit \
              whatever the item actually needs.",
             files.join(", ")
+        ));
+    }
+    if let Some(output) = gate_output {
+        // Told as what happened rather than as a rule, because it IS what happened: this item was
+        // attempted, the tree was measured, and the measurement is below. A node given a policy
+        // about gates would argue with it; a node given the verdict on its own work fixes it.
+        prompt.push_str(&format!(
+            "\n\nThis item has been attempted before. That attempt finished, the project's gate ran \
+             over the tree, and the gate said no — this is the tail of what it printed:\n\n{output}\n\n\
+             The work that attempt left is still in the tree: nothing was undone, so you are \
+             continuing it rather than starting again. Make the gate agree."
         ));
     }
     prompt
@@ -1816,12 +1921,27 @@ async fn open_the_next_round(
 }
 
 /// Starts one node, and records that the item it belongs to is now in someone's hands.
+/// The item a node is being started for, and the row status its claim has to find.
+///
+/// The two travel together because neither is usable without the other: an ordinal says which row,
+/// and `held` says what that row must still say for this pass to be the one allowed to start it.
+/// `held` is never guessed here — it comes from [`ItemState::claimable_as`], applied to the verdict
+/// the caller's `JobView` already carries.
+#[derive(Debug, Clone, Copy)]
+struct ItemClaim {
+    ordinal: usize,
+    /// The status the item is in right now: `pending` for an item nobody has attempted, `gate_failed`
+    /// for one the gate rejected with a retry left. Also what [`release_item`] puts back, so a claim
+    /// that has to be given up returns the item to what it was rather than to what it resembled.
+    held: &'static str,
+}
+
 async fn spawn_node(
     state: &AppState,
     job: &JobRow,
     stage: &'static str,
     prompt: String,
-    item: Option<usize>,
+    item: Option<ItemClaim>,
     worktree: (PathBuf, String),
 ) -> Step {
     let pool = &state.pool;
@@ -1829,13 +1949,19 @@ async fn spawn_node(
     // Claimed BEFORE the run exists, so a creation that succeeds and a bookkeeping write that fails
     // cannot leave an item looking untouched while a node works on it — the next pass would start a
     // second node on the same tree.
-    if let Some(ordinal) = item {
+    //
+    // Still a compare-and-swap, and the zero-rows branch below is still load-bearing: it is what
+    // stops two passes starting two nodes on one tree. What changed is only that the status it
+    // compares against is passed in rather than hard-coded — a hard-coded `'pending'` silently
+    // refused every retriable item, which read as the job stopping for no reason.
+    if let Some(ItemClaim { ordinal, held }) = item {
         let claimed = sqlx::query(
             "UPDATE job_items SET status = 'running'
-             WHERE job_id = ? AND ordinal = ? AND status = 'pending'",
+             WHERE job_id = ? AND ordinal = ? AND status = ?",
         )
         .bind(job.id)
         .bind(ordinal as i64)
+        .bind(held)
         .execute(pool)
         .await;
         match claimed {
@@ -1849,6 +1975,28 @@ async fn spawn_node(
     }
 
     let (path, branch) = worktree;
+
+    // What the owner said to this job while it was running, appended to the brief this node was
+    // handed rather than put in its place. Here and not in each caller because this is the one seam
+    // every node kind passes through — plan, implement, gate retry, replan, review — and a note
+    // addressed to "whichever node comes next" must not depend on which kind that turned out to be.
+    //
+    // Read AFTER the claim and marked delivered only once a run exists, which is the whole order:
+    // a note spent on a node that never started is lost silently, and the owner learns about it by
+    // watching the job finish without doing what they asked. Best-effort on the way in — a queue
+    // that cannot be read is not a reason to refuse to start the node, only a reason to say so.
+    let waiting = match crate::notes::pending(pool, job.id).await {
+        Ok(waiting) => waiting,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read a job's notes");
+            Vec::new()
+        }
+    };
+    let mut prompt = prompt;
+    if let Some(block) = crate::notes::render(&waiting) {
+        prompt.push_str(&block);
+    }
+
     let created = crate::runs::create_job_node_run(
         state,
         prompt,
@@ -1865,7 +2013,18 @@ async fn spawn_node(
 
     match created {
         Ok(run_id) => {
-            if let Some(ordinal) = item {
+            // The run exists, so the words are in a prompt something will read: only now do they
+            // leave the queue. Unconsumed, one sentence typed at midnight would be appended to item
+            // 4, item 5, the replan and the review, each of them reading it as something newly said
+            // about the work in front of it.
+            let delivered = waiting.iter().map(|note| note.id).collect::<Vec<_>>();
+            if let Err(error) = crate::notes::mark_delivered(pool, &delivered, run_id).await {
+                // Said out loud rather than swallowed: the failure this leaves is a note delivered
+                // again to the next node, which is confusing but not silent, and there is nothing
+                // to undo — the run is already started.
+                tracing::warn!(job_id = job.id, run_id, %error, "could not mark a job's notes delivered");
+            }
+            if let Some(ItemClaim { ordinal, .. }) = item {
                 let _ =
                     sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = ?")
                         .bind(run_id)
@@ -1919,11 +2078,20 @@ async fn spawn_node(
     }
 }
 
-async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<usize>) {
-    let Some(ordinal) = item else { return };
+/// Gives back a claim whose node never started.
+///
+/// Puts back the status the claim TOOK, not a fixed `pending`. The difference is a retry: an item
+/// released to `pending` would have lost the red gate that made it retriable while keeping the
+/// `gate_attempts` that gate cost it, so a budget of one would be spent on an attempt that never
+/// ran, and the item would come back as though nothing had ever measured it.
+async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<ItemClaim>) {
+    let Some(ItemClaim { ordinal, held }) = item else {
+        return;
+    };
     let _ = sqlx::query(
-        "UPDATE job_items SET status = 'pending' WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+        "UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ? AND status = 'running'",
     )
+    .bind(held)
     .bind(job.id)
     .bind(ordinal as i64)
     .execute(pool)
@@ -2087,6 +2255,31 @@ pub async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf
         .map(|(path, _)| path)
 }
 
+/// How much of a red gate's output is kept for the node that has to answer it.
+///
+/// `gate.rs` already caps what it captures at 1 MiB, which is the right bound for "do not let a
+/// runaway suite eat memory" and the wrong one for everything downstream: a megabyte per item in the
+/// database, and a megabyte pasted into a prompt, is its own defect. A few KB of the TAIL is where
+/// a test runner puts its failures and its summary line, which is the part a retry can act on.
+const GATE_OUTPUT_TAIL: usize = 4096;
+
+/// The last [`GATE_OUTPUT_TAIL`] bytes of a gate's output, cut where a character actually ends.
+///
+/// The boundary walk is not defensive tidiness: slicing a `String` mid-character panics, and a gate
+/// prints whatever the project's tools print — a test name with an accent in it, a `✗`, a path from
+/// a non-ASCII branch. Cutting by raw byte index would turn somebody's stack trace into a crashed
+/// daemon on the one night it mattered.
+fn gate_output_tail(output: &str) -> &str {
+    if output.len() <= GATE_OUTPUT_TAIL {
+        return output;
+    }
+    let mut start = output.len() - GATE_OUTPUT_TAIL;
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    &output[start..]
+}
+
 async fn record_gate(
     state: &AppState,
     job: &JobRow,
@@ -2138,6 +2331,85 @@ async fn record_gate(
                     "no worktree on record to checkpoint"
                 );
             }
+        }
+    }
+
+    // Red, with a retry left: keep the tree, remember what the gate said, ask for the item again.
+    //
+    // BEFORE the revert below, and the order is the feature rather than tidiness. That block puts
+    // the tree back to this item's footing, which is precisely the work a second attempt would start
+    // from — a retriable item that reached it would be handed a blank page together with an account
+    // of what the gate disliked about something no longer there. Nothing is checkpointed either:
+    // nothing passed, and a footing taken over rejected work is a footing the items after this one
+    // would inherit.
+    if let crate::gate::GateOutcome::Failed { exit_code, output } = &outcome {
+        // Counted on BOTH paths, whether or not the count buys anything. A counter that only
+        // incremented where a retry was spent would disagree with itself about what happened to the
+        // item — and the budget it is read against is a number that can differ between two jobs
+        // gating the same repository on the same night.
+        if let Err(error) = sqlx::query(
+            "UPDATE job_items SET gate_attempts = gate_attempts + 1, gate_output = ?
+             WHERE job_id = ? AND ordinal = ?",
+        )
+        .bind(gate_output_tail(output))
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not count a red gate against its item");
+        }
+
+        // Read back rather than reasoned about, and read as a pair: the count and the budget are the
+        // only two numbers that can tell a first red gate from a last one. Fails CLOSED — a budget
+        // that cannot be read spends nothing, which is exactly today's behaviour.
+        let spendable: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT i.gate_attempts, j.gate_retries
+             FROM job_items i JOIN jobs j ON j.id = i.job_id
+             WHERE i.job_id = ? AND i.ordinal = ?",
+        )
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        // ASKED, not restated. `attempts <= retries` written here would be the retriability rule in
+        // a second place, and the two would agree only until one of them was edited — which is the
+        // failure this module has already had three times, each under a comment asserting they
+        // agreed. `item_state_from` owns the comparison; this passes it the status it is about to
+        // write and believes the answer.
+        if let Some((attempts, retries)) = spendable
+            && item_state_from(item_status, attempts, retries) == ItemState::GateRetriable
+        {
+            let written = sqlx::query(
+                "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(item_status)
+            .bind(gate_status)
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            if let Err(error) = written {
+                tracing::warn!(job_id = job.id, ordinal, %error, "could not record a red gate that still has a retry");
+                return Step::Stopped;
+            }
+            say(
+                pool,
+                job,
+                "job_gate_failed",
+                &format!(
+                    "job {} at item {}: the gate failed with exit code {exit_code}, so the item is \
+                     being implemented again with what the gate said (attempt {attempts} of \
+                     {retries} allowed)",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            return Step::Continued;
         }
     }
 
@@ -2328,6 +2600,35 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
         }
     }
 
+    // Somebody asked that this job and another not run at the same time, and the other one is
+    // running. `Park` and never `Stop`: the reason lifts by itself the moment the partner ends, and
+    // stopping would throw away a job for a wait measured in minutes.
+    //
+    // Placed after the budget and before the attention check, and the order is what the person
+    // reads. Two of these can be true at once — the owner at the keyboard AND a partner holding a
+    // slot — and "job 42 holds a slot and the two are excluded" is the more useful of the two,
+    // because it names something that will resolve on its own and says what to watch for.
+    //
+    // Fails CLOSED like its neighbours, and the choice is nearly moot: a pool that cannot answer
+    // this could not answer the kill switch at the top of the chain either, so the job would already
+    // be parked before reaching here.
+    match crate::exclusion::blocking_partner(&state.pool, job.id).await {
+        Ok(None) => {}
+        Ok(Some(partner)) => {
+            return Brake::Park {
+                reason: "excluded",
+                detail: format!("job {partner} holds a slot and the two are excluded"),
+            };
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read this job's exclusions");
+            return Brake::Park {
+                reason: "excluded",
+                detail: format!("this job's exclusions could not be read: {error}"),
+            };
+        }
+    }
+
     // Decision 10, and the whole of what it adds: the brake was a check made once at admission, and
     // a job admitted at 03:00 could otherwise keep starting nodes at 08:00 with the owner at the
     // keyboard. The item in flight is never killed — its gate has already run or is about to — so
@@ -2398,12 +2699,17 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 pool,
                 job,
                 "job_stopped",
+                // "Unfinished" is asked of `claimable_as` rather than spelled out as a list of
+                // states, because that function is already the one place saying which states are
+                // work the queue still owes a run — including `GateRetriable`, an item whose gate
+                // went red with a retry left. Listing the states here would be the same rule in a
+                // second dialect, agreeing only until one of them was edited.
                 &format!(
                     "job {} stopped with {} item(s) unfinished: {detail}",
                     job.id,
                     view.items
                         .iter()
-                        .filter(|item| **item == ItemState::Pending)
+                        .filter(|item| item.claimable_as().is_some())
                         .count()
                 ),
             )
@@ -2435,8 +2741,26 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             spawn_node(state, job, "plan", prompt, None, worktree).await
         }
         Next::SpawnImplement { ordinal } => {
-            let row = sqlx::query_as::<_, (String, Option<String>)>(
-                "SELECT description, files FROM job_items WHERE job_id = ? AND ordinal = ?",
+            // What the claim below has to find. Taken from the verdict this pass already reached —
+            // `next_step` named this ordinal precisely because `item_state_from` called it `Pending`
+            // or `GateRetriable` — rather than asked of the database a second time. The alternative
+            // is a `WHERE` clause that re-derives which red gates are retriable, which is the same
+            // rule in a second dialect and drifts the first time either side is edited.
+            let Some(held) = view
+                .items
+                .get(ordinal)
+                .and_then(|state| state.claimable_as())
+            else {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "asked to implement an item that is not startable"
+                );
+                return Step::Stopped;
+            };
+            let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                "SELECT description, files, gate_output FROM job_items
+                 WHERE job_id = ? AND ordinal = ?",
             )
             .bind(job.id)
             .bind(ordinal as i64)
@@ -2444,7 +2768,10 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             .await
             .ok()
             .flatten();
-            let Some((description, files)) = row else {
+            // `gate_output` is NULL for every item on its first attempt, which is every item of every
+            // job that never retries anything — so the `None` this reads is the prompt staying
+            // exactly as it was, not a fallback.
+            let Some((description, files, gate_output)) = row else {
                 tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
                 return Step::Stopped;
             };
@@ -2454,9 +2781,23 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             let files: Vec<String> = files
                 .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
                 .unwrap_or_default();
-            let prompt =
-                implement_prompt(&description, ordinal, view.items.len(), &artifacts, &files);
-            spawn_node(state, job, "implement", prompt, Some(ordinal), worktree).await
+            let prompt = implement_prompt(
+                &description,
+                ordinal,
+                view.items.len(),
+                &artifacts,
+                &files,
+                gate_output.as_deref(),
+            );
+            spawn_node(
+                state,
+                job,
+                "implement",
+                prompt,
+                Some(ItemClaim { ordinal, held }),
+                worktree,
+            )
+            .await
         }
         Next::SpawnReview => {
             let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
@@ -2700,6 +3041,14 @@ pub struct JobDetail {
     /// The branch the work is on, so a stopped job's partial can be found. `None` once the GC has
     /// taken the worktree.
     pub branch: Option<String>,
+    /// What the owner has said to this job, delivered or still waiting.
+    ///
+    /// Every note and not only the pending ones, because both states answer a question the owner
+    /// actually asks. Before delivery this is the only thing separating a note that is queued from
+    /// one that was dropped — and an owner who cannot tell those apart leaves it a second time.
+    /// After delivery, `delivered_to_run_id` is the join back to the prompt it was appended to,
+    /// which is how "did it arrive in time" gets answered at all.
+    pub notes: Vec<crate::notes::Note>,
 }
 
 /// The owner-kind predicate belongs in the `ON` clause and not in a `WHERE`. In a `WHERE` it would
@@ -2828,7 +3177,14 @@ pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDe
     .fetch_optional(pool)
     .await?;
 
-    Ok(Some(JobDetail { job, items, branch }))
+    let notes = crate::notes::all(pool, job_id).await?;
+
+    Ok(Some(JobDetail {
+        job,
+        items,
+        branch,
+        notes,
+    }))
 }
 
 /// What cancelling a job did.
@@ -3038,6 +3394,7 @@ mod tests {
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            run_tails: Default::default(),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };
@@ -3174,6 +3531,7 @@ mod tests {
                 max_items: 5,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha,
                 max_rounds: None,
                 budget_usd: None,
@@ -3320,6 +3678,144 @@ mod tests {
             )),
             Next::Finish(Outcome::Completed),
             "and a queue nothing rejected still completes"
+        );
+    }
+
+    /// A red gate that still has a retry left has not finished with its item.
+    ///
+    /// The three numbers are read together or not at all. `gate_attempts` counts how many times this
+    /// item's gate has gone red; `gate_retries` is what the job allows; neither says anything alone,
+    /// and the pair is the only thing that can tell "try again" from "give up". Without this, the
+    /// first red gate is terminal for the item — which is today's behaviour, and the behaviour the
+    /// retry exists to replace for the work that a missing import or an unupdated test made red.
+    #[test]
+    fn a_first_red_gate_with_a_retry_left_is_retriable() {
+        assert_eq!(
+            item_state_from("gate_failed", 1, 1),
+            ItemState::GateRetriable
+        );
+    }
+
+    /// The budget is spent, not renewed.
+    ///
+    /// The second red gate against a budget of one is where the retry stops being a retry. An item
+    /// that kept re-implementing on every red gate would spend the whole night's runs on the one
+    /// piece of work that cannot be made to pass, and the items behind it would never be reached.
+    #[test]
+    fn a_second_red_gate_with_one_retry_is_terminal() {
+        assert_eq!(item_state_from("gate_failed", 2, 1), ItemState::GateFailed);
+    }
+
+    /// Zero retries has to stay reachable, because it is what every existing job IS.
+    ///
+    /// `jobs.gate_retries` defaults to 0 in migration 0068 precisely so that no job already
+    /// scheduled quietly acquires a retry it never asked for. This is the assertion that says the
+    /// unretried path is still the old path: one red gate, one dead item.
+    #[test]
+    fn zero_retries_is_todays_behaviour() {
+        assert_eq!(item_state_from("gate_failed", 1, 0), ItemState::GateFailed);
+    }
+
+    /// A retriable item is work to do, and the work is the SAME item.
+    ///
+    /// The number in `SpawnImplement` is what the caller looks the item up by, so an off-by-one here
+    /// would re-implement the wrong item — or, at the end of a queue, implement one that does not
+    /// exist. Item 1 went red, so item 1 is what runs again; the passed item before it is finished
+    /// with and must not be touched.
+    #[test]
+    fn a_retriable_item_reruns_the_same_ordinal() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::Passed, ItemState::GateRetriable],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 1 }
+        );
+    }
+
+    /// Position decides which item runs next, not how the item got to be work.
+    ///
+    /// A retriable item is picked by the same positional search that picks a pending one, so an
+    /// earlier retriable item outranks a later pending one. Running the pending item first would
+    /// build it on a tree that still stands where the red gate left it, and the next gate could no
+    /// longer say which of the two items broke it — which is the whole reason gating happens between
+    /// items rather than at the end.
+    #[test]
+    fn a_retriable_item_is_taken_before_a_later_pending_one() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateRetriable, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 0 }
+        );
+    }
+
+    /// An item that has spent its retries is walked past, exactly as it is today.
+    ///
+    /// Said again beside the retry tests rather than left to
+    /// `a_failed_gate_and_an_errored_gate_end_the_job_differently`, because this is the assertion a
+    /// new state most easily breaks: `GateFailed` arriving at the positional search must still be
+    /// nothing to the queue, or a job whose first item ran out of retries would sit re-implementing
+    /// it and never reach the four items behind it that were never the ones that broke.
+    #[test]
+    fn an_item_out_of_retries_lets_the_queue_carry_on() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateFailed, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::SpawnImplement { ordinal: 1 }
+        );
+    }
+
+    /// The retry moves WHEN the verdict is decided, never what it is.
+    ///
+    /// A branch carrying an item the gate rejected is not one to tell somebody is complete, and
+    /// spending a retry on it does not change that — it only means the rejection is final rather
+    /// than first. A retry that softened the ending would be worse than no retry at all: the night
+    /// would report `completed` over work no gate ever agreed with.
+    #[test]
+    fn a_job_ending_on_a_red_gate_still_reports_gate_failed() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateFailed, ItemState::Passed],
+                ReviewState::Done
+            )),
+            Next::Finish(Outcome::GateFailed)
+        );
+    }
+
+    /// Silence is not retriable, whatever the budget says.
+    ///
+    /// The asymmetry the whole two-state gate design rests on. A non-zero exit is a verdict about
+    /// the code and is worth another attempt; a gate that would not run measured nothing, so there
+    /// is nothing to attempt again — a second implement node would be told "the gate said" and given
+    /// the silence. Buying past it with a retry budget would mean building on work nothing has
+    /// looked at, which is the one thing the gate exists to prevent.
+    #[test]
+    fn a_gate_that_could_not_run_still_ends_the_job() {
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[ItemState::GateErrored, ItemState::Pending],
+                ReviewState::Pending
+            )),
+            Next::Finish(Outcome::GateErrored)
+        );
+        assert_eq!(
+            item_state_from("gate_errored", 1, 1),
+            ItemState::GateErrored,
+            "a retry left over cannot turn silence into something to retry"
+        );
+        assert_eq!(
+            item_state_from("gate_errored", 1, 3),
+            ItemState::GateErrored,
+            "and neither can the largest budget the ceiling allows"
         );
     }
 
@@ -3478,7 +3974,7 @@ mod tests {
         let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos");
         let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos");
         // No hint, because what this pins is the paragraph every node gets regardless of one.
-        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[]);
+        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None);
 
         for prompt in [&plan, &replan] {
             assert!(
@@ -4579,6 +5075,7 @@ mod tests {
                 max_items: 3,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
@@ -4698,6 +5195,7 @@ mod tests {
                 max_items: 5,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: head_sha.as_deref(),
                 max_rounds: None,
                 budget_usd: None,
@@ -5425,6 +5923,172 @@ mod tests {
         assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
     }
 
+    async fn exclude(pool: &sqlx::SqlitePool, project_id: &str, low: i64, high: i64) {
+        sqlx::query(
+            "INSERT INTO fleet_exclusions
+                 (project_id, job_low, job_high, proposal_id, created_at)
+             VALUES (?, ?, ?, 1, '2026-08-15T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(low)
+        .bind(high)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The whole journey, with nothing along it faked.
+    ///
+    /// Every other test here inserts the rule straight into `fleet_exclusions`, which is right for
+    /// testing the brake and wrong for testing the FEATURE: those would pass unchanged if `propose`
+    /// filed the wrong pair or `approve` wrote a row nothing reads. This one walks the path a person
+    /// walks — ask, approve, watch one job hold and the other wait, and watch the wait end by itself
+    /// — through the same functions the routes call.
+    ///
+    /// The two jobs are asked about BACKWARDS (`high` first) on purpose: the ordering that makes the
+    /// tie-break work has to survive the request, not just the table.
+    #[tokio::test]
+    async fn asking_approving_and_waiting_is_one_unbroken_chain() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        // 1. Somebody draws the edge. Nothing about scheduling changes yet.
+        let proposal = crate::exclusion::propose(&pool, high, low, &[])
+            .await
+            .unwrap();
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        let high_row = load_job(&pool, high).await.unwrap();
+        assert!(
+            matches!(brakes(&state, &high_row, Utc::now()).await, Brake::Go),
+            "a request that nobody has approved must not hold anything"
+        );
+
+        // 2. Somebody approves it. Only now is there a rule.
+        let approved = crate::exclusion::approve(&pool, proposal).await.unwrap();
+        assert!(
+            matches!(approved, crate::exclusion::Approved::Written(_)),
+            "got {approved:?}"
+        );
+
+        // 3. The higher job waits, and the reason names what to wait for.
+        let Brake::Park { reason, detail } = brakes(&state, &high_row, Utc::now()).await else {
+            panic!("the higher job must wait while its partner holds a slot");
+        };
+        assert_eq!(reason, "excluded");
+        assert!(detail.contains(&format!("job {low}")), "got: {detail}");
+        // And it is written on the job itself, which is what the card reads.
+        park(&state, &high_row, reason, &detail).await;
+        let parked = load_job(&pool, high).await.unwrap();
+        assert_eq!(parked.status, "waiting");
+        assert_eq!(parked.wait_reason.as_deref(), Some("excluded"));
+
+        // 4. The partner finishes. Nobody presses anything.
+        crate::concurrency::release(&pool, crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        resume(&pool, high).await.unwrap();
+        let woken = load_job(&pool, high).await.unwrap();
+        assert_eq!(
+            woken.wait_reason, None,
+            "the note outlives the pause it explains"
+        );
+        assert!(matches!(
+            brakes(&state, &woken, Utc::now()).await,
+            Brake::Go
+        ));
+    }
+
+    /// One of the two waits, and it is always the same one.
+    ///
+    /// The asymmetry is the deadlock argument, not a detail of the query: the low id is never parked
+    /// by this brake, so of any two excluded jobs at least one is always free to run. Were the
+    /// tie-break decided at read time, two reads that disagreed would park both — and two jobs
+    /// somebody asked to SERIALISE, stopped forever on each other, is the one failure this feature
+    /// must not be able to produce.
+    #[tokio::test]
+    async fn the_higher_job_waits_for_its_partner_and_the_lower_one_never_does() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        exclude(&pool, "project-a", low, high).await;
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+
+        let high_row = load_job(&pool, high).await.unwrap();
+        let Brake::Park { reason, detail } = brakes(&state, &high_row, Utc::now()).await else {
+            panic!("the higher job must wait while its partner holds a slot");
+        };
+        assert_eq!(reason, "excluded");
+        assert!(
+            detail.contains(&format!("job {low}")),
+            "the reason has to name what to wait for, got: {detail}"
+        );
+
+        // The other side of the same rule, at the same moment: never parked by it.
+        let low_row = load_job(&pool, low).await.unwrap();
+        assert!(matches!(
+            brakes(&state, &low_row, Utc::now()).await,
+            Brake::Go
+        ));
+    }
+
+    /// The brake lifts by itself, which is why it is a `Park` and not a `Stop`.
+    ///
+    /// Two ways for it to lift, and both are tested here because they fail differently: the partner
+    /// gives its slot back, or somebody revokes the rule. A brake that needed a person to restart
+    /// the job would make serialising two fronts of work cost more attention than doing them by
+    /// hand.
+    #[tokio::test]
+    async fn the_wait_ends_when_the_slot_goes_back_or_the_rule_is_revoked() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        exclude(&pool, "project-a", low, high).await;
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        let high_row = load_job(&pool, high).await.unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Park { .. }
+        ));
+
+        crate::concurrency::release(&pool, crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Go
+        ));
+
+        // And with the slot taken again, revoking the rule releases it just the same.
+        crate::concurrency::claim(&pool, "project-a", crate::worktree::Owner::Job(low))
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Park { .. }
+        ));
+        sqlx::query("UPDATE fleet_exclusions SET revoked_at = '2026-08-15T01:00:00Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Go
+        ));
+    }
+
     /// Decision 9, and the whole reason `PauseKind` exists. The hourly brake lifts by itself, so
     /// the job comes back; the window ceiling does not lift before the period rolls over, so
     /// waiting for it would be a hang dressed up as patience.
@@ -5454,6 +6118,51 @@ mod tests {
 
         assert_eq!(job_status(&pool, job_id).await, STATUS_STOPPED);
         assert!(feed_kinds(&pool).await.contains(&"job_stopped".to_owned()));
+    }
+
+    /// The number in that line is what the night left behind, and a retriable item is work.
+    ///
+    /// An item whose gate went red with a retry still to spend is one the queue owed another
+    /// implement run. Counting only `Pending` reports one item fewer than was really left, and the
+    /// item it drops is precisely the one that had already cost money.
+    #[tokio::test]
+    async fn a_stopped_job_counts_a_retriable_item_among_the_unfinished() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The row a red gate with a retry left behind, written the way `record_gate` writes it: the
+        // status still says `gate_failed`, and it is the attempt count read beside the job's budget
+        // that makes the item retriable rather than finished with.
+        seed_items(&pool, job_id, &["gate_failed", "pending"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The window ceiling, because it is the brake that stops rather than parks.
+        set_budget(&pool, Some(0.0), None).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(job_status(&pool, job_id).await, STATUS_STOPPED);
+        let summary: String =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'job_stopped'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            summary.contains("2 item(s) unfinished"),
+            "the retriable item is work the queue still owed a run: {summary}"
+        );
     }
 
     /// Decision 10. The brake used to be a check made once at admission, so a job admitted at 03:00
@@ -5596,6 +6305,272 @@ mod tests {
         );
     }
 
+    /// The retry budget is copied onto the job when it starts, or the config key is decoration.
+    ///
+    /// The join every other test in this chunk hangs off, and the only one that can fail on it.
+    /// `GraphConfig::gate_retries()` can be right, `item_state_from` can be right, `record_gate` can
+    /// be right, and every one of those assertions can pass while every real job runs on the column
+    /// default of 0 — because nothing on the way IN ever carried the number across. The two
+    /// pool-backed tests below set `jobs.gate_retries` by hand, so they cannot notice; this one goes
+    /// through `NewJob` and reads the row back, which is the only shape that can.
+    ///
+    /// Copied rather than re-read, for the reason `0042_jobs.sql` already gives about `max_items`,
+    /// `gate_each` and `review`: `.ai/autopilot.yaml` can be edited mid-flight, and a job that
+    /// changed shape between its own nodes would gate some items and not others with nothing
+    /// recording why. A budget re-read at each step has that failure with a worse symptom — one item
+    /// retried because the file said 2 this morning, and the item beside it dropped because it says
+    /// 0 now, in the same night, under the same gate.
+    #[tokio::test]
+    async fn a_jobs_retry_budget_comes_from_the_rule_that_started_it() {
+        let pool = test_pool().await;
+        let job_id = insert_job(
+            &pool,
+            &NewJob {
+                project_id: "project-a",
+                project_root: "/project/a",
+                rule_name: Some("nightly-backlog"),
+                prompt: "pull from the todo list and advance what you can",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 2,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+            },
+        )
+        .await
+        .expect("start a job");
+
+        let stored: i64 = sqlx::query_scalar("SELECT gate_retries FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, 2,
+            "the budget the rule asked for never reached the row the job actually runs on"
+        );
+    }
+
+    /// A red gate with a retry left leaves the tree where it stands and asks for the item again.
+    ///
+    /// **No worktree row is seeded, and the absence is the assertion.** Today a red gate reverts the
+    /// tree to the item's footing before it marks anything, and a job with no worktree on record
+    /// takes the `!reverted` branch: it marks the item and stops the night, refusing to let the
+    /// queue advance onto a tree it could not put back. A retry must not reach for any of that — the
+    /// work it is about to redo is the work standing in the tree, and reverting it first would throw
+    /// away everything the second node would otherwise start from, turning a near miss into a blank
+    /// page. If the revert machinery still ran here, this job would come back with a dead queue
+    /// instead of asking for item 1 again, and this test is what would notice.
+    ///
+    /// The count and the output are the other half. Without the count the budget never runs out and
+    /// a hopeless item retries forever; without the output the second node is a second guess.
+    #[tokio::test]
+    async fn a_red_gate_with_a_retry_left_keeps_the_tree() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        // Set on the row rather than asked for at creation: `NewJob` carries no retry budget yet,
+        // and a job is what the column says it is whatever wrote it.
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // `implemented` is the status an item is really in when the gate measures it — `next_step`
+        // answers `RunGate` for exactly that state and no other.
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let row = load_job(&pool, job_id).await.unwrap();
+
+        record_gate(
+            &state,
+            &row,
+            0,
+            crate::gate::GateOutcome::Failed {
+                exit_code: 1,
+                output: "boom".into(),
+            },
+        )
+        .await;
+
+        let (attempts, output): (i64, Option<String>) = sqlx::query_as(
+            "SELECT gate_attempts, gate_output FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "an uncounted red gate is a budget that never runs out"
+        );
+        assert_eq!(
+            output.as_deref(),
+            Some("boom"),
+            "the retrying node has to be able to read what the gate said"
+        );
+
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnImplement { ordinal: 0 },
+            "the queue has to come back to the same item, not stop and not step over it"
+        );
+    }
+
+    /// Asking for the item again is not the same as starting it, and only one of those was tested.
+    ///
+    /// Every other test of this feature stops at `next_step`, which is pure and which answers
+    /// `SpawnImplement { ordinal: 0 }` for a retriable item quite correctly. `advance` then has to
+    /// CLAIM that item, and the claim is a compare-and-swap that names the status it expects:
+    /// `WHERE ... AND status = 'pending'`. A retriable item's row says `gate_failed`, so the swap
+    /// matched nothing, `rows_affected() == 0` took the branch that exists to stop two nodes starting
+    /// on one tree, and the job stopped at the first red gate — with the rejected work still standing,
+    /// because `record_gate` had correctly skipped the revert on the way in. That is worse than the
+    /// behaviour the retry replaced: before it, the job at least reverted and carried on.
+    ///
+    /// So this test crosses from the pure half into the I/O half deliberately. It drives `advance`,
+    /// not `next_step`, and it reads the two rows that prove a node actually started: the item is
+    /// `running` and it has a run attached. The prompt is the third assertion, and it is what makes
+    /// the whole chain load-bearing — output stored by `record_gate`, selected by `advance`, appended
+    /// by `implement_prompt`, and handed to a node. Any link missing and this says so.
+    /// A real repository and a real worktree, because a node that cannot be provisioned would leave
+    /// the item back where it started for a reason that has nothing to do with the claim — and would
+    /// look exactly like the defect this pins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retriable_item_is_claimed_and_started_not_merely_asked_for() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-retryclaim-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The row a red gate with a retry left leaves behind, written the way `record_gate` writes
+        // it: the status still says `gate_failed`, and it is the count beside the job's budget that
+        // makes it retriable. Seeded rather than gated so that what fails here can only be the claim.
+        seed_items(&pool, job_id, &["gate_failed"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1, gate_output = ?
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind("FAILED tests/test_cursor.py::test_guard")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["running"],
+            "the retry was asked for and never claimed, so the job stopped on an unreverted tree"
+        );
+        let run_id: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id = run_id.expect("the retried item has a node of its own attached to it");
+
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            prompt.contains("FAILED tests/test_cursor.py::test_guard"),
+            "the node that has to answer the gate was not told what it said: {prompt}"
+        );
+    }
+
+    /// Out of retries, the tree still governs, and nothing about that branch has moved.
+    ///
+    /// `gate_retries = 0` is every job written before migration 0068, so this is the regression the
+    /// retry is most likely to break: with no budget the first red gate is final, and a red gate
+    /// whose worktree cannot be put back still stops the night where it stands rather than letting
+    /// the next item build on work the gate has just called broken.
+    ///
+    /// The attempt is counted anyway. It costs nothing here — there is no budget for it to be
+    /// measured against — and a counter that only increments on the paths that spend it would be a
+    /// counter that disagrees with itself about what happened to the item.
+    #[tokio::test]
+    async fn a_red_gate_out_of_retries_still_stops_when_it_cannot_revert() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        // Said out loud rather than left to the column default, because it is the premise: this is
+        // a job with nothing to spend.
+        sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let row = load_job(&pool, job_id).await.unwrap();
+
+        let step = record_gate(
+            &state,
+            &row,
+            0,
+            crate::gate::GateOutcome::Failed {
+                exit_code: 1,
+                output: "boom".into(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            step,
+            Step::Stopped,
+            "a tree that could not be put back still ends the pass"
+        );
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["gate_failed"]);
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "the red gate happened, and it is counted whether or not it bought anything"
+        );
+    }
+
     /// `gate_after_each_item: false` buys back the intermediate suite runs. The final gate runs
     /// regardless, because a job that measured nothing hands back a partial nobody can trust.
     #[tokio::test]
@@ -5728,7 +6703,7 @@ mod tests {
             "core/src/job.rs".to_owned(),
             "core/migrations/0052.sql".to_owned(),
         ];
-        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints);
+        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints, None);
 
         assert!(hinted.contains("core/src/job.rs"));
         assert!(hinted.contains("core/migrations/0052.sql"));
@@ -5737,7 +6712,7 @@ mod tests {
             "the list is a hint, not a boundary: {hinted}"
         );
 
-        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[]);
+        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None);
         assert_eq!(
             bare,
             "You are item 1 of 3 in an autonomous job. The working tree already holds the work \
@@ -5769,6 +6744,46 @@ mod tests {
         assert!(hinted.starts_with(&bare));
     }
 
+    /// A retry is only worth a run if the node is told what the gate said.
+    ///
+    /// §5.4 keeps nodes from resuming each other's sessions on purpose, so the second implement node
+    /// knows nothing about the first — including that there WAS a first. Without the gate's output
+    /// travelling in the prompt, a retry is a second independent guess at the same item, which is a
+    /// whole run spent to rediscover what the gate already printed. That is the difference between
+    /// a retry and repeating yourself.
+    ///
+    /// The other half is the `None` call, and it is the half that protects every job that is not
+    /// retrying: an item on its first attempt is given the brief it has always been given, with
+    /// nothing in it about a previous gate it never had. The byte-for-byte guarantee lives in
+    /// `implement_prompt_names_the_hinted_files_as_a_possibly_incomplete_list` above, which pins the
+    /// unhinted prompt as a literal; here the claim is that the output is APPENDED, so everything
+    /// the node was told before it is still there and in the same place.
+    #[test]
+    fn the_retry_prompt_carries_the_gate_output() {
+        let first = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None);
+        let retry = implement_prompt(
+            "write the thing",
+            0,
+            3,
+            "/wt/.nucleos",
+            &[],
+            Some("FAILED test_x"),
+        );
+
+        assert!(
+            retry.contains("FAILED test_x"),
+            "the retrying node was not told what failed: {retry}"
+        );
+        assert!(
+            !first.contains("FAILED test_x"),
+            "a first attempt must carry no account of a gate it never faced: {first}"
+        );
+        assert!(
+            retry.starts_with(&first),
+            "the gate's output is appended to the brief, not substituted for part of it: {retry}"
+        );
+    }
+
     /// §5.4: the review node's independence is structural, not requested. It is never given a
     /// builder's session because no builder session is kept for it to resume.
     #[test]
@@ -5780,5 +6795,198 @@ mod tests {
         // commits is worse than naming a sha and better than reviewing a guess.
         let without = review_prompt(None, "/wt/.nucleos");
         assert!(without.contains("git log --oneline"));
+    }
+
+    /// The words an owner would leave on a job in flight, and the item they arrive beside.
+    ///
+    /// Distinctive strings on purpose. `seed_items` writes `'an item'` for every description, which
+    /// appears inside `implement_prompt`'s own boilerplate often enough that asserting on it would
+    /// pass whether or not the item's brief survived.
+    const A_NOTE: &str = "when you get to item 3, update the docs too";
+    const AN_ITEM: &str = "rename the cursor helper";
+
+    /// The one seam a job's words have to cross, driven end to end.
+    ///
+    /// Every other test of this feature stops inside `notes`, which is pure or nearly so and which
+    /// will happily store and return a note nobody ever reads. The wiring is the part that can be
+    /// missing while all of that passes: `advance` selects the item, builds the brief and hands it
+    /// to `spawn_node`, and unless the pending notes are appended THERE the owner's sentence is a
+    /// row in a table with no reader. A node is born with a clean context window and no steering
+    /// channel — `create_job_node_run` passes `steerable: false` on purpose — so the prompt is the
+    /// only door, and this test opens it from the outside.
+    ///
+    /// It asserts on the STORED prompt, read back out of `runs`, and not on a string the test built.
+    /// The chain is long — note left, queue read, text rendered, brief appended, run created, row
+    /// written — and a test that composed those pieces itself would be checking its own arithmetic
+    /// while any one of the links could be missing.
+    ///
+    /// The item's own description is asserted for beside it, because "the note reached the prompt"
+    /// is satisfied by a `render` that returned the note INSTEAD of the brief. A node whose item
+    /// vanished would go and do what the note said and nothing else, which is the failure the whole
+    /// wording of `render` is written to avoid.
+    ///
+    /// And the queue is asserted empty afterwards. Delivery is what makes a note a message rather
+    /// than a standing order: unconsumed, one sentence typed at midnight would be appended to item
+    /// 4, item 5, the replan and the review, each of them reading it as something newly said about
+    /// the work in front of it.
+    ///
+    /// A real repository and a real worktree, for the reason
+    /// `a_retriable_item_is_claimed_and_started_not_merely_asked_for` gives: a node that could not
+    /// be provisioned leaves the item exactly where a node that was never told about the note would,
+    /// and the two would be indistinguishable here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_note_left_on_a_job_reaches_the_next_nodes_prompt() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-note-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        seed_items(&pool, job_id, &["pending"]).await;
+        sqlx::query("UPDATE job_items SET description = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(AN_ITEM)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "duarte")
+            .await
+            .expect("the owner leaves a note on a job already running");
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let run_id: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id = run_id.expect("the item's node started, so there is a prompt to look at");
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            prompt.contains(A_NOTE),
+            "the note never reached the node it was left for: {prompt}"
+        );
+        assert!(
+            prompt.contains(AN_ITEM),
+            "the note took the place of the item's brief instead of being added to it: {prompt}"
+        );
+        assert_eq!(
+            crate::notes::pending(&pool, job_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            Vec::<i64>::new(),
+            "note {note_id} is still queued after being read out, so every later node of this job \
+             gets told the same thing again"
+        );
+    }
+
+    /// A node that never started was told nothing, and the note has to still be waiting.
+    ///
+    /// `spawn_node` has an exit before the run exists, and it is not an exotic one: the item claim
+    /// is a compare-and-swap that stops two passes starting two nodes on one tree, and losing it is
+    /// the ordinary outcome of a second pass arriving while the first is still working. The `Busy`
+    /// and provisioning-failure arms below it end the same way — no run, no prompt, nobody told.
+    ///
+    /// So the order inside `spawn_node` is the behaviour: read the queue, render, append, create the
+    /// run, and only THEN mark the notes delivered. A `mark_delivered` at the top reads as harmless
+    /// — the words were rendered, after all — and loses the owner's sentence in exactly the case
+    /// nothing reports. The run is never created, the prompt is thrown away, the note is gone from
+    /// the queue, and the owner learns about it by watching the job finish without doing what they
+    /// asked.
+    ///
+    /// `spawn_node` is called directly rather than through `advance`, because `advance` derives the
+    /// status it claims against from the view it just loaded and therefore cannot lose the swap
+    /// inside one pass. Driving the seam itself is the only way to stand in the moment this is about.
+    /// The run count is asserted as well as the note, because "no node started" is this test's
+    /// premise and a premise the test assumed rather than checked would make the rest of it vacuous.
+    #[tokio::test]
+    async fn a_note_is_not_consumed_by_a_node_that_failed_to_start() {
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        // The race the compare-and-swap exists to lose: another pass claimed this item first, so its
+        // row already says `running` and the claim below — which expects `pending`, the status the
+        // caller last saw — matches nothing.
+        seed_items(&pool, job_id, &["running"]).await;
+
+        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "duarte")
+            .await
+            .expect("the owner leaves a note on a job already running");
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        let step = spawn_node(
+            &state,
+            &job,
+            "implement",
+            "the brief this node would have been given".to_owned(),
+            Some(ItemClaim {
+                ordinal: 0,
+                held: "pending",
+            }),
+            (PathBuf::from("/project/a/worktree"), "nucleos/job".into()),
+        )
+        .await;
+
+        assert_eq!(
+            step,
+            Step::Stopped,
+            "an item that could not be claimed has to end the pass"
+        );
+        let started: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            started, 0,
+            "the premise of this test is that no node started, and one did"
+        );
+
+        assert_eq!(
+            crate::notes::pending(&pool, job_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            vec![note_id],
+            "the note was spent on a node that never read it, and nothing will say so"
+        );
     }
 }

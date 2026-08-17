@@ -124,6 +124,34 @@ impl TempDb {
 mod tests {
     use super::*;
 
+    /// Two branches, two migrations, one number, and a merge that says nothing.
+    ///
+    /// `_sqlx_migrations.version` is the PRIMARY KEY, so a repeated number is neither a merge
+    /// conflict nor a compile error: it is a panic inside `open` on the next start, and only after
+    /// the first file of the pair has already been applied and committed. That is the expensive
+    /// part. The loser rolls back, but the winner is now recorded with its checksum, so the loser
+    /// is the only one of the two that can still be renumbered — rename the winner and every
+    /// database that ran it refuses to open at all.
+    ///
+    /// The migrator's own list is walked rather than the directory, so this cannot drift from what
+    /// ships: it is the same embedded list `open` runs.
+    #[test]
+    fn no_two_migrations_claim_the_same_version() {
+        use std::collections::BTreeMap;
+
+        let mut claimed: BTreeMap<i64, String> = BTreeMap::new();
+        for migration in sqlx::migrate!("./migrations").iter() {
+            let description = migration.description.to_string();
+            if let Some(first) = claimed.insert(migration.version, description.clone()) {
+                panic!(
+                    "migration {} is claimed twice, by '{first}' and by '{description}' -- \
+                     renumber the one no database has applied yet",
+                    migration.version
+                );
+            }
+        }
+    }
+
     #[test]
     fn uma_escrita_por_confirmar_nao_toca_no_destino() {
         let dir = tempfile::tempdir().unwrap();

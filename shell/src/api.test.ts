@@ -273,6 +273,9 @@ describe("daemon API client", () => {
     await expect(api.approveProposal(TOKEN, 5)).resolves.toEqual({
       ok: true,
       resumeRunId: 77,
+      // Null and not absent: an ordinary approval closed nothing early, and the field being there
+      // with nothing in it is what lets a caller test it without knowing which kind it approved.
+      closed: null,
     });
     expectPostCall(1, `${DAEMON_URL}/proposals/5/approve`);
   });

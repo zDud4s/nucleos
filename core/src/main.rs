@@ -1,3 +1,4 @@
+mod agent;
 mod assistant;
 mod attention;
 mod auth;
@@ -16,6 +17,7 @@ mod council;
 mod daemon_client;
 mod email;
 mod errands;
+mod exclusion;
 mod feed;
 mod files;
 mod gate;
@@ -30,6 +32,7 @@ mod local_agent;
 mod logging;
 mod mailsend;
 mod mcp_tools;
+mod notes;
 mod notify;
 mod pii_shadow;
 mod presets;
@@ -44,6 +47,7 @@ mod runs;
 mod scheduler;
 mod search;
 mod secrets;
+mod sessions;
 mod shadow;
 mod sidecar;
 mod state;
@@ -109,6 +113,54 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("failed to read token from Credential Manager: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // `nucleos-core --land`, run from inside a worktree: "I am finished, take this branch."
+    //
+    // A subcommand rather than a documented `curl`, for the reason `--print-token` is one: the
+    // token lives in Credential Manager, and the alternative is teaching every session how to
+    // fetch the master key in order to ask a question about itself. Here the binary reads it, and
+    // the session runs one word.
+    //
+    // It asks; it does not wait. The queue decides when, and the ticket is how to follow it —
+    // printing the id and returning is the honest shape for a request whose whole point is that
+    // somebody else schedules it.
+    if std::env::args().any(|a| a == "--land") {
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = serde_json::json!({ "cwd": cwd }).to_string();
+        let response = reqwest::Client::new()
+            .post("http://127.0.0.1:8791/vcs/land")
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{text}");
+                } else {
+                    eprintln!("the queue refused: {text}");
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
                 std::process::exit(1);
             }
         }
@@ -594,6 +646,7 @@ async fn main() {
         }),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };

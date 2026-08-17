@@ -10,6 +10,7 @@ function turn(overrides: Partial<Turn> & { id: number }): Turn {
     cost_usd: null,
     failed: false,
     answeredBy: "cloud",
+    sessionId: null,
     ...overrides,
   };
 }

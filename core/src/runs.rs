@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -327,7 +327,7 @@ pub(crate) fn run_env(
 /// a secret that lands in the row a moment later would 401 that call for reasons no log explains.
 /// A failure to store is not fatal — the run proceeds with a key that authenticates nothing, so its
 /// tool calls are refused rather than ungoverned, which is the right direction to fail in.
-async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
+pub(crate) async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
     let (token, secret) = crate::auth::mint_run_token(id);
     if let Err(error) = sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
         .bind(&secret)
@@ -460,6 +460,10 @@ struct Registration {
     /// a task can end are the three ways a run stops listening — and a sender outliving its receiver
     /// would let `post_run_message` accept a turn nothing will ever read.
     messages: crate::state::RunMessages,
+    /// Released here for the same reason as the two above, and the cost of getting it wrong is
+    /// different in kind: an abort handle is a word, a transcript is the run's entire output. Left
+    /// behind, every run the daemon has ever executed stays in memory until restart.
+    tails: crate::state::RunTails,
     id: i64,
 }
 
@@ -467,7 +471,31 @@ impl Drop for Registration {
     fn drop(&mut self) {
         self.handles.lock().unwrap().remove(&self.id);
         self.messages.lock().unwrap().remove(&self.id);
+        self.tails.lock().unwrap().remove(&self.id);
     }
+}
+
+/// What a live run has written so far, from `since` bytes in.
+///
+/// `None` means there is no live tail — the run finished, or this daemon never started it. It does
+/// NOT mean the run wrote nothing, and the difference is the whole point: `run_events` is written
+/// once at the end (`append_run_events` has two callers and both are terminal), so a finished run's
+/// output lives in the database and not here. A caller that renders `None` as an empty transcript
+/// claims a run produced nothing when the durable copy may hold thousands of lines.
+///
+/// `since` is in BYTES. The last line of a working run has not ended, so a line count would give a
+/// cursor that moves backwards as that line grows.
+pub(crate) fn read_tail(
+    tails: &crate::state::RunTails,
+    run_id: i64,
+    since: usize,
+) -> Option<String> {
+    let buffer = tails.lock().ok()?.get(&run_id).cloned()?;
+    let text = buffer.lock().ok()?;
+    // Saturating rather than slicing: `since` past the end is what every poll of a run that wrote
+    // nothing since the last one looks like, so it is the common path, and `&text[since..]` would
+    // panic on it inside the daemon's HTTP thread.
+    Some(text.get(since..).unwrap_or("").to_owned())
 }
 
 /// Tells a steerable run that no more turns are coming.
@@ -508,6 +536,7 @@ where
     let registration = Registration {
         handles: state.run_handles.clone(),
         messages: state.run_messages.clone(),
+        tails: state.run_tails.clone(),
         id,
     };
     let mut handles = state.run_handles.lock().unwrap();
@@ -1015,6 +1044,7 @@ fn spawn_run(
     let progress_timeout = state.progress_timeout;
     let handoff_state = state.clone();
     let run_messages = state.run_messages.clone();
+    let run_tails = state.run_tails.clone();
 
     spawn_registered(state, id, async move {
         let mut attempt: u32 = 1;
@@ -1037,6 +1067,17 @@ fn spawn_run(
 
             // Owned out here so it survives the timeout below dropping the run future.
             let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            // Published so `GET /runs/{id}/tail` can read it while the CLI is still writing. This
+            // is inside the retry loop, and the insert therefore REPLACES the previous attempt's
+            // buffer rather than adding to it — which is the wanted behaviour: a retry starts a
+            // fresh CLI on a fresh context, so the old transcript describes work that is no longer
+            // happening, and a screen still showing it would be reporting a dead attempt as live.
+            //
+            // Removal is not here. `Registration`'s `Drop` takes this entry out beside the abort
+            // handle and the steering channel, which is what covers the abort and panic paths too.
+            if let Ok(mut map) = run_tails.lock() {
+                map.insert(id, std::sync::Arc::clone(&transcript));
+            }
             let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
             // Held for this attempt only: a retry starts a fresh CLI on a fresh context, so the
             // previous attempt's mirror has nothing left to say. Dropping the guard at the end of
@@ -2173,6 +2214,50 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     Ok(resume_id)
 }
 
+/// Where a tail read should resume from. Absent is the start.
+#[derive(serde::Deserialize)]
+pub struct TailQuery {
+    pub since: Option<usize>,
+}
+
+/// What a run has written since `since`, while it is still writing.
+#[derive(serde::Serialize)]
+pub struct TailResponse {
+    pub text: String,
+    /// The offset to send back next time, in bytes. Handed over rather than left to the client to
+    /// compute: it is `since + text.len()`, and a client that measured the string in characters
+    /// instead would drift on the first non-ASCII byte and then re-send text it already had.
+    pub next: usize,
+    /// Always `true` on a 200 — there is no live tail without a live run. Present so the shape does
+    /// not change if a recorded fallback is ever served through this same route, and so the screen
+    /// has something to bind its "ao vivo" label to rather than inferring it from the status code.
+    pub live: bool,
+}
+
+/// Serves the live tail, and answers 204 when there is not one.
+///
+/// **204, never 404.** `404` claims the run does not exist, which is usually false and always
+/// misleading here: the ordinary reason for no tail is a run that finished, or one a previous
+/// daemon started, and both of those have their whole output in `runs.stdout` and `run_events`. A
+/// client told the id is wrong stops asking; a client told there is no content knows to read the
+/// recorded copy instead.
+///
+/// No database work on this path at all, which is what lets a screen poll it every three seconds
+/// per visible run without the tick paying for it.
+pub async fn get_run_tail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<TailQuery>,
+) -> Result<Json<TailResponse>, StatusCode> {
+    let since = query.since.unwrap_or(0);
+    let text = read_tail(&state.run_tails, id, since).ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(TailResponse {
+        next: since + text.len(),
+        text,
+        live: true,
+    }))
+}
+
 pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -2602,6 +2687,80 @@ mod tests {
         );
     }
 
+    /// A live run's tail is readable from outside its task, and the offset is in BYTES.
+    ///
+    /// Bytes rather than lines because the last line of a working run has not ended yet: counting
+    /// lines would give a cursor that moves backwards every time the line in progress grows, and the
+    /// reader would redraw text it already had.
+    #[test]
+    fn a_live_tail_is_read_from_a_byte_offset() {
+        let tails: crate::state::RunTails = Default::default();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        tails
+            .lock()
+            .unwrap()
+            .insert(7, std::sync::Arc::clone(&buffer));
+
+        buffer.lock().unwrap().push_str("primeira\n");
+        assert_eq!(read_tail(&tails, 7, 0).as_deref(), Some("primeira\n"));
+
+        buffer.lock().unwrap().push_str("segunda");
+        assert_eq!(
+            read_tail(&tails, 7, 9).as_deref(),
+            Some("segunda"),
+            "the second read repeated what the first had already shown"
+        );
+    }
+
+    /// No entry is `None`, and `None` is not the empty string.
+    ///
+    /// The distinction is the whole contract. A run this daemon never started, and a run that has
+    /// finished, both have no tail — and neither produced no output. `Some("")` would let a screen
+    /// draw an empty transcript over a run that wrote thousands of lines; `None` makes it say where
+    /// the durable copy is instead.
+    #[test]
+    fn a_run_with_no_live_tail_is_absent_rather_than_empty() {
+        let tails: crate::state::RunTails = Default::default();
+        assert_eq!(read_tail(&tails, 404, 0), None);
+    }
+
+    /// An offset past the end is empty, not a panic.
+    ///
+    /// It happens on every ordinary poll of a run that wrote nothing since the last one, so it is
+    /// the common path and not an edge case. It is also what a slicing bug would turn into a crash
+    /// in the daemon's HTTP thread.
+    #[test]
+    fn an_offset_at_or_past_the_end_reads_empty() {
+        let tails: crate::state::RunTails = Default::default();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::from("abc")));
+        tails.lock().unwrap().insert(1, buffer);
+
+        assert_eq!(read_tail(&tails, 1, 3).as_deref(), Some(""));
+        assert_eq!(read_tail(&tails, 1, 99).as_deref(), Some(""));
+    }
+
+    /// The guard that drops a run's abort handle drops its tail with it.
+    ///
+    /// Registered in one place and released in another is how a map leaks: every run the daemon has
+    /// ever executed would keep its whole transcript in memory until restart. `Registration` already
+    /// owns that lifetime for the other two maps, and this is what keeps the third beside them.
+    #[test]
+    fn ending_a_run_takes_its_tail_with_the_rest_of_its_registration() {
+        let handles: crate::state::RunHandles = Default::default();
+        let messages: crate::state::RunMessages = Default::default();
+        let tails: crate::state::RunTails = Default::default();
+        tails.lock().unwrap().insert(9, Default::default());
+
+        drop(Registration {
+            handles: handles.clone(),
+            messages: messages.clone(),
+            tails: tails.clone(),
+            id: 9,
+        });
+
+        assert!(tails.lock().unwrap().is_empty(), "the tail outlived its run");
+    }
+
     async fn retention_pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -2876,6 +3035,7 @@ mod tests {
             local_assistant: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
@@ -3075,6 +3235,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 max_items: 5,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
@@ -3754,6 +3915,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 max_items: 5,
                 gate_each: true,
                 review: true,
+                gate_retries: 0,
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
