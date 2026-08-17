@@ -136,7 +136,7 @@ pub struct Errand {
     /// When this errand is finished, in the owner's words — the gate of an investigation.
     ///
     /// `None` for every errand that answers when spoken to and does nothing else, which is the
-    /// default and stays the default. See migration 0079 for why the gate is a sentence.
+    /// default and stays the default. See migration 0080 for why the gate is a sentence.
     pub done_when: Option<String>,
     /// How many more turns it may take on its own initiative. Zero means none, which is what makes
     /// this dark until somebody turns it on.

@@ -2529,7 +2529,7 @@ mod tests {
     /// An errand nobody made an investigation carries on exactly as before.
     ///
     /// The regression half. `windows_left` defaults to zero and `done_when` to NULL, so every errand
-    /// that existed before migration 0079 — and every one opened by `/assunto` since — answers when
+    /// that existed before migration 0080 — and every one opened by `/assunto` since — answers when
     /// spoken to and starts nothing. A default that quietly armed them would turn every open errand
     /// into a spender on the day this shipped.
     #[tokio::test]
