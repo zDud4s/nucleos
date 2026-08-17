@@ -28,6 +28,9 @@ function renderFleet() {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  // The chosen view and the node layout live here, and a test that switched view would otherwise
+  // decide what the next one opens on.
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -436,6 +439,45 @@ it("offers the pairing action only where it can be used", async () => {
 });
 
 /**
+ * And it goes away once there is nobody left to ask about.
+ *
+ * Found by looking at the rendered page rather than at the DOM: with two jobs already tied to each
+ * other, both cards still offered to pair, and the only thing that click could produce was the
+ * daemon's 409. An action whose sole outcome is a refusal is worse than a missing one — the person
+ * learns the screen was offering something that was never there.
+ */
+it("takes the pairing action away when every neighbour is already paired", async () => {
+  respondWith({
+    ...TWO_JOBS,
+    "/fleet/exclusions": [
+      {
+        id: 3,
+        project_id: "alpha",
+        job_low: 41,
+        job_high: 42,
+        proposal_id: 9,
+        paths: null,
+        created_at: "t",
+      },
+    ],
+  });
+  renderFleet();
+  await settle();
+
+  expect(screen.getAllByRole("button", { name: /^lift$/i }).length).toBe(2);
+  expect(screen.queryByRole("button", { name: /not at the same time as…/i })).toBeNull();
+});
+
+/** A request that is still only a request closes the offer just the same: asking twice is a 409. */
+it("takes it away for a pair that has already been asked about", async () => {
+  respondWith({ ...TWO_JOBS, "/fleet/exclusions/requests": [REQUEST] });
+  renderFleet();
+  await settle();
+
+  expect(screen.queryByRole("button", { name: /not at the same time as…/i })).toBeNull();
+});
+
+/**
  * A run's card has no graph: it has a way through to the Runs tab.
  *
  * The `RUNS` key and the `run()` factory are load-bearing — without them `slotDetail` answers
@@ -465,4 +507,37 @@ it("sends a run's card to the Runs tab instead of drawing a graph", async () => 
   fireEvent.click(screen.getByRole("button", { name: /open in runs/i }));
 
   expect(onOpenRuns).toHaveBeenCalled();
+});
+
+/**
+ * The two views are two ways of looking at the same fleet, and the screen remembers which.
+ *
+ * Not a replacement: the columns carry `n/limit`, the only thing on the whole screen that says
+ * there is no more room, and a free surface has nowhere to put that number without inventing a
+ * frame per project. What the canvas has instead is every project at once, which is the shape of
+ * the question it exists for.
+ *
+ * Remembered because it is a preference of whoever is looking, and being put back in the other view
+ * on every reload is how a second view stops being used.
+ */
+it("keeps the view you chose, across a reload", async () => {
+  respondWith({ [CONCURRENCY]: readout([column()]), [JOBS]: [job()] });
+  const first = renderFleet();
+  await settle();
+
+  // The columns are what a screen with no preference opens on.
+  expect(first.container.querySelector(".fleet-columns")).not.toBeNull();
+  expect(first.container.querySelector("[data-node]")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Canvas" }));
+
+  expect(first.container.querySelector(".fleet-columns")).toBeNull();
+  expect(first.container.querySelector('[data-node="job:41"]')).not.toBeNull();
+
+  // The reload.
+  first.unmount();
+  const second = renderFleet();
+  await settle();
+
+  expect(second.container.querySelector('[data-node="job:41"]')).not.toBeNull();
 });

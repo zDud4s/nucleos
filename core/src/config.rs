@@ -405,6 +405,68 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     }
 }
 
+/// `.ai/browser.yaml`. The browser pillar's switch and its ceilings (spec §8).
+///
+/// The site lists are deliberately NOT here, and that omission is the pillar's central invariant:
+/// they live in `browser_sites` and grow only when a person finishes a login (spec §5.2). A field in
+/// this file would be a way to grant a profile access to a host by editing a gitignored YAML, which
+/// is exactly the path §5.2 exists to close.
+///
+/// There is also no field that widens the fence. Spec §6.4: the boundary of §6.2 is not
+/// configurable, because a switch to loosen it is a switch somebody eventually finds a reason to
+/// flip at 2am.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct BrowserConfig {
+    /// Opt-in, like every pillar that reaches the network. Ships off (spec §14.2).
+    pub enabled: bool,
+    /// Live tabs. They compete with the local model for the same card, so this is a ceiling rather
+    /// than a target.
+    pub max_sessions: u32,
+    pub cache_size_mb: u32,
+    /// Persistent profiles. Above this the sidecar refuses and names one to forget.
+    pub max_profiles: u32,
+    /// The whole profiles directory, ephemeral included. Reaching it sweeps first and refuses second.
+    pub disk_budget_mb: u32,
+    pub load_timeout_seconds: u32,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        // The numbers spec §8 ships, so the documented file and an absent file behave alike.
+        Self {
+            enabled: false,
+            max_sessions: 2,
+            cache_size_mb: 100,
+            max_profiles: 20,
+            disk_budget_mb: 3000,
+            load_timeout_seconds: 30,
+        }
+    }
+}
+
+/// Reads `.ai/browser.yaml`. Absent, unreadable or malformed → defaults, with a warning.
+///
+/// Defaults mean the pillar is OFF, so a broken file costs a capability and never grants one — the
+/// same asymmetry [`load_web_config`] has, and here it is easier to justify: there is nothing in
+/// this file whose default is more permissive than what somebody would have written.
+pub fn load_browser_config(path: &Path) -> BrowserConfig {
+    if !path.exists() {
+        return BrowserConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<BrowserConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "browser config: could not be parsed; the pillar stays off");
+            BrowserConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "browser config: could not be read; the pillar stays off");
+            BrowserConfig::default()
+        }
+    }
+}
+
 /// How many seats one council may hold.
 ///
 /// Eight, from the Python orchestrator this pillar was ported out of, where it was the parallelism
@@ -719,7 +781,9 @@ pub fn load_council_config(path: &Path, local_available: bool) -> Option<Council
 /// project silently stops. That direction is fail-closed, which is precisely why nobody notices —
 /// the contract this module advertises is "error on malformed YAML rather than guess", and a
 /// misspelt key is malformed.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`: `GraphConfig` carries an `Option<f64>` now, and floats are not `Eq`.
+// Nothing outside this module ever needed the total equality.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleRule {
     pub name: String,
@@ -838,7 +902,8 @@ fn default_true() -> bool {
 
 /// Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a
 /// single run capped by one context window.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`: `budget_usd` is an `Option<f64>`, and floats have no total equality.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphConfig {
     #[serde(default = "default_max_items")]
@@ -849,6 +914,22 @@ pub struct GraphConfig {
     pub review: bool,
     #[serde(default = "default_gate_retries")]
     gate_retries: usize,
+    /// The most this one job may spend, in USD, before its own brakes stop it.
+    ///
+    /// `None` — the key absent — means what every `graph:` rule has always meant: only the house
+    /// limit governs this job. That is the behaviour of every rule already sitting in somebody's
+    /// gitignored `.ai/autopilot.yaml`, and it must stay theirs, so there is no default number here.
+    ///
+    /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
+    /// accessor because the accessor applies a CEILING against a per-developer file no review sees.
+    /// A budget has no ceiling to apply: it runs UNDER the house limit rather than instead of it, so
+    /// whatever the file writes here can only ever tighten what this job is allowed to spend. There
+    /// is no number a rule could put in this key that buys it more than the daemon already allows.
+    ///
+    /// The value must be a finite, non-negative number; `load_schedule_rules` refuses the rest
+    /// rather than clamping, for the reasons written at `validate_rules`.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
 }
 
 impl GraphConfig {
@@ -879,7 +960,8 @@ pub struct RepoTrigger {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+// `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AutopilotRules {
     #[serde(default)]
@@ -904,8 +986,63 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
     if contents.trim().is_empty() {
         return Ok(AutopilotRules::default());
     }
-    serde_yaml::from_str(&contents)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let rules: AutopilotRules = serde_yaml::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    validate_rules(&rules)?;
+    Ok(rules)
+}
+
+/// Refuses the values that parse as numbers but that no rule could have meant.
+///
+/// Here rather than in a `Deserialize` detail on purpose: serde's job is the shape of the file, and
+/// this is a range check on a value whose shape was fine. `load_schedule_rules` is already the place
+/// where "the file says something impossible" becomes `InvalidData`, so it stays the one place a
+/// caller has to look, and a hand-built `GraphConfig` in a test is not silently held to a rule that
+/// only the file-reading path enforces.
+///
+/// Refused rather than clamped, both times, because `.ai/autopilot.yaml` is gitignored per-developer
+/// configuration no review ever sees. A number quietly corrected there is a number nobody learns was
+/// wrong: the file would keep reading as though it had asked for something, and the job would behave
+/// as though it had asked for something else.
+///
+/// - **Negative.** A negative allowance is not a number anyone meant to write. Clamped to zero it
+///   would stop the job at its first node, which is a real behaviour change bought by a typo.
+/// - **Non-finite.** The sharp one, and the reason "reject negatives" is not the whole rule. Every
+///   comparison against NaN is false, and `job::job_over_budget` decides with
+///   `spent + reserve <= limit`: a NaN limit makes that false for ever, so the brake reads as
+///   already blown and the job stops at its FIRST node while the file reads as though it had asked
+///   for something generous. An infinity is the same class of answer from the other end — a ceiling
+///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
+///   by leaving the key out, which is what `None` already means.
+fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+    for rule in &rules.schedules {
+        let Some(budget) = rule.graph.as_ref().and_then(|graph| graph.budget_usd) else {
+            continue;
+        };
+        if !budget.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "schedule `{}`: budget_usd must be a finite number, got `{budget}`; a ceiling \
+                     that cannot be compared against is not a ceiling — leave the key out to run \
+                     under the house limit alone",
+                    rule.name
+                ),
+            ));
+        }
+        if budget < 0.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "schedule `{}`: budget_usd must not be negative, got `{budget}`; it is not \
+                     clamped to zero because that would stop the job at its first node while the \
+                     file still read as though it had asked for something",
+                    rule.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1015,6 +1152,97 @@ mod tests {
         )
         .expect_err("an unknown key inside graph is an error");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The overnight case is the one this field exists for. A job fired at 03:00 with nobody
+    /// watching is precisely the job that can eat the whole house allowance before morning, and
+    /// until now it was the only kind that could not be given a ceiling of its own: `POST /jobs`
+    /// has taken `budget_usd` since the column did, and the scheduler hard-coded `None` because
+    /// there was nowhere in a rule to write one.
+    ///
+    /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
+    /// accessor because the accessor applies a CEILING; a budget has no ceiling to apply, because
+    /// it runs UNDER the house limit rather than instead of it and can therefore only ever tighten.
+    /// Public is what `gate_after_each_item` and `review` already are, for the same reason.
+    #[test]
+    fn a_graph_block_may_name_its_own_budget() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: 5.0\n",
+        )
+        .expect("a graph block naming a budget parses");
+        assert_eq!(
+            rules.schedules[0].graph.as_ref().unwrap().budget_usd,
+            Some(5.0),
+            "the number the file asked for is the number the rule carries"
+        );
+    }
+
+    /// Absent means absent, and never zero. A rule that says nothing about money keeps exactly
+    /// today's behaviour — only the house limit governs — and every `graph:` rule already sitting in
+    /// somebody's gitignored `.ai/autopilot.yaml` says nothing about money. Defaulting this to a
+    /// number would put a ceiling on all of them overnight, and the first evidence would be a job
+    /// stopping for a limit nobody set.
+    ///
+    /// The block here is non-empty on purpose: what must yield `None` is the absence of this one
+    /// key inside a `graph:` block that is otherwise present and saying things.
+    #[test]
+    fn a_graph_block_without_a_budget_leaves_the_house_limit_alone() {
+        let rules = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_items: 2\n",
+        )
+        .expect("a graph block that says nothing about money parses");
+        assert_eq!(rules.schedules[0].graph.as_ref().unwrap().budget_usd, None);
+    }
+
+    /// Malformed, not clamped. The posture this module advertises is that it falls back to defaults
+    /// when the file is ABSENT but errors on malformed YAML rather than guessing, and a negative
+    /// allowance is not a number anyone meant to write.
+    ///
+    /// Clamping it silently to zero would be the worse of the two failures: the job would stop at
+    /// its first node while `.ai/autopilot.yaml` still read as though it had asked for something,
+    /// and the file is gitignored per-developer configuration that no review ever sees.
+    #[test]
+    fn a_negative_budget_is_malformed_rather_than_clamped() {
+        let error = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: -1.0\n",
+        )
+        .expect_err("a negative allowance is not a number anyone meant");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        // Refused for the RIGHT reason. Before `budget_usd` existed as a field, `deny_unknown_fields`
+        // refused this same YAML as an unknown key — so without this line the assertion above is
+        // green on both sides of what the test claims, and would stay green if the field were added
+        // and the range check forgotten.
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "the key must be recognised and its VALUE refused: {error}"
+        );
+    }
+
+    /// NaN is the sharp case, and the reason "reject negatives" is not the whole rule.
+    ///
+    /// Every comparison against NaN is false. `job::job_over_budget` decides with
+    /// `spent + reserve <= limit`, so a NaN limit makes that false forever: the brake reads as
+    /// already blown and the job stops at its FIRST node, while the file reads as though it had
+    /// asked for something generous. An infinity is the same class of answer from the other end — a
+    /// ceiling that can never be reached is not a ceiling, and a rule that wanted no ceiling says so
+    /// by leaving the key out.
+    #[test]
+    fn a_budget_that_is_not_a_finite_number_is_refused() {
+        for value in [".nan", ".inf"] {
+            let error = rules_from(&format!(
+                "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      budget_usd: {value}\n"
+            ))
+            .err()
+            .unwrap_or_else(|| panic!("{value} must be refused, not accepted as a budget"));
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{value}");
+            // As in the negative case: `deny_unknown_fields` refuses this YAML today for a reason
+            // that has nothing to do with the value, so the kind check alone would pass before the
+            // field exists and after a finiteness check was left out.
+            assert!(
+                !error.to_string().contains("unknown field"),
+                "{value} must be recognised as a budget and refused as a number: {error}"
+            );
+        }
     }
 
     fn email_config_from(yaml: &str) -> EmailConfig {

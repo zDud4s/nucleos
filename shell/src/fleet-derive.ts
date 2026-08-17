@@ -11,6 +11,17 @@ import {
 } from "./api";
 
 /**
+ * Identifies an owner across ticks, so a cancelled card stays gone — and identifies a NODE on the
+ * canvas, so a saved position belongs to one owner and not to a number.
+ *
+ * `"job:41"` and never `41`: job ids and run ids come from different sequences and collide
+ * constantly, which is the same reason `slotDetail` below compares the pair rather than the id.
+ */
+export function ownerKey(slot: HeldSlot): string {
+  return `${slot.owner_kind}:${slot.owner_id}`;
+}
+
+/**
  * What is known about a slot's owner.
  *
  * `unknown` and `orphaned` are different states and it matters that they are. The first is

@@ -4,9 +4,10 @@
 -- policy — already has a row in `agents`; a table here would be the second place the same truth is
 -- declared, and the design says so at length.
 --
--- Numbered 0074 against a branch tip of 0073 and a master tip of 0072. Re-check before merging: the
--- number is not reserved by being written down, only by being on master, and this repository has
--- lost that bet four times.
+-- Numbered 0082, having been cut as 0074 against a master tip of 0072. That bet lost, as it had
+-- four times before: master is at 0079 now. `0081_runs_team_run_id.sql` carries the whole account,
+-- including why this branch's four files start above master's highest instead of filling the hole
+-- at 0074-0078.
 
 -- The agent that took this seat, or NULL for a seat declared the old way — `{ kind, ref }`, which
 -- stays valid forever. Not a declared foreign key, for the reason `chairman_run_id` gives one line

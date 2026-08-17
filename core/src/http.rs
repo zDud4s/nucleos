@@ -182,6 +182,9 @@ pub fn build_router(state: AppState) -> Router {
         // node leaves the tree holding edits no gate measured — but only this one reaches a job
         // that has no node in flight: parked for budget, waiting for the slot, or between nodes.
         .route("/jobs/{id}/cancel", post(cancel_job))
+        // Speaking to a job that is already running. Scoped like `POST /runs/{id}/message` and
+        // deliberately NOT like the `POST /jobs` one segment above it — see `post_job_note`.
+        .route("/jobs/{id}/notes", post(post_job_note))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -211,6 +214,10 @@ pub fn build_router(state: AppState) -> Router {
             "/vcs/requests",
             post(submit_vcs_request).get(list_vcs_requests),
         )
+        // Beside `/vcs/requests` because it admits one, and apart from it because the caller knows
+        // something different: a worktree knows where it is standing and nothing else, while
+        // `/vcs/requests` is for a caller that already names a project and an operation.
+        .route("/vcs/land", post(land_worktree))
         // Two spellings of one read, separated only by how long the caller is willing to hold the
         // line. `/wait` blocks up to `vcs::DEFAULT_WAIT`; the bare route is the same read with a
         // zero deadline, which `wait_for` answers from its first look at the row.
@@ -278,6 +285,35 @@ pub fn build_router(state: AppState) -> Router {
         .route("/web/read", post(crate::web::post_read))
         .route("/web/pages", get(crate::web::list_pages))
         .route("/web/pages/{id}", get(crate::web::get_page))
+        // The browser pillar. Every one of these needs Admin — none is in `auth.rs`'s read-only
+        // table, including the two GETs, because the list of hosts a project has logged into is a
+        // map of where its owner has accounts.
+        //
+        // There is no `/browser/grant`, and its absence is the pillar's central invariant rather
+        // than an omission: the site list grows when a person finishes a login and hands the wheel
+        // back (spec §5.2), never by asking for a host to be added.
+        .route("/browser/open", post(crate::browser::post_open))
+        .route("/browser/snapshot", post(crate::browser::post_snapshot))
+        .route("/browser/act", post(crate::browser::post_act))
+        .route("/browser/screenshot", post(crate::browser::post_screenshot))
+        .route("/browser/close", post(crate::browser::post_close))
+        .route("/browser/revoke", post(crate::browser::post_revoke))
+        .route("/browser/forget", post(crate::browser::post_forget))
+        // The wheel (spec §4.4). `/handoff` is the agent asking; there is deliberately no route that
+        // ACCEPTS — accepting is `POST /proposals/{id}/approve`, the same door every other decision
+        // goes through, so the compare-and-set that settles a concurrent approve is also the write
+        // that moves the session out of the agent's hands (rule 1).
+        //
+        // `/keep` is the closest thing to a grant on this surface, and it names no host: it answers
+        // yes or no to a chain a browser recorded under a person's own hands.
+        .route("/browser/handoff", post(crate::browser_wheel::post_handoff))
+        .route("/browser/return", post(crate::browser_wheel::post_return))
+        .route("/browser/keep", post(crate::browser_wheel::post_keep))
+        .route("/browser/sessions", get(crate::browser::list_open_sessions))
+        .route(
+            "/browser/sites/{project_id}",
+            get(crate::browser::get_sites),
+        )
         .route("/voice/config", get(crate::voice::get_config))
         .route("/voice/memos", get(crate::voice::list_memos))
         // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
@@ -336,6 +372,15 @@ pub fn build_router(state: AppState) -> Router {
             post(post_file_upload).layer(DefaultBodyLimit::max(crate::files::MAX_UPLOAD_BYTES)),
         )
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
+        // construction rather than by a list: `permits` gives `Control` everything and answers every
+        // other scope from an allowlist, so a route absent from all of them is reachable by the
+        // control token alone. `Scope::Run` must never arrive here — a run has its own route, whose
+        // handler checks the claimed run against the token, and this one has no run to check.
+        .route(
+            "/hooks/session-git-decision",
+            post(crate::hooks::session_git_decision),
+        )
         .route("/api-tokens", get(list_api_tokens).post(create_api_token))
         .route(
             "/api-tokens/{name}",
@@ -2627,6 +2672,110 @@ fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
 /// proposal, which is what the approval chunk adds. A disconnect between them would leave a request
 /// that can never be approved. Whoever writes that second write moves this through `uncancellable`
 /// at the same time.
+#[derive(serde::Deserialize)]
+struct LandBody {
+    /// Anywhere inside the worktree that is asking. Resolved to its root, so a session standing
+    /// in a subdirectory asks the same question as one standing at the top.
+    cwd: String,
+}
+
+/// "I am finished — take this branch." The one request a worktree could not previously express.
+///
+/// **A session can only ever have asked for merges INTO its own branch**, because
+/// `merge_from_command` takes the target from the worktree it is standing in and there is no other
+/// branch it could name. The reverse — landing the work — has no git spelling from inside the
+/// worktree at all: you would have to check out the integration branch, which is the isolation
+/// violation a worktree session must not commit, and which its harness blocks outright. So this is
+/// not a command to be intercepted; it is a request, and it needed a door of its own.
+///
+/// **Asking is authorisation; it is not scheduling.** The session's own completion is the decision
+/// that the work is ready — a person commanding it, or the agent when it has finished — so the row
+/// enters `queued` rather than `awaiting_approval`, and no second approval is invented for a
+/// judgement that has already been made. What stays with the queue is WHEN, which is the part a
+/// session cannot know: one operation per repository, in order, against a repository that may have
+/// moved since the asking.
+///
+/// **Re-evaluation is not added here because it is already how the queue works.** The merge is
+/// computed fresh in the integration worktree at the moment of execution, not at the moment of
+/// asking, so a branch that has diverged or a merge that has come to conflict aborts before
+/// publishing and the row records `failed` with git's own output. A request that can no longer land
+/// says so and stops, which is the behaviour wanted rather than a new mechanism.
+///
+/// The target is the branch the project's MAIN worktree has open, not a configured name. It is the
+/// branch the project is standing on, which is what "land it" means to whoever asks, and it is read
+/// rather than assumed so a project that works on something other than `master` needs no setting.
+async fn land_worktree(
+    State(state): State<AppState>,
+    Json(body): Json<LandBody>,
+) -> Result<Json<vcs::Ticket>, (StatusCode, String)> {
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let refuse = |code: StatusCode, reason: String| (code, reason);
+
+    let root = crate::git_exec::toplevel(std::path::Path::new(&body.cwd), deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    let source = crate::git_exec::current_branch(&root, deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    if source.trim() == "HEAD" {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this worktree is on a detached HEAD, so there is no branch to land".to_owned(),
+        ));
+    }
+
+    let project_id = crate::vcs::project_for_worktree(&state.pool, &root, deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::NOT_FOUND, reason))?;
+    let repo = crate::vcs::resolve_repo(&state.pool, &project_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(project_id, ?error, "land: could not resolve the repository");
+            refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{project_id}'s repository could not be resolved"),
+            )
+        })?;
+
+    let target = crate::git_exec::current_branch(std::path::Path::new(repo.root()), deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    // Standing on the integration branch itself. Refused rather than admitted as a no-op, because
+    // the request means "take my work" and there is no separate work to take — and `Merge` with one
+    // branch named twice is a shape the executor should never be handed.
+    if source.trim() == target.trim() {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("this worktree is already on {target}, which is where work lands"),
+        ));
+    }
+
+    let op = crate::vcs::Op::Merge {
+        source: crate::vcs::Branch::new(source.trim())
+            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
+        target: crate::vcs::Branch::new(target.trim())
+            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
+    };
+    let id = crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "land: admitting the request failed");
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the request could not be admitted".to_owned(),
+            )
+        })?;
+
+    vcs_ticket(&state, id, std::time::Duration::ZERO)
+        .await
+        .map_err(|code| {
+            refuse(
+                code,
+                "the request was admitted but could not be read back".to_owned(),
+            )
+        })
+}
+
 async fn submit_vcs_request(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -3611,9 +3760,13 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "browser-wheel" {
+        return approve_browser_wheel(state, id).await;
+    }
+
     if kind == "fleet-exclusion" {
-        // Fourth kind through this door, third that starts no run. Uncancellable for the reason the
-        // other three are: the rule and the decision that authorised it commit together, and a
+        // Fifth kind through this door, fourth that starts no run. Uncancellable for the reason the
+        // others are: the rule and the decision that authorised it commit together, and a
         // request dropped mid-flight must not leave a job parked by a rule whose proposal still
         // reads `pending` beside it.
         let state = state.clone();
@@ -3772,6 +3925,104 @@ async fn post_proposal_approve(
     }
 }
 
+/// A person took the wheel (spec §4.4, rules 1 and 3).
+///
+/// The `transition` below is the load-bearing line, and its position is the argument: it is a
+/// compare-and-set on `status = 'pending'`, so exactly one of two concurrent approvals wins — and the
+/// one that wins is the one that then hands over the browser. Handing over first and recording
+/// afterwards would let both callers open a window; recording without handing over would leave a
+/// proposal saying a person is driving something that was never started.
+///
+/// Uncancellable for the same reason as the three arms above: a request dropped in between would
+/// leave the decision recorded and the window unopened.
+async fn approve_browser_wheel(
+    state: AppState,
+    id: i64,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a wheel request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the proposal could not be read".to_owned(),
+            )
+        })?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(serde_json::Value::as_i64))
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this wheel request names no session".to_owned(),
+            )
+        })?;
+
+    let transitioned = crate::proposals::transition(&state.pool, id, "approved", "wheel accepted")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "accepting a wheel request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decision could not be recorded".to_owned(),
+            )
+        })?;
+    if !transitioned {
+        return Err((
+            StatusCode::CONFLICT,
+            "this proposal has already been decided".to_owned(),
+        ));
+    }
+
+    let handover = state.clone();
+    match uncancellable(async move { crate::browser_wheel::accept(&handover, session_id).await })
+        .await
+        .map_err(|status| (status, "the handover task did not finish".to_owned()))?
+    {
+        Ok(row) => Ok(Json(serde_json::json!({ "session": row }))),
+        Err(crate::browser_wheel::WheelError::NoSuchSession) => Err((
+            StatusCode::NOT_FOUND,
+            "the session this wheel was asked for is gone".to_owned(),
+        )),
+        // The window did not open (spec §4.4a). The session is recorded as a failed delivery and the
+        // proposal carries the reason; it does NOT go back to the agent.
+        Err(error) => Err((StatusCode::BAD_GATEWAY, error.to_string())),
+    }
+}
+
+/// The wheel was not given (spec §4.4), and the session goes with the refusal.
+///
+/// Spec §4.4's diagram draws an arrow back to `agente_conduz`, and this is deliberately narrower —
+/// `browser_wheel`'s module comment carries the reasoning. In short: the wall that caused the request
+/// is still there, §4.5 already says the run continues without that page, and giving the wheel back
+/// would need a second place where the two processes can disagree about who is driving.
+async fn reject_browser_wheel(state: AppState, id: i64) -> Result<StatusCode, StatusCode> {
+    let session_id = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(serde_json::Value::as_i64));
+
+    if !crate::proposals::transition(&state.pool, id, "rejected", "wheel refused")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "rejecting a wheel request failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    if let Some(session_id) = session_id
+        && let Err(error) = crate::browser_wheel::refuse(&state, session_id).await
+    {
+        // Logged and not returned. The refusal is recorded and that is the part the person asked
+        // for; a session left open by a sidecar that did not answer is retired on its next restart.
+        tracing::warn!(session = session_id, error = %error, "closing a refused wheel's session failed");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn post_proposal_reject(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -3784,6 +4035,9 @@ async fn post_proposal_reject(
         })?
         .ok_or(StatusCode::NOT_FOUND)?
         .kind;
+    if kind == "browser-wheel" {
+        return reject_browser_wheel(state, id).await;
+    }
     if kind == "contact-merge" {
         // `reject_merge` records the refused pair in the same transaction as the status, which is
         // what stops the heuristic asking the identical question forever. Wiring the approval
@@ -4094,6 +4348,73 @@ async fn cancel_job(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct LeaveNoteRequest {
+    body: String,
+}
+
+#[derive(serde::Serialize)]
+struct LeaveNoteResponse {
+    note_id: i64,
+}
+
+/// `POST /jobs/{id}/notes` — leaves words for whichever of this job's nodes comes next.
+///
+/// **Admin, by being in no scope table at all.** `auth::permits` is default-deny, so a route nobody
+/// lists is reachable only by Control and Admin, and that is the grade this one wants. The table it
+/// must not be added to is `RUN_CREATING_ROUTES`, where `POST /jobs` sits one path segment away:
+/// creating a job authorises the prompt supplied at that moment, in advance of the work existing,
+/// while a note adds a second author to work already running past every check its creation went
+/// through. That is exactly why `POST /runs/{id}/message` is kept out of the same table, and a note
+/// is steering with a longer wait.
+///
+/// The author is [`notes::OWNER`] and never a field of the body. Only Control and Admin arrive here
+/// and both of them are the person, so there is nothing for a caller to claim to be — and a note
+/// that could name its own author is the first half of a run leaving notes for another run.
+///
+/// 201 rather than 204 because the note now has an id and a life the caller can watch: it appears in
+/// `GET /jobs/{id}` while it waits, and carries the run it eventually reached once it has been read
+/// out. The acknowledgement says only that the words were accepted — nothing has read them yet, and
+/// the next node may be minutes away or may be the review at the end of the night.
+///
+/// A note left on a job that has already finished is accepted and never delivered. Refusing it would
+/// mean deciding here what "still able to hear you" means, and the honest place to see that is the
+/// job detail, where the note sits visibly undelivered beside a job that is over.
+async fn post_job_note(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<LeaveNoteRequest>,
+) -> Result<(StatusCode, Json<LeaveNoteResponse>), StatusCode> {
+    // A note with no words is not a note: it would be an entry in the queue that delivers nothing
+    // and can never be delivered again.
+    let body = request.body.trim();
+    if body.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Asked before the insert so a note for a job that does not exist is a 404 and not the 500 the
+    // foreign key would otherwise make of it.
+    let job: Option<i64> = sqlx::query_scalar("SELECT id FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(job_id = id, %error, "reading a job to leave a note on it failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if job.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    crate::notes::leave(&state.pool, id, body, crate::notes::OWNER)
+        .await
+        .map(|note_id| (StatusCode::CREATED, Json(LeaveNoteResponse { note_id })))
+        .map_err(|error| {
+            tracing::warn!(job_id = id, %error, "leaving a note on a job failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 async fn post_worktree_release(
     State(state): State<AppState>,
     Path(run_id): Path<i64>,
@@ -4232,6 +4553,7 @@ mod tests {
                 files_root: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+                browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -4384,6 +4706,93 @@ mod tests {
         );
 
         db.close().await;
+    }
+
+    /// **The target is read, never assumed.** A constant `master` would be wrong for any project
+    /// working on something else, and wrong silently — it would queue a merge into a branch nobody
+    /// asked about. So the test builds a repository whose integration branch is deliberately NOT
+    /// called master, and the landed request has to name it.
+    ///
+    /// It also pins the direction, which is the whole point of this route existing: a session could
+    /// already ask for merges INTO its own branch, and this is the only way it can ask for the
+    /// reverse.
+    #[tokio::test]
+    async fn landing_a_worktree_queues_its_branch_into_the_branch_the_project_is_on() {
+        let (state, _db) = file_test_state().await;
+        let container = crate::git_exec::tests::space_free_tempdir("http-land-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        // Not `master`, on purpose — see the doc comment.
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
+        assert!(git_in(&repo, &["branch", "feature"]));
+        let worktree = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
+        ));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let landed = land_worktree(
+            State(state.clone()),
+            Json(LandBody {
+                cwd: worktree.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .expect("a worktree on its own branch can land");
+        assert_eq!(landed.0.status, "queued");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(landed.0.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let op: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(op["op"], "merge");
+        assert_eq!(
+            op["source"], "feature",
+            "the worktree's own branch is what lands"
+        );
+        assert_eq!(
+            op["target"], "trunk",
+            "the target is the branch the project's main checkout is on, not a constant"
+        );
+
+        // Standing on the integration branch, there is no separate work to take. Refused rather
+        // than admitted as a merge naming one branch twice.
+        let refused = land_worktree(
+            State(state),
+            Json(LandBody {
+                cwd: repo.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .expect_err("the main checkout has nothing to land");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("already on trunk"), "{}", refused.1);
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start")
+            .success()
     }
 
     /// A request submitted over HTTP comes back as a ticket, and the same ticket is readable after.
@@ -4726,6 +5135,7 @@ mod tests {
             files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -7847,6 +8257,7 @@ mod tests {
             files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -10491,5 +10902,151 @@ mod tests {
         assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
 
         assert_eq!(promotion_feed_rows(&pool).await, 0);
+    }
+
+    /// The sentence an owner would leave, kept in one place so both note tests say the same thing.
+    const A_NOTE: &str = "when you get to item 3, update the docs too";
+
+    async fn notes_left_on(pool: &sqlx::SqlitePool, job_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_notes WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Speaking into work already in flight is Admin's, and RUN-CREATING is the level that matters.
+    ///
+    /// `permits` is default-deny, so a route nobody thought about is already refused to a read-only
+    /// key — which makes the read-only half of this test the cheap half. The expensive one is the
+    /// run-creating key, because `POST /jobs` is in `RUN_CREATING_ROUTES` and a note lives at a URL
+    /// one segment away from it. Filing the note route beside the job route is the natural mistake,
+    /// it reads as consistent, and it is wrong for the reason `POST /runs/{id}/message` is kept out
+    /// of that table: creating a job authorises the prompt supplied at that moment, in advance of
+    /// the work existing, while a note adds a second author to work that is already running past
+    /// every check its creation went through. That is why steering asks for Admin, and a note is
+    /// steering with a longer wait.
+    ///
+    /// The refusals are checked for having written nothing, and the acceptance for having written
+    /// something. Without the first, a route that answered 403 and stored the note anyway would
+    /// pass; without the second, so would a route that answered 200 and did nothing — and either
+    /// would leave the whole test asserting the shape of a status code.
+    #[tokio::test]
+    async fn leaving_a_note_needs_more_than_a_read_only_token() {
+        let state = test_state().await;
+        let job_id = add_job(&state.pool, "project-a").await;
+        let read_only = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let admin = store_api_token_at_level(&state, "administrator", ApiTokenLevel::Admin).await;
+
+        for token in [&read_only, &run_creating] {
+            let response = api_token_request(
+                state.clone(),
+                "POST",
+                &format!("/jobs/{job_id}/notes"),
+                token,
+                Some(serde_json::json!({ "body": A_NOTE })),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "a key that cannot approve anything got to add an author to a job in flight"
+            );
+        }
+        assert_eq!(
+            notes_left_on(&state.pool, job_id).await,
+            0,
+            "a refused request left the note behind anyway, so the refusal protected nothing"
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/jobs/{job_id}/notes"),
+            &admin,
+            Some(serde_json::json!({ "body": A_NOTE })),
+        )
+        .await;
+
+        assert!(
+            response.status().is_success(),
+            "an Admin key may leave a note; a door nothing can open is an outage, not a boundary \
+             — got {}",
+            response.status()
+        );
+        assert_eq!(
+            notes_left_on(&state.pool, job_id).await,
+            1,
+            "the route answered as though it had taken the note and stored nothing"
+        );
+    }
+
+    /// A note is visible while it waits, which is the whole of what makes it worth leaving.
+    ///
+    /// `POST /jobs/{id}/notes` answers before any node has read the words — the next one may be
+    /// minutes away, or may be the review at the end of the night — so the acknowledgement it
+    /// returns says only that the note was accepted. Until `GET /jobs/{id}` shows it, the owner has
+    /// no way to tell a note that is queued from one that was dropped, and the natural response to
+    /// that uncertainty is to leave it a second time.
+    ///
+    /// `delivered_at` is asserted null for the same reason it is the queue: it is the field that
+    /// separates "still waiting" from "already said", and a detail that showed every note without it
+    /// would tell an owner nothing about whether the job has heard them yet.
+    ///
+    /// Both halves go through the real router. Seeding the row by hand and reading it back would
+    /// check that `detail` can select from a table, which is not the question — the question is
+    /// whether the note a person left through the front door comes back out of it.
+    #[tokio::test]
+    async fn a_jobs_detail_shows_the_notes_still_waiting() {
+        let state = test_state().await;
+        let job_id = add_job(&state.pool, "project-a").await;
+
+        let left = api_token_request(
+            state.clone(),
+            "POST",
+            &format!("/jobs/{job_id}/notes"),
+            "test-token",
+            Some(serde_json::json!({ "body": A_NOTE })),
+        )
+        .await;
+        assert!(
+            left.status().is_success(),
+            "the note was refused before this test could ask about it — got {}",
+            left.status()
+        );
+
+        let response = api_token_request(
+            state.clone(),
+            "GET",
+            &format!("/jobs/{job_id}"),
+            "test-token",
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let notes = detail["notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a job's detail has to carry its notes: {detail}"));
+        assert_eq!(
+            notes.len(),
+            1,
+            "the note the owner left is not on the job they left it on: {detail}"
+        );
+        assert_eq!(
+            notes[0]["body"], A_NOTE,
+            "the words came back changed: {detail}"
+        );
+        assert!(
+            notes[0]["delivered_at"].is_null(),
+            "a note nothing has read yet reads as already delivered, so the owner cannot tell \
+             whether the job has heard them: {detail}"
+        );
     }
 }

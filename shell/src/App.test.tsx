@@ -184,8 +184,14 @@ describe("App navigation and presence", () => {
       Array.from(nav.querySelectorAll("button")).map((button) => button.textContent),
     ).toEqual([
       "Home", "Fleet", "Autopilot", "Waiting", "Runs", "Projects", "Chats",
-      "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "Agents", "Teams", "Council",
-      "System",
+      // Browser sits beside Web because the two are constantly mistaken for each other: Web is what
+      // has been READ — one fetch, no session, no cookies — and Browser is what has been BROWSED, in
+      // a profile that holds the owner's logins. Then Agents and Teams, in that order and still
+      // immediately before Council: who exists, then who works together, then the tab that spends
+      // on purpose. Three tabs landed here from three branches and every neighbourhood App.tsx
+      // claims in prose survives all of them.
+      "Mail", "Files", "Contacts", "Voice", "Calendar", "Web", "Browser", "Agents", "Teams",
+      "Council", "System",
     ]);
   });
 

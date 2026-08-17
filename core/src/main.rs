@@ -5,6 +5,10 @@ mod auth;
 mod autopilot;
 mod autostart;
 mod backup;
+mod browser;
+mod browser_client;
+mod browser_policy;
+mod browser_wheel;
 mod budget;
 mod calendar;
 mod chats;
@@ -31,6 +35,7 @@ mod local_agent;
 mod logging;
 mod mailsend;
 mod mcp_tools;
+mod notes;
 mod notify;
 mod pii_shadow;
 mod presets;
@@ -113,6 +118,63 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("failed to read token from Credential Manager: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // `nucleos-core --land`, run from inside a worktree: "I am finished, take this branch."
+    //
+    // A subcommand rather than a documented `curl`, for the reason `--print-token` is one: the
+    // token lives in Credential Manager, and the alternative is teaching every session how to
+    // fetch the master key in order to ask a question about itself. Here the binary reads it, and
+    // the session runs one word.
+    //
+    // It asks; it does not wait. The queue decides when, and the ticket is how to follow it —
+    // printing the id and returning is the honest shape for a request whose whole point is that
+    // somebody else schedules it.
+    if std::env::args().any(|a| a == "--land") {
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = serde_json::json!({ "cwd": cwd }).to_string();
+        let response = reqwest::Client::new()
+            .post("http://127.0.0.1:8791/vcs/land")
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{text}");
+                    // Said at the moment of asking, because that is the last moment the asker is
+                    // listening. A conflict arrives later and reads like a failure to fix; whoever
+                    // read this already knows it is not theirs.
+                    eprintln!(
+                        "asked. the queue decides when — one operation per repository, in order.\n\
+                         watch it with GET /vcs/requests/<id>/wait.\n\
+                         if it conflicts, nothing is published and no copy is left conflicted: \
+                         that is the queue's to report, not yours to resolve from here."
+                    );
+                } else {
+                    eprintln!("the queue refused: {text}");
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
                 std::process::exit(1);
             }
         }
@@ -373,6 +435,7 @@ async fn main() {
     let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
+    let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
     // The web sidecar's own shared secret, minted per boot and never persisted.
     //
     // NOT the control token, and not for the reason the email sidecar has its own: this traffic
@@ -381,6 +444,10 @@ async fn main() {
     // per-boot random value is therefore strictly better than a long-lived one — there is nothing
     // to leak and nothing to rotate.
     let web_sidecar_token = auth::generate_token();
+    // The browser sidecar's, minted the same way and for the same reason. It matters more here: the
+    // process it authenticates drives browsers holding the owner's logged-in profiles, so a secret
+    // that leaked would hand those sessions to anything on the machine that can open a socket.
+    let browser_sidecar_token = auth::generate_token();
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -572,6 +639,13 @@ async fn main() {
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
+        browser: Arc::new(browser::BrowserRuntime {
+            enabled: browser_config.enabled,
+            client: browser_client::BrowserClient::new(
+                sidecar::BROWSER_ADDR,
+                browser_sidecar_token.clone(),
+            ),
+        }),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,
             trusted_hosts: web_config.trusted_hosts.clone(),
@@ -610,6 +684,38 @@ async fn main() {
         sidecar_path,
         vec![],
     ));
+
+    // The browser sidecar. Started only when the pillar is on, like the web one beside it.
+    //
+    // Before it starts, every session this database still calls open is retired. Spec §9.1: the
+    // adapter is the parent of the browsers, so a daemon restart takes every live session with it —
+    // and a row saying "open" about a browser that no longer exists is worse than no row at all,
+    // because the shell would offer to take the wheel of it.
+    if browser_config.enabled {
+        match browser::retire_open_sessions(&state.pool, &chrono::Utc::now().to_rfc3339()).await {
+            Ok(retired) if retired > 0 => {
+                tracing::warn!("retired {retired} browsing session(s) left open by a previous run")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "could not retire open browsing sessions"),
+        }
+
+        let path = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("browser-sidecar.exe");
+        let env = sidecar::browser_env(
+            "http://127.0.0.1:8791",
+            &browser_sidecar_token,
+            &browser_config,
+        );
+        tokio::spawn(sidecar::supervise(sidecar::BROWSER.to_string(), path, env));
+        tracing::info!(
+            max_sessions = browser_config.max_sessions,
+            "browser sidecar supervised"
+        );
+    }
 
     // The web sidecar. Started only when the pillar is on: an unstarted one means `/web/*` answers
     // 502, which is the honest reading of "there is nothing to ask".

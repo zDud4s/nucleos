@@ -67,14 +67,13 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git`, `add_worktree`, `repo_key` and `current_branch` are the only sanctioned production
-/// entries**, and a new caller belongs behind one of them rather than here: each is a place where
-/// whatever is left of the operation's budget is computed and an already-spent one is refused
-/// *before* a child is spawned, which `output()` would otherwise do eagerly. `repo_key` and
-/// `current_branch` are on the list because they pass that same test rather than because they
-/// arrived later — each computes its own remaining budget and returns without spawning when there is
-/// none. A caller that reaches past the four takes its `Duration` from somewhere else and quietly
-/// loses that gate. Naming them makes the gate greppable rather than conventional. The tests below call this directly on purpose — they are
+/// **`git`, `add_worktree`, `repo_key`, `current_branch` and `toplevel` are the only sanctioned
+/// production entries**, and a new caller belongs behind one of them rather than here: each is a
+/// place where whatever is left of the operation's budget is computed and an already-spent one is
+/// refused *before* a child is spawned, which `output()` would otherwise do eagerly. The last three
+/// are on the list because they pass that same test rather than because they arrived later — each
+/// computes its own remaining budget and returns without spawning when there is none. A caller that
+/// reaches past the five takes its `Duration` from somewhere else and quietly loses that gate. Naming them makes the gate greppable rather than conventional. The tests below call this directly on purpose — they are
 /// testing the transport itself.
 ///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
@@ -363,10 +362,26 @@ pub async fn compute_merge(
         // Best-effort: the next operation resets this worktree anyway, and a failure to abort must
         // not replace the conflict — the conflict is what the caller needs to read.
         let _ = git(&integration, &["merge", "--abort"], deadline).await;
-        return Err(failed(
-            format!("merging {source} into {target} failed"),
-            &merge,
-        ));
+        // **The reason names the owner, because the asker's instinct is to fix it.** An agent that
+        // has just finished work and is told "merging failed" will reach for the conflict, and it
+        // is the one thing here that is not its to reach for: the merge happened in an integration
+        // worktree it does not have, was aborted, and left nothing conflicted anywhere. There is no
+        // conflicted state in its copy to resolve — only the temptation to manufacture one.
+        //
+        // What IS the asker's is the other direction, and the message says so rather than leaving
+        // it to be guessed: bringing the target INTO its branch is an ordinary queue operation, and
+        // resolving there is resolving in its own worktree, on its own branch, where it belongs.
+        return Err(Outcome::Escalated {
+            reason: format!(
+                "merging {source} into {target} conflicts, so nothing was published and no copy \
+                 was left conflicted. This is the queue's to carry and not yours to fix from \
+                 here — the merge ran in an integration worktree you do not have. To clear it, \
+                 bring {target} into {source} in your own worktree (an ordinary queue operation), \
+                 resolve it there, and ask again."
+            ),
+            exit_code: merge.exit_code,
+            output_tail: merge.output_tail.clone(),
+        });
     }
 
     let new = revision(&integration, "HEAD", deadline).await?;
@@ -445,6 +460,70 @@ fn remaining(deadline: std::time::Instant, what: &str) -> Result<Duration, Outco
 /// — git already normalises drive-letter case and `.`/`..` itself (measured) — and is kept for
 /// junctions and symlinks, where two spellings genuinely reach one directory.
 ///
+/// The root of the working tree `path` sits in, whether `path` is that root or a directory under it.
+///
+/// **The one question `repo_key` and `current_branch` deliberately refuse to answer**, and it exists
+/// because a caller arrived that genuinely does not know: an interactive session's `cwd` is wherever
+/// the person happened to be standing, which is a subdirectory far more often than not. Both of the
+/// others demand the path already BE the top level, and that demand is right for them — it turns
+/// "found a repository" into "found this repository". This function is how a caller earns the path
+/// that satisfies it, rather than each caller inventing its own `rev-parse`.
+///
+/// Skipping it is the hole, not a shortcut. `git -C <dir>` walks UP, so `current_branch` called on a
+/// subdirectory does not fail — it refuses with "not the root", and a caller that reads that refusal
+/// as "not a repository, nothing to govern here" hands the session exactly the bypass the gate
+/// exists to close. Measured: every one of this repo's own worktrees answers a different toplevel and
+/// the SAME common dir.
+///
+/// **Named `toplevel` and not `worktree_root`, which is taken and means the opposite end of the
+/// same word.** `worktree::worktree_root(project_root)` answers "where does this project's worktrees
+/// get CREATED" and returns a parent directory; this answers "which working tree am I standing IN"
+/// and returns a checkout. Two functions in one crate under one name, differing only by module, is a
+/// misreading waiting to happen — and it nearly did: the collision surfaced only because a grep for
+/// this function's name found the other one in a worktree it had never been written to. `toplevel`
+/// is git's own word for the thing (`--show-toplevel`), so it borrows a name that is already exact.
+///
+/// A fifth sanctioned entry to `run_git` (see its doc comment): it computes what is left of the
+/// budget and refuses before spawning, which is the property that comment protects.
+pub async fn toplevel(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<std::path::PathBuf, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(
+            "the operation ran out of time before the working tree could be located".to_owned(),
+        );
+    }
+
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--show-toplevel"),
+        ],
+        budget,
+    )
+    .await?;
+    if !result.succeeded() {
+        return Err(format!(
+            "{} is not inside a git repository: {}",
+            path.display(),
+            result.output_tail.trim()
+        ));
+    }
+    let Some(toplevel) = result.stdout.lines().next() else {
+        return Err(format!(
+            "git reported no top level for {} — a bare repository has none",
+            path.display()
+        ));
+    };
+    Ok(std::path::PathBuf::from(
+        canonical(Path::new(toplevel.trim())).await?,
+    ))
+}
+
 /// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it
 /// computes what is left of the budget and refuses before spawning, which is the property that
 /// comment exists to protect.
@@ -571,7 +650,7 @@ pub async fn current_branch(path: &Path, deadline: std::time::Instant) -> Result
 /// On Windows this returns a verbatim path (`\\?\C:\…`). That is fine for a key, whose only job is
 /// to compare equal to itself, and it is worth knowing before anyone compares a stored repository
 /// key against a stored `project_root` — they are in different spellings on purpose.
-async fn canonical(path: &Path) -> Result<String, String> {
+pub(crate) async fn canonical(path: &Path) -> Result<String, String> {
     tokio::fs::canonicalize(path)
         .await
         .map(|path| path.to_string_lossy().into_owned())
@@ -1806,10 +1885,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Spec §7, first row. A conflict is a reported failure, not a problem this module solves — and
-    /// the point of computing on the side is that the user's copy is not where it happens.
+    /// Spec §7, first row. A conflict is not a problem this module solves — and the point of
+    /// computing on the side is that the user's copy is not where it happens.
+    ///
+    /// **It is `Escalated` and no longer `Failed`.** The distinction is who is left holding it:
+    /// `failed` says the operation did not happen and that is the end, which leaves the conflict
+    /// with whoever asked — and for a landing that is the agent which had just finished its work,
+    /// the one actor this queue exists to spare from other sessions' integration.
     #[tokio::test]
-    async fn a_conflicted_merge_fails_without_touching_the_user_s_copy() {
+    async fn a_conflicted_merge_escalates_without_touching_the_user_s_copy() {
         let _lock = crate::worktree::test_env_lock();
         let (_container, repo) = init_contained_repo("nucleos-gitexec-conflict-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -1853,11 +1937,34 @@ pub(crate) mod tests {
             .expect_err("a conflict must not produce a merge commit");
 
         match outcome {
-            Outcome::Failed { output_tail, .. } => assert!(
-                output_tail.contains("CONFLICT"),
-                "the row must carry what git said: {output_tail}"
-            ),
-            other => panic!("a conflict is a Failed, got {other:?}"),
+            Outcome::Escalated {
+                output_tail,
+                reason,
+                ..
+            } => {
+                assert!(
+                    output_tail.contains("CONFLICT"),
+                    "the row must carry what git said: {output_tail}"
+                );
+                // The asker's instinct on reading "merging failed" is to go and fix it, and that is
+                // the one thing here that is not theirs: the merge ran in an integration worktree
+                // they do not have and was aborted, so there is no conflicted state anywhere to
+                // resolve — only the temptation to manufacture one. The reason has to say so, and
+                // has to say what IS theirs instead.
+                assert!(
+                    reason.contains("not yours to fix"),
+                    "the reason must name the owner: {reason}"
+                );
+                assert!(
+                    reason.contains("no copy was left conflicted"),
+                    "the reason must say there is nothing to resolve: {reason}"
+                );
+                assert!(
+                    reason.contains("in your own worktree"),
+                    "a refusal that names no alternative sends the asker looking: {reason}"
+                );
+            }
+            other => panic!("a conflict is an Escalated, got {other:?}"),
         }
 
         assert_eq!(sha_of(&repo, "master"), before);

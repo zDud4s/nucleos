@@ -296,6 +296,40 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    // The browser pillar's five agent verbs (spec §6.1).
+    //
+    // # What is NOT here, and why each absence is load-bearing
+    //
+    // **No profile argument on `browser_open`.** The agent chooses WHAT to look at; the núcleo
+    // chooses WHERE it happens (spec §5.3, §6.1). A parameter here would be that boundary escaping
+    // to the wrong side of the wire, and what it decides is whether a stranger's page runs inside the
+    // profile holding the owner's logins.
+    //
+    // **No run id either.** Letting a tool name one would let an agent join the browser of a run
+    // that is not its own. The cost is real and worth stating: a session opened through this tool
+    // gets a throwaway of its own rather than sharing its run's, so a run that opens three pages
+    // gets three browsers.
+    //
+    // **No `browser_screenshot`.** It exists as a route and answers the shell. `filter_outgoing` in
+    // `mcp_tools.rs` redacts text and has never had an image branch, so a screenshot of the owner's
+    // authenticated session handed to a model would leave this machine without passing the redaction
+    // every other answer goes through. Spec §6.1a lists six tools; this is five, deliberately.
+    //
+    // **No `browser_grant`, and no route to write one against.** The site list grows when a person
+    // finishes a login and keeps the chain, and by no other means (spec §5.2).
+
+    /// Open a browsing session. The profile is chosen by the daemon, never named here.
+    pub async fn browser_open(&self, project_id: &str, url: &str) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/browser/open")
+            .json(&serde_json::json!({ "project_id": project_id, "url": url }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Ask the core to do something on the calling department's behalf.
     ///
     /// **The run is not an argument**, for `read_team_file`'s reason one method up: the department
@@ -355,6 +389,69 @@ impl DaemonClient {
             });
         }
         response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// The accessibility view of a page: what is there and what it is called.
+    pub async fn browser_snapshot(&self, session_id: i64) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/browser/snapshot")
+            .json(&serde_json::json!({ "session_id": session_id }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// One action against a ref from the last snapshot.
+    ///
+    /// A refusal by the fence comes back as an ordinary answer carrying `outcome: "refused"`, and
+    /// stays one all the way to the agent (spec §6.2). Turning it into an error here would make it
+    /// indistinguishable from a crashed browser, and the response to a crash is a retry.
+    pub async fn browser_act(
+        &self,
+        session_id: i64,
+        kind: &str,
+        element_ref: &str,
+        text: Option<String>,
+    ) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/browser/act")
+            .json(&serde_json::json!({
+                "session_id": session_id,
+                "kind": kind,
+                "ref": element_ref,
+                "text": text.unwrap_or_default(),
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Ask for the wheel. Raises a proposal; it hands nothing over (spec §4.4 rule 3).
+    pub async fn browser_handoff(&self, session_id: i64, reason: &str) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/browser/handoff")
+            .json(&serde_json::json!({ "session_id": session_id, "reason": reason }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Close a session. The only one of the five that reads nothing from the page.
+    pub async fn browser_close(&self, session_id: i64) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/browser/close")
+            .json(&serde_json::json!({ "session_id": session_id }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        Ok(serde_json::json!({ "closed": status.is_success(), "status": status.as_u16() }))
     }
 
     /// What is in the files folder. Reading only — there is deliberately no client method here for

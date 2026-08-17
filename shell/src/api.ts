@@ -4007,3 +4007,206 @@ export async function cancelCouncil(token: string, id: string): Promise<boolean>
     return false;
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The browser pillar (spec Â§10).
+//
+// Every route here is Admin, including the two reads, and that is deliberate: the list of hosts a
+// project has logged into is a map of where its owner has accounts. `GET /web/pages` beside it is an
+// allowlisted read; this is not the same kind of thing.
+// ---------------------------------------------------------------------------------------------
+
+/** One browsing session as the daemon remembers it. */
+export interface BrowserSession {
+  id: number;
+  sidecar_id: string;
+  run_id: number | null;
+  /** The project this was opened FOR â€” not necessarily the one whose profile it ran in. */
+  project_id: string | null;
+  profile_kind: string;
+  profile_id: string;
+  requested_url: string;
+  final_url: string;
+  rule: string;
+  /** `agent`, `wheel-requested`, `human` or `delivery-failed` â€” spec Â§4.4's state machine. */
+  mode: string;
+  refusal: string | null;
+  proposal_id: number | null;
+  /** The navigation a person's window recorded, as a JSON array, once the wheel has come back. */
+  chain: string | null;
+  /** Set once they have answered "keep these?", either way. */
+  chain_decided_at: string | null;
+  opened_at: string;
+  closed_at: string | null;
+}
+
+export async function listBrowserSessions(
+  token: string,
+): Promise<BrowserSession[] | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/sessions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as BrowserSession[];
+  } catch {
+    return null;
+  }
+}
+
+/** One origin a project's profile admits, and the story of how it got there. */
+export interface BrowserSite {
+  origin: string;
+  /** `destination` â€” somewhere a person chose to log in â€” or `idp`, a host their login passed through. */
+  kind: string;
+  granted_at: string;
+  /** The destination whose login brought this origin in, or null when this IS the destination. */
+  granted_for: string | null;
+}
+
+export async function listBrowserSites(
+  token: string,
+  projectId: string,
+): Promise<BrowserSite[] | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/browser/sites/${encodeURIComponent(projectId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as BrowserSite[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Withdraw one origin from a project's profile.
+ *
+ * There is no matching grant call, and there is no route to write one against: a host enters the
+ * list when a person finishes a login and keeps the chain (spec Â§5.2), which is `keepBrowserChain`
+ * below and names no host at all.
+ */
+export async function revokeBrowserSite(
+  token: string,
+  projectId: string,
+  origin: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/revoke`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project_id: projectId, origin }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function closeBrowserSession(
+  token: string,
+  sessionId: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/close`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Hand the wheel back. The window closes and the daemon reports where the person went.
+ *
+ * Nothing is granted by this call. What comes back is the set to be shown, and the answer is
+ * `keepBrowserChain` â€” two steps, because spec Â§5.2 says the concession happens at the return and
+ * covers the whole chain, so a person has to see the chain before agreeing to it.
+ */
+export async function returnBrowserWheel(
+  token: string,
+  sessionId: number,
+): Promise<ApiResult<{ chain: string[] }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/return`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { chain: string[] } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * The answer to "keep these?" â€” the only way a host ever enters a profile's list.
+ *
+ * It names no origin. The set is whatever the person's own window recorded, held on the session row,
+ * and this says yes or no to it. That is why there is no `grantBrowserSite`: a call that took a host
+ * would be one the confused deputy of spec Â§5.2 could aim, and this one has nothing to aim.
+ */
+export async function keepBrowserChain(
+  token: string,
+  sessionId: number,
+  keep: boolean,
+): Promise<ApiResult<{ granted: string[] }>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/keep`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ session_id: sessionId, keep }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as { granted: string[] } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Delete a project's profile: the directory, its cookies, and everything granted to it.
+ *
+ * The only call in this file that destroys something a person made, and it exists because the site
+ * list grows only by a human act (spec §5.2) and would otherwise grow for ever. Revoking one origin
+ * stops that host loading again; this is what removes the cookies it already left.
+ */
+export async function forgetBrowserProfile(
+  token: string,
+  projectId: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/forget`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project_id: projectId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

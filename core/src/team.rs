@@ -2132,7 +2132,7 @@ async fn ceiling_reached(
 ///
 /// Keyed on `root_id` with an index, not a recursive walk of `parent_id`: this is asked at every
 /// pass of every run in the tree, one indexed read beats a CTE that arrives at the same answer by a
-/// route that can be got wrong. It rests on `runs.team_run_id` (migration 0073) — without that
+/// route that can be got wrong. It rests on `runs.team_run_id` (migration 0081) — without that
 /// column a run's cost counts the specialists alone, and a tree ceiling built on a sum that
 /// undercounts errs towards spending, multiplied by the depth.
 pub async fn spend_of_tree(pool: &sqlx::SqlitePool, root_id: &str) -> f64 {
@@ -3990,6 +3990,9 @@ mod tests {
             files_root: Some(root),
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
+            // Off, like `web` beside it: no test in this module drives a browser, and a department
+            // reaches one — if it ever does — through the daemon client like any other agent.
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),
@@ -5694,7 +5697,7 @@ mod tests {
         assert_eq!(fetch_run(&state, &id).await.state, "done");
     }
 
-    /// The column migration 0073 adds, doing the job it was added for: the director's own nodes are
+    /// The column migration 0081 adds, doing the job it was added for: the director's own nodes are
     /// part of what the run cost.
     #[tokio::test]
     async fn a_runs_spend_counts_the_directors_nodes_and_not_another_runs() {

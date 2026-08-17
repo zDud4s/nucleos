@@ -202,6 +202,7 @@ mod tests {
             files_root: None,
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
