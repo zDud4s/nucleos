@@ -10,6 +10,8 @@ import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Placeholder } from "./pages/Placeholder";
+import { RunDetail } from "./pages/RunDetail";
+import { Runs, validateRunSearch } from "./pages/Runs";
 
 /**
  * Memory history, in the real app as well as in the tests.
@@ -33,7 +35,37 @@ import { Placeholder } from "./pages/Placeholder";
 const PAGES: Record<string, () => ReactNode> = {
   "/": Home,
   "/fleet": Fleet,
+  "/runs": Runs,
 };
+
+/**
+ * The pages whose *filters* are part of the location.
+ *
+ * A validator per path, in a table beside the components, for the same reason
+ * the components are in one: this list grows with the slices, and a special
+ * case bolted into the map below would be the first of fourteen. The validator
+ * itself lives with the page that reads it — the page owns what its search
+ * params mean, and the router only needs to know that it has some.
+ */
+const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => object> = {
+  "/runs": validateRunSearch,
+};
+
+/**
+ * The routes that are not navigation items.
+ *
+ * `/runs/$runId` is the first of them, and the shape is the general one: a
+ * detail is reached *from* a list rather than from the rail, so it has no place
+ * in the nav table and must be added here instead. Registered as a sibling of
+ * `/runs` and not as its child, because opening a run replaces the index rather
+ * than appearing beside it — a nested route would need the list to render an
+ * `Outlet` and would keep fifty rows polling behind one open run.
+ *
+ * TanStack spells a parameter `$runId`; the page reads it back under that name.
+ */
+const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
+  { path: "/runs/$runId", component: RunDetail },
+];
 
 export function createAppRouter(initialPath = "/") {
   /**
@@ -52,16 +84,29 @@ export function createAppRouter(initialPath = "/") {
    * reachable — the two ways an app grows a dead link are both closed here
    * rather than by anybody remembering.
    */
-  const routes = NAV_ITEMS.map((item) =>
-    createRoute({
+  const routes = NAV_ITEMS.map((item) => {
+    const validateSearch = SEARCH_VALIDATORS[item.path];
+    return createRoute({
       getParentRoute: () => rootRoute,
       path: item.path,
       component: PAGES[item.path] ?? placeholderFor(item),
+      // Spread rather than passed as `undefined`: the router treats the key's
+      // presence as the declaration, and a route that declares a validator and
+      // has none would strip every search param it is given.
+      ...(validateSearch === undefined ? {} : { validateSearch }),
+    });
+  });
+
+  const details = DETAIL_ROUTES.map((detail) =>
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: detail.path,
+      component: detail.component,
     }),
   );
 
   return createRouter({
-    routeTree: rootRoute.addChildren(routes),
+    routeTree: rootRoute.addChildren([...routes, ...details]),
     history: createMemoryHistory({ initialEntries: [initialPath] }),
     /**
      * Nothing here has a loader, so there is nothing to keep warm and nothing

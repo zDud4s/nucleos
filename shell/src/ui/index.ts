@@ -11,6 +11,18 @@ export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
+/**
+ * Three formatters in one module — the recorded exception to one primitive per
+ * file. See the header of `readings.tsx` for why they travel together.
+ */
+export {
+  ContextMeter,
+  CostLine,
+  RelativeTime,
+  type ContextMeterProps,
+  type CostLineProps,
+  type RelativeTimeProps,
+} from "./readings";
 export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";
