@@ -50,6 +50,7 @@ argument to the run, and it is named in the summary this prints so the caller ca
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 # The layers that carry the PreToolUse gate. The only thing this file varies.
@@ -58,6 +59,47 @@ LAYERS = ("H0", "H1", "H2", "H3")
 
 # The run mode each layer is launched with. Printed, never applied — it belongs to the run.
 LAYER_MODE = {"H0": "real", "H1": "worktree", "H2": "worktree", "H3": "worktree"}
+
+
+def ensure_repository(tree: str) -> str:
+    """Make the candidate a git repository, because `mode: worktree` cannot start without one.
+
+    `materialize.sh` lays the tree out with `git archive | tar -x` and says why in its own comment:
+    an extraction reads and nothing else, where `git worktree add` would write to shared `.git`
+    state on a machine somebody is working on. That is right for what it was for — H0 and the
+    scorer, which both want a directory of files.
+
+    It is not enough for the rest of the ladder, and nothing said so. `create_run_inner` refuses
+    `worktree` mode without a `project_id` and a `cwd`, and `worktree.rs` then makes a worktree OF
+    that cwd — so H1, H2 and H3 each need the candidate to be a repository with the base at HEAD.
+    Three of the four layers could not have been launched at all.
+
+    One commit, made here rather than by hand, so the tree the agent is handed is the tree the base
+    describes and nothing about which files were staged is left to whoever ran it. `target/` is
+    excluded by the repository's own committed `.gitignore`, which the archive carries — so this
+    stays cheap even after a pre-warm.
+    """
+    if os.path.isdir(os.path.join(tree, ".git")):
+        head = subprocess.run(["git", "-C", tree, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True)
+        return f"already a repository at {head.stdout.strip() or 'an unborn HEAD'}"
+
+    for command in (
+        ["git", "-C", tree, "init", "-q"],
+        # Named locally: the eval must not inherit whoever's identity happens to be configured, and
+        # a repository with no identity refuses to commit at all.
+        ["git", "-C", tree, "config", "user.email", "eval@nucleos.invalid"],
+        ["git", "-C", tree, "config", "user.name", "nucleos eval"],
+        ["git", "-C", tree, "add", "-A"],
+        ["git", "-C", tree, "commit", "-q", "-m", "eval base"],
+    ):
+        done = subprocess.run(command, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise SystemExit(f"layer.py: {' '.join(command[3:])} failed: "
+                             f"{(done.stderr or done.stdout).strip()[:200]}")
+    head = subprocess.run(["git", "-C", tree, "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True)
+    return f"initialised, base committed at {head.stdout.strip()}"
 
 # Identical in every layer, on purpose. Enough to build, test and read the tree, and nothing that
 # reaches outside it: no network, no installs, no writes anywhere but the candidate tree.
@@ -125,7 +167,15 @@ def main() -> int:
         json.dump(settings, handle, indent=2)
         handle.write("\n")
 
+    # Only the worktree layers need it, and H0 is deliberately left as the plain directory
+    # `materialize.sh` argues for.
+    repo_note = None
+    if LAYER_MODE[args.layer] == "worktree":
+        repo_note = ensure_repository(args.tree)
+
     print(f"layer.py: {args.tree} is now {args.layer}")
+    if repo_note:
+        print(f"  git repository: {repo_note} — worktree mode cannot start without one")
     print(f"  PreToolUse:  {'kept' if args.layer in LAYERS_WITH_HOOK else 'removed'}"
           f" (was {'present' if had_pre else 'absent'})")
     print(f"  PostToolUse: {'removed' if had_post else 'absent'} — its script is gitignored, so it "
