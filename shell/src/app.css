@@ -1,0 +1,512 @@
+/**
+ * The shell's own stylesheet: the rail, the page frame, the footer surfaces and
+ * the connection takeovers.
+ *
+ * `app-` for the frame and `nav-` for the rail. Nothing here styles a design
+ * system component — those rules live in `ui.css`, behind the `ui-` prefix, and
+ * the separation is what keeps "shared" meaning something. The one thing this
+ * file is allowed to do to a primitive is give it room inside a shell slot.
+ *
+ * The rule that keeps this honest: no class appears in a component that is not
+ * defined below. TypeScript and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect only shows up as something
+ * looking wrong on screen.
+ */
+
+/* ----------------------------------------------------------------- frame -- */
+
+/**
+ * Rail plus page, full height, and the page is the only thing that scrolls.
+ *
+ * `min-height: 0` on the main column is the load-bearing line: without it a
+ * grid child refuses to shrink below its content and the page pushes the whole
+ * window taller instead of scrolling inside itself — which would take the
+ * pinned footer of the rail off the bottom of the screen.
+ */
+.app-shell {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-main {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg);
+}
+
+.app-page {
+  max-width: 78rem;
+  padding: var(--space-6) var(--space-6) var(--space-8);
+}
+
+/* ------------------------------------------------------------------- nav -- */
+
+/**
+ * Three rows: brand, the scrolling list, the pinned footer.
+ *
+ * The footer is a sibling of the scrolling region and never a child of it.
+ * That is the whole mechanism behind "the kill switch is never hidden" — a
+ * footer inside the scroller would be reachable only from the bottom of a
+ * twenty-item list, which is precisely where nobody is when they need it.
+ */
+.nav {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  width: 15rem;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.nav-collapsed {
+  width: 3.5rem;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-wordmark {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-wide);
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.nav-collapsed .nav-wordmark {
+  /* The mark goes, the toggle stays — a rail with no way back out is a trap. */
+  display: none;
+}
+
+.nav-collapse {
+  flex: none;
+  padding: 0 var(--space-1);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-sm);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.nav-collapse:hover {
+  color: var(--text);
+}
+
+.nav-collapsed .nav-brand {
+  justify-content: center;
+}
+
+/* The list, and the only part of the rail that scrolls. */
+.nav-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-2);
+}
+
+.nav-group + .nav-group {
+  margin-top: var(--space-4);
+}
+
+.nav-group-label {
+  padding: 0 var(--space-3) var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.nav-collapsed .nav-group-label {
+  /* Kept in the accessibility tree — the groups still name themselves to a
+     screen reader — but there is no room for the word at 56px. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav-item:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/**
+ * The page you are on. A left bar rather than a fill alone: the fill is easy to
+ * lose against a hover, and the bar reads at the edge of vision as "you are
+ * here" without competing with the state tones further down the rail.
+ */
+.nav-item-active {
+  background: var(--accent-quiet);
+  box-shadow: inset 2px 0 0 var(--accent);
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+/**
+ * Present, and plainly not ready.
+ *
+ * Dimmed rather than removed, and still a link: the page it leads to explains
+ * itself. `Disabled` is not `Down` and neither is `absent` — a rail that hides
+ * what is not configured makes the app look smaller than it is and gives
+ * nobody a way to find out how to switch the thing on.
+ */
+.nav-item-disabled {
+  opacity: 0.5;
+}
+
+.nav-glyph {
+  flex: none;
+  width: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  text-align: center;
+  color: var(--text-faint);
+}
+
+.nav-item-active .nav-glyph {
+  color: var(--accent);
+}
+
+.nav-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-collapsed .nav-label {
+  /* Visually hidden, not removed: the link keeps its accessible name, and the
+     `title` gives the pointer user the same word as a tooltip. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/**
+ * A count, and only ever a count that is greater than zero.
+ *
+ * The pending tone, because that is the one tone in the palette that means
+ * "this is waiting for a person" — the same colour the queue itself uses, so
+ * the badge and the page it sends you to agree.
+ */
+.nav-badge {
+  flex: none;
+  min-width: 1.25rem;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--tone-pending-bg);
+  color: var(--tone-pending-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  text-align: center;
+}
+
+.nav-collapsed .nav-badge {
+  /* At icon width there is no room beside the glyph, so the count becomes a
+     mark in the corner. The number is still in the accessible name. */
+  position: absolute;
+  right: var(--space-1);
+  min-width: 0;
+  font-size: 0.5rem;
+  overflow: hidden;
+  text-indent: -100vw;
+  width: 0.4rem;
+  height: 0.4rem;
+  padding: 0;
+  background: var(--tone-pending-fg);
+}
+
+/* Something in System wants looking at. A dot, with a word behind it for
+   anything that cannot see the dot. */
+.nav-dot {
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: var(--radius-pill);
+  background: var(--tone-danger-fg);
+}
+
+/* ---------------------------------------------------------- nav: footer -- */
+
+.nav-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.nav-rule {
+  width: 100%;
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------ connection -- */
+
+.app-connection {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.app-connection-dot {
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: var(--radius-pill);
+  background: currentcolor;
+}
+
+/* Three readings, three colours — and three different words, which are what
+   actually carry the meaning. `checking` is not `down`. */
+.app-connection-up {
+  color: var(--tone-active-fg);
+}
+
+.app-connection-down {
+  color: var(--tone-danger-fg);
+}
+
+.app-connection-checking {
+  color: var(--text-faint);
+}
+
+.app-connection-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-collapsed .app-connection-text {
+  display: none;
+}
+
+.nav-collapsed .app-connection {
+  justify-content: center;
+  padding: 0;
+}
+
+/* ---------------------------------------------------------------- budget -- */
+
+.app-budget {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.app-budget-figure {
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+  color: var(--text);
+}
+
+.app-budget-scope {
+  color: var(--text-faint);
+}
+
+/* Nothing has been read yet, which is not the same as nothing has been spent. */
+.app-budget-unread .app-budget-figure {
+  color: var(--text-faint);
+}
+
+/* A ceiling is holding work. Warm, not alarming — a rule fired, nothing broke. */
+.app-budget-paused .app-budget-figure {
+  color: var(--tone-paused-fg);
+}
+
+.app-budget-reason {
+  flex-basis: 100%;
+  color: var(--tone-paused-fg);
+}
+
+.nav-collapsed .app-budget-scope,
+.nav-collapsed .app-budget-reason {
+  display: none;
+}
+
+.nav-collapsed .app-budget {
+  justify-content: center;
+  padding: 0;
+  font-size: 0.6rem;
+}
+
+/* ----------------------------------------------------------------- kill -- */
+
+.app-kill {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+}
+
+/* The button is the width of the rail: this is the control you must be able to
+   hit without aiming. */
+.app-kill > .ui-button,
+.app-kill > .ui-confirm,
+.app-kill > .ui-confirm > .ui-button {
+  width: 100%;
+}
+
+.app-kill-state {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--tone-danger-fg);
+}
+
+.app-kill-unread {
+  font-size: var(--text-xs);
+  font-style: italic;
+  color: var(--text-faint);
+}
+
+.nav-collapsed .app-kill-state,
+.nav-collapsed .app-kill-unread {
+  display: none;
+}
+
+/* -------------------------------------------------------------- takeover -- */
+
+/**
+ * The whole window, when the handshake has not gone through.
+ *
+ * A takeover rather than a banner, and deliberately so: everything behind it
+ * would be showing numbers from a daemon that is not answering, and a stale
+ * fleet under a small red strip is how someone acts on a machine that is not
+ * there.
+ */
+.app-takeover {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: var(--space-6);
+  background: var(--bg);
+}
+
+.app-takeover-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-width: 46ch;
+  padding: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.app-takeover-title {
+  font-size: var(--text-xl);
+}
+
+.app-takeover-body {
+  color: var(--text-muted);
+  line-height: var(--leading-normal);
+}
+
+.app-takeover-hint {
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/* Still looking. No border, no card, no alarm — there is nothing to report yet. */
+.app-takeover-quiet .app-takeover-card {
+  border-color: transparent;
+  background: none;
+  box-shadow: none;
+  color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------ home -- */
+
+.app-home-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+.app-quicklinks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: var(--space-4);
+}
+
+.app-quicklink {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.app-quicklink:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-raised);
+}
+
+.app-quicklink-title {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.app-quicklink-text {
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}

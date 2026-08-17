@@ -13,6 +13,7 @@ export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
 export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
+export { StatCard, type StatCardProps } from "./StatCard";
 export { StateBadge, type StateBadgeProps } from "./StateBadge";
 export { Teach, type TeachProps } from "./Teach";
 export { readState, type StateDomain, type StateReading } from "./state-map";
