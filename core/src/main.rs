@@ -154,6 +154,15 @@ async fn main() {
                 let text = response.text().await.unwrap_or_default();
                 if status.is_success() {
                     println!("{text}");
+                    // Said at the moment of asking, because that is the last moment the asker is
+                    // listening. A conflict arrives later and reads like a failure to fix; whoever
+                    // read this already knows it is not theirs.
+                    eprintln!(
+                        "asked. the queue decides when — one operation per repository, in order.\n\
+                         watch it with GET /vcs/requests/<id>/wait.\n\
+                         if it conflicts, nothing is published and no copy is left conflicted: \
+                         that is the queue's to report, not yours to resolve from here."
+                    );
                 } else {
                     eprintln!("the queue refused: {text}");
                     std::process::exit(1);

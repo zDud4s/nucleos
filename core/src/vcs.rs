@@ -1000,9 +1000,15 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
 
     match verb.as_deref()? {
         "push" => Some(
+            // The pointer to `--land` lives here because this is where a finishing agent arrives.
+            // "Deliver this work" and "push it somewhere" are the same thought to most callers, and
+            // a refusal that only says what is wrong sends them looking for another way to push.
             "a push writes the remote, which is the shared thing this queue orders — and this \
              spelling is not one it can perform. Use `git push <remote>` or \
-             `git push <remote> <branch>`, which it queues."
+             `git push <remote> <branch>`, which it queues. If what you actually want is to \
+             deliver this branch, that is `nucleos-core --land`: it asks the queue to merge your \
+             branch into the branch the project is on, in order, and reports conflicts rather than \
+             leaving you to resolve them."
                 .to_owned(),
         ),
         "pull" => Some(
