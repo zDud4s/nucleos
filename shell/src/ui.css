@@ -1,199 +1,412 @@
-/* Camada de primitivos — consumida pelos componentes em src/ui/.
-   Um só sistema de botões, badges, painéis, banners e campos.
-   Vistas específicas (cockpit, filas) vivem em App.css. */
+/**
+ * The design system's stylesheet.
+ *
+ * Everything here is `ui-` prefixed and corresponds to a component in
+ * `src/ui/`. Feature styles never live in this file — a feature gets its own
+ * `src/<feature>.css` with its own prefix — because the moment a page's rules
+ * land here, "shared" stops meaning anything and every change becomes a
+ * question about who else is using it.
+ *
+ * The rule that keeps this honest: no class appears in a component that is not
+ * defined below. A component can happily ship a class name no stylesheet
+ * defines — the typechecker and the tests both pass — and the defect only
+ * surfaces as something looking wrong on screen.
+ */
 
-/* ── Botões ─────────────────────────────────────────────── */
+/* ------------------------------------------------------------------ boot -- */
 
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-2);
-  background: none;
-  border: 1px solid transparent;
-  border-radius: var(--r-full);
-  font-weight: 500;
-  transition: color var(--t-fast) var(--ease-out),
-    background-color var(--t-fast) var(--ease-out),
-    border-color var(--t-fast) var(--ease-out);
+/**
+ * The stub the app renders before the shell exists. It is here rather than in a
+ * feature sheet because it must survive until the AppShell replaces it, and a
+ * blank dark rectangle is indistinguishable from a webview that failed to load.
+ */
+.ui-boot {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-faint);
 }
 
-.btn--md { font-size: var(--fs-sm); padding: 7px 18px; }
-.btn--sm { font-size: var(--fs-xs); padding: 3px 12px; }
+/* ----------------------------------------------------------------- panel -- */
 
-.btn--approve {
-  background: var(--green-tint);
-  border-color: var(--green-line);
-  color: var(--green);
-  font-weight: 600;
-}
-.btn--approve:hover:not(:disabled) { background: var(--green-tint-strong); }
-
-.btn--ghost {
-  border-color: var(--line);
-  color: var(--muted);
-}
-.btn--ghost:hover:not(:disabled) { color: var(--text); border-color: var(--glass-line); }
-.btn--ghost.intent-go:hover:not(:disabled) { color: var(--green); border-color: var(--green-line); }
-.btn--ghost.intent-stop:hover:not(:disabled) { color: var(--red); border-color: var(--red-line); }
-
-.btn--danger {
-  border-color: var(--red-line);
-  color: var(--red);
-}
-.btn--danger:hover:not(:disabled) { background: var(--red-tint); }
-
-.btn--danger-solid {
-  background: var(--red);
-  color: var(--on-red);
-  font-weight: 600;
+.ui-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
 }
 
-.btn--link {
-  border: none;
-  padding: 3px 4px;
-  color: var(--faint);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-.btn--link:hover:not(:disabled) { color: var(--red); }
-
-/* estado armado do ConfirmButton: a segunda pergunta é visível, não um modal */
-.btn.is-armed {
-  background: var(--red-tint);
-  border-color: var(--red-line);
-  color: var(--red);
-  font-weight: 600;
-  text-decoration: none;
-}
-
-/* Armar não torna a acção perigosa: aprovar continua verde, porque a pergunta
-   é "de certeza?" e não "isto destrói alguma coisa". */
-.btn--approve.is-armed {
-  background: var(--green-tint-strong);
-  border-color: var(--green-line);
-  color: var(--green);
-}
-
-/* ── Badges ─────────────────────────────────────────────── */
-
-.badge {
-  font: 500 var(--fs-2xs) / 1.6 var(--mono);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  border-radius: var(--r-full);
-  padding: 2px 10px;
-  flex-shrink: 0;
-}
-.badge--active { color: var(--green); background: var(--green-tint); }
-.badge--shadow { color: var(--shadow-mode); background: var(--shadow-mode-tint); }
-.badge--off { color: var(--faint); background: var(--hairline); }
-.badge--pending { color: var(--gold); background: var(--gold-tint); }
-.badge--paused { color: var(--gold); background: none; border: 1px solid var(--gold-line); }
-
-/* ── Seletor segmentado (controlo de modo) ──────────────── */
-
-.seg {
-  display: inline-flex;
-  border: 1px solid var(--line);
-  border-radius: var(--r-full);
-  overflow: hidden;
-  flex-shrink: 0;
-}
-.seg button {
+.ui-panel-flat {
   background: none;
   border: none;
-  font: 500 var(--fs-2xs) var(--mono);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 4px 10px;
-  color: var(--faint);
-  transition: color var(--t-fast) var(--ease-out),
-    background-color var(--t-fast) var(--ease-out);
-}
-.seg button:hover:not(:disabled):not(.on) { color: var(--text); background: var(--hairline); }
-.seg button.on.off { color: var(--text); background: var(--wash-strong); }
-.seg button.on.shadow { color: var(--on-shadow); background: var(--shadow-mode); }
-.seg button.on.active { color: var(--on-green); background: var(--green); }
-
-/* ── Painéis (camada base, sólida) ──────────────────────── */
-
-.flat {
-  background: var(--bg-raise);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  padding: var(--sp-4);
+  border-radius: 0;
+  box-shadow: none;
 }
 
-section > h2 {
-  font: 700 var(--fs-lg) var(--display);
-  letter-spacing: 0.01em;
-  margin: 0 0 var(--sp-3);
-}
-section > h2 small {
-  font: 400 var(--fs-xs) var(--body);
-  color: var(--faint);
-  margin-left: var(--sp-2);
+.ui-panel-dim {
+  background: var(--surface-sunken);
+  box-shadow: none;
+  color: var(--text-muted);
 }
 
-/* ── Teach (empty state que ensina) ─────────────────────── */
-
-.teach {
-  padding: var(--sp-5);
-  border: 1px dashed var(--line);
-  border-radius: var(--r-md);
-  color: var(--muted);
-  font-size: var(--fs-sm);
-  max-width: 58ch;
-}
-.teach b { color: var(--text); }
-.teach .t-title {
-  font: 700 var(--fs-md) var(--display);
-  color: var(--text);
-  display: block;
-  margin-bottom: var(--sp-2);
+.ui-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
 }
 
-/* ── Banners de exceção (camada elevada: vidro) ─────────── */
+.ui-panel-flat > .ui-panel-head {
+  padding-left: 0;
+  padding-right: 0;
+}
 
-.banner {
-  max-width: 1120px;
-  width: calc(100% - var(--sp-6));
-  margin: var(--sp-4) auto 0;
+.ui-panel-title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.ui-panel-aside {
   display: flex;
   align-items: center;
-  gap: var(--sp-4);
-  padding: var(--sp-3) var(--sp-5);
-  border-radius: var(--r-md);
-  backdrop-filter: var(--blur);
-  border: 1px solid;
-  box-shadow: var(--shadow-card);
-  animation: drop var(--t-med) var(--ease-out);
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
-.banner p { font-size: var(--fs-sm); max-width: 70ch; }
-.banner .b-title { font: 700 var(--fs-md) var(--display); }
-.banner > .btn { margin-left: auto; flex-shrink: 0; }
-.banner--kill { background: var(--red-surface); border-color: var(--red-line); }
-.banner--kill .b-title { color: var(--red); }
-.banner--budget { background: var(--gold-surface); border-color: var(--gold-line); }
-.banner--budget .b-title { color: var(--gold); }
 
-/* ── Erro e campos ──────────────────────────────────────── */
-
-.error { color: var(--red); font-size: var(--fs-sm); }
-
-.field {
-  display: grid;
-  gap: var(--sp-1);
-  color: var(--faint);
-  font-size: var(--fs-xs);
+.ui-panel-body {
+  padding: var(--space-5);
 }
-.field input,
-.field select {
-  width: 100%;
-  background: var(--bg-raise);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
+
+.ui-panel-flat > .ui-panel-body {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* ----------------------------------------------------------------- badge -- */
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.1rem var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.ui-badge-active {
+  color: var(--tone-active-fg);
+  background: var(--tone-active-bg);
+  border-color: var(--tone-active-border);
+}
+
+.ui-badge-shadow {
+  color: var(--tone-shadow-fg);
+  background: var(--tone-shadow-bg);
+  border-color: var(--tone-shadow-border);
+}
+
+.ui-badge-off {
+  color: var(--tone-off-fg);
+  background: var(--tone-off-bg);
+  border-color: var(--tone-off-border);
+}
+
+.ui-badge-pending {
+  color: var(--tone-pending-fg);
+  background: var(--tone-pending-bg);
+  border-color: var(--tone-pending-border);
+}
+
+.ui-badge-paused {
+  color: var(--tone-paused-fg);
+  background: var(--tone-paused-bg);
+  border-color: var(--tone-paused-border);
+}
+
+.ui-badge-danger {
+  color: var(--tone-danger-fg);
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-border);
+}
+
+.ui-badge-info {
+  color: var(--tone-info-fg);
+  background: var(--tone-info-bg);
+  border-color: var(--tone-info-border);
+}
+
+/**
+ * A state this shell has no reading for, shown as itself.
+ *
+ * Dashed, monospaced, and lower-case: it is a literal off the wire rather than
+ * a phrase anyone wrote, and it should look like one. Nobody should mistake it
+ * for a state the app understands.
+ */
+.ui-state-unmapped {
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+  border-style: dashed;
+}
+
+/* ---------------------------------------------------------------- button -- */
+
+.ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 0.34rem var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
   color: var(--text);
-  font: 400 var(--fs-sm) var(--body);
-  padding: 6px 8px;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: 1.4;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.ui-button:hover:not(:disabled) {
+  border-color: var(--text-faint);
+}
+
+.ui-button:disabled {
+  /* Half-visible, not hidden: a control that vanishes when it cannot be used
+     leaves no trace of what is missing. The exception is deliberate elsewhere —
+     an action that would act on stale data is removed, not disabled, because
+     there the answer is "not now" rather than "not for you". */
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ui-button-ghost {
+  background: none;
+  border-color: var(--border-strong);
+  color: var(--text-muted);
+}
+
+.ui-button-ghost:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.ui-button-approve {
+  background: var(--tone-active-bg);
+  border-color: var(--tone-active-border);
+  color: var(--tone-active-fg);
+}
+
+.ui-button-approve:hover:not(:disabled) {
+  border-color: var(--tone-active-fg);
+}
+
+.ui-button-danger {
+  background: none;
+  border-color: var(--tone-danger-border);
+  color: var(--tone-danger-fg);
+}
+
+.ui-button-danger:hover:not(:disabled) {
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-fg);
+}
+
+.ui-button-danger-solid {
+  background: var(--tone-danger-fg);
+  border-color: var(--tone-danger-fg);
+  color: var(--solid-ink);
+  font-weight: var(--weight-semibold);
+}
+
+.ui-button-danger-solid:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.ui-button-link {
+  padding: 0;
+  background: none;
+  border-color: transparent;
+  color: var(--accent);
+  font-weight: var(--weight-regular);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+.ui-button-link:hover:not(:disabled) {
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* Direction, as a glyph rather than as a colour — it reads the same to someone
+   who cannot separate the hues, and it survives being placed on any variant. */
+.ui-button-go::before {
+  content: "▸";
+  font-size: 0.85em;
+  line-height: 1;
+}
+
+.ui-button-stop::before {
+  content: "■";
+  font-size: 0.7em;
+  line-height: 1;
+}
+
+/* --------------------------------------------------------- confirmbutton -- */
+
+.ui-confirm {
+  display: inline-flex;
+}
+
+/**
+ * Armed: the control is live and will act on the next click.
+ *
+ * A ring rather than a colour change alone — the button has already changed
+ * what it says, and the ring is the peripheral signal that something on this
+ * page is waiting for a second click.
+ */
+.ui-confirm-armed > .ui-button {
+  box-shadow: 0 0 0 3px var(--tone-danger-bg);
+}
+
+/* ----------------------------------------------------------------- teach -- */
+
+.ui-teach {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: flex-start;
+  max-width: 52ch;
+  padding: var(--space-6) var(--space-5);
+  color: var(--text-muted);
+}
+
+.ui-teach-title {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.ui-teach-body {
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+}
+
+.ui-teach-action {
+  margin-top: var(--space-1);
+}
+
+/* ----------------------------------------------------------------- notes -- */
+
+.ui-note {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* Something broke. Red, and assertive to a screen reader. */
+.ui-note-error {
+  color: var(--tone-danger-fg);
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-border);
+}
+
+/**
+ * The daemon said no.
+ *
+ * Cool where the error is red, and framed with a left rule rather than a full
+ * border: a refusal is a considered answer, and the visual language of alarm
+ * would make every ordinary rule-firing feel like a fault.
+ */
+.ui-note-refusal {
+  color: var(--text);
+  background: var(--tone-info-bg);
+  border-color: transparent;
+  border-left: 3px solid var(--tone-info-border);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+}
+
+/* The refusal's stable name, next to the sentence it was turned into. */
+.ui-note-code {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--tone-info-fg);
+  letter-spacing: 0;
+}
+
+.ui-note-text {
+  color: var(--text);
+}
+
+/* The data is old, not wrong. The quietest note in the set. */
+.ui-note-stale {
+  padding-left: 0;
+  padding-right: 0;
+  color: var(--text-faint);
+  background: none;
+  border-color: transparent;
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
+/* ----------------------------------------------------------- page header -- */
+
+.ui-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.ui-page-header-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.ui-page-title {
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.015em;
+}
+
+.ui-page-headline {
+  color: var(--text-muted);
+  font-size: var(--text-base);
+}
+
+.ui-page-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
 }

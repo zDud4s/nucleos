@@ -1,94 +1,194 @@
-/* ─────────────────────────────────────────────────────────────
-   NucleOS — design tokens (fonte canónica)
-   Direção: B · "vidro com propósito" — ver design/design-system.md
-   design/prototypes/b-tokens.css é o snapshot histórico do protótipo;
-   este ficheiro é o que a shell consome e o que evolui.
-   Regra de ouro: vidro (blur + translucidez + sombra) SÓ nas camadas
-   elevadas — barra de comando, cartões de aprovação, banners de
-   exceção. A camada base é sólida e quieta.
-   ───────────────────────────────────────────────────────────── */
+/**
+ * The token layer.
+ *
+ * Dark is the base palette and light is the override, which is the opposite of
+ * the usual arrangement and deliberate: this window sits open next to an editor
+ * for hours, and the design fixed dark as the primary theme. Writing dark on
+ * bare `:root` means the app is never briefly light before a media query
+ * resolves, and it means the theme that gets the most care is the one that is
+ * spelled out in full.
+ *
+ * Only colour and shadow are redefined under `prefers-color-scheme: light`.
+ * Spacing, type and radii are facts about the layout, not about the light in
+ * the room, and duplicating them into the light block is how the two themes
+ * start to drift apart.
+ *
+ * The seven state tones are the app's whole colour vocabulary for *state*.
+ * Interaction does not get a hue of its own — a primary button is expressed by
+ * contrast, and the one brand colour (`--accent`) is reserved for the wordmark,
+ * links and the focus ring. That is what keeps a focused button from reading as
+ * a status, and a status from reading as something you can click.
+ */
+
 :root {
-  /* ── superfícies & tinta (hue 265 = tinta de marca, OKLCH) ── */
-  --bg: oklch(0.155 0.02 265);
-  --bg-raise: oklch(0.19 0.021 265 / 0.6);      /* painéis flat, camada base */
-  --glass: color-mix(in oklab, oklch(0.28 0.025 265) 52%, transparent);
-  --glass-line: oklch(0.85 0.02 265 / 0.14);
-  --line: oklch(0.32 0.02 265 / 0.7);
-  --hairline: oklch(1 0 0 / 0.05);              /* separadores dentro de vidro */
-  --wash: oklch(1 0 0 / 0.09);                  /* preenchimento selecionado/hover */
-  --wash-strong: oklch(1 0 0 / 0.12);
-  --code-bg: oklch(0.1 0.02 265 / 0.55);        /* chips de comando, <pre> */
-  --text: oklch(0.93 0.008 265);
-  --muted: oklch(0.68 0.015 265);
-  --faint: oklch(0.58 0.018 265);               /* ≥4.5:1 sobre --bg (AA) */
+  /* ---------------------------------------------------------------- type -- */
+  /* The three families declared in fonts.css, each with a job. */
+  --font-display: "Cabinet Grotesk", "General Sans", system-ui, sans-serif;
+  --font-body: "General Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Spline Sans Mono", ui-monospace, "Cascadia Mono", monospace;
 
-  /* ── estado = cor; croma quase só aqui ── */
-  --gold: oklch(0.82 0.115 85);                  /* pendente / atenção */
-  --green: oklch(0.78 0.11 155);                 /* ok / ativo */
-  --red: oklch(0.67 0.165 20);                   /* perigo / kill */
-  --shadow-mode: oklch(0.76 0.05 255);           /* modo sombra */
+  --text-xs: 0.6875rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --text-3xl: 2.25rem;
 
-  /* tints derivados: -tint (fundo), -line (contorno), -strong (hover) */
-  --green-tint: oklch(0.78 0.11 155 / 0.14);
-  --green-tint-strong: oklch(0.78 0.11 155 / 0.28);
-  --green-line: oklch(0.78 0.11 155 / 0.45);
-  --gold-tint: oklch(0.82 0.115 85 / 0.13);
-  --gold-line: oklch(0.82 0.115 85 / 0.35);
-  --red-tint: oklch(0.67 0.165 20 / 0.14);
-  --red-line: oklch(0.67 0.165 20 / 0.5);
-  --shadow-mode-tint: oklch(0.76 0.05 255 / 0.13);
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
 
-  /* tinta sobre preenchimentos sólidos de estado */
-  --on-green: oklch(0.15 0.03 155);
-  --on-red: oklch(0.15 0.03 20);
-  --on-shadow: oklch(0.15 0.02 255);
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
+  --leading-normal: 1.55;
 
-  /* superfícies de banner (exceções) */
-  --red-surface: color-mix(in oklab, oklch(0.35 0.09 20) 45%, transparent);
-  --gold-surface: color-mix(in oklab, oklch(0.4 0.07 85) 38%, transparent);
+  /* Group labels and badges are set in small caps with air between letters;
+     at 11px an untracked uppercase run is a smear. */
+  --tracking-wide: 0.08em;
+  --tracking-wider: 0.14em;
 
-  /* foco */
-  --focus-ring: oklch(0.75 0.04 265 / 0.9);
+  /* -------------------------------------------------------------- space -- */
+  /* A 4px grid. Every gap in the app is one of these, so a stray 7px is a bug
+     you can see rather than a value you have to measure. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
 
-  /* brilhos de fundo (fixos, alpha baixo) */
-  --glow-cool: oklch(0.42 0.06 250 / 0.20);
-  --glow-warm: oklch(0.46 0.06 85 / 0.13);
+  /* -------------------------------------------------------------- radii -- */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
 
-  /* ── tipografia ── */
-  --display: "Cabinet Grotesk", "Segoe UI", system-ui, sans-serif;
-  --body: "General Sans", "Segoe UI", system-ui, sans-serif;
-  --mono: "Spline Sans Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+  /* ---------------------------------------------------- surfaces & text -- */
+  --bg: #0c0e12;
+  --surface: #14171d;
+  --surface-raised: #1c2029;
+  --surface-sunken: #08090c;
 
-  /* escala fixa (app UI, sem fluid) */
-  --fs-2xs: 10px;   /* micro-labels uppercase: badges, seg, th */
-  --fs-xs: 11.5px;  /* meta mono, labels, botões sm */
-  --fs-sm: 13px;    /* secundário, botões md */
-  --fs-md: 14.5px;  /* corpo */
-  --fs-lg: 18px;    /* título de secção */
-  --fs-xl: 23px;    /* subheadline */
-  --fs-2xl: 29px;   /* headline de estado */
+  --border: #262b35;
+  --border-strong: #39404d;
 
-  /* espaçamento 4pt */
-  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
-  --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
+  --text: #e7eaf0;
+  --text-muted: #98a1b2;
+  --text-faint: #6a7484;
 
-  /* raio */
-  --r-sm: 10px;
-  --r-md: 16px;
-  --r-full: 999px;
+  /* The one brand colour. Not a state; never used to mean anything. */
+  --accent: #4fd1e0;
+  --accent-quiet: rgba(79, 209, 224, 0.14);
+  /* Text laid *on* an accent fill — dark, because the accent is light. */
+  --accent-ink: #08191c;
+  --focus-ring: rgba(79, 209, 224, 0.55);
 
-  /* elevação — sombra só nas camadas de vidro */
-  --shadow-float: 0 18px 44px oklch(0.05 0.02 265 / 0.45),
-                  inset 0 1px 0 oklch(1 0 0 / 0.08);
-  --shadow-card: 0 22px 50px oklch(0.05 0.02 265 / 0.4),
-                 inset 0 1px 0 oklch(1 0 0 / 0.07);
+  /* Contrast-carried interaction: a solid button is near-white on dark. */
+  --solid: #e7eaf0;
+  --solid-ink: #0c0e12;
 
-  /* vidro — usar em conjunto com background: var(--glass) */
-  --blur: blur(20px) saturate(1.2);
+  /* ------------------------------------------------------- state tones -- */
+  /* active — it is really acting. */
+  --tone-active-fg: #46dfae;
+  --tone-active-bg: rgba(70, 223, 174, 0.12);
+  --tone-active-border: rgba(70, 223, 174, 0.32);
 
-  /* movimento */
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
-  --t-fast: 0.15s;
-  --t-med: 0.3s;
-  --t-slow: 0.55s;
+  /* shadow — deciding, not acting. Deliberately not green. */
+  --tone-shadow-fg: #a99bd8;
+  --tone-shadow-bg: rgba(169, 155, 216, 0.12);
+  --tone-shadow-border: rgba(169, 155, 216, 0.3);
+
+  /* off — switched off on purpose. Quiet, and never red. */
+  --tone-off-fg: #8b94a3;
+  --tone-off-bg: rgba(139, 148, 163, 0.12);
+  --tone-off-border: rgba(139, 148, 163, 0.28);
+
+  /* pending — waiting for a person. The only tone that asks for you. */
+  --tone-pending-fg: #f7c04a;
+  --tone-pending-bg: rgba(247, 192, 74, 0.12);
+  --tone-pending-border: rgba(247, 192, 74, 0.32);
+
+  /* paused — held by a rule or a ceiling. Warm, but not a summons. */
+  --tone-paused-fg: #f09168;
+  --tone-paused-bg: rgba(240, 145, 104, 0.12);
+  --tone-paused-border: rgba(240, 145, 104, 0.32);
+
+  /* danger — something is wrong, or is about to be. */
+  --tone-danger-fg: #fa6a70;
+  --tone-danger-bg: rgba(250, 106, 112, 0.12);
+  --tone-danger-border: rgba(250, 106, 112, 0.34);
+
+  /* info — a fact with no verdict attached. */
+  --tone-info-fg: #66b5f0;
+  --tone-info-bg: rgba(102, 181, 240, 0.12);
+  --tone-info-border: rgba(102, 181, 240, 0.3);
+
+  /* ------------------------------------------------------------ shadow -- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.55);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f6f9;
+    --surface: #ffffff;
+    --surface-raised: #ffffff;
+    --surface-sunken: #eceef3;
+
+    --border: #dcdfe6;
+    --border-strong: #b4bbc7;
+
+    --text: #12151b;
+    --text-muted: #545d6c;
+    --text-faint: #79828f;
+
+    --accent: #0b8493;
+    --accent-quiet: rgba(11, 132, 147, 0.12);
+    --accent-ink: #ffffff;
+    --focus-ring: rgba(11, 132, 147, 0.5);
+
+    /* The contrast flips with the ground: near-black fill, light ink. */
+    --solid: #12151b;
+    --solid-ink: #ffffff;
+
+    /* Foregrounds darken for the light ground; the fills stay the same idea
+       at a slightly higher alpha, because a 12% tint disappears on white. */
+    --tone-active-fg: #0d7d5c;
+    --tone-active-bg: rgba(13, 125, 92, 0.1);
+    --tone-active-border: rgba(13, 125, 92, 0.28);
+
+    --tone-shadow-fg: #5b4a9c;
+    --tone-shadow-bg: rgba(91, 74, 156, 0.1);
+    --tone-shadow-border: rgba(91, 74, 156, 0.26);
+
+    --tone-off-fg: #57606e;
+    --tone-off-bg: rgba(87, 96, 110, 0.1);
+    --tone-off-border: rgba(87, 96, 110, 0.24);
+
+    --tone-pending-fg: #8a5c00;
+    --tone-pending-bg: rgba(138, 92, 0, 0.1);
+    --tone-pending-border: rgba(138, 92, 0, 0.28);
+
+    --tone-paused-fg: #a94e22;
+    --tone-paused-bg: rgba(169, 78, 34, 0.1);
+    --tone-paused-border: rgba(169, 78, 34, 0.28);
+
+    --tone-danger-fg: #bd2b33;
+    --tone-danger-bg: rgba(189, 43, 51, 0.09);
+    --tone-danger-border: rgba(189, 43, 51, 0.28);
+
+    --tone-info-fg: #175f9e;
+    --tone-info-bg: rgba(23, 95, 158, 0.09);
+    --tone-info-border: rgba(23, 95, 158, 0.26);
+
+    --shadow-sm: 0 1px 2px rgba(18, 21, 27, 0.08);
+    --shadow-md: 0 4px 14px rgba(18, 21, 27, 0.1);
+    --shadow-lg: 0 18px 48px rgba(18, 21, 27, 0.16);
+  }
 }
