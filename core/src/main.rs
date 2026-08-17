@@ -5,6 +5,10 @@ mod auth;
 mod autopilot;
 mod autostart;
 mod backup;
+mod browser;
+mod browser_client;
+mod browser_policy;
+mod browser_wheel;
 mod budget;
 mod calendar;
 mod chats;
@@ -429,6 +433,7 @@ async fn main() {
     let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
+    let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
     // The web sidecar's own shared secret, minted per boot and never persisted.
     //
     // NOT the control token, and not for the reason the email sidecar has its own: this traffic
@@ -437,6 +442,10 @@ async fn main() {
     // per-boot random value is therefore strictly better than a long-lived one — there is nothing
     // to leak and nothing to rotate.
     let web_sidecar_token = auth::generate_token();
+    // The browser sidecar's, minted the same way and for the same reason. It matters more here: the
+    // process it authenticates drives browsers holding the owner's logged-in profiles, so a secret
+    // that leaked would hand those sessions to anything on the machine that can open a socket.
+    let browser_sidecar_token = auth::generate_token();
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -628,6 +637,13 @@ async fn main() {
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
+        browser: Arc::new(browser::BrowserRuntime {
+            enabled: browser_config.enabled,
+            client: browser_client::BrowserClient::new(
+                sidecar::BROWSER_ADDR,
+                browser_sidecar_token.clone(),
+            ),
+        }),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,
             trusted_hosts: web_config.trusted_hosts.clone(),
@@ -666,6 +682,38 @@ async fn main() {
         sidecar_path,
         vec![],
     ));
+
+    // The browser sidecar. Started only when the pillar is on, like the web one beside it.
+    //
+    // Before it starts, every session this database still calls open is retired. Spec §9.1: the
+    // adapter is the parent of the browsers, so a daemon restart takes every live session with it —
+    // and a row saying "open" about a browser that no longer exists is worse than no row at all,
+    // because the shell would offer to take the wheel of it.
+    if browser_config.enabled {
+        match browser::retire_open_sessions(&state.pool, &chrono::Utc::now().to_rfc3339()).await {
+            Ok(retired) if retired > 0 => {
+                tracing::warn!("retired {retired} browsing session(s) left open by a previous run")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "could not retire open browsing sessions"),
+        }
+
+        let path = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("browser-sidecar.exe");
+        let env = sidecar::browser_env(
+            "http://127.0.0.1:8791",
+            &browser_sidecar_token,
+            &browser_config,
+        );
+        tokio::spawn(sidecar::supervise(sidecar::BROWSER.to_string(), path, env));
+        tracing::info!(
+            max_sessions = browser_config.max_sessions,
+            "browser sidecar supervised"
+        );
+    }
 
     // The web sidecar. Started only when the pillar is on: an unstarted one means `/web/*` answers
     // 502, which is the honest reading of "there is nothing to ask".

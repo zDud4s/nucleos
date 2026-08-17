@@ -552,6 +552,7 @@ mod tests {
             run_tails: Default::default(),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -609,6 +610,18 @@ mod tests {
             .route("/files/move", post(|| async {}))
             .route("/api-tokens", get(|| async {}).post(|| async {}))
             .route("/api-tokens/{name}", axum::routing::delete(|| async {}))
+            // The browser pillar, mounted so the refusals below are refusals of a route that
+            // exists. Without these the assertions would pass against a 404 that never reached the
+            // classifier, which is the shape of a test that stops noticing.
+            .route("/browser/open", post(|| async {}))
+            .route("/browser/act", post(|| async {}))
+            .route("/browser/revoke", post(|| async {}))
+            .route("/browser/forget", post(|| async {}))
+            .route("/browser/handoff", post(|| async {}))
+            .route("/browser/return", post(|| async {}))
+            .route("/browser/keep", post(|| async {}))
+            .route("/browser/sessions", get(|| async {}))
+            .route("/browser/sites/{project_id}", get(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -1124,6 +1137,22 @@ mod tests {
             ("POST", "/files/upload"),
             ("POST", "/files/move"),
             ("DELETE", "/files"),
+            // The browser, all of it, including the two reads. `GET /web/pages` beside it IS an
+            // allowlisted read, and the difference is what these routes disclose: the pages a
+            // machine has fetched, against the list of hosts a person has accounts on and the
+            // sessions currently open in their name.
+            ("POST", "/browser/open"),
+            ("POST", "/browser/act"),
+            ("POST", "/browser/revoke"),
+            // The wheel. `/keep` is the one that grows the allowlist, and a read-only key reaching
+            // it would be a read-only key granting a host permanent access to the profile that
+            // holds the owner's logins.
+            ("POST", "/browser/forget"),
+            ("POST", "/browser/handoff"),
+            ("POST", "/browser/return"),
+            ("POST", "/browser/keep"),
+            ("GET", "/browser/sessions"),
+            ("GET", "/browser/sites/demo"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,
@@ -1304,6 +1333,7 @@ mod tests {
             ("POST", "/email/triage"),
             ("POST", "/web/read"),
             ("POST", "/web/search"),
+            ("POST", "/browser/open"),
             ("DELETE", "/files"),
         ] {
             assert_eq!(
