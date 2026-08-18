@@ -21,8 +21,10 @@
 //	  (proxy.go)                which the CDP layer also refuses        tunnel, which is TLS to a
 //	                                                                    host the page chose
 //
-// WebRTC is closed by none of the three, and the spike proved every mechanism that claimed to. See
-// spec §6.2b and [launch.WebRTCIsNotFencedHere].
+// WebRTC is closed by none of the three — not the CDP fence, not the CSP, not the proxy. It is
+// closed OUTSIDE this file, by a preference written into the profile before the browser starts
+// (spec §6.2b; see launch.applyWebRTCPolicy), which is worth knowing here: nothing you add to this
+// table will govern it.
 //
 // # How narrow the proxy actually is, since it is easy to overrate
 //

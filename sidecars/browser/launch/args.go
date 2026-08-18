@@ -134,32 +134,25 @@ func Args(opts Options) ([]string, error) {
 	), nil
 }
 
-// WebRTCIsNotFencedHere documents, in a place a reader will actually reach, that no flag in Args
-// closes the WebRTC hole (spec §6.2b).
+// WebRTCIsNotClosedByAnyFlag documents, in the place a reader looking at the command line will
+// actually reach, that nothing in Args closes spec §6.2b — and points at the thing that does.
 //
 // The spike tried: CSP `webrtc 'block'` (ignored by Chrome 151), --disable-features=WebRtc,
 // --disable-blink-features=RTCPeerConnection and --disable-webrtc (none remove the global), deleting
 // the global on every new document (survives in a cross-site iframe even with recursive auto-attach
 // and the target paused before it runs), and --force-webrtc-ip-handling-policy=disable_non_proxied_udp
-// together with a working proxy — a UDP packet still reached a page-chosen address.
+// together with a working proxy — a UDP packet still reached a page-chosen address. Two of those were
+// RE-MEASURED on 2026-08-16 against the pinned build with a real instrument and still leaked.
 //
-// RE-MEASURED 2026-08-16 against the pinned build, with an instrument the spike did not have:
-// gate.TestWebRTCUDPStillLeavesTheFence, which points a page's RTCPeerConnection at a UDP socket the
-// test owns and watches for the first STUN binding request. Two of the six were re-run through it —
-// --force-webrtc-ip-handling-policy=disable_non_proxied_udp (with the fence proxy attached, which is
-// the configuration the flag is supposed to need) and --disable-blink-features=PeerConnection, the
-// feature name the spike may have got wrong. Both let the packet through, three runs each. The
-// spike's conclusion stands.
+// CLOSED 2026-08-19, and not from here: `WebRtcIPHandlingPolicy` is an enterprise policy that maps to
+// an ordinary profile preference, and while the policy needs an elevated shell to set — even under
+// HKCU, whose `SOFTWARE\Policies` grants write to Administrators only — the preference is in a file
+// we own. See applyWebRTCPolicy in webrtc.go, and gate.TestWebRTCUDPDoesNotLeaveTheFence.
 //
-// Two mechanisms remain untried and neither is a flag: a Windows Firewall rule on this executable,
-// and Chromium's WebRtcIPHandlingPolicy as an ENTERPRISE POLICY rather than a command line — a
-// different code path, and a plausible reason the flag above does nothing. Both change the machine
-// outside this repository, so both are the owner's call, and the test above is now what would score
-// them.
-//
-// It is a constant rather than a comment so that a future change that believes it has fixed this has
-// something to delete, and a reviewer has something to grep for.
-const WebRTCIsNotFencedHere = "spec §6.2b: WebRTC egress is an open hole; no command-line flag closes it"
+// This constant stays after the fix rather than going with it, because what it says is still true and
+// still worth failing a test over: a future reader reaching for a flag will find the list of six that
+// do not work before they add a seventh.
+const WebRTCIsNotClosedByAnyFlag = "spec §6.2b: no command-line flag closes WebRTC; the profile preference does (webrtc.go)"
 
 // String renders an argv for a log line without leaking the profile path's contents.
 func String(args []string) string {

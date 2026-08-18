@@ -217,29 +217,30 @@ func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2c — the hole. Spec §6.2b.
+// Test 2c — the hole that is no longer one. Spec §6.2b.
 // ---------------------------------------------------------------------------
 
-// TestWebRTCUDPStillLeavesTheFence measures the one thing this fence does not stop, and it is the
-// only test in this package that asserts a FAILURE of the design rather than a success.
+// TestWebRTCUDPDoesNotLeaveTheFence closes spec §6.2b, which was open from the spike until
+// 2026-08-19 and is the reason this test used to assert the opposite.
 //
-// That shape is deliberate. `launch.WebRTCIsNotFencedHere` and THREAT_MODEL.md item 13 have said in
-// prose since the spike that a page can put bytes on the wire over UDP; prose does not notice when
-// the world changes underneath it. Six mechanisms were tried and rejected — CSP `webrtc 'block'`,
-// --disable-webrtc, --disable-features=WebRtc, --disable-blink-features=RTCPeerConnection, deleting
-// the global per document, and --force-webrtc-ip-handling-policy=disable_non_proxied_udp — so the
-// hole is not going to close because someone here fixes it. It will close, if it ever does, because
-// a Chromium revision bump changed the answer. THIS TEST GOING RED IS THAT NEWS ARRIVING, and it is
-// news worth a red suite: spec §6.1a classifies all six browser tools as ReadsUntrusted rather than
-// Acts, and that classification is an assertion about the fence.
+// # What closed it, after six things did not
 //
-// Both controls are load-bearing, and neither is ceremony. "No packet arrived" is what a closed hole
-// looks like and it is ALSO what a page whose script never ran looks like, and what a sink bound to
-// the wrong socket looks like. Today's other finding in this file was exactly that kind of mistake
-// read as a result, so: the sink is proved to receive before the browser starts, and the page is
-// proved to have reached setLocalDescription before the absence of a packet is allowed to mean
-// anything.
-func TestWebRTCUDPStillLeavesTheFence(t *testing.T) {
+// No command line does. The spike tried CSP `webrtc 'block'`, --disable-webrtc,
+// --disable-features=WebRtc, --disable-blink-features=RTCPeerConnection, deleting the global per
+// document, and --force-webrtc-ip-handling-policy=disable_non_proxied_udp; two of those were
+// re-measured here against the pinned build and still leaked. The seventh mechanism is not a flag:
+// `WebRtcIPHandlingPolicy` maps to an ordinary profile preference, and the profile is ours to write.
+// See launch.applyWebRTCPolicy.
+//
+// # Both controls are still load-bearing, and now more than before
+//
+// "No packet arrived" is what a closed hole looks like. It is ALSO what a page whose script never
+// ran looks like, and what a sink bound to the wrong socket looks like — and now that this test
+// PASSES on silence, a broken test reads as a security guarantee rather than as a failure. That is
+// the worst direction for a mistake to point, so the sink is proved to receive before the browser
+// exists, and the page is proved to have reached setLocalDescription before its silence is allowed
+// to mean anything.
+func TestWebRTCUDPDoesNotLeaveTheFence(t *testing.T) {
 	sink := newUDPSink(t)
 	site := newSite(t)
 
@@ -276,12 +277,11 @@ func TestWebRTCUDPStillLeavesTheFence(t *testing.T) {
 		t.Fatal("the script ran but never reached setLocalDescription; this test measured nothing")
 	}
 
-	if !sink.gotPacket(settle) {
-		t.Fatal("NO UDP LEFT THE FENCED BROWSER. This is good news and a red suite is how you are " +
-			"being told: something now closes spec §6.2b. Find out what — a Chromium revision, a " +
-			"flag in launch.Args — write it down, then delete launch.WebRTCIsNotFencedHere, this " +
-			"test, THREAT_MODEL.md item 13, and revisit whether the browser tools are still " +
-			"ReadsUntrusted for the reason §6.1a gives.")
+	if sink.gotPacket(settle) {
+		t.Fatal("UDP left the fenced browser for an address the page chose: spec §6.2b is open again. " +
+			"Check that launch.applyWebRTCPolicy still writes webrtc.ip_handling_policy into the " +
+			"profile, and that this Chromium revision still honours it — nothing on the command line " +
+			"does, so if the preference stopped working there is no fallback in place.")
 	}
 }
 

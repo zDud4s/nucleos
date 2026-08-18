@@ -44,6 +44,13 @@ func Start(ctx context.Context, opts Options, wait time.Duration) (*Process, err
 	if err := os.MkdirAll(opts.ProfileDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating profile dir: %w", err)
 	}
+	// Before the browser starts, because a preference read at startup is only read at startup. This
+	// is the only thing that closes spec §6.2b — no command-line flag does — so a launch that could
+	// not write it is a launch with a hole in the fence, and refusing is the same answer ErrNoProxy
+	// gives for the same reason.
+	if err := applyWebRTCPolicy(opts.ProfileDir, opts.Mode); err != nil {
+		return nil, err
+	}
 	marker := filepath.Join(opts.ProfileDir, portFile)
 	// Delete first. See ErrInheritedInstance: a stale file would make an inherited instance look
 	// like a fresh one, which is the failure this whole dance exists to catch.

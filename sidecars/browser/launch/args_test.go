@@ -200,9 +200,10 @@ func TestCrashReporterFlagsArePresentAndHonestlyLabelled(t *testing.T) {
 	}
 }
 
-// TestWebRTCIsDocumentedAsOpen. No flag closes it (spec §6.2b); this asserts nobody quietly added
-// one and believed it worked, because the spike tried four and none did.
-func TestWebRTCIsDocumentedAsOpen(t *testing.T) {
+// TestNoWebRTCFlagIsBelieved. Spec §6.2b is closed by a profile preference (webrtc.go), never by
+// the command line. This asserts nobody added a flag and believed it worked — the spike measured six
+// that do not, and a flag sitting here would read as the mechanism to anyone auditing the fence.
+func TestNoWebRTCFlagIsBelieved(t *testing.T) {
 	args, err := Args(agentOptions())
 	if err != nil {
 		t.Fatalf("args: %v", err)
@@ -216,7 +217,7 @@ func TestWebRTCIsDocumentedAsOpen(t *testing.T) {
 		if has(args, wishful) {
 			t.Errorf(
 				"%s is in the command line, but the spike measured that it does not remove WebRTC. %s",
-				wishful, WebRTCIsNotFencedHere,
+				wishful, WebRTCIsNotClosedByAnyFlag,
 			)
 		}
 	}
