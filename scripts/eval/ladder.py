@@ -163,8 +163,13 @@ def watch(project, first_id):
             time.sleep(10)
             continue
         rows = rows if isinstance(rows, list) else rows.get("runs", [])
-        mine = ([r for r in rows if r.get("project_id") == project] if project
-                else [r for r in rows if r.get("id") == first_id])
+        # `id >= first_id` scopes this to THIS cell. A project id outlives a cell — a re-run
+        # after a failure reuses it — so without the floor the chain swept up every earlier
+        # attempt: T2xH3 reported 6311s and $2.08 across two dead runs and the live one, where
+        # the cell was 1014s and $1.65.
+        mine = ([r for r in rows
+                 if r.get("project_id") == project and (r.get("id") or 0) >= first_id]
+                if project else [r for r in rows if r.get("id") == first_id])
         row = max(mine, key=lambda r: r.get("id", 0)) if mine else {}
         status = row.get("status")
         if (row.get("id"), status) != last:
