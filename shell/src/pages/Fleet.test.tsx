@@ -1,6 +1,6 @@
 import { act, createElement } from "react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 /**
  * jsdom 29 implements neither of these, and xyflow needs both: the observer to
@@ -69,6 +69,7 @@ import type { Proposal } from "../data/system";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
+  daemon.apiText.mockReset();
   localStorage.clear();
 });
 
@@ -359,6 +360,70 @@ describe("Fleet — asking for a job", () => {
     const said = await screen.findByText(/this project already has 2 piece\(s\) of work in flight/);
     expect(said).toBeDefined();
     expect(said.textContent).not.toMatch(/kill switch/);
+  });
+});
+
+/* ----------------------------------------------------- taking a slot back -- */
+
+describe("Fleet — cancelling", () => {
+  it("reports no error when a run's cancel answers the way the route really answers", async () => {
+    // The regression: `POST /runs/{id}/cancel` returns a bare `StatusCode::OK`
+    // — a 200 with an **empty body** — and `apiFetch` exempts only 204/205 from
+    // JSON parsing, so every successful cancel from this page threw and the
+    // card reported a failure for a run that really had stopped.
+    const state = fleetState({
+      concurrency: {
+        house: { limit: 4, held: 1 },
+        projects: [column({ limit: 2, slots: [slot({ slot: 1, owner_kind: "run", owner_id: 7 })] })],
+      },
+      runs: [run()],
+    });
+    const answer = fleetFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      // One answer, described at both seams the way the real client describes
+      // it — so this test is about what the page does with the daemon's reply
+      // and not about which function the hook happens to call. Through the JSON
+      // call an empty 200 is `res.json()` throwing, which is exactly the failure
+      // the user saw.
+      if (path === "/runs/7/cancel") {
+        throw new Error("the daemon answered /runs/7/cancel with a body that is not JSON");
+      }
+      return await answer(path, init);
+    });
+    // Through the text call the same answer is the empty string. The state moves
+    // with it, so the invalidation that follows reads back a slot really gone.
+    daemon.apiText.mockImplementation(async (path: string) => {
+      if (path === "/runs/7/cancel") {
+        state.concurrency = { house: { limit: 4, held: 0 }, projects: [column({ limit: 2 })] };
+        state.runs = [];
+      }
+      return "";
+    });
+
+    const { queryClient } = await renderWithRouter(<Fleet />);
+    const card = await screen.findByRole("article", { name: "slot 1 — run 7" });
+
+    fireEvent.click(within(card).getByRole("button", { name: "Cancel" }));
+    // Real timers rather than fake ones: the page polls, and the wait is the
+    // interlock's 300ms dwell, which swallows a click arriving as the tail of a
+    // double-click. Clicking through it without waiting would confirm nothing.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(within(card).getByRole("button", { name: "Cancel run 7?" }));
+
+    await waitFor(() => {
+      expect(daemon.apiText).toHaveBeenCalledWith("/runs/7/cancel", { method: "POST" });
+    });
+    // Settles as a success, and not as the parse error the JSON call produced.
+    await waitFor(() => {
+      const [cancel] = queryClient.getMutationCache().getAll();
+      expect(cancel?.state.status).toBe("success");
+    });
+    // And says nothing about a failure — the note the page draws on `isError`.
+    expect(screen.queryByText(/could not be cancelled/)).toBeNull();
+    // The slot is gone, optimistically and then for real.
+    expect(screen.queryByRole("article", { name: "slot 1 — run 7" })).toBeNull();
   });
 });
 

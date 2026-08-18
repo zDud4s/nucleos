@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch, isApiUnavailable } from "./client";
+import { apiFetch, apiText, isApiUnavailable } from "./client";
 import { keys } from "./keys";
 import { POLL, pollWhile } from "./poll";
 import type { Proposal } from "./system";
@@ -329,14 +329,24 @@ export function useCreateJob() {
  * between the render and the click — the slot really is gone. Only an
  * `ApiUnavailable` puts it back, because then nothing is known about whether
  * the cancel happened at all.
+ *
+ * **`apiText`, never `apiFetch`.** The two routes answer success differently and
+ * neither answers with a document: `cancel_job` returns `204 No Content`, while
+ * `cancel_run` returns a bare `StatusCode::OK` — a **200 with an empty body**.
+ * `apiFetch` exempts only 204/205 from parsing, so the run half turned every
+ * successful cancel into "the daemon answered with a body that is not JSON" and
+ * the card reported a failure for work that really had stopped. `apiText` reads
+ * both as the empty string, which is what they are. Same idiom, same reason, as
+ * `useCancelRun` in `data/runs.ts`.
  */
 export function useCancelSlotOwner() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (owner: SlotOwner) =>
-      apiFetch<void>(`/${owner.kind === "job" ? "jobs" : "runs"}/${owner.id}/cancel`, {
+    mutationFn: async (owner: SlotOwner) => {
+      await apiText(`/${owner.kind === "job" ? "jobs" : "runs"}/${owner.id}/cancel`, {
         method: "POST",
-      }),
+      });
+    },
     retry: false,
     onMutate: async (owner: SlotOwner) => {
       await queryClient.cancelQueries({ queryKey: keys.concurrency });
