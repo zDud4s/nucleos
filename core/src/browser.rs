@@ -547,6 +547,38 @@ pub async fn rebind_sidecar(
     Ok(())
 }
 
+/// Open a row for a window a PERSON asked for, in `human` from the first instant.
+///
+/// Every other row in this table starts in `agent` and may become `human` by the handover of spec
+/// §4.4. This one never was the agent's, and the difference is not bookkeeping: the whole of §4.4 —
+/// the proposal, the punycode origin, the "who asked and how they got there" — exists because an
+/// AGENT chose the destination while holding a stranger's words in its context. Here the person
+/// typed it. There is no deputy to confuse, so there is nothing to approve, and a row that started
+/// in `agent` would have to be walked through a state machine whose reason for existing is absent.
+///
+/// `rule` says `person-opened` for the same reason the others say why they landed where they did:
+/// the placement here is not the outcome of `browser_policy::decide`, and a row claiming a rule that
+/// never ran would be the kind of record that reads as evidence and is not.
+pub async fn insert_person_window(
+    pool: &SqlitePool,
+    project_id: &str,
+    url: &str,
+    now: &str,
+) -> sqlx::Result<i64> {
+    let result = sqlx::query(
+        "INSERT INTO browser_sessions \
+           (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, final_url, \
+            rule, mode, opened_at) \
+         VALUES ('', NULL, ?, 'project', '', ?, '', 'person-opened', 'human', ?)",
+    )
+    .bind(project_id)
+    .bind(url)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
 /// Store the navigation a person's window recorded, unanswered.
 pub async fn record_chain(pool: &SqlitePool, id: i64, chain: &[String]) -> sqlx::Result<()> {
     sqlx::query("UPDATE browser_sessions SET chain = ? WHERE id = ?")

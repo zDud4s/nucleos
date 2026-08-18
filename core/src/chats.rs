@@ -48,6 +48,14 @@ pub struct ChatSummary {
     /// worktrees of the same repository are otherwise indistinguishable by anything a person can
     /// read.
     pub cwd: Option<String>,
+    /// Which conversation had in the editor this one was picked up from, or `None` when it was
+    /// opened here.
+    ///
+    /// Travels to the list because the window draws what was already said in that conversation
+    /// above the turns the daemon ran. Read off this row rather than off `assistant_sessions`,
+    /// which names the session the NEXT turn resumes and is replaced the first time a context
+    /// rotates — see 0082.
+    pub ide_session_id: Option<String>,
     /// The fallback title. Read from the turns rather than copied into `title` at creation, so it
     /// cannot go stale.
     pub first_message: Option<String>,
@@ -67,18 +75,29 @@ pub struct ChatSummary {
 /// precisely because it arrives from a sidecar and cannot be trusted. That encoding stays; this
 /// simply declines to open a second door for arbitrary strings.
 ///
-/// `cwd` is named by every caller rather than defaulted, for the reason `RunRequest` gives about
-/// its own fields: it decides both where the turn runs AND how much it may do, and a parameter with
-/// a default is a parameter nobody chose.
-pub async fn create(pool: &SqlitePool, brain: Brain, cwd: Option<&str>) -> sqlx::Result<String> {
+/// `picked_up` is the session this conversation continues, and it is named by every caller rather
+/// than defaulted — for the reason `RunRequest` gives about its own fields: it decides both where
+/// the turn runs AND how much it may do, and a parameter with a default is a parameter nobody chose.
+///
+/// The whole session and not its two facts separately. The directory and the id come from one file
+/// and mean nothing apart: a row carrying one session's directory and another's id would resume a
+/// conversation somewhere it was never had, which the CLI does not refuse — it quietly starts a new
+/// session instead. Taking the pair as one value is what makes that pairing unable to be wrong.
+pub async fn create(
+    pool: &SqlitePool,
+    brain: Brain,
+    picked_up: Option<&crate::sessions::IdeSession>,
+) -> sqlx::Result<String> {
     let chat_id = crate::auth::generate_uuid_v4();
     sqlx::query(
-        "INSERT INTO chats (chat_id, title, brain, created_at, cwd) VALUES (?, NULL, ?, ?, ?)",
+        "INSERT INTO chats (chat_id, title, brain, created_at, cwd, ide_session_id)
+         VALUES (?, NULL, ?, ?, ?, ?)",
     )
     .bind(&chat_id)
     .bind(brain.as_str())
     .bind(chrono::Utc::now().to_rfc3339())
-    .bind(cwd)
+    .bind(picked_up.map(|session| session.cwd.as_str()))
+    .bind(picked_up.map(|session| session.session_id.as_str()))
     .execute(pool)
     .await?;
     Ok(chat_id)
@@ -107,7 +126,7 @@ pub async fn cwd_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<Str
 /// second, and "the first message" must not depend on which of them SQLite happens to return.
 pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
     sqlx::query_as::<_, ChatSummary>(
-        "SELECT c.chat_id, c.title, c.brain, c.created_at, c.cwd,
+        "SELECT c.chat_id, c.title, c.brain, c.created_at, c.cwd, c.ide_session_id,
                 (SELECT r.prompt FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
@@ -141,6 +160,27 @@ pub async fn get(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<ChatSu
         .await?
         .into_iter()
         .find(|chat| chat.chat_id == chat_id))
+}
+
+/// Every conversation had in the editor that this daemon has already picked up.
+///
+/// Two columns, and neither is the other's fallback. `chats.ide_session_id` is where a conversation
+/// CAME FROM and never moves; `assistant_sessions.session_id` is what its next turn RESUMES and is
+/// replaced the first time a context rotates or a turn reads third-party text. A session is spoken
+/// for if either names it: without the first, a rotated conversation puts its own origin back on
+/// offer and picking it up again would put two threads on one context; without the second, the
+/// sessions the daemon minted here would be missing from the answer this has always given.
+///
+/// Archiving does not release one, which is the behaviour that was already there — the
+/// `assistant_sessions` row outlives the archive — and is stated the same way for both halves.
+pub async fn picked_up(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT ide_session_id FROM chats WHERE ide_session_id IS NOT NULL
+          UNION
+         SELECT session_id FROM assistant_sessions WHERE session_id IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// The chat's brain, or `None` when this conversation has no row — which is every Telegram chat.
@@ -440,5 +480,74 @@ mod tests {
         // decides. Defaulting to `Cloud` here would silently move every Telegram chat off the
         // local model.
         assert_eq!(brain_of(&pool, "-100200300").await.unwrap(), None);
+    }
+
+    /// A conversation picked up from the editor remembers WHICH conversation it was picked up from,
+    /// on its own row.
+    ///
+    /// Not read back off `assistant_sessions`. That row holds the session the NEXT turn resumes,
+    /// and the daemon replaces it whenever a context rotates past its ceiling or a turn reads
+    /// third-party text — so within a message or two it names a session the CLI minted here, not
+    /// the one this conversation came from. The window needs the original every time the chat is
+    /// opened, to draw what was already said in it, and the original never changes.
+    #[tokio::test]
+    async fn a_chat_picked_up_from_the_editor_remembers_which_conversation_it_came_from() {
+        let pool = test_pool().await;
+        let picked_up = crate::sessions::IdeSession {
+            session_id: "aaaa-1111".into(),
+            cwd: "C:/Projects/nucleos".into(),
+            title: Some("arranja o parser".into()),
+            last_activity: "2026-08-11T10:00:00+00:00".into(),
+        };
+
+        let id = create(&pool, Brain::Cloud, Some(&picked_up)).await.unwrap();
+
+        let chat = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(chat.ide_session_id.as_deref(), Some("aaaa-1111"));
+        // The two travel together because they came from one place, which is the whole reason
+        // `create` takes the session rather than the two facts separately.
+        assert_eq!(chat.cwd.as_deref(), Some("C:/Projects/nucleos"));
+    }
+
+    #[tokio::test]
+    async fn a_chat_opened_here_came_from_no_conversation_at_all() {
+        let pool = test_pool().await;
+
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+
+        let chat = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(chat.ide_session_id, None);
+        assert_eq!(chat.cwd, None);
+    }
+
+    /// A conversation stays picked up after the session it resumes has moved on.
+    ///
+    /// This is the case the column exists for. The daemon rotates a context past its ceiling by
+    /// minting a fresh session and replacing the row that named the old one — so a filter reading
+    /// only `assistant_sessions` puts the conversation's ORIGIN back on the list of things to pick
+    /// up, and picking it up a second time puts two threads on one context.
+    #[tokio::test]
+    async fn a_conversation_stays_picked_up_after_the_session_it_resumes_has_rotated() {
+        let pool = test_pool().await;
+        let id = create(
+            &pool,
+            Brain::Cloud,
+            Some(&crate::sessions::had_in("C:/Projects/nucleos", "aaaa-1111")),
+        )
+        .await
+        .unwrap();
+        crate::assistant::upsert_session(&pool, &id, "aaaa-1111", "2026-08-11T10:00:00+00:00")
+            .await
+            .unwrap();
+
+        // The context fills, and the next turn runs in a session the daemon minted here.
+        crate::assistant::upsert_session(&pool, &id, "minted-here", "2026-08-11T11:00:00+00:00")
+            .await
+            .unwrap();
+
+        let taken = picked_up(&pool).await.unwrap();
+        assert!(taken.contains(&"aaaa-1111".to_string()), "{taken:?}");
+        // And the one it resumes now, which is what kept the old filter honest before rotation.
+        assert!(taken.contains(&"minted-here".to_string()), "{taken:?}");
     }
 }

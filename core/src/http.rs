@@ -134,6 +134,13 @@ pub fn build_router(state: AppState) -> Router {
         // number cannot shadow a turn id.
         .route("/assistant/local-model", get(get_local_model))
         .route("/assistant/ide-sessions", get(list_ide_sessions))
+        // The conversation behind one of them. A GET on the session itself rather than a
+        // `/messages` under it: what a session IS, to anything outside this daemon, is what was
+        // said in it — the id and the directory are how it is found, not what it holds.
+        .route(
+            "/assistant/ide-sessions/{session_id}",
+            get(read_ide_session),
+        )
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -281,6 +288,11 @@ pub fn build_router(state: AppState) -> Router {
         // `/keep` is the closest thing to a grant on this surface, and it names no host: it answers
         // yes or no to a chain a browser recorded under a person's own hands.
         .route("/browser/handoff", post(crate::browser_wheel::post_handoff))
+        // A window a person opens for themselves. It skips the proposal that `/handoff` raises,
+        // because the dialogue there defends against an AGENT having chosen the destination and here
+        // nobody did — and it refuses outright when nobody is at the machine, which is the check that
+        // stops it being a route any run could use to open a browser over the owner's live cookies.
+        .route("/browser/window", post(crate::browser_wheel::post_window))
         .route("/browser/return", post(crate::browser_wheel::post_return))
         .route("/browser/keep", post(crate::browser_wheel::post_keep))
         .route("/browser/sessions", get(crate::browser::list_open_sessions))
@@ -2736,15 +2748,26 @@ async fn land_worktree(
         target: crate::vcs::Branch::new(target.trim())
             .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
     };
-    let id = crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "land: admitting the request failed");
-            refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the request could not be admitted".to_owned(),
-            )
-        })?;
+    // **A landing that came out of a conflict resolution is marked as it is admitted**, and the mark
+    // is what makes the queue verify it before publishing — a two-parent tip, no conflict markers.
+    // Asked here rather than at execution time because the answer is only reliable now: it is read
+    // from the worktree the asker is standing in, which exists precisely because they are standing
+    // in it.
+    let from_resolution =
+        crate::resolver::landing_is_a_resolution(&state.pool, repo.project_id(), source.trim())
+            .await;
+    let admitted = if from_resolution {
+        crate::vcs::submit_resolution(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
+    } else {
+        crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
+    };
+    let id = admitted.map_err(|error| {
+        tracing::warn!(%error, "land: admitting the request failed");
+        refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the request could not be admitted".to_owned(),
+        )
+    })?;
 
     vcs_ticket(&state, id, std::time::Duration::ZERO)
         .await
@@ -3254,8 +3277,7 @@ async fn list_ide_sessions(
     let Some(root) = crate::sessions::default_root() else {
         return Ok(Json(Vec::new()));
     };
-    let taken: Vec<String> = sqlx::query_scalar("SELECT session_id FROM assistant_sessions")
-        .fetch_all(&state.pool)
+    let taken = crate::chats::picked_up(&state.pool)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "listing the sessions already continued failed");
@@ -3274,6 +3296,32 @@ async fn list_ide_sessions(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(found))
+}
+
+/// What was said in one conversation had in the editor, oldest first.
+///
+/// Read off disk on the request, like the list above and for the same reason: the store is the
+/// CLI's and changes whenever a session is typed into, so anything kept here would be a second copy
+/// of somebody else's truth. This one reads a whole file rather than its head, which is why it is
+/// on the blocking pool.
+///
+/// Not behind a chat id, though the window only ever asks about sessions it holds one for. The
+/// session is the thing that has a conversation in it; a chat merely points at one, and two routes
+/// for the same bytes would be two places for the bounds to differ.
+///
+/// A transcript this machine does not have is a 404. An empty conversation is a 200 with nothing in
+/// it, and the window says different things about the two — "nothing was said here" is a claim, and
+/// it must not be made about a file that was never found.
+async fn read_ide_session(
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<crate::sessions::Said>>, StatusCode> {
+    let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
+    let found =
+        tokio::task::spawn_blocking(move || crate::sessions::conversation(&root, &session_id))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    found.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// How many past sessions the list offers.
@@ -3307,16 +3355,12 @@ async fn create_chat(
         }
     };
 
-    let chat_id = crate::chats::create(
-        &state.pool,
-        brain,
-        continued.as_ref().map(|session| session.cwd.as_str()),
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(%error, "opening a chat failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let chat_id = crate::chats::create(&state.pool, brain, continued.as_ref())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "opening a chat failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Written after the chat exists, because it is what `get_session` reads to decide the first
     // turn resumes rather than starts clean. A failure here is not a failed request: the
@@ -7691,6 +7735,64 @@ mod tests {
 
         assert_eq!(listed.status(), StatusCode::OK);
         assert!(json_body(listed).await.is_array());
+    }
+
+    /// A session this machine does not have is a 404 and not an empty conversation.
+    ///
+    /// The two are different answers and the window shows them differently: nothing was said in
+    /// this conversation, versus this conversation is not on this machine. Collapsing them would
+    /// have the window claim the first about a transcript it never found.
+    #[tokio::test]
+    async fn a_session_this_machine_does_not_have_has_no_conversation_to_read() {
+        let state = test_state().await;
+        let read = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+
+        // And the 404 above is the transcript's absence rather than the route's. A path nothing
+        // routes answers 404 as well, so without this line the assertion would hold just as firmly
+        // with no route at all — which is the state it was written in.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// It is behind the token like everything else. These are the owner's conversations, and the
+    /// route reads them off disk rather than out of the database — which is exactly the kind of
+    /// route that gets added without one.
+    #[tokio::test]
+    async fn a_conversation_had_in_the_editor_is_not_readable_without_the_token() {
+        let state = test_state().await;
+        let read = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/anything-at-all")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(read.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.

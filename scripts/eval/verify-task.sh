@@ -21,7 +21,7 @@
 #
 # Neither survives being run. So: run them.
 #
-# THE THREE CHECKS
+# THE FOUR CHECKS
 #
 #   1. The base COMPILES. An agent handed a tree that does not build is doing a
 #      different task, and every layer of an ablation fails it identically -- as
@@ -34,6 +34,14 @@
 #   3. The held-out test PASSES on the reference (score.sh exit 0). If it fails,
 #      the test does not describe the fix, and the task scores every candidate
 #      "not solved", including a correct one.
+#
+#   4. The project's own gate is GREEN on the base. Only H3 runs a gate, so this
+#      check is younger than the rest and its absence was invisible: the other
+#      three layers never ask the base this question. Measured 2026-08-17, T1's
+#      base failed `core: fmt` on one `assert!` that bases/T1.patch left across
+#      three lines where rustfmt wants one. The 649 tests were green; only the
+#      gate saw it. H3 launched on that base opens red and measures the agent
+#      tidying somebody else's formatting.
 #
 # Check 2 is the one that catches a vacuous test, and it is the one nobody runs
 # by accident. Checks 2 and 3 together are the same mutation argument used on
@@ -97,6 +105,12 @@ if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   echo "verify-task.sh: warning: CARGO_TARGET_DIR is unset — each tree will build its own ~15 GB target dir" >&2
 fi
 
+# Named, not inherited from PATH. On this machine `bash` is C:\Windows\System32\bash.exe — WSL, a
+# different operating system with none of this toolchain in it — so a bare `bash scripts/gates.sh`
+# would fail for reasons that look like the gate's. Same value `layer.py` gives H3's gate_command.
+git_bash="${GIT_BASH:-C:/Program Files/Git/bin/bash.exe}"
+[ -x "$git_bash" ] || die "no Git bash at $git_bash (override with GIT_BASH=...); check 4 needs it"
+
 reference_of() {
   awk -F'\t' -v id="$1" '
     { sub(/\r$/, "") } /^[ \t]*#/ { next } /^[ \t]*$/ { next }
@@ -136,7 +150,7 @@ for task in "${tasks[@]}"; do
     || { results+=("$task	HARNESS	could not materialize the reference"); overall=1; continue; }
 
   # ------------------------------------------------------- 1. the base compiles
-  echo "verify-task.sh: [1/3] does the base compile?"
+  echo "verify-task.sh: [1/4] does the base compile?"
   ( cd "$base_tree" && cargo check --all-targets ) > "$log_dir/base-check.log" 2>&1
   if [ $? -ne 0 ]; then
     echo "verify-task.sh: NO. The base does not build; an agent handed it is doing a different task."
@@ -148,7 +162,7 @@ for task in "${tasks[@]}"; do
   echo "verify-task.sh: yes."
 
   # ------------------------------------ 2. the held-out test fails on the base
-  echo "verify-task.sh: [2/3] does the held-out test fail on the base?"
+  echo "verify-task.sh: [2/4] does the held-out test fail on the base?"
   bash "$script_dir/score.sh" --task "$task" --tree "$base_tree" \
     --tasks-file "$tasks_file" --ref-repo "$repo" \
     --work-dir "$log_dir/score-base" > "$log_dir/score-base.log" 2>&1
@@ -167,7 +181,7 @@ for task in "${tasks[@]}"; do
   esac
 
   # --------------------------------- 3. the held-out test passes on the reference
-  echo "verify-task.sh: [3/3] does the held-out test pass on the reference?"
+  echo "verify-task.sh: [3/4] does the held-out test pass on the reference?"
   bash "$script_dir/score.sh" --task "$task" --tree "$ref_tree" \
     --tasks-file "$tasks_file" --ref-repo "$repo" \
     --work-dir "$log_dir/score-ref" > "$log_dir/score-ref.log" 2>&1
@@ -181,6 +195,24 @@ for task in "${tasks[@]}"; do
     *) results+=("$task	HARNESS	score.sh exit $ref_verdict on the reference"); overall=1; continue ;;
   esac
 
+  # ------------------------------------ 4. the project's own gate is green on the base
+  #
+  # Only H3 runs a gate, which is why this check is younger than the other three and why its
+  # absence stayed invisible: H0-H2 never ask the base this question. Measured 2026-08-17, T1's
+  # base failed `core: fmt` — one `assert!` that `bases/T1.patch` left across three lines where
+  # rustfmt wants one. Tests were green; only the gate saw it. An H3 launched on that base would
+  # have opened with a red gate and measured the agent tidying somebody else's formatting.
+  echo "verify-task.sh: [4/4] is the project's own gate green on the base?"
+  ( cd "$base_tree" && "$git_bash" scripts/gates.sh core ) > "$log_dir/base-gate.log" 2>&1
+  if [ $? -ne 0 ]; then
+    echo "verify-task.sh: NO. H3 would start red, and its verdict would be about the base."
+    grep -E '^gates FAILED|^  [a-z]+: ' "$log_dir/base-gate.log" | head -n 10
+    results+=("$task	GATE-RED-ON-BASE	$log_dir/base-gate.log")
+    overall=1
+    continue
+  fi
+  echo "verify-task.sh: yes."
+
   results+=("$task	VALID	base=$kind")
 done
 
@@ -192,7 +224,8 @@ printf '%s\n' "${results[@]}" | column -t -s "$(printf '\t')" 2>/dev/null \
   || printf '%s\n' "${results[@]}"
 echo
 if [ $overall -eq 0 ]; then
-  echo "every task verified: base compiles, test fails on base, test passes on reference."
+  echo "every task verified: base compiles, test fails on base, test passes on reference,"
+  echo "and the project's own gate is green on the base."
 else
   echo "at least one task is NOT valid. A row that fails here must not appear in a"
   echo "results table — it produces verdicts that mean nothing."

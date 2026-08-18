@@ -2724,9 +2724,13 @@ mod tests {
     /// An in-flight turn of a conversation ROOTED in `root` — one continuing a session had in the
     /// IDE. Returns the run id.
     async fn rooted_turn_run(state: &AppState, root: &str) -> i64 {
-        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, Some(root))
-            .await
-            .unwrap();
+        let chat_id = crate::chats::create(
+            &state.pool,
+            crate::chats::Brain::Cloud,
+            Some(&crate::sessions::had_in(root, "had-in-the-ide")),
+        )
+        .await
+        .unwrap();
         let run_id = in_flight_run(state, "assistant", None, None, None).await;
         sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
             .bind(&chat_id)

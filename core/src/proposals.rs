@@ -644,6 +644,33 @@ pub async fn grant_action(
 /// takeover row was already forbidden to authorize the one action it names; covering a class for the
 /// rest of the run, it would authorize an open-ended number of them — every merge the run cared to
 /// attempt, off the back of a row minted to say the queue had taken merging away from it.
+/// The authorization this run was resumed with and never used, if there is one.
+///
+/// A resume exists to carry out one action a human agreed to. `grant_covers_class` stamps
+/// `consumed_at` the first time that action is attempted, so a grant still NULL when the run reaches
+/// its end says the run finished without ever doing the thing it was resumed for.
+///
+/// **Measured 2026-08-17** (`.ai/eval/ABLATION.md`, T1×H3): two resumed runs refused the instruction
+/// they were given, answered with a question nobody was there to read, and were recorded
+/// `completed`, `exit_code: 0`, `gate_status: passed` — the gate green precisely because the tree was
+/// untouched. The run that did continue (900270) consumed its grant; the two that did not never
+/// touched it. The distinction the record was missing is already in this table.
+///
+/// A takeover row (`queued_request_id IS NOT NULL`) authorizes nothing and is never consumed by
+/// design, so it is excluded — otherwise every queued merge would report itself as work not done.
+pub async fn unconsumed_grant(
+    pool: &SqlitePool,
+    run_id: i64,
+) -> sqlx::Result<Option<(String, i64)>> {
+    sqlx::query_as::<_, (String, i64)>(
+        "SELECT tool_name, proposal_id FROM action_grants
+         WHERE run_id = ? AND consumed_at IS NULL AND queued_request_id IS NULL",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn grant_covers_class(
     pool: &SqlitePool,
     run_id: i64,
@@ -715,6 +742,41 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    /// The distinction the run record was missing: resumed and acted, against resumed and did not.
+    ///
+    /// Both runs end `completed` with exit 0, and no field on `runs` separates them. This one does,
+    /// and it was already being written — `grant_covers_class` stamps `consumed_at` on the first
+    /// attempt, so a grant still NULL at the end is a resume that never carried out its errand.
+    #[tokio::test]
+    async fn a_grant_the_resumed_run_never_used_is_reported_and_one_it_used_is_not() {
+        let pool = test_pool().await;
+        grant_action(&pool, 900, "Bash", Some("write-local"), 61)
+            .await
+            .unwrap();
+        grant_action(&pool, 901, "Bash", Some("write-local"), 62)
+            .await
+            .unwrap();
+
+        // 901 attempts the action it was resumed for; 900 finishes without ever trying.
+        assert!(grant_covers_class(&pool, 901, "write-local").await.unwrap());
+
+        assert_eq!(
+            unconsumed_grant(&pool, 900).await.unwrap(),
+            Some(("Bash".to_string(), 61)),
+            "a resume that never attempted its action must be reportable"
+        );
+        assert_eq!(
+            unconsumed_grant(&pool, 901).await.unwrap(),
+            None,
+            "a resume that did the work must not be reported as if it had not"
+        );
+        assert_eq!(
+            unconsumed_grant(&pool, 902).await.unwrap(),
+            None,
+            "a run that was never resumed has no errand to have skipped"
+        );
     }
 
     #[tokio::test]

@@ -46,6 +46,7 @@ mod proposals;
 mod recurrence;
 mod redact;
 mod repo_trigger;
+mod resolver;
 mod runner;
 mod runs;
 mod scheduler;
@@ -822,6 +823,11 @@ async fn main() {
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor::default()),
     ));
+    // Its own loop and not a step inside the queue worker's, for the reason `resolver.rs` opens
+    // with: the worker holds a pool and a repository lock, and starting an agent needs an
+    // `AppState` and the time an agent takes. The queue escalates and lets go; this picks the
+    // conflict up afterwards.
+    tokio::spawn(resolver::run_resolution_loop(state.clone()));
     // Only when a local model is already configured, and reusing the triage one rather than adding
     // a key: this reads mail-derived text, which is the text that model was chosen for, and
     // `web.rs` sets the precedent of one local model pinned in one place serving more than one

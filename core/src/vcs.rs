@@ -1071,6 +1071,40 @@ pub async fn submit_on<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
+    admit(executor, repo, op, origin, false).await
+}
+
+/// `submit`, for the landing that comes OUT of a conflict resolution.
+///
+/// Two things follow from the mark and neither can be recovered later, which is why it is written
+/// with the row rather than stamped on afterwards. The executor VERIFIES a marked source before
+/// merging it — a two-parent tip, no conflict markers — and a stamp applied after the INSERT has a
+/// window the queue polls every 500ms, so the merge that most needs checking is the one likeliest to
+/// be claimed unmarked. And a marked request never spawns a resolution of its own, which is what
+/// stops a resolution that conflicts from minting an agent that lands, that conflicts, for ever.
+///
+/// A separate entry point rather than a flag on `submit`, because there is exactly one caller and
+/// the truth it asserts is specific: *this branch was produced by a resolver*. Every other admission
+/// reads unchanged, and the INSERT is still written once.
+pub async fn submit_resolution(
+    pool: &sqlx::SqlitePool,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64> {
+    admit(pool, repo, op, origin, true).await
+}
+
+async fn admit<'e, E>(
+    executor: E,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+    from_resolution: bool,
+) -> sqlx::Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let status = if origin.needs_approval() {
         "awaiting_approval"
     } else {
@@ -1078,8 +1112,8 @@ where
     };
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at, from_resolution)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(op.kind())
     .bind(op.to_args())
@@ -1090,6 +1124,7 @@ where
     .bind(origin.run_id())
     .bind(status)
     .bind(created_at)
+    .bind(i64::from(from_resolution))
     .execute(executor)
     .await?;
     Ok(result.last_insert_rowid())
@@ -2641,6 +2676,53 @@ mod tests {
         assert!(
             database_error.to_string().contains("repo_key"),
             "the index that rejected this must be the one keyed on repo_key: {database_error}"
+        );
+    }
+
+    /// The mark has to survive from admission to claim, and those two are a daemon restart apart —
+    /// which is why it is written onto the row rather than worked out when the queue gets there.
+    /// Everything the resolver's safety rests on hangs off this boolean: a marked source is verified
+    /// before it is merged, and an unmarked one is not, so a mark that failed to travel would let the
+    /// merge that most needs checking through unchecked.
+    #[tokio::test]
+    async fn only_a_landing_that_came_out_of_a_resolution_is_claimed_for_verification() {
+        let pool = test_pool().await;
+        let ordinary = submit(&pool, &repo(), &merge_op(), Origin::Shell)
+            .await
+            .unwrap();
+        let resolved = submit_resolution(&pool, &repo(), &merge_op(), Origin::Shell)
+            .await
+            .unwrap();
+
+        let first = claim_next(&pool, "alpha")
+            .await
+            .unwrap()
+            .expect("the first request is claimable");
+        assert_eq!(first.id, ordinary);
+        assert!(
+            !first.from_resolution,
+            "an ordinary landing must not be held to a resolution's shape — a single-parent tip is \
+             what every branch has"
+        );
+        finish(
+            &pool,
+            first.id,
+            Outcome::Succeeded {
+                sha: None,
+                output_tail: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let second = claim_next(&pool, "alpha")
+            .await
+            .unwrap()
+            .expect("the second follows once the repository is free");
+        assert_eq!(second.id, resolved);
+        assert!(
+            second.from_resolution,
+            "a resolution's landing has to arrive at the executor marked, or nothing verifies it"
         );
     }
 

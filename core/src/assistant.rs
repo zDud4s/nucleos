@@ -2998,9 +2998,13 @@ mod tests {
     #[tokio::test]
     async fn a_session_the_daemon_never_ran_is_resumable_because_there_is_nothing_against_it() {
         let state = test_state().await;
-        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, Some("C:/x"))
-            .await
-            .unwrap();
+        let chat_id = crate::chats::create(
+            &state.pool,
+            crate::chats::Brain::Cloud,
+            Some(&crate::sessions::had_in("C:/x", "had-in-the-ide")),
+        )
+        .await
+        .unwrap();
         upsert_session(
             &state.pool,
             &chat_id,
@@ -3025,7 +3029,10 @@ mod tests {
         let chat_id = crate::chats::create(
             &state.pool,
             crate::chats::Brain::Cloud,
-            Some("C:/Projects/nucleos-canvas"),
+            Some(&crate::sessions::had_in(
+                "C:/Projects/nucleos-canvas",
+                "aaaa-1111",
+            )),
         )
         .await
         .unwrap();

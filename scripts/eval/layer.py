@@ -32,18 +32,83 @@ blocker, and it is not a property of the harness — it is the CLI's permission 
 this ladder measures. An H0 that cannot compile does not measure a weaker layer, it measures nothing,
 and it does so while looking like a result.
 
+**Except that the list has never once taken effect, and this file said otherwise for three weeks.**
+Every eval run so far — 900265, 900268, 900270, 900272, all four layers — printed the same line on
+stderr, which nobody read until 2026-08-17:
+
+    Ignoring 16 permissions.allow entries from .claude/settings.json: this workspace has not been
+    trusted. Run Claude Code interactively here once and accept the trust dialog, or set
+    projects["<tree>"].hasTrustDialogAccepted: true in ~/.claude.json
+
+A candidate tree is a fresh directory that no human has ever opened, so it is untrusted by
+construction and the CLI drops the whole list. The runs work anyway, which is why this went unnoticed:
+the daemon launches autonomous runs with permissions bypassed, so the allow list was never what was
+letting `cargo` through. It is inert in all four layers equally, so it biases no comparison — the
+paragraph above is right about the constant and wrong about the mechanism. Left in place deliberately:
+removing it would make the trees differ from every row already recorded, for a list that does nothing.
+Whoever wants it to bite must set `hasTrustDialogAccepted` per tree, and must then re-run the whole
+ladder, because that changes what H0 and H1 are.
+
 **Removed everywhere: `hooks.PostToolUse`.** It runs `.ai/scripts/log_event.py`, and `.ai/` is
 gitignored, so that file is in no candidate tree of any layer. Left in place it fires and fails on
 every Bash call in every layer — noise, equal across layers, but noise inside the thing being timed.
 
+**Constant: one shared, pre-warmed `CARGO_TARGET_DIR`,** written into the tree as `.cargo/config.toml`
+so it travels into the worktree the daemon makes. This was the first thing measured that did not
+compare: T1×H0 ran against a target directory I had warmed by hand and T1×H1 against a cold one, and
+$1.59 vs $2.93 was in good part the price of a dependency graph, not of a layer.
+
+It is not really a choice. `README.md` already prescribes the shared directory for the scorer and
+says why — a per-tree target costs ~12 GB, and this machine has 20.9 GB free. Two cold cells fill the
+disk; a twelve-cell ladder was never going to run. Sharing makes every layer pay the same one
+workspace-crate compile and none of them the ~500-crate dependency build.
+
+**But not the project's own `target/`, which is what `README.md` gives the scorer.** The scorer runs
+when nothing else does; a run does not. Pointing cells at the live repository's target directory was
+tried here first and is wrong twice over:
+
+- **Cargo locks the build directory.** Measured while preparing this: `Blocking waiting for file
+  lock on build directory`, because the other session was building. Every cell's wall clock would
+  then include however long somebody else's compile took, and wall clock is half of what the ladder
+  reports.
+- **It lets a live repository's binary run inside a cell.** Cargo's artifact hash for this package
+  does not include the workspace path, so every tree writes the same `nucleos_core-<hash>` and shares
+  one fingerprint; only mtimes separate them. A build in the live repo mid-run leaves artifacts newer
+  than the cell's untouched sources, and cargo calls the cell fresh and runs the other binary. That is
+  not hypothetical — `README.md` records a gate reporting green in 0.87s while running a test its tree
+  did not contain. Its blast radius here is the agent's first `cargo test`, before it has edited
+  anything, which is exactly the observation an agent decides its approach from.
+
+Hence a directory of the eval's own, built once and shared by every cell, and torn down after. The
+same mtime trap still applies between cells, so this stamps the tree — last, after the commit, since
+`git commit` does not touch working-tree mtimes.
+
+The stamp also decides something the ladder reports. A worktree is checked out fresh and is newborn
+by construction, so H1–H3 each pay one workspace-crate compile inside their own clock. Stamped, H0
+pays it too. That is deliberate: unstamped, H0 would be the one layer allowed to run a binary built
+from another tree, and buying a fair comparison with a stale-artifact bug is not a trade worth making.
+
+The related fix, which outlives the choice above: the daemon runs from a copy at
+`C:/Projects/nucleos-daemon/`, not from `target/debug/nucleos-core.exe`. `nucleos-core` is bin-only,
+so anything building it relinks that path, and Windows denies the write while the daemon holds it
+open. The token is state, not a property of the binary, so the copy prints the same one.
+
+**H3 only: `gate_command` in `.ai/autopilot.yaml`.** H3 is H2 plus the exit gate. An earlier version
+of this file refused to write it, on the grounds that it is "daemon-side configuration, not a property
+of this tree" and would land somewhere the daemon does not read. That was wrong, and left the top of
+the ladder needing a manual step nobody had written down. `runs.rs` reads it through
+`load_schedule_rules(project_root)` where `project_root` is the run's own `cwd` — this tree. Gitignored
+is fine and in fact required: it is read before the worktree exists, which is what stops an agent from
+repointing its own gate.
+
+The command names Git's bash by absolute path, quoted. `bash` alone resolves to `C:\Windows\System32\
+bash.exe` on this machine — WSL, a different operating system with no Windows cargo in it — and H3
+would then measure a gate that could never have gone green. `split_command` keeps quoted groups
+together, so the space in `Program Files` survives.
+
 ## What this does NOT do
 
-H3 is H2 plus the exit gate, which `README.md` places in `gate_command:` in the `.ai/autopilot.yaml`
-of the PROJECT ROOT — daemon-side configuration, not a property of this tree. It is not written here
-because writing it into the tree would put it somewhere the daemon does not read, which is worse than
-leaving it undone: the layer would look prepared and would be H2.
-
-Nor does it choose the run's mode. H0 is `mode: real` and H1-H3 are `mode: worktree`; that is an
+It does not choose the run's mode. H0 is `mode: real` and H1-H3 are `mode: worktree`; that is an
 argument to the run, and it is named in the summary this prints so the caller cannot forget it.
 """
 
@@ -59,6 +124,67 @@ LAYERS = ("H0", "H1", "H2", "H3")
 
 # The run mode each layer is launched with. Printed, never applied — it belongs to the run.
 LAYER_MODE = {"H0": "real", "H1": "worktree", "H2": "worktree", "H3": "worktree"}
+
+# The one target directory every layer builds into. The eval's own, not the project's — see the
+# module docstring for the two ways sharing the live repository's target corrupts a cell.
+SHARED_TARGET_DIR = "C:/Projects/nucleos-eval-target"
+
+# H3's exit gate. Git's bash by absolute path — see the docstring on why the bare name is a trap.
+GATE_COMMAND = '"C:/Program Files/Git/bin/bash.exe" scripts/gates.sh core'
+
+
+def write_cargo_config(tree: str) -> str:
+    """Point this tree's cargo at the shared target directory.
+
+    In the tree rather than in the run's environment because the worktree layers do not run where
+    this script runs — the daemon checks the candidate out somewhere else, and a variable exported
+    here would not be there. A committed `.cargo/config.toml` is found by cargo walking up from
+    wherever the crate ends up.
+    """
+    config_dir = os.path.join(tree, ".cargo")
+    config_path = os.path.join(config_dir, "config.toml")
+    if os.path.exists(config_path):
+        # No base of this repository carries one today. If one ever does it will hold real settings,
+        # and merging TOML by hand is how those get silently dropped — so stop and let a person look.
+        raise SystemExit(f"layer.py: {config_path} already exists; it would be overwritten. "
+                         f"Merge the target-dir into it by hand and re-run.")
+    os.makedirs(config_dir, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("# Written by scripts/eval/layer.py — see its docstring.\n"
+                     "[build]\n"
+                     f'target-dir = "{SHARED_TARGET_DIR}"\n')
+    return config_path
+
+
+def write_gate(tree: str) -> str:
+    """Configure H3's exit gate, in the one place the daemon looks for it."""
+    config_dir = os.path.join(tree, ".ai")
+    config_path = os.path.join(config_dir, "autopilot.yaml")
+    os.makedirs(config_dir, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("# Written by scripts/eval/layer.py — H3 is H2 plus this line.\n"
+                     f"gate_command: '{GATE_COMMAND}'\n"
+                     "schedules: []\n")
+    return config_path
+
+
+def stamp(tree: str) -> int:
+    """Give every file a current mtime, so cargo cannot mistake this tree for one it already built.
+
+    Last, after the commit: `git commit` does not touch working-tree mtimes, and this has to be the
+    newest thing that happened to the tree before the run starts.
+    """
+    count = 0
+    for directory, _, names in os.walk(tree):
+        if ".git" in directory.split(os.sep):
+            continue
+        for name in names:
+            try:
+                os.utime(os.path.join(directory, name), None)
+                count += 1
+            except OSError:
+                pass
+    return count
 
 
 def ensure_repository(tree: str) -> str:
@@ -167,23 +293,38 @@ def main() -> int:
         json.dump(settings, handle, indent=2)
         handle.write("\n")
 
+    # Before the commit: the worktree layers only ever see what HEAD carries.
+    config_path = write_cargo_config(args.tree)
+
+    # Deliberately after nothing in particular — `.ai/` is gitignored, so this never reaches the
+    # worktree, and `runs.rs` reads it from the project root before the worktree exists.
+    gate_path = write_gate(args.tree) if args.layer == "H3" else None
+
     # Only the worktree layers need it, and H0 is deliberately left as the plain directory
     # `materialize.sh` argues for.
     repo_note = None
     if LAYER_MODE[args.layer] == "worktree":
         repo_note = ensure_repository(args.tree)
 
+    stamped = stamp(args.tree)
+
     print(f"layer.py: {args.tree} is now {args.layer}")
     if repo_note:
         print(f"  git repository: {repo_note} — worktree mode cannot start without one")
+    print(f"  cargo target-dir: {SHARED_TARGET_DIR} (via {os.path.relpath(config_path, args.tree)})"
+          f" — shared and pre-warmed, identical in every layer")
+    print(f"  stamped {stamped} files — without it cargo can call this tree fresh and run another's "
+          f"binary")
+    if gate_path:
+        print(f"  gate_command: {GATE_COMMAND}")
+        print(f"    in {os.path.relpath(gate_path, args.tree)} — gitignored on purpose: read from "
+              f"the project root before the worktree exists, so the run cannot repoint it")
     print(f"  PreToolUse:  {'kept' if args.layer in LAYERS_WITH_HOOK else 'removed'}"
           f" (was {'present' if had_pre else 'absent'})")
     print(f"  PostToolUse: {'removed' if had_post else 'absent'} — its script is gitignored, so it "
           f"is in no candidate tree")
     print(f"  permissions.allow: {len(EVAL_ALLOW)} entries, identical in every layer")
-    print(f"  launch this run with mode={LAYER_MODE[args.layer]}"
-          + ("  and a gate_command in the PROJECT ROOT's .ai/autopilot.yaml"
-             if args.layer == "H3" else ""))
+    print(f"  launch this run with mode={LAYER_MODE[args.layer]}")
     return 0
 
 
