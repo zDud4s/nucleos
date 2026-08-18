@@ -181,6 +181,46 @@ describe("StateBadge — pillar", () => {
   });
 });
 
+describe("StateBadge — council", () => {
+  it("keeps running, done, error and cancelled apart", () => {
+    assertAllDistinct("council", ["running", "done", "error", "cancelled"]);
+  });
+
+  it("gives each of the four run states its own label", () => {
+    expect(badge("council", "running")?.text).toMatch(/deliberat/i);
+    expect(badge("council", "done")?.text).toMatch(/settled/i);
+    expect(badge("council", "error")?.text).toMatch(/fail/i);
+    expect(badge("council", "cancelled")?.text).toMatch(/cancelled/i);
+  });
+});
+
+describe("StateBadge — council_seat", () => {
+  it("keeps pending, ok, timeout, error, cancelled and skipped apart", () => {
+    assertAllDistinct("council_seat", ["pending", "ok", "timeout", "error", "cancelled", "skipped"]);
+  });
+
+  it("renders a timed-out seat with a tone and a label distinct from a failed one (A9)", () => {
+    // §7: a seat that ran out of time is not a seat that failed, and it must
+    // never take the danger tone.
+    const timeout = badge("council_seat", "timeout");
+    const error = badge("council_seat", "error");
+    expect(timeout?.className).not.toContain("ui-badge-danger");
+    expect(timeout?.text).not.toMatch(/fail/i);
+    expect(timeout?.text).not.toBe(error?.text);
+    expect(timeout?.className).not.toBe(error?.className);
+  });
+
+  it("does not read a skipped seat as one that was cancelled", () => {
+    // `skipped` is a seat never invited to vote in stage 2 — a different fact
+    // from a seat that was invited and then had the run cancelled under it.
+    const skipped = badge("council_seat", "skipped");
+    const cancelled = badge("council_seat", "cancelled");
+    expect(skipped?.text).not.toBe(cancelled?.text);
+    expect(skipped?.text).toMatch(/not asked/i);
+    expect(cancelled?.text).toMatch(/cancelled/i);
+  });
+});
+
 describe("StateBadge — states with no reading", () => {
   it("shows an unmapped state as itself rather than guessing a tone", () => {
     const unknown = badge("run", "hibernating");

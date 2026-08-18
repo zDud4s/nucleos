@@ -31,7 +31,9 @@ export type StateDomain =
   | "pillar"
   | "collision"
   | "slot"
-  | "vcs";
+  | "vcs"
+  | "council"
+  | "council_seat";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -172,6 +174,46 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   pillar: {
     disabled: { tone: "off", label: "not configured" },
     down: { tone: "danger", label: "down" },
+  },
+
+  /**
+   * A council's run status — `core/src/council.rs:23-26`.
+   *
+   * `running` gets the pending tone rather than an active one: nothing has been
+   * decided yet, and drawing a deliberation in progress the same colour as a
+   * settled one would tell a person to stop watching a card that still has
+   * something to say. `cancelled` is withdrawn work, not a verdict, so it takes
+   * the same quiet `off` every other cancellation in this table does.
+   */
+  council: {
+    running: { tone: "pending", label: "deliberating" },
+    done: { tone: "active", label: "settled" },
+    error: { tone: "danger", label: "failed" },
+    cancelled: { tone: "off", label: "cancelled" },
+  },
+
+  /**
+   * One seat's status within one phase — `core/src/council.rs:28-34`. The same
+   * six literals serve both `stage1_status` and `stage2_status`; a card reads
+   * this table twice, once per stage.
+   *
+   * Two pairs the design's §7 will not let collapse. `timeout` is a seat that
+   * ran out of time, not a seat that failed — it gets the held tone, never the
+   * danger one, so a card full of timeouts reads as "the deadline was too
+   * short" rather than "these models are broken". And `skipped` is a seat that
+   * was never invited to vote in stage 2 at all — a different fact from
+   * `cancelled`, which is a seat that was invited and then had the invitation
+   * withdrawn when the run was called off. Both read as quiet and dismissed
+   * (`off`), but with different words, because a person auditing a council
+   * needs to be able to tell the two apart from the label alone.
+   */
+  council_seat: {
+    pending: { tone: "pending", label: "waiting" },
+    ok: { tone: "active", label: "answered" },
+    timeout: { tone: "paused", label: "timed out" },
+    error: { tone: "danger", label: "failed" },
+    cancelled: { tone: "off", label: "cancelled" },
+    skipped: { tone: "off", label: "not asked" },
   },
 };
 
