@@ -12,6 +12,7 @@ function chat(overrides: Partial<ChatRow> & { chat_id: string }): ChatRow {
     first_message: null,
     last_activity: null,
     cwd: null,
+    ide_session_id: null,
     waiting: 0,
     ...overrides,
   };

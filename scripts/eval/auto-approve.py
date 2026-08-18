@@ -66,8 +66,17 @@ def main() -> int:
         "--run",
         type=int,
         action="append",
-        required=True,
         help="a run whose approvals to answer; repeatable. There is deliberately no --all.",
+    )
+    parser.add_argument(
+        "--project",
+        action="append",
+        help="a project whose runs' approvals to answer; repeatable. Required for H2/H3, because "
+        "approving does not resume the run it approved — `resume_after_approval` marks that run "
+        "`superseded` and INSERTS a successor with a NEW id. A `--run 900269` approver answers the "
+        "first question and then goes deaf, and the cell dies at its wall clock looking like a "
+        "timeout. Still scoped, which is the property that mattered: `eval-T1-H2` is the eval's own "
+        "project and nobody else's work is in it.",
     )
     parser.add_argument("--daemon-url", default=os.environ.get("NUCLEOS_DAEMON_URL", DEFAULT_DAEMON_URL))
     parser.add_argument("--interval", type=float, default=3.0, help="seconds between polls")
@@ -92,9 +101,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if not args.run and not args.project:
+        sys.exit("one of --run or --project is required; there is deliberately no --all")
+
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     token = control_token(root)
-    wanted = set(args.run)
+    wanted = set(args.run or ())
+    projects = set(args.project or ())
     log_path = args.log if os.path.isabs(args.log) else os.path.join(root, args.log)
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
@@ -119,6 +132,19 @@ def main() -> int:
             print(f"daemon unreachable ({error}); retrying", flush=True)
             time.sleep(args.interval)
             continue
+
+        # Re-read every poll rather than once: the successor run this loop's own approvals create
+        # does not exist yet when the loop starts.
+        if projects:
+            try:
+                runs = call(f"{args.daemon_url}/runs", token) or []
+            except urllib.error.URLError:
+                runs = []
+            if not isinstance(runs, list):
+                runs = runs.get("runs", [])
+            for run in runs:
+                if run.get("project_id") in projects and isinstance(run.get("id"), int):
+                    wanted.add(run["id"])
 
         mine = [
             proposal

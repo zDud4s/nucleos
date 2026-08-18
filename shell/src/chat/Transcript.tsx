@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { formatUsd, runIsLive } from "../derive";
 import { Teach } from "../ui";
+import type { Said } from "../api";
 import type { Turn } from "./turns";
 
 /**
@@ -56,22 +57,36 @@ interface TranscriptProps {
    * their conversation is still arriving is the same wrong answer this page exists to prevent.
    */
   loaded: boolean;
+  /**
+   * What was said in the conversation this one was picked up from, or null when there is no such
+   * conversation — it was opened here, or its transcript is no longer on this machine.
+   *
+   * Read out of the editor's own file rather than out of the daemon, and drawn above the turns
+   * because that is when it happened. Without it, picking up a conversation opened onto a blank
+   * page: the model on the other side remembered every word of it and the person continuing it
+   * could see none of them.
+   */
+  pickedUp: Said[] | null;
 }
 
 /** A conversation's turns, oldest first, with the model changes marked where they happened. */
-function Transcript({ turns, loaded }: TranscriptProps) {
+function Transcript({ turns, loaded, pickedUp }: TranscriptProps) {
   const tail = useRef<HTMLDivElement | null>(null);
+  const before = pickedUp ?? [];
 
   // Follow the conversation down as it grows, the way a chat is read.
   useEffect(() => {
     tail.current?.scrollIntoView({ block: "end" });
-  }, [turns]);
+  }, [turns, pickedUp]);
 
-  if (!loaded && turns.length === 0) {
+  if (!loaded && turns.length === 0 && before.length === 0) {
     return <p className="a-note">Reading the conversation…</p>;
   }
 
-  if (turns.length === 0) {
+  // Both halves empty, and not just the daemon's. A picked-up conversation has no turns of its own
+  // until you answer in it, and saying "nothing said yet" over a page full of what you said in the
+  // editor is the same wrong answer `loaded` exists to prevent.
+  if (turns.length === 0 && before.length === 0) {
     return (
       <Teach title="Nothing said yet.">
         Each message is a run, so it is billed and appears in the run history like any other. The
@@ -83,6 +98,21 @@ function Transcript({ turns, loaded }: TranscriptProps) {
 
   return (
     <div className="chat">
+      {before.map((said, index) => (
+        // Keyed by position: these came from a file, in the order they are in it, and nothing here
+        // reorders or removes one. There is no id in a transcript to key by.
+        <div className={said.by_owner ? "bubble asked" : "bubble said"} key={`ide-${index}`}>
+          <span className="b-who">{said.by_owner ? "you" : "núcleo"}</span>
+          {/* Text, never markup, on both sides — for the reason the turns below give. */}
+          <pre className="b-text">{said.text}</pre>
+        </div>
+      ))}
+      {before.length > 0 && (
+        <p className="brain-cut">
+          Picked up here. Everything above was said in the editor and is read back out of its own
+          file — none of it was a run, and none of it was billed here.
+        </p>
+      )}
       {turns.map((turn, index) => {
         const previous = turns[index - 1];
         const changed = modelChange(previous, turn);

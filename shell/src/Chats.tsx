@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   archiveChat, createChat, getAssistantChat, getAssistantTurn, getLocalModelAvailable,
-  markChatSeen, patchChat, sendAssistantMessage, titleChatLocally,
-  type ApiResult, type Brain, type ChatRow, type ConnectionState,
+  markChatSeen, patchChat, readIdeConversation, sendAssistantMessage, titleChatLocally,
+  type ApiResult, type Brain, type ChatRow, type ConnectionState, type Said,
 } from "./api";
 import { runIsLive } from "./derive";
 import BrainPicker from "./chat/BrainPicker";
@@ -59,6 +59,15 @@ function Chats({
 }: ChatsProps) {
   /** The conversations whose transcript has been read back at least once. */
   const [read, setRead] = useState<Set<string>>(new Set());
+  /**
+   * What was said in the conversation each picked-up chat came from, by chat.
+   *
+   * By chat and not one for the open one, so returning to a conversation draws its editor half
+   * straight away instead of blanking it while the file is read again. Local to this page, unlike
+   * the transcripts: nothing here is at risk of being lost on a tab switch — it is a file on disk
+   * that no turn of ours changes, and re-reading it costs a read.
+   */
+  const [pickedUpByChat, setPickedUpByChat] = useState<Record<string, Said[] | null>>({});
   const [localAvailable, setLocalAvailable] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
   /** Whether the picker of IDE conversations is open, taking the place of the open conversation. */
@@ -78,22 +87,40 @@ function Chats({
     };
   }, [ready, token]);
 
-  // Reads the open conversation back out of the núcleo, once per conversation opened.
+  /**
+   * Which conversation had in the editor the open one was picked up from, or null.
+   *
+   * Pulled out as a string so the read below depends on the FACT and not on the list carrying it:
+   * `chats` is a new array every three seconds, and an effect watching it would re-read the whole
+   * conversation on every tick of a list that had not changed.
+   */
+  const ideSessionId = chats?.find((chat) => chat.chat_id === selected)?.ide_session_id ?? null;
+
+  // Reads the open conversation back, once per conversation opened: the turns out of the núcleo,
+  // and — on one picked up from the editor — what was said in it before it was picked up.
+  //
+  // Both before the chat counts as read, so the "nothing said yet" below is never shown over a
+  // conversation whose editor half is still arriving. Together rather than in two effects for that
+  // reason alone: it is one answer to one question, and two effects would race to say it.
   useEffect(() => {
     if (!ready || token === null || selected === null) return;
     let cancelled = false;
     void (async () => {
-      const history = await getAssistantChat(token, selected);
+      const [history, hadInTheEditor] = await Promise.all([
+        getAssistantChat(token, selected),
+        ideSessionId === null ? null : readIdeConversation(token, ideSessionId),
+      ]);
       if (cancelled) return;
       if (history !== null) {
         setTurnsForChat(selected, (current) => merge(history.map(turnFromRow), current));
       }
+      setPickedUpByChat((current) => ({ ...current, [selected]: hadInTheEditor }));
       setRead((current) => new Set(current).add(selected));
     })();
     return () => {
       cancelled = true;
     };
-  }, [ready, selected, setTurnsForChat, token]);
+  }, [ideSessionId, ready, selected, setTurnsForChat, token]);
 
   /**
    * Records that the open conversation has been read, whenever it has anything unread.
@@ -351,7 +378,11 @@ function Chats({
               onChange={(brain) => void changeBrain(brain)}
             />
             <Panel title="Conversation" aside={thinking ? "working" : undefined}>
-              <Transcript turns={turns} loaded={read.has(current.chat_id)} />
+              <Transcript
+                turns={turns}
+                loaded={read.has(current.chat_id)}
+                pickedUp={pickedUpByChat[current.chat_id] ?? null}
+              />
             </Panel>
             <Composer busy={thinking} onSend={send} />
           </>

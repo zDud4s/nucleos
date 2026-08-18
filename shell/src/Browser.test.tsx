@@ -245,3 +245,78 @@ it("says when the fence refused the page a session was opened for", async () => 
   expect(screen.getByText(/The fence stopped this page/)).toBeTruthy();
   expect(screen.getByText("off-allowlist")).toBeTruthy();
 });
+
+/**
+ * The one door no agent asked for, and the assertion is about what it does NOT do.
+ *
+ * Every other control on this screen sits behind a dialogue, because every other control acts on a
+ * destination an AGENT chose while carrying a stranger's words. This one opens an address the person
+ * typed, so it raises no proposal and asks for no approval — and a test is the only thing that keeps
+ * that from being "fixed" later by someone adding a confirmation for symmetry. Symmetry here would
+ * teach people to click through the dialogue that matters.
+ */
+it("opens a window straight from a typed address, with nothing to approve", async () => {
+  await show({});
+
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Project id for the new window"), {
+      target: { value: "acme" },
+    });
+  });
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Address to open"), {
+      target: { value: "https://jira.example.org" },
+    });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByText("Open a window"));
+  });
+
+  const opened = fetchMock.mock.calls.find((call) => String(call[0]).includes("/browser/window"));
+  expect(opened).toBeTruthy();
+  expect(JSON.parse(String(opened?.[1].body))).toEqual({
+    project_id: "acme",
+    url: "https://jira.example.org",
+  });
+  // No proposal was raised and nothing was approved on the way.
+  expect(
+    fetchMock.mock.calls.some((call) => String(call[0]).includes("/proposals/")),
+  ).toBe(false);
+});
+
+/**
+ * A 409 here means the daemon decided nobody is at the machine — while somebody is plainly looking
+ * at this screen. So the message points at the heartbeat rather than at the browser: sending someone
+ * to restart a browser that is fine is worse than telling them nothing.
+ */
+it("says which subsystem refused when nobody is judged present", async () => {
+  daemon({});
+  fetchMock.mockImplementation((url: string) => {
+    if (url.includes("/browser/window")) {
+      return Promise.resolve({ ok: false, status: 409, json: async () => ({}) });
+    }
+    if (url.includes("/browser/sessions")) {
+      return Promise.resolve({ ok: true, json: async () => [] });
+    }
+    return Promise.resolve({ ok: true, json: async () => [] });
+  });
+  await act(async () => {
+    render(<Browser token="t" connection="connected" />);
+  });
+
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Project id for the new window"), {
+      target: { value: "acme" },
+    });
+  });
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Address to open"), {
+      target: { value: "https://jira.example.org" },
+    });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByText("Open a window"));
+  });
+
+  expect(screen.getByText(/attention heartbeat, not the browser/)).toBeTruthy();
+});

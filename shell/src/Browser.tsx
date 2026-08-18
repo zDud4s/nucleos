@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   approveProposal, getProposals, keepBrowserChain, listBrowserSessions, listBrowserSites,
-  closeBrowserSession, forgetBrowserProfile, rejectProposal, returnBrowserWheel, revokeBrowserSite,
+  closeBrowserSession, forgetBrowserProfile, openBrowserWindow, rejectProposal, returnBrowserWheel,
+  revokeBrowserSite,
   type BrowserSession, type BrowserSite, type ConnectionState, type Proposal,
 } from "./api";
 import { relativeTime } from "./derive";
@@ -172,6 +173,7 @@ export default function Browser({ token, connection }: BrowserProps) {
   const [asks, setAsks] = useState<Proposal[]>([]);
   const [project, setProject] = useState("");
   const [sites, setSites] = useState<BrowserSite[] | null>(null);
+  const [windowUrl, setWindowUrl] = useState("");
   const [pending, setPending] = useState<{ session: number; project: string; chain: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -218,6 +220,32 @@ export default function Browser({ token, connection }: BrowserProps) {
     },
     [token, load],
   );
+
+  /**
+   * Opens a window nobody asked for but you.
+   *
+   * The 409 is worth its own sentence rather than a generic failure. It means the daemon decided
+   * nobody is at this machine, and since this screen IS somebody being at the machine, seeing it
+   * points at the heartbeat rather than at the browser — which is a different thing to go and look
+   * at, and a message saying "could not open" would send you to the wrong one.
+   */
+  const openWindow = useCallback(async () => {
+    if (token === null || project.trim() === "" || windowUrl.trim() === "") return;
+    setBusy(true);
+    setNote(null);
+    const opened = await openBrowserWindow(token, project.trim(), windowUrl.trim());
+    setBusy(false);
+    if (!opened.ok) {
+      setNote(
+        opened.status === 409
+          ? "The daemon says nobody is at this machine, so it will not open a window for someone to sit at. That is the attention heartbeat, not the browser."
+          : "The window would not open. The pillar may be off, or the browser could not start.",
+      );
+    } else {
+      setWindowUrl("");
+    }
+    await load();
+  }, [token, project, windowUrl, load]);
 
   const refuse = useCallback(
     async (proposal: Proposal) => {
@@ -366,6 +394,51 @@ export default function Browser({ token, connection }: BrowserProps) {
             </li>
           ))}
         </ul>
+      </Panel>
+
+      {/*
+        The only door into this pillar that no agent asked for.
+
+        It is deliberately plain — two fields and a button, no confirmation and no dialogue — and the
+        plainness is the argument. Every ceremony on this screen defends against an AGENT having
+        chosen a destination while carrying a stranger's words; you typed this one. Asking you to
+        approve your own address would teach you to click through the dialogue above, which is the
+        one that matters.
+
+        What it is FOR: until it existed, a profile could only be repaired, never prepared. The way
+        to let the agent read your Jira was to wait for it to fail at Jira first. This opens the
+        window before the wall.
+      */}
+      <Panel title="Open a window yourself">
+        <p className="faint">
+          A real window, on this project&rsquo;s profile, with no fence and nobody asking. Log in,
+          look around, then give it back below &mdash; the hosts it went through are offered to keep
+          on the way out, which is the same and only way the list underneath ever grows.
+        </p>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void openWindow();
+          }}
+        >
+          <input
+            type="text"
+            value={project}
+            placeholder="Project id"
+            aria-label="Project id for the new window"
+            onChange={(event) => setProject(event.target.value)}
+          />
+          <input
+            type="text"
+            value={windowUrl}
+            placeholder="https://…"
+            aria-label="Address to open"
+            onChange={(event) => setWindowUrl(event.target.value)}
+          />
+          <Button type="submit" disabled={busy || project.trim() === "" || windowUrl.trim() === ""}>
+            Open a window
+          </Button>
+        </form>
       </Panel>
 
       <Panel title="Where a project has logged in" aside={sites === null ? undefined : `${sites.length}`}>

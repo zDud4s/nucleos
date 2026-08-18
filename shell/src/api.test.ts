@@ -1015,3 +1015,38 @@ describe("moving an occurrence, reading the web, and the dictations", () => {
     expectGetCall(2, `${DAEMON_URL}/jobs?project_id=alpha`);
   });
 });
+
+describe("readIdeConversation", () => {
+  it("reads back what was said in a conversation had in the editor", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson([
+        { by_owner: true, text: "arranja o parser" },
+        { by_owner: false, text: "está arranjado" },
+      ]),
+    );
+
+    const said = await api.readIdeConversation(TOKEN, "aaaa-1111");
+
+    expectGetCall(1, `${DAEMON_URL}/assistant/ide-sessions/aaaa-1111`);
+    expect(said).toEqual([
+      { by_owner: true, text: "arranja o parser" },
+      { by_owner: false, text: "está arranjado" },
+    ]);
+  });
+
+  it("reads back nothing when the transcript is no longer on this machine", async () => {
+    fetchMock.mockResolvedValueOnce(nonOk(404));
+
+    // Null and not an empty list. An empty list is a conversation nobody spoke in, and the window
+    // says so out loud; a transcript that was not found is not something to make that claim about.
+    expect(await api.readIdeConversation(TOKEN, "aaaa-1111")).toBeNull();
+  });
+
+  it("sends the id encoded, because it names a path on the daemon", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([]));
+
+    await api.readIdeConversation(TOKEN, "../elsewhere/secret");
+
+    expectGetCall(1, `${DAEMON_URL}/assistant/ide-sessions/..%2Felsewhere%2Fsecret`);
+  });
+});

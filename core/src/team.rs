@@ -2272,7 +2272,9 @@ fn mcp_config_path(team_run_id: &str) -> std::path::PathBuf {
 fn write_mcp_config(team_run_id: &str) -> std::io::Result<std::path::PathBuf> {
     let path = mcp_config_path(team_run_id);
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-    let body = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
+    // `None`: a department is not an errand. What narrows its surface is `--allowedTools` from
+    // `TEAM_TOOLS`, decided per node, not the server-side box.
+    let body = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe, None))
         .map_err(std::io::Error::other)?;
     crate::storage::write_atomic(&path, &body)?;
     Ok(path)

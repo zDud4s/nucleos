@@ -20,6 +20,7 @@ mod contacts;
 mod council;
 mod daemon_client;
 mod email;
+mod errands;
 mod exclusion;
 mod feed;
 mod files;
@@ -45,6 +46,7 @@ mod proposals;
 mod recurrence;
 mod redact;
 mod repo_trigger;
+mod resolver;
 mod runner;
 mod runs;
 mod scheduler;
@@ -216,7 +218,18 @@ async fn main() {
     }
 
     if std::env::args().any(|a| a == "--mcp-tools") {
-        if let Err(e) = mcp_tools::run_stdio().await {
+        // `--box errand --errand <id>` narrows what this process serves. Refused rather than
+        // ignored when the box is not one this server knows: a launcher that misspells it would
+        // otherwise get the FULL tool set, in a Telegram topic, with nothing saying so.
+        let args: Vec<String> = std::env::args().collect();
+        let served = match mcp_tools::box_from_args(&args) {
+            Ok(served) => served,
+            Err(e) => {
+                eprintln!("mcp-tools failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = mcp_tools::run_stdio(served).await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
         }
@@ -830,6 +843,11 @@ async fn main() {
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor::default()),
     ));
+    // Its own loop and not a step inside the queue worker's, for the reason `resolver.rs` opens
+    // with: the worker holds a pool and a repository lock, and starting an agent needs an
+    // `AppState` and the time an agent takes. The queue escalates and lets go; this picks the
+    // conflict up afterwards.
+    tokio::spawn(resolver::run_resolution_loop(state.clone()));
     // Only when a local model is already configured, and reusing the triage one rather than adding
     // a key: this reads mail-derived text, which is the text that model was chosen for, and
     // `web.rs` sets the precedent of one local model pinned in one place serving more than one

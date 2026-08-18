@@ -1664,6 +1664,10 @@ pub struct FakeCommandRunner {
     // Set by Task 4's cancellation/timeout tests to simulate a slow/hung run.
     pub delay: std::sync::Mutex<Option<std::time::Duration>>,
     pub last_plan_only: std::sync::Mutex<Option<bool>>,
+    /// The prompt the launch was handed. Recorded because a turn's prompt is not always the text
+    /// the person typed — an errand's notebook is prepended to it — so what the CLI actually
+    /// received is the only place that injection can be observed.
+    pub last_prompt: std::sync::Mutex<Option<String>>,
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
@@ -1731,6 +1735,7 @@ impl CommandRunner for FakeCommandRunner {
             std::fs::write(std::path::Path::new(artifacts).join("plan.json"), plan)
                 .expect("the plan node writes its queue");
         }
+        *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
         *self.last_cwd.lock().unwrap() = request.cwd.clone();
         *self.last_plan_only.lock().unwrap() = Some(request.plan_only);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();

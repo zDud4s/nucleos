@@ -64,7 +64,7 @@ func TestClientSendMessage(t *testing.T) {
 	client := New("token")
 	client.apiBase = server.URL
 
-	if err := client.SendMessage(42, "hello"); err != nil {
+	if err := client.SendMessage(Destination{ChatID: 42}, "hello"); err != nil {
 		t.Fatalf("SendMessage() error = %v", err)
 	}
 	if request["chat_id"] != float64(42) {
@@ -90,7 +90,7 @@ func TestClientSendMessageWithButtons(t *testing.T) {
 	client.apiBase = server.URL
 
 	rows := [][]Button{{{Text: "Approve", CallbackData: "approve:7"}}}
-	if err := client.SendMessageWithButtons(42, "proposal", rows); err != nil {
+	if err := client.SendMessageWithButtons(Destination{ChatID: 42}, "proposal", rows); err != nil {
 		t.Fatalf("SendMessageWithButtons() error = %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestClientTelegramError(t *testing.T) {
 	client := New("token")
 	client.apiBase = server.URL
 
-	err := client.SendMessage(42, "hello")
+	err := client.SendMessage(Destination{ChatID: 42}, "hello")
 	if err == nil {
 		t.Fatal("SendMessage() error = nil, want error")
 	}
@@ -193,7 +193,7 @@ func TestARateLimitedRequestWaitsTheAdvertisedDelayAndRetries(t *testing.T) {
 		return true
 	}
 
-	if err := client.SendMessage(42, "hello"); err != nil {
+	if err := client.SendMessage(Destination{ChatID: 42}, "hello"); err != nil {
 		t.Fatalf("SendMessage() error = %v, want the retry to succeed", err)
 	}
 	if calls != 2 {
@@ -218,7 +218,7 @@ func TestAThrottleThatNeverClearsIsReportedAsRateLimiting(t *testing.T) {
 	client.apiBase = server.URL
 	client.sleep = func(context.Context, time.Duration) bool { return true }
 
-	err := client.SendHTML(42, "<b>hi</b>")
+	err := client.SendHTML(Destination{ChatID: 42}, "<b>hi</b>")
 	if !IsRateLimited(err) {
 		t.Errorf("IsRateLimited(%v) = false, want true", err)
 	}
@@ -240,7 +240,7 @@ func TestATelegramRejectionIsNotMistakenForATransportFailure(t *testing.T) {
 	client := New("token")
 	client.apiBase = server.URL
 
-	err := client.SendHTML(42, "<b>hi")
+	err := client.SendHTML(Destination{ChatID: 42}, "<b>hi")
 	if err == nil {
 		t.Fatal("SendHTML() error = nil, want a rejection")
 	}
@@ -279,5 +279,104 @@ func TestGetUpdatesStopsWhenItsContextIsCancelled(t *testing.T) {
 
 	if _, err := client.GetUpdatesContext(ctx, 0, 50); err == nil {
 		t.Fatal("GetUpdatesContext() error = nil, want the cancellation reported")
+	}
+}
+
+// captureSend stands up a fake Bot API that records the JSON body of one sendMessage call.
+func captureSend(t *testing.T, body *map[string]any) *Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := New("token")
+	client.apiBase = server.URL
+	return client
+}
+
+// This is where the silent failure lives. Without the thread on the way out, every reply lands in
+// the group's General topic and nothing errors — the only way to find out is to look at a phone.
+func TestSendCarriesTheThread(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		send func(*Client) error
+	}{
+		{"SendMessage", func(c *Client) error {
+			return c.SendMessage(Destination{ChatID: -100123, ThreadID: 7}, "olá")
+		}},
+		{"SendHTML", func(c *Client) error {
+			return c.SendHTML(Destination{ChatID: -100123, ThreadID: 7}, "<b>olá</b>")
+		}},
+		{"SendMessageWithButtons", func(c *Client) error {
+			return c.SendMessageWithButtons(Destination{ChatID: -100123, ThreadID: 7}, "olá",
+				[][]Button{{{Text: "ok", CallbackData: "ok"}}})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			if err := tc.send(captureSend(t, &body)); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			if body["message_thread_id"] != float64(7) {
+				t.Fatalf("the reply lost its topic: %v", body)
+			}
+			if body["chat_id"] != float64(-100123) {
+				t.Fatalf("chat_id = %v, want -100123", body["chat_id"])
+			}
+		})
+	}
+}
+
+// A one-to-one chat has no topic, and a zero sent as one is a topic that does not exist — Telegram
+// answers 400. Absent has to mean absent from the body.
+func TestSendOmitsAnAbsentThread(t *testing.T) {
+	var body map[string]any
+	client := captureSend(t, &body)
+
+	if err := client.SendMessage(Destination{ChatID: -100123}, "olá"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, present := body["message_thread_id"]; present {
+		t.Fatalf("an absent topic must not travel in the body: %v", body)
+	}
+}
+
+func TestUpdateCarriesTheThread(t *testing.T) {
+	var update Update
+	raw := `{"update_id":1,"message":{"message_id":2,"chat":{"id":-100123},
+	         "message_thread_id":7,"is_topic_message":true,"text":"olá"}}`
+	if err := json.Unmarshal([]byte(raw), &update); err != nil {
+		t.Fatal(err)
+	}
+	if update.Message.MessageThreadID != 7 {
+		t.Fatalf("the topic did not arrive: %+v", update.Message)
+	}
+	if !update.Message.IsTopicMessage {
+		t.Fatalf("the message says it is in a forum topic and the struct does not: %+v", update.Message)
+	}
+}
+
+// Telegram sets `message_thread_id` on a plain reply chain in a supergroup too, and only
+// `is_topic_message` says it is a forum topic. Reading the id on its own would give every reply
+// chain in an ordinary group its own key — and on the day this ships, every one of those
+// conversations would lose its session.
+func TestDestinationIgnoresAThreadThatIsNotATopic(t *testing.T) {
+	message := &Message{
+		Chat:            Chat{ID: -100123},
+		MessageThreadID: 55,
+		IsTopicMessage:  false,
+	}
+	if got := message.Destination(); got != (Destination{ChatID: -100123}) {
+		t.Fatalf("Destination() = %+v, want the bare chat", got)
+	}
+
+	message.IsTopicMessage = true
+	if got := message.Destination(); got != (Destination{ChatID: -100123, ThreadID: 55}) {
+		t.Fatalf("Destination() = %+v, want the topic", got)
 	}
 }

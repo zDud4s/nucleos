@@ -36,7 +36,10 @@ func main() {
 		// Supervised, not bare: a panic in the notifier used to take the process down and the
 		// command path with it, silently.
 		go pipe.Supervise("notifier", func() {
-			pipe.RunNotifier(ctx, bot, dc, cfg.AllowedChatID, cfg.PollInterval)
+			// The bare chat and no topic: what the notifier announces — a new proposal, the kill
+			// switch, a budget alert — is about the machine and not about any one errand, so it
+			// belongs where the whole room sees it rather than buried in whichever topic was open.
+			pipe.RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: cfg.AllowedChatID}, cfg.PollInterval)
 		})
 	} else {
 		log.Printf("no allowed_chat_id configured — notifier disabled until one is set")
@@ -74,7 +77,7 @@ func main() {
 		}
 
 		for _, u := range updates {
-			dispatcher.Dispatch(pipe.ChatOf(u), func() {
+			dispatcher.Dispatch(pipe.ChatKey(pipe.DestinationOf(u)), func() {
 				pipe.HandleUpdate(bot, dc, bot, cfg, tr, u)
 			})
 		}

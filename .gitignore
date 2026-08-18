@@ -26,6 +26,9 @@
 # Rust + Tauri + Node build artifacts
 # ─────────────────────────────────────────────────────────────
 /target/
+# A second target directory, for building tests while the daemon is running out of the first one:
+# `cargo test` relinks the binary, and Windows refuses to replace an executable that is in use.
+/target-test/
 /shell/node_modules/
 /shell/dist/
 /shell/src-tauri/target/

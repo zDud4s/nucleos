@@ -967,7 +967,7 @@ pub async fn start(
         .map_err(|error| StartError::Unavailable(error.to_string()))?;
     crate::storage::write_atomic(
         &mcp_path,
-        &serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
+        &serde_json::to_vec(&crate::assistant::build_mcp_config(&exe, None))
             .map_err(|error| StartError::Unavailable(error.to_string()))?,
     )
     .map_err(|error| StartError::Unavailable(error.to_string()))?;

@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// queueDepth bounds how many updates can be waiting on one chat. Reaching it means that chat's
-// worker has been stuck for a long time; the bound is what keeps a wedged worker from turning into
-// unbounded memory.
+// queueDepth bounds how many updates can be waiting on one conversation. Reaching it means that
+// conversation's worker has been stuck for a long time; the bound is what keeps a wedged worker
+// from turning into unbounded memory.
 const queueDepth = 64
 
 // restartDelay keeps a loop that panics on every attempt from spinning.
@@ -17,31 +17,37 @@ const restartDelay = 5 * time.Second
 
 // Dispatcher runs updates off the polling loop. Handling used to happen inside the loop, so one
 // slow update held up every update behind it — including `/kill`, which is the one message this
-// process exists to deliver. Work is serialised per chat, because the núcleo hands a chat one turn
-// at a time (its ChatSlot), but chats do not block each other and none of them blocks the poller.
+// process exists to deliver. Work is serialised per CONVERSATION, because the núcleo hands each one
+// turn at a time (its ChatSlot), but conversations do not block each other and none of them blocks
+// the poller.
+//
+// The key is `ChatKey`'s and not a chat id, which is what makes two topics of one group two
+// conversations here. Keyed on the chat, a group's topics would queue behind each other for no
+// reason the núcleo has — it holds a slot per chat KEY — and the whole point of an errand per topic
+// is that two of them can be working at once.
 type Dispatcher struct {
 	mu     sync.Mutex
-	queues map[int64]chan func()
+	queues map[string]chan func()
 	wg     sync.WaitGroup
 	closed bool
 }
 
 func NewDispatcher() *Dispatcher {
-	return &Dispatcher{queues: map[int64]chan func(){}}
+	return &Dispatcher{queues: map[string]chan func(){}}
 }
 
-// Dispatch queues work for a chat and returns immediately.
-func (d *Dispatcher) Dispatch(chatID int64, task func()) {
+// Dispatch queues work for one conversation and returns immediately.
+func (d *Dispatcher) Dispatch(key string, task func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
 		return
 	}
 
-	queue, running := d.queues[chatID]
+	queue, running := d.queues[key]
 	if !running {
 		queue = make(chan func(), queueDepth)
-		d.queues[chatID] = queue
+		d.queues[key] = queue
 		d.wg.Add(1)
 		go d.serve(queue)
 	}
@@ -50,7 +56,7 @@ func (d *Dispatcher) Dispatch(chatID int64, task func()) {
 	select {
 	case queue <- task:
 	default:
-		log.Printf("chat %d already has %d updates waiting; dropping this one", chatID, queueDepth)
+		log.Printf("conversation %s already has %d updates waiting; dropping this one", key, queueDepth)
 	}
 }
 

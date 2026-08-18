@@ -2818,6 +2818,14 @@ export interface ChatRow {
    */
   cwd: string | null;
   /**
+   * Which conversation had in the editor this one was picked up from, or null when it was opened
+   * here.
+   *
+   * What the window reads the old conversation back by. Not the session the next turn resumes —
+   * the daemon replaces that one the first time a context rotates, and this never moves.
+   */
+  ide_session_id: string | null;
+  /**
    * How many answers landed here since the conversation was last opened.
    *
    * Waiting for YOU, not for the model — a turn still being written is the chat waiting on the
@@ -2853,6 +2861,37 @@ export interface IdeSession {
   /** The first thing its owner said in it, or null when nothing quotable was said. */
   title: string | null;
   last_activity: string;
+}
+
+/** One thing said in a conversation had in the editor. */
+export interface Said {
+  /** Whether the owner typed it. The model answered everything else. */
+  by_owner: boolean;
+  text: string;
+}
+
+/**
+ * What was said in a conversation had in the editor, oldest first.
+ *
+ * Null covers both "this machine no longer has that transcript" and "the daemon could not be
+ * reached", and the window treats them alike: it draws the half it does have and makes no claim
+ * about the half it could not read. An EMPTY list is the different answer — a conversation nobody
+ * spoke in — and the window does say that one out loud.
+ */
+export async function readIdeConversation(
+  token: string,
+  sessionId: string,
+): Promise<Said[] | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/assistant/ide-sessions/${encodeURIComponent(sessionId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as Said[];
+  } catch {
+    return null;
+  }
 }
 
 /** The IDE conversations this daemon can still pick up. */
@@ -4150,6 +4189,41 @@ export async function returnBrowserWheel(
       return { ok: false, fault: faultForStatus(res.status), status: res.status };
     }
     return { ok: true, value: (await res.json()) as { chain: string[] } };
+  } catch {
+    return { ok: false, fault: "unreachable", status: 0 };
+  }
+}
+
+/**
+ * Open a real window, on a project's profile, because you want to.
+ *
+ * The one door into the pillar that no agent asked for. It raises no proposal: the dialogue in
+ * `Waiting` exists because an agent chose the address while holding a stranger's words, and here the
+ * person typed it, so there is nobody to approve. The daemon refuses with 409 when nobody is at the
+ * machine â€” a window is opened for somebody to sit at.
+ *
+ * It exists because until it did, a profile could only be repaired and never prepared: the sole way
+ * to log in was to wait for the agent to walk into the login first. What it grants is unchanged â€”
+ * the window records where it goes and `keepBrowserChain` still answers on the way out.
+ */
+export async function openBrowserWindow(
+  token: string,
+  projectId: string,
+  url: string,
+): Promise<ApiResult<BrowserSession>> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/browser/window`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project_id: projectId, url }),
+    });
+    if (!res.ok) {
+      return { ok: false, fault: faultForStatus(res.status), status: res.status };
+    }
+    return { ok: true, value: (await res.json()) as BrowserSession };
   } catch {
     return { ok: false, fault: "unreachable", status: 0 };
   }

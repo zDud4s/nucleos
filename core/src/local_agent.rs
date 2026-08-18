@@ -332,6 +332,26 @@ impl LocalAssistant {
         Self { chat, tools }
     }
 
+    /// One question, one answer, and NO TOOLS.
+    ///
+    /// This is what "a separate verifier" comes to in code. `answer` hands the model a toolbox and a
+    /// chat's history; this hands it a prompt and nothing else — it cannot search, cannot read a
+    /// file, cannot write one, and cannot start anything. A judge that could do the work is not a
+    /// judge, and a judge that could act on what it read is the injection barrier reopened at the
+    /// one point where the text it is reading was written by a turn that had been reading strangers.
+    ///
+    /// No taint flag either, and that is the same argument from the other side: nothing here can
+    /// carry what it read anywhere. The text goes in, one line comes out, and the caller decides.
+    pub async fn verdict(&self, prompt: &str) -> std::io::Result<String> {
+        let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
+        let reply = self.chat.exchange(messages, None).await?;
+        Ok(reply
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+
     /// `taint` is the caller's, for the reason `run_turn` gives: the two endings that lose a return
     /// value are the two where losing it writes a tainted turn down as clean.
     pub async fn answer(
