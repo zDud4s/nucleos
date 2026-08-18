@@ -1,0 +1,37 @@
+-- Which team run paid for this run, in the shape `runs.job_id` already established.
+--
+-- Numbered 0084, and the number in this header has now been wrong three times.
+--
+-- Cut as 0072. Master landed `0072_job_notes.sql` (`02787ff`), so 0073. Master landed
+-- `0073_vcs_escalated.sql` and the browser pillar, so 0081, chosen to sit above everything master
+-- held and to leave the 0074-0078 block to `feat/assuntos`, which had had it written for weeks.
+-- Then `feat/assuntos` itself landed (`c80f1dd`) -- taking its block AND 0080 -- and the vcs and
+-- sessions work took 0081, 0082 and 0083 behind it. So 0084, above a master that now ends at 0083.
+--
+-- That is the sixth time this repository has had two files with different names claim one version,
+-- and, as `0065_council.sql` records at length, every previous time git reported nothing: two such
+-- files merge clean, and only `sqlx::migrate!` finds them, at the daemon's next start -- after one
+-- of the pair has been applied and recorded with its checksum, which is the point at which only the
+-- other one can still move. Master now carries a test for it
+-- (`storage.rs::no_two_migrations_claim_the_same_version`), so the seventh time will be a red gate
+-- instead of a panic in front of a user. The rule is unchanged and was never in question: the
+-- BRANCH gives way, master's lineage stands.
+--
+-- **This branch's four files move together, and always to the top.** Not into whatever hole master
+-- happens to have -- the holes belong to branches that have not landed yet, and filling one only
+-- moves the collision onto somebody else. Sitting above everything master holds also means a
+-- database that has already run master's migrations never sees one of these arrive out of order.
+--
+-- The teams design said no existing table needed changing, and for four of the five columns it was
+-- right. This is the fifth. `team_runs.director_run_id` names the director node IN FLIGHT and is
+-- overwritten by the next one, so the plan node, the replan nodes and the delivery node of a
+-- finished run are reachable from nothing — and `teams.budget_usd` is a per-run ceiling that would
+-- therefore be computed from the specialists alone. A spend ceiling that undercounts is wrong in
+-- the expensive direction.
+--
+-- `job_id` is the precedent and the reason this is a column rather than a join table:
+-- `budget::job_rows` filters `WHERE job_id = ?` and deliberately does not filter by mode, because
+-- every run carrying the id was started by the thing that owns it. The same is true here.
+ALTER TABLE runs ADD COLUMN team_run_id TEXT REFERENCES team_runs(id);
+
+CREATE INDEX idx_runs_team_run_id ON runs(team_run_id) WHERE team_run_id IS NOT NULL;

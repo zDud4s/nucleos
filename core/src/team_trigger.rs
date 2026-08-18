@@ -748,7 +748,7 @@ async fn release_window(
 /// `WHERE root_id = ?` is one read, and a recursive CTE over a depth-3 tree is the same answer by a
 /// route that can be got wrong.
 ///
-/// It rests on `runs.team_run_id` (migration 0081), and it is worth remembering why that column
+/// It rests on `runs.team_run_id` (migration 0084), and it is worth remembering why that column
 /// exists: without it a run's cost counts the specialists alone, because `team_runs.director_run_id`
 /// is overwritten at every node. **A tree ceiling built on a sum that undercounts errs towards
 /// spending, multiplied by the depth.**

@@ -4,10 +4,9 @@
 -- policy — already has a row in `agents`; a table here would be the second place the same truth is
 -- declared, and the design says so at length.
 --
--- Numbered 0082, having been cut as 0074 against a master tip of 0072. That bet lost, as it had
--- four times before: master is at 0079 now. `0081_runs_team_run_id.sql` carries the whole account,
--- including why this branch's four files start above master's highest instead of filling the hole
--- at 0074-0078.
+-- Numbered 0085, having been cut as 0074 and passed through 0082. `0084_runs_team_run_id.sql`
+-- carries the whole account: three cedings, and why these four always go above master's highest
+-- rather than into a hole some branch has already written into.
 
 -- The agent that took this seat, or NULL for a seat declared the old way — `{ kind, ref }`, which
 -- stays valid forever. Not a declared foreign key, for the reason `chairman_run_id` gives one line

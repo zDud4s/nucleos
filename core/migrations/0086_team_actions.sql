@@ -12,8 +12,8 @@
 -- `calendar_events` gain a row." So the agent DECLARES and the core EXECUTES. `TEAM_TOOLS` gains
 -- `propose_action` and stays read-only forever; `TEAM_ROUTES` gains `POST /team-actions`.
 --
--- Numbered 0083, having been cut as 0075 against a master tip of 0072. See
--- `0081_runs_team_run_id.sql` for why all four moved and why they start above 0080.
+-- Numbered 0086, having been cut as 0075 and passed through 0083. See
+-- `0084_runs_team_run_id.sql` for why all four moved, three times, and always to the top.
 
 -- What one team is allowed to ask for, and whether a human sees it first.
 --
