@@ -67,7 +67,8 @@
   color: var(--text-faint);
 }
 
-.browser-field select {
+.browser-field select,
+.browser-field input {
   padding: var(--space-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -175,6 +176,15 @@
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
+}
+
+/* ========================================================= open a window == */
+
+/* Two fields and a button. The plainness is the argument — see `OpenAWindow`. */
+.browser-open {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
 /* ------------------------------------------------------------- site grants == */
