@@ -152,6 +152,43 @@ export function useBudget() {
   });
 }
 
+/** What `POST /autopilot/budget` accepts — `http.rs:697-704`. FIVE fields, all of them, every time. */
+export interface BudgetChange {
+  limit_usd: number | null;
+  period: "daily" | "weekly" | "monthly";
+  hourly_limit_usd: number | null;
+  per_run_reserve_usd: number;
+  time_cost_per_hour_usd: number;
+}
+
+/**
+ * Replace the budget, whole.
+ *
+ * `POST /autopilot/budget` answers **200 with the full `BudgetResponse`**
+ * (`http.rs:1876-1892`), not 204 — so the mutation is typed against
+ * `BudgetView` and its result is written straight into the cache in
+ * `onSuccess`, confirmed by an `invalidateQueries` in `onSettled`. No
+ * optimistic write, unlike the kill switches above: a ceiling drawn before the
+ * daemon accepted it is a ceiling somebody may act on.
+ */
+export function useSetBudget() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: BudgetChange) =>
+      apiFetch<BudgetView>("/autopilot/budget", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSuccess: (data) => {
+      queryClient.setQueryData<BudgetView>(keys.autopilot.budget, data);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.budget });
+    },
+  });
+}
+
 /**
  * The project roster with its governance counts.
  *
@@ -279,4 +316,85 @@ export function useSidecars() {
  */
 export function isAggregateTimeout(readout: HealthReadout): boolean {
   return readout.subsystems.length === 1 && readout.subsystems[0].name === "aggregate";
+}
+
+/* ----------------------------------------------------------------- backups -- */
+
+/** One stored snapshot — `backup::BackupInfo`. */
+export interface BackupInfo {
+  name: string;
+  /** Absent when the snapshot predates version stamping — absent is not zero. */
+  migration_version: number | null;
+  size_bytes: number;
+}
+
+/** What a restore request answers with — `backup::StagedRestore`. */
+export interface StagedRestore {
+  name: string;
+  migration_version: number;
+  /** The daemon's own sentence about when this takes effect. Render it; do not paraphrase. */
+  applies: string;
+}
+
+/** The stored snapshots — `GET /backups`. */
+export function useBackups() {
+  return useQuery({
+    queryKey: keys.system.backups,
+    queryFn: () => apiFetch<BackupInfo[]>("/backups"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * Take a snapshot now.
+ *
+ * `POST /backup` — SINGULAR, one letter apart from the listing route above and
+ * answered by a different handler (`http.rs:48-49`). No body; the daemon
+ * decides the name and retention.
+ */
+export function useTakeBackup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch<BackupInfo>("/backup", { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.backups });
+    },
+  });
+}
+
+/**
+ * Stage a restore, by snapshot name.
+ *
+ * Nothing changes immediately — `StagedRestore.applies` is the daemon's own
+ * sentence about when the swap actually happens (its next start), and pages
+ * render it verbatim rather than paraphrasing.
+ */
+export function useStageRestore() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<StagedRestore>(`/backups/${encodeURIComponent(name)}/restore`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.backups });
+    },
+  });
+}
+
+/* -------------------------------------------------------------------- pii -- */
+
+/** One row of the PII tally — `GET /pii/observations` is an aggregate, not a list of observations. */
+export interface PiiTallyRow {
+  column: string;
+  class: string;
+  count: number;
+}
+
+/** The PII tally. No `refetchInterval` — read once per open, per design §6.20. */
+export function usePiiTally() {
+  return useQuery({
+    queryKey: keys.system.pii,
+    queryFn: () => apiFetch<PiiTallyRow[]>("/pii/observations"),
+  });
 }
