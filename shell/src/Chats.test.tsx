@@ -16,6 +16,7 @@ interface DaemonChat {
   first_message?: string | null;
   last_activity?: string | null;
   waiting?: number;
+  ide_session_id?: string | null;
 }
 
 /** A daemon holding the given conversations, with no transcript for any of them. */
@@ -27,6 +28,7 @@ function daemon(chats: DaemonChat[], overrides: Record<string, unknown> = {}) {
     first_message: null,
     last_activity: null,
     waiting: 0,
+    ide_session_id: null,
     ...chat,
   }));
   return async (url: string, init?: RequestInit) => {
@@ -55,6 +57,7 @@ function daemon(chats: DaemonChat[], overrides: Record<string, unknown> = {}) {
           first_message: null,
           last_activity: null,
           waiting: 0,
+          ide_session_id: null,
         });
         return { ok: true, status: 200, json: async () => ({ chat_id: "brand-new" }) };
       }
@@ -241,4 +244,47 @@ describe("Chats", () => {
     expect(screen.getByText(/waiting for the daemon/i)).toBeTruthy();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  /// A conversation picked up from the editor opens showing what it already was.
+  ///
+  /// This is the whole point of picking one up. The model on the other side of the resume remembers
+  /// every word of that conversation; before this, the person continuing it could see none of them
+  /// and the page said "nothing said yet" over a thread that was hours long.
+  it("shows the conversation a chat was picked up from, above its own turns", async () => {
+    fetchMock.mockImplementation(
+      daemon([{ chat_id: "picked-up", ide_session_id: "aaaa-1111" }], {
+        "/assistant/ide-sessions/aaaa-1111": {
+          ok: true,
+          status: 200,
+          json: async () => [
+            { by_owner: true, text: "arranja o parser de datas" },
+            { by_owner: false, text: "está arranjado" },
+          ],
+        },
+      }),
+    );
+    renderChats();
+    await settle();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Nothing said yet/i }));
+    });
+
+    expect(screen.getByText("arranja o parser de datas")).toBeTruthy();
+    expect(screen.getByText("está arranjado")).toBeTruthy();
+  });
+
+  it("asks for no such thing on a conversation that was opened here", async () => {
+    fetchMock.mockImplementation(daemon([{ chat_id: "opened-here" }]));
+    renderChats();
+    await settle();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Nothing said yet/i }));
+    });
+
+    const asked = fetchMock.mock.calls.map(([url]) => url as string);
+    expect(asked.some((url) => url.includes("/assistant/ide-sessions/"))).toBe(false);
+  });
+
 });

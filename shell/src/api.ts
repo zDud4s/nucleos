@@ -2386,6 +2386,14 @@ export interface ChatRow {
    */
   cwd: string | null;
   /**
+   * Which conversation had in the editor this one was picked up from, or null when it was opened
+   * here.
+   *
+   * What the window reads the old conversation back by. Not the session the next turn resumes —
+   * the daemon replaces that one the first time a context rotates, and this never moves.
+   */
+  ide_session_id: string | null;
+  /**
    * How many answers landed here since the conversation was last opened.
    *
    * Waiting for YOU, not for the model — a turn still being written is the chat waiting on the
@@ -2421,6 +2429,37 @@ export interface IdeSession {
   /** The first thing its owner said in it, or null when nothing quotable was said. */
   title: string | null;
   last_activity: string;
+}
+
+/** One thing said in a conversation had in the editor. */
+export interface Said {
+  /** Whether the owner typed it. The model answered everything else. */
+  by_owner: boolean;
+  text: string;
+}
+
+/**
+ * What was said in a conversation had in the editor, oldest first.
+ *
+ * Null covers both "this machine no longer has that transcript" and "the daemon could not be
+ * reached", and the window treats them alike: it draws the half it does have and makes no claim
+ * about the half it could not read. An EMPTY list is the different answer — a conversation nobody
+ * spoke in — and the window does say that one out loud.
+ */
+export async function readIdeConversation(
+  token: string,
+  sessionId: string,
+): Promise<Said[] | null> {
+  try {
+    const res = await fetch(
+      `${DAEMON_URL}/assistant/ide-sessions/${encodeURIComponent(sessionId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as Said[];
+  } catch {
+    return null;
+  }
 }
 
 /** The IDE conversations this daemon can still pick up. */
