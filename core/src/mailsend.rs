@@ -73,6 +73,80 @@ pub fn validate(to: &str, subject: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Why a message did not go.
+///
+/// Three variants and not a string, because the caller has to be able to tell them apart: the route
+/// below turns them into three different status codes, and `team.rs` writes the sentence into a row
+/// somebody reads the morning after.
+#[derive(Debug)]
+pub enum SendFailure {
+    /// The request is not a message. The caller's mistake, and fixable by the caller.
+    Invalid(&'static str),
+    /// This daemon is not in a position to send one. **Nothing was attempted** — no submission host,
+    /// or no key minted for the sidecar. The deployment is at fault rather than the caller.
+    NotConfigured(&'static str),
+    /// The sidecar was asked and something went wrong there. Bytes may have left this process.
+    Sidecar(&'static str),
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(reason) | Self::NotConfigured(reason) | Self::Sidecar(reason) => {
+                formatter.write_str(reason)
+            }
+        }
+    }
+}
+
+/// Sends one message, or says which of the three ways it did not.
+///
+/// Extracted from the route below rather than duplicated for it. The teams pillar executes an
+/// approved `send_email` from inside `team_tick`, and a second copy of "validate, check the host,
+/// use the sidecar's own key, call loopback" is a second set of answers to questions that already
+/// have one — including the one that matters most, which is *whose key goes to the process that
+/// parses MIME written by strangers*.
+pub async fn send(state: &AppState, message: &SendRequest) -> Result<(), SendFailure> {
+    validate(&message.to, &message.subject).map_err(SendFailure::Invalid)?;
+
+    if state.email.smtp_host.trim().is_empty() {
+        return Err(SendFailure::NotConfigured(
+            "no submission host is configured — set smtp_host in .ai/email.yaml",
+        ));
+    }
+
+    // The sidecar's OWN key, and no fallback. `state.token` is the control token: handing it to the
+    // process that parses MIME written by strangers would be removing the arrangement that keeps it
+    // away from there, at exactly the moment something has already gone wrong.
+    let Some(sidecar_token) = state.email.sidecar_token.as_deref() else {
+        return Err(SendFailure::NotConfigured(
+            "the email sidecar has no key of its own — it was not started",
+        ));
+    };
+
+    let Ok(client) = reqwest::Client::builder().timeout(SEND_TIMEOUT).build() else {
+        return Err(SendFailure::Sidecar("no http client could be built"));
+    };
+    // The same loopback address the attachment fetches use — one fact, one constant, so the two
+    // processes cannot come to disagree about where the sidecar is.
+    let response = client
+        .post(format!("http://{}/send", crate::sidecar::EMAIL_FETCH_ADDR))
+        .bearer_auth(sidecar_token)
+        .json(message)
+        .send()
+        .await;
+
+    match response {
+        Ok(response) if response.status().is_success() => Ok(()),
+        // Both arms are the same answer on purpose: "the sidecar refused" and "the sidecar could not
+        // be reached" mean the same thing to the person waiting — it did not go, and this daemon is
+        // not the thing that failed.
+        _ => Err(SendFailure::Sidecar(
+            "the email sidecar could not send the message",
+        )),
+    }
+}
+
 /// `POST /email/send` — Admin-only, and the only route in this daemon that cannot be undone.
 ///
 /// Three answers before anything is attempted, in the order that keeps the caller informed without
@@ -90,51 +164,19 @@ pub async fn post_email_send(
     State(state): State<AppState>,
     Json(body): Json<SendRequest>,
 ) -> Response {
-    if let Err(reason) = validate(&body.to, &body.subject) {
-        return (StatusCode::BAD_REQUEST, reason).into_response();
-    }
-
-    if state.email.smtp_host.trim().is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no submission host is configured — set smtp_host in .ai/email.yaml",
-        )
-            .into_response();
-    }
-
-    // The sidecar's OWN key, and no fallback. `state.token` is the control token: handing it to the
-    // process that parses MIME written by strangers would be removing the arrangement that keeps it
-    // away from there, at exactly the moment something has already gone wrong.
-    let Some(sidecar_token) = state.email.sidecar_token.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the email sidecar has no key of its own — it was not started",
-        )
-            .into_response();
-    };
-
-    let Ok(client) = reqwest::Client::builder().timeout(SEND_TIMEOUT).build() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    // The same loopback address the attachment fetches use — one fact, one constant, so the two
-    // processes cannot come to disagree about where the sidecar is.
-    let response = client
-        .post(format!("http://{}/send", crate::sidecar::EMAIL_FETCH_ADDR))
-        .bearer_auth(sidecar_token)
-        .json(&body)
-        .send()
-        .await;
-
-    match response {
-        Ok(response) if response.status().is_success() => StatusCode::NO_CONTENT.into_response(),
-        // Both arms are 502 on purpose: "the sidecar refused" and "the sidecar could not be
-        // reached" are the same answer to the person waiting — it did not go, and this daemon is
-        // not the thing that failed. What must never land here is a request that was never sent.
-        _ => (
-            StatusCode::BAD_GATEWAY,
-            "the email sidecar could not send the message",
-        )
-            .into_response(),
+    match send(&state, &body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(failure @ SendFailure::Invalid(_)) => {
+            (StatusCode::BAD_REQUEST, failure.to_string()).into_response()
+        }
+        Err(failure @ SendFailure::NotConfigured(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, failure.to_string()).into_response()
+        }
+        // 502 and not 500: bytes may have left this process. What must never land here is a request
+        // that was never sent — which is why `NotConfigured` above is a different code.
+        Err(failure @ SendFailure::Sidecar(_)) => {
+            (StatusCode::BAD_GATEWAY, failure.to_string()).into_response()
+        }
     }
 }
 
@@ -279,6 +321,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: Arc::new(email),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),

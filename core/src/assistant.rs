@@ -383,15 +383,23 @@ async fn errand_turn(
         return Err(errand_not_answering(&errand));
     }
 
-    let folder = crate::errands::folder_path(&state.email.files_root, &errand)
+    // `files_root` moved off `EmailRuntime` onto `AppState` and became an `Option`: `None` is
+    // startup having failed to make the directory, which every route beneath it answers 503 for.
+    // An errand has nowhere to work without it, so it is refused here rather than half-run.
+    let Some(files_root) = state.files_root.as_deref() else {
+        return Err(format!(
+            "the errand {:?} has no files folder to work in",
+            errand.name
+        ));
+    };
+    let folder = crate::errands::folder_path(files_root, &errand)
         .map_err(|error| format!("the errand {:?} has no usable folder: {error}", errand.name))?;
-    let notebook =
-        crate::errands::read_notebook(&state.email.files_root, &errand).map_err(|error| {
-            format!(
-                "the errand {:?} has no readable notebook: {error}",
-                errand.name
-            )
-        })?;
+    let notebook = crate::errands::read_notebook(files_root, &errand).map_err(|error| {
+        format!(
+            "the errand {:?} has no readable notebook: {error}",
+            errand.name
+        )
+    })?;
 
     Ok(Some(ErrandTurn {
         errand,
@@ -409,11 +417,21 @@ async fn errand_turn(
 /// LEARNED, and a turn killed halfway learned nothing it can state. A timed-out or failed turn is
 /// silent here for the same reason.
 fn record_in_notebook(
-    files_root: &std::path::Path,
+    files_root: Option<&std::path::Path>,
     errand: &crate::errands::Errand,
     run_id: i64,
     answer: &str,
 ) {
+    // No folder at all lands in the same place as a failed write, and for the paragraph above:
+    // the person already has their reply, and there is nothing here worth failing a turn over.
+    let Some(files_root) = files_root else {
+        tracing::warn!(
+            run_id,
+            errand_id = errand.id,
+            "there is no files folder; the errand will not remember this turn"
+        );
+        return;
+    };
     if let Err(error) = crate::errands::append_notebook(files_root, errand, run_id, answer) {
         // Warned and not propagated: the person already has the reply, and failing the turn over a
         // memory that could not be written would throw away the answer as well as the record.
@@ -761,7 +779,7 @@ async fn spawn_local_turn(
         None => text.clone(),
     };
     let notebook = errand.map(|turn| turn.errand);
-    let files_root = state.email.files_root.clone();
+    let files_root = state.files_root.clone();
 
     let pool = state.pool.clone();
     let run_timeout = state.run_timeout;
@@ -856,7 +874,7 @@ async fn spawn_local_turn(
                     if let Some(errand) = &notebook
                         && matches!(&completed, Ok(result) if result.rows_affected() > 0)
                     {
-                        record_in_notebook(&files_root, errand, id, &turn.answer);
+                        record_in_notebook(files_root.as_deref(), errand, id, &turn.answer);
                     }
                     completed
                 }
@@ -956,7 +974,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
     let runner = state.runner.clone();
     let run_timeout = state.run_timeout;
     let control_token = state.token.0.clone();
-    let files_root = state.email.files_root.clone();
+    let files_root = state.files_root.clone();
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
@@ -1060,6 +1078,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     ambient_mcp: false,
                     // An orchestrator turn is not a job node, so it has no role to route.
                     model: None,
+                    // The wildcard, on purpose: an orchestrator turn acts for the person watching
+                    // the chat and carries the control token, so narrowing what it is offered would
+                    // only take away tools it is entitled to call.
+                    allowed_mcp_tools: None,
                 },
                 session_tx,
                 // Unread here, deliberately. An assistant turn's product is the reply that
@@ -1111,7 +1133,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     if let Some(errand) = &notebook
                         && matches!(&completed, Ok(result) if result.rows_affected() > 0)
                     {
-                        record_in_notebook(&files_root, errand, id, &reply);
+                        record_in_notebook(files_root.as_deref(), errand, id, &reply);
                     }
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
@@ -1222,6 +1244,7 @@ mod tests {
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2415,10 +2438,8 @@ mod tests {
     /// Every errand needs one: the folder is where its notebook lives, and `folder_path` refuses a
     /// root it cannot canonicalise — which the default empty root is.
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
-        let mut email = (*state.email).clone();
-        email.files_root = root;
         AppState {
-            email: std::sync::Arc::new(email),
+            files_root: Some(root),
             ..state
         }
     }

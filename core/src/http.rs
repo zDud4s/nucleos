@@ -102,6 +102,62 @@ pub fn build_router(state: AppState) -> Router {
             "/agents/{id}",
             get(get_agent).put(update_agent).delete(delete_agent),
         )
+        // The teams pillar. Everything here is the owner's except the last line: `/team-files/read`
+        // is the only one a team run's own key opens, and which folder it reads is decided by that
+        // key and never by the body — see `team::post_read_file`. `auth::TEAM_ROUTES` is where that
+        // split is actually enforced; this is only where the names appear.
+        .route(
+            "/teams",
+            get(crate::team::list_teams).post(crate::team::create_team),
+        )
+        .route(
+            "/teams/{id}",
+            get(crate::team::get_team)
+                .put(crate::team::update_team)
+                .delete(crate::team::delete_team),
+        )
+        .route("/teams/{id}/runs", post(crate::team::post_team_run))
+        .route("/team-runs", get(crate::team::list_team_runs))
+        .route(
+            "/team-runs/{id}",
+            get(crate::team::get_team_run).delete(crate::team::delete_team_run),
+        )
+        .route(
+            "/team-runs/{id}/cancel",
+            post(crate::team::post_team_run_cancel),
+        )
+        .route(
+            "/team-runs/{id}/actions",
+            get(crate::team::list_team_run_actions),
+        )
+        .route("/team-files/read", post(crate::team::post_read_file))
+        // Two callers, two methods, two scopes. A department POSTs what it would like done; only
+        // the owner reads the queue of them. `auth::TEAM_ROUTES` lists the POST and not the GET, and
+        // that pair is the whole of a department's authority to act.
+        .route(
+            "/team-actions",
+            post(crate::team::post_team_action).get(crate::team::list_open_actions),
+        )
+        .route("/team-recruits", post(crate::team::post_team_recruit))
+        // All Control, and NONE of them in `auth::TEAM_ROUTES`. A department neither arms nor fires
+        // a rule, and that is not an oversight: it is what stops a chain feeding itself underneath
+        // the graph the cycle check walks.
+        .route(
+            "/team-triggers",
+            get(crate::team_trigger::list_triggers).post(crate::team_trigger::create_trigger),
+        )
+        .route(
+            "/team-triggers/{id}",
+            axum::routing::delete(crate::team_trigger::delete_trigger),
+        )
+        .route(
+            "/team-triggers/{id}/enable",
+            post(crate::team_trigger::post_trigger_enable),
+        )
+        .route(
+            "/team-triggers/{id}/next",
+            get(crate::team_trigger::get_trigger_next),
+        )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -187,6 +243,8 @@ pub fn build_router(state: AppState) -> Router {
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
         .route("/proposals/skipped-items", get(get_skipped_items))
+        .route("/proposals/team-actions", get(get_team_action_proposals))
+        .route("/proposals/recruits", get(get_recruit_proposals))
         .route("/proposals/refused-actions", get(get_refused_actions))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
@@ -928,6 +986,42 @@ async fn get_contacts(
         })
 }
 
+/// The things departments have asked for and nobody has answered yet.
+///
+/// A door of its own rather than a slice of `/proposals`, which filters to `action-approval` and
+/// would need widening — and widening it would put two decisions with the same button next to each
+/// other: one resumes a paused run holding a worktree, the other authorises an email from a
+/// department that finished hours ago. `list_skipped_items` split off for exactly this reason.
+async fn get_team_action_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending_team_actions(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending team actions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The specialists directors asked for and nobody has answered.
+///
+/// A fourth door, and separate for the reason the third is: the button says "Hire", not "Approve",
+/// because what it does is different from the rest of the queue — and unlike every other proposal
+/// in the house, this one is EDITABLE at the moment of decision. Sharing a list with things that
+/// are not editable would mean one form that pretends the fields are read-only half the time.
+async fn get_recruit_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending_recruits(&state.pool, None)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending recruitments failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 /// Suggestions that two addresses are one person, waiting on an answer.
 ///
 /// Its own route rather than a slice of `/proposals`, because the two kinds share a table and
@@ -1345,11 +1439,16 @@ fn folder_status(error: crate::files::PathError) -> StatusCode {
 }
 
 /// The folder root, or a refusal when startup could not create it.
-fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
-    if state.email.files_root.as_os_str().is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    Ok(&state.email.files_root)
+///
+/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
+/// thing worth sharing is the 503: an installation with no files folder must answer the same way
+/// whichever route asked. The field itself lives on `AppState` rather than in any one pillar's
+/// runtime — see the doc there for why it stopped being the mail pillar's.
+pub(crate) fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
+    state
+        .files_root
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 #[derive(Deserialize)]
@@ -2636,14 +2735,20 @@ struct VcsRequestBody {
 ///
 /// `Run` cannot reach this route today — a run token opens exactly one route, the safety gate — but
 /// mapping it costs nothing and is what the MCP tools will need once a run can submit directly.
-/// `Service` and the lesser API levels are refused rather than guessed at: `permits` should already
-/// have turned them away, so a scope arriving here unaccounted for is a routing bug, and defaulting
-/// it would mean guessing about approval.
+/// `Service`, `TeamRun` and the lesser API levels are refused rather than guessed at: `permits`
+/// should already have turned them away, so a scope arriving here unaccounted for is a routing bug,
+/// and defaulting it would mean guessing about approval.
+///
+/// `TeamRun` is the sharpest of the three. A department has no `vcs::Origin` because it is not
+/// allowed to want one: queueing a merge is the act that makes work survive on a branch other
+/// people build on, and the teams design gives a department no authority to act at all. When that
+/// authority arrives it arrives as its own spec, with a value here chosen on purpose — which is
+/// exactly what a default would have taken away.
 fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
     match scope {
         Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Human),
         Scope::Run(id) => Ok(vcs::Origin::Run(*id)),
-        Scope::Service(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
+        Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
     }
 }
 
@@ -4098,10 +4203,27 @@ fn merge_decision_response(
 /// The case that made it worth doing is real rather than hypothetical: `mode: "real"` is the API's
 /// DEFAULT and creates no worktree, so approving a merge in such a run is refused by a mechanism
 /// nobody can see, and the refusal is indistinguishable from a button that did not fire.
+/// The body `approve` accepts, and the only kind that reads one.
+///
+/// `Option` and last in the argument list, so every existing caller — which sends no body at all —
+/// is unaffected. A recruitment is a SUGGESTION: the director knows the name, the speciality and
+/// the prompt well, and knows the engine, the model and the tool policy badly, because those are
+/// what cost money per turn and what widen a surface. So the person approving may correct them, and
+/// `agent::validate` runs over the correction.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ApproveBody {
+    hire: Option<crate::agent::AgentRequest>,
+}
+
 async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    // Last, because axum requires a body extractor to be — and optional, because four of the five
+    // kinds through this door send nothing.
+    body: Option<Json<ApproveBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let edited = body.and_then(|Json(body)| body.hire);
     // Two kinds of proposal share this table and this door, and they are decided by entirely
     // different machinery: an action approval resumes a paused run, a contact merge joins two
     // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
@@ -4216,6 +4338,81 @@ async fn post_proposal_approve(
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "the rule could not be written".to_owned(),
+                ))
+            }
+        };
+    }
+
+    if kind == "agent-recruit" {
+        // The sixth kind, and the only one that grows the house rather than releasing something:
+        // approving writes an `agents` row and a `team_members` row in one transaction with the
+        // decision. Uncancellable for the reason all of them are — a dropped request must not leave
+        // an agent hired into a team nobody agreed to.
+        let state = state.clone();
+        let hired =
+            uncancellable(
+                async move { crate::team::approve_recruit(&state.pool, id, edited).await },
+            )
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match hired {
+            Ok(agent_id) => Ok(Json(serde_json::json!({ "agent_id": agent_id }))),
+            Err(crate::team::HireError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::team::HireError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::team::HireError::Malformed) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this request does not describe an agent this daemon can create".to_owned(),
+            )),
+            // 409 and a sentence: the team went away while the request waited, and the person can
+            // still dismiss the proposal or recreate the team. Neither is obvious from a bare code.
+            Err(crate::team::HireError::NoSuchTeam(team_id)) => Err((
+                StatusCode::CONFLICT,
+                format!("`{team_id}` no longer exists, so there is no team to hire them into"),
+            )),
+            Err(crate::team::HireError::Refused(why)) => Err((StatusCode::CONFLICT, why)),
+            Err(crate::team::HireError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "hiring an agent failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the agent could not be written".to_owned(),
+                ))
+            }
+        };
+    }
+
+    if kind == "team-action" {
+        // Fifth kind through this door, and the only one where approving DOES NOTHING but say yes.
+        // The action is carried out by `team::execute_due_actions` on the next tick, and that is the
+        // design rather than an omission: an HTTP handler that sends an email holds the connection
+        // open while a slow SMTP thinks, and a daemon restarted in the middle loses the action with
+        // no trace. A `pending` row survives a restart; an `await` in a handler does not.
+        //
+        // Uncancellable all the same, for the reason the four above are: the decision commits.
+        let state = state.clone();
+        let decided = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "approved", "approved by user").await
+        })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match decided {
+            Ok(true) => Ok(Json(serde_json::json!({
+                "queued": "the department's action will be carried out shortly",
+            }))),
+            // The compare-and-set lost: somebody decided this while the request was in flight.
+            Ok(false) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "approving a team action failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the approval could not be recorded".to_owned(),
                 ))
             }
         };
@@ -4430,6 +4627,52 @@ async fn post_proposal_reject(
             }
             Err(crate::exclusion::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "agent-recruit" {
+        // Refusing leaves nothing behind, because nothing was created: no agent, no roster row, no
+        // run held. And it is deliberately not a permanent no — the NEXT run of that department
+        // meets the same gap and may ask again, which is right. Nobody said the director should
+        // stop asking; they said not this one.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "rejected", "not hired").await
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "refusing a recruitment failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "team-action" {
+        // Refusing closes the action as well as the proposal, in that order: the proposal is the
+        // decision and the action is what is left to do about it, and leaving the second `pending`
+        // would keep it in the department's queue ceiling forever, blocking the next request over a
+        // question already answered.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            let decided =
+                crate::proposals::transition(&state.pool, id, "rejected", "rejected by user")
+                    .await?;
+            if decided {
+                crate::team::refuse_action(&state.pool, id).await?;
+            }
+            Ok::<bool, sqlx::Error>(decided)
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting a team action failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
@@ -4838,6 +5081,7 @@ mod tests {
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
+                files_root: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -5419,6 +5663,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -6475,10 +6720,8 @@ mod tests {
     }
 
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
-        let mut email = (*state.email).clone();
-        email.files_root = root;
         AppState {
-            email: std::sync::Arc::new(email),
+            files_root: Some(root),
             ..state
         }
     }
@@ -7426,7 +7669,6 @@ mod tests {
                 poll_interval_secs: 120,
                 ..Default::default()
             },
-            std::path::PathBuf::new(),
             std::path::PathBuf::new(),
             None,
         ));
@@ -8767,6 +9009,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -11775,7 +12018,7 @@ mod tests {
         let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
         crate::errands::write_file(
             &state.pool,
-            &state.email.files_root,
+            state.files_root.as_deref().unwrap(),
             &errand,
             "nota.txt",
             "215 cv, 2019, 84 mil km",
@@ -11815,7 +12058,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
-            crate::errands::read_file(&state.email.files_root, &errand, "nota.txt").unwrap(),
+            crate::errands::read_file(state.files_root.as_deref().unwrap(), &errand, "nota.txt")
+                .unwrap(),
             "215 cv, 2019, 84 mil km"
         );
     }
@@ -11832,7 +12076,7 @@ mod tests {
         for (errand, name) in [(&mine, "carros.md"), (&neighbour, "casa.md")] {
             crate::errands::write_file(
                 &state.pool,
-                &state.email.files_root,
+                state.files_root.as_deref().unwrap(),
                 errand,
                 name,
                 "o que foi encontrado",
@@ -11880,7 +12124,7 @@ mod tests {
         let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
         crate::errands::write_file(
             &state.pool,
-            &state.email.files_root,
+            state.files_root.as_deref().unwrap(),
             &errand,
             "nota.txt",
             "215 cv, 2019, 84 mil km",
@@ -11890,7 +12134,7 @@ mod tests {
         .await
         .unwrap();
         std::fs::write(
-            state.email.files_root.join("segredo.txt"),
+            state.files_root.as_deref().unwrap().join("segredo.txt"),
             "a senha do wifi e batatas",
         )
         .unwrap();
@@ -11954,7 +12198,7 @@ mod tests {
         let (state, _temp) = errand_state().await;
         let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
         crate::errands::append_notebook(
-            &state.email.files_root,
+            state.files_root.as_deref().unwrap(),
             &errand,
             42,
             "encontrei tres anuncios abaixo de 12 mil",

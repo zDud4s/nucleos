@@ -1,0 +1,6016 @@
+//! Departments: a director agent that plans, specialists that answer, and a folder that is the
+//! delivery.
+//!
+//! This module decides the SHAPE of the work — the roster, the rounds, the replanning, the folder
+//! index — and nothing that executes it. How one talks to a model is `runner.rs` and
+//! `local_agent.rs`, when there is money to spend is `budget.rs`, who is who is `auth.rs`, what a
+//! tool does to the turn that called it is `hooks.rs` and `mcp_tools.rs`, and how a path resolves
+//! inside the managed root is `files.rs`.
+//!
+//! **Everything a run needs to be resumed is in the database, and nothing is in memory.** A pass is
+//! `team_tick`, which reads the live runs and moves each one as far as it can this second; a
+//! subprocess landing is discovered by reading its `runs` row, not by awaiting a task. That is what
+//! makes a daemon restart mid-round a non-event rather than a recovery procedure — the same tick
+//! that would have ingested the answer ingests it after the restart, and `reconcile_orphaned_team_runs`
+//! only has to deal with the runs that genuinely died.
+//!
+//! The loop is its own rather than the scheduler's, and the reason is this pillar's rather than
+//! borrowed: a pass launches up to `max_parallel` subprocesses and writes files at a cadence
+//! nothing else in the house shares.
+
+use crate::state::AppState;
+
+/// The `runs.mode` every invocation of a department carries — director and specialist alike.
+///
+/// One mode and not two, because everything that reads it asks the same question and wants the same
+/// answer: the budget counts it, the hook refuses it every acting tool, the policy tables call it
+/// unattended. Which of the two roles a run played is a question `team_items` answers, and only the
+/// engine ever asks it.
+pub const TEAM_MODE: &str = "team";
+
+/// The states in which a team run is still going somewhere.
+///
+/// Three readers need this answer and none of them may keep its own copy: the token's death rule
+/// in `auth::resolve` (a key that outlives its run is a working key in a log file), the folder GC,
+/// and startup reconciliation. `job.rs` carries `TERMINAL_STATUSES`/`LIVE_STATUSES` for the same
+/// reason, and `concurrency.rs` pays for a test — `every_live_status_is_a_status_the_sweep_spares`
+/// — precisely because three copies of a list like this drift apart one edit at a time.
+pub const LIVE_STATES: &[&str] = &["planning", "working", "delivering"];
+
+/// Where a team run stops, and it stops in five distinguishable ways.
+///
+/// `stopped` and `expired` are deliberately not `failed`. Nothing failed — a ceiling was reached —
+/// and an owner shown `failed` goes looking for an error that does not exist. The job graph draws
+/// the same distinction for the same reason.
+pub const TERMINAL_STATES: &[&str] = &["done", "stopped", "expired", "failed", "cancelled"];
+
+/// How often a pass runs. Slower than the job loop's 30s would be wrong in the other direction: a
+/// department's rounds are short, and a whole round of specialists can land between two ticks.
+const TEAM_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ceilings the daemon imposes on what a team may declare, whatever the owner types.
+///
+/// The roster is static and written by the owner (design §1.1), so what is left to bound is how far
+/// the director may run with it: rounds times parallelism is the multiplier on the bill.
+pub const MAX_ROUNDS_CEILING: i64 = 6;
+pub const MAX_PARALLEL_CEILING: i64 = 8;
+
+/// How many items one plan may queue.
+///
+/// Cut items are REPORTED and not dropped in silence, for the reason `job::PlannedItems::dropped`
+/// records: a queue quietly truncated reads downstream as the whole of what the planner found.
+const MAX_ITEMS_PER_ROUND: usize = 8;
+
+/// Two consecutive rounds that add nothing end the work.
+///
+/// One would be wrong: a replan can legitimately produce nothing while the previous round settles.
+/// Counting items up to a target is worse still — it never finds the tail, and a model that never
+/// says "finished" would run to `max_rounds` spending. The brake is "it dried up", not "it reached
+/// a number", and the reasoning is `job::DRY_ROUNDS_TO_STOP`'s.
+const DRY_ROUNDS_TO_STOP: i64 = 2;
+
+/// How many times an unreadable plan relaunches the planner in round 0.
+///
+/// Only in round 0, and that asymmetry is the design: in `planning` there is no partial work to
+/// deliver, so giving up would hand the owner nothing at all. In a later round there IS work, and
+/// an unreadable plan is just a dry round.
+const PLAN_RETRY_LIMIT: i64 = 1;
+
+/// Four hours, as `MAX_JOB_LIFETIME` is. A department that has been going this long has stopped
+/// answering the request the owner recognises.
+const MAX_TEAM_RUN_LIFETIME: chrono::Duration = chrono::Duration::hours(4);
+
+/// How long a finished run's folder survives.
+///
+/// A constant and not a setting, unlike `web::prune`'s retention: that one is a preference about
+/// how much of the world to keep, this one is about how long the owner has to read their own
+/// delivery, and a number nobody needs to tune should not have a place to tune it.
+const TEAM_WORKSPACE_RETENTION_DAYS: i64 = 30;
+
+/// How often the folder GC sweeps. Daily: the thing it collects is measured in days.
+const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// What the owner opens. Named in the delivery prompt, and the one file the core writes on the
+/// director's behalf.
+const DELIVERY_FILE: &str = "entrega.md";
+
+const DAEMON_URL: &str = "http://127.0.0.1:8791";
+
+/// PURE: whether a run in this state is still one the daemon is advancing.
+pub fn is_live(state: &str) -> bool {
+    LIVE_STATES.contains(&state)
+}
+
+/// PURE: where one run's folder lives, relative to the managed files root.
+///
+/// Relative and never absolute, because it is stored: a root that moves — a machine restored from
+/// backup, a data directory relocated — must not invalidate every folder written before the move.
+pub fn workspace_for(team_id: &str, team_run_id: &str) -> String {
+    format!("teams/{team_id}/{team_run_id}")
+}
+
+// ---------------------------------------------------------------------------------------------
+// The catalogue of teams
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    /// What the department does. Enters the director's prompt in every round — it is the standing
+    /// half of the instruction, where `request` is the occasional half.
+    pub mission: String,
+    pub director_agent_id: String,
+    pub max_rounds: i64,
+    pub max_parallel: i64,
+    pub budget_usd: Option<f64>,
+    /// How many actions this team may leave waiting for a human at once. See
+    /// `DEFAULT_MAX_OPEN_ACTIONS`.
+    pub max_open_actions: i64,
+    /// How many runs of this department may be in flight at once. One by default: a rule that
+    /// fires while the last run is still going SKIPS its window rather than queueing, because a
+    /// queue is a debt the machine then tries to pay all at once.
+    pub max_live_runs: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A team with its roster and its alçada, which is how the shell reads one: the membership and what
+/// it may ask for ARE the team.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TeamView {
+    #[serde(flatten)]
+    pub team: Team,
+    pub members: Vec<String>,
+    /// Only the kinds this team was granted. An empty list is a department that can only write
+    /// memos, which is what every team is until somebody decides otherwise.
+    pub grants: Vec<TeamGrant>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TeamRequest {
+    pub name: String,
+    pub mission: String,
+    pub director_agent_id: String,
+    pub max_rounds: i64,
+    pub max_parallel: i64,
+    pub budget_usd: Option<f64>,
+    /// Defaulted rather than required, so a client written before this column existed still saves a
+    /// team instead of 400ing on a field it has never heard of.
+    #[serde(default = "default_max_open_actions")]
+    pub max_open_actions: i64,
+    #[serde(default = "default_max_live_runs")]
+    pub max_live_runs: i64,
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Replaced wholesale, exactly as `members` is, and for the same reason: the editor sends the
+    /// alçada as the owner left it, and a merge would make revoking one impossible through the only
+    /// surface that edits it.
+    #[serde(default)]
+    pub grants: Vec<TeamGrant>,
+}
+
+fn default_max_open_actions() -> i64 {
+    DEFAULT_MAX_OPEN_ACTIONS
+}
+
+fn default_max_live_runs() -> i64 {
+    1
+}
+
+#[derive(Debug)]
+pub enum TeamError {
+    DuplicateName,
+    Invalid(&'static str),
+    NotFound,
+    /// An agent the team names is not in the catalogue.
+    UnknownAgent(String),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for TeamError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for TeamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateName => {
+                formatter.write_str("a team with that name or id already exists")
+            }
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::NotFound => formatter.write_str("team not found"),
+            Self::UnknownAgent(id) => write!(formatter, "no agent named {id} is in the catalogue"),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TeamError {}
+
+/// PURE: what a team may declare about itself.
+///
+/// An EMPTY ROSTER IS ALLOWED here and refused at the start of a run, and that split is deliberate:
+/// a team halfway through being assembled is a legitimate state to save, and a team with nobody in
+/// it is only a problem at the moment somebody asks it to work.
+fn validate(request: &TeamRequest) -> Result<(), TeamError> {
+    if request.name.trim().is_empty() {
+        return Err(TeamError::Invalid("name must not be empty"));
+    }
+    if request.mission.trim().is_empty() {
+        return Err(TeamError::Invalid(
+            "mission must not be empty — it is what the director is told the department is for",
+        ));
+    }
+    if !(1..=MAX_ROUNDS_CEILING).contains(&request.max_rounds) {
+        return Err(TeamError::Invalid(
+            "max_rounds is outside what a daemon allows",
+        ));
+    }
+    if !(1..=MAX_PARALLEL_CEILING).contains(&request.max_parallel) {
+        return Err(TeamError::Invalid(
+            "max_parallel is outside what a daemon allows",
+        ));
+    }
+    if request.budget_usd.is_some_and(|budget| budget <= 0.0) {
+        return Err(TeamError::Invalid(
+            "a budget of zero or less is a team that can never run; leave it unset instead",
+        ));
+    }
+    // Zero is allowed and means something: a team that may hold no action open is one whose grants
+    // are all `allow` or none, which is a legitimate thing to configure deliberately.
+    if !(0..=MAX_OPEN_ACTIONS_CEILING).contains(&request.max_open_actions) {
+        return Err(TeamError::Invalid(
+            "max_open_actions is outside what a daemon allows",
+        ));
+    }
+    if !(1..=crate::team_trigger::MAX_LIVE_TEAM_RUNS).contains(&request.max_live_runs) {
+        return Err(TeamError::Invalid(
+            "max_live_runs is outside what a daemon allows",
+        ));
+    }
+    for grant in &request.grants {
+        if !GRANTABLE_ACTIONS.contains(&grant.kind.as_str()) {
+            return Err(TeamError::Invalid(
+                "that is not an action a department may be granted",
+            ));
+        }
+        if !GRANT_MODES.contains(&grant.mode.as_str()) {
+            return Err(TeamError::Invalid("a grant is either propose or allow"));
+        }
+    }
+    Ok(())
+}
+
+/// The id a name earns, once, and then frozen — `agent::slug`'s argument applies unchanged:
+/// `team_members`, `team_runs.team_id` and the folder path on disk all point at it.
+fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_dash = false;
+    for character in name.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            out.extend(character.to_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !out.is_empty() {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_owned()
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|database_error| database_error.is_unique_violation())
+}
+
+/// Every agent the team names must be in the catalogue, asked BEFORE the write.
+///
+/// The foreign keys already refuse it, and they refuse it as a 500 naming nothing. The same
+/// question one statement earlier is a 400 that says which agent — `agent::delete` makes the same
+/// trade in the other direction.
+async fn every_agent_exists(
+    pool: &sqlx::SqlitePool,
+    request: &TeamRequest,
+) -> Result<(), TeamError> {
+    for id in std::iter::once(&request.director_agent_id).chain(request.members.iter()) {
+        let known: Option<String> = sqlx::query_scalar("SELECT id FROM agents WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+        if known.is_none() {
+            return Err(TeamError::UnknownAgent(id.clone()));
+        }
+    }
+    Ok(())
+}
+
+pub async fn create(pool: &sqlx::SqlitePool, request: TeamRequest) -> Result<TeamView, TeamError> {
+    validate(&request)?;
+    every_agent_exists(pool, &request).await?;
+    let id = slug(&request.name);
+    if id.is_empty() {
+        return Err(TeamError::Invalid("name must contain a letter or a digit"));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                            budget_usd, max_open_actions, max_live_runs, created_at,
+                            updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&request.name)
+    .bind(&request.mission)
+    .bind(&request.director_agent_id)
+    .bind(request.max_rounds)
+    .bind(request.max_parallel)
+    .bind(request.budget_usd)
+    .bind(request.max_open_actions)
+    .bind(request.max_live_runs)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(_) => {}
+        Err(error) if is_unique_violation(&error) => return Err(TeamError::DuplicateName),
+        Err(error) => return Err(TeamError::Db(error)),
+    }
+    replace_roster(pool, &id, &request.members).await?;
+    replace_grants(pool, &id, &request.grants).await?;
+    get(pool, &id).await?.ok_or(TeamError::NotFound)
+}
+
+/// What a department may ask the core to do on its behalf.
+///
+/// **Not "the `Acts` tools".** Those are `approve_proposal`, `cancel_run`, `create_job`,
+/// `create_run`, `reject_proposal`, `set_kill`, `triage_email`, `vcs_request` and `send_email` —
+/// which is to say, the controls of the daemon itself. A department holding `set_kill` turns off the
+/// house's autonomy; one holding `approve_proposal` approves its own proposals and thereby holds
+/// every other authority by transitivity, without anybody having written that down anywhere.
+///
+/// So an alçada is not about tools. It is about ACTIONS, and this list is short, explicit, and
+/// checked before the table is: a row in `team_grants` naming something absent from here grants
+/// nothing (`a_kind_outside_the_list_is_refused_even_with_a_grant_in_the_table`).
+///
+/// `vcs_ticket` was in the design and is deliberately NOT here. The design called it "the cheapest
+/// of the four to undo", and that was written down wrongly: `TOOL_EFFECTS` records `vcs_request` as
+/// "the sharpest `Acts` on the list… the only effect on this list that outlives the daemon, and the
+/// only one its owner cannot take back from here". It moves a branch in a repository other people
+/// build on. Handing a department the one irreversible effect in the house as its first authority
+/// is exactly backwards, and choosing WHICH git operations a department may request is a design
+/// decision no spec has made. Refused until one does — asserted by
+/// `no_grantable_action_is_a_control_of_the_daemon`.
+pub const GRANTABLE_ACTIONS: &[&str] = &["calendar_event", "file_document", "send_email"];
+
+/// `propose` puts a human in the middle; `allow` does not.
+///
+/// There is no `deny`, and its absence is the design: a team with no row for a kind may not ask for
+/// it, exactly as `auth::permits` refuses anything not listed. Two ways of saying no is where they
+/// eventually disagree.
+const GRANT_MODES: &[&str] = &["propose", "allow"];
+
+/// How many actions a team may leave waiting for a decision, absent an owner's opinion.
+pub const DEFAULT_MAX_OPEN_ACTIONS: i64 = 5;
+
+/// And the ceiling on that opinion. A queue nobody can work through is a queue that gets approved
+/// unread, which is worse than one that refuses to grow.
+pub const MAX_OPEN_ACTIONS_CEILING: i64 = 20;
+
+/// One line of a team's alçada: an action, and whether a human sees it first.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct TeamGrant {
+    pub kind: String,
+    pub mode: String,
+}
+
+pub async fn grants(pool: &sqlx::SqlitePool, team_id: &str) -> Result<Vec<TeamGrant>, TeamError> {
+    sqlx::query_as("SELECT kind, mode FROM team_grants WHERE team_id = ? ORDER BY kind")
+        .bind(team_id)
+        .fetch_all(pool)
+        .await
+        .map_err(TeamError::Db)
+}
+
+/// Replaced wholesale, for `replace_roster`'s reason: the editor sends the alçada as the owner left
+/// it, and a merge would make revoking one impossible through the only surface that edits it.
+async fn replace_grants(
+    pool: &sqlx::SqlitePool,
+    team_id: &str,
+    grants: &[TeamGrant],
+) -> Result<(), TeamError> {
+    sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
+        .bind(team_id)
+        .execute(pool)
+        .await?;
+    for grant in grants {
+        sqlx::query("INSERT OR REPLACE INTO team_grants (team_id, kind, mode) VALUES (?, ?, ?)")
+            .bind(team_id)
+            .bind(&grant.kind)
+            .bind(&grant.mode)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The roster is REPLACED and not merged, because that is what the editor sends: the whole
+/// membership as the owner left it. A merge would make removing somebody impossible through the
+/// only surface that edits one.
+async fn replace_roster(
+    pool: &sqlx::SqlitePool,
+    team_id: &str,
+    members: &[String],
+) -> Result<(), TeamError> {
+    sqlx::query("DELETE FROM team_members WHERE team_id = ?")
+        .bind(team_id)
+        .execute(pool)
+        .await?;
+    for agent_id in members {
+        sqlx::query("INSERT OR IGNORE INTO team_members (team_id, agent_id) VALUES (?, ?)")
+            .bind(team_id)
+            .bind(agent_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<TeamView>, TeamError> {
+    let teams: Vec<Team> = sqlx::query_as(
+        "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                max_open_actions, max_live_runs, created_at, updated_at
+         FROM teams ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut views = Vec::with_capacity(teams.len());
+    for team in teams {
+        let members = roster(pool, &team.id).await?;
+        let grants = grants(pool, &team.id).await?;
+        views.push(TeamView {
+            team,
+            members,
+            grants,
+        });
+    }
+    Ok(views)
+}
+
+pub async fn get(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<TeamView>, TeamError> {
+    let team: Option<Team> = sqlx::query_as(
+        "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                max_open_actions, max_live_runs, created_at, updated_at
+         FROM teams WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    match team {
+        None => Ok(None),
+        Some(team) => {
+            let members = roster(pool, &team.id).await?;
+            let grants = grants(pool, &team.id).await?;
+            Ok(Some(TeamView {
+                team,
+                members,
+                grants,
+            }))
+        }
+    }
+}
+
+pub async fn roster(pool: &sqlx::SqlitePool, team_id: &str) -> Result<Vec<String>, TeamError> {
+    sqlx::query_scalar("SELECT agent_id FROM team_members WHERE team_id = ? ORDER BY agent_id")
+        .bind(team_id)
+        .fetch_all(pool)
+        .await
+        .map_err(TeamError::Db)
+}
+
+/// The id is deliberately NOT recomputed from a new name: it is a reference, and a folder on disk
+/// is named after it.
+pub async fn update(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    request: TeamRequest,
+) -> Result<TeamView, TeamError> {
+    validate(&request)?;
+    every_agent_exists(pool, &request).await?;
+    let affected = sqlx::query(
+        "UPDATE teams
+         SET name = ?, mission = ?, director_agent_id = ?, max_rounds = ?, max_parallel = ?,
+             budget_usd = ?, max_open_actions = ?, max_live_runs = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&request.name)
+    .bind(&request.mission)
+    .bind(&request.director_agent_id)
+    .bind(request.max_rounds)
+    .bind(request.max_parallel)
+    .bind(request.budget_usd)
+    .bind(request.max_open_actions)
+    .bind(request.max_live_runs)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await;
+    match affected {
+        Ok(result) if result.rows_affected() == 0 => return Err(TeamError::NotFound),
+        Ok(_) => {}
+        Err(error) if is_unique_violation(&error) => return Err(TeamError::DuplicateName),
+        Err(error) => return Err(TeamError::Db(error)),
+    }
+    replace_roster(pool, id, &request.members).await?;
+    // Revoking here does NOT cancel an action already proposed. The alçada is read when the agent
+    // asks, not when the core executes — see `execute_due_actions`, and the design's risk 1.
+    replace_grants(pool, id, &request.grants).await?;
+    get(pool, id).await?.ok_or(TeamError::NotFound)
+}
+
+/// Refused while any run of this team is still live, for the reason `agent::delete` refuses a
+/// director: the constraint would come back as a 500 naming nothing, and the same question asked
+/// one statement earlier is a 409 that says why.
+pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> {
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM team_runs
+         WHERE team_id = ? AND state IN ('planning', 'working', 'delivering')",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    if live > 0 {
+        return Err(TeamError::Invalid(
+            "that team has a run in flight; cancel it first",
+        ));
+    }
+    let past: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_runs WHERE team_id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    if past > 0 {
+        return Err(TeamError::Invalid(
+            "that team has runs on record; deleting it would orphan their deliveries",
+        ));
+    }
+
+    sqlx::query("DELETE FROM team_members WHERE team_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    // The alçada goes with the team it described. There is no equivalent worry about
+    // `team_actions`: an action belongs to a RUN, and the check above already refuses to delete a
+    // team that has ever had one — so a team reaching this line has no runs and therefore no
+    // actions, pending or otherwise.
+    sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    // This team's own rules go with it — a rule that starts a department which no longer exists
+    // fires at nothing, every window, for ever.
+    sqlx::query(
+        "DELETE FROM team_trigger_state WHERE trigger_id IN
+           (SELECT id FROM team_triggers WHERE team_id = ?)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM team_triggers WHERE team_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    // Rules that fire ON this team are DISARMED and not deleted — the opposite treatment, for the
+    // opposite reason. Such a rule still describes something its author wanted and has merely lost
+    // its signal: deleting it throws away their sentence, and leaving it armed leaves a rule that
+    // can never fire looking like one that might.
+    sqlx::query(
+        "UPDATE team_triggers SET enabled = 0, updated_at = ?
+          WHERE source = 'team_finished' AND from_team = ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    let result = sqlx::query("DELETE FROM teams WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(TeamError::NotFound);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// A run, and the plan that drives it
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct TeamRun {
+    pub id: String,
+    pub team_id: String,
+    pub request: String,
+    pub workspace: String,
+    pub state: String,
+    /// Which director node is IN FLIGHT: `none` | `planning` | `replanning` | `delivering`.
+    ///
+    /// One column and not three booleans, because two booleans can both be true and the enum makes
+    /// that state inexpressible. Separate from `state` because it answers a different question —
+    /// `state` says where the run is, this says whether the node has already been launched. Without
+    /// it every tick would launch another planner while the first one runs, which is the mistake
+    /// `job::JobView::planning` exists to record; the cost of getting it wrong is measured in
+    /// `job.rs` at one wasted node per round.
+    pub director_node: String,
+    pub director_run_id: Option<i64>,
+    pub round: i64,
+    pub next_ordinal: i64,
+    pub dry_rounds: i64,
+    pub plan_retries: i64,
+    pub replanned: String,
+    pub outcome: Option<String>,
+    pub why: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    /// The rule that started this, or NULL when a person did.
+    pub trigger_id: Option<i64>,
+    /// The run whose ending started this. For drawing the chain; it decides nothing.
+    pub parent_id: Option<String>,
+    /// The run this tree grew from. **This is what decides the money** — see
+    /// `team_trigger::tree_has_room`. A run a person asked for is its own root, never NULL: a NULL
+    /// meaning "I am the root" makes every reader write `COALESCE(root_id, id)`, and the day one
+    /// forgets, the tree ceiling reads the wrong run.
+    pub root_id: String,
+    pub depth: i64,
+}
+
+/// Where a run came from, for the columns above.
+///
+/// Defaulted to "a person asked, and this is its own tree", which is what every caller that is not
+/// a trigger means. `start` takes no lineage at all and `start_with` takes one, so the ordinary
+/// path cannot accidentally declare itself the child of something.
+#[derive(Debug, Clone, Default)]
+pub struct Lineage {
+    pub trigger_id: Option<i64>,
+    pub parent_id: Option<String>,
+    /// `None` means this run is its own root.
+    pub root_id: Option<String>,
+    pub depth: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct TeamItem {
+    pub ordinal: i64,
+    pub round: i64,
+    pub agent_id: String,
+    pub description: String,
+    pub state: String,
+    pub run_id: Option<i64>,
+    pub output_path: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TeamRunView {
+    #[serde(flatten)]
+    pub run: TeamRun,
+    pub items: Vec<TeamItem>,
+    /// What this run has spent so far, summed over every run it started — the director's nodes
+    /// included, which is what `runs.team_run_id` exists for.
+    pub cost_usd: f64,
+}
+
+/// One item a director asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedItem {
+    pub agent_id: String,
+    pub description: String,
+}
+
+/// What one director node produced, after the roster and the ceiling have been applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedItems {
+    pub items: Vec<PlannedItem>,
+    /// What was cut, and why — reported rather than discarded, because a silently truncated queue
+    /// reads downstream as the whole of what the planner found.
+    pub dropped: Vec<String>,
+    pub done: bool,
+    pub why: Option<String>,
+}
+
+/// PURE: the plan a director wrote, or `None` if there is no plan in what it wrote.
+///
+/// `None` is the signal the round machine acts on — a relaunch in round 0, a dry round after — so
+/// it must mean "unreadable" and never "readable and empty". A readable plan with no items is
+/// `Some` with an empty list, and those two travel to different places.
+///
+/// The JSON is looked for inside the answer rather than expected to be the whole of it, because a
+/// model asked for JSON writes a sentence around it perhaps a third of the time. An `agent_id`
+/// outside the roster drops THAT ITEM and not the plan: a director that misspells one name in five
+/// should not cost the round.
+pub fn parse_team_plan(text: &str, roster: &[String], ceiling: usize) -> Option<PlannedItems> {
+    let value = extract_json(text)?;
+
+    // `done: true` wins over any items beside it, for the reason `job::parse_plan` gives: the model
+    // said the work is finished, and queueing work it also mentioned would be obeying the half of
+    // the answer that costs money.
+    let done = value.get("done").and_then(serde_json::Value::as_bool) == Some(true);
+    let why = value
+        .get("why")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+
+    let mut items = Vec::new();
+    let mut dropped = Vec::new();
+    if !done {
+        let raw = value
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for entry in raw {
+            let agent_id = entry.get("agent_id").and_then(serde_json::Value::as_str);
+            let description = entry.get("description").and_then(serde_json::Value::as_str);
+            let (Some(agent_id), Some(description)) = (agent_id, description) else {
+                dropped.push("an item named no agent or no work".to_owned());
+                continue;
+            };
+            if !roster.iter().any(|member| member == agent_id) {
+                dropped.push(format!("{agent_id} is not on this team"));
+                continue;
+            }
+            if description.trim().is_empty() {
+                dropped.push(format!("{agent_id} was given no work to do"));
+                continue;
+            }
+            if items.len() == ceiling {
+                dropped.push(format!(
+                    "{agent_id} was cut: a round queues at most {ceiling} items"
+                ));
+                continue;
+            }
+            items.push(PlannedItem {
+                agent_id: agent_id.to_owned(),
+                description: description.trim().to_owned(),
+            });
+        }
+    }
+
+    Some(PlannedItems {
+        items,
+        dropped,
+        done,
+        why,
+    })
+}
+
+/// The outermost JSON object in a string, or `None`.
+///
+/// Whole-string first, because that is what a well-behaved answer is and parsing it directly is
+/// what keeps a `}` inside a string literal from confusing the fallback. The fallback spans the
+/// first `{` to the last `}`, which is the shape a model produces when it wraps the object in prose
+/// or a code fence.
+fn extract_json(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && value.is_object()
+    {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
+        .ok()
+        .filter(serde_json::Value::is_object)
+}
+
+/// Where a run goes when a director node lands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Progress {
+    pub state: &'static str,
+    pub round: i64,
+    pub dry_rounds: i64,
+    pub plan_retries: i64,
+    /// Whether the plan's items should be queued. `false` whenever the run is leaving `working`,
+    /// so that items are never written for a round that will not run.
+    pub queue_items: bool,
+    pub why: Option<String>,
+}
+
+/// PURE: the whole round machine, in one function.
+///
+/// Every transition of the design's §3 table that a director node can cause is here, and the two
+/// call sites — the tick and the reconciliation — share it rather than each implementing the half
+/// it needs. `plan: None` means the node produced nothing readable.
+///
+/// **The order is: increment the round, then check the ceiling.** A team with `max_rounds = 3` runs
+/// rounds 0, 1 and 2, and the check catches it as round 3 opens. Written down because it is exactly
+/// the kind of detail an implementer guesses, and guesses wrong half the time.
+pub fn next_after_director(
+    state: &str,
+    plan: Option<&PlannedItems>,
+    round: i64,
+    dry_rounds: i64,
+    plan_retries: i64,
+    max_rounds: i64,
+) -> Progress {
+    let unchanged = Progress {
+        state: "working",
+        round,
+        dry_rounds,
+        plan_retries,
+        queue_items: false,
+        why: None,
+    };
+
+    if state == "planning" {
+        return match plan {
+            // Round 0 has no partial work to hand over, so an unreadable plan is worth one more
+            // attempt and then nothing.
+            None if plan_retries < PLAN_RETRY_LIMIT => Progress {
+                state: "planning",
+                plan_retries: plan_retries + 1,
+                ..unchanged
+            },
+            None => Progress {
+                state: "failed",
+                why: Some("the director's plan could not be read, twice".to_owned()),
+                ..unchanged
+            },
+            Some(plan) if plan.done => Progress {
+                state: "delivering",
+                why: plan.why.clone(),
+                ..unchanged
+            },
+            // Readable, not done, and nothing to delegate. Not a dry round — there has been no
+            // round — and not a failure either: the director read the request and found nothing to
+            // hand out, which is an answer the delivery node should write down.
+            Some(plan) if plan.items.is_empty() => Progress {
+                state: "delivering",
+                why: plan
+                    .why
+                    .clone()
+                    .or_else(|| Some("the director queued no work".to_owned())),
+                ..unchanged
+            },
+            Some(_) => Progress {
+                state: "working",
+                queue_items: true,
+                ..unchanged
+            },
+        };
+    }
+
+    // A round ended. It counts whether or not the replan could be read — an unreadable plan is a
+    // dry round, because there is work in the folder either way.
+    let round = round + 1;
+    let produced = plan.is_some_and(|plan| !plan.done && !plan.items.is_empty());
+    let dry_rounds = if produced { 0 } else { dry_rounds + 1 };
+    let done = plan.is_some_and(|plan| plan.done);
+
+    if done || dry_rounds >= DRY_ROUNDS_TO_STOP || round >= max_rounds {
+        return Progress {
+            state: "delivering",
+            round,
+            dry_rounds,
+            plan_retries,
+            queue_items: false,
+            why: plan.and_then(|plan| plan.why.clone()).or_else(|| {
+                Some(if done {
+                    "the director called the work finished".to_owned()
+                } else if round >= max_rounds {
+                    format!("the team reached its ceiling of {max_rounds} rounds")
+                } else {
+                    "two rounds in a row added nothing".to_owned()
+                })
+            }),
+        };
+    }
+
+    Progress {
+        state: "working",
+        round,
+        dry_rounds,
+        plan_retries,
+        queue_items: produced,
+        why: None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Starting a run
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum StartError {
+    NotFound,
+    Invalid(String),
+    BudgetExhausted(String),
+    Unavailable(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("team not found"),
+            Self::Invalid(message)
+            | Self::BudgetExhausted(message)
+            | Self::Unavailable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// Starts a department on one request: validates, mints the key, makes the folder, writes the row.
+///
+/// Returns as soon as the row exists — everything after is the tick's. The four refusals here are
+/// the four things that cannot be discovered later without wasting money: a team with nobody in it,
+/// a director that was deleted, a local member on a machine with no local model, and a house budget
+/// that is already spent.
+pub async fn start(state: &AppState, team_id: &str, request: &str) -> Result<String, StartError> {
+    start_with(state, team_id, request, Lineage::default()).await
+}
+
+/// `start`, for a caller that knows where the run came from.
+///
+/// One function and not two paths: a triggered run is an ordinary run with four columns filled in,
+/// and every refusal above applies to it unchanged. What a trigger adds — the depth, the tree
+/// ceiling, the live-run counts — is checked by `team_trigger::fire` BEFORE it gets here, because
+/// those are questions about whether to start at all rather than about whether this team can.
+pub async fn start_with(
+    state: &AppState,
+    team_id: &str,
+    request: &str,
+    lineage: Lineage,
+) -> Result<String, StartError> {
+    let request = request.trim();
+    if request.is_empty() {
+        return Err(StartError::Invalid("the request is empty".to_owned()));
+    }
+
+    let team = get(&state.pool, team_id)
+        .await
+        .map_err(|error| StartError::Unavailable(error.to_string()))?
+        .ok_or(StartError::NotFound)?;
+
+    if team.members.is_empty() {
+        return Err(StartError::Invalid(
+            "this team has no members yet; add at least one specialist".to_owned(),
+        ));
+    }
+
+    // The director is asked for by id rather than assumed present: `agent::delete` refuses to
+    // delete one, but a database restored from a backup taken before the team existed would not
+    // have that history.
+    let director = crate::agent::get(&state.pool, &team.team.director_agent_id)
+        .await
+        .map_err(|error| StartError::Unavailable(error.to_string()))?
+        .ok_or_else(|| {
+            StartError::Invalid(format!(
+                "this team's director ({}) is no longer in the catalogue",
+                team.team.director_agent_id
+            ))
+        })?;
+
+    // A local member with no local assistant on this machine is refused rather than silently run in
+    // the cloud, which would swap the model the owner chose for one that spends.
+    let mut members = Vec::with_capacity(team.members.len());
+    for id in &team.members {
+        let agent = crate::agent::get(&state.pool, id)
+            .await
+            .map_err(|error| StartError::Unavailable(error.to_string()))?
+            .ok_or_else(|| {
+                StartError::Invalid(format!("{id} is on this team and not in the catalogue"))
+            })?;
+        members.push(agent);
+    }
+    if state.local_assistant.is_none()
+        && let Some(local) = members
+            .iter()
+            .chain(std::iter::once(&director))
+            .find(|agent| agent.engine == "local")
+    {
+        return Err(StartError::Invalid(format!(
+            "{} runs on a local model and this machine has none available",
+            local.id
+        )));
+    }
+
+    match crate::budget::budget_permits_new_run(&state.pool, chrono::Utc::now()).await {
+        crate::budget::BudgetDecision::Allow => {}
+        crate::budget::BudgetDecision::Pause { reason, .. } => {
+            return Err(StartError::BudgetExhausted(reason));
+        }
+    }
+
+    let id = crate::auth::generate_uuid_v4();
+    let workspace = workspace_for(&team.team.id, &id);
+
+    // The folder before the row: a run whose row exists and whose folder does not is a run whose
+    // every specialist fails on its first write. The other order leaves an empty directory the GC
+    // collects, which costs nothing.
+    let root = files_root(state).map_err(StartError::Unavailable)?;
+    let folder = crate::files::resolve_within(&root, &workspace)
+        .map_err(|error| StartError::Unavailable(format!("{error:?}")))?;
+    std::fs::create_dir_all(&folder).map_err(|error| StartError::Unavailable(error.to_string()))?;
+
+    let (_, secret) = crate::auth::mint_team_token(&id);
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO team_runs (id, team_id, request, workspace, token, state, created_at,
+                                updated_at, trigger_id, parent_id, root_id, depth)
+         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&team.team.id)
+    .bind(request)
+    .bind(&workspace)
+    .bind(&secret)
+    .bind(&now)
+    .bind(&now)
+    .bind(lineage.trigger_id)
+    .bind(&lineage.parent_id)
+    // Its own id when nobody named a root. Written rather than left NULL for the reason the column
+    // documents: a sentinel meaning "me" is a `COALESCE` at every reader, and one missing `COALESCE`
+    // is a tree ceiling read off the wrong run.
+    .bind(lineage.root_id.as_deref().unwrap_or(&id))
+    .bind(lineage.depth)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| StartError::Unavailable(error.to_string()))?;
+
+    let _ = crate::feed::append(
+        &state.pool,
+        None,
+        "team_run_started",
+        &format!("{} was asked to {request}", team.team.name),
+        None,
+    )
+    .await;
+
+    Ok(id)
+}
+
+fn files_root(state: &AppState) -> Result<std::path::PathBuf, String> {
+    crate::http::files_root(state)
+        .map(std::path::Path::to_path_buf)
+        .map_err(|_| "no files folder is configured on this machine".to_owned())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Alçada: what a department asks for, and what the core does about it
+// ---------------------------------------------------------------------------------------------
+
+/// Which node of a team run is calling, and what it is.
+///
+/// A team's key names the RUN: the director and every specialist of one run hold the identical
+/// token, by design — the key belongs to the run. Two questions are nonetheless about the node, and
+/// this is where they are answered from the one column that already knows: `team_runs.director_run_id`
+/// names the director's node while it is in flight.
+///
+/// **Not a new `Scope`.** A `Scope::TeamDirector` would be a fifth family of credentials expressing
+/// a condition a column already answers, and it would duplicate the token's death rule, the mint,
+/// the arm in `resolve` and the line in `permits` — five places for a question that is `WHERE id = ?`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// The director's node, in flight right now.
+    Director,
+    /// A specialist working an item of this run, and which one.
+    Specialist(i64),
+    /// A node this run does not recognise: no header, a stale id, or one belonging to another run.
+    /// Treated as the least authority rather than as an error, because that is the safe direction
+    /// and the honest one — the daemon does not know who this is.
+    Unknown,
+}
+
+/// Resolves the calling node against the run its key authenticated.
+///
+/// The header is checked against THIS run, always. A run id from somewhere else — another
+/// department, another era — matches neither the director column nor an item of this run, so it
+/// resolves to `Unknown` and holds nothing.
+async fn calling_node(
+    pool: &sqlx::SqlitePool,
+    team_run_id: &str,
+    headers: &axum::http::HeaderMap,
+) -> Caller {
+    let Some(run_id) = headers
+        .get(crate::daemon_client::RUN_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return Caller::Unknown;
+    };
+
+    let director: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT director_run_id FROM team_runs WHERE id = ?")
+            .bind(team_run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    if director == Some(Some(run_id)) {
+        return Caller::Director;
+    }
+
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT ordinal FROM team_items WHERE team_run_id = ? AND run_id = ?",
+    )
+    .bind(team_run_id)
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(ordinal)) => Caller::Specialist(ordinal),
+        _ => Caller::Unknown,
+    }
+}
+
+/// One thing a department asked the core to do.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct TeamAction {
+    pub id: i64,
+    pub team_run_id: String,
+    /// The item that asked, or NULL when the director did.
+    pub ordinal: Option<i64>,
+    pub kind: String,
+    pub payload: String,
+    pub why: String,
+    pub proposal_id: Option<i64>,
+    pub state: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub executed_at: Option<String>,
+}
+
+/// Why an action could not even be asked for. Every variant is a refusal handed back to the AGENT,
+/// mid-turn, while it can still do something about it.
+#[derive(Debug)]
+pub enum ActionError {
+    /// Not a `Scope::TeamRun` at all.
+    NotADepartment,
+    /// The run named by the key is gone.
+    NoSuchRun,
+    /// `kind` is not in `GRANTABLE_ACTIONS`. Nobody can ask for this, granted or not.
+    Unknown(String),
+    /// This team has no grant for it.
+    Ungranted(String),
+    /// The payload is not a well-formed request of that kind, with the fault named.
+    Malformed(String),
+    /// The team already holds as many undecided actions as it may.
+    QueueFull(String),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ActionError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADepartment => {
+                formatter.write_str("only a department asks the core to act for it")
+            }
+            Self::NoSuchRun => formatter.write_str("no such team run"),
+            Self::Unknown(kind) => write!(formatter, "nobody can do `{kind}`"),
+            Self::Ungranted(kind) => {
+                write!(formatter, "this department may not do `{kind}`")
+            }
+            Self::Malformed(why) | Self::QueueFull(why) => formatter.write_str(why),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProposeActionRequest {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub why: String,
+}
+
+/// What the agent is told. **A sentence, not a status code**, because the reader is a model that has
+/// to decide what to do next: "filed for approval as #41" and "this department may not send email"
+/// lead to different paragraphs, and a 403 leads to a retry.
+#[derive(Debug, serde::Serialize)]
+pub struct ProposeActionResponse {
+    pub id: i64,
+    pub proposal_id: Option<i64>,
+    pub outcome: String,
+}
+
+/// PURE: whether this payload is a well-formed request of this kind, and its canonical form.
+///
+/// **Validated when it is WRITTEN and never when it is executed.** A `send_email` with no recipient
+/// has to be refused to the agent, which is still mid-turn and can still fix it — not to a human
+/// three hours later, who can fix nothing and whose only options are to approve something broken or
+/// throw away work already paid for.
+///
+/// Returns the JSON to store, re-serialised from the fields this understands rather than passed
+/// through. A payload carrying extra keys stores without them, so what a human reads when approving
+/// is exactly what the executor will act on.
+fn validate_payload(kind: &str, payload: &serde_json::Value) -> Result<String, String> {
+    // Trimmed, for the fields where surrounding space is a typo: an address, a subject, a path, a
+    // timezone name.
+    let text = |field: &str| -> Result<String, String> {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("a `{kind}` needs a non-empty `{field}`"))
+    };
+    // NOT trimmed, for the fields where it is the content: a document's trailing newline is part of
+    // the document, and a body's leading blank line may be deliberate. Still required to have
+    // something in it — an empty file and an empty message are both requests worth refusing — but
+    // what is stored is what was written.
+    let body = |field: &str| -> Result<String, String> {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("a `{kind}` needs a non-empty `{field}`"))
+    };
+
+    let canonical = match kind {
+        "send_email" => {
+            let (to, subject, body) = (text("to")?, text("subject")?, body("body")?);
+            // The house's own rule, borrowed rather than restated: a header ends at the first line
+            // break, so a `\n` in `to` or `subject` does not corrupt a message — it ends that header
+            // and starts one nobody approved. Asking `mailsend` means a department and the owner's
+            // own send button cannot come to disagree about what an address is.
+            crate::mailsend::validate(&to, &subject).map_err(str::to_owned)?;
+            serde_json::json!({ "to": to, "subject": subject, "body": body })
+        }
+        "file_document" => {
+            let (path, content) = (text("path")?, body("content")?);
+            // Shape only, here. Whether the path stays inside the files root is decided by
+            // `files::resolve_within` at execution, against a root this function does not have —
+            // and that is the check that matters, so this one only refuses the obviously wrong.
+            if path.starts_with('/') || path.starts_with('\\') || path.contains("..") {
+                return Err(
+                    "a `file_document` path is relative and stays inside the folder".into(),
+                );
+            }
+            serde_json::json!({ "path": path, "content": content })
+        }
+        "calendar_event" => {
+            let title = text("title")?;
+            let starts_at_local = text("starts_at_local")?;
+            let tz = text("tz")?;
+            let minutes = payload
+                .get("duration_minutes")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|minutes| *minutes > 0)
+                .ok_or("a `calendar_event` needs a `duration_minutes` above zero")?;
+            // Both parsed HERE and stored as strings, so an unparseable date is the agent's problem
+            // and not a `failed` row a human approved in good faith.
+            chrono::NaiveDateTime::parse_from_str(&starts_at_local, crate::calendar::LOCAL_FORMAT)
+                .map_err(|_| {
+                    format!(
+                        "`starts_at_local` is written {}, e.g. 2026-08-17T09:30:00",
+                        crate::calendar::LOCAL_FORMAT
+                    )
+                })?;
+            tz.parse::<chrono_tz::Tz>()
+                .map_err(|_| format!("`{tz}` is not a timezone name, e.g. Europe/Lisbon"))?;
+            serde_json::json!({
+                "title": title,
+                "starts_at_local": starts_at_local,
+                "duration_minutes": minutes,
+                "tz": tz,
+            })
+        }
+        // Unreachable in production: `propose_action` checks `GRANTABLE_ACTIONS` first. Kept total
+        // rather than `unreachable!` so that adding a kind to the constant and forgetting this
+        // function is a refusal, not a panic in a background loop.
+        _ => return Err(format!("nobody can do `{kind}`")),
+    };
+    Ok(canonical.to_string())
+}
+
+/// A department asks the core to do something. **It does not happen here.**
+///
+/// This is the whole of the design's decision #2, and the reason `TEAM_TOOLS` stays read-only
+/// forever: the agent declares an intention and gets a sentence back, the turn carries on, nothing
+/// blocks and nothing is resumed. `proposals::create_calendar_event` had already written the shape
+/// — *"The agent never writes the event itself. This row is the whole mechanism"* — and this is that
+/// mechanism with a second table in front of it.
+///
+/// **Which run is asking comes from the key, not from the body**, exactly as `post_read_file` insists
+/// one route over. A department is the one scope in the house that names its caller.
+///
+/// The order of the five refusals is not arbitrary. The constant is asked before the table, so a row
+/// somebody put in `team_grants` by hand cannot grant an action the house does not have. The payload
+/// is checked before the ceiling, so a malformed request is a fault the agent can fix rather than
+/// one that eats a slot in the queue.
+pub async fn propose_action(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    headers: &axum::http::HeaderMap,
+    request: &ProposeActionRequest,
+) -> Result<ProposeActionResponse, ActionError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(ActionError::NotADepartment);
+    };
+
+    if !GRANTABLE_ACTIONS.contains(&request.kind.as_str()) {
+        return Err(ActionError::Unknown(request.kind.clone()));
+    }
+
+    let team_id: String = sqlx::query_scalar("SELECT team_id FROM team_runs WHERE id = ?")
+        .bind(team_run_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(ActionError::NoSuchRun)?;
+
+    let mode: Option<String> =
+        sqlx::query_scalar("SELECT mode FROM team_grants WHERE team_id = ? AND kind = ?")
+            .bind(&team_id)
+            .bind(&request.kind)
+            .fetch_optional(&state.pool)
+            .await?;
+    // Default deny. The absence of a row is the refusal — there is no `mode = 'deny'` to disagree
+    // with it.
+    let mode = mode.ok_or_else(|| ActionError::Ungranted(request.kind.clone()))?;
+
+    let payload =
+        validate_payload(&request.kind, &request.payload).map_err(ActionError::Malformed)?;
+    let why = request.why.trim();
+    if why.is_empty() {
+        return Err(ActionError::Malformed(
+            "say why, in one line — it is what the person deciding will read".to_owned(),
+        ));
+    }
+
+    // Only `propose` actions occupy the queue: an `allow` action is decided already and executes on
+    // the next pass, so counting it would let a fast-clearing kind block a slow one.
+    if mode == "propose" {
+        let ceiling: i64 = sqlx::query_scalar("SELECT max_open_actions FROM teams WHERE id = ?")
+            .bind(&team_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(DEFAULT_MAX_OPEN_ACTIONS);
+        let open = open_actions_of(&state.pool, &team_id).await?;
+        if open >= ceiling {
+            return Err(ActionError::QueueFull(format!(
+                "this department already has {open} action(s) waiting for approval, and may hold \
+                 {ceiling}; the person deciding has not got to them yet"
+            )));
+        }
+    }
+
+    // Attribution, not authority: every node of a run may ask, and this only records which did.
+    // `None` for the director and for a node the run does not recognise — see `Caller`.
+    //
+    // **Read before the transaction opens, and that ordering is load-bearing.** A read taken while
+    // a transaction is in flight is served by a SECOND pooled connection, and against a
+    // `sqlite::memory:` database a second connection is a second, empty database — so this
+    // silently resolved to `Unknown` and every action was recorded as nobody's. Every read this
+    // function makes happens before `begin`; everything after it is writes.
+    let ordinal = match calling_node(&state.pool, team_run_id, headers).await {
+        Caller::Specialist(ordinal) => Some(ordinal),
+        Caller::Director | Caller::Unknown => None,
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = state.pool.begin().await?;
+    // The proposal FIRST, so its id can go on the action row. One transaction and not two writes:
+    // an action with no proposal is one nobody will ever decide, and a proposal with no action is a
+    // button that approves nothing. `ingest_director` learned this at cost in the pillar before —
+    // saving only the last write leaves the earlier ones unsaved.
+    let proposal_id = if mode == "propose" {
+        Some(
+            crate::proposals::create_team_action_in_transaction(
+                &mut transaction,
+                &request.kind,
+                why,
+                &payload,
+                &now,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let id = sqlx::query(
+        "INSERT INTO team_actions
+           (team_run_id, ordinal, kind, payload, why, proposal_id, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+    )
+    .bind(team_run_id)
+    .bind(ordinal)
+    .bind(&request.kind)
+    .bind(&payload)
+    .bind(why)
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?
+    .last_insert_rowid();
+    transaction.commit().await?;
+
+    let outcome = match proposal_id {
+        Some(proposal_id) => format!(
+            "filed for approval as #{proposal_id}. It will happen if the person says yes; carry on \
+             without waiting."
+        ),
+        None => "queued — this department may do that without asking, and the core will do it \
+                 shortly."
+            .to_owned(),
+    };
+    Ok(ProposeActionResponse {
+        id,
+        proposal_id,
+        outcome,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recruitment: a director says who it needed and did not have
+// ---------------------------------------------------------------------------------------------
+
+/// Why a director could not ask for somebody. Every variant is a sentence for the MODEL, mid-round.
+#[derive(Debug)]
+pub enum RecruitError {
+    NotADepartment,
+    /// The caller is a specialist, or a node this run no longer recognises.
+    NotTheDirector,
+    NoSuchRun,
+    /// That id is already in the catalogue — actionable in the same turn: ask for them to be added
+    /// rather than for somebody new.
+    AlreadyExists(String),
+    /// Already asked for, and nobody has answered yet.
+    AlreadyAsked(String),
+    /// `agent::validate` refused the proposal, in its own words.
+    Invalid(String),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for RecruitError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for RecruitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADepartment => formatter.write_str("only a department may ask for a teammate"),
+            Self::NotTheDirector => formatter.write_str(
+                "only a director may ask for a teammate — say in your answer what you needed and \
+                 did not have, and the director will pass it on",
+            ),
+            Self::NoSuchRun => formatter.write_str("no such team run"),
+            Self::AlreadyExists(id) => write!(
+                formatter,
+                "`{id}` is already in the catalogue — ask the owner to add them to this team \
+                 rather than hiring somebody new"
+            ),
+            Self::AlreadyAsked(id) => write!(
+                formatter,
+                "you already asked for `{id}`; it is waiting for the owner. Carry on without them"
+            ),
+            Self::Invalid(why) => formatter.write_str(why),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RecruitRequest {
+    pub name: String,
+    pub speciality: String,
+    pub prompt: String,
+    /// Absent means the director's own — the only defensible guess. A director running on
+    /// `claude-sonnet-5` whose new specialist runs on the same surprises nobody, where a director
+    /// free to choose puts the most expensive model on everybody.
+    pub engine: Option<String>,
+    pub model: Option<String>,
+    /// Absent means `mcp_only`, which is what every team agent already has.
+    pub tool_policy: Option<String>,
+    pub why: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RecruitResponse {
+    pub proposal_id: i64,
+    pub outcome: String,
+}
+
+/// A director asks for somebody it does not have. **Nothing is hired here.**
+///
+/// The same shape as `propose_action` and for the same reason. What differs is where the new person
+/// lands: **not in the run that asked.** `team::start` validates the whole roster before writing the
+/// run's row, and somebody appearing mid-run breaks all three things it settled — every item's agent
+/// exists, no member is `local` on a machine that cannot serve one, and the ceiling was computed
+/// over that group. The fourth reason is the deciding one: a recruitment takes a person's time, and
+/// a run that waited for one would sit `working` for days holding a `max_parallel` slot.
+pub async fn propose_teammate(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    headers: &axum::http::HeaderMap,
+    request: &RecruitRequest,
+) -> Result<RecruitResponse, RecruitError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(RecruitError::NotADepartment);
+    };
+    // FIRST, before anything else is read or written. It is the one check here whose failure would
+    // be a governance problem rather than an inconvenience.
+    if calling_node(&state.pool, team_run_id, headers).await != Caller::Director {
+        return Err(RecruitError::NotTheDirector);
+    }
+
+    let team_id: String = sqlx::query_scalar("SELECT team_id FROM team_runs WHERE id = ?")
+        .bind(team_run_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(RecruitError::NoSuchRun)?;
+
+    let id = slug(&request.name);
+    if id.is_empty() {
+        return Err(RecruitError::Invalid(
+            "a name must contain a letter or a digit".to_owned(),
+        ));
+    }
+    if crate::agent::get(&state.pool, &id)
+        .await
+        .map_err(|error| RecruitError::Invalid(error.to_string()))?
+        .is_some()
+    {
+        return Err(RecruitError::AlreadyExists(id));
+    }
+    // The first of the two defences against asking every round. The second is in
+    // `director_prompt`, and both are needed: without this the director files three lawyers, and
+    // without that one it spends a turn per round discovering it already did.
+    if crate::proposals::recruit_pending_for(&state.pool, &id).await? {
+        return Err(RecruitError::AlreadyAsked(id));
+    }
+
+    // The director's own engine and model, when the proposal named none. Read from the catalogue
+    // rather than from the run row, because `runs` has no column for a model.
+    let director_agent_id: Option<String> =
+        sqlx::query_scalar("SELECT director_agent_id FROM teams WHERE id = ?")
+            .bind(&team_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let director = match director_agent_id {
+        Some(agent_id) => crate::agent::get(&state.pool, &agent_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let engine = request
+        .engine
+        .clone()
+        .or_else(|| director.as_ref().map(|agent| agent.engine.clone()))
+        .unwrap_or_else(|| "claude".to_owned());
+    let model = request
+        .model
+        .clone()
+        .or_else(|| director.as_ref().and_then(|agent| agent.model.clone()));
+
+    let proposed = crate::agent::AgentRequest {
+        name: request.name.trim().to_owned(),
+        speciality: request.speciality.trim().to_owned(),
+        prompt: request.prompt.clone(),
+        engine,
+        model,
+        tool_policy: request
+            .tool_policy
+            .clone()
+            .unwrap_or_else(|| "mcp_only".to_owned()),
+    };
+    // Validated here AND at approval, and the two are not redundant. Here it is a sentence the
+    // director can act on while it still holds the turn; there it is the last word, over whatever
+    // the owner edited. A director asking for `unrestricted` learns so now rather than filing a
+    // request that could only ever have been refused.
+    crate::agent::validate_request(&proposed)
+        .map_err(|why| RecruitError::Invalid(why.to_owned()))?;
+
+    let why = request.why.trim();
+    if why.is_empty() {
+        return Err(RecruitError::Invalid(
+            "say what you needed them for — it is the whole of what the owner will read".to_owned(),
+        ));
+    }
+
+    let payload = serde_json::json!({
+        "name": proposed.name,
+        "speciality": proposed.speciality,
+        "prompt": proposed.prompt,
+        "engine": proposed.engine,
+        "model": proposed.model,
+        "tool_policy": proposed.tool_policy,
+    });
+    let proposal_id = crate::proposals::create_agent_recruit(
+        &state.pool,
+        &team_id,
+        team_run_id,
+        &id,
+        &payload,
+        why,
+    )
+    .await?;
+
+    Ok(RecruitResponse {
+        proposal_id,
+        outcome: format!(
+            "filed as #{proposal_id}; the owner decides. They will not join this run — carry on \
+             with who you have, and say in the delivery what was missing."
+        ),
+    })
+}
+
+/// Why a recruitment could not be completed once somebody said yes.
+#[derive(Debug)]
+pub enum HireError {
+    NotFound,
+    NotPending,
+    /// The stored request is not one this daemon can read back.
+    Malformed,
+    /// The team was deleted while the request waited.
+    NoSuchTeam(String),
+    /// `agent::validate` refused what was approved, or the name now collides.
+    Refused(String),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for HireError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+/// Hires the person a director asked for, over whatever the owner edited.
+///
+/// **What was approved is the authority, not what was proposed.** A director knows three of the six
+/// fields well — it has just found the gap — and knows `engine`, `model` and `tool_policy` badly,
+/// because those are what cost money per turn and what widen a surface. So the proposal is a
+/// suggestion, the approval may carry corrections, and `agent::validate` runs over the corrections.
+///
+/// One transaction over three writes. An agent created without joining the roster is somebody
+/// nobody asked for; a roster row pointing at an agent that was never written breaks the foreign key
+/// at the NEXT run's `start`, which is the worst place to find out.
+pub async fn approve_recruit(
+    pool: &sqlx::SqlitePool,
+    proposal_id: i64,
+    edited: Option<crate::agent::AgentRequest>,
+) -> Result<String, HireError> {
+    let proposal = crate::proposals::get(pool, proposal_id)
+        .await?
+        .ok_or(HireError::NotFound)?;
+    if proposal.kind != "agent-recruit" || proposal.status != "pending" {
+        return Err(HireError::NotPending);
+    }
+    let payload: serde_json::Value = proposal
+        .tool_input
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .ok_or(HireError::Malformed)?;
+    let team_id = payload
+        .get("team_id")
+        .and_then(|value| value.as_str())
+        .ok_or(HireError::Malformed)?
+        .to_owned();
+
+    let request = match edited {
+        Some(edited) => edited,
+        None => serde_json::from_value(payload.clone()).map_err(|_| HireError::Malformed)?,
+    };
+    crate::agent::validate_request(&request).map_err(|why| HireError::Refused(why.to_owned()))?;
+
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM teams WHERE id = ?)")
+        .bind(&team_id)
+        .fetch_one(pool)
+        .await?;
+    if !exists {
+        return Err(HireError::NoSuchTeam(team_id));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let id = slug(&request.name);
+    if id.is_empty() {
+        return Err(HireError::Refused(
+            "a name must contain a letter or a digit".to_owned(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    // The decision first, and guarded: an approval that lost a race writes nothing here and the
+    // rest of the transaction never runs, so nobody is hired twice.
+    if !crate::proposals::transition_in_transaction(
+        &mut transaction,
+        proposal_id,
+        "approved",
+        "hired by user",
+        &now,
+    )
+    .await?
+    {
+        return Err(HireError::NotPending);
+    }
+    let written = sqlx::query(
+        "INSERT INTO agents (id, name, speciality, prompt, engine, model, tool_policy,
+                             created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&request.name)
+    .bind(&request.speciality)
+    .bind(&request.prompt)
+    .bind(&request.engine)
+    .bind(&request.model)
+    .bind(&request.tool_policy)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await;
+    if written.is_err() {
+        // A name that collided while the request waited. The whole transaction is dropped, so the
+        // proposal is still `pending` and the owner edits the name and tries again — which is
+        // trivial precisely because the approval puts the six fields in front of them.
+        return Err(HireError::Refused(
+            "an agent with that name or id already exists — edit the name and hire again"
+                .to_owned(),
+        ));
+    }
+    sqlx::query("INSERT OR IGNORE INTO team_members (team_id, agent_id) VALUES (?, ?)")
+        .bind(&team_id)
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(id)
+}
+
+/// How many of this team's actions are still waiting for somebody to decide.
+///
+/// Counted across the team's RUNS and not within one, because the ceiling is the owner's attention
+/// and the owner has one queue. It clears the moment somebody decides — the same self-limiting
+/// property `wip.rs` has, in the axis `wip.rs` cannot reach: that one counts
+/// `proposals WHERE project_id = ?`, and a department has no project.
+async fn open_actions_of(pool: &sqlx::SqlitePool, team_id: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM team_actions
+           JOIN team_runs ON team_runs.id = team_actions.team_run_id
+           JOIN proposals ON proposals.id = team_actions.proposal_id
+          WHERE team_runs.team_id = ?
+            AND team_actions.state = 'pending'
+            AND proposals.status = 'pending'",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Everything decided and not yet done, oldest first.
+///
+/// `proposal_id IS NULL` is an `allow` action, which was decided when it was written. Otherwise the
+/// proposal has to read `approved`: `rejected` is handled by `refuse_action`, and `pending` means
+/// nobody has answered.
+const DUE_ACTIONS_SQL: &str =
+    "SELECT id, team_run_id, ordinal, kind, payload, why, proposal_id, state,
+                                      error, created_at, executed_at
+                                 FROM team_actions
+                                WHERE state = 'pending'
+                                  AND (proposal_id IS NULL
+                                       OR proposal_id IN (SELECT id FROM proposals
+                                                           WHERE status = 'approved'))
+                                ORDER BY id";
+
+/// Does what the department asked and a human agreed to, one action at a time.
+///
+/// **In the tick and not in the approve handler**, for the two reasons this house always gives: an
+/// HTTP handler that sends an email holds the connection open while a slow SMTP thinks, and a daemon
+/// restarted in the middle of that loses the action with no trace. A `pending` row survives a
+/// restart and is reconcilable by construction; an `await` inside a handler is neither. It is the
+/// same decision that makes a team run driven by the database rather than by a `JoinHandle`.
+///
+/// Claimed by compare-and-swap BEFORE the work, so two passes overlapping cannot send one email
+/// twice. `ingest_director` uses the identical pattern for the identical reason.
+pub async fn execute_due_actions(state: &AppState) {
+    let due: Vec<TeamAction> = match sqlx::query_as(DUE_ACTIONS_SQL).fetch_all(&state.pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the team actions waiting to be done");
+            return;
+        }
+    };
+
+    for action in due {
+        // The claim. A row moved to `working` by another pass is skipped here, and the pass that
+        // moved it owns it — an email that may already have gone must not be sent again.
+        let claimed = sqlx::query(
+            "UPDATE team_actions SET state = 'working' WHERE id = ? AND state = 'pending'",
+        )
+        .bind(action.id)
+        .execute(&state.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .unwrap_or(false);
+        if !claimed {
+            continue;
+        }
+
+        let outcome = perform(state, &action).await;
+        let (final_state, error) = match &outcome {
+            Ok(()) => ("done", None),
+            Err(why) => ("failed", Some(why.clone())),
+        };
+        if let Err(error) = sqlx::query(
+            "UPDATE team_actions SET state = ?, error = ?, executed_at = ? WHERE id = ?",
+        )
+        .bind(final_state)
+        .bind(error.as_deref())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(action.id)
+        .execute(&state.pool)
+        .await
+        {
+            // The action HAPPENED and the record says `working`. Loud, because the next pass will
+            // not retry it — `working` matches no claim — and a human reading the row needs to know
+            // why it is stuck there.
+            tracing::error!(
+                action = action.id,
+                %error,
+                "a team action was performed and its outcome could not be recorded"
+            );
+            continue;
+        }
+
+        // The feed is where a person reads what the daemon did while nobody was looking, and both
+        // endings belong in it: a `done` nobody sees is an email that went out unannounced.
+        let _ = crate::feed::append(
+            &state.pool,
+            None,
+            "team_action",
+            &match &outcome {
+                Ok(()) => format!("a department's `{}` was carried out", action.kind),
+                Err(why) => format!("a department's `{}` failed: {why}", action.kind),
+            },
+            None,
+        )
+        .await;
+    }
+}
+
+/// The four lines that actually touch the world. Everything above decides whether to reach here.
+///
+/// Each arm delegates: `team.rs` knows what was asked and who may ask it, and knows nothing about
+/// how a message is submitted or where a folder lives. The `Err` string is what a person reads
+/// beside a `failed` row the morning after, so it says what did not happen rather than which
+/// function returned what.
+async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
+    let payload: serde_json::Value = serde_json::from_str(&action.payload)
+        .map_err(|error| format!("the stored request could not be read back: {error}"))?;
+    let text = |field: &str| -> String {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    match action.kind.as_str() {
+        "send_email" => crate::mailsend::send(
+            state,
+            &crate::mailsend::SendRequest {
+                to: text("to"),
+                subject: text("subject"),
+                body: text("body"),
+            },
+        )
+        .await
+        .map_err(|failure| failure.to_string()),
+
+        "file_document" => {
+            // The one action that leaves the sandbox the pillar built: it writes into the owner's
+            // files root rather than into the run's own folder, which is the whole point — a
+            // delivery nobody opens has not been delivered. Contained by `files::resolve_within`
+            // against that root, the same check the Files tab makes, and by nothing else.
+            let root = files_root(state)?;
+            let target = crate::files::resolve_within(&root, &text("path"))
+                .map_err(|_| "that path is not inside the files folder".to_owned())?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("the folder could not be made: {error}"))?;
+            }
+            crate::storage::write_atomic(&target, text("content").as_bytes())
+                .map_err(|error| format!("the file could not be written: {error}"))
+        }
+
+        "calendar_event" => {
+            // Parsed again rather than trusted, though `validate_payload` already parsed it: the row
+            // has been sitting in a table since, and this is the last moment before it becomes an
+            // event somebody's week is arranged around.
+            let starts_at_local = chrono::NaiveDateTime::parse_from_str(
+                &text("starts_at_local"),
+                crate::calendar::LOCAL_FORMAT,
+            )
+            .map_err(|_| "the stored start time is not a date and time".to_owned())?;
+            let tz: chrono_tz::Tz = text("tz")
+                .parse()
+                .map_err(|_| "the stored timezone is not one".to_owned())?;
+            let minutes = payload
+                .get("duration_minutes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            crate::calendar::insert_event(
+                &state.pool,
+                &text("title"),
+                starts_at_local,
+                minutes,
+                tz,
+                // The source column says WHO put it there, which is what a person scanning their
+                // week wants to know about an entry they do not remember making.
+                "team",
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("the event could not be written: {error}"))
+        }
+
+        other => Err(format!("nobody can do `{other}`")),
+    }
+}
+
+/// A rejected proposal closes its action.
+///
+/// `failed` with `error = 'rejected'` and not a `rejected` state of its own. A third state would say
+/// the same thing `proposals.status` already says, in a second place, and the two would eventually
+/// disagree — while `state` here answers only one question: is there anything left to do about this
+/// row? There is not.
+pub async fn refuse_action(pool: &sqlx::SqlitePool, proposal_id: i64) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE team_actions SET state = 'failed', error = 'rejected', executed_at = ?
+          WHERE proposal_id = ? AND state = 'pending'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(proposal_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The tick
+// ---------------------------------------------------------------------------------------------
+
+/// Advances every live run as far as it will go, once.
+///
+/// Runs are advanced independently and a failure in one is logged rather than propagated: a
+/// department that cannot be moved must not stop the sweep that moves the others.
+pub async fn team_tick(state: &AppState, now: chrono::DateTime<chrono::Utc>) {
+    // Before the runs, and independently of them. An action outlives the run that asked for it —
+    // people decide overnight, and by morning that department has usually finished — so this loop
+    // reads `team_actions` rather than walking the live runs. It is also why a pending action never
+    // holds a run open: nothing here is waiting for anything there.
+    execute_due_actions(state).await;
+
+    let live: Vec<TeamRun> = match sqlx::query_as(
+        "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
+         FROM team_runs
+         WHERE state IN ('planning', 'working', 'delivering')
+         ORDER BY created_at",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the live team runs");
+            return;
+        }
+    };
+
+    for run in live {
+        let id = run.id.clone();
+        if let Err(error) = advance(state, run, now).await {
+            tracing::warn!(team_run = %id, %error, "a team run could not be advanced this pass");
+        }
+    }
+}
+
+/// One run, one pass.
+async fn advance(
+    state: &AppState,
+    run: TeamRun,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sqlx::Error> {
+    // Whatever is in flight is ingested first, so a ceiling reached while a node was running does
+    // not throw away a node that has already been paid for. It is the reasoning `job::reconcile_nodes`
+    // states: refusing to write down a finished node because the budget ran out loses the node and
+    // repeats it.
+    if run.director_node != "none" {
+        // One step per pass, whichever way that went: a node still in flight means nothing else can
+        // happen, and a node just ingested means the row this pass is holding is already stale.
+        // What comes next is decided from the row the next tick reads, ten seconds later, which is
+        // the cost of never acting on a snapshot that has moved underneath.
+        ingest_director(state, run).await?;
+        return Ok(());
+    }
+    ingest_landed_items(state, &run).await?;
+
+    // Ceilings, at the two points the design names: before a round and before delivery. Both are
+    // reached here, because `director_node == none` is exactly "between nodes".
+    if let Some((ending, why)) = ceiling_reached(state, &run, now).await {
+        return finish(state, &run, ending, &why).await;
+    }
+
+    match run.state.as_str() {
+        "planning" => launch_director(state, &run, DirectorNode::Planning).await,
+        "delivering" => launch_director(state, &run, DirectorNode::Delivering).await,
+        "working" => advance_round(state, &run).await,
+        _ => Ok(()),
+    }
+}
+
+/// Which ceiling, if any, this run has hit.
+///
+/// Time before money, because an expired run tells the owner something a stopped one does not: the
+/// department is not slow, it has been going for four hours.
+async fn ceiling_reached(
+    state: &AppState,
+    run: &TeamRun,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(&'static str, String)> {
+    if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&run.created_at)
+        && now.signed_duration_since(created.with_timezone(&chrono::Utc)) > MAX_TEAM_RUN_LIFETIME
+    {
+        return Some((
+            "expired",
+            format!(
+                "the run passed its ceiling of {} hours",
+                MAX_TEAM_RUN_LIFETIME.num_hours()
+            ),
+        ));
+    }
+
+    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+        crate::budget::budget_permits_new_run(&state.pool, now).await
+    {
+        return Some(("stopped", reason));
+    }
+
+    // `Option<f64>` spelled out, and the two `flatten`s are not noise: the outer one is "is there a
+    // team row", the inner is "did that row name a ceiling". Decoding straight into `f64` read a
+    // NULL as 0.00, so a team with NO ceiling was stopped before its first round with the message
+    // "the team's ceiling of $0.00 is spent" — the whole pillar dead on arrival for every team the
+    // owner did not put a number on, which is the default.
+    let ceiling: Option<f64> =
+        sqlx::query_scalar::<_, Option<f64>>("SELECT budget_usd FROM teams WHERE id = ?")
+            .bind(&run.team_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    if let Some(ceiling) = ceiling {
+        let spent = spend_of(&state.pool, &run.id).await;
+        if spent >= ceiling {
+            return Some((
+                "stopped",
+                format!("the team's ceiling of ${ceiling:.2} is spent (${spent:.2})"),
+            ));
+        }
+    }
+
+    // And the TREE's, which is a different question once a run can start another. Two teams with a
+    // $5 ceiling that start each other spend $5 every time, for ever, and every run is inside its
+    // own ceiling the whole time — so the check above never fires and nothing is locally wrong.
+    //
+    // Both checks stand, and neither weakens the other: a $1 department does not get to spend $4
+    // because the root allowed it, and a chain does not get to spend without end because each link
+    // is cheap. For a run a person asked for the two are the same question, since it is its own
+    // root and its own tree.
+    if run.root_id != run.id {
+        let root_ceiling: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT teams.budget_usd FROM team_runs
+               JOIN teams ON teams.id = team_runs.team_id
+              WHERE team_runs.id = ?",
+        )
+        .bind(&run.root_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        if let Some(root_ceiling) = root_ceiling {
+            let spent = spend_of_tree(&state.pool, &run.root_id).await;
+            if spent >= root_ceiling {
+                return Some((
+                    "stopped",
+                    format!(
+                        "this chain has spent ${spent:.2} of the ${root_ceiling:.2} its first run \
+                         was given"
+                    ),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// What a whole chain has cost, every run in it and every director node of each.
+///
+/// Keyed on `root_id` with an index, not a recursive walk of `parent_id`: this is asked at every
+/// pass of every run in the tree, one indexed read beats a CTE that arrives at the same answer by a
+/// route that can be got wrong. It rests on `runs.team_run_id` (migration 0084) — without that
+/// column a run's cost counts the specialists alone, and a tree ceiling built on a sum that
+/// undercounts errs towards spending, multiplied by the depth.
+pub async fn spend_of_tree(pool: &sqlx::SqlitePool, root_id: &str) -> f64 {
+    sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT SUM(cost_usd) FROM runs
+          WHERE team_run_id IN (SELECT id FROM team_runs WHERE root_id = ?)",
+    )
+    .bind(root_id)
+    .fetch_one(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0.0)
+}
+
+/// What one run has cost, director nodes included.
+///
+/// Reads `runs.team_run_id` and not `team_items.run_id`, and that is why the column exists: the
+/// director's plan, replans and delivery are runs of this department that no item points at.
+pub async fn spend_of(pool: &sqlx::SqlitePool, team_run_id: &str) -> f64 {
+    sqlx::query_scalar::<_, Option<f64>>("SELECT SUM(cost_usd) FROM runs WHERE team_run_id = ?")
+        .bind(team_run_id)
+        .fetch_one(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0.0)
+}
+
+/// A round: start what is pending, up to the team's parallelism, and replan when it is empty.
+async fn advance_round(state: &AppState, run: &TeamRun) -> Result<(), sqlx::Error> {
+    let items: Vec<TeamItem> = sqlx::query_as(
+        "SELECT ordinal, round, agent_id, description, state, run_id, output_path
+         FROM team_items WHERE team_run_id = ? AND round = ? ORDER BY ordinal",
+    )
+    .bind(&run.id)
+    .bind(run.round)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let running = items.iter().filter(|item| item.state == "running").count() as i64;
+    let pending: Vec<&TeamItem> = items
+        .iter()
+        .filter(|item| item.state == "pending")
+        .collect();
+
+    if pending.is_empty() && running == 0 {
+        // The round is over. Replanning is a director node like any other, and `director_node`
+        // is what stops the next tick launching a second one.
+        return launch_director(state, run, DirectorNode::Replanning).await;
+    }
+
+    let parallel: i64 = sqlx::query_scalar("SELECT max_parallel FROM teams WHERE id = ?")
+        .bind(&run.team_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+    for item in pending
+        .into_iter()
+        .take((parallel - running).max(0) as usize)
+    {
+        if let Err(error) = launch_specialist(state, run, item).await {
+            tracing::warn!(
+                team_run = %run.id,
+                ordinal = item.ordinal,
+                %error,
+                "a specialist could not be launched; the item is marked failed and the run goes on"
+            );
+            sqlx::query(
+                "UPDATE team_items SET state = 'failed' WHERE team_run_id = ? AND ordinal = ?",
+            )
+            .bind(&run.id)
+            .bind(item.ordinal)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectorNode {
+    Planning,
+    Replanning,
+    Delivering,
+}
+
+impl DirectorNode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Replanning => "replanning",
+            Self::Delivering => "delivering",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Launching
+// ---------------------------------------------------------------------------------------------
+
+/// The row a launch writes before anything is spawned, so the run exists for the hook to resolve a
+/// mode from and for reconciliation to find if the daemon dies here.
+async fn open_run(
+    state: &AppState,
+    team_run_id: &str,
+    prompt: &str,
+) -> Result<(i64, String), sqlx::Error> {
+    let session_id = crate::auth::generate_uuid_v4();
+    let id = sqlx::query(
+        "INSERT INTO runs (prompt, status, mode, session_id, team_run_id, created_at)
+         VALUES (?, 'running', ?, ?, ?, ?)",
+    )
+    .bind(prompt)
+    .bind(TEAM_MODE)
+    .bind(&session_id)
+    .bind(team_run_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await?
+    .last_insert_rowid();
+    Ok((id, session_id))
+}
+
+/// The MCP config a team run's cloud agents are launched with.
+///
+/// One per team run rather than one per invocation: every agent of a run holds the same key and the
+/// same tool list, so a file per node would be the same bytes written a dozen times.
+fn mcp_config_path(team_run_id: &str) -> std::path::PathBuf {
+    let safe: String = team_run_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect();
+    std::env::temp_dir().join(format!("nucleos-team-{safe}.json"))
+}
+
+fn write_mcp_config(team_run_id: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = mcp_config_path(team_run_id);
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    // `None`: a department is not an errand. What narrows its surface is `--allowedTools` from
+    // `TEAM_TOOLS`, decided per node, not the server-side box.
+    let body = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe, None))
+        .map_err(std::io::Error::other)?;
+    crate::storage::write_atomic(&path, &body)?;
+    Ok(path)
+}
+
+/// The key this run's agents authenticate with: `team:<id>.<secret>`, rebuilt from the stored half.
+async fn team_token(pool: &sqlx::SqlitePool, team_run_id: &str) -> Result<String, sqlx::Error> {
+    let secret: String = sqlx::query_scalar("SELECT token FROM team_runs WHERE id = ?")
+        .bind(team_run_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(format!("team:{team_run_id}.{secret}"))
+}
+
+async fn launch_director(
+    state: &AppState,
+    run: &TeamRun,
+    node: DirectorNode,
+) -> Result<(), sqlx::Error> {
+    let Some((team, director)) = team_and_director(state, run).await? else {
+        return finish(
+            state,
+            run,
+            "failed",
+            "this team's director is no longer in the catalogue",
+        )
+        .await;
+    };
+    let prompt = match node {
+        DirectorNode::Delivering => delivery_prompt(state, run, &team).await,
+        _ => director_prompt(state, run, &team).await,
+    };
+
+    let (run_id, session_id) = open_run(state, &run.id, &prompt).await?;
+
+    // The marker is written BEFORE the spawn and cleared by the ingestion, which is what makes it a
+    // marker and not a derived condition — the lesson migration 0051 bought, where a derived
+    // `replanning` cost one wasted node per round.
+    sqlx::query(
+        "UPDATE team_runs SET director_node = ?, director_run_id = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(node.as_str())
+    .bind(run_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&run.id)
+    .execute(&state.pool)
+    .await?;
+
+    spawn_agent(state, run, &director, run_id, session_id, prompt).await;
+    Ok(())
+}
+
+async fn launch_specialist(
+    state: &AppState,
+    run: &TeamRun,
+    item: &TeamItem,
+) -> Result<(), sqlx::Error> {
+    let Some(agent) = crate::agent::get(&state.pool, &item.agent_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        // The agent was deleted between the plan and the launch. One item fails; the run goes on.
+        sqlx::query("UPDATE team_items SET state = 'failed' WHERE team_run_id = ? AND ordinal = ?")
+            .bind(&run.id)
+            .bind(item.ordinal)
+            .execute(&state.pool)
+            .await?;
+        return Ok(());
+    };
+
+    let team = sqlx::query_scalar::<_, String>("SELECT mission FROM teams WHERE id = ?")
+        .bind(&run.team_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let prompt = specialist_prompt(state, run, &team, item).await;
+    let (run_id, session_id) = open_run(state, &run.id, &prompt).await?;
+
+    sqlx::query(
+        "UPDATE team_items SET state = 'running', run_id = ? WHERE team_run_id = ? AND ordinal = ?",
+    )
+    .bind(run_id)
+    .bind(&run.id)
+    .bind(item.ordinal)
+    .execute(&state.pool)
+    .await?;
+
+    spawn_agent(state, run, &agent, run_id, session_id, prompt).await;
+    Ok(())
+}
+
+/// Spawns one invocation and lets it write its own terminal `runs` row.
+///
+/// Nothing awaits the task: the tick discovers the answer by reading the row, which is what makes a
+/// restart mid-flight cost nothing. `spawn_registered` is what makes the run cancellable.
+async fn spawn_agent(
+    state: &AppState,
+    run: &TeamRun,
+    agent: &crate::agent::Agent,
+    run_id: i64,
+    session_id: String,
+    prompt: String,
+) {
+    let token = match team_token(&state.pool, &run.id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(team_run = %run.id, %error, "a team run has no key; its agent cannot call a tool");
+            return;
+        }
+    };
+    let with_tools = agent.tool_policy == "mcp_only";
+    let pool = state.pool.clone();
+
+    if agent.engine == "local" {
+        let Some(model) = agent.model.clone() else {
+            fail_run(&pool, run_id, "a local agent with no model").await;
+            return;
+        };
+        let chat =
+            crate::runner::OllamaChat::new(crate::runner::OLLAMA_BASE_URL.to_string(), model);
+        // The TEAM's box, never `LocalToolBox::new`: `LOCAL_TOOLS` carries `create_run` and
+        // `create_job`, and the local path never passes through `hooks.rs` at all.
+        let tools = crate::mcp_tools::LocalToolBox::for_team(
+            DAEMON_URL.to_string(),
+            token,
+            pool.clone(),
+            run_id,
+        );
+        let timeout = state.run_timeout;
+        crate::runs::spawn_registered(state, run_id, async move {
+            let taint = std::sync::atomic::AtomicBool::new(false);
+            let empty = crate::local_agent::NoTools;
+            let tool_box: &dyn crate::local_agent::ToolBox =
+                if with_tools { &tools } else { &empty };
+            let turn = tokio::time::timeout(
+                timeout,
+                crate::local_agent::run_turn(
+                    &chat,
+                    tool_box,
+                    crate::local_agent::SYSTEM_PROMPT,
+                    &[],
+                    &prompt,
+                    &taint,
+                ),
+            )
+            .await;
+            if taint.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = crate::runs::mark_untrusted_context(&pool, run_id).await;
+            }
+            let completed_at = chrono::Utc::now().to_rfc3339();
+            match turn {
+                // `cost_usd = 0` and not NULL: NULL is what `budget.rs` time-approximates a cost
+                // for, so leaving it unset would charge the window for electricity.
+                Ok(Ok(turn)) => {
+                    let _ = sqlx::query(
+                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
+                                cost_usd = 0, completed_at = ?
+                         WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(&turn.answer)
+                    .bind(&completed_at)
+                    .bind(run_id)
+                    .execute(&pool)
+                    .await;
+                }
+                Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
+                Err(_) => {
+                    let _ = sqlx::query(
+                        "UPDATE runs SET status = 'timed_out', cost_usd = 0, completed_at = ?
+                         WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(&completed_at)
+                    .bind(run_id)
+                    .execute(&pool)
+                    .await;
+                }
+            }
+        });
+        return;
+    }
+
+    let mcp_config = if with_tools {
+        match write_mcp_config(&run.id) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                tracing::warn!(team_run = %run.id, %error, "could not write the team's MCP config");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let request = crate::runner::RunRequest {
+        prompt,
+        // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
+        env: crate::runs::run_env(&token, run_id, None),
+        // No working directory, exactly as a council seat has none — which is also why the
+        // `PreToolUse` hook may never fire and why the route table has to hold alone.
+        cwd: None,
+        plan_only: false,
+        resume_session_id: None,
+        mcp_config,
+        tool_policy: if with_tools {
+            crate::runner::ToolPolicy::McpOnly
+        } else {
+            crate::runner::ToolPolicy::None
+        },
+        progress_timeout: None,
+        session_id: Some(session_id),
+        fork_session: false,
+        include_partial_messages: false,
+        // `steerable` with no `messages`, for the reason `council.rs` documents at length: it is the
+        // only way to keep the prompt off the command line, and a director's prompt carries the
+        // whole folder index. Windows caps a command line at 32 767 characters, and the first real
+        // council died exactly there.
+        steerable: true,
+        classifier_governs_tools: false,
+        messages: None,
+        ambient_mcp: false,
+        model: agent.model.clone(),
+        // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
+        allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
+    };
+
+    let runner = state.runner.clone();
+    let timeout = state.run_timeout;
+    crate::runs::spawn_registered(state, run_id, async move {
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let outcome = tokio::time::timeout(
+            timeout,
+            runner.run_prompt(request, session_tx, transcript.clone()),
+        )
+        .await;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        match outcome {
+            Err(_) => {
+                let partial = transcript.lock().unwrap().clone();
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'timed_out', stdout = ?, completed_at = ?
+                     WHERE id = ? AND status = 'running'",
+                )
+                .bind(&partial)
+                .bind(&completed_at)
+                .bind(run_id)
+                .execute(&pool)
+                .await;
+            }
+            Ok(Ok(outcome)) if outcome.exit_code == 0 => {
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = ?,
+                            input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+                            num_turns = ?, completed_at = ?
+                     WHERE id = ? AND status = 'running'",
+                )
+                .bind(&outcome.stdout)
+                .bind(outcome.cost_usd)
+                .bind(outcome.input_tokens)
+                .bind(outcome.output_tokens)
+                .bind(outcome.cache_read_tokens)
+                .bind(outcome.num_turns)
+                .bind(&completed_at)
+                .bind(run_id)
+                .execute(&pool)
+                .await;
+            }
+            Ok(Ok(outcome)) => {
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
+                            cost_usd = ?, completed_at = ?
+                     WHERE id = ? AND status = 'running'",
+                )
+                .bind(outcome.exit_code)
+                .bind(&outcome.stdout)
+                .bind(&outcome.stderr)
+                .bind(outcome.cost_usd)
+                .bind(&completed_at)
+                .bind(run_id)
+                .execute(&pool)
+                .await;
+            }
+            Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
+        }
+    });
+}
+
+async fn fail_run(pool: &sqlx::SqlitePool, run_id: i64, why: &str) {
+    let _ = sqlx::query(
+        "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0, completed_at = ?
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(why)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(run_id)
+    .execute(pool)
+    .await;
+}
+
+async fn team_and_director(
+    state: &AppState,
+    run: &TeamRun,
+) -> Result<Option<(Team, crate::agent::Agent)>, sqlx::Error> {
+    let team: Option<Team> = sqlx::query_as(
+        "SELECT id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                max_open_actions, max_live_runs, created_at, updated_at
+         FROM teams WHERE id = ?",
+    )
+    .bind(&run.team_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(team) = team else {
+        return Ok(None);
+    };
+    let director = crate::agent::get(&state.pool, &team.director_agent_id)
+        .await
+        .ok()
+        .flatten();
+    Ok(director.map(|director| (team, director)))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ingesting what landed
+// ---------------------------------------------------------------------------------------------
+
+/// Specialist runs that have finished since the last pass: file the answer, mark the item.
+///
+/// A failed item leaves no file and does not stop the run — there is no shared worktree here
+/// accumulating damage, so what a failure costs is one absence the director sees in the next
+/// round's index.
+async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx::Error> {
+    let landed: Vec<(i64, String, i64, String)> = sqlx::query_as(
+        "SELECT i.ordinal, i.agent_id, r.id, r.status
+         FROM team_items i JOIN runs r ON r.id = i.run_id
+         WHERE i.team_run_id = ? AND i.state = 'running' AND r.status != 'running'",
+    )
+    .bind(&run.id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    for (ordinal, agent_id, run_id, status) in landed {
+        if status != "completed" {
+            sqlx::query(
+                "UPDATE team_items SET state = 'failed' WHERE team_run_id = ? AND ordinal = ?",
+            )
+            .bind(&run.id)
+            .bind(ordinal)
+            .execute(&state.pool)
+            .await?;
+            continue;
+        }
+
+        let answer: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .flatten();
+        let answer = crate::runner::extract_reply(answer.as_deref().unwrap_or_default())
+            .unwrap_or_else(|| answer.unwrap_or_default());
+
+        // The core names the file, which is what removes collisions by construction: the ordinal is
+        // unique across the whole run, so two specialists — in one round or across rounds — can
+        // never choose the same name, because neither of them chooses.
+        let name = format!("{ordinal}-{agent_id}.md");
+        match write_into_workspace(state, run, &name, &answer) {
+            Ok(()) => {
+                sqlx::query(
+                    "UPDATE team_items SET state = 'done', output_path = ?
+                     WHERE team_run_id = ? AND ordinal = ?",
+                )
+                .bind(&name)
+                .bind(&run.id)
+                .bind(ordinal)
+                .execute(&state.pool)
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(team_run = %run.id, ordinal, %error, "could not file a specialist's answer");
+                sqlx::query(
+                    "UPDATE team_items SET state = 'failed' WHERE team_run_id = ? AND ordinal = ?",
+                )
+                .bind(&run.id)
+                .bind(ordinal)
+                .execute(&state.pool)
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_into_workspace(
+    state: &AppState,
+    run: &TeamRun,
+    name: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let root = files_root(state).map_err(std::io::Error::other)?;
+    let folder = crate::files::resolve_within(&root, &run.workspace)
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    std::fs::create_dir_all(&folder)?;
+    let target = crate::files::resolve_within(&folder, name)
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    crate::storage::write_atomic(&target, body.as_bytes())
+}
+
+/// Ingests the director node in flight, if it has landed.
+///
+/// The marker is claimed by a compare-and-swap before anything is written, so ingesting the same
+/// `director_run_id` twice cannot advance the round twice — and neither call site cares which of
+/// the two happened, which is why this reports nothing.
+async fn ingest_director(state: &AppState, run: TeamRun) -> Result<(), sqlx::Error> {
+    let Some(director_run_id) = run.director_run_id else {
+        // A marker with no run behind it: nothing can land, so clear it and let the next pass
+        // relaunch rather than leave the run wedged forever.
+        return clear_director_node(state, &run).await;
+    };
+
+    let landed: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, stdout FROM runs WHERE id = ?")
+            .bind(director_run_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((status, stdout)) = landed else {
+        return clear_director_node(state, &run).await;
+    };
+    if status == "running" {
+        return Ok(());
+    }
+
+    let node = run.director_node.clone();
+    if status != "completed" {
+        // Without a director there is nobody to replan, so the run ends with whatever is in the
+        // folder. `delivering` is the one node whose failure still leaves the specialists' files.
+        return finish(
+            state,
+            &run,
+            "failed",
+            &format!("the director's {node} node {status}"),
+        )
+        .await;
+    }
+
+    let answer = stdout.unwrap_or_default();
+    let answer = crate::runner::extract_reply(&answer).unwrap_or(answer);
+
+    if node == "delivering" {
+        write_into_workspace(state, &run, DELIVERY_FILE, &answer)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        return finish(state, &run, "done", "the department delivered").await;
+    }
+
+    let team_roster = roster(&state.pool, &run.team_id).await.unwrap_or_default();
+    let plan = parse_team_plan(&answer, &team_roster, MAX_ITEMS_PER_ROUND);
+    for dropped in plan.iter().flat_map(|plan| plan.dropped.iter()) {
+        let _ = crate::feed::append(&state.pool, None, "team_item_dropped", dropped, None).await;
+    }
+
+    let max_rounds: i64 = sqlx::query_scalar("SELECT max_rounds FROM teams WHERE id = ?")
+        .bind(&run.team_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let progress = next_after_director(
+        &run.state,
+        plan.as_ref(),
+        run.round,
+        run.dry_rounds,
+        run.plan_retries,
+        max_rounds,
+    );
+
+    if progress.state == "failed" {
+        return finish(
+            state,
+            &run,
+            "failed",
+            progress.why.as_deref().unwrap_or("the director failed"),
+        )
+        .await;
+    }
+
+    // **One transaction, and the CLAIM comes first.** Guarding only the final `UPDATE` was not
+    // enough and failed loudly the first time it was tested: the items are written before it, so a
+    // second ingestion of the same node inserted the same ordinals again and died on the primary
+    // key — with the first copy already committed. The compare-and-swap below is `job::spawn_node`'s
+    // shape: zero rows affected means another caller has already taken this node, and there is
+    // nothing left to do. Both halves inside one transaction, so a crash between them cannot leave
+    // a claimed node whose items were never queued.
+    let mut transaction = state.pool.begin().await?;
+
+    let claimed = sqlx::query(
+        "UPDATE team_runs SET director_node = 'none', director_run_id = NULL, updated_at = ?
+         WHERE id = ? AND director_node = ? AND director_run_id = ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&run.id)
+    .bind(&node)
+    .bind(director_run_id)
+    .execute(&mut *transaction)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(());
+    }
+
+    let mut next_ordinal = run.next_ordinal;
+    if progress.queue_items
+        && let Some(plan) = plan.as_ref()
+    {
+        for item in &plan.items {
+            sqlx::query(
+                "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state)
+                 VALUES (?, ?, ?, ?, ?, 'pending')",
+            )
+            .bind(&run.id)
+            .bind(next_ordinal)
+            .bind(progress.round)
+            .bind(&item.agent_id)
+            .bind(&item.description)
+            .execute(&mut *transaction)
+            .await?;
+            next_ordinal += 1;
+        }
+    }
+
+    sqlx::query(
+        "UPDATE team_runs
+         SET state = ?, round = ?, next_ordinal = ?, dry_rounds = ?, plan_retries = ?,
+             replanned = ?, why = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(progress.state)
+    .bind(progress.round)
+    .bind(next_ordinal)
+    .bind(progress.dry_rounds)
+    .bind(progress.plan_retries)
+    .bind(if node == "replanning" {
+        "done"
+    } else {
+        &run.replanned
+    })
+    .bind(&progress.why)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&run.id)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn clear_director_node(state: &AppState, run: &TeamRun) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE team_runs SET director_node = 'none', director_run_id = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&run.id)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+/// Ends a run, once. The `state IN (live)` guard is what makes a second call a no-op rather than a
+/// way to overwrite how a run ended.
+async fn finish(
+    state: &AppState,
+    run: &TeamRun,
+    ending: &str,
+    why: &str,
+) -> Result<(), sqlx::Error> {
+    // The one place a run's ending is written, so the one place worth holding to the vocabulary.
+    // `ending` is a `&str`, and a typo would store a state `is_live` reads as not-live, the GC
+    // reads as collectable and nothing at all recognises — a run that has quietly stopped existing
+    // to every reader while still sitting in the table.
+    debug_assert!(
+        TERMINAL_STATES.contains(&ending),
+        "{ending} is not one of the five ways a team run ends"
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE team_runs
+         SET state = ?, outcome = ?, why = ?, director_node = 'none', updated_at = ?,
+             finished_at = ?
+         WHERE id = ? AND state IN ('planning', 'working', 'delivering')",
+    )
+    .bind(ending)
+    .bind(ending)
+    .bind(why)
+    .bind(&now)
+    .bind(&now)
+    .bind(&run.id)
+    .execute(&state.pool)
+    .await?;
+
+    // The config carries no secret — the key travels in the environment — but it is a file per run
+    // in the temp directory, and a daemon that runs for months would leave one for every department
+    // it ever ran.
+    let _ = std::fs::remove_file(mcp_config_path(&run.id));
+
+    let _ = crate::feed::append(
+        &state.pool,
+        None,
+        "team_run_finished",
+        &format!("a team run {ending}: {why}"),
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------------------------
+
+/// What is in the folder, as the director reads it: the item that produced each file, who wrote it,
+/// and its first line.
+///
+/// The first line and not the body, because the index goes into every director prompt and the
+/// bodies are what `read_team_file` is for.
+async fn folder_index(state: &AppState, run: &TeamRun) -> String {
+    let items: Vec<TeamItem> = sqlx::query_as(
+        "SELECT ordinal, round, agent_id, description, state, run_id, output_path
+         FROM team_items WHERE team_run_id = ? ORDER BY ordinal",
+    )
+    .bind(&run.id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    if items.is_empty() {
+        return "The folder is empty; nothing has been done yet.".to_owned();
+    }
+
+    let root = files_root(state).ok();
+    let mut out = String::new();
+    for item in items {
+        let first_line = item
+            .output_path
+            .as_ref()
+            .zip(root.as_ref())
+            .and_then(|(name, root)| {
+                let folder = crate::files::resolve_within(root, &run.workspace).ok()?;
+                let path = crate::files::resolve_within(&folder, name).ok()?;
+                let body = std::fs::read_to_string(path).ok()?;
+                body.lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "(no answer)".to_owned());
+        out.push_str(&format!(
+            "- round {} item {} [{}] {} — {}: {}\n",
+            item.round,
+            item.ordinal,
+            item.state,
+            item.agent_id,
+            item.output_path.as_deref().unwrap_or("(no file)"),
+            first_line
+        ));
+    }
+    out
+}
+
+async fn roster_lines(state: &AppState, team_id: &str) -> String {
+    let mut out = String::new();
+    for id in roster(&state.pool, team_id).await.unwrap_or_default() {
+        if let Ok(Some(agent)) = crate::agent::get(&state.pool, &id).await {
+            out.push_str(&format!("- {}: {}\n", agent.id, agent.speciality));
+        }
+    }
+    out
+}
+
+/// The director's prompt, for planning and replanning alike.
+///
+/// The roster carries each member's `speciality` and NOT their `prompt`: a specialist's
+/// instructions are its own, and putting them in the director's context would make every round pay
+/// for text that only changes what somebody else does.
+async fn director_prompt(state: &AppState, run: &TeamRun, team: &Team) -> String {
+    format!(
+        "You direct the {} department. Its mission: {}\n\n\
+         The request you are working on:\n{}\n\n\
+         Your specialists, and what each is for:\n{}\n\
+         What is in the department's folder so far:\n{}\n\
+         Reply with JSON and nothing else, in this shape:\n\
+         {{\"items\": [{{\"agent_id\": \"...\", \"description\": \"...\"}}], \"done\": false, \"why\": \"...\"}}\n\n\
+         Each item is one piece of work for one specialist, described well enough to be done \
+         without asking you anything. Queue at most {} of them. Set \"done\" to true when the \
+         folder holds enough to answer the request — everything queued beside a true \"done\" is \
+         discarded, so do not do both. \"why\" is one sentence for the person who asked.{}",
+        team.name,
+        team.mission,
+        run.request,
+        roster_lines(state, &team.id).await,
+        folder_index(state, run).await,
+        MAX_ITEMS_PER_ROUND,
+        pending_recruits_line(state, run).await,
+    )
+}
+
+/// What the director has already asked the owner for, so it does not ask again.
+///
+/// `propose_teammate` refuses a duplicate, and that refusal alone is not enough: a director replans
+/// every round with the same prompt and the same gap in front of it, so without this it spends a
+/// turn per round walking into the same closed door. `calendar_proposal_pending_for` exists for the
+/// identical reason and its doc says so.
+///
+/// Empty string when there is nothing pending, so the prompt of a department that never asked for
+/// anybody is byte for byte what it was.
+async fn pending_recruits_line(state: &AppState, run: &TeamRun) -> String {
+    let pending = crate::proposals::list_pending_recruits(&state.pool, Some(&run.id))
+        .await
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = pending
+        .iter()
+        .map(|proposal| {
+            let speciality = proposal
+                .tool_input
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|payload| {
+                    payload
+                        .get("speciality")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            match proposal.tool_name.as_deref() {
+                Some(id) if !speciality.is_empty() => format!("{id} ({speciality})"),
+                Some(id) => id.to_owned(),
+                None => "somebody".to_owned(),
+            }
+        })
+        .collect();
+    format!(
+        "\n\nYou have already asked the owner for: {}. They are waiting to be decided and will not \
+         join this run. Do not ask again — work with who you have, and say in the delivery what \
+         was left thin because of it.",
+        named.join("; ")
+    )
+}
+
+async fn delivery_prompt(state: &AppState, run: &TeamRun, team: &Team) -> String {
+    format!(
+        "You direct the {} department. Its mission: {}\n\n\
+         The request:\n{}\n\n\
+         What is in the department's folder:\n{}\n\
+         Write the department's answer to that request. Read any file you need with the \
+         read_team_file tool, naming it exactly as it appears above. Reply with the finished \
+         document itself — markdown, no preamble, no JSON. It is what the person who asked will \
+         open, and it is the only thing they will read.{}",
+        team.name,
+        team.mission,
+        run.request,
+        folder_index(state, run).await,
+        // Cheap, and it is the difference between a bad delivery and an honest one. Without it the
+        // person reading a thin section has no way to know the department knew it was thin.
+        match pending_recruits_line(state, run).await.is_empty() {
+            true => String::new(),
+            false =>
+                " Say plainly, at the end, which part is thin and why — you asked for somebody \
+                      this department does not have and did not get them in time."
+                    .to_owned(),
+        },
+    )
+}
+
+/// A specialist is told its own instructions, its own task, the mission and the index — and
+/// deliberately not the rest of the plan. What the others are doing is not its context.
+async fn specialist_prompt(
+    state: &AppState,
+    run: &TeamRun,
+    mission: &str,
+    item: &TeamItem,
+) -> String {
+    let own = crate::agent::get(&state.pool, &item.agent_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|agent| agent.prompt)
+        .unwrap_or_default();
+    format!(
+        "{own}\n\n\
+         You are working inside a department whose mission is: {mission}\n\
+         The department was asked to: {}\n\n\
+         Your task:\n{}\n\n\
+         What is already in the department's folder:\n{}\n\
+         Answer with your work itself. Do not write it to a file — your reply IS the deliverable, \
+         and it is filed for you.",
+        run.request,
+        item.description,
+        folder_index(state, run).await,
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cancellation, reconciliation, retention
+// ---------------------------------------------------------------------------------------------
+
+/// Cancels a run and everything it has in flight.
+///
+/// The runs are terminated BEFORE the row is marked, so there is no window in which the run reads
+/// terminal while its subprocesses are still spending. A cancelled run that left an orphan is the
+/// one failure `core/AGENTS.md` §*Cancellation safety* names.
+pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
+    let in_flight: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM runs WHERE team_run_id = ? AND status = 'running'")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await?;
+    for run_id in in_flight {
+        // `finalize_termination` rather than the `/runs/{id}/cancel` handler beside it: that one is
+        // an axum extractor signature, and reaching it would mean a loopback HTTP call to a
+        // function already in scope. This is the same body that handler runs.
+        crate::runs::finalize_termination(state, run_id, "cancelled").await;
+    }
+
+    // And then the sweep, which is not belt-and-braces but a second case: `finalize_termination`
+    // writes a status only for a run it holds an ABORT HANDLE for, and there is a window between
+    // `open_run` writing the row and `spawn_registered` registering one. A row left `running` there
+    // would be a run this department is recorded as still spending on, forever — nothing else
+    // collects it until the next daemon restart. First writer still wins, so a row that finalised
+    // itself a moment ago is untouched.
+    sqlx::query(
+        "UPDATE runs SET status = 'cancelled', completed_at = ?
+         WHERE team_run_id = ? AND status = 'running'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(&state.pool)
+    .await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE team_runs
+         SET state = 'cancelled', outcome = 'cancelled', why = 'the owner cancelled it',
+             director_node = 'none', updated_at = ?, finished_at = ?
+         WHERE id = ? AND state IN ('planning', 'working', 'delivering')",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(TeamError::NotFound);
+    }
+    sqlx::query("UPDATE team_items SET state = 'failed' WHERE team_run_id = ? AND state IN ('pending', 'running')")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    let _ = std::fs::remove_file(mcp_config_path(id));
+    Ok(())
+}
+
+/// Unwedges the runs a dead daemon left behind, at startup.
+///
+/// Runs AFTER `runs::reconcile_orphaned_runs`, which is what marks the abandoned subprocesses
+/// `interrupted` — the same ordering, and for the same reason, that `job::reconcile_orphaned_jobs`
+/// respects.
+///
+/// **A director node that COMPLETED is ingested rather than reset**, and that is the case worth
+/// getting right: the daemon died after the CLI wrote its answer, so resetting `director_node` to
+/// `none` would throw away a node that has already been paid for and run it again. The reasoning is
+/// `job::reconcile_nodes`': "it records work that already happened."
+pub async fn reconcile_orphaned_team_runs(state: &AppState) -> Result<(), sqlx::Error> {
+    let orphaned: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT i.team_run_id, i.ordinal
+         FROM team_items i JOIN runs r ON r.id = i.run_id
+         JOIN team_runs t ON t.id = i.team_run_id
+         WHERE i.state = 'running' AND r.status != 'running' AND r.status != 'completed'
+           AND t.state IN ('planning', 'working', 'delivering')",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    for (team_run_id, ordinal) in orphaned {
+        sqlx::query("UPDATE team_items SET state = 'failed' WHERE team_run_id = ? AND ordinal = ?")
+            .bind(&team_run_id)
+            .bind(ordinal)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    // The completed-but-uningested nodes go through the very same function the tick uses. One
+    // ingestion path and not two: the assertion `job.rs` bought with migration 0051 is that
+    // ingesting the same node twice must not advance the round, and it only holds if there is one
+    // place that can advance it.
+    let live: Vec<TeamRun> = sqlx::query_as(
+        "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
+         FROM team_runs
+         WHERE state IN ('planning', 'working', 'delivering') AND director_node != 'none'",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    for run in live {
+        let id = run.id.clone();
+        if let Err(error) = ingest_director(state, run).await {
+            tracing::warn!(team_run = %id, %error, "could not reconcile a team run's director node");
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the folders of runs that ended long enough ago, by AGE and never by state.
+///
+/// A worktree is disposable and nobody reads it; a department's folder IS the delivery, so
+/// collecting it when the run ends would delete the thing the owner was about to open.
+pub async fn workspace_gc(state: &AppState, now: chrono::DateTime<chrono::Utc>) {
+    let cutoff = (now - chrono::Duration::days(TEAM_WORKSPACE_RETENTION_DAYS)).to_rfc3339();
+    let stale: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT id, workspace FROM team_runs
+         WHERE finished_at IS NOT NULL AND finished_at < ?
+           AND state NOT IN ('planning', 'working', 'delivering')",
+    )
+    .bind(&cutoff)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not list the team folders due for collection");
+            return;
+        }
+    };
+
+    let Ok(root) = files_root(state) else {
+        return;
+    };
+    for (id, workspace) in stale {
+        let Ok(folder) = crate::files::resolve_within(&root, &workspace) else {
+            continue;
+        };
+        if folder.exists()
+            && let Err(error) = std::fs::remove_dir_all(&folder)
+        {
+            tracing::warn!(team_run = %id, %error, "could not collect a finished team run's folder");
+        }
+    }
+}
+
+pub async fn run_team_loop(state: AppState) {
+    let mut interval = tokio::time::interval(TEAM_TICK);
+    loop {
+        interval.tick().await;
+        team_tick(&state, chrono::Utc::now()).await;
+    }
+}
+
+pub async fn run_workspace_gc_loop(state: AppState) {
+    let mut interval = tokio::time::interval(GC_INTERVAL);
+    loop {
+        interval.tick().await;
+        workspace_gc(&state, chrono::Utc::now()).await;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The HTTP surface
+// ---------------------------------------------------------------------------------------------
+
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+
+fn team_status(error: &TeamError) -> StatusCode {
+    match error {
+        TeamError::DuplicateName => StatusCode::CONFLICT,
+        TeamError::Invalid(_) | TeamError::UnknownAgent(_) => StatusCode::BAD_REQUEST,
+        TeamError::NotFound => StatusCode::NOT_FOUND,
+        TeamError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn refuse(error: TeamError) -> (StatusCode, String) {
+    (team_status(&error), error.to_string())
+}
+
+pub async fn list_teams(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TeamView>>, (StatusCode, String)> {
+    list(&state.pool).await.map(Json).map_err(refuse)
+}
+
+pub async fn create_team(
+    State(state): State<AppState>,
+    Json(request): Json<TeamRequest>,
+) -> Result<(StatusCode, Json<TeamView>), (StatusCode, String)> {
+    create(&state.pool, request)
+        .await
+        .map(|team| (StatusCode::CREATED, Json(team)))
+        .map_err(refuse)
+}
+
+pub async fn get_team(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TeamView>, (StatusCode, String)> {
+    match get(&state.pool, &id).await {
+        Ok(Some(team)) => Ok(Json(team)),
+        Ok(None) => Err(refuse(TeamError::NotFound)),
+        Err(error) => Err(refuse(error)),
+    }
+}
+
+pub async fn update_team(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<TeamRequest>,
+) -> Result<Json<TeamView>, (StatusCode, String)> {
+    update(&state.pool, &id, request)
+        .await
+        .map(Json)
+        .map_err(refuse)
+}
+
+pub async fn delete_team(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    delete(&state.pool, &id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(refuse)
+}
+
+#[derive(serde::Deserialize)]
+pub struct StartRequest {
+    pub request: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct StartResponse {
+    pub id: String,
+}
+
+/// `POST /teams/{id}/runs` → 202. The record exists; the work has not happened yet, which is what
+/// makes 202 the honest code and 201 a claim about a finished resource.
+pub async fn post_team_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<StartRequest>,
+) -> Result<(StatusCode, Json<StartResponse>), (StatusCode, String)> {
+    match start(&state, &id, &body.request).await {
+        Ok(id) => Ok((StatusCode::ACCEPTED, Json(StartResponse { id }))),
+        Err(error @ StartError::NotFound) => Err((StatusCode::NOT_FOUND, error.to_string())),
+        Err(error @ StartError::Invalid(_)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
+        // 429 and not 402: the ceiling is a window that reopens, and the caller should come back.
+        Err(error @ StartError::BudgetExhausted(_)) => {
+            Err((StatusCode::TOO_MANY_REQUESTS, error.to_string()))
+        }
+        Err(error @ StartError::Unavailable(_)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        }
+    }
+}
+
+pub async fn list_team_runs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TeamRun>>, (StatusCode, String)> {
+    sqlx::query_as(
+        "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
+         FROM team_runs ORDER BY created_at DESC LIMIT 100",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| refuse(TeamError::Db(error)))
+}
+
+pub async fn get_team_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TeamRunView>, (StatusCode, String)> {
+    let run: Option<TeamRun> = sqlx::query_as(
+        "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                updated_at, finished_at, trigger_id, parent_id, root_id, depth
+         FROM team_runs WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| refuse(TeamError::Db(error)))?;
+    let run = run.ok_or_else(|| refuse(TeamError::NotFound))?;
+
+    let items: Vec<TeamItem> = sqlx::query_as(
+        "SELECT ordinal, round, agent_id, description, state, run_id, output_path
+         FROM team_items WHERE team_run_id = ? ORDER BY ordinal",
+    )
+    .bind(&id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| refuse(TeamError::Db(error)))?;
+
+    let cost_usd = spend_of(&state.pool, &id).await;
+    Ok(Json(TeamRunView {
+        run,
+        items,
+        cost_usd,
+    }))
+}
+
+pub async fn post_team_run_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    cancel(&state, &id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(refuse)
+}
+
+/// Deleting a run deletes its folder with it — the one way the owner disposes of a delivery before
+/// the retention does. Refused while the run is live, because the alternative is deleting a folder
+/// specialists are still writing into.
+pub async fn delete_team_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT state, workspace FROM team_runs WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|error| refuse(TeamError::Db(error)))?;
+    let (run_state, workspace) = row.ok_or_else(|| refuse(TeamError::NotFound))?;
+    if is_live(&run_state) {
+        return Err(refuse(TeamError::Invalid(
+            "that run is still going; cancel it first",
+        )));
+    }
+
+    if let Ok(root) = files_root(&state)
+        && let Ok(folder) = crate::files::resolve_within(&root, &workspace)
+        && folder.exists()
+    {
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // The items before the run: the foreign key points that way, and `runs.team_run_id` is left
+    // pointing at nothing on purpose — a run's cost stays in the ledger after the department that
+    // spent it is gone.
+    sqlx::query("UPDATE runs SET team_run_id = NULL WHERE team_run_id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
+    sqlx::query("DELETE FROM team_items WHERE team_run_id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
+    sqlx::query("DELETE FROM team_runs WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReadFileRequest {
+    pub path: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FileView {
+    pub path: String,
+    pub content: String,
+}
+
+/// `POST /team-actions` — **the only route of this design a department may call**, and the only one
+/// it will ever gain.
+///
+/// It does not perform the action. See `propose_action`: the surface stops growing here because
+/// what arrives is a `kind` and a payload rather than a route per action, and what leaves is a
+/// sentence rather than a result.
+///
+/// The status codes carry the same distinction the sentences do. 400 is "nobody can do this", 403 is
+/// "you may not", 422 is "you asked wrongly", 429 is "come back when somebody has decided" — and a
+/// model reading only the code would still pick the right next move for three of the four.
+pub async fn post_team_action(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ProposeActionRequest>,
+) -> Result<Json<ProposeActionResponse>, (StatusCode, String)> {
+    propose_action(&state, &scope, &headers, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                ActionError::NotADepartment | ActionError::Ungranted(_) => StatusCode::FORBIDDEN,
+                ActionError::NoSuchRun => StatusCode::NOT_FOUND,
+                ActionError::Unknown(_) => StatusCode::BAD_REQUEST,
+                ActionError::Malformed(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                // 429 and not 403: the ceiling is a queue that drains, and the caller — or the next
+                // run of this department — should come back.
+                ActionError::QueueFull(_) => StatusCode::TOO_MANY_REQUESTS,
+                ActionError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        })
+}
+
+/// `POST /team-recruits` — a director says who it needed and did not have.
+///
+/// The second and last route this scope gains, and the only one in the house that answers
+/// differently depending on WHICH NODE of a run is calling. That distinction comes from
+/// `team_runs.director_run_id` and not from a scope of its own — see `Caller`.
+///
+/// 403 for a specialist, and the body says what to do instead: put it in your answer and let the
+/// director pass it on. A model reading only the code would retry; the sentence is what stops it.
+pub async fn post_team_recruit(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RecruitRequest>,
+) -> Result<Json<RecruitResponse>, (StatusCode, String)> {
+    propose_teammate(&state, &scope, &headers, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                RecruitError::NotADepartment | RecruitError::NotTheDirector => {
+                    StatusCode::FORBIDDEN
+                }
+                RecruitError::NoSuchRun => StatusCode::NOT_FOUND,
+                // 409 for both: somebody with that id already exists, or a question about them is
+                // already open. Neither is a malformed request, and both clear by somebody acting.
+                RecruitError::AlreadyExists(_) | RecruitError::AlreadyAsked(_) => {
+                    StatusCode::CONFLICT
+                }
+                RecruitError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                RecruitError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        })
+}
+
+/// `GET /team-runs/{id}/actions` — what that department asked for, and what became of it.
+pub async fn list_team_run_actions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<TeamAction>>, (StatusCode, String)> {
+    sqlx::query_as(
+        "SELECT id, team_run_id, ordinal, kind, payload, why, proposal_id, state, error,
+                created_at, executed_at
+         FROM team_actions WHERE team_run_id = ? ORDER BY id",
+    )
+    .bind(&id)
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| refuse(TeamError::Db(error)))
+}
+
+/// `GET /team-actions` — everything still waiting on somebody, across every department.
+///
+/// Includes the `allow` actions that have not run yet, which are waiting on the tick rather than on
+/// a person. Both are "asked for and not yet done", which is the question this list answers.
+pub async fn list_open_actions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TeamAction>>, (StatusCode, String)> {
+    sqlx::query_as(
+        "SELECT id, team_run_id, ordinal, kind, payload, why, proposal_id, state, error,
+                created_at, executed_at
+         FROM team_actions WHERE state IN ('pending', 'working') ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| refuse(TeamError::Db(error)))
+}
+
+/// `POST /team-files/read` — one file out of the calling run's own folder.
+///
+/// **Which run is reading comes from the key, not from the body.** A `team_run_id` field here would
+/// be the caller naming what it may open, and this is the one scope in the house that already names
+/// its caller — so it is asked rather than believed. A caller without `Scope::TeamRun` is refused
+/// with 403 and not 401: it authenticated perfectly well, it is simply not a department.
+///
+/// The path is resolved twice, and the second resolution is the one that matters. The workspace is
+/// resolved against the files root, and the caller's path against the workspace — so `files.rs`
+/// applies its whitelist to what the model chose: `..`, absolutes, drive prefixes, UNC shares and
+/// symlinks pointing out of the folder are all refused there rather than reasoned about here.
+pub async fn post_read_file(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    Json(request): Json<ReadFileRequest>,
+) -> Result<Json<FileView>, (StatusCode, String)> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only a team run reads a team run's folder".to_owned(),
+        ));
+    };
+
+    let workspace: String = sqlx::query_scalar("SELECT workspace FROM team_runs WHERE id = ?")
+        .bind(&team_run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "no such team run".to_owned()))?;
+
+    let root = files_root(&state).map_err(|why| (StatusCode::SERVICE_UNAVAILABLE, why))?;
+    let folder = crate::files::resolve_within(&root, &workspace)
+        .map_err(|_| (StatusCode::NOT_FOUND, "no such folder".to_owned()))?;
+    let target = crate::files::resolve_within(&folder, &request.path).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "that path is not inside your folder".to_owned(),
+        )
+    })?;
+
+    let content = tokio::fs::read_to_string(&target)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
+
+    Ok(Json(FileView {
+        path: request.path,
+        content,
+    }))
+}
+
+/// The one piece of this module's test scaffolding another module needs.
+///
+/// `team_trigger.rs` starts real departments to test what starts them, and a second copy of this
+/// `AppState` would be a second set of answers to "what does a daemon with a files folder look
+/// like" — kept in step by hand, and wrong on the day somebody adds a field.
+#[cfg(test)]
+pub mod test_support {
+    pub async fn state_with(root: std::path::PathBuf) -> crate::state::AppState {
+        super::tests::test_state(root).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Scope;
+
+    // -----------------------------------------------------------------------------------------
+    // The vocabulary three readers share
+    // -----------------------------------------------------------------------------------------
+
+    /// The two lists partition the state machine of the design's §3 — every state is in exactly one
+    /// of them.
+    ///
+    /// Written against the transition table rather than against the constants, so that adding a
+    /// sixth ending to `TERMINAL_STATES` without teaching the machine about it, or teaching the
+    /// machine a state neither list knows, both fail here rather than in whichever of the three
+    /// readers happens to meet the unknown value first.
+    #[test]
+    fn every_state_of_the_machine_is_live_or_terminal_and_never_both() {
+        const EVERY_STATE: &[&str] = &[
+            "planning",
+            "working",
+            "delivering",
+            "done",
+            "stopped",
+            "expired",
+            "failed",
+            "cancelled",
+        ];
+
+        for state in EVERY_STATE {
+            assert_ne!(
+                LIVE_STATES.contains(state),
+                TERMINAL_STATES.contains(state),
+                "{state} must be live or terminal, and exactly one of the two"
+            );
+        }
+        assert_eq!(LIVE_STATES.len() + TERMINAL_STATES.len(), EVERY_STATE.len());
+    }
+
+    /// A state nobody declared is not live. The default matters: `is_live` gates a credential, and
+    /// a typo that read as live would keep a token working forever.
+    #[test]
+    fn an_unknown_state_is_not_live() {
+        for state in ["", "running", "Planning", "workin", "done "] {
+            assert!(!is_live(state), "{state:?} must not read as a live run");
+        }
+    }
+
+    /// `stopped` and `expired` are endings and are NOT failures, which is the distinction an owner
+    /// reads: shown `failed`, they go looking for an error that does not exist.
+    #[test]
+    fn a_ceiling_is_an_ending_and_not_a_failure() {
+        for ceiling in ["stopped", "expired"] {
+            assert!(TERMINAL_STATES.contains(&ceiling));
+            assert_ne!(ceiling, "failed");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Reading a director's plan
+    // -----------------------------------------------------------------------------------------
+
+    fn roster() -> Vec<String> {
+        vec!["copywriter".to_owned(), "researcher".to_owned()]
+    }
+
+    #[test]
+    fn a_plain_plan_is_read_as_written() {
+        let plan = parse_team_plan(
+            r#"{"items":[{"agent_id":"copywriter","description":"draft the post"}],"done":false}"#,
+            &roster(),
+            MAX_ITEMS_PER_ROUND,
+        )
+        .expect("a well-formed plan is readable");
+
+        assert_eq!(
+            plan.items,
+            vec![PlannedItem {
+                agent_id: "copywriter".to_owned(),
+                description: "draft the post".to_owned(),
+            }]
+        );
+        assert!(plan.dropped.is_empty());
+        assert!(!plan.done);
+    }
+
+    /// A model asked for JSON writes a sentence around it perhaps a third of the time, and a code
+    /// fence more often than that. Neither is a reason to lose a paid-for plan.
+    #[test]
+    fn a_plan_wrapped_in_prose_or_a_fence_is_still_a_plan() {
+        for text in [
+            "Here is the plan:\n```json\n{\"items\":[],\"done\":true}\n```\nHope that helps.",
+            "{\"items\":[],\"done\":true}",
+            "  \n{\"items\": [], \"done\": true}\n\n",
+        ] {
+            let plan = parse_team_plan(text, &roster(), MAX_ITEMS_PER_ROUND)
+                .unwrap_or_else(|| panic!("{text:?} should have been readable"));
+            assert!(plan.done);
+        }
+    }
+
+    /// `None` means unreadable and must never mean "readable and empty": the round machine relaunches
+    /// on the first and counts a dry round on the second, and those are different places to go.
+    #[test]
+    fn an_unreadable_answer_is_none_and_an_empty_plan_is_not() {
+        for text in ["", "I could not do that", "[1,2,3]", "null", "{"] {
+            assert!(
+                parse_team_plan(text, &roster(), MAX_ITEMS_PER_ROUND).is_none(),
+                "{text:?} should be unreadable"
+            );
+        }
+
+        let empty = parse_team_plan(r#"{"items":[]}"#, &roster(), MAX_ITEMS_PER_ROUND)
+            .expect("an empty plan is a plan");
+        assert!(empty.items.is_empty());
+        assert!(!empty.done);
+    }
+
+    /// One misspelled name in five must not cost the round. The item falls, with a reason the feed
+    /// can carry, and its siblings run.
+    #[test]
+    fn an_agent_outside_the_roster_drops_its_own_item_only() {
+        let plan = parse_team_plan(
+            r#"{"items":[
+                 {"agent_id":"copywriter","description":"draft"},
+                 {"agent_id":"designer","description":"a logo"},
+                 {"agent_id":"researcher","description":"find the numbers"}
+               ]}"#,
+            &roster(),
+            MAX_ITEMS_PER_ROUND,
+        )
+        .unwrap();
+
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.items.iter().all(|item| item.agent_id != "designer"));
+        assert_eq!(plan.dropped.len(), 1);
+        assert!(plan.dropped[0].contains("designer"));
+    }
+
+    /// Cut items are REPORTED, not discarded: a silently truncated queue reads downstream as the
+    /// whole of what the planner found.
+    #[test]
+    fn the_ceiling_reports_what_it_cut() {
+        let items: Vec<String> = (0..5)
+            .map(|index| format!(r#"{{"agent_id":"copywriter","description":"item {index}"}}"#))
+            .collect();
+        let plan = parse_team_plan(
+            &format!(r#"{{"items":[{}]}}"#, items.join(",")),
+            &roster(),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(
+            plan.dropped.len(),
+            3,
+            "three were cut and three must be said"
+        );
+    }
+
+    /// `done: true` beside items is a model answering both halves of the question. The half that
+    /// costs money loses.
+    #[test]
+    fn done_wins_over_any_items_beside_it() {
+        let plan = parse_team_plan(
+            r#"{"items":[{"agent_id":"copywriter","description":"more work"}],"done":true,
+                "why":"the folder already answers it"}"#,
+            &roster(),
+            MAX_ITEMS_PER_ROUND,
+        )
+        .unwrap();
+
+        assert!(plan.done);
+        assert!(
+            plan.items.is_empty(),
+            "queueing work beside a true `done` is obeying the expensive half"
+        );
+        assert_eq!(plan.why.as_deref(), Some("the folder already answers it"));
+    }
+
+    #[test]
+    fn an_item_with_no_work_in_it_is_dropped() {
+        let plan = parse_team_plan(
+            r#"{"items":[
+                 {"agent_id":"copywriter","description":"   "},
+                 {"agent_id":"copywriter"},
+                 {"description":"nobody asked"}
+               ]}"#,
+            &roster(),
+            MAX_ITEMS_PER_ROUND,
+        )
+        .unwrap();
+
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.dropped.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The round machine
+    // -----------------------------------------------------------------------------------------
+
+    fn plan_with(count: usize) -> PlannedItems {
+        PlannedItems {
+            items: (0..count)
+                .map(|index| PlannedItem {
+                    agent_id: "copywriter".to_owned(),
+                    description: format!("item {index}"),
+                })
+                .collect(),
+            dropped: Vec::new(),
+            done: false,
+            why: None,
+        }
+    }
+
+    fn finished_plan() -> PlannedItems {
+        PlannedItems {
+            items: Vec::new(),
+            dropped: Vec::new(),
+            done: true,
+            why: None,
+        }
+    }
+
+    #[test]
+    fn a_first_plan_with_items_opens_round_zero() {
+        let progress = next_after_director("planning", Some(&plan_with(2)), 0, 0, 0, 3);
+        assert_eq!(progress.state, "working");
+        assert_eq!(progress.round, 0, "the plan's items ARE round zero");
+        assert!(progress.queue_items);
+    }
+
+    #[test]
+    fn a_first_plan_that_says_done_delivers_without_a_round() {
+        let progress = next_after_director("planning", Some(&finished_plan()), 0, 0, 0, 3);
+        assert_eq!(progress.state, "delivering");
+        assert!(!progress.queue_items);
+    }
+
+    /// Round 0 has no partial work to hand over, so an unreadable plan is worth one more attempt —
+    /// and exactly one.
+    #[test]
+    fn an_unreadable_first_plan_relaunches_once_and_then_fails() {
+        let first = next_after_director("planning", None, 0, 0, 0, 3);
+        assert_eq!(first.state, "planning");
+        assert_eq!(first.plan_retries, 1);
+
+        let second = next_after_director("planning", None, 0, 0, first.plan_retries, 3);
+        assert_eq!(second.state, "failed");
+        assert!(
+            second.why.is_some(),
+            "a failure the owner reads needs a reason"
+        );
+    }
+
+    /// The ordering the design writes down because implementers guess it wrong: increment the
+    /// round, THEN check the ceiling. A team with `max_rounds = 3` runs rounds 0, 1 and 2.
+    #[test]
+    fn a_team_runs_max_rounds_rounds_and_delivers_as_the_next_one_opens() {
+        let mut round = 0;
+        for expected in [0, 1] {
+            let progress = next_after_director("working", Some(&plan_with(1)), round, 0, 0, 3);
+            assert_eq!(progress.state, "working");
+            assert_eq!(progress.round, expected + 1);
+            assert!(progress.queue_items);
+            round = progress.round;
+        }
+
+        let last = next_after_director("working", Some(&plan_with(1)), round, 0, 0, 3);
+        assert_eq!(last.round, 3);
+        assert_eq!(last.state, "delivering");
+        assert!(
+            !last.queue_items,
+            "items must never be written for a round that will not run"
+        );
+        assert!(last.why.unwrap().contains("ceiling"));
+    }
+
+    /// One dry round is not a signal — a replan can legitimately produce nothing while the previous
+    /// round settles. Two in a row is.
+    #[test]
+    fn two_dry_rounds_deliver_and_one_does_not() {
+        let first = next_after_director("working", Some(&plan_with(0)), 0, 0, 0, 6);
+        assert_eq!(first.state, "working");
+        assert_eq!(first.dry_rounds, 1);
+
+        let second = next_after_director(
+            "working",
+            Some(&plan_with(0)),
+            first.round,
+            first.dry_rounds,
+            0,
+            6,
+        );
+        assert_eq!(second.state, "delivering");
+        assert_eq!(second.dry_rounds, 2);
+        assert!(second.why.unwrap().contains("added nothing"));
+    }
+
+    /// A round that produces work resets the count, which is what makes the brake "it dried up"
+    /// rather than "two of the rounds were quiet".
+    #[test]
+    fn a_productive_round_resets_the_dry_count() {
+        let dry = next_after_director("working", Some(&plan_with(0)), 0, 0, 0, 6);
+        assert_eq!(dry.dry_rounds, 1);
+
+        let wet = next_after_director(
+            "working",
+            Some(&plan_with(2)),
+            dry.round,
+            dry.dry_rounds,
+            0,
+            6,
+        );
+        assert_eq!(wet.dry_rounds, 0);
+        assert_eq!(wet.state, "working");
+    }
+
+    /// In a later round there IS work in the folder, so an unreadable replan is a dry round rather
+    /// than a relaunch — the asymmetry with round 0 stated as an assertion.
+    #[test]
+    fn an_unreadable_later_plan_is_a_dry_round_and_never_a_failure() {
+        let progress = next_after_director("working", None, 1, 0, 0, 6);
+        assert_eq!(progress.state, "working");
+        assert_eq!(progress.dry_rounds, 1);
+        assert_eq!(
+            progress.plan_retries, 0,
+            "retries are a round-zero mechanism"
+        );
+
+        let second =
+            next_after_director("working", None, progress.round, progress.dry_rounds, 0, 6);
+        assert_eq!(second.state, "delivering");
+    }
+
+    #[test]
+    fn a_director_that_says_done_mid_flight_delivers() {
+        let progress = next_after_director("working", Some(&finished_plan()), 1, 0, 0, 6);
+        assert_eq!(progress.state, "delivering");
+        assert!(progress.why.unwrap().contains("finished"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The database, end to end
+    // -----------------------------------------------------------------------------------------
+
+    pub(super) async fn test_state(root: std::path::PathBuf) -> AppState {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        AppState {
+            token: crate::auth::Token("test-token".into()),
+            pool,
+            runner: Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            local_assistant: None,
+            run_handles: Arc::new(Mutex::new(HashMap::new())),
+            run_messages: Arc::new(Mutex::new(HashMap::new())),
+            run_tails: Default::default(),
+            files_root: Some(root),
+            email: Arc::new(crate::state::EmailRuntime::default()),
+            voice: Arc::new(crate::voice::VoiceRuntime::default()),
+            // Off, like `web` beside it: no test in this module drives a browser, and a department
+            // reaches one — if it ever does — through the daemon client like any other agent.
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
+            web: Arc::new(crate::web::WebRuntime::disabled()),
+            calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// A state whose files root is a real, canonicalised directory.
+    ///
+    /// Canonicalised as `files::ensure_root` does at startup, and for the reason written there:
+    /// every containment check compares against this path, and on Windows a temp directory arrives
+    /// as a short name that no resolved child compares equal to.
+    async fn state_with_root() -> (AppState, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(std::fs::canonicalize(root.path()).unwrap()).await;
+        (state, root)
+    }
+
+    async fn insert_agent(state: &AppState, id: &str, engine: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO agents
+                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
+             VALUES (?, ?, 'writes things', 'you write things', ?, NULL, 'mcp_only',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(engine)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A team with a director and two specialists, through the public surface.
+    async fn marketing(state: &AppState) -> TeamView {
+        for id in ["director", "copywriter", "researcher"] {
+            insert_agent(state, id, "claude").await;
+        }
+        create(
+            &state.pool,
+            TeamRequest {
+                name: "Marketing".to_owned(),
+                mission: "sell the thing".to_owned(),
+                director_agent_id: "director".to_owned(),
+                max_rounds: 3,
+                max_parallel: 2,
+                budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: vec!["copywriter".to_owned(), "researcher".to_owned()],
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_team_round_trips_with_its_roster() {
+        let (state, _root) = state_with_root().await;
+        let team = marketing(&state).await;
+
+        assert_eq!(team.team.id, "marketing");
+        assert_eq!(team.members, vec!["copywriter", "researcher"]);
+
+        let listed = list(&state.pool).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].members.len(), 2);
+    }
+
+    /// The roster is replaced and not merged, because that is what the editor sends. A merge would
+    /// make removing somebody impossible through the only surface that edits one.
+    #[tokio::test]
+    async fn editing_a_team_replaces_its_roster_rather_than_adding_to_it() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+
+        let updated = update(
+            &state.pool,
+            "marketing",
+            TeamRequest {
+                name: "Marketing".to_owned(),
+                mission: "sell the thing".to_owned(),
+                director_agent_id: "director".to_owned(),
+                max_rounds: 3,
+                max_parallel: 2,
+                budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: vec!["copywriter".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.members, vec!["copywriter"]);
+    }
+
+    #[tokio::test]
+    async fn a_team_may_not_name_an_agent_that_is_not_in_the_catalogue() {
+        let (state, _root) = state_with_root().await;
+        insert_agent(&state, "director", "claude").await;
+
+        let refusal = create(
+            &state.pool,
+            TeamRequest {
+                name: "Ghosts".to_owned(),
+                mission: "haunt".to_owned(),
+                director_agent_id: "director".to_owned(),
+                max_rounds: 2,
+                max_parallel: 1,
+                budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: vec!["nobody".to_owned()],
+            },
+        )
+        .await;
+        assert!(matches!(refusal, Err(TeamError::UnknownAgent(id)) if id == "nobody"));
+    }
+
+    /// The ceilings the daemon imposes whatever the owner types, because rounds times parallelism
+    /// is the multiplier on the bill.
+    #[tokio::test]
+    async fn the_daemons_ceilings_are_not_the_owners_to_raise() {
+        let (state, _root) = state_with_root().await;
+        insert_agent(&state, "director", "claude").await;
+
+        for (rounds, parallel) in [
+            (0, 1),
+            (MAX_ROUNDS_CEILING + 1, 1),
+            (1, 0),
+            (1, MAX_PARALLEL_CEILING + 1),
+        ] {
+            let refusal = create(
+                &state.pool,
+                TeamRequest {
+                    name: format!("Team {rounds}x{parallel}"),
+                    mission: "work".to_owned(),
+                    director_agent_id: "director".to_owned(),
+                    max_rounds: rounds,
+                    max_parallel: parallel,
+                    budget_usd: None,
+                    max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                    max_live_runs: 1,
+                    grants: Vec::new(),
+                    members: Vec::new(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(refusal, Err(TeamError::Invalid(_))),
+                "{rounds} rounds x {parallel} parallel should be refused"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Alçada
+    // -----------------------------------------------------------------------------------------
+
+    /// Grants a team an alçada and starts a run, returning that run's id.
+    async fn team_with_grant(state: &AppState, kind: &str, mode: &str) -> String {
+        marketing(state).await;
+        sqlx::query("INSERT INTO team_grants (team_id, kind, mode) VALUES ('marketing', ?, ?)")
+            .bind(kind)
+            .bind(mode)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        start(state, "marketing", "write the launch post")
+            .await
+            .unwrap()
+    }
+
+    fn an_email() -> serde_json::Value {
+        serde_json::json!({
+            "to": "list@example.com",
+            "subject": "we launch tomorrow",
+            "body": "Details inside.",
+        })
+    }
+
+    async fn ask(
+        state: &AppState,
+        run_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<ProposeActionResponse, ActionError> {
+        propose_action(
+            state,
+            &Scope::TeamRun(run_id.to_owned()),
+            &axum::http::HeaderMap::new(),
+            &ProposeActionRequest {
+                kind: kind.to_owned(),
+                payload,
+                why: "the launch is tomorrow and the list asked to be told".to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Default deny, and it is the ABSENCE of a row that denies — there is no `mode = 'deny'` for a
+    /// second opinion to disagree with.
+    #[tokio::test]
+    async fn a_department_with_no_alcada_may_ask_for_nothing() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        for kind in GRANTABLE_ACTIONS {
+            let refusal = ask(&state, &run_id, kind, an_email()).await;
+            assert!(
+                matches!(&refusal, Err(ActionError::Ungranted(named)) if named == kind),
+                "{kind}: got {refusal:?}"
+            );
+        }
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_actions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "a refusal leaves no row to decide");
+    }
+
+    /// The constant is asked BEFORE the table, so a row somebody wrote into `team_grants` by hand
+    /// cannot grant an action the house does not have.
+    #[tokio::test]
+    async fn a_kind_outside_the_list_is_refused_even_with_a_grant_in_the_table() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "set_kill", "allow").await;
+
+        let refusal = ask(&state, &run_id, "set_kill", serde_json::json!({})).await;
+        assert!(
+            matches!(&refusal, Err(ActionError::Unknown(named)) if named == "set_kill"),
+            "got {refusal:?}"
+        );
+    }
+
+    /// The list of what a department may be granted, held against the list of what it must never
+    /// be. Written out by hand on both sides: "everything that is not `Acts`" would have handed a
+    /// marketing department the controls of the daemon, decided by whoever added the next tool.
+    #[test]
+    fn no_grantable_action_is_a_control_of_the_daemon() {
+        // A department holding `set_kill` turns off the house's autonomy. One holding
+        // `approve_proposal` approves its own proposals, and thereby holds every other authority by
+        // transitivity, without anybody having written that down.
+        for forbidden in [
+            "approve_proposal",
+            "reject_proposal",
+            "set_kill",
+            "cancel_run",
+            "create_run",
+            "create_job",
+            "triage_email",
+            // The sharpest of all, and the one the design named and this refuses: `TOOL_EFFECTS`
+            // records it as the only effect in the house that outlives the daemon and that its
+            // owner cannot take back from here.
+            "vcs_request",
+            "vcs_ticket",
+        ] {
+            assert!(
+                !GRANTABLE_ACTIONS.contains(&forbidden),
+                "`{forbidden}` is a control of the daemon and no department may be granted it"
+            );
+        }
+        // And every grantable kind is understood by the validator, so a grant cannot name something
+        // the writer would refuse and the owner would only discover mid-run.
+        for kind in GRANTABLE_ACTIONS {
+            let refusal = validate_payload(kind, &serde_json::json!({}))
+                .expect_err("an empty payload is not a request");
+            assert!(
+                !refusal.contains("nobody can do"),
+                "`{kind}` is grantable and `validate_payload` does not know it"
+            );
+        }
+    }
+
+    /// **The test that decides whether this design is safe.**
+    ///
+    /// A specialist reads a web page. The page contains text asking for an email to be sent. Two
+    /// independent things stop it, and this asserts the second: `propose_action` is `Acts`, so the
+    /// turn that called a `ReadsUntrusted` tool cannot reach it for the rest of that turn. (The
+    /// first is that the page arrived summarised by a local model rather than raw — `web.rs`.)
+    #[tokio::test]
+    async fn a_specialist_that_read_the_web_may_not_ask_for_an_action_in_that_turn() {
+        use crate::mcp_tools::{ToolEffect, tool_effect};
+
+        assert_eq!(
+            tool_effect("web_read"),
+            ToolEffect::ReadsUntrusted,
+            "the premise: reading a page marks the turn"
+        );
+        assert_eq!(
+            tool_effect("read_team_file"),
+            ToolEffect::ReadsUntrusted,
+            "and so does reading what another specialist wrote out of one"
+        );
+        // The conclusion, and the whole reason `propose_action` is classified as an action despite
+        // performing none: `hooks.rs` refuses every `Acts` tool once the run is marked, so a page
+        // that asks for an email reaches a turn that can no longer ask for one.
+        assert_eq!(
+            tool_effect("propose_action"),
+            ToolEffect::Acts,
+            "if this ever becomes ReadsOwn, a web page can send mail"
+        );
+    }
+
+    /// A `propose` grant writes the action AND the proposal, or neither. An action with no proposal
+    /// is one nobody will ever decide; a proposal with no action is a button that approves nothing.
+    #[tokio::test]
+    async fn a_propose_grant_files_the_action_and_the_question_together() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+
+        let filed = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        let proposal_id = filed.proposal_id.expect("a propose grant asks somebody");
+        assert!(filed.outcome.contains(&format!("#{proposal_id}")));
+
+        let action: TeamAction = sqlx::query_as(
+            "SELECT id, team_run_id, ordinal, kind, payload, why, proposal_id, state, error,
+                    created_at, executed_at
+             FROM team_actions WHERE id = ?",
+        )
+        .bind(filed.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(action.state, "pending");
+        assert_eq!(action.proposal_id, Some(proposal_id));
+
+        let proposal = crate::proposals::get(&state.pool, proposal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.kind, "team-action");
+        assert_eq!(proposal.status, "pending");
+        // The action's kind, so a person scanning the queue knows what they are agreeing to without
+        // opening the row.
+        assert_eq!(proposal.tool_name.as_deref(), Some("send_email"));
+        assert_eq!(
+            proposal.project_id, None,
+            "a department has no project, which is why the per-project wip ceiling never sees this"
+        );
+        // Nothing has happened yet, and nothing will until somebody says so.
+        execute_due_actions(&state).await;
+        let still: String = sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+            .bind(filed.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(still, "pending", "an undecided action is not carried out");
+    }
+
+    /// `allow` is the owner saying they do not want to be in the middle. No proposal is written, and
+    /// the next pass of the tick does it.
+    #[tokio::test]
+    async fn an_allow_grant_asks_nobody_and_runs_on_the_next_pass() {
+        let (state, root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+
+        let filed = ask(
+            &state,
+            &run_id,
+            "file_document",
+            serde_json::json!({ "path": "launch/post.md", "content": "# Launch\n" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filed.proposal_id, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM proposals")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        execute_due_actions(&state).await;
+
+        let action: (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(action, ("done".to_owned(), None), "{action:?}");
+        let written = std::fs::read_to_string(
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("launch")
+                .join("post.md"),
+        )
+        .unwrap();
+        assert_eq!(written, "# Launch\n");
+    }
+
+    /// Two passes overlapping must not do the same thing twice. The claim is a compare-and-swap
+    /// before the work, exactly as `ingest_director` does it — an email that may already have gone
+    /// is not sent again.
+    #[tokio::test]
+    async fn an_approved_action_is_carried_out_once_and_once_only() {
+        let (state, root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+        let filed = ask(
+            &state,
+            &run_id,
+            "file_document",
+            serde_json::json!({ "path": "note.md", "content": "once" }),
+        )
+        .await
+        .unwrap();
+
+        let (first, second) =
+            tokio::join!(execute_due_actions(&state), execute_due_actions(&state));
+        let _ = (first, second);
+
+        let executed: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(executed, ["done"]);
+        assert!(
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("note.md")
+                .exists()
+        );
+    }
+
+    /// Two fields and not one. `proposals.status` says what the human decided; `team_actions.state`
+    /// says what the world answered. Merged, `failed` would read as "the person refused" and
+    /// `approved` would be a lie about a message that never left.
+    #[tokio::test]
+    async fn an_action_that_fails_does_not_contradict_the_approval() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        let filed = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        let proposal_id = filed.proposal_id.unwrap();
+
+        crate::proposals::transition(&state.pool, proposal_id, "approved", "approved by user")
+            .await
+            .unwrap();
+        // No submission host is configured in a test state, so the send fails at the first check
+        // and nothing leaves the process.
+        execute_due_actions(&state).await;
+
+        let action: (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(action.0, "failed");
+        assert!(action.1.is_some_and(|why| !why.is_empty()));
+        assert_eq!(
+            crate::proposals::get(&state.pool, proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved",
+            "the person did say yes, and a failure afterwards does not unsay it"
+        );
+    }
+
+    /// The ceiling is per TEAM — `wip.rs` counts per project and a department has none — and it
+    /// clears the moment somebody decides.
+    #[tokio::test]
+    async fn the_open_action_ceiling_is_per_team_and_frees_when_somebody_decides() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        sqlx::query("UPDATE teams SET max_open_actions = 2 WHERE id = 'marketing'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let first = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+        let refusal = ask(&state, &run_id, "send_email", an_email()).await;
+        assert!(
+            matches!(&refusal, Err(ActionError::QueueFull(why)) if why.contains('2')),
+            "got {refusal:?}"
+        );
+
+        // A department next door is untouched by a queue it did not fill.
+        insert_agent(&state, "engineer", "claude").await;
+        create(
+            &state.pool,
+            TeamRequest {
+                name: "Support".to_owned(),
+                mission: "answer people".to_owned(),
+                director_agent_id: "engineer".to_owned(),
+                max_rounds: 2,
+                max_parallel: 1,
+                budget_usd: None,
+                max_open_actions: 1,
+                max_live_runs: 1,
+                grants: vec![TeamGrant {
+                    kind: "send_email".to_owned(),
+                    mode: "propose".to_owned(),
+                }],
+                members: vec!["engineer".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+        let support_run = start(&state, "support", "answer the backlog")
+            .await
+            .unwrap();
+        ask(&state, &support_run, "send_email", an_email())
+            .await
+            .expect("another department's queue is not this one's");
+
+        // Deciding frees the slot, which is the self-limiting property `wip.rs` has in the other
+        // axis: the queue cannot grow past what somebody is willing to work through.
+        crate::proposals::transition(
+            &state.pool,
+            first.proposal_id.unwrap(),
+            "rejected",
+            "rejected by user",
+        )
+        .await
+        .unwrap();
+        ask(&state, &run_id, "send_email", an_email())
+            .await
+            .expect("a decided action no longer holds a slot");
+    }
+
+    /// A malformed request is refused to the AGENT, mid-turn, while it can still fix it — and not to
+    /// a person three hours later whose only options are approving something broken or throwing away
+    /// work already paid for.
+    #[tokio::test]
+    async fn a_malformed_payload_is_refused_to_the_agent_and_never_reaches_a_person() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+
+        for broken in [
+            serde_json::json!({ "subject": "no recipient", "body": "x" }),
+            serde_json::json!({ "to": "", "subject": "empty recipient", "body": "x" }),
+            serde_json::json!({ "to": "nobody", "subject": "no domain", "body": "x" }),
+            // The header-injection rule, borrowed from `mailsend::validate` rather than restated.
+            serde_json::json!({ "to": "a@b.c\nBcc: c@d.e", "subject": "x", "body": "x" }),
+            serde_json::json!({ "to": "a@b.c", "subject": "no body", "body": "  " }),
+        ] {
+            let refusal = ask(&state, &run_id, "send_email", broken.clone()).await;
+            assert!(
+                matches!(refusal, Err(ActionError::Malformed(_))),
+                "{broken} should not be a message"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM proposals")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0,
+            "nothing malformed reached the queue"
+        );
+
+        // And a request with no reason is refused too: the sentence is what the person deciding
+        // reads, and a queue whose entries do not explain themselves gets approved unread.
+        let unexplained = propose_action(
+            &state,
+            &Scope::TeamRun(run_id.clone()),
+            &axum::http::HeaderMap::new(),
+            &ProposeActionRequest {
+                kind: "send_email".to_owned(),
+                payload: an_email(),
+                why: "   ".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(unexplained, Err(ActionError::Malformed(_))));
+    }
+
+    /// A run may finish with actions nobody has decided, and they outlive it. The opposite would
+    /// hold a department in `working` until somebody opened a laptop — occupying a `max_parallel`
+    /// slot and counting against the four-hour ceiling the whole time.
+    #[tokio::test]
+    async fn a_run_may_end_with_actions_still_undecided() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        let filed = ask(&state, &run_id, "send_email", an_email())
+            .await
+            .unwrap();
+
+        cancel(&state, &run_id).await.unwrap();
+        let run_state: String = sqlx::query_scalar("SELECT state FROM team_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(TERMINAL_STATES.contains(&run_state.as_str()), "{run_state}");
+
+        let action: String = sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+            .bind(filed.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            action, "pending",
+            "the question outlives the run that asked"
+        );
+    }
+
+    /// The path is contained by `files::resolve_within` against the files root, which is the one
+    /// thing standing between a department and the rest of the disk.
+    #[tokio::test]
+    async fn a_filed_document_cannot_leave_the_files_folder() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+
+        for escape in ["../outside.md", "/etc/passwd", "a/../../outside.md"] {
+            let refusal = ask(
+                &state,
+                &run_id,
+                "file_document",
+                serde_json::json!({ "path": escape, "content": "x" }),
+            )
+            .await;
+            assert!(
+                matches!(refusal, Err(ActionError::Malformed(_))),
+                "{escape} should not be a path inside the folder"
+            );
+        }
+    }
+
+    /// An event the department asked for, written by the core after a person said yes — the shape
+    /// `proposals::create_calendar_event` established, with a department in place of the triage.
+    #[tokio::test]
+    async fn an_approved_calendar_event_is_written_by_the_core() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "calendar_event", "propose").await;
+        let filed = ask(
+            &state,
+            &run_id,
+            "calendar_event",
+            serde_json::json!({
+                "title": "launch review",
+                "starts_at_local": "2026-08-17T09:30:00",
+                "duration_minutes": 45,
+                "tz": "Europe/Lisbon",
+            }),
+        )
+        .await
+        .unwrap();
+
+        crate::proposals::transition(
+            &state.pool,
+            filed.proposal_id.unwrap(),
+            "approved",
+            "approved by user",
+        )
+        .await
+        .unwrap();
+        execute_due_actions(&state).await;
+
+        let event: (String, String, i64, String) =
+            sqlx::query_as("SELECT title, tz, duration_minutes, source FROM calendar_events")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            event,
+            (
+                "launch review".to_owned(),
+                "Europe/Lisbon".to_owned(),
+                45,
+                "team".to_owned()
+            )
+        );
+    }
+
+    /// Only a department asks, and which one comes from the KEY. A `team_run_id` in the body would
+    /// be the caller naming what it may do, which is what `post_read_file` refuses one route over.
+    #[tokio::test]
+    async fn only_a_team_run_may_ask_and_the_key_says_which() {
+        let (state, _root) = state_with_root().await;
+        team_with_grant(&state, "send_email", "allow").await;
+
+        for scope in [Scope::Control, Scope::Run(1)] {
+            let refusal = propose_action(
+                &state,
+                &scope,
+                &axum::http::HeaderMap::new(),
+                &ProposeActionRequest {
+                    kind: "send_email".to_owned(),
+                    payload: an_email(),
+                    why: "because".to_owned(),
+                },
+            )
+            .await;
+            assert!(matches!(refusal, Err(ActionError::NotADepartment)));
+        }
+
+        let refusal = ask(&state, "never-existed", "send_email", an_email()).await;
+        assert!(matches!(refusal, Err(ActionError::NoSuchRun)));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Recruitment
+    // -----------------------------------------------------------------------------------------
+
+    /// The header the daemon's own client sends, standing in for one node of a run.
+    fn as_node(run_id: i64) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::daemon_client::RUN_ID_HEADER,
+            run_id.to_string().parse().unwrap(),
+        );
+        headers
+    }
+
+    /// Puts a director's node and one specialist's item in flight on the same run, and hands back
+    /// the two run ids. Both nodes hold the identical team key — that is the point of the first
+    /// test below.
+    async fn director_and_specialist(state: &AppState, team_run_id: &str) -> (i64, i64) {
+        let director_run: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('plan', 'running', 'team', '2026-08-16T10:00:00Z') RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE team_runs SET director_run_id = ?, director_node = 'planning' WHERE id = ?",
+        )
+        .bind(director_run)
+        .bind(team_run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let specialist_run: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('work', 'running', 'team', '2026-08-16T10:00:00Z') RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                     run_id)
+             VALUES (?, 1, 0, 'copywriter', 'draft the post', 'running', ?)",
+        )
+        .bind(team_run_id)
+        .bind(specialist_run)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        (director_run, specialist_run)
+    }
+
+    fn a_lawyer() -> RecruitRequest {
+        RecruitRequest {
+            name: "Contracts lawyer".to_owned(),
+            speciality: "reads contracts and flags what binds us".to_owned(),
+            prompt: "You are a lawyer. Be exact about obligations.".to_owned(),
+            engine: None,
+            model: None,
+            tool_policy: None,
+            why: "the launch has a distribution agreement nobody here can read".to_owned(),
+        }
+    }
+
+    /// **The test that proves the director check works without inventing a scope.**
+    ///
+    /// The two nodes present the IDENTICAL key — a team's token names the run, not the node — and
+    /// get different answers, because the answer comes from `team_runs.director_run_id` rather than
+    /// from the credential. A specialist is refused with a sentence telling it what to do instead.
+    #[tokio::test]
+    async fn only_the_director_recruits_and_a_specialist_hears_why_not() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let (director_run, specialist_run) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        let refusal = propose_teammate(&state, &scope, &as_node(specialist_run), &a_lawyer()).await;
+        assert!(
+            matches!(&refusal, Err(RecruitError::NotTheDirector)),
+            "got {refusal:?}"
+        );
+        assert!(
+            refusal
+                .unwrap_err()
+                .to_string()
+                .contains("say in your answer"),
+            "a specialist is told what to do instead of only being told no"
+        );
+
+        // A node this run does not know — a stale id, or one from another department — holds the
+        // LEAST authority rather than the most.
+        let stranger = propose_teammate(&state, &scope, &as_node(9_999), &a_lawyer()).await;
+        assert!(matches!(stranger, Err(RecruitError::NotTheDirector)));
+        let headerless =
+            propose_teammate(&state, &scope, &axum::http::HeaderMap::new(), &a_lawyer()).await;
+        assert!(matches!(headerless, Err(RecruitError::NotTheDirector)));
+
+        // The same key, the same route, the same body — and the director is heard.
+        let filed = propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .expect("the director may ask");
+        assert!(filed.outcome.contains("will not join this run"));
+    }
+
+    /// The catalogue and the roster move together or not at all. An agent hired into nothing is
+    /// somebody nobody asked for; a roster row pointing at nobody breaks the foreign key at the
+    /// next run's `start`, which is the worst place to find out.
+    #[tokio::test]
+    async fn hiring_writes_the_agent_and_the_roster_together() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let filed = propose_teammate(
+            &state,
+            &Scope::TeamRun(run_id.clone()),
+            &as_node(director_run),
+            &a_lawyer(),
+        )
+        .await
+        .unwrap();
+
+        let hired = approve_recruit(&state.pool, filed.proposal_id, None)
+            .await
+            .unwrap();
+        assert_eq!(hired, "contracts-lawyer");
+        let agent = crate::agent::get(&state.pool, &hired)
+            .await
+            .unwrap()
+            .unwrap();
+        // Engine defaults to the DIRECTOR's, which is the only defensible guess: a specialist of a
+        // department that runs on one engine running on the same surprises nobody.
+        assert_eq!(agent.engine, "claude");
+        // Through the view, because the tests have a `roster` of their own that shadows the module
+        // function — and the view is what the shell reads anyway.
+        assert!(
+            get(&state.pool, "marketing")
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .contains(&hired)
+        );
+        assert_eq!(
+            crate::proposals::get(&state.pool, filed.proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+
+        // A second approval finds nothing left to decide, so nobody is hired twice.
+        assert!(matches!(
+            approve_recruit(&state.pool, filed.proposal_id, None).await,
+            Err(HireError::NotPending)
+        ));
+    }
+
+    /// Asked once, stopped twice — by the tool, and by the prompt that keeps the director from
+    /// walking into the tool's refusal every round.
+    #[tokio::test]
+    async fn a_director_does_not_ask_for_the_same_person_twice() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+        propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .unwrap();
+
+        let again = propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer()).await;
+        assert!(
+            matches!(&again, Err(RecruitError::AlreadyAsked(id)) if id == "contracts-lawyer"),
+            "got {again:?}"
+        );
+
+        let run: TeamRun = sqlx::query_as(
+            "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                    next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
+             FROM team_runs WHERE id = ?",
+        )
+        .bind(&run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let team = get(&state.pool, "marketing").await.unwrap().unwrap();
+        let prompt = director_prompt(&state, &run, &team.team).await;
+        assert!(prompt.contains("already asked the owner for"), "{prompt}");
+        assert!(prompt.contains("contracts-lawyer"));
+        assert!(prompt.contains("Do not ask again"));
+        // And the delivery is told to say what was thin, which is the difference between a bad
+        // answer and an honest one.
+        let delivery = delivery_prompt(&state, &run, &team.team).await;
+        assert!(delivery.contains("which part is thin"), "{delivery}");
+    }
+
+    /// A department that asked for nobody has the prompt it always had, byte for byte.
+    #[tokio::test]
+    async fn a_department_that_asked_for_nobody_reads_the_prompt_it_always_did() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let run: TeamRun = sqlx::query_as(
+            "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                    next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
+             FROM team_runs WHERE id = ?",
+        )
+        .bind(&run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let team = get(&state.pool, "marketing").await.unwrap().unwrap();
+
+        let prompt = director_prompt(&state, &run, &team.team).await;
+        assert!(!prompt.contains("already asked"));
+        assert!(prompt.trim_end().ends_with("for the person who asked."));
+    }
+
+    /// A name already in the catalogue gets an answer the director can act on in the same turn,
+    /// rather than a refusal it can only report.
+    #[tokio::test]
+    async fn a_name_already_in_the_catalogue_says_to_add_them_instead() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let mut asked = a_lawyer();
+        asked.name = "Copywriter".to_owned();
+
+        let refusal = propose_teammate(
+            &state,
+            &Scope::TeamRun(run_id),
+            &as_node(director_run),
+            &asked,
+        )
+        .await;
+        assert!(
+            matches!(&refusal, Err(RecruitError::AlreadyExists(id)) if id == "copywriter"),
+            "got {refusal:?}"
+        );
+        assert!(
+            refusal
+                .unwrap_err()
+                .to_string()
+                .contains("add them to this team")
+        );
+    }
+
+    /// The proposal is a suggestion; what the owner approved is the authority.
+    #[tokio::test]
+    async fn what_is_hired_is_what_the_owner_approved_and_not_what_was_proposed() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        // Refused at the PROPOSAL too, so the director learns while it can still act rather than
+        // filing something that could only ever have been refused.
+        let mut greedy = a_lawyer();
+        greedy.tool_policy = Some("unrestricted".to_owned());
+        assert!(matches!(
+            propose_teammate(&state, &scope, &as_node(director_run), &greedy).await,
+            Err(RecruitError::Invalid(_))
+        ));
+
+        let filed = propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .unwrap();
+        // The last word is over what was EDITED. An owner who edits it into something the daemon
+        // refuses is refused there, and the question stays open for them to correct.
+        let bad = approve_recruit(
+            &state.pool,
+            filed.proposal_id,
+            Some(crate::agent::AgentRequest {
+                name: "Contracts lawyer".to_owned(),
+                speciality: "reads contracts".to_owned(),
+                prompt: "You are a lawyer.".to_owned(),
+                engine: "local".to_owned(),
+                model: None,
+                tool_policy: "mcp_only".to_owned(),
+            }),
+        )
+        .await;
+        assert!(matches!(bad, Err(HireError::Refused(_))), "{bad:?}");
+        assert_eq!(
+            crate::proposals::get(&state.pool, filed.proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        let hired = approve_recruit(
+            &state.pool,
+            filed.proposal_id,
+            Some(crate::agent::AgentRequest {
+                name: "House counsel".to_owned(),
+                speciality: "reads contracts".to_owned(),
+                prompt: "You are a lawyer.".to_owned(),
+                engine: "claude".to_owned(),
+                model: Some("claude-sonnet-5".to_owned()),
+                tool_policy: "none".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        let agent = crate::agent::get(&state.pool, &hired)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.name, "House counsel");
+        assert_eq!(agent.tool_policy, "none");
+    }
+
+    /// Refusing is "not this one", never "stop asking". The next run of that department meets the
+    /// same gap and may say so again.
+    #[tokio::test]
+    async fn a_refused_recruitment_may_be_asked_for_again() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch")
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+        let filed = propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .unwrap();
+
+        crate::proposals::transition(&state.pool, filed.proposal_id, "rejected", "not hired")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::agent::get(&state.pool, "contracts-lawyer")
+                .await
+                .unwrap(),
+            None,
+            "refusing leaves nothing behind, because nothing was created"
+        );
+
+        propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .expect("nobody told the director to stop asking, only not that one");
+    }
+
+    /// Attribution, from the same header and by the same rule: the item that asked is recorded, the
+    /// director's own request is recorded as nobody's item, and a node this run does not know is
+    /// recorded as neither rather than as a guess.
+    #[tokio::test]
+    async fn an_action_records_which_node_asked_for_it() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "allow").await;
+        let (director_run, specialist_run) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        let ask_as = async |headers: axum::http::HeaderMap| {
+            propose_action(
+                &state,
+                &scope,
+                &headers,
+                &ProposeActionRequest {
+                    kind: "send_email".to_owned(),
+                    payload: an_email(),
+                    why: "the list asked to be told".to_owned(),
+                },
+            )
+            .await
+            .unwrap()
+            .id
+        };
+
+        assert_eq!(
+            calling_node(&state.pool, &run_id, &as_node(specialist_run)).await,
+            Caller::Specialist(1)
+        );
+        let by_specialist = ask_as(as_node(specialist_run)).await;
+        let by_director = ask_as(as_node(director_run)).await;
+        let by_stranger = ask_as(as_node(9_999)).await;
+
+        let ordinal = async |id: i64| -> Option<i64> {
+            sqlx::query_scalar("SELECT ordinal FROM team_actions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap()
+        };
+        assert_eq!(ordinal(by_specialist).await, Some(1));
+        assert_eq!(ordinal(by_director).await, None);
+        assert_eq!(ordinal(by_stranger).await, None);
+    }
+
+    /// A team halfway through being assembled is a legitimate thing to save; asking it to work is
+    /// not. The two refusals live at different moments on purpose.
+    #[tokio::test]
+    async fn an_empty_roster_saves_and_refuses_to_start() {
+        let (state, _root) = state_with_root().await;
+        insert_agent(&state, "director", "claude").await;
+        create(
+            &state.pool,
+            TeamRequest {
+                name: "Empty".to_owned(),
+                mission: "nothing yet".to_owned(),
+                director_agent_id: "director".to_owned(),
+                max_rounds: 2,
+                max_parallel: 1,
+                budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: Vec::new(),
+            },
+        )
+        .await
+        .expect("a half-built team is a legitimate thing to save");
+
+        let refusal = start(&state, "empty", "do some work").await;
+        assert!(
+            matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("no members")),
+            "got {refusal:?}"
+        );
+    }
+
+    /// Not silently degraded to the cloud, which would swap the model the owner chose for one that
+    /// spends.
+    #[tokio::test]
+    async fn a_local_member_on_a_machine_with_no_local_model_refuses_at_the_start() {
+        let (state, _root) = state_with_root().await;
+        insert_agent(&state, "director", "claude").await;
+        insert_agent(&state, "localist", "local").await;
+        create(
+            &state.pool,
+            TeamRequest {
+                name: "Local".to_owned(),
+                mission: "stay on this machine".to_owned(),
+                director_agent_id: "director".to_owned(),
+                max_rounds: 2,
+                max_parallel: 1,
+                budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: vec!["localist".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let refusal = start(&state, "local", "do some work").await;
+        assert!(
+            matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("local model")),
+            "got {refusal:?}"
+        );
+    }
+
+    /// A department's whole output is files in a folder, so a machine without one has nowhere to
+    /// put the answer. The refusal is what makes the shared root worth sharing: this pillar and the
+    /// Files tab read the same `AppState.files_root` through the same helper, and an installation
+    /// missing it must say the same thing to both rather than half-starting a run whose deliverable
+    /// has no home. Refusing here also means no row, no key and no charge.
+    #[tokio::test]
+    async fn a_machine_with_no_files_folder_refuses_to_start_a_department() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let state = AppState {
+            files_root: None,
+            ..state
+        };
+
+        let refusal = start(&state, "marketing", "write the launch post").await;
+        assert!(
+            matches!(&refusal, Err(StartError::Unavailable(why)) if why.contains("files folder")),
+            "got {refusal:?}"
+        );
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "a refused start must not leave a run behind");
+    }
+
+    #[tokio::test]
+    async fn starting_a_run_writes_the_row_the_key_and_the_folder() {
+        let (state, root) = state_with_root().await;
+        marketing(&state).await;
+
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let run: TeamRun = sqlx::query_as(
+            "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                    next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
+             FROM team_runs WHERE id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(run.state, "planning");
+        assert_eq!(run.director_node, "none");
+        assert_eq!(run.round, 0);
+        assert_eq!(run.next_ordinal, 1);
+        assert_eq!(run.workspace, format!("teams/marketing/{id}"));
+        assert!(
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("teams")
+                .join("marketing")
+                .join(&id)
+                .is_dir(),
+            "the folder must exist before any specialist tries to be filed into it"
+        );
+
+        // The key resolves, which is the whole point of minting it here.
+        let token = team_token(&state.pool, &id).await.unwrap();
+        assert!(token.starts_with(&format!("team:{id}.")));
+    }
+
+    /// The ordinal is monotonic across the WHOLE run and never restarts per round, which is what
+    /// makes two files unable to collide — in one round or between rounds.
+    #[tokio::test]
+    async fn an_ordinal_is_unique_across_the_whole_run() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        for round in 0..3 {
+            for _ in 0..2 {
+                let next: i64 =
+                    sqlx::query_scalar("SELECT next_ordinal FROM team_runs WHERE id = ?")
+                        .bind(&id)
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap();
+                sqlx::query(
+                    "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description,
+                                             state)
+                     VALUES (?, ?, ?, 'copywriter', 'work', 'pending')",
+                )
+                .bind(&id)
+                .bind(next)
+                .bind(round)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+                sqlx::query("UPDATE team_runs SET next_ordinal = ? WHERE id = ?")
+                    .bind(next + 1)
+                    .bind(&id)
+                    .execute(&state.pool)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let ordinals: Vec<i64> = sqlx::query_scalar(
+            "SELECT ordinal FROM team_items WHERE team_run_id = ? ORDER BY ordinal",
+        )
+        .bind(&id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(ordinals, vec![1, 2, 3, 4, 5, 6]);
+
+        let names: std::collections::BTreeSet<String> = ordinals
+            .iter()
+            .map(|ordinal| format!("{ordinal}-copywriter.md"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            ordinals.len(),
+            "two rounds wrote the same file"
+        );
+    }
+
+    /// A run in `working` whose items were left `running` by a dead daemon is unwedged at startup;
+    /// its own items are the only ones touched.
+    #[tokio::test]
+    async fn reconciliation_fails_the_items_a_dead_daemon_abandoned() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "work").await.unwrap();
+        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                     run_id)
+             VALUES (?, 1, 0, 'copywriter', 'work', 'running', ?)",
+        )
+        .bind(&id)
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE team_runs SET state = 'working' WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        reconcile_orphaned_team_runs(&state).await.unwrap();
+
+        let item_state: String = sqlx::query_scalar(
+            "SELECT state FROM team_items WHERE team_run_id = ? AND ordinal = 1",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(item_state, "failed");
+    }
+
+    /// The case that is easiest to implement wrongly and the only one that throws away money: the
+    /// daemon died AFTER the CLI wrote the director's answer. Resetting the marker would repeat a
+    /// node that has already been paid for.
+    #[tokio::test]
+    async fn a_director_node_that_completed_unread_is_ingested_and_not_repeated() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "plan it").await.unwrap();
+        sqlx::query("UPDATE runs SET status = 'completed', exit_code = 0, stdout = ? WHERE id = ?")
+            .bind(r#"{"items":[{"agent_id":"copywriter","description":"draft the post"}]}"#)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE team_runs SET director_node = 'planning', director_run_id = ? WHERE id = ?",
+        )
+        .bind(run_id)
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        reconcile_orphaned_team_runs(&state).await.unwrap();
+
+        let run: TeamRun = fetch_run(&state, &id).await;
+        assert_eq!(
+            run.state, "working",
+            "the paid-for plan must have been read"
+        );
+        assert_eq!(run.director_node, "none");
+        assert_eq!(run.next_ordinal, 2);
+
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM team_items WHERE team_run_id = ?")
+                .bind(&id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(queued, 1);
+    }
+
+    /// The assertion `job.rs` bought with migration 0051: one node ingested twice must not advance
+    /// the round twice. The marker is cleared in the same statement that records the move, and the
+    /// `WHERE director_node = ?` guard is what makes the second call a no-op.
+    #[tokio::test]
+    async fn ingesting_the_same_director_node_twice_does_not_advance_the_round_twice() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE team_runs SET state = 'working', round = 0 WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "replan").await.unwrap();
+        sqlx::query("UPDATE runs SET status = 'completed', exit_code = 0, stdout = ? WHERE id = ?")
+            .bind(r#"{"items":[{"agent_id":"copywriter","description":"another draft"}]}"#)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE team_runs SET director_node = 'replanning', director_run_id = ? WHERE id = ?",
+        )
+        .bind(run_id)
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let before = fetch_run(&state, &id).await;
+        ingest_director(&state, before.clone()).await.unwrap();
+        let once = fetch_run(&state, &id).await;
+        assert_eq!(once.round, 1);
+
+        // The stale row again, exactly as a second caller would hold it.
+        ingest_director(&state, before).await.unwrap();
+        let twice = fetch_run(&state, &id).await;
+        assert_eq!(
+            twice.round, 1,
+            "the round moved twice for one paid-for node"
+        );
+        assert_eq!(
+            twice.next_ordinal, once.next_ordinal,
+            "the items were queued twice"
+        );
+    }
+
+    async fn fetch_run(state: &AppState, id: &str) -> TeamRun {
+        sqlx::query_as(
+            "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                    next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
+             FROM team_runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A failed specialist is an absence in the folder, not the end of the department.
+    #[tokio::test]
+    async fn a_failed_specialist_does_not_stop_the_run() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE team_runs SET state = 'working' WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (failed, _) = open_run(&state, &id, "one").await.unwrap();
+        let (ok, _) = open_run(&state, &id, "two").await.unwrap();
+        sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
+            .bind(failed)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET status = 'completed', stdout = 'the draft' WHERE id = ?")
+            .bind(ok)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        for (ordinal, run_id) in [(1, failed), (2, ok)] {
+            sqlx::query(
+                "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                         run_id)
+                 VALUES (?, ?, 0, 'copywriter', 'work', 'running', ?)",
+            )
+            .bind(&id)
+            .bind(ordinal)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let run = fetch_run(&state, &id).await;
+        ingest_landed_items(&state, &run).await.unwrap();
+
+        let states: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT ordinal, state, output_path FROM team_items WHERE team_run_id = ? ORDER BY ordinal",
+        )
+        .bind(&id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(states[0].1, "failed");
+        assert_eq!(states[0].2, None, "a failed item leaves no file");
+        assert_eq!(states[1].1, "done");
+        assert_eq!(states[1].2.as_deref(), Some("2-copywriter.md"));
+        assert_eq!(fetch_run(&state, &id).await.state, "working");
+    }
+
+    /// The core names the file, which is what makes a collision between two specialists impossible
+    /// by construction rather than by agreement.
+    #[tokio::test]
+    async fn the_core_files_a_specialists_answer_under_a_name_it_chose() {
+        let (state, root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "one").await.unwrap();
+        sqlx::query(
+            "UPDATE runs SET status = 'completed', stdout = 'the launch post' WHERE id = ?",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                     run_id)
+             VALUES (?, 7, 0, 'copywriter', 'work', 'running', ?)",
+        )
+        .bind(&id)
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let run = fetch_run(&state, &id).await;
+        ingest_landed_items(&state, &run).await.unwrap();
+
+        let filed = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("teams")
+            .join("marketing")
+            .join(&id)
+            .join("7-copywriter.md");
+        assert_eq!(std::fs::read_to_string(filed).unwrap(), "the launch post");
+    }
+
+    /// A delivery is not collected when its run ends — it IS the delivery — and it is collected by
+    /// age. The two halves of that sentence are the two assertions.
+    #[tokio::test]
+    async fn a_recent_delivery_survives_the_gc_and_an_old_one_does_not() {
+        let (state, root) = state_with_root().await;
+        marketing(&state).await;
+        let now = chrono::Utc::now();
+
+        let mut folders = Vec::new();
+        for (id_hint, finished) in [
+            ("recent", now - chrono::Duration::days(1)),
+            (
+                "old",
+                now - chrono::Duration::days(TEAM_WORKSPACE_RETENTION_DAYS + 1),
+            ),
+        ] {
+            let id = start(&state, "marketing", id_hint).await.unwrap();
+            sqlx::query("UPDATE team_runs SET state = 'done', finished_at = ? WHERE id = ?")
+                .bind(finished.to_rfc3339())
+                .bind(&id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let folder = std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("teams")
+                .join("marketing")
+                .join(&id);
+            std::fs::write(folder.join("entrega.md"), "the answer").unwrap();
+            folders.push(folder);
+        }
+
+        workspace_gc(&state, now).await;
+
+        assert!(
+            folders[0].is_dir(),
+            "a delivery a day old is what the owner is about to read"
+        );
+        assert!(
+            !folders[1].exists(),
+            "a delivery past its retention should be collected"
+        );
+    }
+
+    /// A live run's folder is never collected, whatever its age — the ONE way this could delete
+    /// work in progress.
+    #[tokio::test]
+    async fn the_gc_never_touches_a_live_run() {
+        let (state, root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "still going").await.unwrap();
+        sqlx::query("UPDATE team_runs SET finished_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::days(999)).to_rfc3339())
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        workspace_gc(&state, chrono::Utc::now()).await;
+
+        let folder = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("teams")
+            .join("marketing")
+            .join(&id);
+        assert!(
+            folder.is_dir(),
+            "a run still in `planning` is not finished, whatever its timestamp says"
+        );
+    }
+
+    /// §*Cancellation safety*: a cancelled run leaves nothing in flight spending.
+    #[tokio::test]
+    async fn cancelling_leaves_no_run_still_spending() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "one").await.unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                     run_id)
+             VALUES (?, 1, 0, 'copywriter', 'work', 'running', ?)",
+        )
+        .bind(&id)
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        cancel(&state, &id).await.unwrap();
+
+        let run = fetch_run(&state, &id).await;
+        assert_eq!(run.state, "cancelled");
+        assert!(run.finished_at.is_some());
+        let still_running: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE team_run_id = ? AND status = 'running'",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            still_running, 0,
+            "a cancelled department left a run spending"
+        );
+        let items_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_items WHERE team_run_id = ? AND state IN ('pending', 'running')",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(items_left, 0);
+    }
+
+    /// Cancelling twice is a no-op rather than a way to overwrite how a run ended.
+    #[tokio::test]
+    async fn a_finished_run_cannot_be_cancelled_into_a_different_ending() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+        let run = fetch_run(&state, &id).await;
+        finish(&state, &run, "done", "the department delivered")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            cancel(&state, &id).await,
+            Err(TeamError::NotFound)
+        ));
+        assert_eq!(fetch_run(&state, &id).await.state, "done");
+    }
+
+    /// The column migration 0084 adds, doing the job it was added for: the director's own nodes are
+    /// part of what the run cost.
+    #[tokio::test]
+    async fn a_runs_spend_counts_the_directors_nodes_and_not_another_runs() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let mine = start(&state, "marketing", "mine").await.unwrap();
+        let theirs = start(&state, "marketing", "theirs").await.unwrap();
+
+        for (team_run, cost) in [(&mine, 1.5), (&mine, 0.5), (&theirs, 10.0)] {
+            let (run_id, _) = open_run(&state, team_run, "work").await.unwrap();
+            sqlx::query("UPDATE runs SET status = 'completed', cost_usd = ? WHERE id = ?")
+                .bind(cost)
+                .bind(run_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+
+        assert!((spend_of(&state.pool, &mine).await - 2.0).abs() < 1e-9);
+        assert!((spend_of(&state.pool, &theirs).await - 10.0).abs() < 1e-9);
+    }
+
+    /// The per-team ceiling stops the run BETWEEN rounds, and stops it as `stopped` rather than
+    /// `failed`: nothing failed, a ceiling was reached.
+    #[tokio::test]
+    async fn a_spent_team_budget_stops_the_run_before_a_round_and_not_as_a_failure() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        update(
+            &state.pool,
+            "marketing",
+            TeamRequest {
+                name: "Marketing".to_owned(),
+                mission: "sell the thing".to_owned(),
+                director_agent_id: "director".to_owned(),
+                max_rounds: 3,
+                max_parallel: 2,
+                budget_usd: Some(1.0),
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: vec!["copywriter".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "work").await.unwrap();
+        sqlx::query("UPDATE runs SET status = 'completed', cost_usd = 2.0 WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        team_tick(&state, chrono::Utc::now()).await;
+
+        let run = fetch_run(&state, &id).await;
+        assert_eq!(run.state, "stopped");
+        assert_eq!(run.outcome.as_deref(), Some("stopped"));
+        assert!(run.why.unwrap().contains("ceiling"));
+    }
+
+    /// Four hours is a ceiling on the clock, and it ends the run `expired` — which tells the owner
+    /// something `stopped` does not.
+    #[tokio::test]
+    async fn a_run_past_its_lifetime_expires() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        team_tick(
+            &state,
+            chrono::Utc::now() + MAX_TEAM_RUN_LIFETIME + chrono::Duration::minutes(1),
+        )
+        .await;
+
+        let run = fetch_run(&state, &id).await;
+        assert_eq!(run.state, "expired");
+        assert_ne!(run.state, "failed");
+    }
+
+    /// `director_node` is a marker and not a derived condition, and this is what it buys: a second
+    /// pass while a node is in flight must not launch another one. The cost of getting it wrong is
+    /// measured in `job.rs` at one wasted node per round.
+    /// `director_node` is a marker and not a derived condition, and this is what it buys: while a
+    /// node is in flight, no pass may launch a second one. The cost of getting it wrong is measured
+    /// in `job.rs` at one wasted node per round.
+    ///
+    /// The in-flight state is built here rather than produced by a first tick, and that is not
+    /// shortcutting: the fake runner answers instantly, so a tick-produced node would already have
+    /// LANDED by the second pass and the test would be asserting ingestion instead of the thing it
+    /// is named after. What is being pinned is a pass meeting a director run that is still running.
+    #[tokio::test]
+    async fn a_pass_does_not_launch_a_second_director_while_one_is_in_flight() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        let (in_flight, _) = open_run(&state, &id, "plan it").await.unwrap();
+        sqlx::query(
+            "UPDATE team_runs SET director_node = 'planning', director_run_id = ? WHERE id = ?",
+        )
+        .bind(in_flight)
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            team_tick(&state, chrono::Utc::now()).await;
+        }
+
+        let after = fetch_run(&state, &id).await;
+        assert_eq!(after.director_node, "planning");
+        assert_eq!(after.director_run_id, Some(in_flight));
+
+        let nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE team_run_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(nodes, 1, "three passes launched {nodes} director nodes");
+    }
+
+    /// The counterpart: with nothing in flight, a pass DOES launch the planner. Without this the
+    /// test above would pass just as well for a tick that does nothing at all.
+    ///
+    /// It is also what caught the ceiling check reading a NULL `budget_usd` as $0.00 — a team with
+    /// no ceiling, which is the default, was stopped before its first round. Nothing else would
+    /// have noticed: every other test here either sets a ceiling or never reaches a tick.
+    #[tokio::test]
+    async fn a_pass_launches_the_planner_when_nothing_is_in_flight() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post")
+            .await
+            .unwrap();
+
+        team_tick(&state, chrono::Utc::now()).await;
+
+        let nodes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE team_run_id = ? AND mode = ?")
+                .bind(&id)
+                .bind(TEAM_MODE)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let run = fetch_run(&state, &id).await;
+        assert_eq!(
+            nodes, 1,
+            "the pass launched no planner; the run is {} ({:?})",
+            run.state, run.why
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The folder, and who may read it
+    // -----------------------------------------------------------------------------------------
+
+    async fn run_with_a_folder(state: &AppState, id: &str) -> std::path::PathBuf {
+        insert_agent(state, "director", "claude").await;
+        insert_agent(state, "copywriter", "claude").await;
+        sqlx::query(
+            "INSERT OR IGNORE INTO teams
+                 (id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                  created_at, updated_at)
+             VALUES ('marketing', 'Marketing', 'sell', 'director', 3, 2, NULL,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES (?, 'marketing', 'r', ?, 'secret', 'working',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(workspace_for("marketing", id))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let folder = state
+            .files_root
+            .as_ref()
+            .unwrap()
+            .join("teams")
+            .join("marketing")
+            .join(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("1-copywriter.md"), "the launch post").unwrap();
+        folder
+    }
+
+    async fn read_as(
+        state: &AppState,
+        scope: Scope,
+        path: &str,
+    ) -> Result<Json<FileView>, (StatusCode, String)> {
+        post_read_file(
+            State(state.clone()),
+            axum::Extension(scope),
+            Json(ReadFileRequest {
+                path: path.to_owned(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_run_reads_its_own_folder() {
+        let (state, _root) = state_with_root().await;
+        run_with_a_folder(&state, "run-1").await;
+
+        let answer = read_as(
+            &state,
+            Scope::TeamRun("run-1".to_owned()),
+            "1-copywriter.md",
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.content, "the launch post");
+    }
+
+    /// 403 and not 401, for the reason `require_token` gives: the caller authenticated perfectly
+    /// well, it is simply not a department. Every other scope is refused, the control token
+    /// included — this route answers a run about its own folder, and the owner has the Files tab
+    /// for the same bytes.
+    #[tokio::test]
+    async fn no_scope_but_a_team_run_reads_a_team_folder() {
+        let (state, _root) = state_with_root().await;
+        run_with_a_folder(&state, "run-1").await;
+
+        for scope in [
+            Scope::Control,
+            Scope::Run(1),
+            Scope::Service(crate::auth::Service::Council),
+            Scope::ApiToken(crate::auth::ApiTokenLevel::Admin),
+        ] {
+            let refusal = read_as(&state, scope.clone(), "1-copywriter.md")
+                .await
+                .expect_err("only a department reads a department's folder");
+            assert_eq!(refusal.0, StatusCode::FORBIDDEN, "{scope:?}");
+        }
+    }
+
+    /// One department's key opens one department's folder, and the folder is not an argument.
+    ///
+    /// The assertion that matters is the neighbour's file: naming it by a relative path is how a
+    /// caller would try to make the argument decide, and `files.rs` refuses it before anything is
+    /// opened.
+    #[tokio::test]
+    async fn a_run_cannot_read_out_of_its_own_folder() {
+        let (state, root) = state_with_root().await;
+        run_with_a_folder(&state, "run-1").await;
+        run_with_a_folder(&state, "run-2").await;
+        std::fs::write(
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("owner-notes.md"),
+            "private",
+        )
+        .unwrap();
+
+        for path in [
+            "../run-2/1-copywriter.md",
+            "..\\run-2\\1-copywriter.md",
+            "../../../owner-notes.md",
+            "....//run-2/1-copywriter.md",
+            "/etc/passwd",
+            "C:\\Windows\\win.ini",
+        ] {
+            let refusal = read_as(&state, Scope::TeamRun("run-1".to_owned()), path)
+                .await
+                .unwrap_err();
+            assert!(
+                refusal.0 == StatusCode::BAD_REQUEST || refusal.0 == StatusCode::NOT_FOUND,
+                "{path} answered {}",
+                refusal.0
+            );
+        }
+
+        // And the run beside it reads its own copy perfectly well, so the loop above is refusing
+        // the escape rather than the whole route.
+        assert!(
+            read_as(
+                &state,
+                Scope::TeamRun("run-2".to_owned()),
+                "1-copywriter.md"
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_for_a_run_that_left_no_folder_is_a_404_and_not_a_panic() {
+        let (state, _root) = state_with_root().await;
+
+        let refusal = read_as(&state, Scope::TeamRun("never-existed".to_owned()), "a.md")
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+    }
+}

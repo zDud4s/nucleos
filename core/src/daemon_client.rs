@@ -5,9 +5,28 @@ use serde_json::Value;
 
 use crate::autopilot::{Mode, ProjectSummary};
 
+/// The header that says WHICH NODE is calling.
+///
+/// A team's key names the run, not the node — a director and its specialists hold the identical
+/// token, which is right, because the key belongs to the run. Some questions are about the node
+/// anyway ("is this the director?", "which item asked for this?"), and this is how the answer
+/// travels.
+///
+/// **It is not the model naming itself.** The value comes from `NUCLEOS_RUN_ID`, which the daemon
+/// writes into the node's environment (`runs::run_env`) and which this client — the daemon's own
+/// code — reads and sends. A model calls a tool with the parameters that tool declares; it never
+/// builds the HTTP request. Anything able to forge this header already holds
+/// `NUCLEOS_DAEMON_TOKEN`, which arrives by the identical route, so it buys an attacker nothing
+/// they did not have. The daemon still checks that the node named belongs to the run the key
+/// authenticated, so a stale or foreign value resolves to nobody rather than to somebody else.
+pub const RUN_ID_HEADER: &str = "x-nucleos-run-id";
+
 pub struct DaemonClient {
     base_url: String,
     token: String,
+    /// The node this client speaks for, when it speaks for one. `None` for the desktop app and for
+    /// every caller whose identity is fully described by its token.
+    run_id: Option<i64>,
     http: reqwest::Client,
 }
 
@@ -16,7 +35,16 @@ impl DaemonClient {
         Self {
             base_url,
             token,
+            run_id: None,
             http: reqwest::Client::new(),
+        }
+    }
+
+    /// A client that speaks for one node of one run. See `RUN_ID_HEADER`.
+    pub fn as_run(base_url: String, token: String, run_id: i64) -> Self {
+        Self {
+            run_id: Some(run_id),
+            ..Self::new(base_url, token)
         }
     }
 
@@ -29,13 +57,25 @@ impl DaemonClient {
             return Err("NUCLEOS_DAEMON_TOKEN not set".into());
         }
 
-        Ok(Self::new(base_url, token))
+        Ok(Self {
+            // Absent for the runs that have no use for it, and unparseable is the same as absent:
+            // a malformed value must not become a node id that happens to be valid.
+            run_id: std::env::var("NUCLEOS_RUN_ID")
+                .ok()
+                .and_then(|id| id.parse().ok()),
+            ..Self::new(base_url, token)
+        })
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http
+        let request = self
+            .http
             .request(method, format!("{}{path}", self.base_url))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token);
+        match self.run_id {
+            Some(run_id) => request.header(RUN_ID_HEADER, run_id.to_string()),
+            None => request,
+        }
     }
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectSummary>, String> {
@@ -232,6 +272,28 @@ impl DaemonClient {
         json_or_refusal(response, "reading a web page").await
     }
 
+    /// Read one file out of the calling team run's own workspace.
+    ///
+    /// **The run is not an argument, and that is the whole design of this call.** Which folder gets
+    /// opened comes from the `Scope::TeamRun` that authenticated the request, so the caller names a
+    /// path inside its delivery and nothing else. A `team_run_id` parameter would be the caller
+    /// naming what it may read, which is not a permission anything here grants itself.
+    ///
+    /// Reading only, like `list_files` and `web_read` beside it: the specialists do not write their
+    /// answers, `team.rs` does. A write verb here would reintroduce the collision between two
+    /// specialists choosing the same filename that naming the files from the core removes by
+    /// construction.
+    pub async fn read_team_file(&self, path: &str) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/team-files/read")
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     // The browser pillar's five agent verbs (spec §6.1).
     //
     // # What is NOT here, and why each absence is load-bearing
@@ -264,6 +326,67 @@ impl DaemonClient {
             .json()
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Ask the core to do something on the calling department's behalf.
+    ///
+    /// **The run is not an argument**, for `read_team_file`'s reason one method up: the department
+    /// is named by the key that authenticated the call, never by the body.
+    ///
+    /// Unlike every other method here, a refusal is READ AND RETURNED rather than reduced to a
+    /// status. Every refusal on this route carries a sentence written for the model — "this
+    /// department may not send email", "you already have five waiting for approval" — and each one
+    /// leads somewhere different: rewrite the request, ask for something else, or say plainly in the
+    /// deliverable that it could not be done. A bare `403` leads to a retry.
+    pub async fn propose_action(
+        &self,
+        kind: &str,
+        payload: &Value,
+        why: &str,
+    ) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/team-actions")
+            .json(&serde_json::json!({ "kind": kind, "payload": payload, "why": why }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// A director asks the owner for a specialist its department does not have.
+    ///
+    /// The whole request travels as one object rather than as seven parameters, because it is one
+    /// object at both ends — `team::RecruitRequest` here, `agent::AgentRequest` after a person has
+    /// edited it — and unpacking it in the middle would be a third place the field list is written.
+    ///
+    /// Refusals are read and returned like `propose_action`'s, and here it matters more: a
+    /// specialist calling this is told to put it in its answer instead, and "403" does not say that.
+    pub async fn propose_teammate(&self, request: &Value) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/team-recruits")
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
     }
 
     /// The accessibility view of a page: what is there and what it is called.

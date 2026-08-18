@@ -306,6 +306,115 @@ pub async fn create_calendar_event(
     Ok(proposal_id)
 }
 
+/// A department asked to do something, and this is the question a human answers.
+///
+/// The fifth `kind`, the third that touches no run, and the first that is filed by an agent about
+/// an action the AGENT will not perform. Approving it does not resume anything and does not act:
+/// it marks the proposal, and `team_tick` picks the action up on its next pass. That separation is
+/// the point — see `team::execute_due_actions` and the design's #7.
+///
+/// **Written inside the caller's transaction, on purpose.** `team.rs` writes the `team_actions` row
+/// and this proposal together or writes neither: an action with no proposal is an action nobody
+/// will ever decide, and a proposal with no action is a button that approves nothing. That is why
+/// this takes a transaction where its four siblings take a pool.
+///
+/// `project_id` is NULL, like `calendar-event` and `contact-merge` before it, and the consequence is
+/// deliberate: `wip::OPEN_REVIEW_ITEMS_SQL` filters by project, so these never reach the per-project
+/// ceiling. The ceiling that governs them is `teams.max_open_actions`, which is per team, because a
+/// department has no project to be counted against.
+pub(crate) async fn create_team_action_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    kind: &str,
+    why: &str,
+    payload: &str,
+    now: &str,
+) -> sqlx::Result<i64> {
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('team-action', 'pending', NULL, NULL, NULL, ?, ?, ?, ?, NULL)",
+    )
+    // `tool_name` carries the ACTION's kind — `send_email`, `file_document`. It is the one column
+    // the approvals list already renders, and a queue that says only "team-action" would make the
+    // person open every row to find out what they are agreeing to.
+    .bind(kind)
+    .bind(why)
+    .bind(payload)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(proposal_id)
+}
+
+/// A director found a gap in its roster and is asking for somebody to fill it.
+///
+/// The sixth `kind`, and the third application of the shape `create_calendar_event` established:
+/// the agent never writes the `agents` row. A catalogue that a director could write into directly
+/// would be permanent house staff created from a sentence a model wrote mid-round, and in a month
+/// nobody knows who is who — which is the problem the catalogue was built to solve.
+///
+/// **Not a `GRANTABLE_ACTIONS` entry**, deliberately, for the reason `list_skipped_items` gives
+/// about sharing a door: approving an action means *do that*, approving a recruitment means *keep
+/// this person*. One executes and is finished; the other executes nothing and lasts forever. And
+/// only one of them is editable at the moment of approval, which no shared button could express.
+///
+/// `team_run_id` is kept in the payload so that months later somebody can read WHAT WORK made this
+/// person be hired. `project_id` is NULL, like every other proposal a department files.
+pub async fn create_agent_recruit(
+    pool: &SqlitePool,
+    team_id: &str,
+    team_run_id: &str,
+    slug: &str,
+    request: &serde_json::Value,
+    why: &str,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut payload = request.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("team_id".into(), team_id.into());
+        object.insert("team_run_id".into(), team_run_id.into());
+        // The id the name will earn, stored beside it so `recruit_pending_for` can ask about it
+        // without re-deriving a slug from a name somebody may have edited since.
+        object.insert("slug".into(), slug.into());
+    }
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('agent-recruit', 'pending', NULL, NULL, NULL, ?, ?, ?, ?, NULL)",
+    )
+    .bind(slug)
+    .bind(why)
+    .bind(payload.to_string())
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
 /// Everything a wheel request has to say, as one value.
 ///
 /// A struct rather than seven arguments, and the grouping is not only length: three of these are
@@ -389,6 +498,93 @@ pub async fn create_wheel_request(pool: &SqlitePool, ask: WheelAsk<'_>) -> sqlx:
 
     transaction.commit().await?;
     Ok(proposal_id)
+}
+
+/// Whether somebody has already been asked for under this id and nobody has answered.
+///
+/// `calendar_proposal_pending_for` exists for the identical reason and says it: *"Without this,
+/// every triage pass over the same message would file another one."* A director replans every round
+/// with the same prompt and the same gap in front of it, so without this it asks for three lawyers
+/// in three rounds.
+///
+/// Keyed on `tool_name`, which carries the slug, rather than on a `LIKE` over the payload: the id is
+/// what would collide in the catalogue, and it is the only field here that is not free text.
+pub async fn recruit_pending_for(pool: &SqlitePool, slug: &str) -> sqlx::Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM proposals
+          WHERE kind = 'agent-recruit' AND status = 'pending' AND tool_name = ?
+          LIMIT 1",
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
+/// Every recruitment still waiting, and — for a director's prompt — the ones from one run.
+pub async fn list_pending_recruits(
+    pool: &SqlitePool,
+    team_run_id: Option<&str>,
+) -> sqlx::Result<Vec<Proposal>> {
+    let rows = sqlx::query_as::<_, Proposal>(
+        // `errand_id` and `NULL AS errand_name` in master's own shape. A department has no errand
+        // and never will, so the id is always NULL here -- but the column has to be SELECTED all
+        // the same, because `Proposal` grew both fields and `query_as` hydrates by name. Missing
+        // one is not a compile error; it is a row that fails to decode at runtime.
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals
+         WHERE status = 'pending' AND kind = 'agent-recruit'
+         ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let Some(team_run_id) = team_run_id else {
+        return Ok(rows);
+    };
+    // Filtered here rather than in SQL, because the run id lives inside the JSON payload and a
+    // `LIKE` over it would match a name that happened to contain the id. Read back, compared, done —
+    // the list is a handful of rows.
+    Ok(rows
+        .into_iter()
+        .filter(|proposal| {
+            proposal
+                .tool_input
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|payload| {
+                    payload
+                        .get("team_run_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .is_some_and(|named| named == team_run_id)
+        })
+        .collect())
+}
+
+/// The queue a person works through for departments.
+///
+/// A door of its own rather than a `kind` argument on `list_pending`, for the reason
+/// `list_skipped_items` gives: those two lists are answered by different actions. `list_pending` is
+/// work stopped mid-stride that `approve` lets through; this is work that will START when approved,
+/// and the run that asked has usually finished by then.
+pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    sqlx::query_as::<_, Proposal>(
+        // `errand_id` and `NULL AS errand_name` in master's own shape. A department has no errand
+        // and never will, so the id is always NULL here -- but the column has to be SELECTED all
+        // the same, because `Proposal` grew both fields and `query_as` hydrates by name. Missing
+        // one is not a compile error; it is a row that fails to decode at runtime.
+        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
+                NULL AS errand_name, tool_name, reasoning,
+                tool_input, created_at, decided_at
+         FROM proposals
+         WHERE status = 'pending' AND kind = 'team-action'
+         ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// Whether a message already has a calendar proposal waiting on a decision.

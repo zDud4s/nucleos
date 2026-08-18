@@ -892,7 +892,14 @@ async fn should_continue(state: &AppState, errand: &crate::errands::Errand) -> V
         return Verdict::Enough;
     };
 
-    let notebook = match crate::errands::read_notebook(&state.email.files_root, errand) {
+    let Some(files_root) = state.files_root.as_deref() else {
+        tracing::warn!(
+            errand_id = errand.id,
+            "there is no files folder to read the notebook from; the investigation stops"
+        );
+        return Verdict::Enough;
+    };
+    let notebook = match crate::errands::read_notebook(files_root, errand) {
         Ok(notebook) => notebook,
         Err(error) => {
             tracing::warn!(errand_id = errand.id, %error, "could not read the notebook to check the criterion");
@@ -1296,6 +1303,7 @@ mod tests {
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2426,11 +2434,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("create files root");
         let root = crate::files::ensure_root(temp.path()).expect("prepare files root");
         let state = test_state(None).await;
-        let mut email = (*state.email).clone();
-        email.files_root = root;
         (
             AppState {
-                email: Arc::new(email),
+                files_root: Some(root),
                 ..state
             },
             temp,

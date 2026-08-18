@@ -121,6 +121,23 @@ pub struct RunRequest {
     pub ambient_mcp: bool,
     /// Per-run override of the runner's configured model. `None` keeps it.
     pub model: Option<String>,
+    /// Which of this server's tools this run is offered, when it is offered any at all.
+    ///
+    /// `None` — every caller but one — keeps the wildcard: `--allowedTools mcp__nucleos__*`, the
+    /// whole server. `Some(names)` narrows it to those names, prefixed here so the caller states
+    /// tool names and not CLI syntax.
+    ///
+    /// **Economy, not a boundary, and the distinction is worth keeping straight.** What a run may
+    /// actually reach is decided by the scope of the key in its environment, in `auth::permits`; a
+    /// run handed the wildcard and a narrow key is already safe. What it is not is workable: the
+    /// model sees a tool, calls it, takes a 403 and burns its turns achieving nothing while still
+    /// exiting 0 — the failure this file documents measuring at $1.47 for zero files touched, by a
+    /// different cause.
+    ///
+    /// Only read when `mcp_config` is `Some`, because that is the only branch that writes
+    /// `--allowedTools` at all. A narrowing passed without an MCP config narrows nothing, which is
+    /// the harmless direction.
+    pub allowed_mcp_tools: Option<&'static [&'static str]>,
 }
 
 /// One line of `--input-format stream-json` stdin: a single user turn.
@@ -319,7 +336,14 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());
         args.push("--allowedTools".to_string());
-        args.push("mcp__nucleos__*".to_string());
+        args.push(match request.allowed_mcp_tools {
+            None => "mcp__nucleos__*".to_string(),
+            Some(names) => names
+                .iter()
+                .map(|name| format!("mcp__nucleos__{name}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        });
     }
     match request.tool_policy {
         // No tool denial — the classifier governs what an autopilot run may call — but the ambient
@@ -2029,6 +2053,47 @@ mod tests {
         );
     }
 
+    /// The wildcard is what every caller but a department gets, and a department gets exactly its
+    /// own list — prefixed here, so callers name tools rather than CLI syntax.
+    #[test]
+    fn a_narrowed_request_advertises_only_the_tools_it_names() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+
+        let wide = cli_args(&request, "claude-sonnet-5");
+        let flag = wide.windows(2).find(|w| w[0] == "--allowedTools").unwrap();
+        assert_eq!(flag[1], "mcp__nucleos__*");
+
+        request.allowed_mcp_tools = Some(&["list_files", "read_team_file"]);
+        let narrow = cli_args(&request, "claude-sonnet-5");
+        let flag = narrow
+            .windows(2)
+            .find(|w| w[0] == "--allowedTools")
+            .unwrap();
+        assert_eq!(
+            flag[1],
+            "mcp__nucleos__list_files,mcp__nucleos__read_team_file"
+        );
+        assert!(
+            !narrow.iter().any(|arg| arg == "mcp__nucleos__*"),
+            "the wildcard must be replaced, not accompanied — one of the two would win and it \
+             would not be obvious which"
+        );
+    }
+
+    /// Narrowing without an MCP config narrows nothing, which is the harmless direction and worth
+    /// pinning: the flag is only ever written inside the `mcp_config` branch.
+    #[test]
+    fn narrowing_a_request_with_no_mcp_server_adds_no_flag() {
+        let mut request = baseline_run_request();
+        request.allowed_mcp_tools = Some(&["list_files"]);
+        assert!(
+            !cli_args(&request, "claude-sonnet-5")
+                .iter()
+                .any(|a| a == "--allowedTools")
+        );
+    }
+
     fn baseline_run_request() -> RunRequest {
         RunRequest {
             prompt: "test prompt".to_string(),
@@ -2047,6 +2112,7 @@ mod tests {
             ambient_mcp: false,
             model: None,
             messages: None,
+            allowed_mcp_tools: None,
         }
     }
 
@@ -2068,6 +2134,7 @@ mod tests {
             ambient_mcp: false,
             model: None,
             messages: None,
+            allowed_mcp_tools: None,
         }
     }
 

@@ -142,6 +142,34 @@ pub struct Turn {
 pub const NO_ANSWER: &str =
     "I could not finish working that out. Try asking for one thing at a time.";
 
+/// An empty tool box, for the turns that have none.
+///
+/// It lives beside the trait rather than in either of its two callers, because both a council's
+/// silent phases and a team agent declared `tool_policy: none` want exactly this and a second copy
+/// would be a second answer to "what does an unoffered tool call do".
+///
+/// A type rather than an `Option` threaded through `run_turn`, because "no tools" and "tools that
+/// are all refused" are different things to a model: an empty schema list means it is never offered
+/// one, and never offered is never called.
+pub struct NoTools;
+
+#[async_trait::async_trait]
+impl ToolBox for NoTools {
+    fn schemas(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    /// `ToolAnswer::own`, and it is not a formality: an empty box advertises nothing, so the only
+    /// way to reach this is a name the model invented — and an invented name brings no stranger's
+    /// words into the turn, because no tool ran.
+    async fn call(&self, name: &str, _arguments: &serde_json::Value) -> ToolAnswer {
+        ToolAnswer::own(
+            serde_json::json!({"error": format!("{name} is not a tool this turn can use")})
+                .to_string(),
+        )
+    }
+}
+
 /// Drives one local turn to an answer.
 ///
 /// `system` is separated from `prompt` because a local model needs to be told what it is far more
