@@ -24,6 +24,7 @@ import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
+import { Voice } from "./pages/Voice";
 import { Waiting } from "./pages/Waiting";
 import { Web } from "./pages/Web";
 
@@ -61,6 +62,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/mail": Mail,
   "/contacts": Contacts,
   "/calendar": Calendar,
+  "/voice": Voice,
   "/web": Web,
   "/browser": Browser,
 };

@@ -56,9 +56,11 @@ describe("the app router", () => {
   });
 
   it("gives an unbuilt page a Teach that names the slice it arrives with", async () => {
-    await renderApp({ initialPath: "/voice" });
+    // Was "/voice" — the Pillars slice's own example of an unbuilt page until
+    // that slice built it. "/files" is the pillar still waiting.
+    await renderApp({ initialPath: "/files" });
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Voice" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 1, name: "Files" })).toBeDefined();
     // Not a spinner and not a 404: the route works, the page is simply not
     // built, and saying which slice brings it is the difference between a
     // placeholder and a dead end.
