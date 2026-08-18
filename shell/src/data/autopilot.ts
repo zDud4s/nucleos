@@ -1,0 +1,353 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { apiFetch } from "./client";
+import { keys } from "./keys";
+import { POLL } from "./poll";
+import type { AutopilotMode } from "./system";
+
+/**
+ * The governance slice of the núcleo, as hooks.
+ *
+ * Everything the Autopilot cockpit reads or writes that is *not* already served
+ * by another module lives here. Four things it deliberately does **not**
+ * declare, because declaring them twice would be two cache entries on one
+ * truth: `useProjects` / `useBudget` / `useProposals` / `useKillSwitch` come
+ * from `data/system.ts`, `useLiveJobs` / `useCreateJob` from `data/fleet.ts`,
+ * and the feed from `data/feed.ts`.
+ *
+ * **`GET /autopilot/state` is not the cockpit's read.** It takes a required
+ * `?project_id=` and answers `{project_id, mode}` — one project's setting and
+ * nothing else (`core/src/http.rs`, `get_autopilot_state`). The roster with its
+ * governance counts is `GET /projects`, which already carries `mode`,
+ * `promotable`, `classes_ready` and the WIP fields. So there is no
+ * `useAutopilotState` here at all: the page would have had to fire one request
+ * per project to learn what one request already told it.
+ */
+
+/* ----------------------------------------------------------------- shapes -- */
+
+/** One per-scope brake, exactly as `autopilot::ScopedKill` serialises. */
+export interface ScopedKill {
+  /** `project` or `trigger` — the daemon answers 400 for anything else. */
+  scope_type: string;
+  scope_id: string;
+  engaged: boolean;
+}
+
+/** What `POST /autopilot/kill/scoped` accepts. The body is the whole row. */
+export interface ScopedKillChange {
+  scope_type: string;
+  scope_id: string;
+  engaged: boolean;
+}
+
+/**
+ * One action class's shadow record, as `shadow::ClassTally` serialises.
+ *
+ * Grouped by `(runs.mode, action_class)`, so a project that has run in more
+ * than one mode gets more than one row per class. Only the `shadow` rows are
+ * evidence for promotion — see {@link SHADOW_EVIDENCE_MODE}.
+ */
+export interface ClassTally {
+  mode: string;
+  action_class: string;
+  total: number;
+  would_allow: number;
+  would_pend: number;
+  would_deny: number;
+  reviewed: number;
+  agree: number;
+  disagree: number;
+}
+
+/** One decision the classifier made without enforcing it, awaiting a human verdict. */
+export interface ShadowDecision {
+  id: number;
+  run_id: number;
+  tool_name: string;
+  /** The arguments, as the JSON the classifier saw. Null when nothing was recorded. */
+  tool_input: string | null;
+  /** What the classifier *would* have done: `allow` | `pending_approval` | `deny`. */
+  decision: string;
+  reason: string | null;
+  action_class: string;
+  classifier_version: number;
+  /** `approve` | `reject`, once somebody has answered. Null is unreviewed. */
+  human_verdict: string | null;
+  reviewed_at: string | null;
+  created_at: string;
+}
+
+/** What `POST /autopilot/state` answers on success — 200 with a body, not a 204. */
+export interface AutopilotState {
+  project_id: string;
+  mode: AutopilotMode;
+}
+
+/** What that route accepts. `project_root` is required for `shadow` and `active`. */
+export interface ModeChange {
+  project_id: string;
+  mode: AutopilotMode;
+  project_root?: string;
+}
+
+export interface ShadowVerdict {
+  decisionId: number;
+  verdict: "approve" | "reject";
+}
+
+/* -------------------------------------------------------------- the bar -- */
+
+/**
+ * The mode whose decisions count toward leaving shadow.
+ *
+ * `shadow::shadow_readiness` reads `WHERE runs.mode = 'shadow'` and nothing
+ * else, because promotion out of shadow is earned by evidence gathered *in*
+ * shadow: a `worktree`-mode decision was actually enforced, not a hypothetical
+ * a human could still overrule. The scoreboard returns every mode, so the page
+ * has to say which rows are the evidence and which are history.
+ */
+export const SHADOW_EVIDENCE_MODE = "shadow";
+
+/**
+ * The shadow-exit bar, as the núcleo states it (`shadow.rs`).
+ *
+ * Mirrored here **to be shown, never to be applied.** The daemon's own comment
+ * is explicit that the shell reads `classes_ready` and `promotable` off
+ * `GET /projects` rather than recomputing them, so that the button a person
+ * sees and the rule the product enforces cannot gate on different arithmetic.
+ *
+ * There is a sharper reason than tidiness, and it is the one that makes
+ * recomputing here actually *wrong*: the gate counts reviews and agreements
+ * **distinct by `(tool_name, tool_input)`** (`AGREE_DISTINCT` in `shadow.rs`),
+ * while the scoreboard counts every row. Ten reviews of the same command are
+ * ten on this panel and one at the bar. So these two numbers are context for
+ * reading a tally — "the bar is ten reviews at 95%" — and the panel says out
+ * loud that the enforced count deduplicates.
+ */
+export const READINESS_MIN_REVIEWED = 10;
+export const READINESS_MIN_AGREE_PERCENT = 95;
+
+/* ------------------------------------------------------------------ keys -- */
+
+/**
+ * The one key this file has to spell for itself.
+ *
+ * `keys.autopilot.shadowDecisions` is a bare prefix, and the route it stands
+ * for takes a required `?project_id=` — two projects sharing one cache entry
+ * would show one project's decisions under the other's name. The project is
+ * appended *under* the declared prefix rather than beside it, so an
+ * `invalidateQueries({ queryKey: keys.autopilot.shadowDecisions })` after a
+ * verdict still reaches every project's list. `data/keys.ts` is not this
+ * packet's to edit.
+ */
+function shadowDecisionsKey(projectId: string) {
+  return [...keys.autopilot.shadowDecisions, projectId] as const;
+}
+
+/* ----------------------------------------------------------------- reads -- */
+
+/**
+ * What the classifier has decided for one project, class by class.
+ *
+ * `POLL.queue` rather than `POLL.fast`: this only moves when a shadow run
+ * records a decision or somebody reviews one, and both are events. `enabled`
+ * because the route's `project_id` is required — asking without one is a 400,
+ * so "no project chosen" must not become a failed request.
+ *
+ * **No `keepPreviousData`**, unlike the lists in `system.ts` and `fleet.ts`.
+ * The project is part of the key, so carrying the previous answer across a
+ * change of key would show one project's record under another project's name —
+ * on the page where the reader is deciding whether that project may act on its
+ * own. A blank half-second is the cheaper mistake.
+ */
+export function useScoreboard(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.autopilot.scoreboard(projectId ?? ""),
+    queryFn: () => apiFetch<ClassTally[]>(`/scoreboard?project_id=${encodeURIComponent(projectId ?? "")}`),
+    enabled: projectId !== null,
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * The decisions nobody has answered yet, for one project.
+ *
+ * `list_unreviewed` filters `human_verdict IS NULL`, so a row leaves this list
+ * the moment a verdict lands — which is why the verdict mutation invalidates it
+ * rather than trying to patch it. No `keepPreviousData`, for the reason given
+ * on the scoreboard above.
+ */
+export function useShadowDecisions(projectId: string | null) {
+  return useQuery({
+    queryKey: shadowDecisionsKey(projectId ?? ""),
+    queryFn: () =>
+      apiFetch<ShadowDecision[]>(`/shadow-decisions?project_id=${encodeURIComponent(projectId ?? "")}`),
+    enabled: projectId !== null,
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * The per-scope brakes.
+ *
+ * `POLL.fast` and not the queue cadence, for the reason the global switch gives
+ * in `data/system.ts`: a brake that reads *released* because nothing refetched
+ * is the most dangerous stale value a governance page can show.
+ */
+export function useScopedKills() {
+  return useQuery({
+    queryKey: keys.autopilot.scopedKills,
+    queryFn: () => apiFetch<ScopedKill[]>("/autopilot/kill/scoped"),
+    refetchInterval: POLL.fast,
+  });
+}
+
+/* ------------------------------------------------------------- mutations -- */
+
+/**
+ * Answer one shadow decision.
+ *
+ * **204, so there is no body** (`post_shadow_verdict`) — `void` is the honest
+ * type, and `apiFetch` exempts 204 from its JSON parse. A verdict can also move
+ * the project across the promotion bar, which is why the roster is invalidated
+ * alongside the list: `promotable` is computed by the daemon on every roster
+ * read, and the promote control must unlock on the same tick the last review
+ * lands rather than three seconds later.
+ */
+export function useSetShadowVerdict() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ decisionId, verdict }: ShadowVerdict) =>
+      apiFetch<void>(`/shadow-decisions/${decisionId}/verdict`, {
+        method: "POST",
+        body: JSON.stringify({ verdict }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.shadowDecisions });
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
+/**
+ * Move a project between `off`, `shadow` and `active`.
+ *
+ * No optimistic write, and that is the whole point of this mutation: the daemon
+ * checks the activation prerequisites and can answer **422 with an empty body**
+ * (`activation_status` maps four different `ActivationError`s onto one bare
+ * status). A mode drawn optimistically would have to be un-drawn, and the one
+ * thing a person must never be unsure about is whether a project is acting on
+ * its own.
+ *
+ * The refusal carries **no detail at all** — `client.ts` fills it from
+ * `statusText`, so it arrives as the words "Unprocessable Entity". The page
+ * therefore says the generic prerequisite sentence and offers the root input;
+ * inventing a specific cause here would be a guess between four.
+ */
+export function useSetProjectMode() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: ModeChange) =>
+      apiFetch<AutopilotState>("/autopilot/state", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
+    },
+  });
+}
+
+/**
+ * Engage or release one scope's brake.
+ *
+ * 204 again, so `void`. Optimistic, like the global switch and for the same
+ * reason: engaging a brake is a stopping gesture and has to look like it took.
+ * `cancelQueries` is what stops a 3-second tick already in flight from landing
+ * after the optimistic write and putting the switch back.
+ *
+ * A scope the daemon has never been told about is simply absent from the
+ * listing, so the optimistic update has to be able to *add* a row rather than
+ * only patch one — the first engagement of a scope is the common case, not the
+ * edge one.
+ */
+export function useSetScopedKill() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: ScopedKillChange) =>
+      apiFetch<void>("/autopilot/kill/scoped", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onMutate: async (change: ScopedKillChange) => {
+      await queryClient.cancelQueries({ queryKey: keys.autopilot.scopedKills });
+      const previous = queryClient.getQueryData<ScopedKill[]>(keys.autopilot.scopedKills);
+      if (previous !== undefined) {
+        queryClient.setQueryData<ScopedKill[]>(
+          keys.autopilot.scopedKills,
+          withScope(previous, change),
+        );
+      }
+      return { previous };
+    },
+    onError: (_error, _change, context) => {
+      // Put back exactly what was there, including "there was nothing": writing a
+      // guessed value onto a failed brake would invent a state the daemon never had.
+      if (context !== undefined) {
+        queryClient.setQueryData<ScopedKill[] | undefined>(
+          keys.autopilot.scopedKills,
+          context.previous,
+        );
+      }
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.scopedKills });
+    },
+  });
+}
+
+/** The listing with one scope's state replaced, or appended when it was not in it. */
+function withScope(rows: ScopedKill[], change: ScopedKillChange): ScopedKill[] {
+  const known = rows.some(
+    (row) => row.scope_type === change.scope_type && row.scope_id === change.scope_id,
+  );
+  if (!known) return [...rows, { ...change }];
+  return rows.map((row) =>
+    row.scope_type === change.scope_type && row.scope_id === change.scope_id
+      ? { ...row, engaged: change.engaged }
+      : row,
+  );
+}
+
+/* --------------------------------------------------------------- readings -- */
+
+/** Is this scope's brake on? An absent row means the daemon was never told, which is off. */
+export function scopeEngaged(rows: ScopedKill[] | undefined, type: string, id: string): boolean {
+  return rows?.some((row) => row.scope_type === type && row.scope_id === id && row.engaged) ?? false;
+}
+
+/**
+ * What a classifier decision *would* have done, in a word.
+ *
+ * `pending_approval` is the one worth spelling out: it is neither an allow nor a
+ * deny, it is the classifier declining to decide — and in shadow it is also the
+ * evidence of restraint that `promotable` requires at least one ready class to
+ * be made of.
+ */
+export function readShadowDecision(decision: string): string {
+  switch (decision.trim()) {
+    case "allow":
+      return "would have allowed";
+    case "deny":
+      return "would have denied";
+    case "pending_approval":
+      return "would have asked first";
+    default:
+      return decision.trim();
+  }
+}

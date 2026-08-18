@@ -1,0 +1,220 @@
+/**
+ * The Voice slice: the capture panel, configuration, and the two capture
+ * lists, `voice-` throughout — as `mail-` is for the mail queue and `web-`
+ * for the archive.
+ *
+ * The rule this file lives under: **no class appears in `Voice.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. Grep the component against
+ * this file before calling the page done.
+ */
+
+/* ================================================================ shared == */
+
+.voice-loading,
+.voice-note {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.voice-loading {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.voice-count {
+  padding: 0.1em var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--tone-pending-bg);
+  color: var(--tone-pending-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- capture -- */
+
+.voice-capture-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+/* What the daemon said about the attempt, after asking — quiet and
+   informational, never the danger tone: a `204` here is a value the daemon
+   sent on purpose, not a fault. */
+.voice-outcome {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-info-border);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.voice-delivery {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-active-border);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* One of the five verbatim `held` sentences — a paste that did not land, not
+   a fault of this shell's own, so it stays the paused tone rather than the
+   danger one. */
+.voice-delivery-held {
+  border-left-color: var(--tone-paused-border);
+}
+
+.voice-hotkey-conflict {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-paused-border);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* --------------------------------------------------------- configuration -- */
+
+.voice-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+}
+
+.voice-config-fact {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.voice-config-fact dt {
+  flex: 0 0 10rem;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.voice-config-fact dd {
+  margin: 0;
+  color: var(--text);
+}
+
+.voice-config-prompt-label {
+  margin: 0 0 var(--space-1);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.voice-config-prompt {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.voice-hints {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-5);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.voice-config-source {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.voice-config-source code {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* ------------------------------------------------------------------ lists -- */
+
+.voice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
+}
+
+.voice-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+}
+
+.voice-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.voice-row-duration {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.voice-row-model {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+.voice-row-clean {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.voice-row-raw {
+  margin: 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}

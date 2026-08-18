@@ -1,102 +1,136 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import { Button, type ButtonProps } from "./Button";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Button, type ButtonIntent, type ButtonVariant } from "./Button";
 
-interface ConfirmButtonProps extends Omit<ButtonProps, "onClick"> {
-  /** Rótulo mostrado no estado armado — a pergunta, ex.: "Discard worktree?" */
-  confirmLabel: string;
+/**
+ * How long an armed control stays armed.
+ *
+ * Long enough to read the second label and mean it; short enough that a control
+ * you armed and walked away from is not still live when you come back. An
+ * interlock that never expires is a single-click delete with extra steps.
+ */
+const ARM_WINDOW_MS = 4000;
+
+/**
+ * The dead time immediately after arming.
+ *
+ * A double-click is one gesture, and without this a double-click on a delete
+ * button both arms and confirms it — the interlock would defend against nothing
+ * and would feel, to the person who lost the row, exactly like no interlock at
+ * all. Clicks inside the dwell are *ignored*: they do not confirm, and they do
+ * not disarm either, because disarming would punish the reflex and make the
+ * control feel broken.
+ */
+const DWELL_MS = 300;
+
+export interface ConfirmButtonProps {
+  /** What it says at rest. */
+  label: ReactNode;
+  /** What it says once armed. Say what will happen, not "Confirm". */
+  confirmLabel: ReactNode;
   onConfirm: () => void;
   /**
-   * Chamado quando o botão arma e desarma. Um pai cuja lista se reordena
-   * sozinha usa isto para ficar quieto enquanto uma decisão está aberta.
+   * Told whenever the armed state changes.
+   *
+   * Not decoration: the approval queue freezes its sort order while any card is
+   * armed, so that a list re-ordering under a poll tick cannot move a different
+   * row under the finger that is about to confirm.
    */
   onArmedChange?: (armed: boolean) => void;
-  children: ReactNode;
+  variant?: ButtonVariant;
+  intent?: ButtonIntent;
+  disabled?: boolean;
+  title?: string;
 }
 
-const DISARM_AFTER_MS = 4000;
 /**
- * Two clicks are only a confirmation if a person could have read the question
- * between them. A double-click crosses both states in ~50ms and a held Enter
- * repeats at ~30/s, so without a floor the second click is the same accident
- * as the first — and the action behind it discards a worktree or disengages
- * the kill switch.
- */
-const ARM_DWELL_MS = 300;
-
-/**
- * Confirmação inline em dois cliques para ações irreversíveis.
- * O primeiro clique arma o botão (a pergunta substitui o rótulo);
- * o segundo confirma. Desarma sozinho se o segundo clique não vier.
+ * A two-click interlock for the actions that cannot be undone.
+ *
+ * Arm, then confirm. There is no dialog: a modal that asks "are you sure?"
+ * trains people to click through it, and it moves the decision away from the
+ * control that caused it. Here the button itself changes what it says, in
+ * place, and goes back to what it was if you do nothing.
  */
 export function ConfirmButton({
+  label,
   confirmLabel,
   onConfirm,
   onArmedChange,
-  children,
-  className,
-  onKeyDown,
-  ...rest
+  variant = "danger",
+  intent,
+  disabled,
+  title,
 }: ConfirmButtonProps) {
   const [armed, setArmed] = useState(false);
-  const timer = useRef<number | null>(null);
-  const armedAt = useRef(0);
-  // Mirrors `armed` for the unmount path, which cannot read state: a caller
-  // that freezes a list while this button is armed would freeze it forever if
-  // the button disappeared without ever saying it had disarmed.
-  const armedRef = useRef(false);
-  const notifyRef = useRef(onArmedChange);
-  notifyRef.current = onArmedChange;
+  // A ref rather than state: the dwell must not cause a render, and the click
+  // handler has to see the *current* value rather than the one captured by the
+  // render it belongs to.
+  const dwelling = useRef(false);
+  const dwellTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(
-    () => () => {
-      if (timer.current !== null) window.clearTimeout(timer.current);
-      if (armedRef.current) notifyRef.current?.(false);
-    },
-    [],
-  );
+  function clearTimers() {
+    if (dwellTimer.current !== null) {
+      clearTimeout(dwellTimer.current);
+      dwellTimer.current = null;
+    }
+    if (disarmTimer.current !== null) {
+      clearTimeout(disarmTimer.current);
+      disarmTimer.current = null;
+    }
+    dwelling.current = false;
+  }
+
+  // An armed control that unmounts — the row it belonged to was approved
+  // elsewhere, the page navigated — must not leave a timer that calls setState
+  // on a component that is gone.
+  useEffect(() => {
+    return () => {
+      if (dwellTimer.current !== null) clearTimeout(dwellTimer.current);
+      if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
+    };
+  }, []);
 
   function disarm() {
+    clearTimers();
     setArmed(false);
-    armedRef.current = false;
     onArmedChange?.(false);
   }
 
   function handleClick() {
     if (!armed) {
       setArmed(true);
-      armedRef.current = true;
       onArmedChange?.(true);
-      armedAt.current = Date.now();
-      timer.current = window.setTimeout(disarm, DISARM_AFTER_MS);
+      dwelling.current = true;
+      dwellTimer.current = setTimeout(() => {
+        dwellTimer.current = null;
+        dwelling.current = false;
+      }, DWELL_MS);
+      disarmTimer.current = setTimeout(disarm, ARM_WINDOW_MS);
       return;
     }
-    // Inside the dwell the click is discarded, NOT treated as a disarm: an
-    // accidental double-click must not also consume the deliberate second
-    // click the user is about to make.
-    if (Date.now() - armedAt.current < ARM_DWELL_MS) return;
-    if (timer.current !== null) window.clearTimeout(timer.current);
-    disarm();
+
+    // Inside the dwell this click is the tail of a double-click, not a decision.
+    // Swallow it and stay armed.
+    if (dwelling.current) return;
+
+    clearTimers();
+    setArmed(false);
+    onArmedChange?.(false);
     onConfirm();
   }
 
-  function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
-    onKeyDown?.(event);
-    // A held Enter on a focused button repeats keydown, and the browser
-    // synthesises a click for each repeat — enough to arm and confirm from a
-    // single sustained press. Cancelling the repeat stops those clicks from
-    // ever being generated; the dwell alone cannot outlast a held key.
-    if (event.repeat && !event.defaultPrevented) event.preventDefault();
-  }
-
-  const classes = [armed ? "is-armed" : null, className].filter(Boolean);
   return (
-    <Button
-      {...rest}
-      className={classes.length > 0 ? classes.join(" ") : undefined}
-      onClick={handleClick}
-      onKeyDown={handleKeyDown}
-    >
-      {armed ? confirmLabel : children}
-    </Button>
+    <span className={armed ? "ui-confirm ui-confirm-armed" : "ui-confirm"}>
+      <Button
+        variant={armed && variant === "danger" ? "danger-solid" : variant}
+        intent={intent}
+        disabled={disabled}
+        title={title}
+        aria-pressed={armed}
+        onClick={handleClick}
+      >
+        {armed ? confirmLabel : label}
+      </Button>
+    </span>
   );
 }

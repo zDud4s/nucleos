@@ -1,0 +1,162 @@
+/**
+ * The Agents slice: `/agents`, `agents-` throughout — as `council-` is for
+ * councils and `errands-` is for errands.
+ *
+ * The rule this file lives under: **no class appears in `Agents.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. Grep the component against
+ * this file before calling the page done.
+ */
+
+/* ================================================================ shared == */
+
+.agents-loading {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
+}
+
+.agents-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+/* =================================================================== form == */
+
+.agents-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: var(--space-3);
+  align-items: end;
+}
+
+.agents-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.agents-field-wide {
+  grid-column: 1 / -1;
+}
+
+.agents-field input,
+.agents-field select,
+.agents-field textarea {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+  line-height: var(--leading-snug);
+}
+
+.agents-field textarea {
+  resize: vertical;
+}
+
+.agents-field input:focus-visible,
+.agents-field select:focus-visible,
+.agents-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.agents-form > .ui-button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+/* =================================================================== list == */
+
+.agents-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agents-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.agents-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.agents-row-name {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.agents-row-model,
+.agents-row-policy {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.agents-row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.agents-row-speciality {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.agents-row-prompt {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.agents-row-prompt summary {
+  cursor: pointer;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.agents-row-prompt p {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agents-row > .agents-form {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}

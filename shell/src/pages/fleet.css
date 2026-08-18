@@ -1,0 +1,480 @@
+/**
+ * The fleet page: the meter, the columns, the slot card and the canvas.
+ *
+ * `fleet-` throughout, and nothing in here styles a design-system primitive —
+ * those rules live in `ui.css` behind the `ui-` prefix. The one thing this file
+ * does to a primitive is give it room inside a fleet slot.
+ *
+ * The rule that keeps this honest: **no class appears in a component that is
+ * not defined below.** TypeScript and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on screen.
+ *
+ * Imported from `Fleet.tsx` rather than from `main.tsx`, so the sheet arrives
+ * with the page and cannot outlive it in the bundle. It still lands after the
+ * design system in the cascade, because the page module is reached through
+ * `./router`, which `main.tsx` imports after `./ui.css`.
+ */
+
+/* ----------------------------------------------------------------- meter -- */
+
+.fleet-meter {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+/**
+ * The two arrangements, as one control.
+ *
+ * Sits in the page header's action slot, so it is the first thing after the
+ * headline — the reader chooses how to look before reading what is there.
+ */
+.fleet-views {
+  display: inline-flex;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+}
+
+/* The pressed half is filled rather than merely tinted: which view is open is a
+   fact about the page, not a hover state. */
+.fleet-views .ui-button[aria-pressed="true"] {
+  background: var(--surface-raised);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* --------------------------------------------------------------- columns -- */
+
+/**
+ * A column per project, side by side, scrolling sideways when there are more
+ * than fit.
+ *
+ * `align-items: start` so a busy column does not stretch its idle neighbours to
+ * its own height — an empty column at `0/N` should look empty.
+ */
+.fleet-columns {
+  display: flex;
+  align-items: start;
+  gap: var(--space-4);
+  overflow-x: auto;
+  padding-bottom: var(--space-4);
+}
+
+.fleet-column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  flex: 0 0 20rem;
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.fleet-column-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.fleet-column-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Monospaced so `1/2` and `10/12` line up down a row of columns. */
+.fleet-column-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.fleet-column-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+.fleet-empty {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: var(--leading-normal);
+}
+
+/* -------------------------------------------------------------- new job -- */
+
+.fleet-new-job {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: auto;
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--border);
+}
+
+.fleet-new-job-prompt {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.fleet-new-job-fields {
+  display: flex;
+  align-items: end;
+  gap: var(--space-2);
+}
+
+.fleet-new-job-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  flex: 1 1 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.fleet-new-job-field input {
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.fleet-new-job-prompt:focus-visible,
+.fleet-new-job-field input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* ------------------------------------------------------------- slot card -- */
+
+/**
+ * One slot, in either view.
+ *
+ * A fixed width on the canvas and a fluid one in a column: the surface needs
+ * cards it can lay out against each other, and the column has already decided
+ * how wide things are.
+ */
+.fleet-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
+}
+
+/* The kind of owner, said in the left edge as well as in words. */
+.fleet-card-job {
+  border-left-color: var(--tone-active-border);
+}
+
+.fleet-card-run {
+  border-left-color: var(--tone-info-border);
+}
+
+/* Nothing described this owner — ordinary, and drawn as recessive. */
+.fleet-card-unknown {
+  border-left-color: var(--border);
+  background: var(--surface);
+}
+
+/* A leaked slot. It is a defect, and it is allowed to look like one. */
+.fleet-card-orphaned {
+  border-left-color: var(--tone-danger-border);
+}
+
+.fleet-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.fleet-card-slot {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-faint);
+}
+
+.fleet-card-owner {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.fleet-card-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.fleet-card-rounds,
+.fleet-card-mode {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.fleet-card-prompt {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.fleet-card-link {
+  align-self: start;
+  font-size: var(--text-sm);
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------------- collision -- */
+
+.fleet-collide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+/**
+ * The source, as a word.
+ *
+ * §7 asks for two badges and not one: *this will collide* and *this collided*
+ * are different claims, and only the second is a measurement. Telling them
+ * apart by colour alone would leave the distinction unreadable to the people
+ * who most need the warning.
+ */
+.fleet-collide-source {
+  font-family: var(--font-mono);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.fleet-collide-observed .fleet-collide-source {
+  color: var(--tone-danger-fg);
+}
+
+.fleet-collide-predicted .fleet-collide-source {
+  color: var(--tone-paused-fg);
+}
+
+.fleet-collide-what {
+  flex: 1 1 12rem;
+  min-width: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------ exclusions -- */
+
+.fleet-edge-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+/* A rule in force. */
+.fleet-edge-active {
+  background: var(--tone-shadow-bg);
+  border: 1px solid var(--tone-shadow-border);
+}
+
+/* A question somebody asked. It is changing nothing yet, and it is drawn as a
+   dashed outline for exactly that reason. */
+.fleet-edge-pending {
+  background: transparent;
+  border: 1px dashed var(--tone-pending-border);
+}
+
+.fleet-edge-text {
+  flex: 1 1 12rem;
+  min-width: 0;
+  color: var(--text-muted);
+}
+
+/* ----------------------------------------------------------- job items -- */
+
+.fleet-items-note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.fleet-items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  list-style: none;
+}
+
+.fleet-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/**
+ * The round marker.
+ *
+ * On the *first* item of a new round, which is the boundary a reader is looking
+ * for — ordinals carry on across rounds rather than restarting, so the number
+ * itself says nothing about where one ended.
+ */
+.fleet-item-round {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.fleet-item-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.fleet-item-ordinal {
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+}
+
+.fleet-item-what {
+  flex: 1 1 10rem;
+  min-width: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.fleet-item-state {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.fleet-item-why {
+  margin: 0 0 0 var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------- canvas -- */
+
+/**
+ * The surface.
+ *
+ * A fixed height rather than a flexed one: xyflow measures its container, and a
+ * container whose height depends on its content is a container of height zero.
+ */
+.fleet-canvas {
+  height: 34rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+
+/* The library's own variables, pointed at this app's tokens so the canvas is
+   not a light rectangle in a dark window. */
+.fleet-canvas .react-flow {
+  --xy-background-color: var(--surface-sunken);
+  --xy-node-background-color: transparent;
+  --xy-node-border: none;
+  --xy-node-boxshadow-selected: 0 0 0 2px var(--focus-ring);
+  --xy-edge-stroke: var(--border-strong);
+  --xy-edge-stroke-selected: var(--accent);
+  --xy-controls-button-background-color: var(--surface-raised);
+  --xy-controls-button-background-color-hover: var(--surface);
+  --xy-controls-button-color: var(--text-muted);
+  --xy-controls-button-color-hover: var(--text);
+  --xy-controls-button-border-color: var(--border);
+  --xy-attribution-background-color: transparent;
+}
+
+/* A node is the card and nothing else — the library's own chrome would be a
+   second border around one this app already drew. */
+.fleet-canvas .react-flow__node {
+  width: 19rem;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  color: var(--text);
+  cursor: grab;
+}
+
+.fleet-canvas .react-flow__node .fleet-card {
+  cursor: auto;
+}
+
+.fleet-handle {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--bg);
+  background: var(--accent);
+}
+
+/* A rule in force is solid; a request still waiting is dashed and quieter,
+   because it is changing nothing about how either job is scheduled. */
+.fleet-wire {
+  stroke-width: 2;
+}
+
+.fleet-wire-active {
+  stroke: var(--tone-shadow-fg);
+}
+
+.fleet-wire-pending {
+  stroke: var(--tone-pending-fg);
+  stroke-dasharray: 6 4;
+}

@@ -1,78 +1,134 @@
-/* Camada base: reset, fundo, foco, movimento global.
-   Nada aqui conhece componentes — só o palco. */
+/**
+ * The floor everything else stands on: a reset, and the page painted from
+ * tokens.
+ *
+ * Deliberately small. This file owns the document — box model, the body's
+ * ground, focus, scrollbars, the defaults for text and form elements — and
+ * nothing else. Anything that belongs to a *component* lives in `ui.css`, and
+ * anything that belongs to a feature lives in that feature's own stylesheet.
+ * A base sheet that starts styling components is a base sheet nobody can edit
+ * without checking twenty pages first.
+ *
+ * Import order matters and is fixed in `main.tsx`: fonts, tokens, base, ui.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
 
 * {
-  box-sizing: border-box;
   margin: 0;
 }
 
+html {
+  /* The webview's own ground shows through during load and behind overscroll;
+     painting it here keeps a white flash out of a dark app. */
+  background: var(--bg);
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
-  background:
-    radial-gradient(1100px 700px at 88% -12%, var(--glow-cool), transparent 62%),
-    radial-gradient(900px 650px at -8% 108%, var(--glow-warm), transparent 60%),
-    var(--bg);
-  background-attachment: fixed;
+  min-height: 100vh;
+  background: var(--bg);
   color: var(--text);
-  font: 400 var(--fs-md) / 1.6 var(--body);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  font-synthesis-weight: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
   min-height: 100vh;
-  padding-bottom: 96px;
 }
 
-/* grão subtil por cima dos brilhos — evita banding no vidro */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 1;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
-  mix-blend-mode: overlay;
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+  letter-spacing: -0.01em;
 }
 
-.shell-root {
-  min-height: 100vh;
-  position: relative;
-  z-index: 2;
+h1 {
+  font-size: var(--text-2xl);
+}
+h2 {
+  font-size: var(--text-lg);
+}
+h3 {
+  font-size: var(--text-md);
+}
+h4 {
+  font-size: var(--text-base);
 }
 
-button {
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+  font-size: 0.925em;
+}
+
+pre {
+  /* Third-party text — stdout, e-mail bodies, notebooks — goes in here. It
+     wraps rather than scrolls sideways, and it never becomes markup. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 0.2em;
+}
+
+button,
+input,
+select,
+textarea {
   font: inherit;
-  cursor: pointer;
+  color: inherit;
 }
 
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-[hidden] {
-  display: none !important;
-}
-
-code {
-  font: 500 0.9em var(--mono);
-}
-
-:is(button, summary, input, select):focus-visible {
+/* The ring is the one place `--accent` is allowed near a control: it says
+   "keyboard is here", which is not a state of anything in the app. */
+:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
-@keyframes rise {
-  from { opacity: 0; transform: translateY(10px); }
+/* Pointer users get no ring; keyboard users must never lose it. */
+:focus:not(:focus-visible) {
+  outline: none;
 }
 
-@keyframes drop {
-  from { opacity: 0; transform: translateY(-8px); }
+img,
+svg {
+  display: block;
+  max-width: 100%;
 }
 
-@keyframes pulse {
-  50% { opacity: 0.35; }
+/* Panels scroll independently all over this app, so the scrollbar is part of
+   the surface rather than a strip of operating system laid over it. */
+* {
+  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-width: thin;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation: none !important;
-    transition: none !important;
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

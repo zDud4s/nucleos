@@ -1,5 +1,36 @@
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
+import { configure } from "@testing-library/dom";
 import { cleanup } from "@testing-library/react";
+
+// Testing Library gives a `findBy*` query one second to succeed, which is a
+// budget for the machine and not for the assertion. Every one of these queries
+// waits on react-query handing a mocked answer to a component, and on a loaded
+// machine — a full suite is minutes of environment time here — the timers and
+// MutationObserver callbacks that drive `waitFor` simply run late. The queries
+// that failed that way were correct: their DOM dumps showed the component alive
+// and still in its pre-data state, one tick short. Three seconds is slack for
+// the scheduler, not permission for a slow assertion.
+//
+// Configured through `@testing-library/dom` on purpose: `@testing-library/react`
+// exports a `configure` of its own that wraps this one to intercept
+// `reactStrictMode`, but both write to the single DTL config object that backs
+// `screen` — react re-exports `*` from the same instance.
+configure({ asyncUtilTimeout: 3000 });
+
+// The wait above only fits if the test is allowed to last long enough to hold
+// it. vitest charges its per-test timeout for the whole test, waits included,
+// and the default 5 seconds is not enough room on this machine: contention
+// dilates wall time roughly fourfold — a test that costs 756 ms in isolation
+// was reported at 3026 ms inside a loaded suite — so a dilated test that then
+// waits up to 3 seconds goes straight through the ceiling. That the ceiling is
+// the real limit and not the query budget is settled by a *synchronous* test,
+// with no async query in it at all, having been killed at 5000 ms.
+//
+// Raised here rather than in `vitest.config.ts` to keep the whole compensation
+// for this machine's load in one file, next to the reasoning for it. The two
+// numbers are a pair: raising the query budget alone would only trade an
+// informative "unable to find" dump for an opaque "test timed out".
+vi.setConfig({ testTimeout: 15000 });
 
 // Testing Library only self-registers its unmount hook when the runner injects
 // globals, and this suite imports its helpers explicitly. Without this, a

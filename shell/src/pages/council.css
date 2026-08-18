@@ -1,0 +1,305 @@
+/**
+ * The Council slice: `/council` and `/council/$councilId`, `council-`
+ * throughout — as `chats-` is for conversations and `runs-` is for runs.
+ *
+ * The rule this file lives under: **no class appears in `Council.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. Grep the component against
+ * this file before calling the page done.
+ */
+
+/* ================================================================ shared == */
+
+.council-note,
+.council-empty,
+.council-loading {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.council-loading,
+.council-empty {
+  color: var(--text-faint);
+}
+
+.council-note code {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.council-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+/* =============================================================== convene == */
+
+.council-form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.council-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.council-field textarea {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+  line-height: var(--leading-snug);
+  resize: vertical;
+}
+
+.council-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* =================================================================== list == */
+
+.council-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.council-row {
+  margin: 0;
+}
+
+.council-row-link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.council-row-active .council-row-link {
+  border-color: var(--accent);
+  background: var(--accent-quiet);
+}
+
+.council-row-question {
+  flex: 1 1 14rem;
+  min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.council-row-phase {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ================================================================= detail == */
+
+.council-question {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+
+.council-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.council-phase {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* =================================================================== seats == */
+
+.council-seats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.council-seat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.council-seat-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.council-seat-name {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.council-seat-idx {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.council-seat-ref {
+  margin: calc(var(--space-2) * -1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.council-seat-stage {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.council-seat-stage-label {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.council-seat-error {
+  margin: 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--tone-danger-bg);
+  color: var(--tone-danger-fg);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.council-seat-answer {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.council-seat-abstained {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-style: italic;
+  color: var(--text-faint);
+}
+
+/* ============================================================= leaderboard == */
+
+.council-leaderboard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.council-leaderboard-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: var(--text-sm);
+}
+
+.council-leaderboard-seat {
+  font-weight: var(--weight-medium);
+}
+
+.council-leaderboard-rank {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.council-leaderboard-n {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* =============================================================== synthesis == */
+
+.council-synthesis {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.council-chairman-failed {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--tone-danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--tone-danger-bg);
+  color: var(--tone-danger-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
