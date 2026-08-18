@@ -25,6 +25,7 @@ import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
+import { System } from "./pages/System";
 import { Voice } from "./pages/Voice";
 import { Waiting } from "./pages/Waiting";
 import { Web } from "./pages/Web";
@@ -67,6 +68,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/web": Web,
   "/browser": Browser,
   "/files": Files,
+  "/system": System,
 };
 
 /**
@@ -107,6 +109,10 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * dead end — a typo in a path is not a missing page. Registering a validator
  * here would move that decision away from the page that knows what the views
  * are.
+ *
+ * `/system/$view` is the same idiom again: like `/projects/$projectId/$view`, the
+ * view is a path parameter and not a search param — there is exactly one of it, it
+ * always has a value, and it is not a filter. No `SEARCH_VALIDATORS` entry.
  */
 const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/runs/$runId", component: RunDetail },
@@ -116,6 +122,7 @@ const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/council/$councilId", component: Council },
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: Web },
+  { path: "/system/$view", component: System },
 ];
 
 export function createAppRouter(initialPath = "/") {

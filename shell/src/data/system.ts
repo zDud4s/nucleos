@@ -203,3 +203,80 @@ export async function postAttention(projectId?: string): Promise<void> {
     body: JSON.stringify(scoped ? { project_id: projectId } : {}),
   });
 }
+
+/* ------------------------------------------------------------------ health -- */
+
+/**
+ * The System pillar's health: the daemon's own subsystem readout and the
+ * sidecars' liveness rows, moved here from `data/browser.ts` — this is the
+ * ONE health query in the app, and every pillar's own reading (Browser's
+ * included) narrows this same cache entry rather than asking again.
+ */
+
+/** One sidecar's own liveness row — `sidecar::SidecarState`, `GET /sidecars`. */
+export interface SidecarState {
+  name: string;
+  state: "running" | "down";
+  started_at: string | null;
+  last_failure: string | null;
+  last_failure_at: string | null;
+  restarts: number;
+  last_line: string | null;
+  last_line_at: string | null;
+}
+
+/** One subsystem's readiness — `health::SubsystemReadout`, inside `GET /health/readout`. */
+export interface SubsystemReadout {
+  name: string;
+  status: "ok" | "degraded" | "down" | "disabled";
+  reason?:
+    | "timeout"
+    | "not-configured"
+    | "unreachable"
+    | "permission-denied"
+    | "missing"
+    | "not-running"
+    | "low-disk-space"
+    | "unknown";
+}
+
+/** `GET /health/readout` — `health::HealthReadout`. */
+export interface HealthReadout {
+  status: "ok" | "degraded" | "down" | "disabled";
+  subsystems: SubsystemReadout[];
+}
+
+/**
+ * The whole daemon's health, in the daemon's own subsystem order — render it
+ * as given, never sorted: `sqlite_pool`, `cli_binary`, `credential_manager`,
+ * `worktree_disk`, `echo_sidecar`, `telegram_sidecar`, `email_sidecar`,
+ * `web_sidecar`, `browser_sidecar`, `voice_transcriber` (`health.rs:142-183`).
+ */
+export function useSystemHealth() {
+  return useQuery({
+    queryKey: keys.system.health,
+    queryFn: () => apiFetch<HealthReadout>("/health/readout"),
+    refetchInterval: POLL.fast,
+  });
+}
+
+/** Every sidecar's own liveness row — `GET /sidecars`, a bare array. */
+export function useSidecars() {
+  return useQuery({
+    queryKey: keys.system.sidecars,
+    queryFn: () => apiFetch<SidecarState[]>("/sidecars"),
+    refetchInterval: POLL.fast,
+  });
+}
+
+/**
+ * Did the whole readout time out?
+ *
+ * `health.rs` answers a timed-out readout with `status: "down"` and exactly
+ * ONE subsystem named `aggregate` — the other nine are not *down*, they were
+ * never measured. A page that renders that as nine missing subsystems is
+ * inventing an outage.
+ */
+export function isAggregateTimeout(readout: HealthReadout): boolean {
+  return readout.subsystems.length === 1 && readout.subsystems[0].name === "aggregate";
+}

@@ -176,10 +176,17 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * A pillar's health. `disabled` is a pillar nobody asked for and `down` is a
    * pillar that is broken; a shell that shows the first as the second invents an
    * outage, and one that shows the second as the first hides one.
+   *
+   * `HealthState` has four values, not two; `degraded` is working-and-impaired
+   * and takes neither the healthy tone nor the failure tone, because a person
+   * who reads it as `down` stops a pillar that is still serving and one who
+   * reads it as `ok` ignores one that is about to stop.
    */
   pillar: {
     disabled: { tone: "off", label: "not configured" },
     down: { tone: "danger", label: "down" },
+    ok: { tone: "active", label: "healthy" },
+    degraded: { tone: "paused", label: "degraded" },
   },
 
   /**

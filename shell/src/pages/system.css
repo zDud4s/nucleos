@@ -1,0 +1,187 @@
+/**
+ * The System slice: the tabs, the health readout and the sidecar cards,
+ * `sy-` throughout — as `pj-` is for Projects and `browser-` for Browser.
+ *
+ * The rule this file lives under: **no class appears in `System.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. Grep the component against
+ * this file before calling the page done.
+ */
+
+/* =============================================================== shared == */
+
+.sy-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 64rem;
+}
+
+.sy-loading,
+.sy-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+.sy-loading {
+  font-style: italic;
+}
+
+.sy-meta {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------- tabs == */
+
+.sy-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.sy-tab {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+}
+
+.sy-tab:hover {
+  color: var(--text);
+}
+
+.sy-tab:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.sy-tab-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* ------------------------------------------------------------------ health == */
+
+/* A timed-out aggregate: one collapsed sentence, never nine rows reading
+   "missing". */
+.sy-timeout {
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.sy-subsystems {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sy-subsystem {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.sy-subsystem-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* --------------------------------------------------------------- sidecars == */
+
+.sy-sidecars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sy-sidecar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.sy-sidecar-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.sy-sidecar-name {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.sy-sidecar-state {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.sy-sidecar-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+}
+
+.sy-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.sy-fact dd {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.sy-sidecar-failure {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--tone-danger-fg);
+}
+
+.sy-sidecar-line {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}

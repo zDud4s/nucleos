@@ -223,12 +223,30 @@ export const keys = {
      */
     sessions: ["browser", "sessions"] as const,
     sites: (projectId: string) => ["browser", "sites", projectId] as const,
-    health: ["browser", "health"] as const,
+    /**
+     * Health used to live here as `browser.health`, its own cache entry. It is
+     * `keys.system.health` now — the ONE health query in the app, not one per
+     * pillar — the same retirement `WAITING_KEYS.contactMerges` and
+     * `WAITING_KEYS.wheelRequests` went through when `contacts.merges` and
+     * `sessions` above got their real homes: a route's local key retires in
+     * the slice that gives it a real home.
+     */
   },
 
   files: {
     all: ["files"] as const,
     list: (path: string) => ["files", "list", path] as const,
     search: (path: string, q: string) => ["files", "search", path, q] as const,
+  },
+
+  system: {
+    all: ["system"] as const,
+    /** `GET /health/readout` (+ `/sidecars`) — the ONE health query in the app. */
+    health: ["system", "health"] as const,
+    sidecars: ["system", "sidecars"] as const,
+    backups: ["system", "backups"] as const,
+    tokens: ["system", "tokens"] as const,
+    pii: ["system", "pii"] as const,
+    config: (area: string) => ["system", "config", area] as const,
   },
 } as const;

@@ -56,22 +56,19 @@ describe("the app router", () => {
   });
 
   it("gives an unbuilt page a Teach that names the slice it arrives with", async () => {
-    // Was "/voice", then "/files" — each the Pillars slice's own example of an
-    // unbuilt page until the slice that built it. P6 built "/files"; "/system"
-    // is next.
-    await renderApp({ initialPath: "/system" });
-
-    expect(await screen.findByRole("heading", { level: 1, name: "System" })).toBeDefined();
-    // Not a spinner and not a 404: the route works, the page is simply not
-    // built, and saying which slice brings it is the difference between a
-    // placeholder and a dead end.
-    expect(screen.getByText(/System slice/)).toBeDefined();
-  });
-
-  it("says a route the núcleo cannot serve is not wired, not that it is broken", async () => {
+    // Was "/voice", then "/files", then "/system" — each the roaming example of
+    // an unbuilt page until the slice that built it. S1 built "/system", and the
+    // example has run out of unbuilt pages to point at: everything left in the
+    // nav is "/teams", which is blocked on the núcleo having no team routes at
+    // all — not on this build not having reached it yet.
     await renderApp({ initialPath: "/teams" });
 
     expect(await screen.findByRole("heading", { level: 1, name: "Teams" })).toBeDefined();
+    // Not a spinner and not a 404: the route works, the page is simply not
+    // built, and saying which slice brings it is the difference between a
+    // placeholder and a dead end.
+    expect(screen.getByText(/Work slice/)).toBeDefined();
+    // And a route the núcleo itself cannot serve says so plainly.
     expect(screen.getByText(/not yet wired/i)).toBeDefined();
   });
 

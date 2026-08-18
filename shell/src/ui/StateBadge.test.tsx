@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { StateBadge } from "./StateBadge";
-import type { StateDomain } from "./state-map";
+import { readState, type StateDomain } from "./state-map";
 
 /**
  * The §7 contract, one case per shipped row.
@@ -178,6 +178,18 @@ describe("StateBadge — pillar", () => {
 
   it("accepts the Rust spelling as well as the wire spelling", () => {
     expect(badge("pillar", "Disabled")).toEqual(badge("pillar", "disabled"));
+  });
+
+  it("reads a pillar that is ok as healthy", () => {
+    const reading = readState("pillar", "ok");
+    expect(reading).not.toBeNull();
+    expect(reading?.tone).toBe("active");
+  });
+
+  it("reads a pillar that is degraded as neither healthy nor down", () => {
+    const degraded = readState("pillar", "degraded");
+    expect(degraded?.tone).not.toBe(readState("pillar", "ok")?.tone);
+    expect(degraded?.tone).not.toBe(readState("pillar", "down")?.tone);
   });
 });
 

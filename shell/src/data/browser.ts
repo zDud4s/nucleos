@@ -2,6 +2,10 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
+import { useSidecars, useSystemHealth } from "./system";
+import type { SidecarState, SubsystemReadout } from "./system";
+
+export type { SidecarState, SubsystemReadout } from "./system";
 
 /**
  * The Browser pillar: the sessions in flight, the wheel handover's own
@@ -79,33 +83,6 @@ export interface Site {
   granted_for: string | null;
 }
 
-/** One sidecar's own liveness row — `sidecar::SidecarState`, `GET /sidecars`. */
-export interface SidecarState {
-  name: string;
-  state: "running" | "down";
-  started_at: string | null;
-  last_failure: string | null;
-  last_failure_at: string | null;
-  restarts: number;
-  last_line: string | null;
-  last_line_at: string | null;
-}
-
-/** One subsystem's readiness — `health::SubsystemReadout`, inside `GET /health/readout`. */
-export interface SubsystemReadout {
-  name: string;
-  status: "ok" | "degraded" | "down" | "disabled";
-  reason?:
-    | "timeout"
-    | "not-configured"
-    | "unreachable"
-    | "permission-denied"
-    | "missing"
-    | "not-running"
-    | "low-disk-space"
-    | "unknown";
-}
-
 /**
  * What this page shows for browser health: the one subsystem the daemon
  * measures, plus — only when it is not `ok` — the sidecar's own prose. Never
@@ -164,28 +141,30 @@ export function useBrowserSites(projectId: string | undefined) {
 /**
  * The one browser reading this shell can make honestly.
  *
- * `GET /health/readout` is read first and narrowed to `browser_sidecar`; the
- * second read, `GET /sidecars` narrowed to `name === "browser"` — a
- * different literal, because the health probe's own label and the
- * supervisor's registry key are not the same string
- * (`crate::sidecar::BROWSER == "browser"`) — only fires when the subsystem
- * is not `ok`, so a healthy install never pays for the second call.
+ * Reads the SAME cache entries every other pillar's health does —
+ * `useSystemHealth()` narrowed to `browser_sidecar`, `useSidecars()` narrowed
+ * to `name === "browser"` — a different literal, because the health probe's
+ * own label and the supervisor's registry key are not the same string
+ * (`crate::sidecar::BROWSER == "browser"`). `sidecar` stays `null` while the
+ * subsystem is `ok`: the sidecar's own prose has nothing to add to a
+ * subsystem that is not failing. This declares no query of its own — it only
+ * narrows the two hooks in `data/system.ts`.
  */
-export function useBrowserHealth() {
-  return useQuery({
-    queryKey: keys.browser.health,
-    queryFn: async (): Promise<BrowserHealth> => {
-      const readout = await apiFetch<{ status: string; subsystems: SubsystemReadout[] }>("/health/readout");
-      const subsystem = readout.subsystems.find((row) => row.name === "browser_sidecar") ?? null;
-      if (subsystem === null || subsystem.status === "ok") {
-        return { subsystem, sidecar: null };
-      }
-      const sidecars = await apiFetch<SidecarState[]>("/sidecars");
-      const sidecar = sidecars.find((row) => row.name === "browser") ?? null;
-      return { subsystem, sidecar };
-    },
-    refetchInterval: POLL.fast,
-  });
+export function useBrowserHealth(): { data: BrowserHealth | undefined; isError: boolean; error: unknown } {
+  const health = useSystemHealth();
+  const sidecars = useSidecars();
+
+  const subsystem = health.data?.subsystems.find((row) => row.name === "browser_sidecar") ?? null;
+  const sidecar =
+    subsystem !== null && subsystem.status !== "ok"
+      ? (sidecars.data?.find((row) => row.name === "browser") ?? null)
+      : null;
+
+  return {
+    data: health.data === undefined ? undefined : { subsystem, sidecar },
+    isError: health.isError,
+    error: health.error,
+  };
 }
 
 /* -------------------------------------------------------------- decisions -- */
