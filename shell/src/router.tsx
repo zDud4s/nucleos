@@ -9,7 +9,9 @@ import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Agents } from "./pages/Agents";
 import { Autopilot } from "./pages/Autopilot";
+import { Calendar } from "./pages/Calendar";
 import { Chats } from "./pages/Chats";
+import { Contacts } from "./pages/Contacts";
 import { Council } from "./pages/Council";
 import { Errands } from "./pages/Errands";
 import { Feed, validateFeedSearch } from "./pages/Feed";
@@ -55,6 +57,8 @@ const PAGES: Record<string, () => ReactNode> = {
   "/council": Council,
   "/agents": Agents,
   "/mail": Mail,
+  "/contacts": Contacts,
+  "/calendar": Calendar,
 };
 
 /**

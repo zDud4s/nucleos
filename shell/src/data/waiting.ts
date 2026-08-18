@@ -73,30 +73,6 @@ export interface WheelRequest extends BrowserSession {
   proposal_id: number;
 }
 
-/** One side of a suggested merge, with the standing decision that could refuse it. */
-export interface MergeSide {
-  contact_id: number;
-  addresses: string[];
-  display_name: string | null;
-  messages_in: number;
-  /**
-   * The standing decision on this person. Carried so the conflict that would
-   * refuse the merge is visible BEFORE the button is pressed rather than as a
-   * 409 afterwards.
-   */
-  verdict: string | null;
-}
-
-/** A pending suggestion that two contacts are one person. */
-export interface MergeSuggestion {
-  proposal_id: number;
-  reasoning: string;
-  created_at: string;
-  /** The contact that survives — the lower id, which is the order the pair is keyed on. */
-  keep: MergeSide;
-  absorb: MergeSide;
-}
-
 /** One row of the git queue, as `vcs::RequestSummary` serialises. */
 export interface VcsRequestSummary {
   id: number;
@@ -194,15 +170,15 @@ export function isWheelRequest(session: BrowserSession): session is WheelRequest
   return session.mode === "wheel-requested" && session.proposal_id !== null;
 }
 
-/** §5 — the pairs the núcleo thinks are one person. */
-export function useContactMerges() {
-  return useQuery({
-    queryKey: keys.contacts.merges,
-    queryFn: () => apiFetch<MergeSuggestion[]>("/contacts/merges"),
-    refetchInterval: POLL.queue,
-    placeholderData: keepPreviousData,
-  });
-}
+/**
+ * §5 — the pairs the núcleo thinks are one person, and the shapes they carry.
+ *
+ * Moved to `data/contacts.ts` — Contacts data, and now read from two pages —
+ * and re-exported here under the idiom this file already uses for
+ * `useProposals` and `useExclusionRequests`, so nothing below has to change
+ * which door it imports these through.
+ */
+export { useContactMerges, type MergeSide, type MergeSuggestion } from "./contacts";
 
 /** §8 — what the night put down without doing. A record to read, not a queue to work. */
 export function useSkippedItems() {
