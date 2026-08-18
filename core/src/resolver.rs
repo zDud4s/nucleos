@@ -68,11 +68,18 @@ struct Candidate {
 /// branches at once. That is the fleet migration 0081 says this brake exists to prevent, arriving by
 /// the one route the per-row check does not see.
 ///
-/// So the attempt is claimed against the OPERATION, in this project: `args` is the stored JSON, so
-/// comparing it compares source and target exactly. The cost, stated rather than discovered: a person
-/// who re-asks the same merge later gets no second agent either. That is the rule the design already
-/// chose — *"one attempt, never two: repeating is where an agent burns budget insisting on the same
-/// wall"* — applied to the thing it was always about, which is the conflict rather than the row.
+/// So a conflict is skipped while another resolution of the SAME operation is still live — `args` is
+/// the stored JSON, so comparing it compares source and target exactly, and `LIVE_RUN_STATUSES` is
+/// the same liveness the concurrency sweep derives slots from.
+///
+/// **Live, and not "ever attempted", and that distinction was itself corrected in production.** The
+/// first version of this check blacklisted the branch pair for good, and the cost showed up within
+/// minutes: `feat/frontend-ponte` had had an attempt, that attempt was cancelled without resolving
+/// anything, the branch moved on and conflicted again — genuinely a new conflict — and the loop
+/// refused it an agent for ever. A pair that conflicts again next week is not the same wall an agent
+/// already failed at, and a resolver that stops helping the branches that live longest is one that
+/// stops helping where it is most needed. Repetition against the SAME escalation is still refused,
+/// by `resolution_run_id IS NULL` above; what this adds is only that two never run at once.
 ///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
@@ -86,10 +93,12 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
             AND resolution_run_id IS NULL
             AND from_resolution = 0
             AND NOT EXISTS (
-                SELECT 1 FROM vcs_requests AS attempted
+                SELECT 1
+                  FROM vcs_requests AS attempted
+                  JOIN runs ON runs.id = attempted.resolution_run_id
                  WHERE attempted.project_id = conflict.project_id
                    AND attempted.args = conflict.args
-                   AND attempted.resolution_run_id IS NOT NULL
+                   AND runs.status IN ('running', 'awaiting_approval')
             )
           ORDER BY id
           LIMIT 1",
@@ -472,6 +481,21 @@ mod tests {
         escalated_merge_of(pool, "feat/x", from_resolution).await
     }
 
+    /// A run row for the deduplication to read liveness off. Minimal on purpose: what the filter
+    /// asks about a resolution's run is its status and nothing else.
+    async fn insert_run(pool: &sqlx::SqlitePool, id: i64, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, created_at)
+             VALUES (?, 'proj', 'resolve it', ?, 'worktree', ?)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("insert the resolution's run");
+    }
+
     /// An escalated merge, admitted through the real INSERT so the stored operation is the one the
     /// launcher will actually have to parse back.
     ///
@@ -567,6 +591,10 @@ mod tests {
     ///
     /// Measured in production before this test existed: requests 30 and 31 on `nucleos`, runs 900318
     /// and 900319, both live. The attempt has to be claimed against the conflict, not the row.
+    ///
+    /// And the release at the end is the second correction: blacklisting the pair for good stopped
+    /// the resolver helping a branch that had had one cancelled attempt and then conflicted again for
+    /// a different reason. Two at once is the harm; having tried once is not.
     #[tokio::test]
     async fn the_same_conflict_queued_twice_gets_one_agent_and_not_two() {
         let pool = test_pool().await;
@@ -579,7 +607,8 @@ mod tests {
             .expect("the first of the two is work");
         assert_eq!(picked.id, first);
 
-        // The launcher claims it, exactly as `create_run_with` does.
+        // The launcher claims it, exactly as `create_run_with` does, and the run it names is live.
+        insert_run(&pool, 11, "running").await;
         sqlx::query("UPDATE vcs_requests SET resolution_run_id = 11 WHERE id = ?")
             .bind(first)
             .execute(&pool)
@@ -591,6 +620,23 @@ mod tests {
             "the duplicate names the same merge in the same project — request {again} must not mint \
              a second agent against branches another one is already editing"
         );
+
+        // The attempt ends without resolving anything. The branch pair is not blacklisted by having
+        // been tried: a conflict that is still there, or a new one on the same two branches, is work.
+        sqlx::query("UPDATE runs SET status = 'cancelled' WHERE id = 11")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_conflict(&pool).await.unwrap().map(|it| it.id),
+            Some(again),
+            "once nothing is live on this pair, the escalation nobody has attempted is work again"
+        );
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 12 WHERE id = ?")
+            .bind(again)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // A different merge in the same project is untouched by the deduplication: it is a different
         // conflict, and nobody has looked at it.
