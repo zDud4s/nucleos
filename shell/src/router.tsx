@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
+import { Agents } from "./pages/Agents";
 import { Autopilot } from "./pages/Autopilot";
 import { Chats } from "./pages/Chats";
 import { Council } from "./pages/Council";
@@ -50,6 +51,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/chats": Chats,
   "/errands": Errands,
   "/council": Council,
+  "/agents": Agents,
 };
 
 /**
