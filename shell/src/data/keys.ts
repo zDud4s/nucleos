@@ -128,4 +128,34 @@ export const keys = {
   proposals: {
     all: ["proposals"] as const,
   },
+
+  /**
+   * The Work namespace — chats, council, errands, agents — landing together
+   * ahead of the pages that read most of it, for the reason at the top of this
+   * file: a namespace four pages edit in sequence is a namespace where the
+   * fifth quietly spells its own key.
+   *
+   * `chats` is filled in from the routes this slice verified against
+   * `core/src/http.rs`. The other three carry only the root a later slice
+   * invalidates by — the same minimal shape `presets` above uses — until the
+   * routes that would fill them in further are verified in turn.
+   */
+  chats: {
+    all: ["chats"] as const,
+    detail: (chatId: string) => ["chats", "detail", chatId] as const,
+    localModel: ["chats", "local-model"] as const,
+    ideSessions: ["chats", "ide-sessions"] as const,
+  },
+
+  council: {
+    all: ["council"] as const,
+  },
+
+  errands: {
+    all: ["errands"] as const,
+  },
+
+  agents: {
+    all: ["agents"] as const,
+  },
 } as const;

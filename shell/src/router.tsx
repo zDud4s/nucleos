@@ -8,6 +8,7 @@ import {
 import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Autopilot } from "./pages/Autopilot";
+import { Chats } from "./pages/Chats";
 import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
@@ -44,6 +45,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/runs": Runs,
   "/feed": Feed,
   "/projects": Projects,
+  "/chats": Chats,
 };
 
 /**
@@ -88,6 +90,7 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
 const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/runs/$runId", component: RunDetail },
   { path: "/projects/$projectId/$view", component: Projects },
+  { path: "/chats/$chatId", component: Chats },
 ];
 
 export function createAppRouter(initialPath = "/") {

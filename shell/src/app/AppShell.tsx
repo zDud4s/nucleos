@@ -1,5 +1,7 @@
 import { Outlet } from "@tanstack/react-router";
+import { useChats } from "../data/chats";
 import { useHealth, useProposals } from "../data/system";
+import { unreadTotal } from "../lib/turns";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { BudgetLine } from "./BudgetLine";
 import { ConnectionGate } from "./ConnectionGate";
@@ -38,17 +40,30 @@ function Frame() {
    * queue, not the archive — so its length *is* the badge. Filtering by status
    * here would be the shell second-guessing a decision the route already made.
    *
-   * The other two badge sources, unread chats and untriaged mail, have no hook
-   * yet: they arrive with the slices that build those pillars. Until then those
-   * items simply carry no badge, which is the honest rendering of a count
-   * nobody has measured — a zero would be a claim.
+   * The remaining badge source, untriaged mail, has no hook yet: it arrives
+   * with the slice that builds that pillar. Until then it simply carries no
+   * badge, which is the honest rendering of a count nobody has measured — a
+   * zero would be a claim.
    */
   const proposals = useProposals();
+  /**
+   * Unread turns, summed across every conversation. `undefined` until the
+   * list has answered once — the same honest-absence rule as `proposals`
+   * above, read through `unreadTotal` rather than a bare `.length` because a
+   * chat's badge is `waiting`, not a row count.
+   */
+  const chats = useChats();
 
   return (
     <div className="app-shell">
       <AttentionHeartbeat />
-      <Sidebar badges={{ proposals: proposals.data?.length }} systemAlert={health.data === false}>
+      <Sidebar
+        badges={{
+          proposals: proposals.data?.length,
+          chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
+        }}
+        systemAlert={health.data === false}
+      >
         <ConnectionStatus />
         <BudgetLine />
         {/*
