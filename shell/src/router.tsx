@@ -7,10 +7,12 @@ import {
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
+import { Autopilot } from "./pages/Autopilot";
 import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Placeholder } from "./pages/Placeholder";
+import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
 import { Waiting } from "./pages/Waiting";
@@ -37,9 +39,11 @@ import { Waiting } from "./pages/Waiting";
 const PAGES: Record<string, () => ReactNode> = {
   "/": Home,
   "/fleet": Fleet,
+  "/autopilot": Autopilot,
   "/waiting": Waiting,
   "/runs": Runs,
   "/feed": Feed,
+  "/projects": Projects,
 };
 
 /**
@@ -67,9 +71,23 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * `Outlet` and would keep fifty rows polling behind one open run.
  *
  * TanStack spells a parameter `$runId`; the page reads it back under that name.
+ *
+ * `/projects/$projectId/$view` is the second, and it carries a parameter that is
+ * not an id: the view a project is being looked at through — `browse`, `search`,
+ * `diff` or `rules`. It is in the location rather than in component state
+ * because a folder somebody is reading should survive a reload and be
+ * linkable, and it is **not** a search param because it is not a filter: there
+ * is exactly one of it and it always has a value.
+ *
+ * There is no validator for it. A route parameter is a string, anybody can type
+ * one, and `Projects` answers an unrecognised view with `browse` rather than a
+ * dead end — a typo in a path is not a missing page. Registering a validator
+ * here would move that decision away from the page that knows what the views
+ * are.
  */
 const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/runs/$runId", component: RunDetail },
+  { path: "/projects/$projectId/$view", component: Projects },
 ];
 
 export function createAppRouter(initialPath = "/") {
