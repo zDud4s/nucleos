@@ -376,34 +376,37 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
 
 /// Whether the branch a worktree is asking to land was produced by a conflict resolver.
 ///
-/// Asked of the database rather than of a branch-name convention, because a name is something an
-/// agent can write and this decides whether the merge is verified.
+/// **It reads the run out of the BRANCH and then asks the database about that run**, and the two
+/// steps are in that order because of a defect a live conflict found. It used to join `worktrees` to
+/// `vcs_requests` on the tree's current owner, which is wrong the moment a resolution run pauses for
+/// approval: the resume is a NEW run id and the `worktrees` row is rewritten to it, so the tree no
+/// longer names the run the escalation recorded. Measured — a resolution whose inspection command was
+/// held for approval landed with `from_resolution = 0`, was published without being verified, and was
+/// never accounted for. The branch is opened once and never renamed, so it is the durable half.
 ///
-/// **The join is through the run that owns the worktree**, which is sound at exactly the moment it is
-/// asked: `--land` is run from inside the worktree, so the tree is on disk, so its row has not been
-/// collected. It is not sound at claim time, hours later, which is why the answer is written onto the
-/// request at submission instead of computed when the queue gets to it.
+/// Nothing is asked of the `worktrees` table at all now, which also means the answer survives the GC
+/// collecting the tree: the question is what PRODUCED this branch, and that does not stop being true
+/// when the directory goes away.
 ///
-/// `removed_at` is deliberately not part of the condition. A resolution worktree whose row was marked
-/// removed while the directory survived should still have its output verified — the question is what
-/// PRODUCED this branch, and that does not stop being true when the tree is collected.
+/// Scoped to the project, or two projects' branch names would decide each other's.
 pub(crate) async fn landing_is_a_resolution(
     pool: &sqlx::SqlitePool,
     project_id: &str,
     branch: &str,
 ) -> bool {
+    // A branch this daemon did not open cannot be a resolution's output, and every resolution's is
+    // one it opened.
+    let Some(run) = crate::worktree::run_behind_branch(branch) else {
+        return false;
+    };
     let found: sqlx::Result<bool> = sqlx::query_scalar(
         "SELECT EXISTS (
-             SELECT 1
-               FROM worktrees w
-               JOIN vcs_requests r ON r.resolution_run_id = w.owner_id
-              WHERE w.owner_kind = 'run'
-                AND w.project_id = ?
-                AND w.branch = ?
+             SELECT 1 FROM vcs_requests
+              WHERE project_id = ? AND resolution_run_id = ?
          )",
     )
     .bind(project_id)
-    .bind(branch)
+    .bind(run)
     .fetch_one(pool)
     .await;
     match found {
@@ -520,11 +523,15 @@ mod tests {
         );
     }
 
-    /// The branch a resolution produced is recognised by the run that owns its worktree, not by what
-    /// it is called — a name is something an agent can write, and this decides whether the merge is
-    /// verified before it is published.
+    /// The branch a resolution produced is recognised by the run the ESCALATION recorded, read out of
+    /// the branch name — never by whoever owns the worktree now.
+    ///
+    /// **The third assertion is the defect a live conflict found.** A resolution run that pauses for
+    /// approval resumes under a new run id and the `worktrees` row is handed to the successor, so the
+    /// old join — worktree's current owner against `resolution_run_id` — matched nothing. The landing
+    /// was published unverified and never accounted for. The branch is the half that does not move.
     #[tokio::test]
-    async fn a_landing_is_recognised_as_a_resolution_by_the_run_that_produced_it() {
+    async fn a_landing_is_recognised_as_a_resolution_by_the_run_the_escalation_recorded() {
         let pool = test_pool().await;
         let request = escalated_merge(&pool, false).await;
         sqlx::query("UPDATE vcs_requests SET resolution_run_id = 7 WHERE id = ?")
@@ -532,9 +539,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+
+        assert!(landing_is_a_resolution(&pool, "proj", "nucleos/run-7").await);
+        assert!(
+            !landing_is_a_resolution(&pool, "proj", "nucleos/run-8").await,
+            "an ordinary run's landing must not be verified as a resolution — its tip has one \
+             parent, like every branch, and it would be refused for it"
+        );
+
+        // The resume: the worktree is handed to run 9, which is what a resumed approval does. The
+        // branch keeps naming 7, and that is what has to carry the answer.
         crate::worktree::record(
             &pool,
-            crate::worktree::Owner::Run(7),
+            crate::worktree::Owner::Run(9),
             "proj",
             "C:/repo",
             "C:/wt/run-7",
@@ -543,27 +560,33 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::worktree::record(
-            &pool,
-            crate::worktree::Owner::Run(8),
-            "proj",
-            "C:/repo",
-            "C:/wt/run-8",
-            "nucleos/run-8",
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert!(landing_is_a_resolution(&pool, "proj", "nucleos/run-7").await);
         assert!(
-            !landing_is_a_resolution(&pool, "proj", "nucleos/run-8").await,
-            "an ordinary run's landing must not be verified as a resolution — its tip has one \
-             parent, like every branch, and it would be refused for it"
+            landing_is_a_resolution(&pool, "proj", "nucleos/run-7").await,
+            "a resolution that paused for approval and resumed under a new id is still a resolution \
+             — this is the one that shipped broken"
         );
+
         assert!(
             !landing_is_a_resolution(&pool, "other", "nucleos/run-7").await,
             "the answer is scoped to the project, or two projects' branch names decide each other's"
+        );
+        assert!(
+            !landing_is_a_resolution(&pool, "proj", "feat/ordinary").await,
+            "a branch this daemon never opened cannot be a resolution's output"
+        );
+    }
+
+    /// The name is written in one place and read back in another, and they have to agree — a branch
+    /// this daemon opens must be one it can recognise later.
+    #[test]
+    fn the_branch_a_worktree_gets_names_the_run_it_was_opened_for() {
+        let branch = crate::worktree::Owner::Run(4242).branch_name();
+        assert_eq!(crate::worktree::run_behind_branch(&branch), Some(4242));
+        assert_eq!(
+            crate::worktree::run_behind_branch(&crate::worktree::Owner::Job(4242).branch_name()),
+            None,
+            "a job's tree is not a run's, and reading one as the other would attribute a resolution \
+             to a run id that belongs to a different sequence"
         );
     }
 
