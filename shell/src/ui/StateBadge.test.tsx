@@ -242,6 +242,61 @@ describe("StateBadge — errand", () => {
   });
 });
 
+describe("StateBadge — email_class", () => {
+  it("keeps a failed e-mail apart from a content class, and NULL apart from both", () => {
+    // `failed` is triage giving up on the message itself, not a verdict about
+    // its content — collapsing it onto `noise` would hide a message the
+    // machine never actually read behind one it read and dismissed.
+    assertAllDistinct("email_class", ["urgent", "action", "info", "noise", "failed", null]);
+    const failed = badge("email_class", "failed");
+    const noise = badge("email_class", "noise");
+    expect(failed?.className).not.toBe(noise?.className);
+    const absent = badge("email_class", null);
+    expect(absent?.text).toMatch(/not triaged/i);
+    expect(absent?.text).not.toBe(noise?.text);
+    expect(absent?.text).not.toBe(failed?.text);
+  });
+});
+
+describe("StateBadge — voice_cleanup", () => {
+  it("keeps cleaned, raw and shrunk apart", () => {
+    // `raw` is nothing having been attempted; `shrunk` is a cleanup produced
+    // and then refused by a guard, with the raw text kept instead. Both leave
+    // the same raw transcript on screen and must not read as the same fact.
+    assertAllDistinct("voice_cleanup", ["cleaned", "raw", "shrunk"]);
+    expect(badge("voice_cleanup", "shrunk")?.text).toMatch(/guard/i);
+    expect(badge("voice_cleanup", "raw")?.text).not.toMatch(/guard/i);
+  });
+});
+
+describe("StateBadge — web_trust and web_extract", () => {
+  it("keeps raw apart from quarantined, and article apart from fallback", () => {
+    assertAllDistinct("web_trust", ["raw", "quarantined"]);
+    assertAllDistinct("web_extract", ["article", "fallback"]);
+    // A page with no article root (an index, a dashboard) is a SHAPE, not a
+    // failure, and must not take the danger tone.
+    const fallback = badge("web_extract", "fallback");
+    expect(fallback?.className).not.toContain("ui-badge-danger");
+  });
+});
+
+describe("StateBadge — browser_refusal", () => {
+  it("keeps an undesigned reach apart from nobody being present", () => {
+    // Two of the four clear on their own right where the refusal happened
+    // (`no-one-present` by opening the shell, `pillar-disabled` by turning the
+    // pillar on) and two do not (`reach-undesigned`, `unparseable-url`) — the
+    // four must read as four different facts, not one "the browser said no".
+    assertAllDistinct("browser_refusal", [
+      "reach-undesigned",
+      "no-one-present",
+      "pillar-disabled",
+      "unparseable-url",
+    ]);
+    expect(badge("browser_refusal", "no-one-present")?.text).toMatch(/shell/i);
+    expect(badge("browser_refusal", "reach-undesigned")?.text).not.toMatch(/shell/i);
+  });
+});
+
 describe("StateBadge — states with no reading", () => {
   it("shows an unmapped state as itself rather than guessing a tone", () => {
     const unknown = badge("run", "hibernating");

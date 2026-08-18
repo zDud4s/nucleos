@@ -158,4 +158,77 @@ export const keys = {
   agents: {
     all: ["agents"] as const,
   },
+
+  /**
+   * The Pillars namespace — mail, contacts, calendar, voice, web, browser,
+   * files — landing together for the reason the top of this file gives: seven
+   * pillars arrive across seven slices, and a namespace built one page at a
+   * time is a namespace where the seventh page spells its own key for a route
+   * the first page's slice already named.
+   *
+   * Every child below was read off the route it will serve, whether or not a
+   * hook reads it yet in this slice. `mail` is filled in against
+   * `core/src/http.rs`'s `/email/*` routes for the slice that builds it here;
+   * `contacts.merges` and `browser.sessions` are two keys that already had a
+   * reader — `data/waiting.ts`'s local `WAITING_KEYS`, retired in this same
+   * slice in favour of these. The rest carry the shape their own route
+   * answers with and wait for the slice that reads them.
+   */
+  mail: {
+    all: ["mail"] as const,
+    /** `GET /email/queue?q=` — one optional free-text filter, nothing else (`http.rs:206`). */
+    queue: (q?: string) => ["mail", "queue", q ?? null] as const,
+    /** `GET /email/cursor?mailbox=` — `mailbox` is required, so there is no bare form. */
+    cursor: (mailbox: string) => ["mail", "cursor", mailbox] as const,
+    config: ["mail", "config"] as const,
+    detail: (id: number) => ["mail", "detail", id] as const,
+    attachments: (id: number) => ["mail", "attachments", id] as const,
+  },
+
+  contacts: {
+    all: ["contacts"] as const,
+    /**
+     * `GET /contacts/merges` — already live, previously read through
+     * `WAITING_KEYS.contactMerges`. That constant is gone as of this slice.
+     */
+    merges: ["contacts", "merges"] as const,
+  },
+
+  calendar: {
+    all: ["calendar"] as const,
+    events: (from: string, to: string) => ["calendar", "events", from, to] as const,
+    busy: ["calendar", "busy"] as const,
+    config: ["calendar", "config"] as const,
+  },
+
+  voice: {
+    all: ["voice"] as const,
+    config: ["voice", "config"] as const,
+    memos: ["voice", "memos"] as const,
+    dictations: ["voice", "dictations"] as const,
+  },
+
+  web: {
+    all: ["web"] as const,
+    pages: (q?: string) => ["web", "pages", q ?? null] as const,
+    page: (id: number) => ["web", "page", id] as const,
+  },
+
+  browser: {
+    all: ["browser"] as const,
+    /**
+     * `GET /browser/sessions` — already live, previously read through
+     * `WAITING_KEYS.wheelRequests`. The route answers every open session and
+     * the wheel-request filter still happens in `select`, at the call site.
+     */
+    sessions: ["browser", "sessions"] as const,
+    sites: (projectId: string) => ["browser", "sites", projectId] as const,
+    health: ["browser", "health"] as const,
+  },
+
+  files: {
+    all: ["files"] as const,
+    list: (path: string) => ["files", "list", path] as const,
+    search: (path: string, q: string) => ["files", "search", path, q] as const,
+  },
 } as const;

@@ -34,7 +34,12 @@ export type StateDomain =
   | "vcs"
   | "council"
   | "council_seat"
-  | "errand";
+  | "errand"
+  | "email_class"
+  | "voice_cleanup"
+  | "web_trust"
+  | "web_extract"
+  | "browser_refusal";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -231,6 +236,77 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     paused: { tone: "paused", label: "paused" },
     done: { tone: "off", label: "closed" },
   },
+
+  /**
+   * A message's triage class — `core/src/triage.rs:253` `VALID_CLASSES`, plus
+   * the terminal fifth one at `triage.rs:839,886`.
+   *
+   * `failed` is deliberately kept off `noise`'s tone: it is triage giving up
+   * after repeated attempts to read the message at all, which is a fact about
+   * *us*, not a judgement about the mail's content the way the other four are.
+   * Reading it as noise would hide a message the machine never actually looked
+   * at behind one it looked at and dismissed.
+   */
+  email_class: {
+    urgent: { tone: "pending", label: "urgent" },
+    action: { tone: "paused", label: "needs a reply, not today" },
+    info: { tone: "info", label: "worth having seen" },
+    noise: { tone: "off", label: "noise" },
+    failed: { tone: "danger", label: "triage could not read this" },
+  },
+
+  /**
+   * Whether a voice memo's transcript was cleaned up — `core/src/voice.rs:92-116`.
+   *
+   * `raw` and `shrunk` both leave the raw transcript on screen and must not
+   * collapse into one reading: `raw` is nothing having been attempted (no
+   * cleanup model armed, or it was unreachable), `shrunk` is a cleanup having
+   * been produced and then REFUSED by a guard — a rewrite the guard judged as
+   * having dropped too much, kept raw rather than trusted.
+   */
+  voice_cleanup: {
+    cleaned: { tone: "active", label: "cleaned up" },
+    raw: { tone: "off", label: "raw — no cleanup model armed" },
+    shrunk: { tone: "paused", label: "cleanup refused by a guard — raw kept" },
+  },
+
+  /**
+   * Whether a fetched page's text reaches an agent as written or only as a
+   * summary — `core/src/web.rs`, `trust.rs:31-34`. The default is quarantine;
+   * `raw` is the narrower, earned case (spec §5.2's conjunction), not the
+   * common one.
+   */
+  web_trust: {
+    raw: { tone: "active", label: "full text reached the agent" },
+    quarantined: { tone: "paused", label: "summarised before reaching the agent" },
+  },
+
+  /**
+   * How much of a fetched page's structure survived extraction —
+   * `sidecars/web/extract/extract.go:28,32`. `fallback` is a SHAPE, not a
+   * failure: an index or a dashboard has no article root to find, and lands
+   * here legitimately.
+   */
+  web_extract: {
+    article: { tone: "active", label: "read as an article" },
+    fallback: { tone: "info", label: "read as a page, not an article" },
+  },
+
+  /**
+   * Why `POST /browser/open` refused — `browser.rs:773-783`,
+   * `browser_policy.rs:90-142`. Two are recoverable right where the refusal
+   * happened and two are not, and the four literals must not blur into "the
+   * browser said no": `no-one-present` is fixed by opening the shell,
+   * `pillar-disabled` by turning the pillar on, and neither `reach-undesigned`
+   * (the autonomous path is a seam, not a built road) nor `unparseable-url`
+   * clears on its own from here.
+   */
+  browser_refusal: {
+    "reach-undesigned": { tone: "info", label: "this reach is not built yet" },
+    "no-one-present": { tone: "pending", label: "open the shell to continue" },
+    "pillar-disabled": { tone: "off", label: "the browser pillar is not enabled" },
+    "unparseable-url": { tone: "danger", label: "that url could not be read" },
+  },
 };
 
 /**
@@ -246,6 +322,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
  */
 const ABSENT: Partial<Record<StateDomain, StateReading>> = {
   gate: { tone: "off", label: "no gate configured" },
+  /**
+   * A NULL `triage_class` (`core/src/email.rs:791`) is a message triage has
+   * not reached yet, not a message that was read and found to be nothing —
+   * that second fact is `noise`, a real class, and the two must not share a
+   * badge.
+   */
+  email_class: { tone: "info", label: "not triaged yet" },
 };
 
 /**

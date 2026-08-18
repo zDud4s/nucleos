@@ -1,5 +1,6 @@
 import { Outlet } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
+import { untriagedCount, useMailQueue } from "../data/mail";
 import { useHealth, useProposals } from "../data/system";
 import { unreadTotal } from "../lib/turns";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
@@ -39,11 +40,6 @@ function Frame() {
    * `GET /proposals` is `list_pending` in the núcleo — the route serves the
    * queue, not the archive — so its length *is* the badge. Filtering by status
    * here would be the shell second-guessing a decision the route already made.
-   *
-   * The remaining badge source, untriaged mail, has no hook yet: it arrives
-   * with the slice that builds that pillar. Until then it simply carries no
-   * badge, which is the honest rendering of a count nobody has measured — a
-   * zero would be a claim.
    */
   const proposals = useProposals();
   /**
@@ -53,6 +49,12 @@ function Frame() {
    * chat's badge is `waiting`, not a row count.
    */
   const chats = useChats();
+  /**
+   * Untriaged mail. `undefined` until the queue has answered once, same rule
+   * as the two above — a zero drawn before the first answer would be a claim
+   * nobody has measured, not an honest "nothing waiting".
+   */
+  const mail = useMailQueue();
 
   return (
     <div className="app-shell">
@@ -61,6 +63,7 @@ function Frame() {
         badges={{
           proposals: proposals.data?.length,
           chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
+          mail: mail.data === undefined ? undefined : untriagedCount(mail.data),
         }}
         systemAlert={health.data === false}
       >

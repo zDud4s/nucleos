@@ -15,6 +15,7 @@ import { Errands } from "./pages/Errands";
 import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
+import { Mail } from "./pages/Mail";
 import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
@@ -52,6 +53,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/errands": Errands,
   "/council": Council,
   "/agents": Agents,
+  "/mail": Mail,
 };
 
 /**

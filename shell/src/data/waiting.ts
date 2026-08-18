@@ -35,27 +35,6 @@ import type { Proposal } from "./system";
  * five seconds is soon enough for a list a person works through by hand.
  */
 
-/* ------------------------------------------------------------------ keys -- */
-
-/**
- * The two keys this file has to spell for itself.
- *
- * `keys.waiting.*` covers the three lists the Operate namespace declared, and
- * `data/keys.ts` is not this packet's to edit. Browser sessions and contact
- * merges belong to the Browser and Contacts pillars, which have not landed —
- * so their keys are built here, under the `waiting` prefix, which keeps them
- * inside the one `invalidateQueries` this page makes after a decision.
- *
- * The cost is stated rather than hidden: when the Browser pillar arrives and
- * registers `keys.browser.sessions`, `GET /browser/sessions` will have two cache
- * entries until this constant is retired in favour of it. That is the drift
- * `keys.ts` warns about, and it is a follow-up rather than a surprise.
- */
-export const WAITING_KEYS = {
-  wheelRequests: [...keys.waiting.all, "wheel-requests"] as const,
-  contactMerges: [...keys.waiting.all, "contact-merges"] as const,
-} as const;
-
 /* ----------------------------------------------------------------- shapes -- */
 
 /** One open browser session, exactly as `browser::SessionRow` serialises. */
@@ -202,7 +181,7 @@ export { useExclusionRequests } from "./fleet";
  */
 export function useWheelRequests() {
   return useQuery({
-    queryKey: WAITING_KEYS.wheelRequests,
+    queryKey: keys.browser.sessions,
     queryFn: () => apiFetch<BrowserSession[]>("/browser/sessions"),
     refetchInterval: POLL.queue,
     placeholderData: keepPreviousData,
@@ -218,7 +197,7 @@ export function isWheelRequest(session: BrowserSession): session is WheelRequest
 /** §5 — the pairs the núcleo thinks are one person. */
 export function useContactMerges() {
   return useQuery({
-    queryKey: WAITING_KEYS.contactMerges,
+    queryKey: keys.contacts.merges,
     queryFn: () => apiFetch<MergeSuggestion[]>("/contacts/merges"),
     refetchInterval: POLL.queue,
     placeholderData: keepPreviousData,
