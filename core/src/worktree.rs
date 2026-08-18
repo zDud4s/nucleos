@@ -106,6 +106,35 @@ impl Owner {
             Owner::Job(_) => None,
         }
     }
+
+    /// The branch `create` opens for this owner's worktree.
+    pub fn branch_name(self) -> String {
+        format!("{BRANCH_PREFIX}{}", self.dir_name())
+    }
+}
+
+/// The prefix every worktree branch this daemon creates carries. One constant because two callers
+/// read the name apart: `create_at` writes it, and `run_behind_branch` takes it back off.
+const BRANCH_PREFIX: &str = "nucleos/";
+
+/// The run a worktree branch was opened for, if this daemon opened it.
+///
+/// **The branch name outlives the row that records who owns the tree, and that is why this exists
+/// rather than a join.** A run that pauses for approval and resumes hands its worktree to a NEW run
+/// id, and the `worktrees` row is rewritten to the successor — so anything that identified the tree
+/// by its current owner loses the link to the run that created it. The branch is opened once, is
+/// never renamed, and names that run for as long as the branch is around. Measured the hard way: a
+/// conflict resolution whose inspection command was held for approval landed unmarked, so nothing
+/// verified it before it was published.
+///
+/// A name an agent could write by hand is accepted, and the direction that fails in is the safe one:
+/// claiming to be a resolution buys stricter checking, never less.
+pub fn run_behind_branch(branch: &str) -> Option<i64> {
+    branch
+        .strip_prefix(BRANCH_PREFIX)?
+        .strip_prefix("run-")?
+        .parse()
+        .ok()
 }
 
 pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInfo> {
@@ -150,7 +179,7 @@ pub async fn create_at(
     }
 
     let name = owner.dir_name();
-    let branch = format!("nucleos/{name}");
+    let branch = owner.branch_name();
     let path = root.join(&name);
     tokio::fs::create_dir_all(&root).await?;
 
