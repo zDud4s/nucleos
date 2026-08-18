@@ -53,7 +53,7 @@ struct Candidate {
 
 /// The oldest conflict nobody has attempted, or `None`.
 ///
-/// **Four conditions and each excludes a different thing.** `resolution_run_id IS NULL` is the one
+/// **Five conditions and each excludes a different thing.** `resolution_run_id IS NULL` is the one
 /// attempt for this row: a value there means an agent has already had it, whether it succeeded, gave
 /// up, or crashed. `from_resolution = 0` is the loop brake: a landing that came out of a resolution
 /// and conflicted anyway escalates to a person, because resolving it would produce another landing
@@ -81,6 +81,23 @@ struct Candidate {
 /// stops helping where it is most needed. Repetition against the SAME escalation is still refused,
 /// by `resolution_run_id IS NULL` above; what this adds is only that two never run at once.
 ///
+/// **The fifth is a conflict that has stopped being one, and it is the commonest case in practice.**
+/// The escalation tells the asker what to do about it — bring the target into your branch, resolve
+/// there, ask again — and when they do, the merge lands and the old escalated row stays behind. It
+/// is terminal, so nothing tidies it, and to this loop it still reads as an unattempted conflict.
+/// Watched three times on this repository in one evening: request 28 settled by 29, request 33
+/// settled by 34, each leaving bait. Once it started an agent that resolved a conflict which had
+/// already been settled another way, and that resolution's landing would have reopened what the
+/// other one decided.
+///
+/// A later `succeeded` naming the same operation is what says so. Later by id, because a merge that
+/// succeeded BEFORE this escalation is a different event entirely — the branches moved on and
+/// conflicted afterwards, which is the ordinary way a conflict appears at all.
+///
+/// It does not cover the same thing happening while a resolution is already RUNNING; that one needs
+/// a live run cancelled rather than a row skipped, and it is named here rather than left to be
+/// rediscovered.
+///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
 /// runner to prove.
@@ -99,6 +116,13 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
                  WHERE attempted.project_id = conflict.project_id
                    AND attempted.args = conflict.args
                    AND runs.status IN ('running', 'awaiting_approval')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM vcs_requests AS settled
+                 WHERE settled.project_id = conflict.project_id
+                   AND settled.args = conflict.args
+                   AND settled.status = 'succeeded'
+                   AND settled.id > conflict.id
             )
           ORDER BY id
           LIMIT 1",
@@ -660,6 +684,42 @@ mod tests {
             next_conflict(&pool).await.unwrap().map(|it| it.id),
             Some(elsewhere),
             "deduplication is per conflict, not a stop on the whole project"
+        );
+    }
+
+    /// **The conflict that stopped being one**, which is what the escalation's own advice produces:
+    /// it tells the asker to bring the target into their branch, resolve it there and ask again, and
+    /// when they do the merge lands and the escalated row stays behind. Terminal, so nothing tidies
+    /// it, and to the loop it still reads as work nobody has looked at.
+    ///
+    /// Watched three times in one evening on this repository. Once it minted an agent that resolved a
+    /// conflict already settled by another route, and that resolution's landing would have reopened
+    /// what the other one decided.
+    #[tokio::test]
+    async fn a_conflict_that_somebody_else_already_settled_is_not_work() {
+        let pool = test_pool().await;
+        let escalated = escalated_merge(&pool, false).await;
+        assert_eq!(
+            next_conflict(&pool).await.unwrap().map(|it| it.id),
+            Some(escalated),
+            "until the merge lands some other way, it is a conflict like any other"
+        );
+
+        // The asker takes the advice the escalation gave: they merge the target into their branch,
+        // resolve it there, and ask again. This time it goes through.
+        let settled = escalated_merge(&pool, false).await;
+        sqlx::query(
+            "UPDATE vcs_requests SET status = 'succeeded', result_sha = 'abc' WHERE id = ?",
+        )
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "request {settled} published this merge, so {escalated} is a conflict that no longer \
+             exists — an agent started on it resolves what somebody has already decided"
         );
     }
 
