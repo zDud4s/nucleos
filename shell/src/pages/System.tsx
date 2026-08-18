@@ -4,30 +4,42 @@ import { isApiRefusal } from "../data/client";
 import { scopeEngaged, useScopedKills, useSetScopedKill } from "../data/autopilot";
 import {
   isAggregateTimeout,
+  useApiTokens,
   useBackups,
   useBudget,
+  useCalendarConfig,
+  useEmailConfig,
+  useMintToken,
   usePiiTally,
   useProjects,
+  useRevokeToken,
   useSetBudget,
   useSidecars,
   useStageRestore,
   useSystemHealth,
   useTakeBackup,
+  useVoiceConfig,
+  type ApiTokenLevel,
+  type ApiTokenSummary,
   type BackupInfo,
   type BudgetChange,
   type BudgetView,
+  type CalendarConfig,
+  type CreatedApiToken,
+  type EmailConfig,
   type HealthReadout,
   type PiiTallyRow,
   type SidecarState,
   type SubsystemReadout,
+  type VoiceConfig,
 } from "../data/system";
-import { Badge, Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge, Teach } from "../ui";
+import { Badge, Button, ConfirmButton, CopyOnce, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
 import "./system.css";
 
 /**
  * System — the machine's own state, not a project's.
  *
- * Three tabs. This slice builds the health view (the daemon's own subsystem
+ * Three tabs. S1 and S2 built the health view (the daemon's own subsystem
  * readout and the sidecars' own liveness) plus, on top of it, the project
  * brakes and the editable budget; and the whole backups view (snapshots,
  * staged restore and the PII tally). Health data is read off
@@ -35,8 +47,9 @@ import "./system.css";
  * the app, which every pillar's own health reading (Browser's included)
  * narrows rather than asking again.
  *
- * Tokens arrive with the packet that builds it (S3). This page says so
- * plainly rather than drawing an empty panel that looks broken.
+ * This packet (S3) builds the tokens view: minting and revoking API tokens
+ * with a show-once secret, plus a config index reading the three `/config/*`-
+ * shaped routes that actually exist and naming the four areas that have none.
  */
 
 /** The three tabs, in the order they read. */
@@ -73,7 +86,7 @@ export function System() {
       <div className="sy-sections">
         {view === "health" && <HealthView health={health} sidecars={sidecars} />}
         {view === "backups" && <BackupsView />}
-        {view === "tokens" && <ArrivesLater />}
+        {view === "tokens" && <TokensView />}
       </div>
     </>
   );
@@ -229,24 +242,6 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
         </p>
       )}
     </li>
-  );
-}
-
-/* ------------------------------------------------------------- not yet built -- */
-
-/**
- * The one honest sentence a not-yet-built tab needs.
- *
- * Not the whole-page {@link Placeholder} — the tab, the header and the rest of
- * the shell around it are all real; only this panel's content is still to
- * come, and it says which packet brings it rather than rendering an empty
- * space that reads as broken.
- */
-function ArrivesLater() {
-  return (
-    <Teach title="Tokens arrives with the next packet">
-      <p>This tab is real and will stay — only its content is still to come: token spend and secret access.</p>
-    </Teach>
   );
 }
 
@@ -625,6 +620,324 @@ function PiiTallyRowView({ row }: { row: PiiTallyRow }) {
       <td>{row.class}</td>
       <td>{row.count}</td>
     </tr>
+  );
+}
+
+/* ------------------------------------------------------------------ tokens -- */
+
+const TOKEN_LEVELS: ApiTokenLevel[] = ["read-only", "run-creating", "admin"];
+
+function TokensView() {
+  return (
+    <>
+      <TokensPanel />
+      <ConfigIndex />
+    </>
+  );
+}
+
+/**
+ * Mint and revoke API tokens.
+ *
+ * A minted token's secret lives in this panel's own state, not in the query
+ * cache — `useMintToken`'s answer is the only place the value exists, and
+ * writing it into the cache would dress a value that can never be refetched
+ * as one that could be. `CopyOnce` renders it; `onDismiss` is the whole
+ * lifecycle of that state.
+ */
+function TokensPanel() {
+  const tokens = useApiTokens();
+  const mintToken = useMintToken();
+  const [name, setName] = useState("");
+  const [level, setLevel] = useState<ApiTokenLevel>("read-only");
+  const [minted, setMinted] = useState<CreatedApiToken | null>(null);
+
+  function handleMint() {
+    const trimmed = name.trim();
+    if (trimmed === "") return;
+    mintToken.mutate(
+      { name: trimmed, level },
+      {
+        onSuccess: (created) => {
+          setMinted(created);
+          setName("");
+          setLevel("read-only");
+        },
+      },
+    );
+  }
+
+  return (
+    <Panel title="API tokens">
+      <p className="sy-note">
+        A read-only token cannot read the budget or the kill switch — both sit outside its read
+        allowlist. A run-creating token may start work. An admin token is everything.
+      </p>
+
+      {minted !== null && (
+        <CopyOnce
+          value={minted.token}
+          label={`the new token for ${minted.name}`}
+          onDismiss={() => setMinted(null)}
+        />
+      )}
+
+      <div className="sy-mint-form">
+        <div className="sy-field">
+          <label htmlFor="sy-token-name">Name</label>
+          <input
+            id="sy-token-name"
+            className="sy-field-input"
+            type="text"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </div>
+        <fieldset className="sy-token-levels">
+          <legend>Level</legend>
+          {TOKEN_LEVELS.map((candidate) => (
+            <label key={candidate} className="sy-token-level">
+              <input
+                type="radio"
+                name="sy-token-level"
+                value={candidate}
+                checked={level === candidate}
+                onChange={() => setLevel(candidate)}
+              />
+              {candidate}
+            </label>
+          ))}
+        </fieldset>
+        <Button variant="ghost" disabled={mintToken.isPending || name.trim() === ""} onClick={handleMint}>
+          Mint token
+        </Button>
+      </div>
+      {mintToken.isError && <MintError error={mintToken.error} />}
+
+      {tokens.isError && tokens.data === undefined && (
+        <SystemListError error={tokens.error} what="the API tokens" />
+      )}
+      {!tokens.isError && tokens.data === undefined && <p className="sy-loading">reading the tokens…</p>}
+      {tokens.data !== undefined && tokens.data.length === 0 && (
+        <p className="sy-empty">no token has been minted.</p>
+      )}
+      {tokens.data !== undefined && tokens.data.length > 0 && (
+        <ul className="sy-tokens" aria-label="API tokens">
+          {tokens.data.map((token) => (
+            <TokenRow key={token.name} token={token} />
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+function MintError({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) {
+    return (
+      <RefusalNote
+        refusal={error}
+        sentences={{
+          bad_request: "a token name is 1–64 characters, letters, digits, hyphen or underscore",
+          conflict: "there is already a token with that name",
+        }}
+      />
+    );
+  }
+  return <ErrorNote>the token was not minted — the núcleo did not answer</ErrorNote>;
+}
+
+/** One row, with its own `useRevokeToken` instance — each row's pending/error state is its own. */
+function TokenRow({ token }: { token: ApiTokenSummary }) {
+  const revokeToken = useRevokeToken();
+
+  return (
+    <li className="sy-token">
+      <div className="sy-token-head">
+        <span className="sy-token-name">{token.name}</span>
+        <Badge tone="info">{token.level}</Badge>
+        <span className="sy-token-meta">
+          minted <RelativeTime at={token.created_at} />
+        </span>
+      </div>
+      <ConfirmButton
+        label="Revoke"
+        confirmLabel={`Revoke ${token.name}`}
+        variant="danger"
+        disabled={revokeToken.isPending}
+        onConfirm={() => revokeToken.mutate(token.name)}
+      />
+      {revokeToken.isError && <RevokeError error={revokeToken.error} />}
+    </li>
+  );
+}
+
+function RevokeError({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) {
+    return <RefusalNote refusal={error} sentences={{ not_found: "that token is already gone" }} />;
+  }
+  return <ErrorNote>that token was not revoked — the núcleo did not answer</ErrorNote>;
+}
+
+/* ------------------------------------------------------------------- config -- */
+
+/**
+ * Areas with no configuration route at all, verified against `core/src/http.rs`'s
+ * `/config/*` set plus the two asymmetric paths above it — `/config/email` is
+ * the only `/config/*` route, and nothing serves web, browser, council or
+ * models. Named rather than requested: there is nothing to ask for.
+ */
+const UNCONFIGURED_AREAS = ["web", "browser", "council", "models"] as const;
+
+/**
+ * Readouts for the config routes that exist, and an honest list of the ones
+ * that do not.
+ */
+function ConfigIndex() {
+  return (
+    <>
+      <EmailConfigPanel />
+      <VoiceConfigPanel />
+      <CalendarConfigPanel />
+      <UnconfiguredAreasPanel />
+    </>
+  );
+}
+
+function ConfigFact({ term, value }: { term: string; value: string }) {
+  return (
+    <div className="sy-fact">
+      <dt>{term}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function EmailConfigPanel() {
+  const email = useEmailConfig();
+  return (
+    <Panel title="Email configuration">
+      {email.isError && email.data === undefined && (
+        <SystemListError error={email.error} what="the e-mail configuration" />
+      )}
+      {!email.isError && email.data === undefined && <p className="sy-loading">reading…</p>}
+      {email.data !== undefined && <EmailConfigFacts config={email.data} />}
+    </Panel>
+  );
+}
+
+/**
+ * `enabled` and `armed` are rendered as two separate facts on purpose — the
+ * daemon's own comment says an enabled-but-unarmed mailbox is a real state:
+ * the pillar keeps its retention either way, and triage can be held while
+ * mail keeps arriving. `local_triage_disabled` is a reason string when local
+ * triage was configured and could not be trusted; `null` means nothing is
+ * wrong, not that it is off.
+ */
+function EmailConfigFacts({ config }: { config: EmailConfig }) {
+  return (
+    <>
+      <div className="sy-config-flags">
+        <Badge tone={config.enabled ? "active" : "off"}>{config.enabled ? "enabled" : "disabled"}</Badge>
+        <Badge tone={config.armed ? "active" : "paused"}>{config.armed ? "armed" : "unarmed"}</Badge>
+      </div>
+      <dl className="sy-config-facts">
+        <ConfigFact term="host" value={config.host} />
+        <ConfigFact term="username" value={config.username} />
+        <ConfigFact term="mailbox" value={config.mailbox} />
+        <ConfigFact term="sent mailbox" value={config.sent_mailbox ?? "not set"} />
+        <ConfigFact term="poll interval" value={`${String(config.poll_interval_secs)}s`} />
+        <ConfigFact term="notify classes" value={config.notify_classes.join(", ") || "none"} />
+        <ConfigFact term="digest hour (UTC)" value={String(config.digest_hour_utc)} />
+        <ConfigFact term="retain bodies (days)" value={String(config.retain_bodies_days)} />
+      </dl>
+      <p className="sy-note">
+        {config.local_triage_disabled === null
+          ? "local triage: nothing is wrong."
+          : `local triage disabled: ${config.local_triage_disabled}`}
+      </p>
+    </>
+  );
+}
+
+function VoiceConfigPanel() {
+  const voice = useVoiceConfig();
+  return (
+    <Panel title="Voice configuration">
+      {voice.isError && voice.data === undefined && (
+        <SystemListError error={voice.error} what="the voice configuration" />
+      )}
+      {!voice.isError && voice.data === undefined && <p className="sy-loading">reading…</p>}
+      {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
+    </Panel>
+  );
+}
+
+function VoiceConfigFacts({ config }: { config: VoiceConfig }) {
+  return (
+    <>
+      <div className="sy-config-flags">
+        <Badge tone={config.armed ? "active" : "paused"}>{config.armed ? "armed" : "unarmed"}</Badge>
+      </div>
+      <dl className="sy-config-facts">
+        <ConfigFact term="hotkey" value={config.hotkey} />
+        <ConfigFact term="memo hotkey" value={config.memo_hotkey} />
+        <ConfigFact term="cleanup model" value={config.cleanup_model ?? "none configured"} />
+        <ConfigFact term="retain dictations (days)" value={String(config.retain_dictations_days)} />
+        <ConfigFact term="max capture (s)" value={String(config.max_capture_seconds)} />
+        <ConfigFact term="max body (bytes)" value={String(config.max_body_bytes)} />
+        <ConfigFact term="hints" value={config.hints.join(", ") || "none"} />
+      </dl>
+    </>
+  );
+}
+
+function CalendarConfigPanel() {
+  const calendar = useCalendarConfig();
+  return (
+    <Panel title="Calendar configuration">
+      {calendar.isError && calendar.data === undefined && (
+        <SystemListError error={calendar.error} what="the calendar configuration" />
+      )}
+      {!calendar.isError && calendar.data === undefined && <p className="sy-loading">reading…</p>}
+      {calendar.data !== undefined && <CalendarConfigFacts config={calendar.data} />}
+    </Panel>
+  );
+}
+
+function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
+  return (
+    <dl className="sy-config-facts">
+      <ConfigFact term="default timezone" value={config.default_tz} />
+      <ConfigFact
+        term="working hours"
+        value={`${config.working_hours_start}–${config.working_hours_end}`}
+      />
+      <ConfigFact term="working weekdays" value={config.working_weekdays.join(", ")} />
+    </dl>
+  );
+}
+
+/**
+ * The four areas the núcleo exposes no configuration route for at all — named
+ * plainly, the same way the Teams page names its missing routes, rather than
+ * drawing a request that would only 404.
+ */
+function UnconfiguredAreasPanel() {
+  return (
+    <Panel title="Not exposed by the núcleo">
+      <p className="sy-note">
+        These areas have no configuration route in the núcleo — there is nothing here to read or
+        write, and this page does not ask.
+      </p>
+      <ul className="sy-unconfigured" aria-label="Areas with no configuration route">
+        {UNCONFIGURED_AREAS.map((area) => (
+          <li key={area} className="sy-unconfigured-area">
+            {area}
+          </li>
+        ))}
+      </ul>
+    </Panel>
   );
 }
 

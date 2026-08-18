@@ -382,6 +382,153 @@ export function useStageRestore() {
   });
 }
 
+/* ------------------------------------------------------------------ tokens -- */
+
+/** The three durable key levels — `auth::ApiTokenLevel`, kebab-case on the wire. */
+export type ApiTokenLevel = "read-only" | "run-creating" | "admin";
+
+/** A token as the LISTING gives it — no secret here, ever. */
+export interface ApiTokenSummary {
+  name: string;
+  level: ApiTokenLevel;
+  created_at: string;
+}
+
+/**
+ * What minting answers with — the ONLY place `token` exists.
+ *
+ * `ApiTokenSummary` above never carries it: the daemon does not keep the plain
+ * value around to answer a second read with, so this one response is the
+ * token's entire lifetime as a readable string. `ui/CopyOnce` exists because
+ * of this shape.
+ */
+export interface CreatedApiToken {
+  name: string;
+  level: ApiTokenLevel;
+  created_at: string;
+  token: string;
+}
+
+export interface MintToken {
+  name: string;
+  level: ApiTokenLevel;
+}
+
+/** The minted tokens — `GET /api-tokens`. No poll: the list does not change while the window is open. */
+export function useApiTokens() {
+  return useQuery({
+    queryKey: keys.system.tokens,
+    queryFn: () => apiFetch<ApiTokenSummary[]>("/api-tokens"),
+  });
+}
+
+/**
+ * Mint a token.
+ *
+ * `retry: false` like every mutation in this layer — a refusal is settled, not
+ * a glitch to retry past. The answer carries the only copy of the secret the
+ * daemon will ever give out; the caller holds it in component state and shows
+ * it through `CopyOnce`, never writing it into the query cache — a cache entry
+ * is a thing that can be refetched, and this value cannot be.
+ */
+export function useMintToken() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mint: MintToken) =>
+      apiFetch<CreatedApiToken>("/api-tokens", {
+        method: "POST",
+        body: JSON.stringify(mint),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.tokens });
+    },
+  });
+}
+
+/**
+ * Revoke a token by name.
+ *
+ * `DELETE /api-tokens/{name}` answers **204**, typed `void` — `apiFetch`
+ * already exempts 204/205 from its JSON parse. A 404 means the token is
+ * already gone, which the page treats as a success in substance rather than a
+ * failure; invalidating here either way is what makes the listing catch up
+ * with that reading without a special case in the mutation itself.
+ */
+export function useRevokeToken() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<void>(`/api-tokens/${encodeURIComponent(name)}`, { method: "DELETE" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.tokens });
+    },
+  });
+}
+
+/* ------------------------------------------------------------------- config -- */
+
+/** `GET /config/email` — `EmailConfigView`. No SMTP field exists; there is no send pre-flight. */
+export interface EmailConfig {
+  enabled: boolean;
+  armed: boolean;
+  host: string;
+  username: string;
+  mailbox: string;
+  sent_mailbox: string | null;
+  poll_interval_secs: number;
+  notify_classes: string[];
+  digest_hour_utc: number;
+  retain_bodies_days: number;
+  local_triage_disabled: string | null;
+}
+
+/** `GET /voice/config` — note the path is NOT under `/config/`. */
+export interface VoiceConfig {
+  armed: boolean;
+  hints: string[];
+  cleanup_prompt: string;
+  cleanup_model: string | null;
+  retain_dictations_days: number;
+  hotkey: string;
+  memo_hotkey: string;
+  max_capture_seconds: number;
+  max_body_bytes: number;
+}
+
+/** `GET /calendar/config` — also NOT under `/config/`. */
+export interface CalendarConfig {
+  default_tz: string;
+  working_hours_start: string;
+  working_hours_end: string;
+  working_weekdays: string[];
+}
+
+/** The e-mail pillar's own configuration. No poll: config does not change while the window is open. */
+export function useEmailConfig() {
+  return useQuery({
+    queryKey: keys.system.config("email"),
+    queryFn: () => apiFetch<EmailConfig>("/config/email"),
+  });
+}
+
+/** The voice pillar's own configuration — `GET /voice/config`, asymmetric with the other two. */
+export function useVoiceConfig() {
+  return useQuery({
+    queryKey: keys.system.config("voice"),
+    queryFn: () => apiFetch<VoiceConfig>("/voice/config"),
+  });
+}
+
+/** The calendar pillar's own configuration — `GET /calendar/config`, asymmetric with the other two. */
+export function useCalendarConfig() {
+  return useQuery({
+    queryKey: keys.system.config("calendar"),
+    queryFn: () => apiFetch<CalendarConfig>("/calendar/config"),
+  });
+}
+
 /* -------------------------------------------------------------------- pii -- */
 
 /** One row of the PII tally — `GET /pii/observations` is an aggregate, not a list of observations. */

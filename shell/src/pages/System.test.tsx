@@ -22,12 +22,18 @@ import { System } from "./System";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
+  ApiTokenLevel,
+  ApiTokenSummary,
   BackupInfo,
   BudgetView,
+  CalendarConfig,
+  CreatedApiToken,
+  EmailConfig,
   HealthReadout,
   PiiTallyRow,
   ProjectSummary,
   SidecarState,
+  VoiceConfig,
 } from "../data/system";
 import type { ScopedKill } from "../data/autopilot";
 import { daemonFetch, daemonState, project, renderWithRouter } from "../test/harness";
@@ -59,6 +65,40 @@ const DAEMON_ORDER = [
   "voice_transcriber",
 ] as const;
 
+/** The three config fixtures — one shape each, none of them optional on the wire. */
+const DEFAULT_EMAIL_CONFIG: EmailConfig = {
+  enabled: true,
+  armed: true,
+  host: "imap.example.com",
+  username: "duarte@example.com",
+  mailbox: "INBOX",
+  sent_mailbox: null,
+  poll_interval_secs: 300,
+  notify_classes: ["urgent", "action"],
+  digest_hour_utc: 7,
+  retain_bodies_days: 30,
+  local_triage_disabled: null,
+};
+
+const DEFAULT_VOICE_CONFIG: VoiceConfig = {
+  armed: true,
+  hints: [],
+  cleanup_prompt: "tidy this up",
+  cleanup_model: null,
+  retain_dictations_days: 14,
+  hotkey: "Ctrl+Shift+V",
+  memo_hotkey: "Ctrl+Shift+M",
+  max_capture_seconds: 120,
+  max_body_bytes: 1_000_000,
+};
+
+const DEFAULT_CALENDAR_CONFIG: CalendarConfig = {
+  default_tz: "Europe/Lisbon",
+  working_hours_start: "09:00",
+  working_hours_end: "18:00",
+  working_weekdays: ["mon", "tue", "wed", "thu", "fri"],
+};
+
 interface SystemWorld {
   readout: HealthReadout;
   sidecars: SidecarState[];
@@ -67,6 +107,10 @@ interface SystemWorld {
   budget: BudgetView;
   backups: BackupInfo[];
   pii: PiiTallyRow[];
+  tokens: ApiTokenSummary[];
+  emailConfig: EmailConfig;
+  voiceConfig: VoiceConfig;
+  calendarConfig: CalendarConfig;
 }
 
 function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
@@ -78,6 +122,10 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
     budget: daemonState().budget,
     backups: [],
     pii: [],
+    tokens: [],
+    emailConfig: DEFAULT_EMAIL_CONFIG,
+    voiceConfig: DEFAULT_VOICE_CONFIG,
+    calendarConfig: DEFAULT_CALENDAR_CONFIG,
     ...overrides,
   };
 }
@@ -90,11 +138,12 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
  *
  * `opts.onRestore`, when given, replaces the default restore handling for
  * `POST /backups/{name}/restore` — the seam a test uses to make that route
- * throw a refusal instead of staging.
+ * throw a refusal instead of staging. `opts.onMint` does the same for
+ * `POST /api-tokens`.
  */
 function systemFetch(
   world: SystemWorld,
-  opts: { onRestore?: (name: string) => unknown } = {},
+  opts: { onRestore?: (name: string) => unknown; onMint?: (mint: { name: string; level: ApiTokenLevel }) => unknown } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState({ projects: world.projects }));
   return async (path, init) => {
@@ -136,6 +185,33 @@ function systemFetch(
           applies: `applies on the núcleo's next start, replacing everything written after ${name}`,
         };
       }
+      if (path === "/api-tokens" && typeof init.body === "string") {
+        const mint = JSON.parse(init.body) as { name: string; level: ApiTokenLevel };
+        if (opts.onMint !== undefined) return opts.onMint(mint);
+        if (world.tokens.some((row) => row.name === mint.name)) {
+          throw new ApiRefusal(409, "conflict", "conflict");
+        }
+        const created: CreatedApiToken = {
+          name: mint.name,
+          level: mint.level,
+          created_at: "2026-08-18T09:00:00Z",
+          token: `secret-${mint.name}`,
+        };
+        world.tokens = [...world.tokens, { name: created.name, level: created.level, created_at: created.created_at }];
+        return created;
+      }
+      return await shared(path, init);
+    }
+
+    if (init?.method === "DELETE") {
+      const revokeMatch = /^\/api-tokens\/([^/]+)$/.exec(path);
+      if (revokeMatch !== null) {
+        const name = decodeURIComponent(revokeMatch[1]);
+        const known = world.tokens.some((row) => row.name === name);
+        if (!known) throw new ApiRefusal(404, "not_found", "not_found");
+        world.tokens = world.tokens.filter((row) => row.name !== name);
+        return undefined;
+      }
       return await shared(path, init);
     }
 
@@ -152,6 +228,14 @@ function systemFetch(
         return world.backups;
       case "/pii/observations":
         return world.pii;
+      case "/api-tokens":
+        return world.tokens;
+      case "/config/email":
+        return world.emailConfig;
+      case "/voice/config":
+        return world.voiceConfig;
+      case "/calendar/config":
+        return world.calendarConfig;
       default:
         return await shared(path, init);
     }
@@ -520,6 +604,86 @@ describe("System - PII observations", () => {
     expect(within(table).getByText("mail.body_text")).toBeDefined();
     expect(within(table).getByText("email")).toBeDefined();
     expect(within(table).getByText("4")).toBeDefined();
+  });
+});
+
+/* ----------------------------------------------------------------- tokens -- */
+
+describe("System - tokens", () => {
+  it("shows a minted token's secret once and not in the listing", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/tokens");
+
+    const nameInput = await screen.findByLabelText("Name");
+    fireEvent.change(nameInput, { target: { value: "ci-reader" } });
+    fireEvent.click(screen.getByRole("button", { name: "Mint token" }));
+
+    const secretField = await screen.findByLabelText("the new token for ci-reader");
+    expect((secretField as HTMLInputElement).value).toBe("secret-ci-reader");
+
+    // The listing refetches after the mint and shows the new row — but never
+    // the secret, which lives only in the CopyOnce state above.
+    const list = await screen.findByRole("list", { name: "API tokens" });
+    const row = rowFor(list, "ci-reader");
+    expect(row.textContent).not.toMatch(/secret-ci-reader/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByLabelText("the new token for ci-reader")).toBeNull();
+  });
+
+  it("refuses a duplicate token name with the daemon's 409 as a value", async () => {
+    const world = systemWorld({
+      tokens: [{ name: "ci-reader", level: "read-only", created_at: "2026-08-17T09:00:00Z" }],
+    });
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onMint: () => {
+          throw new ApiRefusal(409, "conflict", "Conflict");
+        },
+      }),
+    );
+
+    await renderSystemAt("/system/tokens");
+
+    const nameInput = await screen.findByLabelText("Name");
+    fireEvent.change(nameInput, { target: { value: "ci-reader" } });
+    fireEvent.click(screen.getByRole("button", { name: "Mint token" }));
+
+    expect(await screen.findByText("there is already a token with that name")).toBeDefined();
+    // No secret ever reached the screen — the refusal is the whole outcome.
+    expect(screen.queryByRole("group", { name: "a secret shown once" })).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------ config index -- */
+
+describe("System - config index", () => {
+  it("names the config areas that have no route instead of failing to read them", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/tokens");
+
+    const areas = await screen.findByRole("list", { name: "Areas with no configuration route" });
+    for (const area of ["web", "browser", "council", "models"]) {
+      expect(within(areas).getByText(area)).toBeDefined();
+    }
+
+    // The three real routes were read...
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/config/email");
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/voice/config");
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/calendar/config");
+    });
+
+    // ...and nothing shaped like the four that do not exist was ever asked for.
+    const badCall = daemon.apiFetch.mock.calls.find(([path]) => {
+      const p = path as string;
+      return /\/config\/(web|browser|council|models)\b/.test(p) || /^\/(web|browser|council|models)\/config$/.test(p);
+    });
+    expect(badCall).toBeUndefined();
   });
 });
 
