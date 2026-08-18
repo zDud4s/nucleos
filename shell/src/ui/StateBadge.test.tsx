@@ -221,6 +221,27 @@ describe("StateBadge — council_seat", () => {
   });
 });
 
+describe("StateBadge — errand", () => {
+  it("keeps active, paused and done apart", () => {
+    assertAllDistinct("errand", ["active", "paused", "done"]);
+  });
+
+  it("gives each of the three its own label", () => {
+    expect(badge("errand", "active")?.text).toMatch(/answering/i);
+    expect(badge("errand", "paused")?.text).toMatch(/paused/i);
+    expect(badge("errand", "done")?.text).toMatch(/closed/i);
+  });
+
+  it("does not dress a closed errand as a failure or as a success (A15-adjacent)", () => {
+    // Closing is an ending, not a verdict — an errand closed the moment it
+    // started and one closed after months of real work are the same status.
+    const done = badge("errand", "done");
+    expect(done?.className).not.toContain("ui-badge-danger");
+    expect(done?.className).not.toContain("ui-badge-active");
+    expect(done?.text).not.toMatch(/fail/i);
+  });
+});
+
 describe("StateBadge — states with no reading", () => {
   it("shows an unmapped state as itself rather than guessing a tone", () => {
     const unknown = badge("run", "hibernating");

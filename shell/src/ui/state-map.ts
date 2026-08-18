@@ -33,7 +33,8 @@ export type StateDomain =
   | "slot"
   | "vcs"
   | "council"
-  | "council_seat";
+  | "council_seat"
+  | "errand";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -214,6 +215,21 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     error: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
     skipped: { tone: "off", label: "not asked" },
+  },
+
+  /**
+   * An errand's status — `core/src/errands.rs`, `Status::as_str`.
+   *
+   * `done` is a closed errand: the asking stopped, the row and its folder
+   * stay. It takes neither the failure tone nor the completion tone, because
+   * closing is an ending and not a verdict — an errand can be closed the
+   * moment it starts and closed after months of real work, and both are the
+   * same status.
+   */
+  errand: {
+    active: { tone: "active", label: "answering" },
+    paused: { tone: "paused", label: "paused" },
+    done: { tone: "off", label: "closed" },
   },
 };
 
