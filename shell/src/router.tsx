@@ -9,6 +9,7 @@ import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Agents } from "./pages/Agents";
 import { Autopilot } from "./pages/Autopilot";
+import { Browser } from "./pages/Browser";
 import { Calendar } from "./pages/Calendar";
 import { Chats } from "./pages/Chats";
 import { Contacts } from "./pages/Contacts";
@@ -24,6 +25,7 @@ import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
 import { Waiting } from "./pages/Waiting";
+import { Web } from "./pages/Web";
 
 /**
  * Memory history, in the real app as well as in the tests.
@@ -59,6 +61,8 @@ const PAGES: Record<string, () => ReactNode> = {
   "/mail": Mail,
   "/contacts": Contacts,
   "/calendar": Calendar,
+  "/web": Web,
+  "/browser": Browser,
 };
 
 /**
@@ -107,6 +111,7 @@ const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
   { path: "/mail/$emailId", component: MailDetail },
+  { path: "/web/pages/$pageId", component: Web },
 ];
 
 export function createAppRouter(initialPath = "/") {

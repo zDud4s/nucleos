@@ -37,42 +37,6 @@ import type { Proposal } from "./system";
 
 /* ----------------------------------------------------------------- shapes -- */
 
-/** One open browser session, exactly as `browser::SessionRow` serialises. */
-export interface BrowserSession {
-  id: number;
-  sidecar_id: string;
-  run_id: number | null;
-  /** The project the session was opened FOR — not necessarily whose profile it runs in. */
-  project_id: string | null;
-  profile_kind: string;
-  profile_id: string;
-  requested_url: string;
-  final_url: string;
-  rule: string;
-  /** Spec §4.4's state machine. `wheel-requested` is the only one this page reads. */
-  mode: "agent" | "wheel-requested" | "human" | "delivery-failed";
-  refusal: string | null;
-  /** The proposal that asked for the wheel, once one exists. Null means nothing to decide yet. */
-  proposal_id: number | null;
-  chain: string | null;
-  chain_decided_at: string | null;
-  opened_at: string;
-  closed_at: string | null;
-}
-
-/**
- * A session that is actually asking, narrowed to say so in the type.
- *
- * `proposal_id` is nullable on a session and not on one of these: a session in
- * `wheel-requested` with no proposal yet is the window between the mode flipping
- * and the record landing (spec §4.4 rule 3), and there is nothing to answer.
- * Narrowing here rather than at every card means a decision button cannot be
- * rendered for a request that has no id to send.
- */
-export interface WheelRequest extends BrowserSession {
-  proposal_id: number;
-}
-
 /** One row of the git queue, as `vcs::RequestSummary` serialises. */
 export interface VcsRequestSummary {
   id: number;
@@ -148,27 +112,12 @@ export { useExclusionRequests } from "./fleet";
 /**
  * §1 — the sessions where an agent has asked for the wheel.
  *
- * The route answers every open session and the filter happens in `select`, so
- * the cache holds what the daemon said and only this page's view is narrowed. A
- * session in `wheel-requested` with no `proposal_id` is the window between the
- * mode flipping and the proposal landing (spec §4.4 rule 3) — there is nothing
- * to decide yet, and offering buttons that would 404 is worse than waiting a
- * tick.
+ * Moved to `data/browser.ts` — Browser data, and now read from two pages —
+ * and re-exported here under the idiom this file already uses for
+ * `useContactMerges`, so nothing below has to change which door it imports
+ * these through.
  */
-export function useWheelRequests() {
-  return useQuery({
-    queryKey: keys.browser.sessions,
-    queryFn: () => apiFetch<BrowserSession[]>("/browser/sessions"),
-    refetchInterval: POLL.queue,
-    placeholderData: keepPreviousData,
-    select: (sessions: BrowserSession[]) => sessions.filter(isWheelRequest),
-  });
-}
-
-/** Whether a session is asking for a person, and has a proposal to answer with. */
-export function isWheelRequest(session: BrowserSession): session is WheelRequest {
-  return session.mode === "wheel-requested" && session.proposal_id !== null;
-}
+export { useWheelRequests, isWheelRequest, type BrowserSession, type WheelRequest } from "./browser";
 
 /**
  * §5 — the pairs the núcleo thinks are one person, and the shapes they carry.
