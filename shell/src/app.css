@@ -416,6 +416,219 @@
   display: none;
 }
 
+/* --------------------------------------------------- notifications drawer -- */
+
+/**
+ * The footer control that opens the drawer.
+ *
+ * Shaped like a `nav-item` and deliberately so: it sits in the rail, at the
+ * rail's width, and reads as one more place to go. It is not a `Button` — the
+ * design system's button is for *doing* something, and opening a panel to read
+ * is not an action on the machine.
+ */
+.app-notify {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.app-notify:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.app-notify-glyph {
+  flex: none;
+  width: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  text-align: center;
+  color: var(--text-faint);
+}
+
+.app-notify-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-collapsed .app-notify-label {
+  /* Visually hidden, not removed: the control keeps its accessible name, which
+     is where the count lives anyway. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.nav-collapsed .app-notify {
+  justify-content: center;
+  padding: var(--space-2) 0;
+}
+
+/**
+ * How many the calendar is holding. The pending tone, because that is the one
+ * tone that means "this is waiting for a person" — the same colour the nav
+ * badge uses, so two counts in one footer agree with each other.
+ */
+.app-notify-count {
+  flex: none;
+  min-width: 1.25rem;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--tone-pending-bg);
+  color: var(--tone-pending-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  text-align: center;
+}
+
+/**
+ * The drawer itself: the one floating surface in this slice.
+ *
+ * Fixed to the right edge and the full height of the window, over the page and
+ * not over the rail — you opened it from the rail and may want to keep reading
+ * the footer while it is open. It does not dim the page behind it and traps
+ * nothing: this is a place to look, not a modal decision, and a scrim would
+ * make a panel opened out of curiosity feel like something that has to be
+ * answered.
+ */
+.app-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  width: min(26rem, 100vw);
+  height: 100vh;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.app-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-drawer-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+
+.app-drawer-close {
+  flex: none;
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-lg);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.app-drawer-close:hover {
+  color: var(--text);
+}
+
+.app-drawer-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4);
+}
+
+.app-drawer-section + .app-drawer-section {
+  margin-top: var(--space-5);
+}
+
+.app-drawer-heading {
+  margin: 0 0 var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* An empty section says what empty means here, rather than showing nothing and
+   leaving the reader to decide whether the panel is broken. */
+.app-drawer-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.app-drawer-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.app-drawer-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-drawer-row:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.app-drawer-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Two timestamps, and both are needed: queued alone cannot say whether it ever
+   arrived, delivered alone cannot say how long it waited. */
+.app-drawer-when {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+.app-drawer-summary {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
 /* -------------------------------------------------------------- takeover -- */
 
 /**

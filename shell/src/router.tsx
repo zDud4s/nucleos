@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
+import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Placeholder } from "./pages/Placeholder";
@@ -38,6 +39,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/fleet": Fleet,
   "/waiting": Waiting,
   "/runs": Runs,
+  "/feed": Feed,
 };
 
 /**
@@ -51,6 +53,7 @@ const PAGES: Record<string, () => ReactNode> = {
  */
 const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => object> = {
   "/runs": validateRunSearch,
+  "/feed": validateFeedSearch,
 };
 
 /**

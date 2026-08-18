@@ -5,6 +5,7 @@ import { BudgetLine } from "./BudgetLine";
 import { ConnectionGate } from "./ConnectionGate";
 import { ConnectionStatus } from "./ConnectionStatus";
 import { KillSwitchControl } from "./KillSwitchControl";
+import { NotificationsDrawer } from "./NotificationsDrawer";
 import { Sidebar } from "./Sidebar";
 
 /**
@@ -50,6 +51,14 @@ function Frame() {
       <Sidebar badges={{ proposals: proposals.data?.length }} systemAlert={health.data === false}>
         <ConnectionStatus />
         <BudgetLine />
+        {/*
+          Above the kill switch and never below it. The switch is the one control
+          that must be reachable without aiming, from every page, and inserting
+          anything under it would move it off the bottom edge people already know
+          — the drawer is somewhere you choose to go, which is a lower claim on
+          the footer than the emergency stop has.
+        */}
+        <NotificationsDrawer />
         <KillSwitchControl />
       </Sidebar>
       <main className="app-main">
