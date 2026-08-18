@@ -1,8 +1,11 @@
 //! The conversations already had in the IDE, found on disk.
 //!
 //! The only module that knows `~/.claude/projects/` exists. Nothing here is ingested: the CLI's
-//! transcripts stay where they are — 583 MB of them at the time of writing — and this reads the
-//! head of a file to answer four questions and then stops.
+//! transcripts stay where they are — 583 MB of them at the time of writing — and each is read on
+//! the request that needs it. Listing reads the HEAD of a file for four facts and stops; opening
+//! one reads it THROUGH for the conversation, which on the four largest files on this machine is
+//! 0.2-3.1% of the bytes. The other 97% is tool calls, their results and the model's reasoning,
+//! and none of it is a line anybody said.
 //!
 //! A session found here is not yet anything. It becomes a conversation when `chats.rs` opens a row
 //! pointing at it, and from that moment it is an ordinary NucleOS conversation whose next turn
@@ -19,6 +22,16 @@ use std::path::{Path, PathBuf};
 const SCAN_LINES: usize = 400;
 const SCAN_BYTES: usize = 512 * 1024;
 
+/// How much of a conversation is read back, and how much of that may be text.
+///
+/// Two ceilings for the same reason `SCAN_LINES` and `SCAN_BYTES` are two: a session of a thousand
+/// short messages and a session of three pasted logs overrun in different directions, and a count
+/// alone would let the second through. Both are applied from the RECENT END, exactly as
+/// `get_assistant_chat` bounds the daemon's own transcripts — the beginning of a long session is
+/// the part nobody came back for.
+const SAID_SHOWN: usize = 200;
+const SAID_BYTES: usize = 512 * 1024;
+
 /// The longest title kept. The first message can be a pasted stack trace.
 const TITLE_LIMIT: usize = 120;
 
@@ -33,6 +46,21 @@ pub struct IdeSession {
     pub title: Option<String>,
     /// When the file was last written, RFC 3339.
     pub last_activity: String,
+}
+
+/// A session had in `cwd`, for the tests of the modules that take one.
+///
+/// Beside the type rather than copied into each of them: `create` takes the whole session precisely
+/// so its directory and its id cannot come from two different places, and a fixture written out
+/// four times is four places for them to.
+#[cfg(test)]
+pub fn had_in(cwd: &str, session_id: &str) -> IdeSession {
+    IdeSession {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        title: None,
+        last_activity: "2026-08-11T10:00:00+00:00".to_string(),
+    }
 }
 
 /// Where the CLI keeps its transcripts, or `None` when this machine has no home directory.
@@ -72,17 +100,47 @@ pub fn discover(root: &Path, limit: usize) -> Vec<IdeSession> {
 
 /// One session by its id, or `None` when this machine has no such transcript.
 ///
-/// Matches against names FOUND on disk rather than building a path out of the id. The id arrives
-/// from a client, and the difference matters: a path built from `../../` reaches wherever it likes,
-/// while a name compared against a directory listing can only ever be one of the names that were
-/// there. The caller then gets the directory from the file rather than from the request, which is
-/// the whole reason this lookup exists — a caller that could name its own working directory could
-/// name one where the classifier hook is wired and take the tools that come with it.
+/// The caller gets the directory from the FILE rather than from the request, which is the whole
+/// reason this lookup exists — a caller that could name its own working directory could name one
+/// where the classifier hook is wired and take the tools that come with it. `path_of` says why the
+/// id itself cannot reach out of the store.
 pub fn find(root: &Path, session_id: &str) -> Option<IdeSession> {
+    let (path, modified) = path_of(root, session_id)?;
+    read_head(&path, modified)
+}
+
+/// What was said in one session, oldest first, or `None` when this machine has no such transcript.
+///
+/// The window draws this ABOVE the turns the daemon ran, so a conversation picked up from the
+/// editor opens showing what it already was. Continuing it was always the point; opening one that
+/// looked empty made the continuation impossible to believe.
+///
+/// Deliberately not bound to whether the session can still be resumed. `discover` drops a session
+/// whose directory is gone because resuming is all a listed row offers; reading is not resuming,
+/// and the file still says what was said in it.
+pub fn conversation(root: &Path, session_id: &str) -> Option<Vec<Said>> {
+    let (path, _) = path_of(root, session_id)?;
+    Some(read_said(&path))
+}
+
+/// One thing said in a conversation had in the IDE.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Said {
+    /// Whether the owner typed it. The model answered everything else here.
+    pub by_owner: bool,
+    pub text: String,
+}
+
+/// The transcript named by an id, matched against the store's own listing.
+///
+/// The matching is the security property, and is why this is one function rather than a lookup
+/// written twice. The id arrives from a client: a path BUILT from `../../` reaches wherever it
+/// likes, while a name COMPARED against a directory listing can only ever be one of the names that
+/// were there.
+fn path_of(root: &Path, session_id: &str) -> Option<(PathBuf, std::time::SystemTime)> {
     transcripts(root)
         .into_iter()
         .find(|(path, _)| path.file_stem().and_then(|s| s.to_str()) == Some(session_id))
-        .and_then(|(path, modified)| read_head(&path, modified))
 }
 
 /// Every `<project>/<session>.jsonl` under the root, with its modification time.
@@ -150,7 +208,7 @@ fn read_head(path: &Path, modified: std::time::SystemTime) -> Option<IdeSession>
             cwd = Some(found.to_string());
         }
         if title.is_none() {
-            title = spoken_by_the_owner(&row);
+            title = spoken_by_the_owner(&row).map(|said| cut_to(said, TITLE_LIMIT));
         }
         if cwd.is_some() && title.is_some() {
             break;
@@ -179,7 +237,10 @@ fn read_head(path: &Path, modified: std::time::SystemTime) -> Option<IdeSession>
 /// Three things wear `"type": "user"` in these files and only one of them was typed: a real message,
 /// a tool result being handed back, and the harness's own injections — caveats about local commands,
 /// system reminders, pasted file contents. Titling a conversation with any of the others would name
-/// it after plumbing.
+/// it after plumbing, and putting one in the body of a conversation would attribute it to somebody.
+///
+/// The full text, uncut. What a title needs and what a transcript needs are different lengths, and
+/// the one place that knows which is the caller.
 fn spoken_by_the_owner(row: &serde_json::Value) -> Option<String> {
     if row.get("type").and_then(|v| v.as_str()) != Some("user") {
         return None;
@@ -203,11 +264,124 @@ fn spoken_by_the_owner(row: &serde_json::Value) -> Option<String> {
         return None;
     }
 
-    let mut title: String = trimmed.chars().take(TITLE_LIMIT).collect();
-    if trimmed.chars().count() > TITLE_LIMIT {
-        title.push('…');
+    Some(trimmed.to_string())
+}
+
+/// The text of a row, when that row is the model answering.
+///
+/// Only the `text` blocks. An assistant row also carries `thinking` and `tool_use`, and neither was
+/// said to anybody — the first is the model talking to itself and the second is it acting. Several
+/// text blocks in one row are joined rather than kept apart: they were one answer, and splitting
+/// them into separate bubbles would invent a pause that never happened.
+fn answered(row: &serde_json::Value) -> Option<String> {
+    if row.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
     }
-    Some(title)
+    let blocks = row.get("message")?.get("content")?.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join(
+            "
+
+",
+        );
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// One row of a transcript as a line of the conversation, or `None` when it is not one.
+///
+/// A subagent's rows are dropped here. `isSidechain` marks the exchange a `Task` tool ran inside
+/// this session — a different conversation, with a different model, that the owner never saw and
+/// never spoke in. Interleaving it would put words in the transcript that nobody in it said.
+fn spoken(row: &serde_json::Value) -> Option<Said> {
+    if row.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    match row.get("type").and_then(|v| v.as_str())? {
+        "user" => spoken_by_the_owner(row).map(|text| Said {
+            by_owner: true,
+            text,
+        }),
+        "assistant" => answered(row).map(|text| Said {
+            by_owner: false,
+            text,
+        }),
+        _ => None,
+    }
+}
+
+/// `text` if it fits in `limit` characters, and its first `limit` with an ellipsis if it does not.
+fn cut_to(text: String, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text;
+    }
+    let mut cut: String = text.chars().take(limit).collect();
+    cut.push('…');
+    cut
+}
+
+/// Reads one transcript through for the conversation in it, newest end kept.
+///
+/// The whole file, and no index kept of it. An index would be a second copy of somebody else's
+/// truth: the CLI owns these files and writes to them whenever a session is typed into, so a cache
+/// would be right until the moment it mattered. The cost is one pass over a file on the request
+/// that opens the conversation, which is a click and not a poll.
+///
+/// A file that cannot be opened reads back as an empty conversation rather than as a failure. The
+/// session is still resumable — the CLI reads its own store — and refusing to draw the chat because
+/// its history could not be read would take away the working half along with the broken one.
+fn read_said(path: &Path) -> Vec<Said> {
+    use std::io::BufRead;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut kept: std::collections::VecDeque<Said> = std::collections::VecDeque::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(mut item) = spoken(&row) else {
+            continue;
+        };
+        // Cut before it is kept, so one pasted log cannot be carried around whole only to be
+        // thrown away by the byte ceiling below — and so that a message bigger than that ceiling
+        // is shown cut rather than dropped, which would leave a gap nothing on screen explains.
+        item.text = cut_to(item.text, SAID_BYTES);
+        kept.push_back(item);
+        if kept.len() > SAID_SHOWN {
+            kept.pop_front();
+        }
+    }
+
+    // The byte ceiling, taken off the oldest end. The last message is never dropped: a conversation
+    // that came back empty because its final message was enormous would look like one nobody spoke
+    // in.
+    let mut total: usize = kept.iter().map(|said| said.text.len()).sum();
+    while kept.len() > 1 && total > SAID_BYTES {
+        if let Some(dropped) = kept.pop_front() {
+            total -= dropped.text.len();
+        }
+    }
+
+    kept.into()
 }
 
 #[cfg(test)]
@@ -403,5 +577,196 @@ mod tests {
 
         assert!(find(&store.root(), "../elsewhere/secret").is_none());
         assert!(find(&store.root(), "..\\elsewhere\\secret").is_none());
+    }
+
+    fn replied(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+    }
+
+    /// What a person came back to read: the two of them talking, in the order they talked.
+    ///
+    /// Everything else stays in the file. On the four largest transcripts on this machine the tool
+    /// calls, their results and the model's reasoning are 97-99.8% of the bytes, and not one of
+    /// them is a line of the conversation.
+    #[test]
+    fn a_session_reads_back_as_what_the_two_of_them_said() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("arranja o parser de datas"),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "thinking", "thinking": "deixa ver"}]}
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "content": "ok"}]}
+                }),
+                replied("está arranjado"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").expect("the session was not found");
+
+        assert_eq!(
+            read,
+            vec![
+                Said {
+                    by_owner: true,
+                    text: "arranja o parser de datas".into()
+                },
+                Said {
+                    by_owner: false,
+                    text: "está arranjado".into()
+                },
+            ]
+        );
+    }
+
+    /// The same rule that keeps the harness from NAMING a conversation keeps it out of the body of
+    /// one. A caveat the CLI typed is not a thing anybody said.
+    #[test]
+    fn the_harnesss_own_injections_are_not_part_of_the_conversation() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("<system-reminder>o ficheiro mudou</system-reminder>"),
+                said("Caveat: The messages below were generated by the user"),
+                said("o que falta fazer"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// A conversation is read from its recent end, exactly as `get_assistant_chat` reads the
+    /// daemon's own. The beginning of a long session is the part nobody is coming back for.
+    #[test]
+    fn only_the_recent_end_of_a_long_conversation_is_read_back() {
+        let store = Store::new();
+        let lines: Vec<serde_json::Value> = (0..SAID_SHOWN + 20)
+            .map(|n| said(&format!("mensagem {n}")))
+            .collect();
+        store.session("one", "aaaa-1111", &lines);
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        assert_eq!(read.len(), SAID_SHOWN);
+        assert_eq!(read[0].text, format!("mensagem {}", 20));
+        assert_eq!(
+            read[SAID_SHOWN - 1].text,
+            format!("mensagem {}", SAID_SHOWN + 19)
+        );
+    }
+
+    /// The count is not a bound on its own: one pasted log is worth a thousand short messages, and
+    /// the window has to draw whatever comes back.
+    #[test]
+    fn a_few_enormous_messages_are_cut_down_to_the_last_of_them() {
+        let store = Store::new();
+        let huge = "x".repeat(SAID_BYTES / 2 + 1);
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[said(&huge), said(&huge), said("a última")],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].text, "a última");
+    }
+
+    /// One message bigger than the whole ceiling is shown cut rather than dropped. Dropping it
+    /// would leave a gap nothing on screen could explain.
+    #[test]
+    fn a_single_message_past_the_ceiling_is_cut_rather_than_lost() {
+        let store = Store::new();
+        store.session("one", "aaaa-1111", &[said(&"x".repeat(SAID_BYTES * 2))]);
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        assert_eq!(read.len(), 1);
+        assert!(
+            read[0].text.len() <= SAID_BYTES + 4,
+            "{}",
+            read[0].text.len()
+        );
+        assert!(read[0].text.ends_with('…'));
+    }
+
+    /// A subagent's conversation is a different conversation. It runs inside this session and was
+    /// never said to the person reading it back.
+    #[test]
+    fn what_a_subagent_said_is_not_part_of_this_conversation() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("procura o bug"),
+                serde_json::json!({
+                    "type": "user", "isSidechain": true,
+                    "message": {"content": "procura o bug"}
+                }),
+                serde_json::json!({
+                    "type": "assistant", "isSidechain": true,
+                    "message": {"content": [{"type": "text", "text": "está no parser"}]}
+                }),
+                replied("está no parser"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].text, "procura o bug");
+        assert!(!read[1].by_owner);
+    }
+
+    /// The id arrives from a client here too, so the lookup is the same one `find` uses: a name
+    /// matched against the store's own listing, never a path built out of what was sent.
+    #[test]
+    fn a_conversation_cannot_be_read_from_outside_the_store() {
+        let store = Store::new();
+        store.session("one", "aaaa-1111", &[said("olá")]);
+        let outside = store.0.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("secret.jsonl"),
+            "{}
+",
+        )
+        .unwrap();
+
+        assert!(conversation(&store.root(), "../elsewhere/secret").is_none());
+        assert!(conversation(&store.root(), "never-existed").is_none());
+    }
+
+    /// A conversation is readable after its directory is gone, and it is deliberately not
+    /// CONTINUABLE then — `discover` drops it. Reading is not resuming: the file is still there and
+    /// still says what was said in it.
+    #[test]
+    fn a_conversation_whose_directory_is_gone_can_still_be_read() {
+        let store = Store::new();
+        store.session("gone", "aaaa-1111", &[said("olá")]);
+        std::fs::remove_dir_all(store.0.join("work").join("gone")).unwrap();
+
+        assert!(discover(&store.root(), 10).is_empty());
+        assert_eq!(conversation(&store.root(), "aaaa-1111").unwrap().len(), 1);
     }
 }
