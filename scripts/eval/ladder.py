@@ -149,8 +149,19 @@ def watch(project, first_id):
     """
     started = time.time()
     last = None
+    mine = []
     while True:
-        rows = call("/runs")
+        try:
+            rows = call("/runs")
+        except (urllib.error.URLError, OSError) as error:
+            # Survivable, and it has to be. `auto-approve.py` already says why for its own loop: the
+            # daemon gets restarted around here — rebuilt, or restarted by whoever else is working in
+            # this repo — and a watcher that died on the first gap would have to be babysat by the
+            # person it exists to replace. Measured 2026-08-18: the daemon went down mid-cell and
+            # took the ladder with it, leaving a run nobody was watching.
+            say(f"    daemon inalcançável ({error}); a tentar de novo")
+            time.sleep(10)
+            continue
         rows = rows if isinstance(rows, list) else rows.get("runs", [])
         mine = ([r for r in rows if r.get("project_id") == project] if project
                 else [r for r in rows if r.get("id") == first_id])
