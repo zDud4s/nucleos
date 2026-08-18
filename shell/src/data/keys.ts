@@ -145,6 +145,7 @@ export const keys = {
     detail: (chatId: string) => ["chats", "detail", chatId] as const,
     localModel: ["chats", "local-model"] as const,
     ideSessions: ["chats", "ide-sessions"] as const,
+    ideSession: (sessionId: string) => ["chats", "ide-session", sessionId] as const,
   },
 
   council: {

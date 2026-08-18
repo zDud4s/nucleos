@@ -6,6 +6,7 @@ import {
   useChatTranscript,
   useChats,
   useCreateChat,
+  useIdeConversation,
   useIdeSessions,
   useLocalModel,
   usePatchChat,
@@ -298,6 +299,7 @@ function ChatDetail({
   transcript: ReturnType<typeof useChatTranscript>;
 }) {
   const seen = usePostChatSeen();
+  const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
 
   // Once per chat opened, after the transcript has loaded — not on every poll
@@ -324,11 +326,16 @@ function ChatDetail({
       )}
 
       {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
+
+      {summary !== undefined && summary.ide_session_id !== null && <PickedUp view={pickedUp} />}
+
       {transcript.isError && transcript.data === undefined && <TranscriptError error={transcript.error} />}
       {!transcript.isError && transcript.data === undefined && (
         <p className="chats-loading">reading the conversation…</p>
       )}
-      {transcript.data !== undefined && <Transcript turns={transcript.data} />}
+      {transcript.data !== undefined && (
+        <Transcript turns={transcript.data} precededBy={(pickedUp.data ?? []).length > 0} />
+      )}
 
       <Composer chatId={chatId} />
     </Panel>
@@ -454,9 +461,66 @@ function ArchiveRefusal({ error }: { error: unknown }) {
   return <RefusalNote refusal={error} />;
 }
 
+/* ------------------------------------------------------- picked up here -- */
+
+/**
+ * What was said in the conversation this one was picked up from, drawn above the turns
+ * the daemon ran because that is when it happened.
+ *
+ * Three answers, and they are deliberately three. A transcript this machine no longer
+ * has is a 404, and the page then makes NO claim about that half — it draws the turns it
+ * does have and says the other half could not be read. An empty list is the different
+ * answer, a conversation nobody spoke in, and that one is said out loud. Collapsing the
+ * two would tell somebody their conversation was empty because a file moved.
+ */
+function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
+  if (view.data === undefined && !view.isError) {
+    return <p className="chats-loading">reading what was said in the editor…</p>;
+  }
+  if (view.data === undefined) {
+    return (
+      <p className="chats-picked-up-unread">
+        what was said in the editor could not be read — only the turns below are shown
+      </p>
+    );
+  }
+  if (view.data.length === 0) {
+    return (
+      <p className="chats-picked-up-cut">
+        this was picked up from a conversation in the editor that nobody spoke in.
+      </p>
+    );
+  }
+  return (
+    <>
+      <ul className="chats-said" aria-label="Said in the editor">
+        {view.data.map((said, index) => (
+          // Keyed by position: these came from a file, in the order they are in it, and
+          // nothing here reorders or removes one. A transcript has no id to key by.
+          <li
+            key={`said-${index}`}
+            className={said.by_owner ? "chats-said-line chats-said-owner" : "chats-said-line"}
+          >
+            <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+            {/* Text, never markup — this is somebody else's file. */}
+            <p className="chats-said-text">{said.text}</p>
+          </li>
+        ))}
+      </ul>
+      <p className="chats-picked-up-cut">
+        picked up here — everything above was said in the editor and read back out of its
+        own file. None of it was a run, and none of it was billed here.
+      </p>
+    </>
+  );
+}
+
 /* ------------------------------------------------------------ transcript -- */
 
-function Transcript({ turns }: { turns: Turn[] }) {
+function Transcript({ turns, precededBy }: { turns: Turn[]; precededBy: boolean }) {
+  // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
+  // one is full of what was said in the editor. Saying it over that is the wrong answer.
+  if (turns.length === 0 && precededBy) return null;
   if (turns.length === 0) return <p className="chats-empty">nothing has been said yet.</p>;
   return (
     <ul className="chats-turns" aria-label="Transcript">

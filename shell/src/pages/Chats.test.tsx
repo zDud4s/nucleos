@@ -22,7 +22,7 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary } from "../data/chats";
+import type { ChatSummary, Said } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow } from "../lib/turns";
@@ -46,6 +46,7 @@ function chatSummary(overrides: Partial<ChatSummary> = {}): ChatSummary {
     brain: "cloud",
     created_at: "2026-08-18T09:00:00Z",
     cwd: null,
+    ide_session_id: null,
     first_message: "hello there",
     last_activity: "2026-08-18T09:05:00Z",
     waiting: 0,
@@ -78,7 +79,11 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
 function chatsFetch(
   chats: ChatSummary[],
   transcripts: Record<string, AssistantTurnRow[]>,
-  opts: { localAvailable?: boolean; onMessage?: () => unknown } = {},
+  opts: {
+    localAvailable?: boolean;
+    onMessage?: () => unknown;
+    said?: Record<string, Said[]>;
+  } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
     if (path === "/assistant/message" && init?.method === "POST") {
@@ -91,6 +96,13 @@ function chatsFetch(
     if (path === "/assistant/chats") return chats;
     if (path === "/assistant/local-model") return { available: opts.localAvailable ?? true };
     if (path === "/assistant/ide-sessions") return [];
+    const ideSession = /^\/assistant\/ide-sessions\/([^/]+)$/.exec(path);
+    if (ideSession !== null) {
+      const found = opts.said?.[decodeURIComponent(ideSession[1])];
+      // A transcript this machine does not have is a 404, exactly as the daemon answers.
+      if (found === undefined) throw new ApiRefusal(404, "not_found", "Not Found");
+      return found;
+    }
     const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
     if (match !== null) return transcripts[match[1]] ?? [];
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
@@ -295,6 +307,79 @@ describe("Chats - an empty list", () => {
 
     expect(await screen.findByRole("heading", { name: "No conversations yet" })).toBeDefined();
     expect(await screen.findByText(/Telegram/)).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------- picked up from the editor -- */
+
+describe("Chats - a conversation picked up from the editor", () => {
+  const picked = () => chatSummary({ chat_id: "c-1", ide_session_id: "aaaa-1111", cwd: "C:/Projects/nucleos" });
+
+  it("draws what was said in the editor above the turns, oldest first, and marks where it was picked up", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "and now the rest", answer: "done" })] }, {
+        said: {
+          "aaaa-1111": [
+            { by_owner: true, text: "fix the date parser" },
+            { by_owner: false, text: "it is fixed" },
+          ],
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const said = await screen.findByRole("list", { name: "Said in the editor" });
+    const lines = within(said).getAllByRole("listitem");
+    expect(lines).toHaveLength(2);
+    expect(lines[0].textContent).toContain("fix the date parser");
+    expect(lines[0].textContent).toContain("you");
+    expect(lines[1].textContent).toContain("it is fixed");
+    expect(await screen.findByText(/picked up here/i)).toBeTruthy();
+
+    // The editor's half is drawn above the daemon's own turns.
+    const turns = await screen.findByRole("list", { name: "Transcript" });
+    expect(said.compareDocumentPosition(turns) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(turns).getByText("and now the rest")).toBeTruthy();
+  });
+
+  it("says nothing was said only when the daemon answered with an empty conversation", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([picked()], { "c-1": [] }, { said: { "aaaa-1111": [] } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/nobody spoke in/i)).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Said in the editor" })).toBeNull();
+  });
+
+  it("makes no claim about the editor's half when that transcript is gone", async () => {
+    // No `said` entry, so the responder answers 404 exactly as the daemon does.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "carry on", answer: "carried" })] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/could not be read/i)).toBeTruthy();
+    // The half it does have still draws, and it does not claim the other half was empty.
+    const turns = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(turns).getByText("carry on")).toBeTruthy();
+    expect(screen.queryByText(/nobody spoke in/i)).toBeNull();
+  });
+
+  it("asks for no editor transcript when the conversation was opened here", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [turnRow({ asked: "opened here" })] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    const asked = daemon.apiFetch.mock.calls.map((call) => String(call[0]));
+    expect(asked.some((path) => path.startsWith("/assistant/ide-sessions/"))).toBe(false);
+    expect(screen.queryByRole("list", { name: "Said in the editor" })).toBeNull();
   });
 });
 

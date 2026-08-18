@@ -26,6 +26,15 @@ export interface ChatSummary {
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
+  /**
+   * Which conversation had in the editor this one was picked up from, or null when it
+   * was opened here.
+   *
+   * What the window reads the old conversation back by. Not the session the next turn
+   * resumes — the daemon replaces that one the first time a context rotates, and this
+   * never moves.
+   */
+  ide_session_id: string | null;
   first_message: string | null;
   last_activity: string | null;
   /** Answers landed since this conversation was last opened. */
@@ -38,6 +47,13 @@ export interface IdeSession {
   cwd: string;
   title: string | null;
   last_activity: string;
+}
+
+/** One thing said in a conversation had in the editor. */
+export interface Said {
+  /** Whether the owner typed it. The model answered everything else. */
+  by_owner: boolean;
+  text: string;
 }
 
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
@@ -134,6 +150,24 @@ export function useIdeSessions(enabled: boolean) {
     queryKey: keys.chats.ideSessions,
     queryFn: () => apiFetch<IdeSession[]>("/assistant/ide-sessions"),
     enabled,
+  });
+}
+
+/**
+ * What was said in the conversation this one was picked up from, oldest first.
+ *
+ * Read on the request rather than held, matching the daemon's own posture: the store is
+ * the CLI's and changes whenever a session is typed into, so anything kept here would be
+ * a second copy of somebody else's truth. Not polled — opening a conversation is a click,
+ * not a queue — but the key does sit under `keys.chats.all`, so a mutation in this
+ * conversation refetches it, which is the direction that stays right.
+ */
+export function useIdeConversation(sessionId: string | null) {
+  return useQuery({
+    queryKey: keys.chats.ideSession(sessionId ?? ""),
+    queryFn: () =>
+      apiFetch<Said[]>(`/assistant/ide-sessions/${encodeURIComponent(sessionId ?? "")}`),
+    enabled: sessionId !== null,
   });
 }
 
