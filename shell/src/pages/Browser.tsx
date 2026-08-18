@@ -8,13 +8,24 @@ import {
   useCloseSession,
   useForgetProfile,
   useKeepChain,
+  useOpenWindow,
   useRevokeSite,
   useReturnWheel,
   type BrowserSession,
   type Site,
 } from "../data/browser";
 import { useProjects } from "../data/system";
-import { Badge, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
+import {
+  Badge,
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  PageHeader,
+  Panel,
+  RefusalNote,
+  RelativeTime,
+  StateBadge,
+} from "../ui";
 import "./browser.css";
 
 /**
@@ -59,6 +70,8 @@ export function Browser() {
           onSettled={() => setChainDialogue(null)}
         />
       )}
+
+      <OpenAWindow />
 
       <SiteGrants />
 
@@ -271,7 +284,104 @@ function ChainDialogue({
   );
 }
 
-/* ------------------------------------------------------------- 3. site grants -- */
+/* -------------------------------------------------------------- 3. open a window -- */
+
+/**
+ * The one door into this pillar that no agent asked for.
+ *
+ * Deliberately plain — two fields and a button, no proposal and no confirmation — and the
+ * plainness is the argument. Every ceremony elsewhere on this screen defends against an
+ * AGENT having chosen a destination while carrying a stranger's words; here the person
+ * typed the address, so there is nobody to approve. Asking them to approve their own
+ * request is the ceremony that teaches people to click through the one that matters.
+ *
+ * What it is for: until it existed a profile could be repaired, never prepared — the only
+ * way to log in was to wait for the agent to walk into the login first. What a session may
+ * GRANT is unchanged; the window records where it went and the chain above still answers
+ * on the way out.
+ *
+ * Its own project picker rather than one lifted out of `SiteGrants`: the two answer
+ * different questions, and choosing which project's grants to read should not move where
+ * a window opens.
+ */
+function OpenAWindow() {
+  const projects = useProjects();
+  const [chosen, setChosen] = useState<string | undefined>(undefined);
+  const [url, setUrl] = useState("");
+  const open = useOpenWindow();
+  const options = projects.data ?? [];
+  const projectId = chosen ?? options[0]?.project_id;
+  const ready = projectId !== undefined && url.trim() !== "" && !open.isPending;
+
+  return (
+    <Panel title="Open a window yourself">
+      <p className="browser-note">
+        A real window on this project&apos;s profile, with no fence and nobody asking. Log in,
+        look around, then give it back above — the hosts it went through are offered to keep
+        on the way out, which is the only way the list below ever grows.
+      </p>
+
+      {projects.data !== undefined && options.length === 0 && (
+        <p className="browser-empty">no project is registered yet.</p>
+      )}
+
+      {options.length > 0 && (
+        <form
+          className="browser-open"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (projectId === undefined || url.trim() === "" || open.isPending) return;
+            open.mutate({ projectId, url: url.trim() });
+          }}
+        >
+          <label className="browser-field">
+            <span>Project</span>
+            <select
+              aria-label="Project for the new window"
+              value={projectId ?? ""}
+              onChange={(event) => setChosen(event.target.value)}
+            >
+              {options.map((option) => (
+                <option key={option.project_id} value={option.project_id}>
+                  {option.project_id}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="browser-field">
+            <span>Address</span>
+            <input
+              type="text"
+              aria-label="Address to open"
+              placeholder="https://…"
+              value={url}
+              onChange={(event) => setUrl(event.target.value)}
+            />
+          </label>
+
+          <div className="browser-actions">
+            {/* A plain Button and not a ConfirmButton: this write is additive and
+                reversible — the window closes, and it grants nothing on its own. */}
+            <Button type="submit" variant="approve" disabled={!ready}>
+              Open a window
+            </Button>
+          </div>
+        </form>
+      )}
+
+      {open.data !== undefined && (
+        <p className="browser-outcome" role="status">
+          opened session #{open.data.id} on the {open.data.profile_kind} profile{" "}
+          {open.data.profile_id} — give it back above when you are done
+        </p>
+      )}
+      {open.isError && <MutationNote error={open.error} what="the window could not be opened" />}
+    </Panel>
+  );
+}
+
+/* ------------------------------------------------------------- 4. site grants -- */
 
 function SiteGrants() {
   const projects = useProjects();
@@ -362,7 +472,7 @@ function SiteRow({ site, onRevoke, pending }: { site: Site; onRevoke: () => void
   );
 }
 
-/* ------------------------------------------------------------- 4. health -- */
+/* ------------------------------------------------------------- 5. health -- */
 
 function BrowserHealth() {
   const health = useBrowserHealth();

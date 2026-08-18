@@ -293,3 +293,36 @@ export function useForgetProfile() {
     },
   });
 }
+
+/** What a person hands over to open a window of their own. */
+export interface OpenWindowInput {
+  projectId: string;
+  url: string;
+}
+
+/**
+ * A person opens a window on a project's profile, from an address they typed.
+ *
+ * No proposal and no confirmation: the §4.4 dialogue defends against an AGENT choosing a
+ * destination while carrying a stranger's words, and here the person typed it. The daemon
+ * refuses with 409 both when the pillar is off and when nobody is at the machine, telling
+ * the two apart only in its prose — which is why the page renders the daemon's own
+ * sentence rather than one of its own.
+ *
+ * `onSettled` rather than `onSuccess`, and that is load-bearing: a launch that fails still
+ * leaves a `delivery-failed` row behind, so the sessions list has moved either way.
+ */
+export function useOpenWindow() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: OpenWindowInput) =>
+      apiFetch<BrowserSession>("/browser/window", {
+        method: "POST",
+        body: JSON.stringify({ project_id: input.projectId, url: input.url }),
+      }),
+    retry: false,
+    onSettled: () => {
+      for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
+    },
+  });
+}
