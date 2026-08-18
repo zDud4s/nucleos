@@ -53,13 +53,26 @@ struct Candidate {
 
 /// The oldest conflict nobody has attempted, or `None`.
 ///
-/// **Three conditions and each excludes a different thing.** `resolution_run_id IS NULL` is the one
-/// attempt: a value there means an agent has already had this conflict, whether it succeeded, gave
-/// up, or crashed, and a second one would be a second opinion nobody asked for. `from_resolution = 0`
-/// is the loop brake: a landing that came out of a resolution and conflicted anyway escalates to a
-/// person, because resolving it would produce another landing that can conflict, one agent per turn,
-/// for ever. `op = 'merge'` is the vocabulary — every other operation escalates for reasons an agent
-/// in a worktree cannot touch.
+/// **Four conditions and each excludes a different thing.** `resolution_run_id IS NULL` is the one
+/// attempt for this row: a value there means an agent has already had it, whether it succeeded, gave
+/// up, or crashed. `from_resolution = 0` is the loop brake: a landing that came out of a resolution
+/// and conflicted anyway escalates to a person, because resolving it would produce another landing
+/// that can conflict, one agent per turn, for ever. `op = 'merge'` is the vocabulary — every other
+/// operation escalates for reasons an agent in a worktree cannot touch.
+///
+/// **The fourth is the same conflict arriving twice, and it was missing.** The one-attempt rule was
+/// written per ROW, and a conflict is not a row: two people, or a person and a session's `--land`,
+/// can each queue `X into Y`, and each escalation carried its own NULL. Measured in production —
+/// request 30 (a human's) and request 31 (a session's) named the identical merge minutes apart, and
+/// the loop minted an agent for each, so two runs sat in two worktrees resolving the same two
+/// branches at once. That is the fleet migration 0081 says this brake exists to prevent, arriving by
+/// the one route the per-row check does not see.
+///
+/// So the attempt is claimed against the OPERATION, in this project: `args` is the stored JSON, so
+/// comparing it compares source and target exactly. The cost, stated rather than discovered: a person
+/// who re-asks the same merge later gets no second agent either. That is the rule the design already
+/// chose — *"one attempt, never two: repeating is where an agent burns budget insisting on the same
+/// wall"* — applied to the thing it was always about, which is the conflict rather than the row.
 ///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
@@ -67,11 +80,17 @@ struct Candidate {
 async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate>> {
     sqlx::query_as(
         "SELECT id, op, args, project_id, project_root, output_tail
-           FROM vcs_requests
+           FROM vcs_requests AS conflict
           WHERE status = 'escalated'
             AND op = 'merge'
             AND resolution_run_id IS NULL
             AND from_resolution = 0
+            AND NOT EXISTS (
+                SELECT 1 FROM vcs_requests AS attempted
+                 WHERE attempted.project_id = conflict.project_id
+                   AND attempted.args = conflict.args
+                   AND attempted.resolution_run_id IS NOT NULL
+            )
           ORDER BY id
           LIMIT 1",
     )
@@ -361,6 +380,10 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
          read at all — because a flattened resolution is exactly what looks perfect.\n\
          - Do not merge, push, pull, or delete branches. Those go to the queue, and the queue is what \
          asked you for this.\n\
+         - Run ONE shell command at a time. No `&&` chains, no pipes, no `$(...)` — the classifier \
+         holds compound shell for a person to approve, and a resolution that stops to be approved \
+         for a `git log` is one nobody gets the benefit of. This costs you a few extra calls and \
+         saves the whole run.\n\
          \n\
          If the two sides genuinely cannot be reconciled — contradictory intent, not merely awkward \
          — stop and say so instead of committing a guess. Leaving it for a person is a correct \
@@ -445,12 +468,24 @@ mod tests {
         pool
     }
 
+    async fn escalated_merge(pool: &sqlx::SqlitePool, from_resolution: bool) -> i64 {
+        escalated_merge_of(pool, "feat/x", from_resolution).await
+    }
+
     /// An escalated merge, admitted through the real INSERT so the stored operation is the one the
     /// launcher will actually have to parse back.
-    async fn escalated_merge(pool: &sqlx::SqlitePool, from_resolution: bool) -> i64 {
+    ///
+    /// The source is a parameter because the attempt is claimed against the OPERATION: rows that
+    /// name the same two branches are the same conflict, so a test about the per-row exclusions has
+    /// to give each row a conflict of its own or it is testing deduplication by accident.
+    async fn escalated_merge_of(
+        pool: &sqlx::SqlitePool,
+        source: &str,
+        from_resolution: bool,
+    ) -> i64 {
         let repo = crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
         let op = crate::vcs::Op::Merge {
-            source: "feat/x".into(),
+            source: source.into(),
             target: "master".into(),
         };
         let id = if from_resolution {
@@ -472,7 +507,9 @@ mod tests {
     async fn only_a_conflict_that_nobody_has_attempted_is_picked_up() {
         let pool = test_pool().await;
 
-        let attempted = escalated_merge(&pool, false).await;
+        // Each row is a DIFFERENT conflict, or this would be testing the deduplication below rather
+        // than the three per-row exclusions it is about.
+        let attempted = escalated_merge_of(&pool, "feat/attempted", false).await;
         sqlx::query("UPDATE vcs_requests SET resolution_run_id = 9 WHERE id = ?")
             .bind(attempted)
             .execute(&pool)
@@ -480,7 +517,7 @@ mod tests {
             .unwrap();
         // A landing that came OUT of a resolution and conflicted anyway. Resolving it would produce
         // another landing that can conflict, one agent per turn, for ever. It goes to a person.
-        let looped = escalated_merge(&pool, true).await;
+        let looped = escalated_merge_of(&pool, "feat/looped", true).await;
         // Escalated, but not a merge: nothing an agent in a worktree can do about a push.
         let other = crate::vcs::submit(
             &pool,
@@ -499,7 +536,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fresh = escalated_merge(&pool, false).await;
+        let fresh = escalated_merge_of(&pool, "feat/fresh", false).await;
 
         let picked = next_conflict(&pool)
             .await
@@ -520,6 +557,63 @@ mod tests {
         assert!(
             next_conflict(&pool).await.unwrap().is_none(),
             "every conflict has been attempted; a fresh agent per tick is the failure this prevents"
+        );
+    }
+
+    /// **The fleet, arriving by the one route the per-row brake does not see.** A person queues
+    /// `X into Y`, it conflicts; a session's `--land` queues the same merge minutes later, and it
+    /// conflicts identically. Two escalations, each with its own NULL, each eligible — so two agents
+    /// end up in two worktrees resolving the same two branches at once.
+    ///
+    /// Measured in production before this test existed: requests 30 and 31 on `nucleos`, runs 900318
+    /// and 900319, both live. The attempt has to be claimed against the conflict, not the row.
+    #[tokio::test]
+    async fn the_same_conflict_queued_twice_gets_one_agent_and_not_two() {
+        let pool = test_pool().await;
+        let first = escalated_merge(&pool, false).await;
+        let again = escalated_merge(&pool, false).await;
+
+        let picked = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("the first of the two is work");
+        assert_eq!(picked.id, first);
+
+        // The launcher claims it, exactly as `create_run_with` does.
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 11 WHERE id = ?")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "the duplicate names the same merge in the same project — request {again} must not mint \
+             a second agent against branches another one is already editing"
+        );
+
+        // A different merge in the same project is untouched by the deduplication: it is a different
+        // conflict, and nobody has looked at it.
+        let elsewhere = crate::vcs::submit(
+            &pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj"),
+            &crate::vcs::Op::Merge {
+                source: "feat/other".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Shell,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(elsewhere)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_conflict(&pool).await.unwrap().map(|it| it.id),
+            Some(elsewhere),
+            "deduplication is per conflict, not a stop on the whole project"
         );
     }
 
@@ -615,6 +709,15 @@ mod tests {
         assert!(
             prompt.contains("ALREADY STAGED"),
             "an agent told to merge would go to the queue that refused this merge, and circle"
+        );
+        // Measured, not guessed: three of the first four resolution runs stopped dead waiting for a
+        // person to approve a READ — `$(git merge-base ...)`, `cd x && grep ... | head`. The
+        // classifier is right to hold compound shell; the resolver is the one run that cannot afford
+        // to be held, so it is told to spend the extra calls instead.
+        assert!(
+            prompt.contains("ONE shell command at a time"),
+            "the resolver's autonomy is what compound shell costs, and the prompt is where that is \
+             cheapest to avoid"
         );
         assert!(
             prompt.contains("CONFLICT (content): seed.txt"),
