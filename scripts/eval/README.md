@@ -94,6 +94,24 @@ a space:** the worktree tests resolve their tempdir from the process's current
 directory and assert it is space-free, so a spaced path fails ~25 tests for
 reasons that have nothing to do with the task. The script refuses one up front.
 
+### Running a whole ladder
+
+`score.sh` scores one tree. `ladder.py` is the loop around it — prepare, launch, approve, watch,
+score, one cell at a time:
+
+```sh
+python scripts/eval/ladder.py T3          # all four layers
+python scripts/eval/ladder.py T2:H3 T3    # one cell, then a whole ladder
+```
+
+The single-cell form exists because a ladder can stop half-way: on 2026-08-18 the account's monthly
+spend limit ended one mid-run, and finishing it must not mean paying again for the cells that
+already landed.
+
+**Cells run one at a time and must.** Every layer builds into the one shared `CARGO_TARGET_DIR`
+above, and cargo locks it — two cells at once each report the other's compile inside their own wall
+clock. The same goes for any build of yours while a cell is running.
+
 ### A trap worth knowing about: stale artifacts across candidate trees
 
 Cargo's artifact hash for `nucleos-core` does **not** include the workspace
