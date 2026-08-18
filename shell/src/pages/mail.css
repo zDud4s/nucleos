@@ -164,11 +164,20 @@
   color: var(--tone-off-fg);
 }
 
+/* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
+   subject line first and a link second, the same posture `.runs-row-link`
+   takes for a run id. */
 .mail-row-subject {
+  display: block;
   margin: 0;
   color: var(--text);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
+  text-decoration: none;
+}
+
+.mail-row-subject:hover {
+  text-decoration: underline;
 }
 
 .mail-row-summary {
@@ -215,4 +224,165 @@
 .mail-config-fact dd {
   margin: 0;
   color: var(--text);
+}
+
+/* ======================================================= message detail == */
+
+/* -------------------------------------------------------------- facts -- */
+
+.mail-detail-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.mail-detail-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.mail-detail-fact dd {
+  margin: var(--space-1) 0 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.mail-detail-address {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* A pruned body or a pruned-therefore-unrequeueable message — quiet, not the
+   danger tone: retention doing its job is not a fault. */
+.mail-detail-pruned {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------- body -- */
+
+/**
+ * A message body is text a sender wrote, not markup — this page renders it in
+ * a `pre` and nowhere does it reach `dangerouslySetInnerHTML`. `pre-wrap` so a
+ * long line wraps instead of forcing the panel to scroll sideways.
+ */
+.mail-detail-body {
+  max-height: 28rem;
+  overflow: auto;
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* --------------------------------------------------------- attachments -- */
+
+.mail-detail-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mail-detail-attachment {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.mail-detail-attachment-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.mail-detail-attachment-name {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.mail-detail-attachment-meta {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.mail-detail-attachment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* -------------------------------------------------------------- sender -- */
+
+.mail-detail-verdict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* ---------------------------------------------------------------- reply -- */
+
+.mail-detail-reply {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.mail-detail-reply-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.mail-detail-reply-field input,
+.mail-detail-reply-field textarea {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.mail-detail-reply-field textarea {
+  resize: vertical;
+  line-height: var(--leading-snug);
+}
+
+.mail-detail-reply-field input:focus-visible,
+.mail-detail-reply-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }

@@ -251,6 +251,23 @@ export async function apiText(path: string, init?: RequestInit): Promise<string>
 }
 
 /**
+ * One authenticated call whose answer is bytes.
+ *
+ * Three routes answer this way: one attachment (`GET
+ * /email/{id}/attachments/{position}`), a file download, and the browser
+ * screenshot route. All three are `application/octet-stream`, and neither
+ * {@link apiFetch} nor {@link apiText} is safe over them — `res.json()` throws
+ * on a body that was never JSON, and `res.text()` decodes the bytes as UTF-8
+ * and hands back a string that has silently lost whatever was not valid text.
+ * A `Blob` is the one shape a caller can hand to `URL.createObjectURL` or write
+ * to disk without either failure mode.
+ */
+export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
+  const res = await request(path, init);
+  return await res.blob();
+}
+
+/**
  * Is the daemon there?
  *
  * The one call that carries no token — it is what the shell asks *before* it

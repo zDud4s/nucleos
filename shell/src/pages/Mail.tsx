@@ -237,7 +237,9 @@ function MailRow({ row }: { row: QueuedEmail }) {
         )}
         <RelativeTime at={row.received_at} />
       </div>
-      <p className="mail-row-subject">{row.subject ?? "(no subject)"}</p>
+      <Link to={`/mail/${row.id}`} className="mail-row-subject">
+        {row.subject ?? "(no subject)"}
+      </Link>
       {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
     </li>
   );

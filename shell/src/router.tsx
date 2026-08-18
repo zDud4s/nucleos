@@ -16,6 +16,7 @@ import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Mail } from "./pages/Mail";
+import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
@@ -101,6 +102,7 @@ const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/chats/$chatId", component: Chats },
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
+  { path: "/mail/$emailId", component: MailDetail },
 ];
 
 export function createAppRouter(initialPath = "/") {

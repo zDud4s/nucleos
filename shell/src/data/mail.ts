@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "./client";
+import { apiBlob, apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 
@@ -177,4 +177,222 @@ export function useTriage() {
  */
 export function untriagedCount(rows: QueuedEmail[]): number {
   return rows.filter((row) => row.triage_class === null).length;
+}
+
+/* ---------------------------------------------------------------- detail -- */
+
+/**
+ * One attachment's metadata, exactly as `GET /email/{id}` flattens it onto
+ * `EmailDetailResponse.attachments`.
+ *
+ * `filename` here is read out of the message's own MIME parts at ingest time —
+ * it is the sender's name for the file, not what a save writes to disk. Never
+ * conflate the two: {@link SavedFile.filename} is the DAEMON's name, chosen
+ * after sanitisation and de-collision, and the two can legitimately differ for
+ * the same attachment.
+ */
+export interface EmailAttachment {
+  /** A zero-based index in message order — NOT a filename, and not stable across messages. */
+  position: number;
+  filename: string | null;
+  mime_type: string | null;
+  size_bytes: number;
+}
+
+/**
+ * One message in full — `GET /email/{id}`.
+ *
+ * A superset of {@link QueuedEmail}'s facts, read off `http.rs`'s flattened
+ * `EmailDetail` plus the `attachments` array it appends. Two fields do not
+ * exist on the queue row: `model_class` is what the model itself said, before
+ * any rule adjusted it, and `priority_rule` is which rule (if any) overrode
+ * that into `triage_class`.
+ *
+ * **`body_text: null` means retention pruned it, not that the message never
+ * had one.** This is the field {@link useRequeue} eligibility reads — never
+ * `triage_class`, since a merely misclassified message is exactly as
+ * requeueable as one triage never reached; only a purged body makes requeuing
+ * impossible to act on.
+ */
+export interface EmailDetail {
+  id: number;
+  from_addr: string;
+  from_name: string | null;
+  subject: string | null;
+  received_at: string;
+  triage_class: string | null;
+  triage_summary: string | null;
+  triaged_at: string | null;
+  model_class: string | null;
+  priority_rule: string | null;
+  body_text: string | null;
+  has_attachments: number;
+  attachments: EmailAttachment[];
+}
+
+/** One message, in full. No `keepPreviousData`: a stale detail under the wrong id is worse than a loading state. */
+export function useEmail(id: number) {
+  return useQuery({
+    queryKey: keys.mail.detail(id),
+    queryFn: () => apiFetch<EmailDetail>(`/email/${id}`),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * What a save answers — `SavedFile` from `files.rs`.
+ *
+ * `filename` is the name the attachment was ACTUALLY written under: sanitised
+ * by `email::safe_filename` and de-collided by `available_name` against
+ * whatever else is already in the folder. A page that shows the sender's name
+ * here instead would be showing a promise the filesystem may not have kept.
+ */
+export interface SavedFile {
+  filename: string;
+  folder: string;
+}
+
+/**
+ * Save one attachment to the files folder.
+ *
+ * No `folder` parameter: this page always saves to the root (`""`, which
+ * `#[serde(default)]` on the daemon's side already means), and the mutation's
+ * whole answer is `SavedFile` — the name actually written, for the page to
+ * show instead of the sender's.
+ */
+export function useSaveAttachment(emailId: number) {
+  return useMutation({
+    mutationFn: (position: number) =>
+      apiFetch<SavedFile>(`/email/${emailId}/attachments/${position}/save`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+    retry: false,
+  });
+}
+
+/** What `POST /email/{id}/attachments/save-all` answers — every name post-sanitisation, in message order. */
+export interface SavedAttachments {
+  folder: string;
+  filenames: string[];
+}
+
+/** Save every attachment on the message in one call. */
+export function useSaveAllAttachments(emailId: number) {
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<SavedAttachments>(`/email/${emailId}/attachments/save-all`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+    retry: false,
+  });
+}
+
+/**
+ * Fetch one attachment's bytes and hand them to the browser as a download.
+ *
+ * `apiBlob`, not `apiFetch` — see its own doc comment. There is no daemon-side
+ * name for these bytes to show: the download's suggested filename is
+ * whatever the caller passes, typically the sender's `EmailAttachment.filename`
+ * — cosmetic only, unlike {@link SavedFile.filename} above, which is a fact
+ * about what actually exists on disk.
+ */
+export function useDownloadAttachment(emailId: number) {
+  return useMutation({
+    mutationFn: async ({ position, suggestedName }: { position: number; suggestedName: string }) => {
+      const blob = await apiBlob(`/email/${emailId}/attachments/${position}`);
+      const url = URL.createObjectURL(blob);
+      try {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = suggestedName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    },
+    retry: false,
+  });
+}
+
+/**
+ * Ask for this one message to be triaged again.
+ *
+ * `204` on success, so `apiFetch<void>` is safe unlike the cases elsewhere in
+ * this shell that need `apiText` — `apiFetch` already exempts 204/205 from
+ * JSON parsing.
+ *
+ * **The two 409s this route can answer — a purged body and a run already
+ * holding the message — are indistinguishable on the wire**, same status, no
+ * body, no discriminator. This page never lets the second one surface as a
+ * mystery: eligibility is decided from `body_text` before the button is even
+ * offered (see {@link EmailDetail}'s header), so a 409 that does arrive here
+ * can only be the run-in-progress case, and the page's own copy says so
+ * instead of repeating the daemon's silence.
+ */
+export function useRequeue(emailId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch<void>(`/email/${emailId}/requeue`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.mail.all });
+    },
+  });
+}
+
+/** What `POST /email/send` accepts — one recipient, always required, along with a subject and a body. */
+export interface ReplyInput {
+  to: string;
+  subject: string;
+  body: string;
+}
+
+/**
+ * Send a reply.
+ *
+ * **There is no SMTP pre-flight.** `GET /config/email` carries no field that
+ * says whether a submission host is configured, so this form cannot be
+ * disabled in advance with a reason — it is always open, and a daemon with
+ * nowhere to send from answers 503 only after the attempt. Every refusal this
+ * route makes is bare prose the daemon wrote on purpose
+ * (`"a recipient must not contain a line break"`, `"no submission host is
+ * configured — set smtp_host in .ai/email.yaml"`, …) and is worth showing
+ * verbatim rather than translated into shell copy.
+ */
+export function useSendReply() {
+  return useMutation({
+    mutationFn: (input: ReplyInput) =>
+      apiFetch<void>("/email/send", { method: "POST", body: JSON.stringify(input) }),
+    retry: false,
+  });
+}
+
+/** What `POST /contacts/verdict` accepts. `verdict: null` withdraws a standing decision — the key must still be present. */
+export interface SenderVerdictInput {
+  address: string;
+  verdict: "pin" | "mute" | null;
+}
+
+/**
+ * Record, change or withdraw a standing decision about a sender.
+ *
+ * Invalidates both `mail` (a pin or mute changes how the queue reads, via
+ * `QueuedEmail.sender_verdict`) and `contacts` — the two namespaces the design
+ * splits this fact across.
+ */
+export function useSenderVerdict() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: SenderVerdictInput) =>
+      apiFetch<void>("/contacts/verdict", { method: "POST", body: JSON.stringify(input) }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.mail.all });
+      void queryClient.invalidateQueries({ queryKey: keys.contacts.all });
+    },
+  });
 }
