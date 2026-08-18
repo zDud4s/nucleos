@@ -23,11 +23,17 @@ use crate::state::AppState;
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Looks for conflicts to resolve, forever. Spawned once by `main.rs`.
+///
+/// Two passes on one tick, and they are separate because they are about different rows at different
+/// moments: one starts a resolution, the other says what an already-published one cost. Sharing a
+/// tick is all they share — the second runs even when the first has been stopped, which is deliberate
+/// and argued at `record_discards`.
 pub async fn run_resolution_loop(state: AppState) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         interval.tick().await;
         launch_once(&state).await;
+        record_discards(&state.pool).await;
     }
 }
 
@@ -206,6 +212,115 @@ async fn launch_once(state: &AppState) -> Option<i64> {
             None
         }
     }
+}
+
+/// One published resolution whose cost has not been worked out yet.
+#[derive(sqlx::FromRow)]
+struct Published {
+    id: i64,
+    project_id: String,
+    project_root: String,
+    /// The merge commit the queue put on the target branch. Everything the computation needs hangs
+    /// off it by sha — `^2` is the resolution, `^2^2` is the branch it was asked to bring in — which
+    /// is what lets this run after the worktree GC has deleted the resolution's branch by name.
+    result_sha: String,
+}
+
+/// Works out what ONE published resolution left behind, and writes it on the row.
+///
+/// **Separate from the merge that published it, and not for tidiness.** The queue's contract is that
+/// a repository is held for the length of a git command; this reads a `git show` per changed file,
+/// which for a long-lived branch is hundreds of them. Doing it inside the claim would hold every
+/// other operation on that repository behind an accounting pass nobody is waiting for.
+///
+/// **It runs even when the kill switch is engaged**, and that is the point rather than an oversight.
+/// The switch stops the daemon STARTING work; this starts nothing — it reads commits that are already
+/// in the repository and writes one row. The moment somebody pulls the emergency stop is also the
+/// moment they most want to know what the last resolution cost.
+///
+/// A failure to work it out is written into the column rather than left NULL to be retried for ever.
+/// One attempt, like the resolution itself: a repository that has moved away does not come back by
+/// being asked every minute, and a column that always holds an answer — even "could not" — is one a
+/// reader can act on.
+///
+/// Takes the pool and not the `AppState`, which is not tidiness: this pass starts nothing, so the
+/// runner, the run handles and the kill switch are all things it has no business reaching. The
+/// narrower argument is also what lets it be tested without an agent runner.
+async fn record_discards(pool: &sqlx::SqlitePool) {
+    let candidate: Option<Published> = match sqlx::query_as(
+        "SELECT id, project_id, project_root, result_sha
+           FROM vcs_requests
+          WHERE from_resolution = 1
+            AND status = 'succeeded'
+            AND result_sha IS NOT NULL
+            AND discarded IS NULL
+          ORDER BY id
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            tracing::warn!(%error, "resolver: could not look for resolutions to account for");
+            return;
+        }
+    };
+    let Some(published) = candidate else {
+        return;
+    };
+
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let record = match crate::git_exec::discarded_by_resolution(
+        std::path::Path::new(&published.project_root),
+        &published.result_sha,
+        deadline,
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(reason) => {
+            tracing::warn!(
+                vcs_request_id = published.id,
+                %reason,
+                "resolver: what a published resolution discarded could not be worked out"
+            );
+            format!("could not be worked out: {reason}")
+        }
+    };
+
+    if let Err(error) = sqlx::query("UPDATE vcs_requests SET discarded = ? WHERE id = ?")
+        .bind(&record)
+        .bind(published.id)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            vcs_request_id = published.id,
+            %error,
+            "resolver: what a published resolution discarded could not be recorded"
+        );
+        return;
+    }
+
+    // **Only when something was actually lost.** A feed row IS a notification, and one saying
+    // "nothing was lost" after every resolution trains its reader to skip the line that one day
+    // says otherwise.
+    if record.starts_with("nothing") {
+        return;
+    }
+    let headline = record.lines().next().unwrap_or(&record);
+    let _ = crate::feed::append(
+        pool,
+        Some(published.project_id.as_str()),
+        "vcs_resolution_discarded",
+        &format!(
+            "vcs request {} published a resolution: {headline}",
+            published.id
+        ),
+        None,
+    )
+    .await;
 }
 
 /// PURE: what the resolving agent is told.
@@ -482,6 +597,57 @@ mod tests {
             prompt.contains("CONFLICT (content): seed.txt"),
             "git's own account of the conflict is the one thing here nobody has to guess at"
         );
+    }
+
+    /// **A resolution that cannot be accounted for is still accounted for**, and the column is what
+    /// stops the pass from asking again every minute for ever. A repository that has moved away does
+    /// not come back by being polled, and a NULL left behind would have this loop reading the same
+    /// row, running the same git, and failing the same way until somebody noticed the log.
+    ///
+    /// It is also the honest answer: "could not be worked out" is a different thing from "nothing was
+    /// lost", and a reader who finds the second when the first is true has been told something
+    /// nobody checked.
+    #[tokio::test]
+    async fn a_resolution_whose_repository_is_gone_records_that_rather_than_asking_for_ever() {
+        let pool = test_pool().await;
+        let request = escalated_merge(&pool, true).await;
+        sqlx::query(
+            "UPDATE vcs_requests
+                SET status = 'succeeded', result_sha = 'deadbeef', project_root = 'C:/gone'
+              WHERE id = ?",
+        )
+        .bind(request)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_discards(&pool).await;
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT discarded FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let recorded = recorded.expect("a row that could not be worked out still gets an answer");
+        assert!(
+            recorded.starts_with("could not be worked out"),
+            "and the answer says which of the three states this is: {recorded}"
+        );
+        assert!(
+            !recorded.starts_with("nothing"),
+            "a repository nobody could read must never report a clean resolution"
+        );
+
+        // The pass moves on rather than finding the same row again.
+        record_discards(&pool).await;
+        let unchanged: Option<String> =
+            sqlx::query_scalar("SELECT discarded FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unchanged.as_deref(), Some(recorded.as_str()));
     }
 
     /// Retention clears `output_tail` on old rows, and a conflict that outlived its text is still

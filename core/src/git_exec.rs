@@ -1125,6 +1125,238 @@ async fn verify_resolution(
     Ok(())
 }
 
+/// How many of the incoming branch's files are examined for lost work before the record says it
+/// stopped looking. A resolution of a long-lived branch can touch hundreds, and each one costs a
+/// `git show` inside the same budget the merge itself came out of.
+const DISCARD_FILE_CEILING: usize = 200;
+
+/// How many of the missing lines are quoted back. The COUNTS are always complete; this bounds only
+/// the excerpt, because the column is read by a person and not by a diff tool.
+const DISCARD_SAMPLE_LINES: usize = 8;
+
+/// `git`, for a reader that is not executing a queued request and so has no `Outcome` to return.
+///
+/// It goes through `remaining` rather than reading the clock itself, and that is the whole point:
+/// the gate that refuses a spent budget BEFORE a child is spawned lives in one place, and a second
+/// entry that re-derived it would be exactly the kind of guarantee that quietly stops holding. Only
+/// the error SHAPE differs, and it differs at the edge — `remaining` reports an `Outcome` because
+/// every other caller is answering for a row, and this one answers for a background pass that has
+/// no row to fail.
+async fn git_read(
+    repo: &Path,
+    args: &[&str],
+    deadline: std::time::Instant,
+) -> Result<CommandResult, String> {
+    let budget = match remaining(deadline, &args.join(" ")) {
+        Ok(budget) => budget,
+        // `remaining` builds this variant and no other; the second arm is the compiler's price for
+        // that being a fact about the function rather than about the type.
+        Err(Outcome::Failed { reason, .. }) => return Err(reason),
+        Err(other) => return Err(format!("the budget could not be read: {other:?}")),
+    };
+    let arguments: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    run_git(repo, &arguments, budget).await
+}
+
+/// What the incoming branch added and the published resolution does not have, worked out from the
+/// commits.
+///
+/// **This is the half of the guarantee `verify_resolution` cannot give.** That one refuses the two
+/// shapes a resolution CANNOT be right in — a flattened merge, committed conflict markers — and both
+/// are structural, so both can be refused without reading a line. What neither it nor the gate can
+/// see is the resolution that kept one side and dropped the other: it compiles, it passes, and by
+/// every measure the suite has it is indistinguishable from a good one. So it is published, and then
+/// this says what it cost.
+///
+/// **Computed, never reported.** An agent that loses work and says it did not is exactly the case
+/// this exists to catch, so nothing the agent wrote is an input.
+///
+/// It works from the published merge commit alone and needs no branch name, which matters more than
+/// it looks: by the time this runs the resolution's branch is merged, so the worktree GC's
+/// `git branch -d` is entitled to delete it. Everything needed is reachable from what was published
+/// — `published^2` is the resolution, `published^2^2` is the branch the resolver was asked to bring
+/// in — and shas outlive names.
+///
+/// **What "missing" means here, stated because the record has to be read literally:** a line the
+/// incoming branch ADDED, relative to where the two sides parted, that appears nowhere in the
+/// published file. A resolution that rewrote a line to carry both intents is reported by this, and
+/// that is a false positive worth having — the alternative is a judgement about meaning, and a
+/// mechanism that guesses at meaning is one nobody can act on. The wording says "not present
+/// verbatim" for that reason.
+pub async fn discarded_by_resolution(
+    project_root: &Path,
+    published: &str,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let resolution = second_parent(project_root, published, deadline).await?;
+    let incoming = second_parent(project_root, &resolution, deadline).await?;
+    let first = format!("{resolution}^1");
+
+    let base = git_read(project_root, &["merge-base", &first, &incoming], deadline).await?;
+    if !base.succeeded() {
+        return Err(format!(
+            "could not find where {incoming} and the target parted: {}",
+            base.output_tail
+        ));
+    }
+    let base = base.stdout.trim().to_owned();
+
+    let listed = git_read(
+        project_root,
+        &["diff", "--name-only", &base, &incoming],
+        deadline,
+    )
+    .await?;
+    if !listed.succeeded() {
+        return Err(format!(
+            "could not list what {incoming} changed: {}",
+            listed.output_tail
+        ));
+    }
+    let files: Vec<&str> = listed
+        .stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+    let examined = files.len().min(DISCARD_FILE_CEILING);
+
+    let mut per_file: Vec<(String, usize)> = Vec::new();
+    let mut samples: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for file in &files[..examined] {
+        let added = added_lines(project_root, &base, &incoming, file, deadline).await?;
+        if added.is_empty() {
+            continue;
+        }
+        // A file the resolution removed outright answers non-zero here, and every line it added is
+        // then missing — which is the right reading, and the reason this is not an error.
+        let published_file = git_read(
+            project_root,
+            &["show", &format!("{published}:{file}")],
+            deadline,
+        )
+        .await?;
+        let kept: std::collections::HashSet<&str> = if published_file.succeeded() {
+            published_file.stdout.lines().map(str::trim).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let missing: Vec<&String> = added
+            .iter()
+            .filter(|line| !kept.contains(line.as_str()))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        total += missing.len();
+        per_file.push(((*file).to_owned(), missing.len()));
+        for line in missing {
+            if samples.len() < DISCARD_SAMPLE_LINES {
+                samples.push(format!(
+                    "{file}: {}",
+                    line.chars().take(120).collect::<String>()
+                ));
+            }
+        }
+    }
+
+    // Named rather than swallowed: a ceiling nobody is told about reads as "we looked everywhere and
+    // found nothing", which is the one thing this record must never imply.
+    let truncated = files.len() > examined;
+    if total == 0 {
+        return Ok(if truncated {
+            format!(
+                "nothing, in the first {examined} of {} files — the rest were not examined",
+                files.len()
+            )
+        } else {
+            "nothing".to_owned()
+        });
+    }
+
+    // **The count AND the files go on the first line**, which is not formatting: the feed carries
+    // one line of this and the feed is the only surface a person passes without going looking. A
+    // headline that says "12 lines went missing" and makes them query the database to find out
+    // where is a headline that gets skipped.
+    let where_ = per_file
+        .iter()
+        .map(|(file, count)| format!("{file} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut record = format!(
+        "{total} line(s) that {incoming} added are not present verbatim in what was published — \
+         {where_}"
+    );
+    if truncated {
+        record.push_str(&format!(
+            " (the first {examined} of {} files were examined)",
+            files.len()
+        ));
+    }
+    record.push_str("\n\nfor example:\n");
+    for sample in &samples {
+        record.push_str(&format!("  {sample}\n"));
+    }
+    Ok(record)
+}
+
+/// The second parent of `revision`, which for a merge commit is the side that was brought in.
+async fn second_parent(
+    project_root: &Path,
+    revision: &str,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let parents = git_read(
+        project_root,
+        &["rev-list", "--parents", "-1", revision],
+        deadline,
+    )
+    .await?;
+    if !parents.succeeded() {
+        return Err(format!(
+            "could not read {revision}'s parents: {}",
+            parents.output_tail
+        ));
+    }
+    parents
+        .stdout
+        .split_whitespace()
+        .nth(2)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{revision} is not a merge commit, so it brought nothing in"))
+}
+
+/// The lines `incoming` added to `file` since the two sides parted, trimmed and without the blanks.
+///
+/// `-U0` so nothing but the changed lines comes back. Blank lines are dropped because a blank
+/// "missing" from the published file is noise in a record meant to be read by a person.
+async fn added_lines(
+    project_root: &Path,
+    base: &str,
+    incoming: &str,
+    file: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<String>, String> {
+    let diff = git_read(
+        project_root,
+        &["diff", "-U0", base, incoming, "--", file],
+        deadline,
+    )
+    .await?;
+    if !diff.succeeded() {
+        return Err(format!("could not read what changed in {file}"));
+    }
+    Ok(diff
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix('+'))
+        .filter(|line| !line.starts_with("++"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// The worktree that has `target` checked out, if any.
 ///
 /// Read out of `git worktree list --porcelain`, whose blocks are `worktree <path>` / `HEAD <sha>` /
@@ -3963,6 +4195,148 @@ pub(crate) mod tests {
             sha_of(&remote, "refs/heads/master"),
             theirs,
             "and nothing of theirs was overwritten — this queue never forces"
+        );
+    }
+
+    /// Builds and publishes a resolution the way the daemon does — a branch off the target with the
+    /// conflict merged into it and resolved to `resolved`, then merged into the target with `--no-ff`
+    /// — and answers with the published merge commit.
+    ///
+    /// Plain git rather than the queue, because what these tests are about is what the COMMITS say.
+    /// Going through `create_resolution_run` would need a runner, an `AppState` and an agent, to
+    /// arrive at the same three commits.
+    fn publish_a_resolution(repo: &Path, resolved: Option<&str>) -> String {
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("resolve"),
+                OsStr::new("master"),
+            ]
+        ));
+        // Conflicts, deliberately: this is the half-finished merge the daemon leaves behind.
+        assert!(!git_ok(repo, &[OsStr::new("merge"), OsStr::new("feat/x")]));
+        match resolved {
+            Some(content) => std::fs::write(repo.join("seed.txt"), content).expect("resolve"),
+            // The other way of losing work: the file goes away entirely.
+            None => std::fs::remove_file(repo.join("seed.txt")).expect("delete"),
+        }
+        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            repo,
+            &[OsStr::new("commit"), OsStr::new("--no-edit")]
+        ));
+        assert!(git_ok(
+            repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("merge"),
+                OsStr::new("--no-ff"),
+                OsStr::new("-m"),
+                OsStr::new("publish the resolution"),
+                OsStr::new("resolve"),
+            ]
+        ));
+        sha_of(repo, "master")
+    }
+
+    /// **The third proof, and the spec says the mechanism is not ready without it.** A resolution
+    /// that keeps one side and drops the other passes every structural check there is: two parents,
+    /// no markers, a green tree. It is a correct-looking merge with half the work gone, and the only
+    /// thing that catches it is counting what went missing.
+    #[tokio::test]
+    async fn a_resolution_that_kept_one_side_is_published_and_the_row_says_what_it_cost() {
+        let (_container, repo) = repo_with_a_conflict("nucleos-gitexec-discard-");
+        // `ours` only. `feat/x`'s line is simply not there.
+        let published = publish_a_resolution(&repo, Some("ours\n"));
+
+        let record = discarded_by_resolution(&repo, &published, deadline())
+            .await
+            .expect("the account should be computable");
+
+        assert!(
+            record.contains("1 line(s)"),
+            "the count is the whole point of computing rather than asking: {record}"
+        );
+        // On the FIRST line, because the feed carries one line of this and a headline that makes
+        // the reader query the database to find out where is a headline that gets skipped.
+        let headline = record.lines().next().expect("a record has a first line");
+        assert!(
+            headline.contains("seed.txt (1)"),
+            "the headline has to name where, not only how much: {headline}"
+        );
+        assert!(
+            record.contains("theirs"),
+            "and it quotes what went missing, or there is nothing to recognise: {record}"
+        );
+    }
+
+    /// The control, and without it the test above proves only that this function returns text. A
+    /// resolution that kept BOTH sides has to come back clean — otherwise every resolution is
+    /// reported as lossy and the record means nothing.
+    #[tokio::test]
+    async fn a_resolution_that_kept_both_sides_costs_nothing_and_says_so() {
+        let (_container, repo) = repo_with_a_conflict("nucleos-gitexec-keep-");
+        let published = publish_a_resolution(&repo, Some("ours\ntheirs\n"));
+
+        let record = discarded_by_resolution(&repo, &published, deadline())
+            .await
+            .expect("the account should be computable");
+
+        assert_eq!(
+            record, "nothing",
+            "a resolution that lost nothing must read as nothing, not as an empty report"
+        );
+    }
+
+    /// The other shape of the same loss, and the reason a file missing from the published tree is
+    /// read rather than errored on: everything the incoming branch put in it is gone, which is the
+    /// answer, not a failure to find one.
+    #[tokio::test]
+    async fn a_resolution_that_deleted_the_contested_file_is_accounted_for_the_same_way() {
+        let (_container, repo) = repo_with_a_conflict("nucleos-gitexec-deleted-");
+        let published = publish_a_resolution(&repo, None);
+
+        let record = discarded_by_resolution(&repo, &published, deadline())
+            .await
+            .expect("a deleted file is an answer, not an error");
+
+        assert!(
+            record.contains("seed.txt") && record.contains("theirs"),
+            "a file that went away loses everything the branch put in it: {record}"
+        );
+    }
+
+    /// An ordinary merge is not a resolution, and asking what one discarded is a question about a
+    /// commit that never brought a resolution in. It answers rather than inventing: `^2^2` does not
+    /// exist, and saying so is what stops the accounting pass from writing a number nobody can trace.
+    #[tokio::test]
+    async fn an_ordinary_merge_has_no_resolution_to_account_for() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-plain-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("merge"),
+                OsStr::new("--no-ff"),
+                OsStr::new("-m"),
+                OsStr::new("plain merge"),
+                OsStr::new("feat/x"),
+            ]
+        ));
+
+        let refused = discarded_by_resolution(&repo, &sha_of(&repo, "master"), deadline())
+            .await
+            .expect_err("there is no resolution under an ordinary merge");
+        assert!(
+            refused.contains("not a merge commit"),
+            "the refusal has to say which commit it could not walk: {refused}"
         );
     }
 }
