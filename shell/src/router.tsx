@@ -16,6 +16,7 @@ import { Contacts } from "./pages/Contacts";
 import { Council } from "./pages/Council";
 import { Errands } from "./pages/Errands";
 import { Feed, validateFeedSearch } from "./pages/Feed";
+import { Files } from "./pages/Files";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Mail } from "./pages/Mail";
@@ -65,6 +66,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/voice": Voice,
   "/web": Web,
   "/browser": Browser,
+  "/files": Files,
 };
 
 /**

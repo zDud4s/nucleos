@@ -1,0 +1,490 @@
+/**
+ * The Files slice, `fi-` throughout — as `pj-` is for Projects and `voice-`
+ * for Voice. **No class appears in `Files.tsx` that is not defined below** —
+ * `tsc` and vitest both pass on a class no stylesheet has ever heard of, so
+ * this file is grepped against the component before the page is called done.
+ *
+ * Everything that shows a path is monospaced and wraps rather than scrolls
+ * the page, the same rule `projects.css` states for its own file paths and
+ * diffs: a Windows path is routinely wider than a panel.
+ */
+
+/* =============================================================== layout == */
+
+.fi-body {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14rem 1fr;
+  gap: var(--space-5);
+  align-items: start;
+}
+
+.fi-side {
+  position: sticky;
+  top: 0;
+}
+
+.fi-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.fi-loading,
+.fi-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/**
+ * The overlay shown while the host reports a drag is over this window.
+ *
+ * Fixed over the whole two-column body rather than just the table: the target
+ * folder is decided by the breadcrumb the moment the drop lands, not by which
+ * pixel the cursor happens to be over, so there is no reason to draw the
+ * target zone smaller than the page.
+ */
+.fi-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  background: var(--accent-quiet);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  pointer-events: none;
+}
+
+/* ================================================================= tree == */
+
+.fi-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.fi-tree-node {
+  display: flex;
+  flex-direction: column;
+}
+
+.fi-tree-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  border-radius: var(--radius-sm);
+}
+
+.fi-tree-row-active {
+  background: var(--accent-quiet);
+}
+
+.fi-tree-toggle {
+  width: 1.1rem;
+  padding: 0;
+  font-size: var(--text-xs);
+  line-height: 1;
+  color: var(--text-faint);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.fi-tree-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.fi-tree-toggle-spacer {
+  display: inline-block;
+  width: 1.1rem;
+}
+
+.fi-tree-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.fi-tree-children {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* ============================================================ breadcrumbs == */
+
+.fi-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.fi-crumb {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* =============================================================== toolbar == */
+
+.fi-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-4);
+}
+
+.fi-search,
+.fi-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.fi-search input,
+.fi-field input {
+  padding: var(--space-2);
+  min-width: 14rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.fi-search input:focus-visible,
+.fi-field input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.fi-new-folder {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+/* ============================================================== upload == */
+
+.fi-upload {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+}
+
+.fi-upload-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.fi-upload-label:focus-within {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.fi-upload-note {
+  margin: 0;
+  max-width: 20rem;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  text-align: right;
+}
+
+/* ============================================================ selection == */
+
+.fi-selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/**
+ * A folder the daemon would not remove without saying so — §6.18's "delete
+ * with contents", surfaced the moment a plain delete answers 409.
+ */
+.fi-not-empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-danger-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--tone-danger-bg);
+}
+
+.fi-not-empty p {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--tone-danger-fg);
+}
+
+.fi-not-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* ================================================================= move == */
+
+.fi-move {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+/* ================================================================ table == */
+
+.fi-table-wrap {
+  border-radius: var(--radius-md);
+}
+
+.fi-table-wrap:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.fi-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+.fi-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.fi-table th {
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.fi-col-select {
+  width: 2rem;
+}
+
+.fi-col-name {
+  width: auto;
+}
+
+.fi-col-num {
+  width: 8rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.fi-sort-button {
+  padding: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.fi-sort-button:hover {
+  color: var(--text);
+}
+
+.fi-sort-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.fi-table td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.fi-table td.fi-col-num {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.fi-row {
+  cursor: default;
+}
+
+.fi-row:hover {
+  background: var(--surface-sunken);
+}
+
+.fi-row-focus,
+.fi-row-focus:hover {
+  background: var(--accent-quiet);
+}
+
+.fi-entry-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  word-break: break-all;
+}
+
+.fi-rename {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.fi-rename input {
+  padding: 2px var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* =============================================================== search == */
+
+.fi-hits {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fi-hit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.fi-hit-path {
+  flex: 1 1 16rem;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  word-break: break-all;
+}
+
+.fi-hit-size {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.fi-truncated {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ============================================================== context == */
+
+.fi-context-menu {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 9rem;
+  padding: var(--space-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+}
+
+.fi-context-item {
+  padding: var(--space-2) var(--space-2);
+  text-align: left;
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.fi-context-item:hover {
+  background: var(--surface-sunken);
+}
+
+.fi-context-item:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.fi-context-item-danger {
+  color: var(--tone-danger-fg);
+}
+
+/* ================================================================ os drop == */
+
+.fi-drop-report {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-info-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--tone-info-bg);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.fi-drop-report p {
+  margin: 0;
+}
+
+.fi-drop-refusals {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
