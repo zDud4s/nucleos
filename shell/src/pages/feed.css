@@ -1,0 +1,234 @@
+/**
+ * The Feed slice: the filter bar, the freeze notice and the line list.
+ * `feed-` throughout, as `runs-` is for the run index and `fleet-` for the
+ * fleet.
+ *
+ * The rule this file lives under: **no class appears in a component that is not
+ * defined below.** `tsc` and vitest both pass happily on a class no stylesheet
+ * has ever heard of, and the defect shows up only as something looking wrong on
+ * a screen nobody is testing.
+ *
+ * The `ui-` rules this page leans on — the relative time in every row's head —
+ * are not repeated here. They live in `runs.css` under its own heading, on loan
+ * from the design system until they move to `ui.css`, and both sheets are in
+ * the bundle because both pages are statically imported by the router.
+ */
+
+/* --------------------------------------------------------------- filters -- */
+
+/**
+ * Seven filters on one line that wraps.
+ *
+ * A grid would give every filter the same width, which is wrong here: the text
+ * box wants the room and the two number boxes want almost none. Flex with
+ * per-filter widths says that out loud.
+ */
+.feed-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.feed-filter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.feed-filter input,
+.feed-filter select {
+  min-width: 9rem;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+}
+
+.feed-filter-text input {
+  min-width: 16rem;
+}
+
+/* An id and a count. Both are two or three digits and neither earns a column. */
+.feed-filter-narrow input {
+  min-width: 5rem;
+}
+
+/* ---------------------------------------------------------------- freeze -- */
+
+/**
+ * The page has stopped refreshing, and why.
+ *
+ * Stated rather than shown: a feed that silently stopped polling is
+ * indistinguishable from a machine that stopped doing anything, and that is the
+ * single most expensive misreading this page can produce. The way out sits
+ * inside the same notice, so the sentence and its remedy are never separated.
+ */
+.feed-frozen {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--tone-info-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+  font-size: var(--text-sm);
+}
+
+.feed-frozen-text {
+  flex: 1 1 20rem;
+  line-height: var(--leading-snug);
+}
+
+/* ------------------------------------------------------------------ list -- */
+
+.feed-loading {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-sm);
+  font-style: italic;
+}
+
+.feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
+}
+
+/**
+ * One line. Hairline-separated rather than carded: the feed is read by
+ * scanning down it, and fifty cards with their own borders turn a column into a
+ * pile. The 1px gap over a `--border` ground is what draws the rules.
+ */
+.feed-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+}
+
+.feed-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Pushed to the end of the head, so a column of times lines up on the right
+   however many badges a row happens to carry. */
+.feed-row-head > .ui-reading-time,
+.feed-row-head > .ui-reading-raw {
+  margin-left: auto;
+}
+
+.feed-row-run {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.feed-row-run:hover {
+  text-decoration: underline;
+}
+
+/**
+ * The owner, as a control rather than a link.
+ *
+ * It narrows this feed, which is the honest thing the row's ids can do — there
+ * is no errand detail route and no job page to send anyone to. Styled as text
+ * with a dotted underline so it does not read as a navigation.
+ */
+.feed-row-owner {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.feed-row-owner:hover {
+  color: var(--text);
+}
+
+/* Nobody's line but the machine's. A fact, not an empty cell. */
+.feed-row-owner-none {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
+.feed-row-summary {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/**
+ * A deferred observation, and deliberately not an alarm.
+ *
+ * `token_efficiency` reaches the feed through the waiting room because it is
+ * not governance — nothing is wrong, four runs in a row simply looked the same
+ * way. So it gets the informational tone and a quiet left rule, never the red
+ * one, and the cause is phrased as somewhere to look rather than something to
+ * stop.
+ */
+.feed-row-observation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--tone-info-border);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.feed-row-signal {
+  flex: none;
+  font-weight: var(--weight-semibold);
+  color: var(--tone-info-fg);
+}
+
+.feed-row-cause {
+  flex: 1 1 18rem;
+  color: var(--text-muted);
+}
+
+/* -------------------------------------------------------------- ceiling -- */
+
+.feed-ceiling {
+  margin: var(--space-3) 0 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+}

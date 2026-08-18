@@ -53,13 +53,50 @@ struct Candidate {
 
 /// The oldest conflict nobody has attempted, or `None`.
 ///
-/// **Three conditions and each excludes a different thing.** `resolution_run_id IS NULL` is the one
-/// attempt: a value there means an agent has already had this conflict, whether it succeeded, gave
-/// up, or crashed, and a second one would be a second opinion nobody asked for. `from_resolution = 0`
-/// is the loop brake: a landing that came out of a resolution and conflicted anyway escalates to a
-/// person, because resolving it would produce another landing that can conflict, one agent per turn,
-/// for ever. `op = 'merge'` is the vocabulary — every other operation escalates for reasons an agent
-/// in a worktree cannot touch.
+/// **Five conditions and each excludes a different thing.** `resolution_run_id IS NULL` is the one
+/// attempt for this row: a value there means an agent has already had it, whether it succeeded, gave
+/// up, or crashed. `from_resolution = 0` is the loop brake: a landing that came out of a resolution
+/// and conflicted anyway escalates to a person, because resolving it would produce another landing
+/// that can conflict, one agent per turn, for ever. `op = 'merge'` is the vocabulary — every other
+/// operation escalates for reasons an agent in a worktree cannot touch.
+///
+/// **The fourth is the same conflict arriving twice, and it was missing.** The one-attempt rule was
+/// written per ROW, and a conflict is not a row: two people, or a person and a session's `--land`,
+/// can each queue `X into Y`, and each escalation carried its own NULL. Measured in production —
+/// request 30 (a human's) and request 31 (a session's) named the identical merge minutes apart, and
+/// the loop minted an agent for each, so two runs sat in two worktrees resolving the same two
+/// branches at once. That is the fleet migration 0081 says this brake exists to prevent, arriving by
+/// the one route the per-row check does not see.
+///
+/// So a conflict is skipped while another resolution of the SAME operation is still live — `args` is
+/// the stored JSON, so comparing it compares source and target exactly, and `LIVE_RUN_STATUSES` is
+/// the same liveness the concurrency sweep derives slots from.
+///
+/// **Live, and not "ever attempted", and that distinction was itself corrected in production.** The
+/// first version of this check blacklisted the branch pair for good, and the cost showed up within
+/// minutes: `feat/frontend-ponte` had had an attempt, that attempt was cancelled without resolving
+/// anything, the branch moved on and conflicted again — genuinely a new conflict — and the loop
+/// refused it an agent for ever. A pair that conflicts again next week is not the same wall an agent
+/// already failed at, and a resolver that stops helping the branches that live longest is one that
+/// stops helping where it is most needed. Repetition against the SAME escalation is still refused,
+/// by `resolution_run_id IS NULL` above; what this adds is only that two never run at once.
+///
+/// **The fifth is a conflict that has stopped being one, and it is the commonest case in practice.**
+/// The escalation tells the asker what to do about it — bring the target into your branch, resolve
+/// there, ask again — and when they do, the merge lands and the old escalated row stays behind. It
+/// is terminal, so nothing tidies it, and to this loop it still reads as an unattempted conflict.
+/// Watched three times on this repository in one evening: request 28 settled by 29, request 33
+/// settled by 34, each leaving bait. Once it started an agent that resolved a conflict which had
+/// already been settled another way, and that resolution's landing would have reopened what the
+/// other one decided.
+///
+/// A later `succeeded` naming the same operation is what says so. Later by id, because a merge that
+/// succeeded BEFORE this escalation is a different event entirely — the branches moved on and
+/// conflicted afterwards, which is the ordinary way a conflict appears at all.
+///
+/// It does not cover the same thing happening while a resolution is already RUNNING; that one needs
+/// a live run cancelled rather than a row skipped, and it is named here rather than left to be
+/// rediscovered.
 ///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
@@ -67,11 +104,26 @@ struct Candidate {
 async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate>> {
     sqlx::query_as(
         "SELECT id, op, args, project_id, project_root, output_tail
-           FROM vcs_requests
+           FROM vcs_requests AS conflict
           WHERE status = 'escalated'
             AND op = 'merge'
             AND resolution_run_id IS NULL
             AND from_resolution = 0
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM vcs_requests AS attempted
+                  JOIN runs ON runs.id = attempted.resolution_run_id
+                 WHERE attempted.project_id = conflict.project_id
+                   AND attempted.args = conflict.args
+                   AND runs.status IN ('running', 'awaiting_approval')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM vcs_requests AS settled
+                 WHERE settled.project_id = conflict.project_id
+                   AND settled.args = conflict.args
+                   AND settled.status = 'succeeded'
+                   AND settled.id > conflict.id
+            )
           ORDER BY id
           LIMIT 1",
     )
@@ -361,6 +413,10 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
          read at all — because a flattened resolution is exactly what looks perfect.\n\
          - Do not merge, push, pull, or delete branches. Those go to the queue, and the queue is what \
          asked you for this.\n\
+         - Run ONE shell command at a time. No `&&` chains, no pipes, no `$(...)` — the classifier \
+         holds compound shell for a person to approve, and a resolution that stops to be approved \
+         for a `git log` is one nobody gets the benefit of. This costs you a few extra calls and \
+         saves the whole run.\n\
          \n\
          If the two sides genuinely cannot be reconciled — contradictory intent, not merely awkward \
          — stop and say so instead of committing a guess. Leaving it for a person is a correct \
@@ -445,12 +501,39 @@ mod tests {
         pool
     }
 
+    async fn escalated_merge(pool: &sqlx::SqlitePool, from_resolution: bool) -> i64 {
+        escalated_merge_of(pool, "feat/x", from_resolution).await
+    }
+
+    /// A run row for the deduplication to read liveness off. Minimal on purpose: what the filter
+    /// asks about a resolution's run is its status and nothing else.
+    async fn insert_run(pool: &sqlx::SqlitePool, id: i64, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, created_at)
+             VALUES (?, 'proj', 'resolve it', ?, 'worktree', ?)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("insert the resolution's run");
+    }
+
     /// An escalated merge, admitted through the real INSERT so the stored operation is the one the
     /// launcher will actually have to parse back.
-    async fn escalated_merge(pool: &sqlx::SqlitePool, from_resolution: bool) -> i64 {
+    ///
+    /// The source is a parameter because the attempt is claimed against the OPERATION: rows that
+    /// name the same two branches are the same conflict, so a test about the per-row exclusions has
+    /// to give each row a conflict of its own or it is testing deduplication by accident.
+    async fn escalated_merge_of(
+        pool: &sqlx::SqlitePool,
+        source: &str,
+        from_resolution: bool,
+    ) -> i64 {
         let repo = crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
         let op = crate::vcs::Op::Merge {
-            source: "feat/x".into(),
+            source: source.into(),
             target: "master".into(),
         };
         let id = if from_resolution {
@@ -472,7 +555,9 @@ mod tests {
     async fn only_a_conflict_that_nobody_has_attempted_is_picked_up() {
         let pool = test_pool().await;
 
-        let attempted = escalated_merge(&pool, false).await;
+        // Each row is a DIFFERENT conflict, or this would be testing the deduplication below rather
+        // than the three per-row exclusions it is about.
+        let attempted = escalated_merge_of(&pool, "feat/attempted", false).await;
         sqlx::query("UPDATE vcs_requests SET resolution_run_id = 9 WHERE id = ?")
             .bind(attempted)
             .execute(&pool)
@@ -480,7 +565,7 @@ mod tests {
             .unwrap();
         // A landing that came OUT of a resolution and conflicted anyway. Resolving it would produce
         // another landing that can conflict, one agent per turn, for ever. It goes to a person.
-        let looped = escalated_merge(&pool, true).await;
+        let looped = escalated_merge_of(&pool, "feat/looped", true).await;
         // Escalated, but not a merge: nothing an agent in a worktree can do about a push.
         let other = crate::vcs::submit(
             &pool,
@@ -499,7 +584,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fresh = escalated_merge(&pool, false).await;
+        let fresh = escalated_merge_of(&pool, "feat/fresh", false).await;
 
         let picked = next_conflict(&pool)
             .await
@@ -520,6 +605,121 @@ mod tests {
         assert!(
             next_conflict(&pool).await.unwrap().is_none(),
             "every conflict has been attempted; a fresh agent per tick is the failure this prevents"
+        );
+    }
+
+    /// **The fleet, arriving by the one route the per-row brake does not see.** A person queues
+    /// `X into Y`, it conflicts; a session's `--land` queues the same merge minutes later, and it
+    /// conflicts identically. Two escalations, each with its own NULL, each eligible — so two agents
+    /// end up in two worktrees resolving the same two branches at once.
+    ///
+    /// Measured in production before this test existed: requests 30 and 31 on `nucleos`, runs 900318
+    /// and 900319, both live. The attempt has to be claimed against the conflict, not the row.
+    ///
+    /// And the release at the end is the second correction: blacklisting the pair for good stopped
+    /// the resolver helping a branch that had had one cancelled attempt and then conflicted again for
+    /// a different reason. Two at once is the harm; having tried once is not.
+    #[tokio::test]
+    async fn the_same_conflict_queued_twice_gets_one_agent_and_not_two() {
+        let pool = test_pool().await;
+        let first = escalated_merge(&pool, false).await;
+        let again = escalated_merge(&pool, false).await;
+
+        let picked = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("the first of the two is work");
+        assert_eq!(picked.id, first);
+
+        // The launcher claims it, exactly as `create_run_with` does, and the run it names is live.
+        insert_run(&pool, 11, "running").await;
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 11 WHERE id = ?")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "the duplicate names the same merge in the same project — request {again} must not mint \
+             a second agent against branches another one is already editing"
+        );
+
+        // The attempt ends without resolving anything. The branch pair is not blacklisted by having
+        // been tried: a conflict that is still there, or a new one on the same two branches, is work.
+        sqlx::query("UPDATE runs SET status = 'cancelled' WHERE id = 11")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_conflict(&pool).await.unwrap().map(|it| it.id),
+            Some(again),
+            "once nothing is live on this pair, the escalation nobody has attempted is work again"
+        );
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 12 WHERE id = ?")
+            .bind(again)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A different merge in the same project is untouched by the deduplication: it is a different
+        // conflict, and nobody has looked at it.
+        let elsewhere = crate::vcs::submit(
+            &pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj"),
+            &crate::vcs::Op::Merge {
+                source: "feat/other".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Shell,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(elsewhere)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_conflict(&pool).await.unwrap().map(|it| it.id),
+            Some(elsewhere),
+            "deduplication is per conflict, not a stop on the whole project"
+        );
+    }
+
+    /// **The conflict that stopped being one**, which is what the escalation's own advice produces:
+    /// it tells the asker to bring the target into their branch, resolve it there and ask again, and
+    /// when they do the merge lands and the escalated row stays behind. Terminal, so nothing tidies
+    /// it, and to the loop it still reads as work nobody has looked at.
+    ///
+    /// Watched three times in one evening on this repository. Once it minted an agent that resolved a
+    /// conflict already settled by another route, and that resolution's landing would have reopened
+    /// what the other one decided.
+    #[tokio::test]
+    async fn a_conflict_that_somebody_else_already_settled_is_not_work() {
+        let pool = test_pool().await;
+        let escalated = escalated_merge(&pool, false).await;
+        assert_eq!(
+            next_conflict(&pool).await.unwrap().map(|it| it.id),
+            Some(escalated),
+            "until the merge lands some other way, it is a conflict like any other"
+        );
+
+        // The asker takes the advice the escalation gave: they merge the target into their branch,
+        // resolve it there, and ask again. This time it goes through.
+        let settled = escalated_merge(&pool, false).await;
+        sqlx::query(
+            "UPDATE vcs_requests SET status = 'succeeded', result_sha = 'abc' WHERE id = ?",
+        )
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "request {settled} published this merge, so {escalated} is a conflict that no longer \
+             exists — an agent started on it resolves what somebody has already decided"
         );
     }
 
@@ -615,6 +815,15 @@ mod tests {
         assert!(
             prompt.contains("ALREADY STAGED"),
             "an agent told to merge would go to the queue that refused this merge, and circle"
+        );
+        // Measured, not guessed: three of the first four resolution runs stopped dead waiting for a
+        // person to approve a READ — `$(git merge-base ...)`, `cd x && grep ... | head`. The
+        // classifier is right to hold compound shell; the resolver is the one run that cannot afford
+        // to be held, so it is told to spend the extra calls instead.
+        assert!(
+            prompt.contains("ONE shell command at a time"),
+            "the resolver's autonomy is what compound shell costs, and the prompt is where that is \
+             cheapest to avoid"
         );
         assert!(
             prompt.contains("CONFLICT (content): seed.txt"),
