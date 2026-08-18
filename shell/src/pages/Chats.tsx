@@ -6,6 +6,7 @@ import {
   useChatTranscript,
   useChats,
   useCreateChat,
+  useIdeConversation,
   useIdeSessions,
   useLocalModel,
   usePatchChat,
@@ -15,6 +16,7 @@ import {
   type Brain,
   type ChatSummary,
   type IdeSession,
+  type Said,
   type Turn,
 } from "../data/chats";
 import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
@@ -299,6 +301,9 @@ function ChatDetail({
 }) {
   const seen = usePostChatSeen();
   const markedSeen = useRef(false);
+  // The editor half, on a conversation picked up from one. Keyed off the summary, so a chat opened
+  // here never asks — there is no session to ask about, and the daemon would answer 404.
+  const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
 
   // Once per chat opened, after the transcript has loaded — not on every poll
   // tick that follows. `markedSeen` is fresh per mount, and `ChatDetail` is
@@ -328,7 +333,9 @@ function ChatDetail({
       {!transcript.isError && transcript.data === undefined && (
         <p className="chats-loading">reading the conversation…</p>
       )}
-      {transcript.data !== undefined && <Transcript turns={transcript.data} />}
+      {transcript.data !== undefined && (
+        <Transcript turns={transcript.data} pickedUp={pickedUp.data} />
+      )}
 
       <Composer chatId={chatId} />
     </Panel>
@@ -456,10 +463,38 @@ function ArchiveRefusal({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------ transcript -- */
 
-function Transcript({ turns }: { turns: Turn[] }) {
-  if (turns.length === 0) return <p className="chats-empty">nothing has been said yet.</p>;
+/**
+ * A conversation, oldest first: what was said in the editor before it was picked up, and then the
+ * turns this daemon has run in it.
+ *
+ * `pickedUp` is undefined on a conversation opened here, and on one whose editor transcript is no
+ * longer on this machine — the query is simply not asked, or it refused. Both draw as the turns
+ * alone, which is the honest half rather than a claim about the other one.
+ */
+function Transcript({ turns, pickedUp }: { turns: Turn[]; pickedUp: Said[] | undefined }) {
+  const before = pickedUp ?? [];
+  // Both halves, and not just the daemon's. A picked-up conversation has no turns of its own until
+  // you answer in it, and "nothing has been said yet" over a page full of what you said in the
+  // editor is the one sentence this page must never print.
+  if (turns.length === 0 && before.length === 0) {
+    return <p className="chats-empty">nothing has been said yet.</p>;
+  }
   return (
     <ul className="chats-turns" aria-label="Transcript">
+      {before.map((said, index) => (
+        // Keyed by position: these came out of a file, in the order they are in it, and nothing
+        // here reorders or removes one. A transcript carries no id to key by.
+        <li className="chats-turn chats-turn-editor" key={`editor-${index}`}>
+          <p className={said.by_owner ? "chats-turn-asked" : "chats-turn-answer"}>{said.text}</p>
+        </li>
+      ))}
+      {before.length > 0 && (
+        <li className="chats-turn">
+          <p className="chats-mark chats-mark-editor" role="status">
+            picked up here — everything above was said in the editor, and none of it was a run
+          </p>
+        </li>
+      )}
       {turns.map((turn, index) => (
         <TurnBlock key={turn.id} turn={turn} previous={index === 0 ? null : turns[index - 1]} />
       ))}

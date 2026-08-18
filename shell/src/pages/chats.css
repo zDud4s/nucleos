@@ -311,6 +311,28 @@
   color: var(--tone-info-fg);
 }
 
+/*
+ * Where a conversation had in the editor ends and this one carries it on.
+ *
+ * Reads as a mark and not as a turn, because that is what it is: nothing happened at this point,
+ * it is the seam between two records of one conversation.
+ */
+.chats-mark-editor {
+  color: var(--tone-info-fg);
+}
+
+/*
+ * What was said before the conversation was picked up.
+ *
+ * Same block as a turn, with the border on one side only: it is the same conversation, read out of
+ * somebody else's file rather than out of the runs this daemon billed. It carries no cost line and
+ * no run id for that reason -- there is no run under it to name.
+ */
+.chats-turn-editor {
+  border-left-width: 3px;
+  background: var(--surface-sunken);
+}
+
 /* ============================================================= composer == */
 
 .chats-composer {

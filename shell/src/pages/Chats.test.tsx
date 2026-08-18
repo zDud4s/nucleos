@@ -22,7 +22,7 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary } from "../data/chats";
+import type { ChatSummary, Said } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow } from "../lib/turns";
@@ -46,6 +46,7 @@ function chatSummary(overrides: Partial<ChatSummary> = {}): ChatSummary {
     brain: "cloud",
     created_at: "2026-08-18T09:00:00Z",
     cwd: null,
+    ide_session_id: null,
     first_message: "hello there",
     last_activity: "2026-08-18T09:05:00Z",
     waiting: 0,
@@ -78,7 +79,12 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
 function chatsFetch(
   chats: ChatSummary[],
   transcripts: Record<string, AssistantTurnRow[]>,
-  opts: { localAvailable?: boolean; onMessage?: () => unknown } = {},
+  opts: {
+    localAvailable?: boolean;
+    onMessage?: () => unknown;
+    /** What was said in each conversation had in the editor, by session id. */
+    hadInTheEditor?: Record<string, Said[]>;
+  } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
     if (path === "/assistant/message" && init?.method === "POST") {
@@ -91,6 +97,13 @@ function chatsFetch(
     if (path === "/assistant/chats") return chats;
     if (path === "/assistant/local-model") return { available: opts.localAvailable ?? true };
     if (path === "/assistant/ide-sessions") return [];
+    const editor = /^\/assistant\/ide-sessions\/([^/]+)$/.exec(path);
+    if (editor !== null) {
+      const said = (opts.hadInTheEditor ?? {})[editor[1]];
+      // The daemon's own answer for a transcript this machine does not have.
+      if (said === undefined) throw new ApiRefusal(404, "not_found", "no such session");
+      return said;
+    }
     const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
     if (match !== null) return transcripts[match[1]] ?? [];
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
@@ -333,5 +346,87 @@ describe("Chats - the route and the sidebar badge", () => {
     fireEvent.click(await screen.findByRole("link", { name: "hello there, cloud, 2 unread" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
     expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
+  });
+});
+
+/* ------------------------------------------ picked up from the editor -- */
+
+describe("a conversation picked up from the editor", () => {
+  const hadThere: Said[] = [
+    { by_owner: true, text: "arranja o parser de datas" },
+    { by_owner: false, text: "está arranjado" },
+  ];
+
+  it("shows what was said there, above what has been said here", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", ide_session_id: "aaaa-1111" })],
+        { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "agora isto" })] },
+        { hadInTheEditor: { "aaaa-1111": hadThere } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => expect(screen.getByText("arranja o parser de datas")).toBeTruthy());
+    expect(screen.getByText("está arranjado")).toBeTruthy();
+    expect(screen.getByText("agora isto")).toBeTruthy();
+  });
+
+  it("marks where it was picked up, so the two halves are not read as one thread", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", ide_session_id: "aaaa-1111" })],
+        { "c-1": [] },
+        { hadInTheEditor: { "aaaa-1111": hadThere } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => expect(screen.getByText(/picked up here/i)).toBeTruthy());
+  });
+
+  it("does not claim nothing was said when the editor's half is all there is", async () => {
+    // A picked-up conversation has no turns of its own until you answer in it. Saying "nothing has
+    // been said yet" over a page full of what you said is the wrong answer this page must not give.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", ide_session_id: "aaaa-1111" })],
+        { "c-1": [] },
+        { hadInTheEditor: { "aaaa-1111": hadThere } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => expect(screen.getByText("arranja o parser de datas")).toBeTruthy());
+    expect(screen.queryByText(/nothing has been said yet/i)).toBeNull();
+  });
+
+  it("asks for no such thing on a conversation opened here", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => expect(screen.getByText(/nothing has been said yet/i)).toBeTruthy());
+    const asked = daemon.apiFetch.mock.calls.map(([path]) => path as string);
+    expect(asked.some((path) => path.startsWith("/assistant/ide-sessions/"))).toBe(false);
+  });
+
+  it("draws the conversation it does have when the editor's file is gone", async () => {
+    // The transcript is somebody else's file and can be deleted between the pick-up and now. The
+    // turns run here are still real, and refusing to draw them would lose the working half too.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", ide_session_id: "gone-from-disk" })],
+        { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "agora isto" })] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => expect(screen.getByText("agora isto")).toBeTruthy());
+    expect(screen.queryByText(/picked up here/i)).toBeNull();
   });
 });

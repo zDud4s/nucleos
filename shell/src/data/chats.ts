@@ -26,6 +26,15 @@ export interface ChatSummary {
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
+  /**
+   * Which conversation had in the editor this one was picked up from, or null when it was
+   * opened here.
+   *
+   * Not the session its next turn resumes — the daemon replaces that one the first time a
+   * context rotates past its ceiling, and this never moves. It is what `useIdeConversation`
+   * reads the editor half back by, every time the conversation is opened.
+   */
+  ide_session_id: string | null;
   first_message: string | null;
   last_activity: string | null;
   /** Answers landed since this conversation was last opened. */
@@ -38,6 +47,13 @@ export interface IdeSession {
   cwd: string;
   title: string | null;
   last_activity: string;
+}
+
+/** One thing said in a conversation had in the IDE — `sessions::Said`. */
+export interface Said {
+  /** Whether the owner typed it. The model answered everything else. */
+  by_owner: boolean;
+  text: string;
 }
 
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
@@ -134,6 +150,28 @@ export function useIdeSessions(enabled: boolean) {
     queryKey: keys.chats.ideSessions,
     queryFn: () => apiFetch<IdeSession[]>("/assistant/ide-sessions"),
     enabled,
+  });
+}
+
+/**
+ * What was said in the conversation a chat was picked up from, oldest first.
+ *
+ * Read once and never polled, which is the opposite of every other read on this
+ * page and is the honest cadence for it: this is the editor's own file, it is
+ * finished — the pick-up is what ended it — and nothing this window does can
+ * change a word of it. A poll would re-read megabytes to be told the same thing.
+ *
+ * An error is not handled here and is not a failure of the page. The transcript
+ * can be deleted between the pick-up and now, and the turns run here are still
+ * real: the caller draws the half it has.
+ */
+export function useIdeConversation(sessionId: string | null) {
+  return useQuery({
+    queryKey: keys.chats.ideConversation(sessionId ?? ""),
+    queryFn: () =>
+      apiFetch<Said[]>(`/assistant/ide-sessions/${encodeURIComponent(sessionId ?? "")}`),
+    enabled: sessionId !== null,
+    staleTime: Infinity,
   });
 }
 
