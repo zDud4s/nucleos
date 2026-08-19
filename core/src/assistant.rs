@@ -2743,10 +2743,10 @@ mod tests {
         let (mut state, dir, _runner) = errand_state().await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         state.local_assistant = Some(capturing_local_assistant(seen.clone()));
-        let errand = open_errand(&state, "carros", "-1:12").await;
+        let errand = open_errand(&state, "carros", "-1:31").await;
         crate::errands::append_notebook(dir.path(), &errand, 1, "já vi 12 anúncios").unwrap();
 
-        let id = send_message(&state, "-1:12", "e agora?", Origin::Telegram)
+        let id = send_message(&state, "-1:31", "e agora?", Origin::Telegram)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;
@@ -2763,13 +2763,13 @@ mod tests {
     #[tokio::test]
     async fn an_errand_with_a_notebook_starts_tainted() {
         let (state, dir, _runner) = errand_state().await;
-        let errand = open_errand(&state, "carros", "-1:13").await;
+        let errand = open_errand(&state, "carros", "-1:30").await;
         crate::errands::set_brain(&state.pool, errand.id, crate::errands::Brain::Cloud)
             .await
             .unwrap();
         crate::errands::append_notebook(dir.path(), &errand, 1, "o site dizia X").unwrap();
 
-        let id = send_message(&state, "-1:13", "continua", Origin::Telegram)
+        let id = send_message(&state, "-1:30", "continua", Origin::Telegram)
             .await
             .unwrap();
 
