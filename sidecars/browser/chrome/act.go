@@ -119,6 +119,8 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		refusal, err = d.press(ctx, on, objectID, action.Text)
 	case browser.ActionBack:
 		refusal, err = d.goBack(ctx, entry)
+	case browser.ActionGoto:
+		refusal, err = d.goTo(ctx, entry, action.Text)
 	default:
 		return browser.Refused(
 			browser.ConsequenceNotApplicable,

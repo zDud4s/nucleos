@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -247,4 +248,85 @@ func (d *Driver) callOnValue(ctx context.Context, on cdp.SessionID, objectID, fu
 		return "", err
 	}
 	return payload.Result.Value, nil
+}
+
+// goTo follows a url in the session that is already open.
+//
+// # The scheme check is load-bearing and is not tidiness
+//
+// Every other verb acts on something a snapshot showed, so the only urls that could be reached were
+// ones the page itself offered. This one takes an address from the agent, and an agent's context is
+// full of text a page put there. The fence answers for http and https — the interception sees those
+// requests and the allowlist decides — but `file:` reads the disk and `data:` is a document out of
+// thin air, and NEITHER goes through the interception. So they are refused here, before the
+// navigation, rather than trusted to a layer that never sees them.
+//
+// # Relative urls resolve against the page
+//
+// Because that is how they appear in the text an agent is reading: "see /docs/setup". Resolving
+// them keeps the agent from having to reassemble an origin by hand, which is the operation most
+// likely to be got wrong in the direction of somebody else's host.
+func (d *Driver) goTo(ctx context.Context, entry *session, raw string) (*browser.Refusal, error) {
+	wanted := strings.TrimSpace(raw)
+	if wanted == "" {
+		return &browser.Refusal{
+			Consequence: browser.ConsequenceNotApplicable,
+			Detail:      "goto needs a url to go to",
+		}, nil
+	}
+
+	d.mu.Lock()
+	on, id, here := entry.cdp, entry.id, entry.final
+	d.mu.Unlock()
+
+	parsed, err := url.Parse(wanted)
+	if err != nil {
+		return &browser.Refusal{
+			Consequence: browser.ConsequenceScheme,
+			Detail:      fmt.Sprintf("%q is not a url", wanted),
+		}, nil
+	}
+	if !parsed.IsAbs() {
+		base, baseErr := url.Parse(here)
+		if baseErr != nil || !base.IsAbs() {
+			return &browser.Refusal{
+				Consequence: browser.ConsequenceNotApplicable,
+				Detail:      fmt.Sprintf("%q is relative and this session has no page to resolve it against", wanted),
+			}, nil
+		}
+		parsed = base.ResolveReference(parsed)
+	}
+	if scheme := strings.ToLower(parsed.Scheme); scheme != "http" && scheme != "https" {
+		return &browser.Refusal{
+			Consequence: browser.ConsequenceScheme,
+			Detail:      fmt.Sprintf("%s: is not a scheme this browser follows; http and https are", scheme),
+		}, nil
+	}
+
+	// Counted before, so a refusal the fence raises while the navigation is in flight belongs to
+	// this act and not to the next one.
+	before := d.refusalCount()
+
+	result, err := d.conn.Call(ctx, on, "Page.navigate", map[string]any{"url": parsed.String()})
+	if err != nil {
+		return nil, fmt.Errorf("navigating: %w", err)
+	}
+	var outcome struct {
+		ErrorText string `json:"errorText"`
+	}
+	if err := json.Unmarshal(result, &outcome); err != nil {
+		return nil, err
+	}
+	if outcome.ErrorText != "" {
+		if d.refusalFor(ctx, id, before) != nil {
+			// The fence stopped it, and Act reports that in the fence's own vocabulary. Saying
+			// nothing here is what lets the one answer through rather than two.
+			return nil, nil
+		}
+		return &browser.Refusal{
+			Consequence: browser.ConsequenceNotApplicable,
+			Detail:      fmt.Sprintf("%s did not load: %s", parsed.String(), outcome.ErrorText),
+		}, nil
+	}
+	return nil, nil
 }

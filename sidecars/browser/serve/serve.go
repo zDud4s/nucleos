@@ -168,7 +168,7 @@ func actHandler(driver browser.Driver) http.HandlerFunc {
 		if !ok {
 			// A closed vocabulary, refused at the door. An unknown verb must not reach a driver
 			// that might interpret it generously (spec §6.2: consequence-free in v1).
-			http.Error(w, "unknown action kind: expected click, type, scroll, select, press or back", http.StatusBadRequest)
+			http.Error(w, "unknown action kind: expected click, type, scroll, select, press, back or goto", http.StatusBadRequest)
 			return
 		}
 		result, err := driver.Act(r.Context(), browser.SessionID(request.SessionID), browser.Action{
@@ -348,7 +348,7 @@ func forgetHandler(profiles browser.Profiles) http.HandlerFunc {
 func parseKind(raw string) (browser.ActionKind, bool) {
 	switch kind := browser.ActionKind(raw); kind {
 	case browser.ActionClick, browser.ActionType, browser.ActionScroll,
-		browser.ActionSelect, browser.ActionPress, browser.ActionBack:
+		browser.ActionSelect, browser.ActionPress, browser.ActionBack, browser.ActionGoto:
 		return kind, true
 	default:
 		return "", false

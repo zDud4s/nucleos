@@ -160,3 +160,57 @@ func TestGoingBackReturnsToThePageBefore(t *testing.T) {
 		t.Errorf("back did not return to the page before: %+v", back)
 	}
 }
+
+// TestFollowingAUrlInTheSessionThatIsAlreadyOpen.
+//
+// There was a way home and no way onward. An agent that read an address in the page's own words —
+// not a link, an address — had to open a SECOND session for it, paying a fresh profile decision and
+// losing the history it would have needed to come back.
+func TestFollowingAUrlInTheSessionThatIsAlreadyOpen(t *testing.T) {
+	site, driver, id := onControls(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	result, err := driver.Act(ctx, id, browser.Action{
+		Kind: browser.ActionGoto, Text: site.origin() + "/reading",
+	})
+	if err != nil {
+		t.Fatalf("goto: %v", err)
+	}
+	if result.Outcome != browser.OutcomeDone {
+		t.Fatalf("a url this profile admits was refused: %+v", result.Refusal)
+	}
+	if !result.Navigated || !strings.Contains(result.URL, "/reading") {
+		t.Fatalf("goto did not report where it went: %+v", result)
+	}
+
+	snapshot, err := driver.Snapshot(ctx, id, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !strings.Contains(snapshot.URL, "/reading") {
+		t.Errorf("the session is not on the page it said it went to: %q", snapshot.URL)
+	}
+}
+
+// TestGoingToAHostTheProfileDoesNotAdmitIsRefused.
+//
+// The argument for having the verb at all: it grants nothing a link does not. `localhost` and
+// `127.0.0.1` are the same socket and different hosts, so this is the same server the session is
+// already reading — under a name the profile was never given. The fence answers, exactly as it
+// would for a link the page itself offered.
+func TestGoingToAHostTheProfileDoesNotAdmitIsRefused(t *testing.T) {
+	site, driver, id := onControls(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	result, err := driver.Act(ctx, id, browser.Action{
+		Kind: browser.ActionGoto, Text: otherHost(site) + "/reading",
+	})
+	if err != nil {
+		t.Fatalf("goto: %v", err)
+	}
+	if result.Outcome != browser.OutcomeRefused {
+		t.Fatalf("a host this profile does not admit was followed: %+v", result)
+	}
+}

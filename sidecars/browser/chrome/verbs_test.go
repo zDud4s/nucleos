@@ -262,3 +262,70 @@ func TestARefFromNoSnapshotSaysThatIsWhatHappened(t *testing.T) {
 		t.Errorf("a stale ref was reported as %q", result.Refusal.Consequence)
 	}
 }
+
+func countOf(fake *cdptest.Browser, method string) int {
+	seen := 0
+	for _, call := range fake.Calls() {
+		if call.Method == method {
+			seen++
+		}
+	}
+	return seen
+}
+
+// TestGoingToAFileUrlIsRefusedBeforeItIsTried.
+//
+// Every other verb acts on something a snapshot showed, so the only urls reachable were ones the
+// page itself offered. goto takes an address from the agent, whose context is full of text a page
+// put there — and `file:` reads the disk without ever passing the interception, so the check has to
+// happen here or it does not happen.
+func TestGoingToAFileUrlIsRefusedBeforeItIsTried(t *testing.T) {
+	fake, driver := connected(t)
+	session := opened(t, driver)
+	navigations := countOf(fake, "Page.navigate")
+
+	result := act(t, driver, session.ID, browser.Action{
+		Kind: browser.ActionGoto, Text: "file:///C:/Users/secrets.txt",
+	})
+	if result.Outcome != browser.OutcomeRefused {
+		t.Fatal("a file: url was followed")
+	}
+	if result.Refusal.Consequence != browser.ConsequenceScheme {
+		t.Errorf("refused for the wrong reason: %q", result.Refusal.Consequence)
+	}
+	if countOf(fake, "Page.navigate") != navigations {
+		t.Error("it navigated anyway; the check has to come before the call, not after it")
+	}
+}
+
+// TestARelativeUrlResolvesAgainstThePage.
+//
+// Because that is the form an address takes in the words an agent is reading — "see /docs/setup".
+// Making the agent reassemble the origin by hand is the operation most likely to be got wrong in
+// the direction of somebody else's host.
+func TestARelativeUrlResolvesAgainstThePage(t *testing.T) {
+	fake, driver := connected(t)
+	session := opened(t, driver)
+
+	if result := act(t, driver, session.ID, browser.Action{
+		Kind: browser.ActionGoto, Text: "/docs/setup",
+	}); result.Outcome != browser.OutcomeDone {
+		t.Fatalf("a relative url was refused: %+v", result.Refusal)
+	}
+
+	last := paramsOf(t, fake, "Page.navigate", countOf(fake, "Page.navigate")-1)
+	if last["url"] != "https://example.org/docs/setup" {
+		t.Errorf("it did not resolve against the page it was on: %+v", last)
+	}
+}
+
+// TestGoingNowhereIsRefused.
+func TestGoingNowhereIsRefused(t *testing.T) {
+	_, driver := connected(t)
+	session := opened(t, driver)
+
+	result := act(t, driver, session.ID, browser.Action{Kind: browser.ActionGoto})
+	if result.Outcome != browser.OutcomeRefused {
+		t.Fatal("goto with no url was accepted")
+	}
+}
