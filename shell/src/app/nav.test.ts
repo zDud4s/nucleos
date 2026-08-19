@@ -67,13 +67,13 @@ describe("the nav table", () => {
     ]);
   });
 
-  it("keeps Teams in the sidebar and says why it cannot work yet", () => {
-    // Verified against `core/src/http.rs`: the team tables exist and none of
-    // the team routes are mounted. Dropping the item would hide a designed
-    // feature; offering it without a note would offer controls that 404.
+  it("keeps Teams in the sidebar with nothing left holding it back", () => {
+    // It carried `disabled: "the núcleo has no team routes yet"` from the
+    // foundation until the núcleo mounted them. It has, so the entry is an
+    // ordinary one now.
     const teams = navItemForPath("/teams");
     expect(teams).toBeDefined();
-    expect(teams?.disabled).toMatch(/team routes/i);
+    expect(teams?.disabled).toBeUndefined();
   });
 
   it("gives every item a unique, rooted path", () => {

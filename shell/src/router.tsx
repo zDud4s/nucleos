@@ -26,6 +26,8 @@ import { Projects } from "./pages/Projects";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
 import { System } from "./pages/System";
+import { TeamRunDetail } from "./pages/TeamRunDetail";
+import { Teams } from "./pages/Teams";
 import { Voice } from "./pages/Voice";
 import { Waiting } from "./pages/Waiting";
 import { Web } from "./pages/Web";
@@ -48,8 +50,11 @@ import { Web } from "./pages/Web";
  * branches is a conditional expression nobody reads. A path that is not here
  * gets the placeholder, which is what makes an unbuilt page a *stated* absence
  * rather than a missing route.
+ *
+ * `export`ed so the "no placeholder left" invariant can be asserted directly
+ * against this table, rather than by walking the rendered tree.
  */
-const PAGES: Record<string, () => ReactNode> = {
+export const PAGES: Record<string, () => ReactNode> = {
   "/": Home,
   "/fleet": Fleet,
   "/autopilot": Autopilot,
@@ -59,6 +64,7 @@ const PAGES: Record<string, () => ReactNode> = {
   "/projects": Projects,
   "/chats": Chats,
   "/errands": Errands,
+  "/teams": Teams,
   "/council": Council,
   "/agents": Agents,
   "/mail": Mail,
@@ -113,6 +119,12 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * `/system/$view` is the same idiom again: like `/projects/$projectId/$view`, the
  * view is a path parameter and not a search param — there is exactly one of it, it
  * always has a value, and it is not a filter. No `SEARCH_VALIDATORS` entry.
+ *
+ * `/team-runs/$runId` is the first detail route whose first segment is not
+ * itself a nav path — `/teams/$teamId` is a detail of `/teams`, but a team run
+ * is reached from inside a department rather than from its own list page.
+ * Nothing else in the tree mentions `/team-runs`, so `router.test.tsx` asserts
+ * it by name.
  */
 const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/runs/$runId", component: RunDetail },
@@ -120,6 +132,8 @@ const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/chats/$chatId", component: Chats },
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
+  { path: "/teams/$teamId", component: Teams },
+  { path: "/team-runs/$runId", component: TeamRunDetail },
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: Web },
   { path: "/system/$view", component: System },
