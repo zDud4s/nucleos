@@ -1,5 +1,5 @@
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Serialize;
 
 pub struct NucleosTools {
@@ -130,24 +130,30 @@ struct BrowserSnapshotParams {
     /// a viewport.
     #[serde(default)]
     text_from: Option<i64>,
+    /// Read the page's controls on from here, when the last snapshot came back `truncated` with
+    /// a `controls_next`. Prose and controls are bounded separately, so a page can run out of
+    /// one and not the other.
+    #[serde(default)]
+    controls_from: Option<i64>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct BrowserActParams {
     /// The session id browser_open gave back.
     session_id: i64,
-    /// One of: click, type, scroll, select, press, back.
+    /// One of: click, type, scroll, select, press, back, goto.
     kind: String,
     /// A ref from the most recent snapshot, such as "e5". Never a CSS selector, and never a ref
     /// you have not seen in a snapshot of THIS page. Required for click, type and select. Leave
     /// it out to scroll the page itself, to send a key wherever the focus already is, or to go
-    /// back.
+    /// back or goto.
     #[serde(rename = "ref", default)]
     element_ref: String,
     /// The verb's argument: the characters for "type", the option's visible label for "select",
     /// the key's name for "press" (Enter, Tab, Escape, Backspace, Delete, Home, End, PageUp,
     /// PageDown, ArrowUp/Down/Left/Right - no modifiers), the direction for a page "scroll"
-    /// (down, up, top, bottom; down if you say nothing).
+    /// (down, up, top, bottom; down if you say nothing), and the url for "goto" - absolute, or
+    /// relative to the page you are on.
     text: Option<String>,
 }
 
@@ -458,7 +464,11 @@ impl NucleosTools {
                        listing refs that left the page. Use it after an action; take a whole one \
                        when you have lost track. `truncated` means the page's WORDS ran out of \
                        budget, not that you reached the bottom of a window - scrolling will not \
-                       reach the rest; pass the `text_next` you were given back as `text_from`. \
+                       reach the rest; pass the `text_next` you were given back as \
+                       `text_from`. A page can also run out of CONTROLS, separately, and \
+                       then hands you a `controls_next` for `controls_from`. A table comes \
+                       back as `row` entries, cells separated by a vertical bar, headers \
+                       first, and a link inside a cell still has its own ref. \
                        Cheap enough to call between actions, and you \
                        should: a ref only names something a snapshot actually showed you."
     )]
@@ -468,6 +478,7 @@ impl NucleosTools {
             session_id,
             changes_only,
             text_from,
+            controls_from,
         }): Parameters<BrowserSnapshotParams>,
     ) -> String {
         json_result(
@@ -476,6 +487,7 @@ impl NucleosTools {
                     session_id,
                     changes_only.unwrap_or(false),
                     text_from.unwrap_or(0),
+                    controls_from.unwrap_or(0),
                 )
                 .await,
         )
@@ -485,8 +497,10 @@ impl NucleosTools {
         description = "Do one thing to the page. click, type and select need a ref a \
                        snapshot showed you; scroll takes one to bring something into view and \
                        none to move the page; press sends one key to a ref or to whatever has \
-                       focus; back returns to the previous page. type PASTES - it fires no \
-                       keystroke - so a box that submits on Enter needs a press after it. \
+                       focus; back returns to the previous page; goto follows a url you \
+                       read, which is how you reach an address the page names in words \
+                       rather than as a link. type PASTES - it fires no keystroke - so a \
+                       box that submits on Enter needs a press after it. \
                        select works on a real dropdown and says so when the thing is not one. \
                        If the answer carries `navigated`, the page changed underneath you and \
                        EVERY ref you hold is dead: take a fresh snapshot before acting again. \

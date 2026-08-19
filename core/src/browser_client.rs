@@ -169,6 +169,10 @@ pub struct Snapshot {
     /// `truncated` is, so its presence is the offer.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub text_next: i64,
+    /// The same offer for the actionable elements, which have a budget of their own: a listing with
+    /// two thousand links used to come back whole and unannounced, because the prose had fit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub controls_next: i64,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -311,6 +315,7 @@ impl BrowserClient {
         session_id: &str,
         changes_only: bool,
         text_from: i64,
+        controls_from: i64,
     ) -> Result<Snapshot, BrowserError> {
         self.call(
             "/snapshot",
@@ -318,6 +323,7 @@ impl BrowserClient {
                 "session_id": session_id,
                 "changes_only": changes_only,
                 "text_from": text_from,
+                "controls_from": controls_from,
             }),
         )
         .await
@@ -735,7 +741,7 @@ mod tests {
         assert_eq!(session.final_url, "https://jira.example.org/browse");
         assert!(session.refusal.is_none());
 
-        let snapshot = client.snapshot("s1", false, 0).await.expect("snapshot");
+        let snapshot = client.snapshot("s1", false, 0, 0).await.expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
         let result = client.act("s1", "click", "e5", "").await.expect("act");

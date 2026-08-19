@@ -779,6 +779,9 @@ pub struct SessionBody {
     /// `/browser/snapshot` reads it.
     #[serde(default)]
     pub text_from: i64,
+    /// The same, for the actionable elements, which are bounded apart from the prose.
+    #[serde(default)]
+    pub controls_from: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -836,7 +839,12 @@ pub async fn post_snapshot(
     match state
         .browser
         .client
-        .snapshot(&row.sidecar_id, body.changes_only, body.text_from)
+        .snapshot(
+            &row.sidecar_id,
+            body.changes_only,
+            body.text_from,
+            body.controls_from,
+        )
         .await
     {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
@@ -1201,10 +1209,12 @@ mod tests {
             let granted = grant(&db.pool, "acme", &chain, NOW).await.expect("grant");
             assert!(granted.is_empty(), "{chain:?} granted {granted:?}");
         }
-        assert!(list_sites(&db.pool, "acme")
-            .await
-            .expect("sites")
-            .is_empty());
+        assert!(
+            list_sites(&db.pool, "acme")
+                .await
+                .expect("sites")
+                .is_empty()
+        );
         db.close().await;
     }
 
@@ -1537,12 +1547,16 @@ mod tests {
             .expect("grant");
         let (runtime, _) = stub_sidecar("https://jira.example.org/").await;
 
-        assert!(revoke(&db.pool, "acme", "https://jira.example.org")
-            .await
-            .expect("revoke"));
-        assert!(!revoke(&db.pool, "acme", "https://jira.example.org")
-            .await
-            .expect("revoke twice"));
+        assert!(
+            revoke(&db.pool, "acme", "https://jira.example.org")
+                .await
+                .expect("revoke")
+        );
+        assert!(
+            !revoke(&db.pool, "acme", "https://jira.example.org")
+                .await
+                .expect("revoke twice")
+        );
 
         let opened = open(
             &db.pool,
