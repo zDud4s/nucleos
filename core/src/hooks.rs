@@ -329,6 +329,7 @@ pub async fn pretooluse_decision(
         &payload.tool_name,
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
+        &state.github.policy,
     );
     tracing::info!(
         tool_name = %payload.tool_name,
@@ -349,6 +350,7 @@ pub async fn pretooluse_decision(
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
+                state.github.policy.digest(),
             )
             .await
         {
@@ -382,6 +384,7 @@ pub async fn pretooluse_decision(
             &payload.tool_name,
             &payload.tool_input,
             &classification,
+            state.github.policy.digest(),
         )
         .await
     {
@@ -612,6 +615,7 @@ async fn rooted_decision(
         &payload.tool_name,
         &payload.tool_input,
         Some(Path::new(root)),
+        &state.github.policy,
     );
     if classification.decision.decision == "deny" {
         return Json(Decision {
@@ -1461,6 +1465,7 @@ mod tests {
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -1983,7 +1988,8 @@ mod tests {
     #[tokio::test]
     async fn pends_unrecognized_command() {
         let tool_input = serde_json::json!({"command": "frobnicate --hard"});
-        let classification = classifier::classify("Bash", &tool_input, None);
+        let classification =
+            classifier::classify("Bash", &tool_input, None, &crate::github::Policy::empty());
         assert_eq!(classification.action_class, "unrecognized");
 
         let app = test_router(test_state().await);

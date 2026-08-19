@@ -3996,6 +3996,7 @@ mod tests {
             // Off, like `web` beside it: no test in this module drives a browser, and a department
             // reaches one — if it ever does — through the daemon client like any other agent.
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: Arc::new(crate::github::GithubRuntime::default()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),

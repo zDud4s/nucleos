@@ -281,6 +281,15 @@ pub fn build_router(state: AppState) -> Router {
         // zero deadline, which `wait_for` answers from its first look at the row.
         .route("/vcs/requests/{id}", get(get_vcs_request))
         .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
+        // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
+        // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
+        // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
+        //
+        // ONE route for both tools, and what makes that safe is exactly the line above: it is
+        // unreachable by a `Scope::Run`, so it is not a second door for the agent the tools serve.
+        // The partition between reading and acting is held by the parameter TYPES at the tool
+        // boundary, never by the transport, which takes an `Op` and executes it.
+        .route("/github/requests", post(submit_github_request))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -2944,6 +2953,95 @@ async fn get_vcs_request(
 }
 
 #[derive(Deserialize)]
+struct GithubRequestBody {
+    /// The operation, as data. Deserialized through `github`'s validating node types, so a dashed
+    /// string is refused HERE rather than reaching an argv.
+    op: crate::github::Op,
+}
+
+/// A second refusal of a call `auth.rs` has already refused, and deliberately so.
+///
+/// `POST /github/requests` is absent from both scope tables, so `permits` lets only the control
+/// token and an Admin key reach this at all. This is not that boundary and must not be read as one
+/// — it is the second of two independent refusals at a place that leaves the machine, which is what
+/// `hooks.rs` says one wants at a boundary.
+fn github_caller_is_allowed(scope: &Scope) -> Result<(), StatusCode> {
+    match scope {
+        Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(()),
+        Scope::Run(_) | Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => {
+            Err(StatusCode::FORBIDDEN)
+        }
+    }
+}
+
+/// The one door both GitHub tools come through.
+///
+/// **Inside `uncancellable`, and by instruction rather than by precaution.** `submit_vcs_request`'s
+/// doc names the exact condition that makes it necessary — "it stops being benign the moment
+/// submitting becomes two writes … whoever writes that second write moves this through
+/// `uncancellable` at the same time" — and this handler is that second write: it publishes to GitHub
+/// and then records a proposal, or it records a proposal that a person will later act on. A client
+/// disconnecting between the two would leave a comment posted and nothing saying so.
+///
+/// The cost is real and not a wrapper for free: `uncancellable` is `tokio::spawn`, so the work must
+/// be `Send + 'static` and this body OWNS everything it touches. And it covers DISCONNECTION, not
+/// panic — a panicking task becomes a 500 with the task gone, which for a path that has already
+/// posted a comment is the same silence it protects against in the other case. Said here so nobody
+/// reads the protection as larger than it is.
+async fn submit_github_request(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(body): Json<GithubRequestBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    github_caller_is_allowed(&scope).map_err(|status| {
+        (
+            status,
+            "reaching GitHub is the owner's, not a run's".to_owned(),
+        )
+    })?;
+    let submitted =
+        uncancellable(
+            async move { crate::github::submit(&state.pool, &state.github, body.op).await },
+        )
+        .await
+        .map_err(|status| (status, "the github task did not finish".to_owned()))?;
+
+    match submitted {
+        Ok(crate::github::Submitted::Ran(outcome)) => Ok(Json(serde_json::json!({
+            "status": "ran",
+            "operation": outcome.kind,
+            "exit_code": outcome.exit_code,
+            "stdout": outcome.stdout,
+            "output_tail": outcome.output_tail,
+        }))),
+        // 200 and not 202: the turn is not waiting for this and there is nothing to poll. What the
+        // caller needs is the number a person will see beside it.
+        Ok(crate::github::Submitted::Filed { proposal_id, kind }) => Ok(Json(serde_json::json!({
+            "status": "filed_for_approval",
+            "operation": kind,
+            "proposal_id": proposal_id,
+            "detail": format!("filed for approval as #{proposal_id}; the turn continues"),
+        }))),
+        Err(failure) => Err((github_failure_status(&failure), failure.to_string())),
+    }
+}
+
+/// Each failure gets the status that sends a reader to the right place.
+///
+/// A switched-off pillar and an absent `gh` are 503: the request was fine and this machine cannot
+/// serve it. A missing token is 403, because somebody has to paste a credential. A timeout is 504.
+fn github_failure_status(failure: &crate::github::Failure) -> StatusCode {
+    match failure {
+        crate::github::Failure::NotConfigured | crate::github::Failure::MissingCli => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        crate::github::Failure::MissingToken => StatusCode::FORBIDDEN,
+        crate::github::Failure::TimedOut => StatusCode::GATEWAY_TIMEOUT,
+        crate::github::Failure::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[derive(Deserialize)]
 struct VcsListQuery {
     project_id: Option<String>,
 }
@@ -4469,6 +4567,61 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "github-action" {
+        // The kind through this door that ACTS on approval, where `team-action` waits for a tick.
+        // A pillar answering synchronously has no later pass to be picked up on, so without this the
+        // button would approve nothing.
+        //
+        // Uncancellable for the reason all of its neighbours are, and here it carries more: the work
+        // between the claim and the note is a live call to GitHub, and a request dropped across it
+        // would leave a comment published and the row saying only that somebody said yes.
+        let state = state.clone();
+        let ran = uncancellable(async move {
+            crate::github::approve_proposed_operation(&state.pool, &state.github, id).await
+        })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match ran {
+            Ok(outcome) => Ok(Json(serde_json::json!({
+                "operation": outcome.kind,
+                "exit_code": outcome.exit_code,
+                "stdout": outcome.stdout,
+                "output_tail": outcome.output_tail,
+            }))),
+            Err(crate::github::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::github::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::github::DecisionError::Malformed) => {
+                tracing::warn!(
+                    proposal_id = id,
+                    "a github proposal carried no usable operation"
+                );
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this proposal carries no usable operation, so there is nothing to run"
+                        .to_owned(),
+                ))
+            }
+            // The proposal is already `approved` and the note beneath it says what happened. The
+            // status is the failure's own, so a missing token does not read as a broken daemon.
+            Err(crate::github::DecisionError::Failed(failure)) => Err((
+                github_failure_status(&failure),
+                format!("approved, and it did not run: {failure}"),
+            )),
+            Err(crate::github::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "approving a github proposal failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the decision could not be recorded".to_owned(),
+                ))
+            }
+        };
+    }
+
     if kind == "browser-wheel" {
         return approve_browser_wheel(state, id).await;
     }
@@ -5426,6 +5579,7 @@ mod tests {
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+                github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -6008,6 +6162,7 @@ mod tests {
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -9529,6 +9684,7 @@ mod tests {
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),

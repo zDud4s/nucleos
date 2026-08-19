@@ -258,6 +258,13 @@ pub struct AppState {
     /// request, because a list cached in the runtime would keep admitting a host somebody revoked —
     /// and the revocation screen would report success while the profile went on loading it.
     pub browser: Arc<crate::browser::BrowserRuntime>,
+    /// The GitHub pillar: whether it is on, and the two lists deciding what runs without asking.
+    ///
+    /// The POLICY is here and not read per request, and that is the opposite choice from `browser`'s
+    /// site lists a few lines up — for the reason `classifier.rs` gives about its fourth argument. A
+    /// policy re-read per call is a policy a run could change in the middle of itself, and the hook
+    /// and the resume would then answer differently about one command line.
+    pub github: Arc<crate::github::GithubRuntime>,
     /// The calendar's settings — the default zone and the window a proposal may land in.
     ///
     /// Same shape and same reasoning as `email` and `voice` above: read together, changed together,

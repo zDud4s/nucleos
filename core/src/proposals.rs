@@ -306,6 +306,58 @@ pub async fn create_calendar_event(
     Ok(proposal_id)
 }
 
+/// A run asked GitHub for something the owner's list does not run on its own.
+///
+/// The seventh `kind` this table carries, and the third that starts no run. The shape is
+/// `create_calendar_event`'s and the column convention is `create_team_action_in_transaction`'s:
+/// `tool_name` carries the OPERATION's kind -- `pr_comment`, `workflow_run` -- because that is the
+/// column the approvals list renders, and a queue saying only "github-action" would make a person
+/// open every row to find out what they are agreeing to.
+///
+/// **Unlike `team-action`, approving this one ACTS.** There is no later tick that picks it up:
+/// `github::approve_proposed_operation` runs `gh` on the approval path itself, because a pillar
+/// answering synchronously has no pass to be picked up on. Without that, the button would approve
+/// nothing.
+///
+/// `project_id` is NULL like its three siblings, so `wip::OPEN_REVIEW_ITEMS_SQL` does not count
+/// these against a project's review ceiling. That is deliberate and it is a real gap: the ceiling
+/// that would govern them is the autonomy list itself, and an agent that files a hundred refused
+/// operations is an agent filling somebody's approvals queue. Nothing here throttles that yet, and
+/// saying so is better than leaving it to be discovered.
+pub async fn create_github_action(
+    pool: &SqlitePool,
+    kind: &str,
+    why: &str,
+    payload: &str,
+) -> sqlx::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO proposals
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+         VALUES ('github-action', 'pending', NULL, NULL, NULL, ?, ?, ?, ?, NULL)",
+    )
+    .bind(kind)
+    .bind(why)
+    .bind(payload)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+    let proposal_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(proposal_id)
+}
+
 /// A department asked to do something, and this is the question a human answers.
 ///
 /// The fifth `kind`, the third that touches no run, and the first that is filed by an agent about

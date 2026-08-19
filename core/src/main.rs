@@ -26,6 +26,7 @@ mod feed;
 mod files;
 mod gate;
 mod git_exec;
+mod github;
 mod handoff;
 mod health;
 mod hooks;
@@ -195,6 +196,38 @@ async fn main() {
             },
             None => {
                 eprintln!("no bot token was read from stdin");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // The door the `github-token` comes in by. `secrets.rs` has always exposed store/load/delete and
+    // nothing put this key there, so the pillar could be configured, enabled and credential-less with
+    // no way to fix it that did not involve writing a second program.
+    //
+    // Stdin and never an argument, exactly like its two neighbours: a token on a command line is in
+    // the shell's history and in every process listing on the machine for as long as this runs.
+    if std::env::args().any(|a| a == "--set-github-token") {
+        match read_secret_from_stdin(
+            "paste the GitHub token (a fine-grained PAT or a classic one), then press Enter:",
+        ) {
+            Some(value) => match secrets::store_secret(github::TOKEN_KEY, &value) {
+                Ok(()) => {
+                    println!("github token stored in Credential Manager");
+                    // Said here because this is the last moment the person is listening, and the
+                    // alternative is discovering it from a health row that says permission-denied.
+                    eprintln!(
+                        "a `gh auth login` on this machine is NOT a substitute and never was: that                          login writes into the interactive session's keyring, and the daemon runs                          as a scheduled task."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("failed to store github token: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("no github token was read from stdin");
                 std::process::exit(1);
             }
         }
@@ -450,6 +483,17 @@ async fn main() {
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
     let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
+    // The path is named once and reused, because two facts come off it: what the file SAYS
+    // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
+    // `GithubRuntime::configured` — and deriving it from a second literal is how the two would come
+    // to disagree about which file they mean.
+    let github_path = std::path::Path::new(".ai/github.yaml");
+    let github_config = config::load_github_config(github_path);
+    let github_configured = github_path.exists();
+    // Resolved here and carried on the runtime, so the daemon and the health probe can never end up
+    // asking about two different programs — the mistake `cli_probe` names when it says to use "the
+    // resolved path, not the configured name".
+    let github_binary = std::env::var("NUCLEOS_GH_BIN").unwrap_or_else(|_| "gh".to_owned());
     // The web sidecar's own shared secret, minted per boot and never persisted.
     //
     // NOT the control token, and not for the reason the email sidecar has its own: this traffic
@@ -653,6 +697,11 @@ async fn main() {
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
+        github: Arc::new(github::GithubRuntime::from_config(
+            &github_config,
+            github_configured,
+            github_binary,
+        )),
         browser: Arc::new(browser::BrowserRuntime {
             enabled: browser_config.enabled,
             client: browser_client::BrowserClient::new(
