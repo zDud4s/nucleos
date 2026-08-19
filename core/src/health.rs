@@ -138,6 +138,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     let web_enabled = state.web.enabled;
     let browser_enabled = state.browser.enabled;
     let github_asked_for = state.github.enabled && state.github.configured;
+    let github_binary = state.github.binary.clone();
     let voice_armed = state.voice.armed;
     let stt_command = state.voice.stt_command.clone();
     let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, github) = tokio::join!(
@@ -169,7 +170,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             sidecar_probe("browser_sidecar", crate::sidecar::BROWSER, browser_enabled),
         ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
-        run_subsystem("github", github_probe(github_asked_for)),
+        run_subsystem("github", github_probe(github_asked_for, github_binary)),
     );
     let subsystems = vec![
         pool,
@@ -304,7 +305,7 @@ async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
 /// It probes the TOKEN and never `gh auth status`, and that is the whole point of asking this
 /// question here: the CLI's own login lives in the interactive session's keyring, so a green
 /// `gh auth status` would say healthy while the daemon — a scheduled task — could not act.
-async fn github_probe(asked_for: bool) -> SubsystemReadout {
+async fn github_probe(asked_for: bool, binary: String) -> SubsystemReadout {
     run_probe("github", async move {
         if !asked_for {
             return Ok(HealthState::Disabled);
@@ -312,17 +313,21 @@ async fn github_probe(asked_for: bool) -> SubsystemReadout {
         // The two facts `execute` needs, in the order it needs them, and the CATEGORY comes from
         // `github::Failure` rather than being chosen again here. One vocabulary, defined where the
         // failures are, so the readout and the refusal a caller gets cannot come to disagree.
-        let failure = if tokio::task::spawn_blocking(|| resolve_program(std::ffi::OsStr::new("gh")))
-            .await
-            .map_err(classify_error)?
-            .is_none()
-        {
-            Some(crate::github::Failure::MissingCli)
-        } else if crate::github::load_token().await.is_none() {
-            Some(crate::github::Failure::MissingToken)
-        } else {
-            None
-        };
+        // The name off the runtime rather than the literal `gh`, so this probe and
+        // `github::execute` cannot be looking for two different files — the second chance to
+        // disagree that `cli_probe` refuses to take.
+        let failure =
+            if tokio::task::spawn_blocking(move || resolve_program(std::ffi::OsStr::new(&binary)))
+                .await
+                .map_err(classify_error)?
+                .is_none()
+            {
+                Some(crate::github::Failure::MissingCli)
+            } else if crate::github::load_token().await.is_none() {
+                Some(crate::github::Failure::MissingToken)
+            } else {
+                None
+            };
         match failure {
             None => Ok(HealthState::Ok),
             Some(failure) => Err(failure.category()),

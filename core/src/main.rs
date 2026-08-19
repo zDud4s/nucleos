@@ -490,6 +490,10 @@ async fn main() {
     let github_path = std::path::Path::new(".ai/github.yaml");
     let github_config = config::load_github_config(github_path);
     let github_configured = github_path.exists();
+    // Resolved here and carried on the runtime, so the daemon and the health probe can never end up
+    // asking about two different programs — the mistake `cli_probe` names when it says to use "the
+    // resolved path, not the configured name".
+    let github_binary = std::env::var("NUCLEOS_GH_BIN").unwrap_or_else(|_| "gh".to_owned());
     // The web sidecar's own shared secret, minted per boot and never persisted.
     //
     // NOT the control token, and not for the reason the email sidecar has its own: this traffic
@@ -696,6 +700,7 @@ async fn main() {
         github: Arc::new(github::GithubRuntime::from_config(
             &github_config,
             github_configured,
+            github_binary,
         )),
         browser: Arc::new(browser::BrowserRuntime {
             enabled: browser_config.enabled,

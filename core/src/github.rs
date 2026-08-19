@@ -1055,6 +1055,20 @@ pub struct GithubRuntime {
     /// file that merely exists": there a file that exists proves nothing, and here it is the only
     /// thing that proves anything.
     pub configured: bool,
+    /// The `gh` executable, resolved once at startup from `NUCLEOS_GH_BIN`.
+    ///
+    /// Overridable for the reason `NUCLEOS_CLAUDE_BIN` exists, and it is the same reason rather than
+    /// a borrowed one: on Windows a CLI installed through npm is a `.cmd` shim that Rust's `Command`
+    /// cannot spawn by name. `health.rs::binary_candidate` deliberately refuses `.cmd` candidates
+    /// too, so without this a machine where `gh` works in the console would report `Missing` and
+    /// nothing would say why.
+    ///
+    /// It lives HERE and is not read from the environment per call, which matters twice. Startup is
+    /// where every other pillar resolves its configuration, so a run cannot change what the daemon
+    /// spawns halfway through itself. And a test can hand this a stub program without mutating
+    /// process-global state, which in Rust 2024 is `unsafe` and races every other test in the
+    /// binary.
+    pub binary: String,
     pub policy: Policy,
 }
 
@@ -1063,6 +1077,7 @@ impl Default for GithubRuntime {
         Self {
             enabled: true,
             configured: false,
+            binary: "gh".to_owned(),
             policy: Policy::empty(),
         }
     }
@@ -1072,10 +1087,15 @@ impl GithubRuntime {
     /// `configured` is passed in rather than derived, because whether the file exists is a fact
     /// about the disk and this module does no I/O to find out. `main.rs` knows the path it just
     /// read and is the one place that should.
-    pub fn from_config(config: &crate::config::GithubConfig, configured: bool) -> Self {
+    pub fn from_config(
+        config: &crate::config::GithubConfig,
+        configured: bool,
+        binary: String,
+    ) -> Self {
         Self {
             enabled: config.enabled,
             configured,
+            binary,
             policy: Policy::from_config(config),
         }
     }
@@ -1260,12 +1280,31 @@ pub async fn execute(runtime: &GithubRuntime, op: &Op) -> Result<Outcome, Failur
         return Err(Failure::NotConfigured);
     }
     let token = load_token().await.ok_or(Failure::MissingToken)?;
+    spawn_gh(runtime, op, &token, OPERATION_TIMEOUT).await
+}
+
+/// Everything `execute` does once it holds a credential and a deadline.
+///
+/// Split out for one reason, and it is worth stating rather than leaving as a shape: **the keyring
+/// and the production deadline are the two things a test cannot have.** The Credential Manager is a
+/// real OS store with no fake behind it, and 120 seconds is not a wait a suite can take. With both
+/// passed in, everything below — the argv built and never interpreted, the token by environment
+/// rather than by argument, the terminator, the tree going down on the deadline, the output capped
+/// and redacted, a non-zero exit returned and never retried — is exercised against a stub program.
+///
+/// The four obligations named in `execute`'s own doc live down here, so that is where they are read.
+async fn spawn_gh(
+    runtime: &GithubRuntime,
+    op: &Op,
+    token: &str,
+    deadline: Duration,
+) -> Result<Outcome, Failure> {
     let argv = op.argv();
 
-    let mut command = tokio::process::Command::new("gh");
+    let mut command = tokio::process::Command::new(&runtime.binary);
     command
         .args(&argv)
-        .env("GH_TOKEN", &token)
+        .env("GH_TOKEN", token)
         .env_remove("GITHUB_TOKEN")
         // `gh` opens a prompt or a pager given half a chance, and there is nobody here to answer one.
         .env("GH_PROMPT_DISABLED", "1")
@@ -1305,7 +1344,7 @@ pub async fn execute(runtime: &GithubRuntime, op: &Op) -> Result<Outcome, Failur
         Arc::clone(&stderr_bytes),
     ));
 
-    let status = match tokio::time::timeout(OPERATION_TIMEOUT, child.wait()).await {
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             if let Some(killer) = killer.as_mut() {
@@ -1560,6 +1599,190 @@ mod tests {
 
     fn repo() -> Repo {
         Repo::new("owner/name").expect("owner/name is a repository")
+    }
+
+    /// A pillar the owner switched off, which is what a test uses when it wants `execute` to refuse
+    /// before spawning anything or touching the Credential Manager.
+    fn switched_off() -> GithubRuntime {
+        GithubRuntime {
+            enabled: false,
+            ..GithubRuntime::default()
+        }
+    }
+
+    /// A runtime pointed at a stub program instead of `gh`.
+    ///
+    /// **These spawn `echo`, `false` and `yes` as PROGRAMS**, so on Windows they need Git's
+    /// `usr/bin` on PATH — the same requirement the nine tests in `gate::` and `transcribe::`
+    /// already carry, and the same failure without it: `program not found`, which reads like a
+    /// broken repository and is not.
+    ///
+    /// The stub is what makes the spawn testable at all. `gh` is not on every machine, and the two
+    /// things `execute` needs that a suite cannot have — a real Credential Manager entry and a
+    /// 120-second deadline — are `spawn_gh`'s arguments rather than its constants.
+    fn pointed_at(program: &str) -> GithubRuntime {
+        GithubRuntime {
+            enabled: true,
+            configured: true,
+            binary: program.to_owned(),
+            policy: Policy::empty(),
+        }
+    }
+
+    fn a_comment(body: &str) -> Op {
+        Op::Act(ActOp::PrComment {
+            repo: repo(),
+            number: PrNumber::new("42").expect("42 is a number"),
+            body: Body::new(body).expect("the sample body is valid"),
+        })
+    }
+
+    /// The law, measured instead of argued. `echo` prints the argv it was handed, so what comes back
+    /// says exactly what the operating system was asked to run.
+    ///
+    /// The body carries a `;`, a `$(...)` and an `&&`. If any shell were anywhere on this path they
+    /// would split the command, run `whoami`, or append a second one; what comes back is one
+    /// argument with all three characters still in it.
+    #[tokio::test]
+    async fn the_argv_is_built_and_never_interpreted() {
+        let dangerous = "a; rm -rf / $(whoami) && echo pwned";
+        let outcome = spawn_gh(
+            &pointed_at("echo"),
+            &a_comment(dangerous),
+            "unused",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("echo runs");
+
+        assert_eq!(outcome.exit_code, Some(0));
+        // The whole argv, exactly, on ONE line. `echo` writes its arguments separated by spaces and
+        // nothing else, so this is the operating system reporting back what it was asked to run.
+        //
+        // Written first as `!stdout.contains("pwned")`, which was the wrong assertion and failed:
+        // the body CONTAINS that word, so `echo` prints it and always would. What distinguishes an
+        // interpreted line from a literal one is not the presence of the word — it is that a shell
+        // would have put it on a SECOND line, from a second command. Comparing the whole output
+        // against the whole argv says that and says it exactly.
+        assert_eq!(
+            outcome.stdout.trim_end(),
+            format!("pr comment --repo=owner/name --body={dangerous} -- 42"),
+        );
+    }
+
+    /// **The credential never touches the command line.** A process's argv is readable by any
+    /// process on the machine, so this is the difference between a secret and a broadcast.
+    ///
+    /// The token is deliberately NOT token-shaped: a `ghp_...` would be caught by `redact.rs` on the
+    /// way out, and the test would then pass whether or not it had ever been in the argv. This one
+    /// nothing redacts, so its absence is the argument.
+    #[tokio::test]
+    async fn the_token_goes_by_environment_and_never_as_an_argument() {
+        let token = "plainly-not-token-shaped-9876543210";
+        let outcome = spawn_gh(
+            &pointed_at("echo"),
+            &a_comment("an ordinary comment"),
+            token,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("echo runs");
+
+        assert!(
+            !outcome.stdout.contains(token),
+            "the token reached the argv"
+        );
+        assert!(!outcome.output_tail.contains(token));
+    }
+
+    /// And a credential that DOES come back out of the CLI's own diagnostics is redacted, which is
+    /// the other half and a different claim: the first is about what goes in, this is about what
+    /// comes out.
+    #[tokio::test]
+    async fn a_credential_in_the_output_comes_back_redacted() {
+        let leaked = format!("ghp_{}", "a1B2c3D4e5".repeat(4)); // 40 chars after the prefix
+        let outcome = spawn_gh(
+            &pointed_at("echo"),
+            &a_comment(&leaked),
+            "unused",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("echo runs");
+
+        assert!(!outcome.stdout.contains(&leaked), "{}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("[SECRET:github]"),
+            "{}",
+            outcome.stdout
+        );
+    }
+
+    /// A non-zero exit is an ANSWER and not an error: it comes back with its code for the caller to
+    /// read. Nothing here retries, and `PrComment` is why — a retry of one that failed halfway posts
+    /// it twice, and this module cannot tell halfway from not-at-all.
+    #[tokio::test]
+    async fn a_non_zero_exit_comes_back_rather_than_failing() {
+        let outcome = spawn_gh(
+            &pointed_at("false"),
+            &a_comment("a comment"),
+            "unused",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a failing command still produced a result");
+
+        assert_eq!(outcome.exit_code, Some(1));
+        assert_eq!(outcome.kind, "pr_comment");
+    }
+
+    /// The deadline, against a program that never ends. `yes` repeats its arguments forever, so
+    /// this also drives the output cap: the buffer stops growing and the call still returns.
+    ///
+    /// It is `spawn_gh`'s argument rather than `OPERATION_TIMEOUT` for exactly this reason — the
+    /// production two minutes is not a wait a suite can take, and a deadline that cannot be
+    /// exercised is a deadline nobody has seen fire.
+    ///
+    /// **`Raw` and not `PrList`, and the first attempt is the reason.** `yes pr list --repo=o/r`
+    /// exits 1 with "unknown option" — `yes` runs getopt over its arguments like any coreutil, so a
+    /// stub cannot be handed an argv full of flags and be expected to ignore them. `Raw` puts every
+    /// caller value after `--`, which is the one argv shape in this module that carries no option at
+    /// all, so it is the shape a stub can actually receive.
+    #[tokio::test]
+    async fn a_command_that_never_ends_dies_on_the_deadline() {
+        let refused = spawn_gh(
+            &pointed_at("yes"),
+            &Op::Act(ActOp::Raw {
+                args: vec!["forever".to_owned()],
+            }),
+            "unused",
+            Duration::from_millis(300),
+        )
+        .await;
+
+        assert_eq!(refused, Err(Failure::TimedOut));
+    }
+
+    /// A machine without `gh` is a machine that cannot do this, and that is not a fault. Told
+    /// anything else, somebody goes looking for a broken repository.
+    #[tokio::test]
+    async fn a_binary_that_is_not_there_is_missing_and_not_an_error() {
+        let refused = spawn_gh(
+            &pointed_at("nucleos-gh-that-is-not-installed"),
+            &Op::Read(ReadOp::PrList { repo: repo() }),
+            "unused",
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert_eq!(refused, Err(Failure::MissingCli));
+    }
+
+    /// The override exists for the reason `NUCLEOS_CLAUDE_BIN` exists, and a default that drifted
+    /// from `gh` would be a pillar looking for a program nobody installs.
+    #[test]
+    fn the_default_binary_is_gh() {
+        assert_eq!(GithubRuntime::default().binary, "gh");
     }
 
     /// The partition. `ReadOp` and `ActOp` cover `Op` with no overlap and no hole: an operation in
@@ -1924,12 +2147,8 @@ mod tests {
     /// Credential Manager is touched.
     #[tokio::test]
     async fn a_switched_off_pillar_executes_nothing() {
-        let runtime = GithubRuntime {
-            enabled: false,
-            configured: true,
-            policy: Policy::empty(),
-        };
         let op = Op::Read(ReadOp::PrList { repo: repo() });
+        let runtime = switched_off();
         assert_eq!(execute(&runtime, &op).await, Err(Failure::NotConfigured));
     }
 
@@ -1962,6 +2181,11 @@ mod tests {
                 autonomous_actions: actions.iter().map(|entry| (*entry).to_owned()).collect(),
             },
             true,
+            // Never spawned by the tests that use this: they file a proposal, or run against a
+            // pillar that is switched off. A name nothing installs is the honest value — if one of
+            // them ever does start spawning, it fails as `MissingCli` instead of reaching a real
+            // `gh` and doing something on GitHub from a test run.
+            "nucleos-gh-never-spawned-here".to_owned(),
         )
     }
 
@@ -2071,11 +2295,7 @@ mod tests {
         // Switched off, so `execute` refuses before spawning anything and the test needs no `gh`.
         // What is under test is which BRANCH a read takes, and the refusal proves it took the one
         // that executes rather than the one that files.
-        let runtime = GithubRuntime {
-            enabled: false,
-            configured: true,
-            policy: Policy::empty(),
-        };
+        let runtime = switched_off();
         let op = Op::Read(ReadOp::PrView {
             repo: repo(),
             number: PrNumber::new("42").expect("42 is a number"),
@@ -2116,11 +2336,7 @@ mod tests {
             panic!("it should have been filed");
         };
 
-        let off = GithubRuntime {
-            enabled: false,
-            configured: true,
-            policy: Policy::empty(),
-        };
+        let off = switched_off();
         let ran = approve_proposed_operation(&pool, &off, proposal_id).await;
         assert!(
             matches!(ran, Err(DecisionError::Failed(Failure::NotConfigured))),
