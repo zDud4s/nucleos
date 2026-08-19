@@ -143,6 +143,17 @@ pub struct Said {
     /// Whether the owner typed it. The model answered everything else here.
     pub by_owner: bool,
     pub text: String,
+    /// Whether this is a note ABOUT the conversation rather than a line OF it.
+    ///
+    /// One thing sets it: a subagent worked here. Those rows are dropped -- they are a different
+    /// conversation, with a different model, that the owner never saw and never spoke in, and
+    /// interleaving them would put words in the transcript nobody in it said. Dropping them
+    /// silently was the mistake: what remained was the model saying it would look into something,
+    /// a long nothing, and then a summary of work with no visible cause.
+    ///
+    /// A note is never attributed to anybody, which is why it carries `by_owner: false` and is
+    /// still not the model speaking. The window draws it as a note and not as a bubble.
+    pub aside: bool,
 }
 
 /// The transcript named by an id, matched against the store's own listing.
@@ -330,6 +341,9 @@ fn answered(row: &serde_json::Value) -> Option<String> {
 /// A subagent's rows are dropped here. `isSidechain` marks the exchange a `Task` tool ran inside
 /// this session — a different conversation, with a different model, that the owner never saw and
 /// never spoke in. Interleaving it would put words in the transcript that nobody in it said.
+///
+/// `read_said` counts them as they go past and leaves one note per run. Dropping is right; dropping
+/// without a trace is what left an unexplained silence in the middle of the conversation.
 fn spoken(row: &serde_json::Value) -> Option<Said> {
     if row.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
         return None;
@@ -338,12 +352,27 @@ fn spoken(row: &serde_json::Value) -> Option<Said> {
         "user" => spoken_by_the_owner(row).map(|text| Said {
             by_owner: true,
             text,
+            aside: false,
         }),
         "assistant" => answered(row).map(|text| Said {
             by_owner: false,
             text,
+            aside: false,
         }),
         _ => None,
+    }
+}
+
+/// The note left where a subagent worked.
+///
+/// Worded here rather than in the window because the count is the fact and the sentence is the
+/// smallest honest way to carry it in a field that is text. It is not attributed to anybody: the
+/// window draws an aside as a note, never as something said.
+fn note(rows: usize) -> Said {
+    Said {
+        by_owner: false,
+        text: format!("a subagent worked here — {rows} messages, not shown"),
+        aside: true,
     }
 }
 
@@ -383,6 +412,8 @@ fn read_said(path: &Path) -> Conversation {
     // short is still on screen and still says who said it; a dropped one is a gap, and the gap is
     // what a reader has no way of noticing.
     let mut cut = false;
+    // How many rows of the subagent excursion currently open have gone past.
+    let mut aside: usize = 0;
 
     loop {
         line.clear();
@@ -394,14 +425,38 @@ fn read_said(path: &Path) -> Conversation {
         let Ok(row) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        // A run of them, not each one: a `Task` is a whole conversation, and one note per row of
+        // it would bury the conversation it happened inside. The run is closed by the next thing
+        // actually said, below.
+        if row.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+            aside += 1;
+            continue;
+        }
         let Some(mut item) = spoken(&row) else {
             continue;
         };
+        if aside > 0 {
+            kept.push_back(note(aside));
+            aside = 0;
+            if kept.len() > SAID_SHOWN {
+                kept.pop_front();
+                cut = true;
+            }
+        }
         // Cut before it is kept, so one pasted log cannot be carried around whole only to be
         // thrown away by the byte ceiling below — and so that a message bigger than that ceiling
         // is shown cut rather than dropped, which would leave a gap nothing on screen explains.
         item.text = cut_to(item.text, SAID_BYTES);
         kept.push_back(item);
+        if kept.len() > SAID_SHOWN {
+            kept.pop_front();
+            cut = true;
+        }
+    }
+
+    // An excursion the file ends inside. It happened, and a note is the whole point.
+    if aside > 0 {
+        kept.push_back(note(aside));
         if kept.len() > SAID_SHOWN {
             kept.pop_front();
             cut = true;
@@ -719,11 +774,13 @@ mod tests {
             vec![
                 Said {
                     by_owner: true,
-                    text: "arranja o parser de datas".into()
+                    text: "arranja o parser de datas".into(),
+                    aside: false,
                 },
                 Said {
                     by_owner: false,
-                    text: "está arranjado".into()
+                    text: "está arranjado".into(),
+                    aside: false,
                 },
             ]
         );
@@ -748,6 +805,67 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// A subagent leaves a gap, and the gap is now named.
+    ///
+    /// `isSidechain` marks the exchange a `Task` ran inside this session -- a different
+    /// conversation, with a different model, that the owner never saw and never spoke in. Dropping
+    /// those rows is right, and dropping them SILENTLY was not: what remained was the model saying
+    /// it would look into something, a long nothing, and then a summary of work with no visible
+    /// cause. A subagent doing ten minutes of work is the most interesting thing on the page.
+    #[test]
+    fn a_subagent_leaves_a_note_where_it_worked_rather_than_a_gap() {
+        let store = Store::new();
+        let aside = |text: &str| {
+            serde_json::json!({
+                "type": "assistant", "cwd": "", "isSidechain": true,
+                "message": {"content": [{"type": "text", "text": text}]}
+            })
+        };
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("arranja o parser"),
+                aside("vou ler os ficheiros"),
+                aside("li tres"),
+                aside("encontrei"),
+                replied("arranjado"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert!(read[0].by_owner && !read[0].aside);
+        // One note for the whole run of them, carrying how much happened inside it.
+        assert!(read[1].aside, "the subagent left no note");
+        assert!(read[1].text.contains('3'), "{}", read[1].text);
+        assert_eq!(read[2].text, "arranjado");
+        assert!(!read[2].aside);
+    }
+
+    /// Two separate excursions are two notes, not one. They happened at different points in the
+    /// conversation and the second one is not a continuation of the first.
+    #[test]
+    fn two_subagent_excursions_leave_two_notes() {
+        let store = Store::new();
+        let aside = || {
+            serde_json::json!({
+                "type": "assistant", "cwd": "", "isSidechain": true,
+                "message": {"content": [{"type": "text", "text": "a trabalhar"}]}
+            })
+        };
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[aside(), replied("primeiro"), aside(), replied("segundo")],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.iter().filter(|s| s.aside).count(), 2, "{read:?}");
     }
 
     /// Cutting silently is the failure this reports.
@@ -856,9 +974,18 @@ mod tests {
 
         let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
 
-        assert_eq!(read.len(), 2);
+        // Three lines: what was asked, a note that a subagent worked, and the answer. The note is
+        // not the subagent talking — nothing it said is here, which is the point of the test.
+        assert_eq!(read.len(), 3);
         assert_eq!(read[0].text, "procura o bug");
-        assert!(!read[1].by_owner);
+        assert!(read[1].aside);
+        assert!(!read[2].by_owner);
+        assert!(
+            !read
+                .iter()
+                .any(|line| line.text == "está no parser" && line.aside),
+            "the subagent's own words reached the conversation"
+        );
     }
 
     /// The id arrives from a client here too, so the lookup is the same one `find` uses: a name

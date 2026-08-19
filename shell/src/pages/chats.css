@@ -639,3 +639,17 @@
   color: var(--text);
   font-weight: var(--weight-medium);
 }
+
+/* A note, not a bubble: no speaker, no ground of its own, and quieter than either side. */
+.chats-said-aside {
+  border-left-color: transparent;
+  background: none;
+  padding-top: 0;
+  padding-bottom: 0;
+  font-style: italic;
+}
+
+.chats-said-aside .chats-said-text {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}

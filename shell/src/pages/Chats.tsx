@@ -656,12 +656,22 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
           // nothing here reorders or removes one. A transcript has no id to key by.
           <li
             key={`said-${index}`}
-            className={said.by_owner ? "chats-said-line chats-said-owner" : "chats-said-line"}
+            className={
+              said.aside
+                ? "chats-said-line chats-said-aside"
+                : said.by_owner
+                  ? "chats-said-line chats-said-owner"
+                  : "chats-said-line"
+            }
           >
-            <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+            {/* No speaker on an aside. It is about the conversation, not a line of it, and a
+                "núcleo" label over it would attribute words the model never said. */}
+            {!said.aside && (
+              <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+            )}
             {/* Text, never markup — this is somebody else's file. `Rich` never emits either:
                 it returns data and this page decides what an element is. */}
-            {said.by_owner ? (
+            {said.aside || said.by_owner ? (
               <p className="chats-said-text">{said.text}</p>
             ) : (
               <div className="chats-said-text">

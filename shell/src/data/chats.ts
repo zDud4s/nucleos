@@ -89,6 +89,15 @@ export interface Said {
   /** Whether the owner typed it. The model answered everything else. */
   by_owner: boolean;
   text: string;
+  /**
+   * Whether this is a note ABOUT the conversation rather than a line OF it.
+   *
+   * One thing sets it: a subagent worked here, and its rows were dropped — a
+   * different conversation, with a different model, that the owner never saw.
+   * Drawn as a note and never as a bubble: attributing it to anybody would put
+   * words on somebody who did not say them.
+   */
+  aside: boolean;
 }
 
 /**

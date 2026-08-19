@@ -344,8 +344,8 @@ describe("Chats - a conversation picked up from the editor", () => {
           "aaaa-1111": {
             cut: false,
             said: [
-              { by_owner: true, text: "fix the date parser" },
-              { by_owner: false, text: "it is fixed" },
+              { by_owner: true, text: "fix the date parser", aside: false },
+              { by_owner: false, text: "it is fixed", aside: false },
             ],
           },
         },
@@ -487,8 +487,8 @@ describe("the editor's sessions, and the door to them", () => {
       "aaaa-1111": {
         cut: false,
         said: [
-          { by_owner: true, text: "arranja o parser de datas" },
-          { by_owner: false, text: "arranjado, o mes vinha antes do dia" },
+          { by_owner: true, text: "arranja o parser de datas", aside: false },
+          { by_owner: false, text: "arranjado, o mes vinha antes do dia", aside: false },
         ],
       },
     });
@@ -575,6 +575,36 @@ describe("what a session would be able to do, before it is picked up", () => {
       (call) => String(call[0]) === "/assistant/ide-sessions/aaaa-1111/tools",
     );
     expect(posted).toHaveLength(1);
+  });
+});
+
+/* --------------------------------------------------- a subagent's excursion -- */
+
+describe("where a subagent worked", () => {
+  it("draws the note as a note, and not as something the model said", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", ide_session_id: "aaaa-1111" })], { "c-1": [] }, {
+        said: {
+          "aaaa-1111": {
+            cut: false,
+            said: [
+              { by_owner: true, text: "procura o bug", aside: false },
+              { by_owner: false, text: "a subagent worked here - 12 messages, not shown", aside: true },
+              { by_owner: false, text: "esta no parser", aside: false },
+            ],
+          },
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const note = await screen.findByText(/a subagent worked here/);
+    // No speaker. A note is about the conversation, not a line of it, and labelling it "nucleo"
+    // would attribute to the model words it did not say.
+    const row = note.closest("li") as HTMLElement;
+    expect(within(row).queryByText("núcleo")).toBeNull();
+    expect(row.className).toContain("aside");
   });
 });
 
@@ -687,7 +717,7 @@ describe("what the page is not showing", () => {
   it("says the beginning of a picked-up conversation was left out", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([fromTheEditor()], { "c-1": [] }, {
-        said: { "aaaa-1111": { said: [{ by_owner: true, text: "o meio" }], cut: true } },
+        said: { "aaaa-1111": { said: [{ by_owner: true, text: "o meio", aside: false }], cut: true } },
       }),
     );
 
@@ -699,7 +729,7 @@ describe("what the page is not showing", () => {
   it("says nothing of the sort when the whole thing is on screen", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([fromTheEditor()], { "c-1": [] }, {
-        said: { "aaaa-1111": { said: [{ by_owner: true, text: "tudo" }], cut: false } },
+        said: { "aaaa-1111": { said: [{ by_owner: true, text: "tudo", aside: false }], cut: false } },
       }),
     );
 

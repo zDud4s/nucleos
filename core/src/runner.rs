@@ -559,7 +559,18 @@ const DETAIL_LIMIT: usize = 120;
 /// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
 /// happened to be ordered first — a different answer between two runs of the same call.
 fn detail_of(input: &serde_json::Value) -> Option<String> {
-    const KEYS: [&str; 6] = ["file_path", "path", "command", "pattern", "url", "query"];
+    // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
+    // and a tool that also says where it acted must answer with that instead. A key ordered above
+    // it would make the sentence a model wrote win over the file it opened.
+    const KEYS: [&str; 7] = [
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "url",
+        "query",
+        "description",
+    ];
     let found = KEYS
         .iter()
         .find_map(|key| input.get(key).and_then(|value| value.as_str()))?;
@@ -2655,6 +2666,36 @@ mod tests {
 
         assert_eq!(old.name, "Bash");
         assert!(old.todos.is_empty());
+    }
+
+    /// A subagent's call said `Task` and nothing else, which is the one call where the name alone
+    /// says least: every `Task` looks like every other, and what distinguishes them is the sentence
+    /// the model wrote to describe the work. It carries no path and no command, so the fixed list
+    /// of keys walked straight past it.
+    #[test]
+    fn a_subagent_call_says_what_it_was_sent_to_do() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Task",
+            "input": {"description": "rever o diff", "prompt": "olha para tudo", "subagent_type": "reviewer"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].detail.as_deref(), Some("rever o diff"));
+    }
+
+    /// Ordered, not searched: a tool carrying both keeps the one that says where it acted. The
+    /// description is the last resort, never the preferred answer.
+    #[test]
+    fn a_description_never_wins_over_the_thing_that_was_acted_on() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Edit",
+            "input": {"file_path": "C:/x.rs", "description": "arranjar isto"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
     }
 
     /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.
