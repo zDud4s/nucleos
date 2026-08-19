@@ -1,5 +1,5 @@
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
+use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Serialize;
 
 pub struct NucleosTools {
@@ -125,19 +125,29 @@ struct BrowserSnapshotParams {
     /// Refs stay the same across snapshots, so what you already know stays true.
     #[serde(default)]
     changes_only: Option<bool>,
+    /// Read the page's words on from here, when the last snapshot came back `truncated`. Pass
+    /// the `text_next` it gave you. Scrolling does not help: the cut is a budget on words, not
+    /// a viewport.
+    #[serde(default)]
+    text_from: Option<i64>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct BrowserActParams {
     /// The session id browser_open gave back.
     session_id: i64,
-    /// One of: click, type, scroll.
+    /// One of: click, type, scroll, select, press, back.
     kind: String,
-    /// A ref from the most recent snapshot, such as "e5". Never a CSS selector, and never a ref you
-    /// have not seen in a snapshot of THIS page.
-    #[serde(rename = "ref")]
+    /// A ref from the most recent snapshot, such as "e5". Never a CSS selector, and never a ref
+    /// you have not seen in a snapshot of THIS page. Required for click, type and select. Leave
+    /// it out to scroll the page itself, to send a key wherever the focus already is, or to go
+    /// back.
+    #[serde(rename = "ref", default)]
     element_ref: String,
-    /// The text to type. Only meaningful for kind "type".
+    /// The verb's argument: the characters for "type", the option's visible label for "select",
+    /// the key's name for "press" (Enter, Tab, Escape, Backspace, Delete, Home, End, PageUp,
+    /// PageDown, ArrowUp/Down/Left/Right - no modifiers), the direction for a page "scroll"
+    /// (down, up, top, bottom; down if you say nothing).
     text: Option<String>,
 }
 
@@ -421,7 +431,10 @@ impl NucleosTools {
                        cannot name one. A page from a host this project has not logged into opens \
                        in a throwaway profile that has no cookies and is deleted afterwards; that \
                        is normal and not a failure. The session may come back carrying a refusal, \
-                       which means the page was not loaded at all."
+                       which means the page was not loaded at all. `still_loading` means the \
+                       page had not finished arriving in the time it was given - a snapshot \
+                       then may be short because the page is not all there yet, not because \
+                       the page is empty."
     )]
     async fn browser_open(
         &self,
@@ -443,7 +456,10 @@ impl NucleosTools {
                        element across snapshots of a session, so what you learned stays true — and \
                        `changes_only` gives you only what moved since your last one, plus `gone` \
                        listing refs that left the page. Use it after an action; take a whole one \
-                       when you have lost track. Cheap enough to call between actions, and you \
+                       when you have lost track. `truncated` means the page's WORDS ran out of \
+                       budget, not that you reached the bottom of a window - scrolling will not \
+                       reach the rest; pass the `text_next` you were given back as `text_from`. \
+                       Cheap enough to call between actions, and you \
                        should: a ref only names something a snapshot actually showed you."
     )]
     async fn browser_snapshot(
@@ -451,23 +467,36 @@ impl NucleosTools {
         Parameters(BrowserSnapshotParams {
             session_id,
             changes_only,
+            text_from,
         }): Parameters<BrowserSnapshotParams>,
     ) -> String {
         json_result(
             self.client
-                .browser_snapshot(session_id, changes_only.unwrap_or(false))
+                .browser_snapshot(
+                    session_id,
+                    changes_only.unwrap_or(false),
+                    text_from.unwrap_or(0),
+                )
                 .await,
         )
     }
 
     #[tool(
-        description = "Click, type or scroll on something a snapshot showed you. Actions with a \
-                       consequence outside this machine — submitting a form, any non-GET request, \
-                       a download, a new window — are REFUSED, and a refusal is a normal answer \
-                       carrying the reason, not an error: read it and go a different way rather \
-                       than retrying. If you need to do one of those things, ask a person with \
-                       browser_handoff. The refusal may also arrive on the NEXT action rather than \
-                       this one, because a click and the request it causes are not simultaneous."
+        description = "Do one thing to the page. click, type and select need a ref a \
+                       snapshot showed you; scroll takes one to bring something into view and \
+                       none to move the page; press sends one key to a ref or to whatever has \
+                       focus; back returns to the previous page. type PASTES - it fires no \
+                       keystroke - so a box that submits on Enter needs a press after it. \
+                       select works on a real dropdown and says so when the thing is not one. \
+                       If the answer carries `navigated`, the page changed underneath you and \
+                       EVERY ref you hold is dead: take a fresh snapshot before acting again. \
+                       Actions with a consequence outside this machine - submitting a form, any \
+                       non-GET request, a download, a new window - are REFUSED, and a refusal \
+                       is a normal answer carrying the reason, not an error: read it and go a \
+                       different way rather than retrying. If you need to do one of those \
+                       things, ask a person with browser_handoff. The refusal may also arrive \
+                       on the NEXT action rather than this one, because a click and the request \
+                       it causes are not simultaneous."
     )]
     async fn browser_act(
         &self,
