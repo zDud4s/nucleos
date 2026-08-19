@@ -1,6 +1,7 @@
 package chrome
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -12,10 +13,30 @@ import (
 // refs has to have a session too.
 func snapshotFrom(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 	driver := &Driver{}
-	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
-	collected, truncated := collect(nodes)
+	entry := newTestSession()
+	collected, truncated := collectParts(oneDocument(nodes), browser.SnapshotRequest{})
 	elements, _ := driver.name(entry, collected, false)
-	return elements, entry.refs, truncated
+	return elements, backends(entry.refs), truncated
+}
+
+// oneDocument wraps a node list as a page with nothing framed in it, which is what every test in
+// this file is about — the framing is measured against real Chromium in the gate, because a fake
+// tree cannot have a process boundary in it.
+func oneDocument(nodes []axNode) *tree {
+	return &tree{nodes: nodes, inner: map[int64]*tree{}}
+}
+
+func newTestSession() *session {
+	return &session{refByNode: map[nodeKey]string{}, lastReported: map[string]browser.Element{}}
+}
+
+// backends drops the document a ref belongs to, so these tests can keep saying "e1 is node 11".
+func backends(refs map[string]nodeKey) map[string]int64 {
+	flat := make(map[string]int64, len(refs))
+	for ref, key := range refs {
+		flat[ref] = key.backend
+	}
+	return flat
 }
 
 func text(id, parent, value string) axNode {
@@ -169,9 +190,9 @@ var _ = browser.Element{}
 // handle on an ELEMENT rather than on a position.
 func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 	driver := &Driver{}
-	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	entry := newTestSession()
 	take := func(nodes []axNode) map[string]string {
-		collected, _ := collect(nodes)
+		collected, _ := collectParts(oneDocument(nodes), browser.SnapshotRequest{})
 		elements, _ := driver.name(entry, collected, false)
 		byName := map[string]string{}
 		for _, element := range elements {
@@ -200,7 +221,7 @@ func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 	if after["Undo"] == before["Save"] || after["Undo"] == before["Cancel"] {
 		t.Fatalf("a new element took a ref that already meant something: %v", after)
 	}
-	if entry.refs[after["Save"]] != 10 {
+	if entry.refs[after["Save"]].backend != 10 {
 		t.Errorf("the ref no longer resolves to its node: %v", entry.refs)
 	}
 }
@@ -214,9 +235,9 @@ func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 // agent goes on believing in a button that is no longer there.
 func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 	driver := &Driver{}
-	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	entry := newTestSession()
 	take := func(nodes []axNode, changesOnly bool) ([]browser.Element, []string) {
-		collected, _ := collect(nodes)
+		collected, _ := collectParts(oneDocument(nodes), browser.SnapshotRequest{})
 		return driver.name(entry, collected, changesOnly)
 	}
 
@@ -255,5 +276,279 @@ func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 	again, goneAgain := take(changed, true)
 	if len(again) != 0 || len(goneAgain) != 0 {
 		t.Errorf("nothing moved and something was reported: %+v %v", again, goneAgain)
+	}
+}
+
+// sliceFrom is snapshotFrom with the prose cursor, for the tests that are about continuation.
+// collectParts keeps the older tests reading the way they did, before one snapshot had two budgets.
+func collectParts(root *tree, req browser.SnapshotRequest) ([]found, bool) {
+	read := collect(root, req)
+	return read.elements, read.truncated
+}
+
+func sliceFrom(nodes []axNode, textFrom int) ([]browser.Element, bool, int) {
+	read := collect(oneDocument(nodes), browser.SnapshotRequest{TextFrom: textFrom})
+	elements, _ := (&Driver{}).name(newTestSession(), read.elements, false)
+	return elements, read.truncated, read.textNext
+}
+
+// controlsFrom is sliceFrom for the other budget.
+func controlsFrom(nodes []axNode, from int) ([]browser.Element, bool, int) {
+	read := collect(oneDocument(nodes), browser.SnapshotRequest{ControlsFrom: from})
+	elements, _ := (&Driver{}).name(newTestSession(), read.elements, false)
+	return elements, read.truncated, read.controlsNext
+}
+
+// paragraphs builds a page of numbered blocks, each big enough that a handful fills the budget.
+func paragraphs(count, size int) []axNode {
+	nodes := make([]axNode, 0, count)
+	for i := 0; i < count; i++ {
+		body := fmt.Sprintf("[%02d]%s", i, strings.Repeat("x", size-4))
+		nodes = append(nodes, text(fmt.Sprintf("p%d", i), "", body))
+	}
+	return nodes
+}
+
+func proseOf(elements []browser.Element) string {
+	var all strings.Builder
+	for _, element := range elements {
+		if element.Role == "text" {
+			all.WriteString(element.Name)
+		}
+	}
+	return all.String()
+}
+
+// TestACutPageCanBeReadOnFromWhereItStopped.
+//
+// Truncation without a continuation is a dead end. The budget is not about the viewport, so no
+// amount of scrolling moves it: the agent is told the page goes on and has no verb that reaches the
+// rest, which is a worse position than not being told at all — it knows something is there and
+// cannot get it.
+func TestACutPageCanBeReadOnFromWhereItStopped(t *testing.T) {
+	nodes := paragraphs(45, 1000)
+
+	first, truncated, next := sliceFrom(nodes, 0)
+	if !truncated {
+		t.Fatal("45000 characters against a 20000 budget must report truncation")
+	}
+	if next <= 0 {
+		t.Fatal("a cut snapshot must say where to read on from")
+	}
+	if !strings.Contains(proseOf(first), "[00]") {
+		t.Error("the first slice does not start at the beginning")
+	}
+
+	second, stillMore, _ := sliceFrom(nodes, next)
+	prose := proseOf(second)
+	if strings.Contains(prose, "[00]") {
+		t.Error("the second slice repeated what the first already delivered")
+	}
+	if !strings.Contains(prose, "[20]") {
+		t.Errorf("the second slice does not carry on where the first stopped; it had: %.40q", prose)
+	}
+	if !stillMore {
+		t.Error("forty-five blocks do not fit in two slices of twenty; the second must still offer more")
+	}
+}
+
+// TestTheCutIsAPrefixAndNotASieve.
+//
+// Skip-and-continue was the shape this had: a paragraph too big for what was left of the budget was
+// dropped, and a shorter one further down was let through. The result is a page nobody wrote, and
+// nothing in the snapshot distinguishes it from the page.
+func TestTheCutIsAPrefixAndNotASieve(t *testing.T) {
+	nodes := append(paragraphs(21, 1000), text("short", "", "[99]tail"))
+
+	elements, truncated, _ := sliceFrom(nodes, 0)
+	if !truncated {
+		t.Fatal("this page is over the budget")
+	}
+	if strings.Contains(proseOf(elements), "[99]") {
+		t.Error("a short block from past the cut was let through while a long one before it was dropped")
+	}
+}
+
+// TestAWholePageOffersNoContinuation.
+//
+// The offer is the presence of the offset. A page that fits must not carry one, or an agent that
+// follows it politely reads the same page twice.
+func TestAWholePageOffersNoContinuation(t *testing.T) {
+	elements, truncated, next := sliceFrom(paragraphs(3, 100), 0)
+	if truncated || next != 0 {
+		t.Errorf("a page that fits was reported as cut: truncated=%v next=%d", truncated, next)
+	}
+	if len(elements) != 3 {
+		t.Errorf("expected the whole page: %+v", elements)
+	}
+}
+
+// links builds a page of numbered links, which is what a directory listing is.
+func links(count int) []axNode {
+	nodes := make([]axNode, 0, count)
+	for i := 0; i < count; i++ {
+		nodes = append(nodes, axNode{
+			NodeID:           fmt.Sprintf("l%d", i),
+			Role:             axValue{Value: "link"},
+			Name:             axValue{Value: fmt.Sprintf("item %03d", i)},
+			BackendDOMNodeID: int64(1000 + i),
+		})
+	}
+	return nodes
+}
+
+func controlsIn(elements []browser.Element) []browser.Element {
+	var out []browser.Element
+	for _, element := range elements {
+		if element.Ref != "" {
+			out = append(out, element)
+		}
+	}
+	return out
+}
+
+// TestTheActionableSetHasABoundToo.
+//
+// "Controls are never dropped" was written against prose crowding out a button, and for that it is
+// right. On a directory listing with two thousand links it meant a snapshot with NO bound at all,
+// reported as `truncated: false` because the prose had fit — and the failure did not arrive as an
+// error, it arrived as a turn with no room left to think in.
+func TestTheActionableSetHasABoundToo(t *testing.T) {
+	elements, truncated, next := controlsFrom(links(500), 0)
+
+	if !truncated {
+		t.Fatal("five hundred links came back claiming to be the whole page")
+	}
+	if got := len(controlsIn(elements)); got != controlBudget {
+		t.Errorf("carried %d controls against a budget of %d", got, controlBudget)
+	}
+	if next != controlBudget {
+		t.Errorf("the cursor must point at the first control not delivered, got %d", next)
+	}
+}
+
+// TestTheActionableSetCanBeReadOnFrom.
+func TestTheActionableSetCanBeReadOnFrom(t *testing.T) {
+	nodes := links(500)
+
+	first, _, next := controlsFrom(nodes, 0)
+	second, stillMore, _ := controlsFrom(nodes, next)
+
+	if stillMore {
+		t.Error("five hundred links fit in two slices of three hundred")
+	}
+	names := map[string]bool{}
+	for _, element := range controlsIn(first) {
+		names[element.Name] = true
+	}
+	for _, element := range controlsIn(second) {
+		if names[element.Name] {
+			t.Fatalf("the second slice repeated %q from the first", element.Name)
+		}
+	}
+	if got := len(controlsIn(first)) + len(controlsIn(second)); got != 500 {
+		t.Errorf("the two slices together are not the page: %d links", got)
+	}
+}
+
+// TestALongArticleStillKeepsItsButtons.
+//
+// The rule the budgets were split to preserve. Bounding prose and controls together would mean a
+// page of text costing the agent the one thing it can act on.
+func TestALongArticleStillKeepsItsButtons(t *testing.T) {
+	nodes := append(paragraphs(40, 1000), links(5)...)
+
+	elements, truncated, _ := sliceFrom(nodes, 0)
+
+	if !truncated {
+		t.Fatal("forty thousand characters is over the budget")
+	}
+	if got := len(controlsIn(elements)); got != 5 {
+		t.Errorf("prose crowded out the controls after all: %d of 5", got)
+	}
+}
+
+// cellOf builds one table cell holding some text.
+func cellOf(id, role, body string) []axNode {
+	return []axNode{
+		{NodeID: id, Role: axValue{Value: role}, ChildIDs: []string{id + "t"}},
+		text(id+"t", id, body),
+	}
+}
+
+func tableOf() []axNode {
+	nodes := []axNode{
+		{NodeID: "tbl", Role: axValue{Value: "table"}, ChildIDs: []string{"r1", "r2"}},
+		{NodeID: "r1", Role: axValue{Value: "row"}, ChildIDs: []string{"h1", "h2"}},
+		{NodeID: "r2", Role: axValue{Value: "row"}, ChildIDs: []string{"c1", "c2"}},
+	}
+	nodes = append(nodes, cellOf("h1", "columnheader", "Quarter")...)
+	nodes = append(nodes, cellOf("h2", "columnheader", "Revenue")...)
+	nodes = append(nodes, cellOf("c1", "cell", "Q1")...)
+	nodes = append(nodes, cellOf("c2", "cell", "-11%")...)
+	return nodes
+}
+
+// TestATableComesBackAsRowsAndNotAsLooseCells.
+//
+// The accessibility tree HAS the grid. Dropping the table roles at the door turned it into a stream
+// of numbers in reading order — the agent could read every figure and could not say which column
+// any of them was in, which for a table is the whole of the information.
+func TestATableComesBackAsRowsAndNotAsLooseCells(t *testing.T) {
+	elements, _, _ := sliceFrom(tableOf(), 0)
+
+	var rows []string
+	for _, element := range elements {
+		if element.Role == "row" {
+			rows = append(rows, element.Name)
+		}
+		if element.Role == "text" {
+			t.Errorf("a cell came back loose, outside its row: %q", element.Name)
+		}
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected a header row and a body row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0] != "Quarter | Revenue" {
+		t.Errorf("the headers lost their shape: %q", rows[0])
+	}
+	if rows[1] != "Q1 | -11%" {
+		t.Errorf("the row lost its shape: %q", rows[1])
+	}
+}
+
+// TestALinkInACellKeepsItsRefAndItsPlaceInTheRow.
+//
+// The one place this file says something twice on purpose. The alternative is a row reading
+// " | 3 days ago", with a hole where the link was, and a hole in a table is worse than a word
+// repeated — the agent cannot tell an empty first column from a column it was not shown.
+func TestALinkInACellKeepsItsRefAndItsPlaceInTheRow(t *testing.T) {
+	nodes := []axNode{
+		{NodeID: "tbl", Role: axValue{Value: "table"}, ChildIDs: []string{"r1"}},
+		{NodeID: "r1", Role: axValue{Value: "row"}, ChildIDs: []string{"c1", "c2"}},
+		{NodeID: "c1", Role: axValue{Value: "cell"}, ChildIDs: []string{"a"}},
+		{NodeID: "a", Role: axValue{Value: "link"}, Name: axValue{Value: "Getting started"},
+			ChildIDs: []string{"at"}, BackendDOMNodeID: 77},
+		text("at", "a", "Getting started"),
+	}
+	nodes = append(nodes, cellOf("c2", "cell", "3 days ago")...)
+
+	elements, _, _ := sliceFrom(nodes, 0)
+
+	var row string
+	var linkRef string
+	for _, element := range elements {
+		if element.Role == "row" {
+			row = element.Name
+		}
+		if element.Role == "link" {
+			linkRef = element.Ref
+		}
+	}
+	if row != "Getting started | 3 days ago" {
+		t.Errorf("the row has a hole where the link is: %q", row)
+	}
+	if linkRef == "" {
+		t.Error("the link inside the cell lost its ref, so the table can be read and not used")
 	}
 }

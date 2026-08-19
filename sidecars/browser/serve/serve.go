@@ -84,6 +84,9 @@ type SessionRequest struct {
 	// track of what it saw last gets a reading it can act on rather than a difference against
 	// something it no longer remembers.
 	ChangesOnly bool `json:"changes_only,omitempty"`
+	// TextFrom resumes a page's prose where the last snapshot stopped. Absent means the beginning,
+	// which is where an agent that has not been cut off yet always is.
+	TextFrom int `json:"text_from,omitempty"`
 }
 
 // ActRequest is one action against a session.
@@ -139,7 +142,10 @@ func snapshotHandler(driver browser.Driver) http.HandlerFunc {
 			http.Error(w, "session_id is required", http.StatusBadRequest)
 			return
 		}
-		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID), request.ChangesOnly)
+		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID), browser.SnapshotRequest{
+			ChangesOnly: request.ChangesOnly,
+			TextFrom:    request.TextFrom,
+		})
 		if err != nil {
 			writeDriverError(w, "snapshot", err)
 			return
@@ -162,7 +168,7 @@ func actHandler(driver browser.Driver) http.HandlerFunc {
 		if !ok {
 			// A closed vocabulary, refused at the door. An unknown verb must not reach a driver
 			// that might interpret it generously (spec §6.2: consequence-free in v1).
-			http.Error(w, "unknown action kind: expected click, type or scroll", http.StatusBadRequest)
+			http.Error(w, "unknown action kind: expected click, type, scroll, select, press, back or goto", http.StatusBadRequest)
 			return
 		}
 		result, err := driver.Act(r.Context(), browser.SessionID(request.SessionID), browser.Action{
@@ -340,13 +346,10 @@ func forgetHandler(profiles browser.Profiles) http.HandlerFunc {
 }
 
 func parseKind(raw string) (browser.ActionKind, bool) {
-	switch browser.ActionKind(raw) {
-	case browser.ActionClick:
-		return browser.ActionClick, true
-	case browser.ActionType:
-		return browser.ActionType, true
-	case browser.ActionScroll:
-		return browser.ActionScroll, true
+	switch kind := browser.ActionKind(raw); kind {
+	case browser.ActionClick, browser.ActionType, browser.ActionScroll,
+		browser.ActionSelect, browser.ActionPress, browser.ActionBack, browser.ActionGoto:
+		return kind, true
 	default:
 		return "", false
 	}

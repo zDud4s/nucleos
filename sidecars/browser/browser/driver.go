@@ -88,6 +88,11 @@ type Session struct {
 	FinalURL     string    `json:"final_url"`
 	Title        string    `json:"title"`
 	Refusal      *Refusal  `json:"refusal,omitempty"`
+	// StillLoading says the page had not finished arriving when this answer was produced. Opening
+	// waits for it — the alternative was a first snapshot that raced the load and read a
+	// script-rendered page as an empty one — but the wait is bounded, and when the bound is reached
+	// the agent is TOLD rather than handed a silence that looks like readiness.
+	StillLoading bool `json:"still_loading,omitempty"`
 }
 
 // Element is one thing on the page the agent may refer to.
@@ -116,6 +121,27 @@ type Element struct {
 	State []string `json:"state,omitempty"`
 }
 
+// SnapshotRequest is what to read and how much of it.
+//
+// A struct rather than a growing list of parameters, because every field here is an ANSWER to a
+// question about cost: a reading of a whole long page is correct and can be most of a turn, so the
+// caller gets to say which part of it it needs.
+type SnapshotRequest struct {
+	// ChangesOnly asks for what moved since the last snapshot of this session instead of the whole
+	// page. The same reading, filtered — never a different one.
+	ChangesOnly bool
+	// TextFrom resumes prose at a character offset, which is what makes truncation survivable. A
+	// snapshot that says it was cut and offers no way to see the rest is a dead end: the agent knows
+	// something is there and has no verb that reaches it, because the budget is not about the
+	// viewport and no amount of scrolling moves it. Pass back the TextNext of the previous snapshot.
+	TextFrom int
+	// ControlsFrom resumes the actionable elements, counted rather than measured. The same idea as
+	// TextFrom and a separate cursor on purpose: prose and controls fail differently, and bounding
+	// them together would mean a long article costing a page its buttons — which is the rule this
+	// whole design started from.
+	ControlsFrom int
+}
+
 // Snapshot is the accessibility view of a page: what is there, what it is called, and what it says.
 type Snapshot struct {
 	SessionID SessionID `json:"session_id"`
@@ -126,6 +152,17 @@ type Snapshot struct {
 	// Said rather than implied: an agent that cannot tell a short page from a cut-off one will
 	// conclude the rest does not exist, which is a worse failure than being told to scroll.
 	Truncated bool `json:"truncated,omitempty"`
+	// TextNext is where the prose stopped, and is what to pass as TextFrom to read on. Set only when
+	// Truncated is, so its presence is the offer and its absence means there is nothing left.
+	TextNext int `json:"text_next,omitempty"`
+	// ControlsNext is the same offer for the actionable elements.
+	//
+	// It exists because "controls are never dropped" stopped being a kindness at some size. The rule
+	// was written against prose crowding out a button, and it is right for that; on a directory
+	// listing with two thousand links it meant a snapshot with no bound at all, reported as
+	// untruncated because the prose had fit. The failure did not surface as an error — it surfaced
+	// as a turn with no room left to think in.
+	ControlsNext int `json:"controls_next,omitempty"`
 	// Gone lists refs that were in the previous snapshot and are not on the page now. Only filled on
 	// a changes-only read, where it is the half that omission cannot express: a full snapshot says
 	// an element is gone by not containing it, and a partial one cannot say anything by silence.
@@ -144,13 +181,45 @@ const (
 	ActionClick  ActionKind = "click"
 	ActionType   ActionKind = "type"
 	ActionScroll ActionKind = "scroll"
+	// ActionSelect chooses an option in a dropdown. Its absence was not a missing convenience: the
+	// snapshot hands out refs for `combobox` and `listbox`, so the agent was being shown a control
+	// and given no verb that operates it — an invitation to click at it and to read whatever
+	// happened next as success.
+	ActionSelect ActionKind = "select"
+	// ActionPress sends one key to whatever has focus. Typing uses Input.insertText, which is what a
+	// paste does and therefore fires no keydown at all: a search box that submits on Enter could not
+	// be submitted, and a field that watches keystrokes saw none. The key set is closed and carries
+	// no modifiers — see the driver — because Ctrl+S is a download and Ctrl+P is a dialog, and
+	// neither is consequence-free.
+	ActionPress ActionKind = "press"
+	// ActionBack returns to the previous page. Without it an agent that followed the wrong link
+	// could only re-open the url it wanted, which it may not have, and which pays the admission
+	// check again. Back can only reach a document this session already loaded, and the fence already
+	// admitted every one of those.
+	ActionBack ActionKind = "back"
+	// ActionGoto follows a url in the session that is already open. Its absence was visible only
+	// once back existed: there was a way home and no way onward, so an agent that read an address in
+	// the page's own words — not a link, an address — had to open a SECOND session for it, paying a
+	// fresh profile decision and losing the history it would need to come back.
+	//
+	// It grants nothing a link does not. The url is a navigation like any other, so the fence's
+	// allowlist answers for it exactly as it answers for a link the page itself offers, and the
+	// scheme is checked here as well because file: and data: are not requests the interception sees.
+	ActionGoto ActionKind = "goto"
 )
 
 // Action is one attempt to touch the page.
 type Action struct {
 	Kind ActionKind `json:"kind"`
-	Ref  string     `json:"ref"`
-	Text string     `json:"text,omitempty"`
+	// Ref names the element, and is required for click, type and select. Scroll takes one to bring
+	// an element into view and takes none to move the page itself; press takes one to focus before
+	// the key and takes none to send it wherever focus already is; back never takes one.
+	Ref string `json:"ref"`
+	// Text is the verb's argument: the characters for type, the option's label for select, the key's
+	// name for press, the direction for a page scroll, and the url for goto. One field rather than
+	// five, because a verb has at most one and naming them apart would only spread the same value
+	// over a wider shape.
+	Text string `json:"text,omitempty"`
 }
 
 // Outcome is the shape of an ActResult.
@@ -161,10 +230,13 @@ const (
 	OutcomeRefused Outcome = "refused"
 )
 
-// Consequence names WHY the fence refused. It is a closed vocabulary rather than a message because
-// the núcleo has to be able to tell these apart without reading prose, and because the agent is
-// shown the reason — a string assembled at the refusal site would drift into something a page could
-// influence.
+// Consequence names WHY an act did not happen. Mostly that is the fence; two of them are not, and
+// they are here rather than expressed as errors because they are the same KIND of answer — the act
+// did not occur, the agent is told plainly why, and it can carry on.
+//
+// It is a closed vocabulary rather than a message because the núcleo has to be able to tell these
+// apart without reading prose, and because the agent is shown the reason — a string assembled at the
+// refusal site would drift into something a page could influence.
 type Consequence string
 
 const (
@@ -199,6 +271,14 @@ const (
 	// --proxy-bypass-list=<-loopback> so that the fence sees loopback at all rather than letting the
 	// page reach it directly.
 	ConsequenceLoopback Consequence = "loopback"
+	// ConsequenceStaleRef — the ref names nothing in the current snapshot. Not a fence refusal at
+	// all, and it used to be reported as off-allowlist, which told the agent a security decision had
+	// been taken about a page when what had actually happened was that the page moved. The right
+	// next move is a fresh snapshot, and the two answers point in opposite directions.
+	ConsequenceStaleRef Consequence = "stale-ref"
+	// ConsequenceNotApplicable — the verb does not apply here: a select on something that is not a
+	// dropdown, a key outside the closed set, a back with nothing behind it. Also not the fence.
+	ConsequenceNotApplicable Consequence = "not-applicable"
 )
 
 // Refusal is a refusal by the fence: a named consequence, and a detail for the human reading a log.
@@ -212,6 +292,17 @@ type Refusal struct {
 type ActResult struct {
 	Outcome Outcome  `json:"outcome"`
 	Refusal *Refusal `json:"refusal,omitempty"`
+	// Navigated says the act replaced the document, so every ref the agent is holding names
+	// something that is gone. Said rather than left to be discovered: an act reported only as "done"
+	// after a click that changed the page leaves the agent operating a page it has never read, and
+	// the ref it acts on next resolves against a document that no longer exists.
+	Navigated bool `json:"navigated,omitempty"`
+	// URL is where the page ended up, filled only when the act moved it. Only then, because that is
+	// the only moment it is NEWS — the rest of the time a snapshot already carries it, and paying a
+	// round trip per act to repeat something unchanged is how a cheap verb stops being cheap.
+	URL string `json:"url,omitempty"`
+	// StillLoading has the same meaning as on Session, for the page this act navigated to.
+	StillLoading bool `json:"still_loading,omitempty"`
 }
 
 // Valid reports whether an ActResult is internally consistent. A driver that returns a refusal with
@@ -279,10 +370,9 @@ type Driver interface {
 	// Open starts a session. It MUST fail with ErrFenceNotAttached rather than navigate without
 	// the fence in place, in agent mode.
 	Open(ctx context.Context, req OpenRequest) (Session, error)
-	// Snapshot returns the accessibility view. Cheap enough to call between every action.
-	// Snapshot reads the page. `changesOnly` asks for what moved since the previous snapshot of this
-	// session instead of the whole page — the same reading, filtered, never a different one.
-	Snapshot(ctx context.Context, id SessionID, changesOnly bool) (Snapshot, error)
+	// Snapshot returns the accessibility view. Cheap enough to call between every action, and the
+	// request says which part of it is wanted — see SnapshotRequest.
+	Snapshot(ctx context.Context, id SessionID, req SnapshotRequest) (Snapshot, error)
 	// Act performs one action. A fence refusal is a value, not an error.
 	Act(ctx context.Context, id SessionID, action Action) (ActResult, error)
 	// Screenshot returns PNG bytes, for a person to look at.

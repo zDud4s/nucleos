@@ -25,6 +25,33 @@ export type Brain = "cloud" | "local";
 export interface ToolCall {
   name: string;
   detail: string | null;
+  /**
+   * The plan this call wrote, when it was one that writes plans. Empty for every
+   * other tool, and empty on any turn recorded before the daemon carried them.
+   */
+  todos: Todo[];
+}
+
+/** One line of a plan, as the daemon read it out of a `TodoWrite`. */
+export interface Todo {
+  text: string;
+  /** The CLI's own words: `pending`, `in_progress`, `completed`. */
+  status: string;
+}
+
+/**
+ * The plan a turn ended with, or nothing.
+ *
+ * The LAST one, because a plan is rewritten as it is worked through: every `TodoWrite` in a turn is
+ * the same list at a different moment, and drawing all of them would be the same three items four
+ * times over with only the ticks moving.
+ */
+export function planOf(did: ToolCall[]): Todo[] {
+  for (let at = did.length - 1; at >= 0; at -= 1) {
+    const call = did[at];
+    if (call.todos !== undefined && call.todos.length > 0) return call.todos;
+  }
+  return [];
 }
 
 export interface AssistantTurnRow {
@@ -38,6 +65,13 @@ export interface AssistantTurnRow {
   answered_by: Brain | null;
   session_id: string | null;
   created_at: string;
+  /**
+   * How much context the turn ran with, an absolute token count. Null on a turn
+   * whose stream never reported one, and on every turn from before the column.
+   */
+  context_fill: number | null;
+  /** The count past which the daemon stops resuming. The same on every row. */
+  context_rotates_at: number;
   /**
    * What the turn ran, oldest first. Empty on a turn that acted on nothing AND
    * on a turn from before the daemon recorded this — the daemon collapses the
@@ -66,6 +100,10 @@ export interface Turn {
   sessionId: string | null;
   /** What the turn ran. See `AssistantTurnRow.did`. */
   did: ToolCall[];
+  /** See `AssistantTurnRow.context_fill`. */
+  contextFill: number | null;
+  /** See `AssistantTurnRow.context_rotates_at`. */
+  rotatesAt: number | null;
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -108,6 +146,10 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     // Defaulted rather than trusted: a daemon older than the column sends no such key, and a
     // conversation losing one line is a better answer to that than a page that will not draw.
     did: row.did ?? [],
+    contextFill: row.context_fill ?? null,
+    // Null, not a number this side made up. A daemon that does not send the ceiling is one whose
+    // ceiling this window does not know, and guessing it would draw a proportion out of nothing.
+    rotatesAt: row.context_rotates_at ?? null,
   };
 }
 

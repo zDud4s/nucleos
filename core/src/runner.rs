@@ -16,6 +16,58 @@ pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// from an ordinary CLI failure without treating already-started work as a retryable launch error.
 pub const PROGRESS_TIMEOUT_EXIT_CODE: i32 = i32::MIN;
 
+/// Internal outcome code for a process terminated for taking more turns than it was allowed.
+///
+/// Its own value beside the deadline above, and for the same reason that one exists: the two are
+/// different diagnoses. A run that went silent stopped producing; a run that hit this was producing
+/// the whole time and getting nowhere, which is the failure a wall clock is worst at catching —
+/// a fast model in a tight loop reaches neither the clock nor the job's money check.
+pub const TURN_CEILING_EXIT_CODE: i32 = i32::MIN + 1;
+
+/// How many model responses one run may take before the daemon stops it.
+///
+/// **Generous on purpose, and the number has a basis.** The ablation in `.ai/eval/ABLATION.md`
+/// measured 19 real cells of this repository's own work; the largest legitimate run took 94 turns
+/// (T3xH1). A ceiling below that would stop work that was going to finish, which is the way a brake
+/// like this gets switched off for good. Twice the largest thing ever measured is a limit only a
+/// run that is not converging can reach.
+///
+/// A ceiling, not a target: nothing is expected to approach it, and a run that does is a result
+/// worth reading rather than a quota to spend.
+pub const DEFAULT_MAX_TURNS: i64 = 200;
+
+/// PURE: how many model responses this stream has carried, folded one line at a time.
+///
+/// One function for both CLIs. Claude says `assistant` once per completed model message; `codex
+/// exec` says `turn.completed`. Neither name appears in the other's stream, so a single fold cannot
+/// double-count — and the alternative, a counter per CLI, is how a ceiling ends up enforced on one
+/// path and quietly absent on the other, which is worse than no ceiling because somebody will
+/// believe it is there.
+///
+/// Counted from the transcript rather than asked of the CLI: measured against CLI 2.1.198, there is
+/// no `--max-turns` flag to delegate this to. `--max-budget-usd` exists and is a different brake —
+/// money, which the job already has, rather than motion, which nothing had.
+pub(crate) fn turns_from_line(line: &str, current: i64) -> i64 {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return current;
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") | Some("turn.completed") => current.saturating_add(1),
+        _ => current,
+    }
+}
+
+/// PURE: whether a run has used up the turns it was given.
+///
+/// `None` is no ceiling and stays no ceiling — every caller that has not chosen one keeps exactly
+/// today's behaviour. A ceiling of zero or less is read as no ceiling too, and that is a decision
+/// rather than an oversight: a misconfiguration that silently stops every run before its first
+/// answer is worse than one that silently disables the brake, because the first looks like the
+/// daemon being broken and the second looks like the daemon it already was.
+pub(crate) fn over_turn_ceiling(turns: i64, ceiling: Option<i64>) -> bool {
+    matches!(ceiling, Some(ceiling) if ceiling > 0 && turns >= ceiling)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunUsage {
     pub input_tokens: Option<i64>,
@@ -80,6 +132,16 @@ pub struct RunRequest {
     pub mcp_config: Option<PathBuf>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
+    /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
+    ///
+    /// The brake the daemon did not have. A run had a wall clock and its job had a money ceiling
+    /// checked BETWEEN nodes — so a single node looping quickly reached neither: fast turns cost
+    /// little each and the clock is generous precisely because real work is slow. This counts the
+    /// thing that actually runs away.
+    ///
+    /// Enforced by counting the transcript, in both runner bodies, because the CLI has no flag for
+    /// it (2.1.198).
+    pub max_turns: Option<i64>,
     pub session_id: Option<String>,
     pub fork_session: bool,
     pub include_partial_messages: bool,
@@ -431,6 +493,61 @@ pub struct ToolCall {
     /// A path, a command, a pattern, a URL — deliberately not the whole input. A `Write` carries
     /// the file it is writing, and a chat that printed that argument would print the file.
     pub detail: Option<String>,
+    /// The plan this call wrote, when the call was one that writes plans. Empty for every other.
+    ///
+    /// The exception to "the one argument": a `TodoWrite` carries no path and no command, so
+    /// `detail_of` finds nothing and the call used to arrive as a bare name with nothing beside it
+    /// — while what it actually carried was the whole plan. A model working through a list is the
+    /// shape of most real work, and none of it reached the page.
+    ///
+    /// Defaulted on the way in. `tools_used` is stored JSON and every turn already recorded is a
+    /// row without this field; a row that predates the plan reads as a call that wrote none, which
+    /// is exactly what it was.
+    #[serde(default)]
+    pub todos: Vec<Todo>,
+}
+
+/// One line of a plan.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Todo {
+    pub text: String,
+    /// As the CLI words it: `pending`, `in_progress`, `completed`. Kept as it arrives rather than
+    /// mapped to something of this daemon's own — a fourth state invented upstream would otherwise
+    /// silently become one of the three here.
+    pub status: String,
+}
+
+/// The plan inside a `TodoWrite` input, or nothing at all for every other tool.
+///
+/// Anything shaped wrong is skipped rather than guessed at: a plan drawn from a half-understood
+/// input is a list of work nobody planned.
+fn plan_of(name: &str, input: Option<&serde_json::Value>) -> Vec<Todo> {
+    if name != "TodoWrite" {
+        return Vec::new();
+    }
+    let Some(items) = input
+        .and_then(|input| input.get("todos"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("content").and_then(|v| v.as_str())?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(Todo {
+                text: cut_detail(text),
+                status: item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending")
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The longest detail kept. A command line can be a heredoc.
@@ -442,7 +559,18 @@ const DETAIL_LIMIT: usize = 120;
 /// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
 /// happened to be ordered first — a different answer between two runs of the same call.
 fn detail_of(input: &serde_json::Value) -> Option<String> {
-    const KEYS: [&str; 6] = ["file_path", "path", "command", "pattern", "url", "query"];
+    // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
+    // and a tool that also says where it acted must answer with that instead. A key ordered above
+    // it would make the sentence a model wrote win over the file it opened.
+    const KEYS: [&str; 7] = [
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "url",
+        "query",
+        "description",
+    ];
     let found = KEYS
         .iter()
         .find_map(|key| input.get(key).and_then(|value| value.as_str()))?;
@@ -450,11 +578,17 @@ fn detail_of(input: &serde_json::Value) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let mut detail: String = trimmed.chars().take(DETAIL_LIMIT).collect();
-    if trimmed.chars().count() > DETAIL_LIMIT {
-        detail.push('…');
+    Some(cut_detail(trimmed))
+}
+
+/// The same ceiling for a detail and for a line of a plan: both are one line beside a tool's name,
+/// and a plan item can be a paragraph somebody pasted.
+fn cut_detail(text: &str) -> String {
+    let mut out: String = text.chars().take(DETAIL_LIMIT).collect();
+    if text.chars().count() > DETAIL_LIMIT {
+        out.push('…');
     }
-    Some(detail)
+    out
 }
 
 /// Distils a stream still being written into the two things worth showing while it is.
@@ -520,6 +654,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                     did.push(ToolCall {
                         name: name.to_string(),
                         detail: block.get("input").and_then(detail_of),
+                        todos: plan_of(name, block.get("input")),
                     });
                     doing = Some(name.to_string());
                 }
@@ -1343,6 +1478,8 @@ impl CommandRunner for ClaudeCliRunner {
         let mut policy_violation: Option<String> = None;
         let mut init_seen = false;
         let mut progress_timeout_elapsed: Option<Duration> = None;
+        let mut turns: i64 = 0;
+        let mut turns_exceeded: Option<i64> = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -1375,6 +1512,14 @@ impl CommandRunner for ClaudeCliRunner {
             running_context_fill = context_fill_from_line(&line, running_context_fill);
             if let Ok(mut shared) = context_fill.lock() {
                 *shared = running_context_fill;
+            }
+            // After the line is accumulated and mirrored, never before: a run stopped here still has
+            // to leave the transcript of the turn that stopped it, or the evidence for why it was
+            // stopped is the one thing missing from the record.
+            turns = turns_from_line(&line, turns);
+            if over_turn_ceiling(turns, request.max_turns) {
+                turns_exceeded = Some(turns);
+                break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if !cli_session_seen && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
@@ -1420,7 +1565,10 @@ impl CommandRunner for ClaudeCliRunner {
             policy_violation = policy_unverified_after_stream(request.tool_policy, init_seen);
         }
 
-        if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
+        if policy_violation.is_some()
+            || progress_timeout_elapsed.is_some()
+            || turns_exceeded.is_some()
+        {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -1460,20 +1608,36 @@ impl CommandRunner for ClaudeCliRunner {
                 "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
             ));
         }
+        if let Some(reached) = turns_exceeded {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            // Says what was reached AND what the limit was. "stopped at 200" alone leaves the reader
+            // unable to tell a ceiling that is too low from a run that was never going to finish.
+            stderr_str.push_str(&format!(
+                "nucleos: stopped after {reached} turns; this run's ceiling was {}\n",
+                request.max_turns.unwrap_or_default()
+            ));
+        }
         let exit_code = match (
             progress_timeout_elapsed,
+            turns_exceeded,
             &policy_violation,
             &post_launch_error,
         ) {
-            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
-            (None, Some(_), _) => -1,
+            (Some(_), _, _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            // After the deadline and before the rest: a run killed for looping may well also be a
+            // run whose stream then stopped, and the ceiling is the diagnosis that explains the
+            // other rather than the other way round.
+            (None, Some(_), _, _) => TURN_CEILING_EXIT_CODE,
+            (None, None, Some(_), _) => -1,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, None, Some(error)) => {
+            (None, None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         Ok(RunOutcome {
@@ -1719,6 +1883,8 @@ impl CommandRunner for CodexCliRunner {
         let mut stdout_acc = String::new();
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut progress_timeout_elapsed: Option<Duration> = None;
+        let mut turns: i64 = 0;
+        let mut turns_exceeded: Option<i64> = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -1747,9 +1913,17 @@ impl CommandRunner for CodexCliRunner {
                 shared.push_str(&line);
                 shared.push('\n');
             }
+            // The same brake as the Claude body above, counting `turn.completed` instead of
+            // `assistant` — `turns_from_line` knows both, so this path cannot drift out of step
+            // with the other by being edited on its own.
+            turns = turns_from_line(&line, turns);
+            if over_turn_ceiling(turns, request.max_turns) {
+                turns_exceeded = Some(turns);
+                break;
+            }
         }
 
-        if progress_timeout_elapsed.is_some() {
+        if progress_timeout_elapsed.is_some() || turns_exceeded.is_some() {
             // Kill the whole tree first, so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -1776,15 +1950,25 @@ impl CommandRunner for CodexCliRunner {
                 "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
             ));
         }
-        let exit_code = match (progress_timeout_elapsed, &post_launch_error) {
-            (Some(_), _) => PROGRESS_TIMEOUT_EXIT_CODE,
+        if let Some(reached) = turns_exceeded {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: stopped after {reached} turns; this run's ceiling was {}\n",
+                request.max_turns.unwrap_or_default()
+            ));
+        }
+        let exit_code = match (progress_timeout_elapsed, turns_exceeded, &post_launch_error) {
+            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            (None, Some(_), _) => TURN_CEILING_EXIT_CODE,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, Some(error)) => {
+            (None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         let usage = codex_extract_usage(&stdout_acc);
@@ -2259,6 +2443,7 @@ mod tests {
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
+            max_turns: None,
             session_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
             fork_session: false,
             include_partial_messages: false,
@@ -2281,6 +2466,7 @@ mod tests {
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
+            max_turns: None,
             session_id: None,
             fork_session: false,
             include_partial_messages: false,
@@ -2415,6 +2601,101 @@ mod tests {
             *runner.last_mcp_config.lock().unwrap(),
             Some(std::path::PathBuf::from("C:/tmp/mcp.json"))
         );
+    }
+
+    /// The plan, which the window had as the word `TodoWrite` and nothing else.
+    ///
+    /// A turn that writes a plan and then works through it is the shape of most real work, and none
+    /// of it reached the page: `detail_of` looks for a path or a command, a `TodoWrite` carries
+    /// neither, so the call arrived as a bare name. Watching a model tick items off is half of what
+    /// a person is looking at when they look at the editor.
+    #[test]
+    fn a_plan_is_carried_beside_the_call_that_wrote_it() {
+        let stream = [message(serde_json::json!([{
+            "type": "tool_use", "name": "TodoWrite",
+            "input": {"todos": [
+                {"content": "ler o parser", "status": "completed"},
+                {"content": "arranjar as datas", "status": "in_progress"},
+                {"content": "correr os testes", "status": "pending"},
+            ]}
+        }]))]
+        .join("\n");
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(
+            did[0].todos,
+            vec![
+                Todo {
+                    text: "ler o parser".into(),
+                    status: "completed".into()
+                },
+                Todo {
+                    text: "arranjar as datas".into(),
+                    status: "in_progress".into()
+                },
+                Todo {
+                    text: "correr os testes".into(),
+                    status: "pending".into()
+                },
+            ]
+        );
+    }
+
+    /// Every other tool carries no plan, and says so with an empty list rather than with a shape
+    /// the window has to test for.
+    #[test]
+    fn a_call_that_is_not_a_plan_carries_no_plan() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Read", "input": {"file_path": "C:/x.rs"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert!(did[0].todos.is_empty());
+        assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
+    }
+
+    /// A row written before this existed deserialises, and reads as a call that wrote no plan.
+    /// `tools_used` is stored JSON: every turn already recorded is a row without the field.
+    #[test]
+    fn a_call_stored_before_plans_existed_still_reads() {
+        let old: ToolCall =
+            serde_json::from_str(r#"{"name":"Bash","detail":"cargo test"}"#).unwrap();
+
+        assert_eq!(old.name, "Bash");
+        assert!(old.todos.is_empty());
+    }
+
+    /// A subagent's call said `Task` and nothing else, which is the one call where the name alone
+    /// says least: every `Task` looks like every other, and what distinguishes them is the sentence
+    /// the model wrote to describe the work. It carries no path and no command, so the fixed list
+    /// of keys walked straight past it.
+    #[test]
+    fn a_subagent_call_says_what_it_was_sent_to_do() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Task",
+            "input": {"description": "rever o diff", "prompt": "olha para tudo", "subagent_type": "reviewer"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].detail.as_deref(), Some("rever o diff"));
+    }
+
+    /// Ordered, not searched: a tool carrying both keeps the one that says where it acted. The
+    /// description is the last resort, never the preferred answer.
+    #[test]
+    fn a_description_never_wins_over_the_thing_that_was_acted_on() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Edit",
+            "input": {"file_path": "C:/x.rs", "description": "arranjar isto"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
     }
 
     /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.
@@ -2652,6 +2933,64 @@ mod tests {
         // Not `Some(0)`. A transcript that never mentioned cache creation has not reported writing
         // nothing — it has reported nothing, and a detector must be able to tell those apart.
         assert_eq!(usage.cache_creation_tokens, None);
+    }
+
+    /// One fold for both CLIs, because their per-turn events cannot appear in the same stream.
+    ///
+    /// Claude says `assistant` once per completed model message; `codex exec` says `turn.completed`.
+    /// Counting both in one function is what keeps the ceiling from being a Claude-only brake — a
+    /// limit that silently does not apply on one of the two paths is worse than no limit, because
+    /// somebody will believe it is there.
+    #[test]
+    fn a_turn_is_counted_once_per_model_response_on_either_cli() {
+        let claude = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let codex = r#"{"type":"turn.completed","usage":{"input_tokens":10}}"#;
+
+        assert_eq!(turns_from_line(claude, 0), 1);
+        assert_eq!(turns_from_line(codex, 4), 5);
+
+        // Everything else in either stream is not a turn. `stream_event` in particular arrives by
+        // the hundred for a single message — counting it would trip a ceiling of 200 inside one
+        // paragraph of the model's first answer.
+        for quiet in [
+            r#"{"type":"stream_event","event":{"delta":{"text":"tok"}}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","num_turns":9}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(turns_from_line(quiet, 7), 7, "counted a turn for: {quiet}");
+        }
+    }
+
+    /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
+    #[test]
+    fn the_ceiling_trips_at_the_number_it_names_and_never_without_one() {
+        assert!(!over_turn_ceiling(199, Some(200)));
+        assert!(over_turn_ceiling(200, Some(200)));
+        assert!(over_turn_ceiling(201, Some(200)));
+
+        // `None` is no ceiling, and it must stay no ceiling however long the run goes. Every caller
+        // that has not chosen a limit keeps exactly today's behaviour.
+        assert!(!over_turn_ceiling(1, None));
+        assert!(!over_turn_ceiling(1_000_000, None));
+
+        // A ceiling of zero or less would stop a run before its first answer. Refused as "no
+        // ceiling" rather than honoured, because a misconfiguration that silently disables every
+        // run is worse than one that disables the brake.
+        assert!(!over_turn_ceiling(1, Some(0)));
+        assert!(!over_turn_ceiling(5, Some(-3)));
+    }
+
+    /// A run the daemon stopped has not succeeded, and must not be readable as either of the other
+    /// two ways a run can end without doing its work.
+    #[test]
+    fn a_run_stopped_by_the_ceiling_cannot_be_read_as_a_success_or_as_a_timeout() {
+        assert_ne!(TURN_CEILING_EXIT_CODE, 0);
+        assert_ne!(TURN_CEILING_EXIT_CODE, -1);
+        assert_ne!(TURN_CEILING_EXIT_CODE, PROGRESS_TIMEOUT_EXIT_CODE);
     }
 
     #[test]

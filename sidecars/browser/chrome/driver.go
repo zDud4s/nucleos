@@ -52,6 +52,13 @@ type Driver struct {
 	// read only after it, which is what makes it safe without a lock.
 	swept    chan struct{}
 	sweepErr error
+
+	// How long a page is given to arrive, and how long after its load event it is given to go
+	// quiet. Fields rather than constants so a test can shorten them: the interesting case is the
+	// page that never finishes, and asserting it against the real bound would cost the suite
+	// fifteen seconds to learn nothing it could not learn in fifty milliseconds.
+	readyWithin time.Duration
+	idleGrace   time.Duration
 }
 
 type session struct {
@@ -62,20 +69,27 @@ type session struct {
 	requested string
 	final     string
 	title     string
+	// frameID is this target's top frame, kept so a wait for "the page is ready" can ignore the
+	// lifecycle of every subframe. A page whose advertisement finished loading has not finished.
+	frameID string
 	// reportedUpTo is how far into the refusal record this session has already been told. It is what
 	// makes a refusal that lands after an act's settle window arrive on the NEXT act instead of being
 	// lost — no fixed window can catch every one, and silence is the wrong failure.
 	reportedUpTo int
 	// refs maps a snapshot ref ("e5") to the node it named. The agent may only act on something a
 	// snapshot actually showed it — see Act.
-	refs map[string]int64
+	refs map[string]nodeKey
 	// refByNode is what makes a ref MEAN the same thing twice, and it is the reason the two fields
 	// are not one. Refs used to be minted by position — first interesting node is e1 — so a snapshot
 	// taken after a click renumbered the page, and an agent holding "e5" from the previous one was
 	// holding a name for something else. Keying on the backend node id, which Chromium keeps stable
 	// for the life of the node, makes a ref a handle on an ELEMENT rather than on a position, which
 	// is what the agent already assumed it was.
-	refByNode map[int64]string
+	refByNode map[nodeKey]string
+	// frames are the documents Chromium decided to run in their own processes, and the session each
+	// one is framed by. A cross-site iframe is a separate target with a separate accessibility tree,
+	// so without this the snapshot stops at the process boundary — see Snapshot.
+	frames map[cdp.SessionID]frameRef
 	// mintedRefs counts how many have ever been handed out for this session, so a ref is never
 	// reused for a different node after the first one leaves the page.
 	mintedRefs int
@@ -83,6 +97,27 @@ type session struct {
 	// what was actually sent: comparing against something the agent never saw would report changes
 	// it cannot reconcile.
 	lastReported map[string]browser.Element
+}
+
+// nodeKey identifies a node across every document a session can see.
+//
+// The backend node id alone is not enough, and the reason is the same process boundary that hid
+// cross-site frames from the snapshot: the id is minted by a RENDERER, and a cross-site frame is a
+// different renderer, so two documents in one session can hand out the same number for two
+// unrelated elements. Keying on the session as well is what keeps a ref a handle on one element
+// rather than on whichever document answered last.
+type nodeKey struct {
+	session cdp.SessionID
+	backend int64
+}
+
+// frameRef is a document in its own process: its target id, and the session that frames it.
+//
+// Parent is recorded rather than assumed to be the page, because frames nest. It is read off the
+// session the attach arrived ON, which is the only place the relationship is stated.
+type frameRef struct {
+	target string
+	parent cdp.SessionID
 }
 
 // Connect attaches the fence and returns a Driver.
@@ -133,6 +168,8 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		targets:      map[string]browser.SessionID{},
 		cdpToSession: map[cdp.SessionID]browser.SessionID{},
 		swept:        make(chan struct{}),
+		readyWithin:  readyDeadline,
+		idleGrace:    idleGrace,
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)
@@ -152,6 +189,10 @@ func (d *Driver) Policy() fence.Policy { return d.policy }
 // spike measured this — a cross-site iframe never appeared as a target until each session re-armed
 // on its own children — so every attached target re-arms before it is released.
 func (d *Driver) onEvent(event cdp.Event) {
+	if event.Method == "Target.detachedFromTarget" {
+		d.onDetached(event)
+		return
+	}
 	if event.Method != "Target.attachedToTarget" {
 		return
 	}
@@ -195,6 +236,24 @@ func (d *Driver) onEvent(event cdp.Event) {
 		d.mu.Unlock()
 	}
 
+	// A frame Chromium chose to run somewhere else. It is tied to its parent by the session the
+	// attach ARRIVED on — auto-attach is re-armed per target and flattened, so this event is
+	// delivered on the session that frames it and nowhere else. Nothing about the child's url says
+	// who framed it, and guessing from arrival order is the mistake the popup comment above records.
+	if params.TargetInfo.Type == "iframe" {
+		d.mu.Lock()
+		if known, ok := d.cdpToSession[event.Session]; ok {
+			d.cdpToSession[params.SessionID] = known
+			if entry, live := d.sessions[known]; live {
+				entry.frames[params.SessionID] = frameRef{
+					target: params.TargetInfo.TargetID,
+					parent: event.Session,
+				}
+			}
+		}
+		d.mu.Unlock()
+	}
+
 	// Spec §5.4: in agent mode a new target is BLOCKED, not opened and then watched. A headless
 	// popup is invisible by construction (§4.1), so there is no mode in which showing it would be
 	// honest. --block-new-web-contents already makes window.open return null; this is the second
@@ -211,6 +270,29 @@ func (d *Driver) onEvent(event cdp.Event) {
 	if params.WaitingForDebugger {
 		_, _ = d.conn.Call(ctx, params.SessionID, "Runtime.runIfWaitingForDebugger", nil)
 	}
+}
+
+// onDetached forgets a frame that went away.
+//
+// Without it a navigation would leave the previous document's frames on the session forever, and
+// the next snapshot would spend a round trip on each before being told the target is gone. Read as
+// bookkeeping, not as cleanup: an entry left behind does not produce a WRONG reading, it produces a
+// slower one and a growing map.
+func (d *Driver) onDetached(event cdp.Event) {
+	var params struct {
+		SessionID cdp.SessionID `json:"sessionId"`
+	}
+	if err := json.Unmarshal(event.Params, &params); err != nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if owner, ok := d.cdpToSession[params.SessionID]; ok {
+		if entry, live := d.sessions[owner]; live {
+			delete(entry.frames, params.SessionID)
+		}
+	}
+	delete(d.cdpToSession, params.SessionID)
 }
 
 // Open creates a target, arms it while it is still paused, and only then navigates.
@@ -231,6 +313,11 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	if _, err := d.conn.Call(ctx, cdpSession, "Page.enable", nil); err != nil {
 		return browser.Session{}, fmt.Errorf("enabling page domain: %w", err)
 	}
+	// Best effort, both of them. Without lifecycle events a wait falls back to the load event, which
+	// is earlier than it should be but is not wrong; refusing to open over it would trade a real
+	// capability for a better wait.
+	_, _ = d.conn.Call(ctx, cdpSession, "Page.setLifecycleEventsEnabled", map[string]any{"enabled": true})
+	mainFrame := d.mainFrameOf(ctx, cdpSession)
 
 	d.mu.Lock()
 	d.counter++
@@ -241,8 +328,10 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		cdp:          cdpSession,
 		mode:         browser.ModeAgent,
 		requested:    req.URL,
-		refs:         map[string]int64{},
-		refByNode:    map[int64]string{},
+		frameID:      mainFrame,
+		refs:         map[string]nodeKey{},
+		refByNode:    map[nodeKey]string{},
+		frames:       map[cdp.SessionID]frameRef{},
 		lastReported: map[string]browser.Element{},
 		// Anything refused before this session existed belongs to the sweep or to another session.
 		reportedUpTo: d.refusalTotal,
@@ -255,6 +344,11 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	// Counted BEFORE the navigation, so a refusal the fence raises while the navigation is in
 	// flight is attributable to it and not lost.
 	before := d.refusalCount()
+
+	// Subscribed before the navigate call for the same reason: a page that finishes quickly would
+	// otherwise fire everything worth hearing before anything was listening.
+	ready := d.watchPage(cdpSession, mainFrame)
+	defer ready.stop()
 
 	navigated, err := d.conn.Call(ctx, cdpSession, "Page.navigate", map[string]any{"url": req.URL})
 	if err != nil {
@@ -282,6 +376,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		return browser.Session{}, fmt.Errorf("navigating to %s: %s", req.URL, outcome.ErrorText)
 	}
 
+	stillLoading := d.awaitReady(ctx, ready)
 	d.readTargetInfo(ctx, entry)
 	return browser.Session{
 		ID:           id,
@@ -289,6 +384,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		RequestedURL: entry.requested,
 		FinalURL:     entry.final,
 		Title:        entry.title,
+		StillLoading: stillLoading,
 	}, nil
 }
 

@@ -3404,6 +3404,10 @@ struct AssistantTurn {
     /// looks like one unbroken conversation, which is the one thing it is not.
     session_id: Option<String>,
     created_at: String,
+    /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
+    /// never reported one -- a turn that failed before the CLI said anything, and every turn from
+    /// before the column existed.
+    context_fill: Option<i64>,
     /// What the turn ran, as the JSON `tools_used` holds. Not serialized: the window is given the
     /// parsed list below, so the shape of the column is this daemon's business and not a format
     /// two codebases have to agree on.
@@ -3422,6 +3426,12 @@ struct AssistantTurnOut {
     #[serde(flatten)]
     turn: AssistantTurn,
     did: Vec<crate::runner::ToolCall>,
+    /// The token count past which this daemon stops resuming and mints a fresh session.
+    ///
+    /// The same number on every row, because it is a property of the daemon and not of the turn.
+    /// It rides here so the window never keeps its own copy of a rule this side owns: a constant
+    /// duplicated across two codebases is one that drifts silently the day one of them changes it.
+    context_rotates_at: i64,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3444,7 +3454,7 @@ async fn get_assistant_chat(
 ) -> Result<Json<Vec<AssistantTurnOut>>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, session_id, created_at, tools_used
+                answered_by, session_id, created_at, context_fill, tools_used
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -3468,7 +3478,11 @@ async fn get_assistant_chat(
                     .as_deref()
                     .and_then(|json| serde_json::from_str(json).ok())
                     .unwrap_or_default();
-                AssistantTurnOut { turn, did }
+                AssistantTurnOut {
+                    turn,
+                    did,
+                    context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+                }
             })
             .collect(),
     ))
@@ -3657,7 +3671,7 @@ async fn wire_ide_session_tools(Path(session_id): Path<String>) -> Result<Status
 /// it must not be made about a file that was never found.
 async fn read_ide_session(
     Path(session_id): Path<String>,
-) -> Result<Json<Vec<crate::sessions::Said>>, StatusCode> {
+) -> Result<Json<crate::sessions::Conversation>, StatusCode> {
     let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
     let found =
         tokio::task::spawn_blocking(move || crate::sessions::conversation(&root, &session_id))
@@ -8261,6 +8275,51 @@ mod tests {
             .collect();
         // Oldest first, so the conversation reads downwards the way it was had.
         assert_eq!(asked, vec!["first", "second"]);
+    }
+
+    /// How full the context is, and the line past which this daemon will not resume.
+    ///
+    /// The rotation was invisible from the window: a conversation ran, crossed 140k, and the next
+    /// turn began remembering nothing -- and the first anybody heard of it was the restart mark
+    /// drawn after the fact. The number the daemon already records travels now, so the ceiling can
+    /// be seen coming instead of explained afterwards.
+    ///
+    /// The ceiling rides on every turn although it is the same on all of them. It is a property of
+    /// this daemon and not of any turn, and the alternative is the window keeping its own copy of a
+    /// rule this side owns -- which is a second source of truth that drifts silently the day the
+    /// constant here changes.
+    #[tokio::test]
+    async fn a_turn_says_how_full_its_context_was_and_where_the_daemon_rotates() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, context_fill, created_at)
+             VALUES ('hello', 'completed', 'assistant', 's', 'shell', 96000, '2026-07-30T10:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/shell")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(turns[0]["context_fill"], serde_json::json!(96000));
+        assert_eq!(
+            turns[0]["context_rotates_at"],
+            serde_json::json!(crate::assistant::CONTEXT_ROTATION_TOKENS)
+        );
     }
 
     /// A chat named like a number must not be read as a turn id. Static segments win in matchit,

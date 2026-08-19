@@ -198,7 +198,7 @@ func (h *Human) Close(ctx context.Context, id browser.SessionID) error {
 }
 
 // Snapshot is refused: the page in front of the person is theirs.
-func (h *Human) Snapshot(context.Context, browser.SessionID, bool) (browser.Snapshot, error) {
+func (h *Human) Snapshot(context.Context, browser.SessionID, browser.SnapshotRequest) (browser.Snapshot, error) {
 	return browser.Snapshot{}, browser.ErrPersonIsDriving
 }
 

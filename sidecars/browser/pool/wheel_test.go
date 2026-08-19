@@ -140,7 +140,7 @@ func TestTakingTheWheelReportsTheSessionsItClosed(t *testing.T) {
 
 	// And neither of them is addressable any more.
 	for _, id := range []browser.SessionID{first.ID, second.ID} {
-		if _, err := pool.Snapshot(context.Background(), id, false); !errors.Is(err, browser.ErrNoSuchSession) {
+		if _, err := pool.Snapshot(context.Background(), id, browser.SnapshotRequest{}); !errors.Is(err, browser.ErrNoSuchSession) {
 			t.Fatalf("session %s survived the handover: %v", id, err)
 		}
 	}

@@ -121,6 +121,11 @@ pub struct Session {
     /// exists and is addressable; it is simply empty.
     #[serde(default)]
     pub refusal: Option<Refusal>,
+    /// The page had not finished arriving. Opening waits for it, bounded; this is what the sidecar
+    /// says when the bound was reached, and it is the difference between a page with nothing on it
+    /// and a page that had not got there yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub still_loading: bool,
 }
 
 /// One thing on the page the agent may refer to.
@@ -160,6 +165,18 @@ pub struct Snapshot {
     /// exist, which is a worse failure than being told to scroll.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Where the prose stopped, to be passed back as `text_from` to read on. Present only when
+    /// `truncated` is, so its presence is the offer.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub text_next: i64,
+    /// The same offer for the actionable elements, which have a budget of their own: a listing with
+    /// two thousand links used to come back whole and unannounced, because the prose had fit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub controls_next: i64,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 /// The answer to an action: done, or refused with a named consequence.
@@ -168,6 +185,15 @@ pub struct ActResult {
     pub outcome: String,
     #[serde(default)]
     pub refusal: Option<Refusal>,
+    /// The act replaced the document, so every ref from before it names something that is gone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub navigated: bool,
+    /// Where the page ended up, filled only when the act moved it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// The page it moved to had not finished arriving. Same meaning as on [`Session`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub still_loading: bool,
 }
 
 impl ActResult {
@@ -282,15 +308,23 @@ impl BrowserClient {
     }
 
     /// Read the page. `changes_only` asks for what moved since the previous snapshot of this
-    /// session rather than the whole page — the same reading, filtered.
+    /// session rather than the whole page — the same reading, filtered. `text_from` resumes prose
+    /// where a truncated snapshot stopped, which is what keeps truncation from being a dead end.
     pub async fn snapshot(
         &self,
         session_id: &str,
         changes_only: bool,
+        text_from: i64,
+        controls_from: i64,
     ) -> Result<Snapshot, BrowserError> {
         self.call(
             "/snapshot",
-            &serde_json::json!({ "session_id": session_id, "changes_only": changes_only }),
+            &serde_json::json!({
+                "session_id": session_id,
+                "changes_only": changes_only,
+                "text_from": text_from,
+                "controls_from": controls_from,
+            }),
         )
         .await
     }
@@ -568,6 +602,49 @@ mod tests {
         assert!(done.refusal.is_none());
     }
 
+    /// An act that moved the page says so, and says where to.
+    ///
+    /// The fields are optional on the wire and absent on the ordinary act, so the risk is the
+    /// reverse of the usual one: a struct that dropped them would decode every payload happily and
+    /// leave the agent holding refs into a document that is gone.
+    #[test]
+    fn an_act_that_navigated_carries_where_it_went() {
+        let result: ActResult = serde_json::from_str(
+            r#"{"outcome":"done","navigated":true,"url":"https://example.org/next","still_loading":true}"#,
+        )
+        .expect("a navigation is a value");
+        assert!(result.navigated);
+        assert_eq!(result.url, "https://example.org/next");
+        assert!(result.still_loading);
+
+        let ordinary: ActResult = serde_json::from_str(r#"{"outcome":"done"}"#).expect("done");
+        assert!(
+            !ordinary.navigated,
+            "a click that changed nothing must not claim otherwise"
+        );
+        assert!(ordinary.url.is_empty());
+    }
+
+    /// A cut snapshot offers a way to read on, and a whole one offers none.
+    ///
+    /// The presence of the offset IS the offer, so a default that invented a zero on a complete
+    /// page would send a polite agent back to read the same page again.
+    #[test]
+    fn a_cut_snapshot_says_where_to_read_on_from() {
+        let cut: Snapshot = serde_json::from_str(
+            r#"{"session_id":"s1","url":"https://example.org/","truncated":true,"text_next":20000}"#,
+        )
+        .expect("a truncated snapshot");
+        assert!(cut.truncated);
+        assert_eq!(cut.text_next, 20000);
+
+        let whole: Snapshot =
+            serde_json::from_str(r#"{"session_id":"s1","url":"https://example.org/"}"#)
+                .expect("a whole snapshot");
+        assert!(!whole.truncated);
+        assert_eq!(whole.text_next, 0);
+    }
+
     /// A sidecar that answers the six routes the way the Go one does, so the client can be driven
     /// over a real socket instead of only being reasoned about.
     ///
@@ -664,7 +741,7 @@ mod tests {
         assert_eq!(session.final_url, "https://jira.example.org/browse");
         assert!(session.refusal.is_none());
 
-        let snapshot = client.snapshot("s1", false).await.expect("snapshot");
+        let snapshot = client.snapshot("s1", false, 0, 0).await.expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
         let result = client.act("s1", "click", "e5", "").await.expect("act");

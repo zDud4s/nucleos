@@ -89,7 +89,7 @@ func (f *Fake) Open(_ context.Context, req OpenRequest) (Session, error) {
 	return session, nil
 }
 
-func (f *Fake) Snapshot(_ context.Context, id SessionID, _ bool) (Snapshot, error) {
+func (f *Fake) Snapshot(_ context.Context, id SessionID, _ SnapshotRequest) (Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Snapshots = append(f.Snapshots, id)
@@ -183,7 +183,7 @@ func (u Unavailable) err() error {
 func (u Unavailable) Open(context.Context, OpenRequest) (Session, error) {
 	return Session{}, u.err()
 }
-func (u Unavailable) Snapshot(context.Context, SessionID, bool) (Snapshot, error) {
+func (u Unavailable) Snapshot(context.Context, SessionID, SnapshotRequest) (Snapshot, error) {
 	return Snapshot{}, u.err()
 }
 func (u Unavailable) Act(context.Context, SessionID, Action) (ActResult, error) {

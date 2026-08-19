@@ -89,6 +89,27 @@ export interface Said {
   /** Whether the owner typed it. The model answered everything else. */
   by_owner: boolean;
   text: string;
+  /**
+   * Whether this is a note ABOUT the conversation rather than a line OF it.
+   *
+   * One thing sets it: a subagent worked here, and its rows were dropped — a
+   * different conversation, with a different model, that the owner never saw.
+   * Drawn as a note and never as a bubble: attributing it to anybody would put
+   * words on somebody who did not say them.
+   */
+  aside: boolean;
+}
+
+/**
+ * What was said in an editor session, and whether that is all of it.
+ *
+ * `cut` is not decoration. The daemon reads these files from the recent end under two ceilings, and
+ * two hundred messages back looks exactly like a conversation that had two hundred messages — so
+ * without being told, a person scrolls up, finds the top, and reads it as the whole thing.
+ */
+export interface Conversation {
+  said: Said[];
+  cut: boolean;
 }
 
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
@@ -201,7 +222,7 @@ export function useIdeConversation(sessionId: string | null) {
   return useQuery({
     queryKey: keys.chats.ideSession(sessionId ?? ""),
     queryFn: () =>
-      apiFetch<Said[]>(`/assistant/ide-sessions/${encodeURIComponent(sessionId ?? "")}`),
+      apiFetch<Conversation>(`/assistant/ide-sessions/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
   });
 }
@@ -235,6 +256,10 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // Nothing has been sent, so nothing has been measured. The daemon's reading arrives with
+        // the turn it belongs to; inventing one here would draw a number this side made up.
+        contextFill: null,
+        rotatesAt: null,
         // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],

@@ -595,3 +595,61 @@
 .chats-turns-end {
   height: 1px;
 }
+
+.chats-turn-fill {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-turn-fill-near {
+  color: var(--tone-warn-fg);
+}
+
+/* ------------------------------------------------------------- the plan -- */
+
+.chats-plan {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--border);
+  list-style: none;
+}
+
+.chats-plan-item {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-plan-mark {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+}
+
+/* Done is quieter, not louder: the eye should land on the line being worked. */
+.chats-plan-completed .chats-plan-text {
+  text-decoration: line-through;
+}
+
+.chats-plan-in_progress {
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+/* A note, not a bubble: no speaker, no ground of its own, and quieter than either side. */
+.chats-said-aside {
+  border-left-color: transparent;
+  background: none;
+  padding-top: 0;
+  padding-bottom: 0;
+  font-style: italic;
+}
+
+.chats-said-aside .chats-said-text {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}

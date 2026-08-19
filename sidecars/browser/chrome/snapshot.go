@@ -26,29 +26,19 @@ import (
 // A ref can only name something a snapshot actually showed. A CSS selector can be synthesised by the
 // agent for an element it never saw — including one a page's text talked it into. Refs make "act on
 // something that was not in the snapshot" unrepresentable rather than merely discouraged.
-func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly bool) (browser.Snapshot, error) {
+func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser.SnapshotRequest) (browser.Snapshot, error) {
 	entry, err := d.lookup(id)
 	if err != nil {
 		return browser.Snapshot{}, err
 	}
 
-	if _, err := d.conn.Call(ctx, entry.cdp, "Accessibility.enable", nil); err != nil {
-		return browser.Snapshot{}, fmt.Errorf("enabling accessibility: %w", err)
-	}
-	raw, err := d.conn.Call(ctx, entry.cdp, "Accessibility.getFullAXTree", nil)
+	root, err := d.readTree(ctx, entry)
 	if err != nil {
-		return browser.Snapshot{}, fmt.Errorf("reading the accessibility tree: %w", err)
-	}
-
-	var payload struct {
-		Nodes []axNode `json:"nodes"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
 		return browser.Snapshot{}, err
 	}
 
-	collected, truncated := collect(payload.Nodes)
-	elements, gone := d.name(entry, collected, changesOnly)
+	read := collect(root, req)
+	elements, gone := d.name(entry, read.elements, req.ChangesOnly)
 
 	url, title := d.locate(ctx, entry.cdp)
 	if url != "" {
@@ -59,13 +49,15 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly
 	}
 
 	return browser.Snapshot{
-		SessionID: id,
-		URL:       entry.final,
-		Title:     entry.title,
-		Elements:  elements,
-		Truncated: truncated,
-		Gone:      gone,
-		Partial:   changesOnly,
+		SessionID:    id,
+		URL:          entry.final,
+		Title:        entry.title,
+		Elements:     elements,
+		Truncated:    read.truncated,
+		TextNext:     read.textNext,
+		ControlsNext: read.controlsNext,
+		Gone:         gone,
+		Partial:      req.ChangesOnly,
 	}, nil
 }
 
@@ -81,7 +73,7 @@ func (d *Driver) name(entry *session, collected []found, changesOnly bool) ([]br
 
 	previous := entry.lastReported
 	elements := make([]browser.Element, 0, len(collected))
-	refs := make(map[string]int64, len(collected))
+	refs := make(map[string]nodeKey, len(collected))
 	reported := make(map[string]browser.Element, len(collected))
 
 	for _, one := range collected {
@@ -96,14 +88,14 @@ func (d *Driver) name(entry *session, collected []found, changesOnly bool) ([]br
 			continue
 		}
 
-		ref, known := entry.refByNode[one.backend]
+		ref, known := entry.refByNode[one.key]
 		if !known {
 			entry.mintedRefs++
 			ref = fmt.Sprintf("e%d", entry.mintedRefs)
-			entry.refByNode[one.backend] = ref
+			entry.refByNode[one.key] = ref
 		}
 		element.Ref = ref
-		refs[ref] = one.backend
+		refs[ref] = one.key
 		reported[ref] = element
 
 		if changesOnly {
@@ -155,6 +147,100 @@ func sameElement(a, b browser.Element) bool {
 // make room for prose would be one the agent cannot use at all.
 const textBudget = 20000
 
+// controlBudget bounds how many actionable elements one snapshot carries.
+//
+// A count and not a character measure, because what an agent pays per control is roughly fixed —
+// a ref, a role, a name, sometimes a value and a state — and three hundred of them costs about what
+// twenty thousand characters of prose costs. The two budgets are separate so that a long article
+// keeps its buttons, which was the rule this design started from and is still right; what was
+// missing was the other end, where a directory listing has two thousand links and NOTHING bounded
+// them. That snapshot came back saying `truncated: false`, because the prose had fit.
+const controlBudget = 300
+
+// slice is what one snapshot managed to carry, and where a next one would resume.
+type slice struct {
+	elements     []found
+	truncated    bool
+	textNext     int
+	controlsNext int
+}
+
+// tableRoles are the parts of a table this walk knows by name.
+//
+// None of them earns a ref: there is no verb that does anything to a cell. What they earn is their
+// SHAPE — a row is emitted as one line with its cells separated, rather than as a stream of loose
+// text with the grid dissolved out of it. A column of numbers whose headers are somewhere further
+// up, in no stated relation, is a table the agent can read and cannot use.
+func isCell(role string) bool {
+	switch role {
+	case "cell", "gridcell", "columnheader", "rowheader":
+		return true
+	default:
+		return false
+	}
+}
+
+// rowLine renders one row as its cells, in order, separated.
+//
+// A cell that holds a control contributes the control's NAME, and the control is still emitted
+// separately with its ref. That is the one place this file says something twice on purpose: the
+// alternative is a row reading " | 3 days ago | 1.2 kB", with a hole where the link was, and a hole
+// in a table is worse than a word repeated. Both halves are bounded, so the cost is capped.
+func rowLine(byID map[string]axNode, row axNode) string {
+	cells := make([]string, 0, len(row.ChildIDs))
+	for _, childID := range row.ChildIDs {
+		child, ok := byID[childID]
+		if !ok || !isCell(child.Role.Value) {
+			continue
+		}
+		cells = append(cells, cellText(byID, childID, 0))
+	}
+	if len(cells) == 0 {
+		return ""
+	}
+	if strings.TrimSpace(strings.Join(cells, "")) == "" {
+		return ""
+	}
+	return strings.Join(cells, " | ")
+}
+
+// cellText is everything one cell says, flattened.
+func cellText(byID map[string]axNode, id string, depth int) string {
+	// Bounded rather than trusted, for the same reason the walk guards against cycles: this is a
+	// tree Chromium built from somebody else's page.
+	if depth > 8 {
+		return ""
+	}
+	node, ok := byID[id]
+	if !ok || node.Ignored {
+		return ""
+	}
+	name := strings.TrimSpace(node.Name.Value)
+	if interesting(node.Role.Value, name) {
+		// A control's text IS its name, and descending would say it again.
+		return name
+	}
+	if node.Role.Value == "StaticText" {
+		return name
+	}
+	parts := make([]string, 0, len(node.ChildIDs))
+	for _, child := range node.ChildIDs {
+		if piece := cellText(byID, child, depth+1); piece != "" {
+			parts = append(parts, piece)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// found is one line of a snapshot together with the node it came from. Refs are NOT minted here:
+// they belong to the session, because a ref has to mean the same element on the next snapshot too,
+// and this function sees one page at one instant.
+type found struct {
+	element browser.Element
+	key     nodeKey
+	control bool
+}
+
 // collect walks the tree in document order and decides what earns a line.
 //
 // Document order is the point, and it is why this does its own depth-first walk over `childIds`
@@ -162,108 +248,170 @@ const textBudget = 20000
 // whose markup runs heading, paragraph, label, checkbox came back as heading, checkbox, checkbox,
 // button, button, paragraph, label. Prose is only worth carrying if the agent can tell which control
 // it belongs to, and a paragraph filed after the button it describes has lost exactly that.
-// found is one line of a snapshot together with the node it came from. Refs are NOT minted here:
-// they belong to the session, because a ref has to mean the same element on the next snapshot too,
-// and this function sees one page at one instant.
-type found struct {
-	element browser.Element
-	backend int64
-	control bool
-}
+//
+// It takes a tree and not a node list because a page is not always one document: a cross-site frame
+// is a separate target with a separate tree, and it is spliced in at the element that holds it for
+// the same reason the walk exists at all.
+//
+// textFrom resumes prose that a previous snapshot could not fit, and the returned offset is where
+// this one stopped. Truncation is terminal for prose rather than skip-and-continue: a reading that
+// dropped one long paragraph and then included a short one from further down would be a page nobody
+// wrote, and the agent has no way to tell that from the page.
+func collect(root *tree, req browser.SnapshotRequest) slice {
+	elements := make([]found, 0, len(root.nodes))
+	// Two pairs and not one. spent/passed are the prose: what this slice delivered, and where the
+	// prose has got to overall. controlsSpent/controlsPassed are the same for the actionable set,
+	// counted rather than measured. They are bounded apart so a long article keeps its buttons.
+	spent, passed := 0, 0
+	controlsSpent, controlsPassed := 0, 0
+	textCut, controlsCut := false, false
 
-func collect(nodes []axNode) ([]found, bool) {
-	byID := make(map[string]axNode, len(nodes))
-	hasParent := make(map[string]bool, len(nodes))
-	for _, node := range nodes {
-		byID[node.NodeID] = node
-		for _, child := range node.ChildIDs {
-			hasParent[child] = true
+	// A paragraph and a table row are the same thing as far as the budget is concerned: both are
+	// what the page SAYS, and neither is something an act can name.
+	//
+	// The cut is terminal. Skip-and-continue would drop a long paragraph and let a shorter one from
+	// further down through, which composes a page nobody wrote and reads exactly like the page.
+	say := func(role, text string) {
+		switch {
+		case text == "" || textCut:
+		case passed < req.TextFrom:
+			passed += len(text)
+		case spent+len(text) > textBudget:
+			textCut = true
+		default:
+			spent += len(text)
+			passed += len(text)
+			elements = append(elements, found{element: browser.Element{Role: role, Name: text}})
 		}
 	}
 
-	// Which nodes are controls, and what they are called. Both are needed to drop text twice over:
-	// a control's accessible name comes from its own subtree on a button, and from a SIBLING on
-	// `<label>Email <input></label>` — where the label's text is not inside the input at all. An
-	// ancestor check alone misses that one, and the agent then sees "Email" as a paragraph and as
-	// the box's name, and cannot tell which of the two it should act on.
-	control := make(map[string]bool, len(nodes))
-	named := make(map[string]bool, len(nodes))
-	for _, node := range nodes {
-		name := strings.TrimSpace(node.Name.Value)
-		if !node.Ignored && interesting(node.Role.Value, name) {
-			control[node.NodeID] = true
-			named[name] = true
-		}
-	}
-
-	elements := make([]found, 0, len(nodes))
-	spent, truncated := 0, false
-	seen := make(map[string]bool, len(nodes))
-
-	var walk func(id string, insideControl bool)
-	walk = func(id string, insideControl bool) {
-		// Cycles are not supposed to happen in a tree. This is a tree Chromium built from a page
-		// somebody else wrote, so it is guarded rather than trusted.
-		if seen[id] {
-			return
-		}
-		seen[id] = true
-		node, ok := byID[id]
-		if !ok {
-			return
-		}
-
-		isControl := control[id]
-		if !node.Ignored {
-			switch {
-			case isControl:
-				elements = append(elements, found{
-					element: browser.Element{
-						Role:  node.Role.Value,
-						Name:  strings.TrimSpace(node.Name.Value),
-						Value: strings.TrimSpace(node.Value.Value),
-						State: stateOf(node),
-					},
-					backend: node.BackendDOMNodeID,
-					control: true,
-				})
-			case node.Role.Value == "StaticText" && !insideControl:
-				name := strings.TrimSpace(node.Name.Value)
-				// Dropped when some control is already called this. It costs the odd line of prose
-				// that happens to repeat a label, and it buys the agent never seeing the same words
-				// twice in two roles.
-				if name != "" && !named[name] {
-					if spent+len(name) > textBudget {
-						truncated = true
-					} else {
-						spent += len(name)
-						elements = append(elements, found{
-							element: browser.Element{Role: "text", Name: name},
-						})
-					}
-				}
+	// One pass per document. Node ids are per document — two documents both call their root "1" —
+	// so the maps below are rebuilt for each rather than shared, and a framed document is walked by
+	// recursing into this function at the element that holds it.
+	var document func(t *tree)
+	document = func(t *tree) {
+		byID := make(map[string]axNode, len(t.nodes))
+		hasParent := make(map[string]bool, len(t.nodes))
+		for _, node := range t.nodes {
+			byID[node.NodeID] = node
+			for _, child := range node.ChildIDs {
+				hasParent[child] = true
 			}
 		}
 
-		for _, child := range node.ChildIDs {
-			walk(child, insideControl || isControl)
+		// Which nodes are controls, and what they are called. Both are needed to drop text twice
+		// over: a control's accessible name comes from its own subtree on a button, and from a
+		// SIBLING on `<label>Email <input></label>` — where the label's text is not inside the input
+		// at all. An ancestor check alone misses that one, and the agent then sees "Email" as a
+		// paragraph and as the box's name, and cannot tell which of the two it should act on.
+		control := make(map[string]bool, len(t.nodes))
+		named := make(map[string]bool, len(t.nodes))
+		for _, node := range t.nodes {
+			name := strings.TrimSpace(node.Name.Value)
+			if !node.Ignored && interesting(node.Role.Value, name) {
+				control[node.NodeID] = true
+				named[name] = true
+			}
+		}
+
+		seen := make(map[string]bool, len(t.nodes))
+
+		var walk func(id string, insideControl, insideRow bool)
+		walk = func(id string, insideControl, insideRow bool) {
+			// Cycles are not supposed to happen in a tree. This is a tree Chromium built from a page
+			// somebody else wrote, so it is guarded rather than trusted.
+			if seen[id] {
+				return
+			}
+			seen[id] = true
+			node, ok := byID[id]
+			if !ok {
+				return
+			}
+
+			isControl := control[id]
+			isRow := node.Role.Value == "row"
+			if !node.Ignored {
+				switch {
+				case isControl:
+					switch {
+					case controlsCut:
+						// Past the cut nothing more, in the order the page has it.
+					case controlsPassed < req.ControlsFrom:
+						controlsPassed++
+					case controlsSpent >= controlBudget:
+						controlsCut = true
+					default:
+						controlsSpent++
+						controlsPassed++
+						elements = append(elements, found{
+							element: browser.Element{
+								Role:  node.Role.Value,
+								Name:  strings.TrimSpace(node.Name.Value),
+								Value: strings.TrimSpace(node.Value.Value),
+								State: stateOf(node),
+							},
+							key:     nodeKey{session: t.session, backend: node.BackendDOMNodeID},
+							control: true,
+						})
+					}
+				case isRow:
+					// The row as one line, and the text inside it suppressed below. Emitted here so
+					// it lands where the row is, which is the whole of what a table is.
+					say("row", rowLine(byID, node))
+				case node.Role.Value == "StaticText" && !insideControl && !insideRow:
+					name := strings.TrimSpace(node.Name.Value)
+					// Dropped when some control is already called this. It costs the odd line of
+					// prose that happens to repeat a label, and it buys the agent never seeing the
+					// same words twice in two roles.
+					if !named[name] {
+						say("text", name)
+					}
+				}
+			}
+
+			// A document Chromium put in another process hangs off the element that holds it, and is
+			// walked HERE so that it lands where it appears rather than after everything.
+			if node.BackendDOMNodeID != 0 {
+				if inner, framed := t.inner[node.BackendDOMNodeID]; framed {
+					document(inner)
+				}
+			}
+
+			for _, child := range node.ChildIDs {
+				walk(child, insideControl || isControl, insideRow || isRow)
+			}
+		}
+
+		// From the roots, in the order Chromium listed them. A well-formed tree has one; a page
+		// mid-load can present several, and starting from each is what keeps the whole page rather
+		// than the first fragment of it.
+		for _, node := range t.nodes {
+			if !hasParent[node.NodeID] {
+				walk(node.NodeID, false, false)
+			}
+		}
+		// Anything the walk never reached, because a detached subtree is still on the page. Same
+		// order as before, appended rather than interleaved: their position is genuinely unknown.
+		for _, node := range t.nodes {
+			walk(node.NodeID, false, false)
+		}
+		// Framed documents whose holder was never found. Same rule, same reason.
+		for _, orphan := range t.orphans {
+			document(orphan)
 		}
 	}
 
-	// From the roots, in the order Chromium listed them. A well-formed tree has one; a page mid-load
-	// can present several, and starting from each is what keeps the whole page rather than the first
-	// fragment of it.
-	for _, node := range nodes {
-		if !hasParent[node.NodeID] {
-			walk(node.NodeID, false)
-		}
+	document(root)
+
+	read := slice{elements: elements, truncated: textCut || controlsCut}
+	if textCut {
+		read.textNext = passed
 	}
-	// Anything the walk never reached, because a detached subtree is still on the page. Same order as
-	// before, appended rather than interleaved: their position is genuinely unknown.
-	for _, node := range nodes {
-		walk(node.NodeID, false)
+	if controlsCut {
+		read.controlsNext = controlsPassed
 	}
-	return elements, truncated
+	return read
 }
 
 // stateOf reports the accessibility properties that change what an act would mean.

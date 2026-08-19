@@ -775,6 +775,13 @@ pub struct SessionBody {
     /// body rather than growing a second one that differs by a single optional field.
     #[serde(default)]
     pub changes_only: bool,
+    /// Where to resume a page's prose, for a snapshot that came back truncated. Same story: only
+    /// `/browser/snapshot` reads it.
+    #[serde(default)]
+    pub text_from: i64,
+    /// The same, for the actionable elements, which are bounded apart from the prose.
+    #[serde(default)]
+    pub controls_from: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -832,7 +839,12 @@ pub async fn post_snapshot(
     match state
         .browser
         .client
-        .snapshot(&row.sidecar_id, body.changes_only)
+        .snapshot(
+            &row.sidecar_id,
+            body.changes_only,
+            body.text_from,
+            body.controls_from,
+        )
         .await
     {
         Ok(snapshot) => axum::Json(snapshot).into_response(),

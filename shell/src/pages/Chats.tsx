@@ -22,7 +22,15 @@ import {
   type ToolCall,
   type Turn,
 } from "../data/chats";
-import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
+import {
+  anyTurnLive,
+  marksBetween,
+  planOf,
+  turnIsLive,
+  unreadTotal,
+  type Mark,
+  type Todo,
+} from "../lib/turns";
 import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import {
   Badge,
@@ -474,7 +482,7 @@ function ChatDetail({
       {transcript.data !== undefined && (
         <Transcript
           turns={transcript.data}
-          precededBy={(pickedUp.data ?? []).length > 0}
+          precededBy={(pickedUp.data?.said ?? []).length > 0}
           chatId={chatId}
         />
       )}
@@ -626,7 +634,7 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
       </p>
     );
   }
-  if (view.data.length === 0) {
+  if (view.data.said.length === 0) {
     return (
       <p className="chats-picked-up-cut">
         this was picked up from a conversation in the editor that nobody spoke in.
@@ -635,18 +643,35 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
   }
   return (
     <>
+      {/* Said above the text, where the missing part would have been, rather than under it as a
+          footnote. A person reads down from the top; the top is exactly where the gap is. */}
+      {view.data.cut && (
+        <p className="chats-picked-up-cut">
+          older messages are not shown — this conversation was read from its recent end
+        </p>
+      )}
       <ul className="chats-said" aria-label="Said in the editor">
-        {view.data.map((said, index) => (
+        {view.data.said.map((said, index) => (
           // Keyed by position: these came from a file, in the order they are in it, and
           // nothing here reorders or removes one. A transcript has no id to key by.
           <li
             key={`said-${index}`}
-            className={said.by_owner ? "chats-said-line chats-said-owner" : "chats-said-line"}
+            className={
+              said.aside
+                ? "chats-said-line chats-said-aside"
+                : said.by_owner
+                  ? "chats-said-line chats-said-owner"
+                  : "chats-said-line"
+            }
           >
-            <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+            {/* No speaker on an aside. It is about the conversation, not a line of it, and a
+                "núcleo" label over it would attribute words the model never said. */}
+            {!said.aside && (
+              <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+            )}
             {/* Text, never markup — this is somebody else's file. `Rich` never emits either:
                 it returns data and this page decides what an element is. */}
-            {said.by_owner ? (
+            {said.aside || said.by_owner ? (
               <p className="chats-said-text">{said.text}</p>
             ) : (
               <div className="chats-said-text">
@@ -737,6 +762,7 @@ function TurnBlock({
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} />}
       {!live && turn.answer !== null && (
         <div className="chats-turn-answer">
@@ -748,6 +774,7 @@ function TurnBlock({
       )}
       <div className="chats-turn-foot">
         <CostLine costUsd={turn.cost_usd} inputTokens={null} outputTokens={null} cachedTokens={null} />
+        <ContextFill fill={turn.contextFill} rotatesAt={turn.rotatesAt} />
         <span className="chats-turn-id">#{turn.id}</span>
       </div>
     </li>
@@ -808,6 +835,32 @@ function RichLineOut({ line }: { line: RichLine }) {
 }
 
 /**
+ * How full the context was, and a word before the daemon starts a new one.
+ *
+ * The rotation used to arrive without a sound. A conversation ran, crossed the ceiling, and the
+ * next turn began remembering nothing — and the first anybody heard of it was the restart mark
+ * drawn after the fact, or a model suddenly asking what they were talking about.
+ *
+ * The ceiling is the daemon's, never this file's. It arrives on every turn precisely so this side
+ * never keeps a copy of it, and a turn that arrives without one draws the count alone rather than
+ * a proportion of a number nobody sent.
+ */
+function ContextFill({ fill, rotatesAt }: { fill: number | null; rotatesAt: number | null }) {
+  if (fill === null) return null;
+  const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
+  if (rotatesAt === null) return <span className="chats-turn-fill">{k(fill)} of context</span>;
+  // Near, not past. Past is too late to be a warning: the turn that crosses the line is the last
+  // one that remembers, and this is drawn under it while the next one is still being typed.
+  const near = fill >= rotatesAt * 0.85;
+  return (
+    <span className={near ? "chats-turn-fill chats-turn-fill-near" : "chats-turn-fill"}>
+      {`${k(fill)} of ${k(rotatesAt)}`}
+      {near && " — the next turn may begin a fresh context"}
+    </span>
+  );
+}
+
+/**
  * The brain and restart marks a transcript draws above one turn.
  *
  * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is
@@ -860,11 +913,42 @@ function LiveAnswer({ turnId }: { turnId: number }) {
   return (
     <>
       {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
+      <Plan todos={planOf(live.data?.did ?? [])} />
       <WhatItDid did={live.data?.did ?? []} />
       <p className="chats-turn-live" ref={end}>
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>
+  );
+}
+
+/**
+ * The plan a turn worked through, which the page had as the word `TodoWrite`.
+ *
+ * A model that writes a list and then works down it is the shape of most real work, and none of it
+ * reached here: the call carries no path and no command, so it arrived as a bare name beside the
+ * others. Watching the ticks move is a good half of what a person is looking at when they look at
+ * the editor, and it was the one thing this page could not show.
+ *
+ * Absent rather than empty when there is none, for the same reason `WhatItDid` is: a heading over
+ * no rows reads as a plan that failed to load, which is a different and worse claim than a turn
+ * that planned nothing.
+ */
+function Plan({ todos }: { todos: Todo[] }) {
+  if (todos.length === 0) return null;
+  return (
+    <ul className="chats-plan" aria-label="The plan">
+      {todos.map((todo, index) => (
+        // Keyed by position: a plan is a list in an order somebody chose, and the same line can
+        // legitimately appear twice.
+        <li key={`todo-${index}`} className={`chats-plan-item chats-plan-${todo.status}`}>
+          <span className="chats-plan-mark" aria-hidden="true">
+            {todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "→" : "·"}
+          </span>
+          <span className="chats-plan-text">{todo.text}</span>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -927,13 +1011,19 @@ function Composer({ chatId }: { chatId: string }) {
   const [text, setText] = useState("");
   const send = useSendMessage(chatId);
 
+  // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
+  // how one of them ends up sending an empty turn six months from now.
+  const say = () => {
+    if (text.trim() === "" || send.isPending) return;
+    send.mutate(text.trim(), { onSuccess: () => setText("") });
+  };
+
   return (
     <form
       className="chats-composer"
       onSubmit={(event) => {
         event.preventDefault();
-        if (text.trim() === "" || send.isPending) return;
-        send.mutate(text.trim(), { onSuccess: () => setText("") });
+        say();
       }}
     >
       <label className="chats-field">
@@ -943,6 +1033,14 @@ function Composer({ chatId }: { chatId: string }) {
           aria-label="Message"
           value={text}
           onChange={(event) => setText(event.target.value)}
+          // Enter sends and Shift+Enter breaks the line, because that is what every chat anybody
+          // has ever used does — and a textarea does the opposite by default, so the habit costs a
+          // reach for the mouse on every single message.
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.shiftKey) return;
+            event.preventDefault();
+            say();
+          }}
         />
       </label>
       <div className="chats-composer-actions">

@@ -394,9 +394,16 @@ impl DaemonClient {
         &self,
         session_id: i64,
         changes_only: bool,
+        text_from: i64,
+        controls_from: i64,
     ) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/browser/snapshot")
-            .json(&serde_json::json!({ "session_id": session_id, "changes_only": changes_only }))
+            .json(&serde_json::json!({
+                "session_id": session_id,
+                "changes_only": changes_only,
+                "text_from": text_from,
+                "controls_from": controls_from,
+            }))
             .send()
             .await
             .map_err(|e| e.to_string())?

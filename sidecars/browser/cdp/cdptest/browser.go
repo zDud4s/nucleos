@@ -38,6 +38,11 @@ type Browser struct {
 	// URL is the WebSocket debugger url to hand to cdp.Dial.
 	URL string
 
+	// NoAutoLoad stops the fake pretending a navigation finishes. Set it to model the page that
+	// never arrives, which is the case a readiness wait exists for and the only one it can get
+	// wrong in the direction that matters.
+	NoAutoLoad bool
+
 	mu       sync.Mutex
 	calls    []Call
 	handlers map[string]Handler
@@ -202,6 +207,15 @@ func (b *Browser) serve(conn net.Conn) {
 			return
 		}
 		writeFrame(conn, encoded)
+
+		// A real browser finishes loading, and the driver now waits to be told so. A fake that
+		// answered `Page.navigate` and then went silent would model a page that never arrives — so
+		// every test that opens anything would sit out the readiness deadline, and the suite would
+		// be measuring a timeout instead of the driver.
+		if incoming.Method == "Page.navigate" && reply["error"] == nil && !b.NoAutoLoad {
+			b.Emit(incoming.SessionID, "Page.loadEventFired", map[string]any{})
+			b.Emit(incoming.SessionID, "Page.lifecycleEvent", map[string]any{"name": "networkAlmostIdle"})
+		}
 	}
 }
 

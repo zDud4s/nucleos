@@ -184,6 +184,46 @@ func newSite(t *testing.T) *site {
 			r.URL.Query().Get("href"))
 	})
 
+	// A table, because the accessibility tree HAS the grid and the question is only what Chromium
+	// calls its parts. Three roles are assumed by the snapshot — row, cell, columnheader — and an
+	// assumption about role names is exactly the kind this repository has got wrong three times
+	// against a hand-built tree and only ever settled here.
+	mux.HandleFunc("/table", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>table</title><table>
+			<caption>Quarterly</caption>
+			<tr><th>Quarter</th><th>Revenue</th></tr>
+			<tr><td>Q1</td><td>-11%</td></tr>
+			<tr><td><a href="/reading">Q2</a></td><td>+4%</td></tr>
+			</table>`)
+	})
+
+	// The page the verb group works on.
+	//
+	// It says out loud what reached it, which is the only way to tell "the key arrived" from "the
+	// page did nothing". Typing goes through Input.insertText — what a paste does — so a box that
+	// reacts to a keystroke never heard one, and the evidence for that was a page that did not
+	// change, indistinguishable from a search with no results.
+	mux.HandleFunc("/controls", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>controls</title><body>
+			<h1>Controls</h1>
+			<label>Search <input id=q type=text></label>
+			<label>Where <select id=where>
+				<option value=pt>Portugal</option>
+				<option value=es>Spain</option>
+			</select></label>
+			<div style="height: 4000px"></div>
+			<script>
+			function beacon(what){ new Image().src = '/beacon?what=' + encodeURIComponent(what); }
+			document.getElementById('q').addEventListener('keydown', e => beacon('keydown-' + e.key));
+			document.getElementById('where').addEventListener('change', e => beacon('chose-' + e.target.value));
+			window.addEventListener('scroll', () => { if (window.scrollY > 100) { beacon('scrolled'); } });
+			</script>`)
+	})
+
 	// Two pages for the profile group. They are about identity rather than the fence: one hands the
 	// browser a cookie, the other says which cookie came back — which is how "the profile is the
 	// identity" (spec §4.2) becomes something a test can observe from outside the browser.
