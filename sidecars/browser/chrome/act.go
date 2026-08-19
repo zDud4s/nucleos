@@ -71,7 +71,14 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 
 	d.mu.Lock()
 	before := entry.reportedUpTo
+	pageSession, frameID := entry.cdp, entry.frameID
 	d.mu.Unlock()
+
+	// Watched from before the action. A click and the navigation it causes are not synchronous
+	// either, which is the same fact the refusal window rests on, applied to the other thing an act
+	// can do to a page.
+	moved := d.watchPage(pageSession, frameID)
+	defer moved.stop()
 
 	switch action.Kind {
 	case browser.ActionClick:
@@ -94,10 +101,33 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	d.mu.Lock()
 	entry.reportedUpTo = consumed
 	d.mu.Unlock()
+
+	result := browser.Done()
 	if refused != nil {
-		return browser.Refused(refused.Consequence, refused.Detail), nil
+		result = browser.Refused(refused.Consequence, refused.Detail)
 	}
-	return browser.Done(), nil
+	// Both, and in this order: an act can be refused AND move the page. A click that navigates and
+	// also fires a blocked beacon is one act with two things worth saying about it, and reporting
+	// only the first would leave the agent holding refs to a document that is gone.
+	return d.afterAct(ctx, entry, moved, result), nil
+}
+
+// afterAct says what the act did to the page, when it did anything.
+//
+// The expensive half — waiting for the new page, re-reading where it landed — runs only when the
+// document actually changed, so the ordinary click that opens a menu still costs one round trip.
+func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, result browser.ActResult) browser.ActResult {
+	if !moved.sawNavigation() {
+		return result
+	}
+	result.Navigated = true
+	result.StillLoading = d.awaitReady(ctx, moved)
+	d.forgetRefs(entry)
+	d.readTargetInfo(ctx, entry)
+	d.mu.Lock()
+	result.URL = entry.final
+	d.mu.Unlock()
+	return result
 }
 
 func (d *Driver) typeInto(ctx context.Context, on cdp.SessionID, objectID, text string) error {

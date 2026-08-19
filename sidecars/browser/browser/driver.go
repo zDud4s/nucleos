@@ -88,6 +88,11 @@ type Session struct {
 	FinalURL     string    `json:"final_url"`
 	Title        string    `json:"title"`
 	Refusal      *Refusal  `json:"refusal,omitempty"`
+	// StillLoading says the page had not finished arriving when this answer was produced. Opening
+	// waits for it — the alternative was a first snapshot that raced the load and read a
+	// script-rendered page as an empty one — but the wait is bounded, and when the bound is reached
+	// the agent is TOLD rather than handed a silence that looks like readiness.
+	StillLoading bool `json:"still_loading,omitempty"`
 }
 
 // Element is one thing on the page the agent may refer to.
@@ -212,6 +217,17 @@ type Refusal struct {
 type ActResult struct {
 	Outcome Outcome  `json:"outcome"`
 	Refusal *Refusal `json:"refusal,omitempty"`
+	// Navigated says the act replaced the document, so every ref the agent is holding names
+	// something that is gone. Said rather than left to be discovered: an act reported only as "done"
+	// after a click that changed the page leaves the agent operating a page it has never read, and
+	// the ref it acts on next resolves against a document that no longer exists.
+	Navigated bool `json:"navigated,omitempty"`
+	// URL is where the page ended up, filled only when the act moved it. Only then, because that is
+	// the only moment it is NEWS — the rest of the time a snapshot already carries it, and paying a
+	// round trip per act to repeat something unchanged is how a cheap verb stops being cheap.
+	URL string `json:"url,omitempty"`
+	// StillLoading has the same meaning as on Session, for the page this act navigated to.
+	StillLoading bool `json:"still_loading,omitempty"`
 }
 
 // Valid reports whether an ActResult is internally consistent. A driver that returns a refusal with

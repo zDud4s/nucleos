@@ -52,6 +52,13 @@ type Driver struct {
 	// read only after it, which is what makes it safe without a lock.
 	swept    chan struct{}
 	sweepErr error
+
+	// How long a page is given to arrive, and how long after its load event it is given to go
+	// quiet. Fields rather than constants so a test can shorten them: the interesting case is the
+	// page that never finishes, and asserting it against the real bound would cost the suite
+	// fifteen seconds to learn nothing it could not learn in fifty milliseconds.
+	readyWithin time.Duration
+	idleGrace   time.Duration
 }
 
 type session struct {
@@ -62,6 +69,9 @@ type session struct {
 	requested string
 	final     string
 	title     string
+	// frameID is this target's top frame, kept so a wait for "the page is ready" can ignore the
+	// lifecycle of every subframe. A page whose advertisement finished loading has not finished.
+	frameID string
 	// reportedUpTo is how far into the refusal record this session has already been told. It is what
 	// makes a refusal that lands after an act's settle window arrive on the NEXT act instead of being
 	// lost — no fixed window can catch every one, and silence is the wrong failure.
@@ -158,6 +168,8 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		targets:      map[string]browser.SessionID{},
 		cdpToSession: map[cdp.SessionID]browser.SessionID{},
 		swept:        make(chan struct{}),
+		readyWithin:  readyDeadline,
+		idleGrace:    idleGrace,
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)
@@ -301,6 +313,11 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	if _, err := d.conn.Call(ctx, cdpSession, "Page.enable", nil); err != nil {
 		return browser.Session{}, fmt.Errorf("enabling page domain: %w", err)
 	}
+	// Best effort, both of them. Without lifecycle events a wait falls back to the load event, which
+	// is earlier than it should be but is not wrong; refusing to open over it would trade a real
+	// capability for a better wait.
+	_, _ = d.conn.Call(ctx, cdpSession, "Page.setLifecycleEventsEnabled", map[string]any{"enabled": true})
+	mainFrame := d.mainFrameOf(ctx, cdpSession)
 
 	d.mu.Lock()
 	d.counter++
@@ -311,6 +328,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		cdp:          cdpSession,
 		mode:         browser.ModeAgent,
 		requested:    req.URL,
+		frameID:      mainFrame,
 		refs:         map[string]nodeKey{},
 		refByNode:    map[nodeKey]string{},
 		frames:       map[cdp.SessionID]frameRef{},
@@ -326,6 +344,11 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	// Counted BEFORE the navigation, so a refusal the fence raises while the navigation is in
 	// flight is attributable to it and not lost.
 	before := d.refusalCount()
+
+	// Subscribed before the navigate call for the same reason: a page that finishes quickly would
+	// otherwise fire everything worth hearing before anything was listening.
+	ready := d.watchPage(cdpSession, mainFrame)
+	defer ready.stop()
 
 	navigated, err := d.conn.Call(ctx, cdpSession, "Page.navigate", map[string]any{"url": req.URL})
 	if err != nil {
@@ -353,6 +376,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		return browser.Session{}, fmt.Errorf("navigating to %s: %s", req.URL, outcome.ErrorText)
 	}
 
+	stillLoading := d.awaitReady(ctx, ready)
 	d.readTargetInfo(ctx, entry)
 	return browser.Session{
 		ID:           id,
@@ -360,6 +384,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		RequestedURL: entry.requested,
 		FinalURL:     entry.final,
 		Title:        entry.title,
+		StillLoading: stillLoading,
 	}, nil
 }
 
