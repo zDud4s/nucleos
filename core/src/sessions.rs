@@ -283,6 +283,12 @@ fn spoken_by_the_owner(row: &serde_json::Value) -> Option<String> {
     if row.get("isMeta").and_then(|v| v.as_bool()) == Some(true) {
         return None;
     }
+    // The editor summarising itself. A compaction is written as a user row, with no `isMeta` and
+    // no `isSidechain`, carrying thousands of words the machine wrote ABOUT the conversation --
+    // and it passes every other guard here. `spoken` turns it into a note; nothing quotes it.
+    if is_compaction(row) {
+        return None;
+    }
     match row.get("message")?.get("content")? {
         serde_json::Value::String(text) => typed(text),
         serde_json::Value::Array(blocks) => blocks
@@ -348,6 +354,16 @@ fn spoken(row: &serde_json::Value) -> Option<Said> {
     if row.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
         return None;
     }
+    // A note rather than a deletion. The compaction is the most load-bearing event in a long
+    // session: everything above it is what the model no longer remembers, and a reader who does not
+    // know it happened cannot tell why the conversation seems to restart mid-thought.
+    if is_compaction(row) {
+        return Some(Said {
+            by_owner: false,
+            text: "the editor ran out of context here and summarised what came before".to_string(),
+            aside: true,
+        });
+    }
     match row.get("type").and_then(|v| v.as_str())? {
         "user" => spoken_by_the_owner(row).map(|text| Said {
             by_owner: true,
@@ -361,6 +377,11 @@ fn spoken(row: &serde_json::Value) -> Option<Said> {
         }),
         _ => None,
     }
+}
+
+/// Whether a row is the editor's own summary of a conversation that ran out of context.
+fn is_compaction(row: &serde_json::Value) -> bool {
+    row.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// The note left where a subagent worked.
@@ -805,6 +826,66 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// The editor's own context ran out, and the summary of it is not something anybody said.
+    ///
+    /// A compaction is written as `"type": "user"`, with no `isMeta` and no `isSidechain` -- it
+    /// passes every other guard here, and what it carries is thousands of words the machine wrote
+    /// about the conversation, attributed to the person reading it back. Twenty-five of them sat in
+    /// six real transcripts on this machine.
+    ///
+    /// It is a note and not a deletion, because the compaction is the most load-bearing event in a
+    /// long session: everything above it is what the model no longer remembers, and a reader with
+    /// no idea it happened cannot tell why the conversation seems to restart mid-thought.
+    #[test]
+    fn a_compaction_is_a_note_and_never_something_the_person_said() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("arranja o parser"),
+                serde_json::json!({
+                    "type": "user", "cwd": "", "isCompactSummary": true,
+                    "message": {"content": "This session is being continued from a previous conversation"}
+                }),
+                replied("arranjado"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert!(read[1].aside, "the compaction was attributed to somebody");
+        assert!(!read[1].by_owner);
+        assert!(
+            !read[1].text.contains("This session is being continued"),
+            "the machine's summary was printed as a message: {}",
+            read[1].text
+        );
+    }
+
+    /// And it never names the conversation either. A session that begins where a compaction left
+    /// off would otherwise be titled with the first line of a summary nobody wrote.
+    #[test]
+    fn a_compaction_does_not_name_a_conversation() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                serde_json::json!({
+                    "type": "user", "cwd": "", "isCompactSummary": true,
+                    "message": {"content": "This session is being continued from a previous conversation"}
+                }),
+                said("e agora o resto"),
+            ],
+        );
+
+        let found = discover(&store.root(), 10);
+
+        assert_eq!(found[0].title.as_deref(), Some("e agora o resto"));
     }
 
     /// A subagent leaves a gap, and the gap is now named.
