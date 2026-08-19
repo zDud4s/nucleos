@@ -523,6 +523,44 @@
   background: var(--surface-sunken);
 }
 
+/* Bounded, and scrolling inside itself. Nothing in this column may grow with the length of a
+   conversation: the panel is beside the list, not instead of it. */
+.chats-sample {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.chats-sample-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.chats-sample-text {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  /* Three lines of each, and no more: this is for recognising a conversation. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.chats-sample-aside .chats-sample-text {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
 /* ------------------------------------------ who said it, and how it reads -- */
 
 .chats-turn-who {

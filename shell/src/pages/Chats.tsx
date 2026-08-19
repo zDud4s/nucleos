@@ -290,6 +290,54 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
 }
 
 /**
+ * The tail of a conversation, enough to recognise it by.
+ *
+ * NOT `PickedUp`, which draws the whole thing. This is a 20rem column beside the conversation list,
+ * and rendering two hundred messages into it made the panel taller than the page and spilled the
+ * preview out from under its own border. What a person is doing here is telling two afternoons
+ * apart, and the last few lines do that.
+ *
+ * The END of it, because that is where a conversation is picked up from — the top of a long session
+ * is the part nobody is coming back for.
+ */
+const SAMPLED = 6;
+
+function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
+  if (view.data === undefined && !view.isError) {
+    return <p className="chats-loading">reading what was said in the editor…</p>;
+  }
+  if (view.data === undefined) {
+    return <p className="chats-picked-up-unread">what was said in the editor could not be read</p>;
+  }
+  if (view.data.said.length === 0) {
+    return <p className="chats-picked-up-cut">nobody spoke in this one.</p>;
+  }
+  const tail = view.data.said.slice(-SAMPLED);
+  return (
+    <>
+      {(view.data.cut || tail.length < view.data.said.length) && (
+        <p className="chats-picked-up-cut">the last {tail.length} of it — the rest opens with it</p>
+      )}
+      <ul className="chats-sample" aria-label="What was said, at the end">
+        {tail.map((said, index) => (
+          <li
+            key={`sample-${index}`}
+            className={said.aside ? "chats-sample-line chats-sample-aside" : "chats-sample-line"}
+          >
+            {!said.aside && (
+              <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+            )}
+            {/* Text, never markup, and never `Rich` either: a sample is for recognising a
+                conversation, and a code block in a 20rem column is not that. */}
+            <p className="chats-sample-text">{said.text}</p>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+/**
  * The conversations you were having in the editor, and the one press that continues one here.
  *
  * A door of its own. Everything this page could already do with an editor session sat inside the
@@ -353,7 +401,7 @@ function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
 
       {chosen !== undefined && (
         <div className="chats-editor-chosen">
-          <PickedUp view={said} />
+          <Sample view={said} />
           {!chosen.tools && <NoTools session={chosen} />}
           <Button
             type="button"

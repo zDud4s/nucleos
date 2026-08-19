@@ -480,6 +480,25 @@ describe("the editor's sessions, and the door to them", () => {
     expect(await screen.findByRole("button", { name: /arranja o parser de datas/i })).toBeTruthy();
   });
 
+  it("shows a sample and not the whole conversation, which does not fit in a picker", async () => {
+    // The picker is a 20rem column. Drawing two hundred messages into it made the panel taller than
+    // the page and spilled the preview out from under its own border.
+    const many = Array.from({ length: 40 }, (_, at) => ({
+      by_owner: at % 2 === 0,
+      text: `linha ${at}`,
+      aside: false,
+    }));
+    await openTheEditorDoor([ideSession()], { "aaaa-1111": { cut: false, said: many } });
+
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+
+    const preview = await screen.findByLabelText(/what was said/i);
+    expect(within(preview).getAllByRole("listitem").length).toBeLessThanOrEqual(6);
+    // The end of it, which is where a conversation is picked up from.
+    expect(within(preview).getByText("linha 39")).toBeTruthy();
+    expect(within(preview).queryByText("linha 0")).toBeNull();
+  });
+
   it("shows what was said in one before it is picked up, not after", async () => {
     // The whole reason this door exists. Choosing by a cut title was choosing blind: you found out
     // which conversation it was by picking it up and reading what came back.
