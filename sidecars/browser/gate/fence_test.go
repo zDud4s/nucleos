@@ -92,7 +92,7 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	snapshot, err := driver.Snapshot(ctx, session.ID, false)
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	snapshot, err := driver.Snapshot(ctx, session.ID, false)
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open the control page: %v", err)
 	}
-	controlSnapshot, err := driver.Snapshot(ctx, allowed.ID, false)
+	controlSnapshot, err := driver.Snapshot(ctx, allowed.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot the control page: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestASnapshotCarriesTheProseAndTheStateOfWhatItShows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	snapshot, err := driver.Snapshot(ctx, session.ID, false)
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}

@@ -55,7 +55,7 @@ func TestAKeyReachesThePageAndTypingDoesNot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	snapshot, err := driver.Snapshot(ctx, id, false)
+	snapshot, err := driver.Snapshot(ctx, id, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestChoosingAnOptionIsAChoiceAsFarAsThePageIsConcerned(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	snapshot, err := driver.Snapshot(ctx, id, false)
+	snapshot, err := driver.Snapshot(ctx, id, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestGoingBackReturnsToThePageBefore(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	snapshot, err := driver.Snapshot(ctx, session.ID, false)
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}

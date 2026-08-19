@@ -58,7 +58,7 @@ func TestTheSnapshotReachesInsideACrossSiteFrame(t *testing.T) {
 	var last browser.Snapshot
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		last, err = driver.Snapshot(ctx, session.ID, false)
+		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 		if err != nil {
 			t.Fatalf("snapshot: %v", err)
 		}

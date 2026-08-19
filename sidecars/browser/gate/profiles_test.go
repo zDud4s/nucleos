@@ -184,7 +184,7 @@ func TestTwoProfilesRunAtOnceWithoutInheritingEachOther(t *testing.T) {
 	// is talking to a browser that closed, and its next call fails.
 	for _, session := range []browser.Session{logged, stranger} {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if _, err := browsers.Snapshot(ctx, session.ID, false); err != nil {
+		if _, err := browsers.Snapshot(ctx, session.ID, browser.SnapshotRequest{}); err != nil {
 			t.Errorf("snapshot on %s: %v", session.ID, err)
 		}
 		cancel()

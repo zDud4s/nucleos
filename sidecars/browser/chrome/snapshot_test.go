@@ -1,6 +1,7 @@
 package chrome
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,7 +14,7 @@ import (
 func snapshotFrom(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 	driver := &Driver{}
 	entry := newTestSession()
-	collected, truncated := collect(oneDocument(nodes))
+	collected, truncated, _ := collect(oneDocument(nodes), 0)
 	elements, _ := driver.name(entry, collected, false)
 	return elements, backends(entry.refs), truncated
 }
@@ -191,7 +192,7 @@ func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 	driver := &Driver{}
 	entry := newTestSession()
 	take := func(nodes []axNode) map[string]string {
-		collected, _ := collect(oneDocument(nodes))
+		collected, _, _ := collect(oneDocument(nodes), 0)
 		elements, _ := driver.name(entry, collected, false)
 		byName := map[string]string{}
 		for _, element := range elements {
@@ -236,7 +237,7 @@ func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 	driver := &Driver{}
 	entry := newTestSession()
 	take := func(nodes []axNode, changesOnly bool) ([]browser.Element, []string) {
-		collected, _ := collect(oneDocument(nodes))
+		collected, _, _ := collect(oneDocument(nodes), 0)
 		return driver.name(entry, collected, changesOnly)
 	}
 
@@ -275,5 +276,97 @@ func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 	again, goneAgain := take(changed, true)
 	if len(again) != 0 || len(goneAgain) != 0 {
 		t.Errorf("nothing moved and something was reported: %+v %v", again, goneAgain)
+	}
+}
+
+// sliceFrom is snapshotFrom with the prose cursor, for the tests that are about continuation.
+func sliceFrom(nodes []axNode, textFrom int) ([]browser.Element, bool, int) {
+	driver := &Driver{}
+	collected, truncated, next := collect(oneDocument(nodes), textFrom)
+	elements, _ := driver.name(newTestSession(), collected, false)
+	return elements, truncated, next
+}
+
+// paragraphs builds a page of numbered blocks, each big enough that a handful fills the budget.
+func paragraphs(count, size int) []axNode {
+	nodes := make([]axNode, 0, count)
+	for i := 0; i < count; i++ {
+		body := fmt.Sprintf("[%02d]%s", i, strings.Repeat("x", size-4))
+		nodes = append(nodes, text(fmt.Sprintf("p%d", i), "", body))
+	}
+	return nodes
+}
+
+func proseOf(elements []browser.Element) string {
+	var all strings.Builder
+	for _, element := range elements {
+		if element.Role == "text" {
+			all.WriteString(element.Name)
+		}
+	}
+	return all.String()
+}
+
+// TestACutPageCanBeReadOnFromWhereItStopped.
+//
+// Truncation without a continuation is a dead end. The budget is not about the viewport, so no
+// amount of scrolling moves it: the agent is told the page goes on and has no verb that reaches the
+// rest, which is a worse position than not being told at all — it knows something is there and
+// cannot get it.
+func TestACutPageCanBeReadOnFromWhereItStopped(t *testing.T) {
+	nodes := paragraphs(45, 1000)
+
+	first, truncated, next := sliceFrom(nodes, 0)
+	if !truncated {
+		t.Fatal("45000 characters against a 20000 budget must report truncation")
+	}
+	if next <= 0 {
+		t.Fatal("a cut snapshot must say where to read on from")
+	}
+	if !strings.Contains(proseOf(first), "[00]") {
+		t.Error("the first slice does not start at the beginning")
+	}
+
+	second, stillMore, _ := sliceFrom(nodes, next)
+	prose := proseOf(second)
+	if strings.Contains(prose, "[00]") {
+		t.Error("the second slice repeated what the first already delivered")
+	}
+	if !strings.Contains(prose, "[20]") {
+		t.Errorf("the second slice does not carry on where the first stopped; it had: %.40q", prose)
+	}
+	if !stillMore {
+		t.Error("forty-five blocks do not fit in two slices of twenty; the second must still offer more")
+	}
+}
+
+// TestTheCutIsAPrefixAndNotASieve.
+//
+// Skip-and-continue was the shape this had: a paragraph too big for what was left of the budget was
+// dropped, and a shorter one further down was let through. The result is a page nobody wrote, and
+// nothing in the snapshot distinguishes it from the page.
+func TestTheCutIsAPrefixAndNotASieve(t *testing.T) {
+	nodes := append(paragraphs(21, 1000), text("short", "", "[99]tail"))
+
+	elements, truncated, _ := sliceFrom(nodes, 0)
+	if !truncated {
+		t.Fatal("this page is over the budget")
+	}
+	if strings.Contains(proseOf(elements), "[99]") {
+		t.Error("a short block from past the cut was let through while a long one before it was dropped")
+	}
+}
+
+// TestAWholePageOffersNoContinuation.
+//
+// The offer is the presence of the offset. A page that fits must not carry one, or an agent that
+// follows it politely reads the same page twice.
+func TestAWholePageOffersNoContinuation(t *testing.T) {
+	elements, truncated, next := sliceFrom(paragraphs(3, 100), 0)
+	if truncated || next != 0 {
+		t.Errorf("a page that fits was reported as cut: truncated=%v next=%d", truncated, next)
+	}
+	if len(elements) != 3 {
+		t.Errorf("expected the whole page: %+v", elements)
 	}
 }

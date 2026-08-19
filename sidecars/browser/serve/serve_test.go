@@ -266,7 +266,7 @@ func (halfADriver) Name() string { return "half" }
 func (halfADriver) Open(context.Context, browser.OpenRequest) (browser.Session, error) {
 	return browser.Session{}, browser.ErrUnsupported
 }
-func (halfADriver) Snapshot(context.Context, browser.SessionID, bool) (browser.Snapshot, error) {
+func (halfADriver) Snapshot(context.Context, browser.SessionID, browser.SnapshotRequest) (browser.Snapshot, error) {
 	return browser.Snapshot{}, browser.ErrUnsupported
 }
 func (halfADriver) Act(context.Context, browser.SessionID, browser.Action) (browser.ActResult, error) {

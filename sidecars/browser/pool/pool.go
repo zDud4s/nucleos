@@ -178,12 +178,12 @@ func (p *Pool) Open(ctx context.Context, req browser.OpenRequest) (browser.Sessi
 	return session, nil
 }
 
-func (p *Pool) Snapshot(ctx context.Context, id browser.SessionID, changesOnly bool) (browser.Snapshot, error) {
+func (p *Pool) Snapshot(ctx context.Context, id browser.SessionID, req browser.SnapshotRequest) (browser.Snapshot, error) {
 	session, err := p.lookup(id)
 	if err != nil {
 		return browser.Snapshot{}, err
 	}
-	snapshot, err := session.holder.driver.Snapshot(ctx, session.inner, changesOnly)
+	snapshot, err := session.holder.driver.Snapshot(ctx, session.inner, req)
 	if err != nil {
 		return browser.Snapshot{}, err
 	}

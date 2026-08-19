@@ -26,7 +26,7 @@ import (
 // A ref can only name something a snapshot actually showed. A CSS selector can be synthesised by the
 // agent for an element it never saw — including one a page's text talked it into. Refs make "act on
 // something that was not in the snapshot" unrepresentable rather than merely discouraged.
-func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly bool) (browser.Snapshot, error) {
+func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser.SnapshotRequest) (browser.Snapshot, error) {
 	entry, err := d.lookup(id)
 	if err != nil {
 		return browser.Snapshot{}, err
@@ -37,8 +37,8 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly
 		return browser.Snapshot{}, err
 	}
 
-	collected, truncated := collect(root)
-	elements, gone := d.name(entry, collected, changesOnly)
+	collected, truncated, next := collect(root, req.TextFrom)
+	elements, gone := d.name(entry, collected, req.ChangesOnly)
 
 	url, title := d.locate(ctx, entry.cdp)
 	if url != "" {
@@ -54,8 +54,9 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly
 		Title:     entry.title,
 		Elements:  elements,
 		Truncated: truncated,
+		TextNext:  next,
 		Gone:      gone,
-		Partial:   changesOnly,
+		Partial:   req.ChangesOnly,
 	}, nil
 }
 
@@ -165,9 +166,16 @@ type found struct {
 // It takes a tree and not a node list because a page is not always one document: a cross-site frame
 // is a separate target with a separate tree, and it is spliced in at the element that holds it for
 // the same reason the walk exists at all.
-func collect(root *tree) ([]found, bool) {
+//
+// textFrom resumes prose that a previous snapshot could not fit, and the returned offset is where
+// this one stopped. Truncation is terminal for prose rather than skip-and-continue: a reading that
+// dropped one long paragraph and then included a short one from further down would be a page nobody
+// wrote, and the agent has no way to tell that from the page.
+func collect(root *tree, textFrom int) ([]found, bool, int) {
 	elements := make([]found, 0, len(root.nodes))
-	spent, truncated := 0, false
+	// spent is what this slice delivered; passed is where the prose has got to overall, and is what
+	// the next slice starts from.
+	spent, passed, truncated := 0, 0, false
 
 	// One pass per document. Node ids are per document — two documents both call their root "1" —
 	// so the maps below are rebuilt for each rather than shared, and a framed document is walked by
@@ -232,15 +240,21 @@ func collect(root *tree) ([]found, bool) {
 					// Dropped when some control is already called this. It costs the odd line of
 					// prose that happens to repeat a label, and it buys the agent never seeing the
 					// same words twice in two roles.
-					if name != "" && !named[name] {
-						if spent+len(name) > textBudget {
-							truncated = true
-						} else {
-							spent += len(name)
-							elements = append(elements, found{
-								element: browser.Element{Role: "text", Name: name},
-							})
-						}
+					switch {
+					case name == "" || named[name] || truncated:
+						// Nothing, and past the cut nothing more: everything after it belongs to
+						// the next slice, in the order the page has it.
+					case passed < textFrom:
+						// Already delivered by an earlier slice.
+						passed += len(name)
+					case spent+len(name) > textBudget:
+						truncated = true
+					default:
+						spent += len(name)
+						passed += len(name)
+						elements = append(elements, found{
+							element: browser.Element{Role: "text", Name: name},
+						})
 					}
 				}
 			}
@@ -278,7 +292,10 @@ func collect(root *tree) ([]found, bool) {
 	}
 
 	document(root)
-	return elements, truncated
+	if !truncated {
+		return elements, false, 0
+	}
+	return elements, true, passed
 }
 
 // stateOf reports the accessibility properties that change what an act would mean.

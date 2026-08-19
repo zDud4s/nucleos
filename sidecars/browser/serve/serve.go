@@ -84,6 +84,9 @@ type SessionRequest struct {
 	// track of what it saw last gets a reading it can act on rather than a difference against
 	// something it no longer remembers.
 	ChangesOnly bool `json:"changes_only,omitempty"`
+	// TextFrom resumes a page's prose where the last snapshot stopped. Absent means the beginning,
+	// which is where an agent that has not been cut off yet always is.
+	TextFrom int `json:"text_from,omitempty"`
 }
 
 // ActRequest is one action against a session.
@@ -139,7 +142,10 @@ func snapshotHandler(driver browser.Driver) http.HandlerFunc {
 			http.Error(w, "session_id is required", http.StatusBadRequest)
 			return
 		}
-		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID), request.ChangesOnly)
+		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID), browser.SnapshotRequest{
+			ChangesOnly: request.ChangesOnly,
+			TextFrom:    request.TextFrom,
+		})
 		if err != nil {
 			writeDriverError(w, "snapshot", err)
 			return

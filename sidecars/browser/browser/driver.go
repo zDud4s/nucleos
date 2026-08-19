@@ -121,6 +121,22 @@ type Element struct {
 	State []string `json:"state,omitempty"`
 }
 
+// SnapshotRequest is what to read and how much of it.
+//
+// A struct rather than a growing list of parameters, because every field here is an ANSWER to a
+// question about cost: a reading of a whole long page is correct and can be most of a turn, so the
+// caller gets to say which part of it it needs.
+type SnapshotRequest struct {
+	// ChangesOnly asks for what moved since the last snapshot of this session instead of the whole
+	// page. The same reading, filtered — never a different one.
+	ChangesOnly bool
+	// TextFrom resumes prose at a character offset, which is what makes truncation survivable. A
+	// snapshot that says it was cut and offers no way to see the rest is a dead end: the agent knows
+	// something is there and has no verb that reaches it, because the budget is not about the
+	// viewport and no amount of scrolling moves it. Pass back the TextNext of the previous snapshot.
+	TextFrom int
+}
+
 // Snapshot is the accessibility view of a page: what is there, what it is called, and what it says.
 type Snapshot struct {
 	SessionID SessionID `json:"session_id"`
@@ -131,6 +147,9 @@ type Snapshot struct {
 	// Said rather than implied: an agent that cannot tell a short page from a cut-off one will
 	// conclude the rest does not exist, which is a worse failure than being told to scroll.
 	Truncated bool `json:"truncated,omitempty"`
+	// TextNext is where the prose stopped, and is what to pass as TextFrom to read on. Set only when
+	// Truncated is, so its presence is the offer and its absence means there is nothing left.
+	TextNext int `json:"text_next,omitempty"`
 	// Gone lists refs that were in the previous snapshot and are not on the page now. Only filled on
 	// a changes-only read, where it is the half that omission cannot express: a full snapshot says
 	// an element is gone by not containing it, and a partial one cannot say anything by silence.
@@ -329,10 +348,9 @@ type Driver interface {
 	// Open starts a session. It MUST fail with ErrFenceNotAttached rather than navigate without
 	// the fence in place, in agent mode.
 	Open(ctx context.Context, req OpenRequest) (Session, error)
-	// Snapshot returns the accessibility view. Cheap enough to call between every action.
-	// Snapshot reads the page. `changesOnly` asks for what moved since the previous snapshot of this
-	// session instead of the whole page — the same reading, filtered, never a different one.
-	Snapshot(ctx context.Context, id SessionID, changesOnly bool) (Snapshot, error)
+	// Snapshot returns the accessibility view. Cheap enough to call between every action, and the
+	// request says which part of it is wanted — see SnapshotRequest.
+	Snapshot(ctx context.Context, id SessionID, req SnapshotRequest) (Snapshot, error)
 	// Act performs one action. A fence refusal is a value, not an error.
 	Act(ctx context.Context, id SessionID, action Action) (ActResult, error)
 	// Screenshot returns PNG bytes, for a person to look at.

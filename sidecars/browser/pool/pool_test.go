@@ -210,7 +210,7 @@ func TestSessionsFromDifferentBrowsersDoNotCollide(t *testing.T) {
 	}
 
 	// And the id the caller was given is the id it keeps hearing, in both directions.
-	snapshot, err := pool.Snapshot(context.Background(), second.ID, false)
+	snapshot, err := pool.Snapshot(context.Background(), second.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
