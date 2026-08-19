@@ -1806,6 +1806,13 @@ mod tests {
 
     /// The exact set, not a subset.
     ///
+    /// **The fourth list a new tool has to be added to**, and the one nobody counts: the other three
+    /// are `TOOL_EFFECTS`, the router itself, and `every_tool_name`. This is the only one written out
+    /// by hand, so it is the only one that fails by SILENCE elsewhere and by a diff here. Adding a
+    /// tool and forgetting this is a red test with a hundred-word diff, which is the cheap failure —
+    /// the expensive one would have been forgetting `TOOL_EFFECTS`, and
+    /// `every_registered_tool_is_classified` is what makes that impossible.
+    ///
     /// This is what an agent can reach, and the mail tools make the list load-bearing rather than
     /// tidy: `get_email` hands it untrusted third-party text, and from that moment every write tool
     /// beside it is something a stranger's words could try to steer. `list_files` reads the
@@ -1840,6 +1847,12 @@ mod tests {
                 "get_email_queue",
                 "get_kill",
                 "get_run",
+                // The pair, and their being two rather than one is the security boundary the
+                // `TOOL_EFFECTS` comment argues: `permitted_after_untrusted` reads that table BY
+                // NAME, so a single tool would have had to be `ReadsOwn` and a turn holding a
+                // stranger's PR body could then have written to GitHub.
+                "github_act",
+                "github_read",
                 "list_files",
                 "list_projects",
                 "list_proposals",

@@ -3119,13 +3119,19 @@ mod tests {
 
     /// The CONTENTS of this file are the policy, so writing it is granting autonomy — and a run that
     /// could append a line would be signing its own permission slip.
+    ///
+    /// The three spellings the sibling tests use, and the cwd they use with them. Written first with
+    /// a POSIX cwd and a Windows path in the same list, which is a `deny` for being outside the
+    /// workspace before this branch is ever reached — a containment failure wearing a governance
+    /// test's name.
     #[test]
     fn writing_ai_github_yaml_asks_for_approval() {
-        let cwd = Some(Path::new("/work"));
+        let cwd = Some(Path::new(r"C:\work\repo"));
         for path in [
             ".ai/github.yaml",
-            "/work/.ai/github.yaml",
-            r"C:\work\.ai\github.yaml",
+            r".ai\github.yaml",
+            r"C:\work\repo\.ai\github.yaml",
+            r"C:\work\repo\src\..\.ai\github.yaml",
         ] {
             assert_classification(
                 classify("Write", &json!({ "file_path": path }), cwd),
