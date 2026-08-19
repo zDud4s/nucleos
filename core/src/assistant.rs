@@ -579,6 +579,33 @@ pub async fn send_message(
         Some(turn) => turn.prompt_for(text),
         None => text.to_string(),
     };
+    // The conversation so far, for a turn that has no session to hold it.
+    //
+    // `resume` is `None` on a first turn — where there is nothing to replay and this adds nothing —
+    // and on a ROTATED one, which is the case this exists for. The daemon refuses to resume past
+    // `CONTEXT_ROTATION_TOKENS`, and past anything that read third-party text, and then mints a
+    // fresh session; without this the model on the far side of that line begins remembering
+    // nothing while the transcript above it reads as one unbroken conversation.
+    //
+    // It bites hardest on a conversation picked up from the editor: one arrives carrying a context
+    // somebody else's session already filled, often past the ceiling on the first turn here — so
+    // continuing one could mean exactly one continued turn and then a stranger.
+    //
+    // The same answer the LOCAL path has always given, for the same reason and through the same
+    // function: no session to resume, so the exchanges are read back instead. A failure to read
+    // them is not a failure of the turn — a model answering without the history is worse than one
+    // answering with it, and better than one that refuses.
+    let prompt = match &resume {
+        Some(_) => prompt,
+        None => match recent_exchanges(&state.pool, chat_id).await {
+            Ok(history) if !history.is_empty() => replayed(&history, &prompt),
+            Ok(_) => prompt,
+            Err(error) => {
+                tracing::warn!(%error, chat_id, "could not read the conversation to replay it");
+                prompt
+            }
+        },
+    };
     // An errand's folder wins over the chat's directory, and its policy wins over `tool_policy_for`.
     //
     // The directory, because an errand's turn runs IN its folder so a relative path the model writes
@@ -671,6 +698,44 @@ const HISTORY_TURNS: i64 = 6;
 /// single exchange and thousands of characters. What overflows the window is length, so length is
 /// what is bounded.
 const HISTORY_CHARS: usize = 6_000;
+
+/// The conversation so far, in front of the message that follows it.
+///
+/// Written as plainly as it can be, because it is read by a model that has NO memory of any of it
+/// and must not mistake a replayed question for the one being asked now. The last line says which
+/// is which.
+///
+/// `you:` and `núcleo:` rather than `user`/`assistant`: the CLI has its own idea of those roles and
+/// this text is a user message, not a transcript it should adopt. Naming them after the roles would
+/// invite the model to continue the transcript rather than answer the question.
+fn replayed(history: &[(String, String)], prompt: &str) -> String {
+    let mut out = String::from(
+        "This conversation has just begun a new context, so you do not remember what is below.          These are its recent exchanges, oldest first, replayed for you:
+
+",
+    );
+    for (asked, answered) in history {
+        out.push_str("you: ");
+        out.push_str(asked);
+        out.push_str(
+            "
+núcleo: ",
+        );
+        out.push_str(answered);
+        out.push_str(
+            "
+
+",
+        );
+    }
+    out.push_str(
+        "That is the replay. The new message follows.
+
+",
+    );
+    out.push_str(prompt);
+    out
+}
 
 /// The exchanges a local turn may be shown, oldest first.
 ///
@@ -3280,5 +3345,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(stored.as_deref(), Some("[]"));
+    }
+
+    /// Records a finished exchange in a chat, the way a turn that completed leaves one.
+    async fn past_exchange(pool: &SqlitePool, chat_id: &str, asked: &str, answered: &str) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, stdout, created_at)
+             VALUES (?, 'completed', 'assistant', 'old-session', ?, ?, '2026-08-11T10:00:00+00:00')",
+        )
+        .bind(asked)
+        .bind(chat_id)
+        .bind(answered)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A conversation that cannot resume is READ BACK to the model instead of starting blank.
+    ///
+    /// This is the ceiling in `CONTEXT_ROTATION_TOKENS` biting, and it bites hardest on a
+    /// conversation picked up from the editor: one arrives with somebody else's context already
+    /// filling the window, so the very first turn here can push it past the ceiling and the second
+    /// one would begin remembering nothing. The local path has always replayed its history for want
+    /// of a session protocol; this is the same answer to the same problem.
+    #[tokio::test]
+    async fn a_turn_that_cannot_resume_is_replayed_the_conversation_so_far() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+        let chat_id = "assistant-rotated-chat";
+        past_exchange(&state.pool, chat_id, "arranja o parser", "está arranjado").await;
+
+        let id = send_message(&state, chat_id, "e os testes?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let launched = runner.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(launched.contains("arranja o parser"), "{launched}");
+        assert!(launched.contains("está arranjado"), "{launched}");
+        assert!(launched.contains("e os testes?"), "{launched}");
+
+        // The ROW keeps what the person typed. It is what the list shows, what the next replay
+        // reads, and what a person recognises as their own message — a row carrying the preamble
+        // would grow a copy of the conversation into every turn of it.
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "e os testes?");
+    }
+
+    /// And a turn that CAN resume is handed nothing but the message.
+    ///
+    /// The session already holds those exchanges. Replaying them into it would put the conversation
+    /// in the window twice and invite the model to answer the older question again.
+    #[tokio::test]
+    async fn a_turn_that_resumes_is_replayed_nothing() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+        let chat_id = "assistant-resuming-chat";
+        past_exchange(&state.pool, chat_id, "arranja o parser", "está arranjado").await;
+        upsert_session(
+            &state.pool,
+            chat_id,
+            "still-good",
+            "2026-08-11T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let id = send_message(&state, chat_id, "e os testes?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(
+            runner.last_prompt.lock().unwrap().clone().unwrap(),
+            "e os testes?"
+        );
+    }
+
+    /// A conversation with nothing behind it is not given an empty preamble.
+    #[tokio::test]
+    async fn a_first_turn_is_replayed_nothing_because_there_is_nothing() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+
+        let id = send_message(&state, "assistant-brand-new-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(runner.last_prompt.lock().unwrap().clone().unwrap(), "olá");
     }
 }

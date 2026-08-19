@@ -621,3 +621,42 @@ describe("what a turn did", () => {
     expect(await screen.findByText(/a\.rs/)).toBeTruthy();
   });
 });
+
+/* ------------------------------------------------------ stopping a turn -- */
+
+describe("stopping a turn", () => {
+  it("offers to stop a turn that is running", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /stop/i }));
+
+    // `apiText` and not `apiFetch`: cancel answers `200` with an empty body, and a JSON parse of
+    // nothing is how that route used to fail.
+    await waitFor(() =>
+      expect(
+        daemon.apiText.mock.calls.some(
+          (call) =>
+            String(call[0]) === "/runs/1/cancel" &&
+            (call[1] as RequestInit | undefined)?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("offers nothing to stop on a turn that has landed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [turnRow({ id: 1 })] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+});

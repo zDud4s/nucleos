@@ -15,6 +15,7 @@ import {
   usePostChatSeen,
   usePostChatTitle,
   useSendMessage,
+  useStopTurn,
   type Brain,
   type ChatSummary,
   type IdeSession,
@@ -388,7 +389,11 @@ function ChatDetail({
         <p className="chats-loading">reading the conversation…</p>
       )}
       {transcript.data !== undefined && (
-        <Transcript turns={transcript.data} precededBy={(pickedUp.data ?? []).length > 0} />
+        <Transcript
+          turns={transcript.data}
+          precededBy={(pickedUp.data ?? []).length > 0}
+          chatId={chatId}
+        />
       )}
 
       <Composer chatId={chatId} />
@@ -571,7 +576,15 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
 
 /* ------------------------------------------------------------ transcript -- */
 
-function Transcript({ turns, precededBy }: { turns: Turn[]; precededBy: boolean }) {
+function Transcript({
+  turns,
+  precededBy,
+  chatId,
+}: {
+  turns: Turn[];
+  precededBy: boolean;
+  chatId: string;
+}) {
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
   if (turns.length === 0 && precededBy) return null;
@@ -579,13 +592,26 @@ function Transcript({ turns, precededBy }: { turns: Turn[]; precededBy: boolean 
   return (
     <ul className="chats-turns" aria-label="Transcript">
       {turns.map((turn, index) => (
-        <TurnBlock key={turn.id} turn={turn} previous={index === 0 ? null : turns[index - 1]} />
+        <TurnBlock
+          key={turn.id}
+          turn={turn}
+          previous={index === 0 ? null : turns[index - 1]}
+          chatId={chatId}
+        />
       ))}
     </ul>
   );
 }
 
-function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
+function TurnBlock({
+  turn,
+  previous,
+  chatId,
+}: {
+  turn: Turn;
+  previous: Turn | null;
+  chatId: string;
+}) {
   const marks = marksBetween(previous, turn);
   const live = turnIsLive(turn.status);
 
@@ -596,6 +622,7 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
       ))}
       <p className="chats-turn-asked">{turn.asked}</p>
       {live && <LiveAnswer turnId={turn.id} />}
+      {live && <StopTurn chatId={chatId} turnId={turn.id} />}
       {!live && <WhatItDid did={turn.did} />}
       {!live && turn.answer !== null && <p className="chats-turn-answer">{turn.answer}</p>}
       {!live && turn.answer === null && (
@@ -628,6 +655,25 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
  * running is named, because "thinking" over a command that is compiling something is the wrong word
  * for the wait. And words already written are shown as they arrive.
  */
+/**
+ * The way out of a turn that is going nowhere.
+ *
+ * Offered only while the turn is live, because that is the only time it means anything: cancelling
+ * a run that has already landed would be asking the daemon to un-bill it.
+ *
+ * It is not a refusal of the answer — the turn is a run and stays in the history, cancelled, with
+ * whatever it cost up to that point. That is the honest record and it is why this says "stop"
+ * rather than "undo".
+ */
+function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
+  const stop = useStopTurn(chatId);
+  return (
+    <Button type="button" variant="ghost" disabled={stop.isPending} onClick={() => stop.mutate(turnId)}>
+      Stop
+    </Button>
+  );
+}
+
 function LiveAnswer({ turnId }: { turnId: number }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
@@ -674,8 +720,8 @@ function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "restart") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
-        the model past this point does not remember anything above it — the conversation restarted
-        here
+        the conversation restarted here — the model past this point was read the last few exchanges
+        back, and remembers nothing older than those
       </p>
     );
   }

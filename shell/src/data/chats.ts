@@ -8,7 +8,7 @@ import {
   type ToolCall,
   type Turn,
 } from "../lib/turns";
-import { apiFetch } from "./client";
+import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 
@@ -288,6 +288,30 @@ export function useLiveTurn(turnId: number, alive: boolean) {
     queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
     enabled: alive,
     refetchInterval: POLL.turn,
+  });
+}
+
+/**
+ * Stop a turn that is running.
+ *
+ * `POST /runs/{id}/cancel`, because a turn IS a run and that route has always
+ * existed — what was missing was anywhere to press it from. The daemon aborts
+ * the task, which drops the guard that holds the conversation's turn slot, so
+ * the chat is answerable again immediately rather than after the run timeout.
+ *
+ * Both the transcript and the list are invalidated: the turn's row becomes
+ * `cancelled`, and the list carries the ordering and the unread count, which
+ * both move when a turn stops moving.
+ */
+export function useStopTurn(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (turnId: number) => apiText(`/runs/${turnId}/cancel`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
   });
 }
 
