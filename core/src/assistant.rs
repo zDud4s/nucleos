@@ -1217,8 +1217,19 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     let tools_used =
                         serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
                             .unwrap_or_else(|_| "[]".to_string());
+                    // Read out of the same stream, and stored here because this is where an
+                    // assistant turn ends. `runs.rs` does the equivalent at its own terminal write,
+                    // and a chat turn never passes through it — so the column stayed null on every
+                    // conversation, and the rotation it governs could not be seen coming.
+                    //
+                    // Cache-read tokens count as context because they occupy the window exactly as
+                    // fresh input does. A resumed conversation is nearly all cache: reading only
+                    // `input_tokens` would report a session at 96k as sitting at 9k.
+                    let context_fill = o.stdout.lines().fold(None, |fill, line| {
+                        crate::runner::context_fill_from_line(line, fill)
+                    });
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
@@ -1226,6 +1237,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
                     .bind(&tools_used)
+                    .bind(context_fill)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -2024,6 +2036,56 @@ mod tests {
             "a chat with room left is still one conversation, and an unreported fill is not an \
              overflow"
         );
+    }
+
+    /// A finished turn records how full its context was.
+    ///
+    /// Found against the live daemon rather than here: a real turn came back with
+    /// `context_fill: null`, and the reading the window draws from it was therefore drawn from a
+    /// column this path never wrote. `runs.rs` observes the stream and stores it at its terminal
+    /// write; an assistant turn has a terminal write of its own, and did not.
+    ///
+    /// It is what decides the rotation, so a turn that does not record it is a turn that cannot be
+    /// seen coming: the ceiling is read off these rows.
+    #[tokio::test]
+    async fn a_finished_turn_records_how_full_its_context_was() {
+        let mut state = test_state().await;
+        let stream = format!(
+            "{}\n{}\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":9000,"cache_read_input_tokens":87000},"content":[{"type":"text","text":"pronto"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"pronto"}"#,
+        );
+        state.runner = Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stream,
+                stderr: String::new(),
+                session_id: Some("s".to_string()),
+                cost_usd: Some(0.01),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+            })),
+            ..Default::default()
+        });
+
+        let id = send_message(&state, "fill-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+        assert_eq!(status, "completed");
+
+        let fill: Option<i64> = sqlx::query_scalar("SELECT context_fill FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        // Cache-read tokens occupy the window exactly as fresh input tokens do, which is the whole
+        // reason this is not just `input_tokens`: a resumed conversation is nearly all cache.
+        assert_eq!(fill, Some(96_000), "the turn recorded no context fill");
     }
 
     /// What a Telegram user actually received when the tool-policy barrier killed a turn: the CLI's
