@@ -578,6 +578,55 @@ describe("what a session would be able to do, before it is picked up", () => {
   });
 });
 
+/* -------------------------------------------------------- the composer -- */
+
+describe("saying something", () => {
+  const openOne = async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+    await renderChats("/chats/c-1");
+    return await screen.findByLabelText("Message");
+  };
+
+  it("sends on Enter, because that is how every chat anybody uses works", async () => {
+    const box = await openOne();
+    fireEvent.change(box, { target: { value: "bom dia" } });
+
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    await waitFor(() => {
+      const posted = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message",
+      );
+      expect(JSON.parse(String(posted?.[1]?.body))).toMatchObject({ text: "bom dia" });
+    });
+  });
+
+  it("keeps Shift+Enter for a new line, and sends nothing", async () => {
+    const box = await openOne();
+    fireEvent.change(box, { target: { value: "primeira linha" } });
+
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: true });
+
+    expect(
+      daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
+    ).toBe(false);
+  });
+
+  it("sends nothing on Enter when there is nothing to send", async () => {
+    // Whitespace is nothing. An empty turn costs a run and answers a question nobody asked.
+    const box = await openOne();
+    fireEvent.change(box, { target: { value: "   " } });
+
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    expect(
+      daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
+    ).toBe(false);
+  });
+});
+
 /* --------------------------------------- what is not shown, and how full -- */
 
 describe("what the page is not showing", () => {

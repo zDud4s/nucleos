@@ -961,13 +961,19 @@ function Composer({ chatId }: { chatId: string }) {
   const [text, setText] = useState("");
   const send = useSendMessage(chatId);
 
+  // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
+  // how one of them ends up sending an empty turn six months from now.
+  const say = () => {
+    if (text.trim() === "" || send.isPending) return;
+    send.mutate(text.trim(), { onSuccess: () => setText("") });
+  };
+
   return (
     <form
       className="chats-composer"
       onSubmit={(event) => {
         event.preventDefault();
-        if (text.trim() === "" || send.isPending) return;
-        send.mutate(text.trim(), { onSuccess: () => setText("") });
+        say();
       }}
     >
       <label className="chats-field">
@@ -977,6 +983,14 @@ function Composer({ chatId }: { chatId: string }) {
           aria-label="Message"
           value={text}
           onChange={(event) => setText(event.target.value)}
+          // Enter sends and Shift+Enter breaks the line, because that is what every chat anybody
+          // has ever used does — and a textarea does the opposite by default, so the habit costs a
+          // reach for the mouse on every single message.
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.shiftKey) return;
+            event.preventDefault();
+            say();
+          }}
         />
       </label>
       <div className="chats-composer-actions">
