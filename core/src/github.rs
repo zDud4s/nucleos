@@ -641,9 +641,252 @@ validating_deserialize!(
     IssueNumber,
 );
 
+/// Prefixes eligible for autonomy. **An allowlist**: what is not in it does not pass, which is why
+/// `gh api` and `gh auth token` are excluded by absence rather than by a parallel table of
+/// exclusions. Two structures deciding one question is how they come to disagree.
+///
+/// The reasons an allowlist cannot state itself:
+///
+/// - `gh api` deletes a repository with the same verb it reads an issue with. No prefix analysis
+///   separates the two. The capability exists — it can always be asked for — and is never autonomous.
+/// - `gh auth token`, `gh auth status`, `gh secret list`, `gh variable list` are *reads*, and they
+///   are the worst kind: they print the credential, or its shape, into the agent's context. A read
+///   that exfiltrates the credential the module acts with does not belong on a list of safe reads,
+///   however much the word suggests otherwise.
+///
+/// **Only reads of STRUCTURAL shape.** `gh pr view` returns the body of a pull request and is not
+/// here under any circumstance; it exists as a `ReadOp`, where the effect is tied to it. Were it
+/// here, an agent that wanted a stranger's text and wanted to go on acting would simply use Bash,
+/// and the per-operation effect would buy nothing.
+pub const READ_CEILING: &[&str] = &[
+    "gh run list",
+    "gh run view",
+    "gh pr list",
+    "gh workflow list",
+];
+
+/// The `ActOp` kinds eligible for autonomy. `raw` is outside it and stays outside.
+///
+/// `pr_create` is outside too, and for its own reason rather than `raw`'s: opening a pull request
+/// publishes a title and a body under the owner's name to people who will read them as the owner's
+/// words. That is not undoable by closing it.
+pub const ACTION_CEILING: &[&str] = &["workflow_run", "run_rerun", "pr_comment", "issue_close"];
+
+/// Flags that take autonomy away from a prefix that had it.
+///
+/// A prefix cannot say "`gh run view` without `--log`", because the form that measures it does not
+/// see flags — and without this list `gh pr list --json body` matches `gh pr list` and returns the
+/// very payload `gh pr view` was excluded for. The ceiling is therefore two constants and not one:
+/// an autonomous read must match a `READ_CEILING` prefix AND carry none of these.
+///
+/// The first seven change the KIND of thing that comes back, unlike `--state` or `--author`, which
+/// only choose which. Two need their own reason:
+///
+/// - `--search` does not change the kind — it chooses which. It is here because a search *over
+///   bodies* (`--search "in:body ..."`) returns the existence of the body's content by inference,
+///   one answer at a time. It is the same leak, more slowly.
+/// - `--limit` was once called harmless, and that was arithmetic rather than analysis: for an
+///   injection channel, HOW MANY is the payload. `gh pr list --limit 1000` is a thousand
+///   stranger-chosen titles in a call that marks nothing, against `gh`'s default of thirty.
+///   Refusing the flag rather than capping it is deliberate — a cap would mean reading a flag's
+///   VALUE, and this comparison reads tokens.
+///
+/// **Every entry has two spellings and the second one does not remember itself.** `-q`, `-t` and
+/// `-L` are the short forms of `--jq`, `--template` and `--limit`, and `-L` was added a review after
+/// `--limit`, forgotten in the very sentence that exists to say short forms are not forgotten. That
+/// is this list's failure mode, recorded here rather than rediscovered.
+pub const REFUSED_READ_FLAGS: &[&str] = &[
+    "--json",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "--log",
+    "--log-failed",
+    "--search",
+    "-L",
+    "--limit",
+];
+
+/// What runs without asking.
+///
+/// Built once at startup from `.ai/github.yaml` and then immutable: it does no I/O after
+/// construction, which is what lets `classifier::classify` take it by reference and stay pure. There
+/// is deliberately no hot reload — a policy a run could reload is a policy a run could change in the
+/// middle of itself.
+///
+/// **Both lists are intersections with a compiled ceiling, and never unions with one.** The file
+/// chooses inside what the code fixes. `.ai/` is gitignored and travels with nobody, so it is
+/// per-developer configuration no review ever sees; one line in it may not be the only thing between
+/// an autonomous run and `gh api -X DELETE`.
+///
+/// It answers WHETHER, never HOW: `execute` builds the argv and this type never sees one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    reads: Vec<String>,
+    actions: Vec<String>,
+    digest: String,
+}
+
+impl Policy {
+    /// Autonomous in nothing — what an absent, unreadable or malformed file produces, and what every
+    /// test that is not about the policy itself should be given.
+    pub fn empty() -> Self {
+        Self {
+            reads: Vec::new(),
+            actions: Vec::new(),
+            digest: digest_of(&[], &[]),
+        }
+    }
+
+    /// Narrows the owner's two lists to the two ceilings.
+    ///
+    /// An entry outside a ceiling is **dropped with a warning**: neither ignored in silence (the
+    /// owner would hold a policy other than the one they believe they wrote) nor fatal (a typo may
+    /// not take the daemon down). The rest of the file stays valid, because one bad line is a
+    /// mistake and not a reason to discard the good ones.
+    ///
+    /// `enabled: false` collapses both lists rather than being carried as a third state. What this
+    /// type answers is "does it run without asking", and a pillar the owner switched off answers no
+    /// to that in exactly the way an empty list does.
+    pub fn from_config(config: &crate::config::GithubConfig) -> Self {
+        if !config.enabled {
+            return Self::empty();
+        }
+        let reads = narrow(&config.autonomous_reads, READ_CEILING, "read");
+        let actions = narrow(&config.autonomous_actions, ACTION_CEILING, "action");
+        let digest = digest_of(&reads, &actions);
+        Self {
+            reads,
+            actions,
+            digest,
+        }
+    }
+
+    pub fn autonomous_reads(&self) -> &[String] {
+        &self.reads
+    }
+
+    pub fn autonomous_actions(&self) -> &[String] {
+        &self.actions
+    }
+
+    /// A short, stable fingerprint of the EFFECTIVE policy — already narrowed, sorted and
+    /// deduplicated. `CLASSIFIER_VERSION` goes on meaning *the code*; this means *the configuration*.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Whether this shell command runs without asking.
+    ///
+    /// **The raw command, not a normalized one, and that is load-bearing.** `normalize_command`
+    /// lowercases, and `-L` is `gh`'s short `--limit` while `-l` is its short `--label`: folded to
+    /// one case the list would either miss the first or refuse the second. The same reason
+    /// `lands_inside_the_workspace` reads raw tokens.
+    ///
+    /// Tokenized with `classifier::shell_words` — the tokenizer already in the house, rather than a
+    /// second one that would drift from it. Quotes are stripped by it, so
+    /// `--search 'in:body x'` is two tokens and the flag is seen.
+    ///
+    /// A refused flag is matched as `tok == flag || tok.starts_with("{flag}=")`. Equality alone
+    /// would let `--json=body` through, and that is one character of difference between an
+    /// implementation that works and one that looks like it does.
+    ///
+    /// **This decides the list and the flags and nothing else.** Whether the line is a single
+    /// command at all, whether it redirects, whether it hides a second command behind a separator —
+    /// those are `classifier.rs`'s guards, applied before this is ever consulted, and this function
+    /// would be wrong to be read as covering them.
+    pub fn read_is_autonomous(&self, command: &str) -> bool {
+        if self.reads.is_empty() {
+            return false;
+        }
+        let words = crate::classifier::shell_words(command);
+        if words.iter().any(|word| {
+            REFUSED_READ_FLAGS
+                .iter()
+                .any(|flag| word == flag || word.starts_with(&format!("{flag}=")))
+        }) {
+            return false;
+        }
+        let normalized = words.join(" ").to_ascii_lowercase();
+        self.reads.iter().any(|prefix| {
+            normalized == *prefix || normalized.starts_with(&format!("{prefix} "))
+        })
+    }
+
+    /// Whether an operation of this `kind()` is executed without asking. Everything else becomes a
+    /// proposal a person approves, and the turn carries on either way.
+    pub fn action_is_autonomous(&self, kind: &str) -> bool {
+        self.actions.iter().any(|allowed| allowed == kind)
+    }
+}
+
+/// PURE: one list intersected with its ceiling, sorted and deduplicated, warning about each entry it
+/// had to drop.
+fn narrow(asked: &[String], ceiling: &[&str], what: &str) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for entry in asked {
+        let entry = entry.trim();
+        if ceiling.contains(&entry) {
+            kept.push(entry.to_owned());
+        } else {
+            tracing::warn!(
+                entry = %entry,
+                kind = %what,
+                "github config: outside the compiled ceiling; dropped, and it will keep asking"
+            );
+        }
+    }
+    kept.sort();
+    kept.dedup();
+    kept
+}
+
+/// PURE: FNV-1a over the effective policy, rendered as sixteen hex characters.
+///
+/// **Not a cryptographic hash, and it does not need to be.** What this labels is a scoreboard row,
+/// so the property required is that two different effective policies get different labels and one
+/// policy gets the same label everywhere. Nothing here defends against a chosen collision: the text
+/// being hashed is the owner's own file, already narrowed by the ceilings.
+///
+/// Hand-written rather than `DefaultHasher`, and that is the reason it exists as ten lines instead
+/// of two: `DefaultHasher`'s algorithm is explicitly allowed to change between Rust releases, and a
+/// toolchain upgrade that silently renumbered every digest would fragment the very scoreboard this
+/// is for. FNV-1a is fixed forever and costs no dependency.
+///
+/// The input is the effective policy and NOT the file, so a comment edit or a reordering does not
+/// break the scoreboard — which is the whole reason `§7` asked for it normalized before hashed. A
+/// switched-off pillar and an empty pair of lists hash alike, and they should: they are the same
+/// effective policy.
+fn digest_of(reads: &[String], actions: &[String]) -> String {
+    let text = format!(
+        "v1\nreads={}\nactions={}",
+        reads.join(","),
+        actions.join(",")
+    );
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GithubConfig, load_github_config};
+
+    /// Goes through the real loader rather than around it, so "absent" is genuinely an absent file
+    /// and not a hand-built default that happens to look like one.
+    fn policy_from(text: Option<&str>) -> Policy {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("github.yaml");
+        if let Some(text) = text {
+            std::fs::write(&path, text).expect("the sample config should be writable");
+        }
+        Policy::from_config(&load_github_config(&path))
+    }
 
     fn repo() -> Repo {
         Repo::new("owner/name").expect("owner/name is a repository")
@@ -807,5 +1050,182 @@ mod tests {
             "op": "pr_view", "repo": "--upload-pack=x", "number": "42"
         }));
         assert!(bad.is_err(), "a dashed repository may not deserialize");
+    }
+
+    /// Every other field's default is a convenience; these two are a refusal.
+    #[test]
+    fn a_github_yaml_that_is_absent_unreadable_or_malformed_is_autonomous_in_nothing() {
+        for text in [
+            None,
+            Some("{{{ this is not yaml"),
+            Some("autonomous_reads: this is not a list\n"),
+            Some(""),
+        ] {
+            let policy = policy_from(text);
+            assert!(policy.autonomous_reads().is_empty(), "{text:?}");
+            assert!(policy.autonomous_actions().is_empty(), "{text:?}");
+            assert!(!policy.read_is_autonomous("gh run list"), "{text:?}");
+            assert!(!policy.action_is_autonomous("pr_comment"), "{text:?}");
+        }
+    }
+
+    /// A missing file leaves the pillar CAPABLE and not switched off, which is the asymmetry with
+    /// the web and browser pillars that `GithubConfig`'s doc argues for. Nothing is autonomous;
+    /// everything can still be asked for.
+    #[test]
+    fn a_missing_file_withholds_autonomy_and_not_capability() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config = load_github_config(&directory.path().join("nothing-here.yaml"));
+        assert!(config.enabled, "an absent file may not switch the pillar off");
+        assert!(config.autonomous_reads.is_empty());
+        assert!(config.autonomous_actions.is_empty());
+    }
+
+    /// The file may narrow the ceiling and may never widen it. It asks for two things the ceiling
+    /// does not have and one it does, and keeps the one it does.
+    #[test]
+    fn the_file_may_narrow_the_ceiling_and_never_widens_it() {
+        let policy = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n  - gh auth token\n\
+             autonomous_actions:\n  - pr_comment\n  - raw\n",
+        ));
+        assert_eq!(policy.autonomous_reads(), ["gh run list"]);
+        assert_eq!(policy.autonomous_actions(), ["pr_comment"]);
+        assert!(policy.read_is_autonomous("gh run list"));
+        assert!(!policy.read_is_autonomous("gh auth token"));
+        assert!(policy.action_is_autonomous("pr_comment"));
+        assert!(!policy.action_is_autonomous("raw"));
+    }
+
+    /// The two that never pass, with the file explicitly asking for the opposite.
+    #[test]
+    fn gh_api_and_gh_auth_token_are_never_autonomous() {
+        let policy = policy_from(Some(
+            "autonomous_reads:\n  - gh auth token\n  - gh auth status\n  - gh secret list\n  \
+             - gh variable list\nautonomous_actions:\n  - raw\n",
+        ));
+        assert!(policy.autonomous_reads().is_empty());
+        assert!(policy.autonomous_actions().is_empty());
+    }
+
+    /// A read that returns prose is not in the ceiling, so the file cannot turn it on.
+    #[test]
+    fn a_read_that_returns_prose_is_not_in_the_read_ceiling() {
+        for prose in ["gh pr view", "gh issue view", "gh run download"] {
+            assert!(
+                !READ_CEILING.contains(&prose),
+                "{prose} returns a stranger's words and may not be eligible for autonomy"
+            );
+        }
+        let policy = policy_from(Some("autonomous_reads:\n  - gh pr view\n  - gh issue view\n"));
+        assert!(policy.autonomous_reads().is_empty());
+    }
+
+    /// **The central test.** The prefix matches and autonomy has to fall anyway: a structural read
+    /// turns into prose — or into a thousand lines of it — without changing subcommand.
+    #[test]
+    fn a_refused_flag_takes_autonomy_from_a_prefix_that_had_it() {
+        let policy = policy_from(Some("autonomous_reads:\n  - gh run view\n  - gh pr list\n"));
+
+        assert!(policy.read_is_autonomous("gh run view 123"));
+        assert!(policy.read_is_autonomous("gh pr list --state open"));
+        assert!(policy.read_is_autonomous("gh pr list --author octocat"));
+
+        for command in [
+            "gh run view 123 --log",
+            "gh run view 123 --log-failed",
+            "gh pr list --json body",
+            // pflag accepts `=`, and equality alone would let this one through.
+            "gh pr list --json=body",
+            // The short form of `--jq`.
+            "gh pr list -q .[].body",
+            "gh pr list --template {{.body}}",
+            "gh pr list -t {{.body}}",
+            "gh pr list --search 'in:body secret'",
+            // For an injection channel, how many IS the payload.
+            "gh pr list --limit 1000",
+            "gh pr list --limit=1000",
+            // The alias that a review forgot, on the very entry created to stop aliases being
+            // forgotten.
+            "gh pr list -L 1000",
+        ] {
+            assert!(
+                !policy.read_is_autonomous(command),
+                "{command} should have lost its autonomy"
+            );
+        }
+    }
+
+    /// `-L` is `--limit` and `-l` is `--label`. Folding the comparison to one case would either
+    /// miss the first or refuse the second, which is why the raw command is what gets read.
+    #[test]
+    fn the_flag_comparison_is_case_sensitive_because_gh_is() {
+        let policy = policy_from(Some("autonomous_reads:\n  - gh pr list\n"));
+        assert!(!policy.read_is_autonomous("gh pr list -L 1000"));
+        assert!(policy.read_is_autonomous("gh pr list -l bug"));
+    }
+
+    /// A prefix is a prefix of WORDS. `gh run listen` is not `gh run list`, and a comparison by
+    /// `starts_with` alone would have said it was.
+    #[test]
+    fn a_prefix_matches_whole_words_and_not_a_string() {
+        let policy = policy_from(Some("autonomous_reads:\n  - gh run list\n"));
+        assert!(policy.read_is_autonomous("gh run list"));
+        assert!(policy.read_is_autonomous("gh run list --branch main"));
+        assert!(!policy.read_is_autonomous("gh run listen"));
+        assert!(!policy.read_is_autonomous("gh runlist"));
+    }
+
+    /// A pillar the owner switched off is autonomous in nothing, which is the same answer an empty
+    /// list gives — and the reason `enabled` is not carried as a third state.
+    #[test]
+    fn enabled_false_collapses_both_lists() {
+        let config = GithubConfig {
+            enabled: false,
+            autonomous_reads: vec!["gh run list".to_owned()],
+            autonomous_actions: vec!["pr_comment".to_owned()],
+        };
+        let policy = Policy::from_config(&config);
+        assert!(policy.autonomous_reads().is_empty());
+        assert!(policy.autonomous_actions().is_empty());
+        assert_eq!(
+            policy.digest(),
+            Policy::empty().digest(),
+            "a switched-off pillar and an empty pair of lists are the same effective policy"
+        );
+    }
+
+    /// The digest tracks the effective policy and nothing else: a comment, the order of the entries,
+    /// and a line the ceiling drops all leave it alone.
+    #[test]
+    fn the_digest_changes_with_the_effective_policy_and_not_with_a_comment() {
+        let base = policy_from(Some("autonomous_reads:\n  - gh run list\n  - gh pr list\n"));
+        let commented = policy_from(Some(
+            "# the owner's notes\nautonomous_reads:\n  - gh pr list\n  - gh run list\n",
+        ));
+        let dropped = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n  - gh pr list\n  - gh api\n",
+        ));
+        let different = policy_from(Some("autonomous_reads:\n  - gh run list\n"));
+
+        assert_eq!(base.digest(), commented.digest());
+        assert_eq!(base.digest(), dropped.digest());
+        assert_ne!(base.digest(), different.digest());
+        assert_ne!(base.digest(), Policy::empty().digest());
+        assert_eq!(base.digest().len(), 16);
+    }
+
+    /// The ceilings hold to the operations. An `ACTION_CEILING` entry naming a kind no `ActOp` has
+    /// would be a line in the owner's file that grants nothing and says it grants something.
+    #[test]
+    fn every_action_ceiling_entry_names_a_real_operation() {
+        let kinds: Vec<&str> = ActOp::all().iter().map(|op| op.kind()).collect();
+        for entry in ACTION_CEILING {
+            assert!(kinds.contains(entry), "{entry} is not an ActOp kind");
+        }
+        assert!(
+            !ACTION_CEILING.contains(&"raw"),
+            "`raw` is never eligible for autonomy"
+        );
     }
 }

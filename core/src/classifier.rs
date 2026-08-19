@@ -1094,7 +1094,13 @@ fn delete_targets<'a>(program: &str, arguments: &'a [String]) -> Vec<&'a str> {
         .collect()
 }
 
-fn shell_words(command: &str) -> Vec<String> {
+/// PURE: a shell line's words, with quotes stripped.
+///
+/// `pub(crate)` for `github::Policy::read_is_autonomous`, which compares `gh` flags against
+/// these tokens. Shared rather than copied on purpose: a second tokenizer would drift from this
+/// one, and the two would disagree about the same command line — which is the class of bug this
+/// file exists to keep out.
+pub(crate) fn shell_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;

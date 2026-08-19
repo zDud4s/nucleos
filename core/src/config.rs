@@ -467,6 +467,74 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
     }
 }
 
+/// `.ai/github.yaml`. The GitHub pillar's switch and the two lists that decide what runs without
+/// anybody watching.
+///
+/// **`enabled` defaults to TRUE, which is the opposite of every other pillar that reaches the
+/// network, and the asymmetry is the whole design rather than an oversight.** `WebConfig` and
+/// `BrowserConfig` ship off because for them "off" and "grants nothing" are the same state. Here
+/// they are not: what a missing file has to produce is a pillar *capable of everything and
+/// autonomous in nothing* — a person can still approve any operation, and no operation runs without
+/// one. That is what the two empty lists below deliver, and switching the pillar off as well would
+/// take away the capability the owner asked for in order to withhold an autonomy the empty lists had
+/// already withheld.
+///
+/// So the refusal in this struct lives in `autonomous_reads` and `autonomous_actions`, exactly where
+/// `WebConfig::trusted_hosts` puts its own: every other field's default is a convenience, and those
+/// two are a refusal. A file that is missing, unreadable or malformed asks a human about every last
+/// `gh` invocation.
+///
+/// Neither list is authoritative on its own. `github::Policy` intersects both with a compiled
+/// ceiling, so what is written here can only ever NARROW what the code already allows — which is
+/// what makes a per-developer gitignored YAML a defensible place for this at all.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GithubConfig {
+    pub enabled: bool,
+    /// `gh` prefixes a run may execute through Bash without asking. Subset of
+    /// `github::READ_CEILING`; an entry outside it is dropped with a warning.
+    pub autonomous_reads: Vec<String>,
+    /// `github::ActOp` kinds the núcleo executes without asking. Subset of
+    /// `github::ACTION_CEILING`, which contains neither `raw` nor `pr_create`.
+    pub autonomous_actions: Vec<String>,
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            autonomous_reads: Vec::new(),
+            autonomous_actions: Vec::new(),
+        }
+    }
+}
+
+/// Reads `.ai/github.yaml`. Absent, unreadable or malformed -> defaults, with a warning.
+///
+/// The same asymmetry `load_web_config` has and the same reason: falling back to defaults here means
+/// falling back to two EMPTY lists, so a broken file costs convenience — everything starts asking —
+/// and never costs safety. A loader that errored would take the daemon down over a typo in a
+/// convenience list; one that guessed would be the worst of both.
+///
+/// The warning says what was lost in the words the owner needs, because "could not parse" alone
+/// reads like a pillar that stopped working and this one has not.
+pub fn load_github_config(path: &Path) -> GithubConfig {
+    if !path.exists() {
+        return GithubConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<GithubConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "github config: could not be parsed; the pillar stays capable and stops being autonomous");
+            GithubConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "github config: could not be read; the pillar stays capable and stops being autonomous");
+            GithubConfig::default()
+        }
+    }
+}
+
 /// How many seats one council may hold.
 ///
 /// Eight, from the Python orchestrator this pillar was ported out of, where it was the parallelism
