@@ -1036,7 +1036,11 @@ mod tests {
         }
 
         assert_eq!(
-            shadow_readiness(&pool).await.unwrap().get("project-a").copied(),
+            shadow_readiness(&pool)
+                .await
+                .unwrap()
+                .get("project-a")
+                .copied(),
             Some((1, 1, 0)),
             "a class whose evidence predates the column must still be able to become ready"
         );

@@ -3099,7 +3099,11 @@ mod tests {
             ("ls -la", "allow", "read-local"),
             ("cargo test", "allow", "read-local"),
             ("git add -A", "allow", "vcs-local"),
-            ("git push origin master", "pending_approval", "push-merge-deploy"),
+            (
+                "git push origin master",
+                "pending_approval",
+                "push-merge-deploy",
+            ),
             ("rm -rf /", "deny", "destructive"),
             ("gh run list", "pending_approval", "unrecognized"),
             ("gh pr view 42", "pending_approval", "unrecognized"),

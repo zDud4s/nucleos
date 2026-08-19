@@ -233,6 +233,12 @@ impl ActOp {
 
     /// Always `Acts`, and the constant answer is the point: this half is defined by acting, so a
     /// variant here can never be graded down into something the untrusted barrier lets through.
+    ///
+    /// Nothing in production calls it, and that is the correct shape rather than an omission —
+    /// `github_act` is `Acts` in `TOOL_EFFECTS` by NAME, which is what the barrier reads. It exists
+    /// so `every_operation_declares_an_effect` can hold the enum to that claim instead of the claim
+    /// living only in a table.
+    #[allow(dead_code)]
     pub fn effect(&self) -> ToolEffect {
         ToolEffect::Acts
     }
@@ -259,7 +265,11 @@ impl ActOp {
     /// about its own `tool_name` column.
     pub fn describe(&self) -> String {
         match self.repo() {
-            Some(repo) => format!("a run asked GitHub for {} on {}", self.kind(), repo.as_str()),
+            Some(repo) => format!(
+                "a run asked GitHub for {} on {}",
+                self.kind(),
+                repo.as_str()
+            ),
             None => format!("a run asked GitHub for {}", self.kind()),
         }
     }
@@ -371,12 +381,10 @@ impl Op {
         }
     }
 
-    pub fn effect(&self) -> ToolEffect {
-        match self {
-            Op::Read(operation) => operation.effect(),
-            Op::Act(operation) => operation.effect(),
-        }
-    }
+    // There is deliberately NO `Op::effect()`. The union's effect is never the question anyone
+    // should be asking: the untrusted barrier asks `tool_effect` BY NAME, and the per-call answer is
+    // `effect_of_call` reading which READ was named. An accessor on the union would be the one shape
+    // that reads like an answer to both and is an answer to neither.
 
     pub fn argv(&self) -> Vec<String> {
         match self {
@@ -385,6 +393,10 @@ impl Op {
         }
     }
 
+    /// Every operation, for the partition test. Test-only, and said so rather than left to be
+    /// discovered: `clippy --all-targets` computes dead code per target, so an item the tests alone
+    /// use is dead in the bin build.
+    #[allow(dead_code)]
     pub fn all() -> Vec<Self> {
         ReadOp::all()
             .into_iter()
@@ -950,10 +962,14 @@ impl Policy {
         }
     }
 
+    /// The effective lists, for the tests that assert what the ceilings let through. Production
+    /// asks the two questions below instead, which is why these carry the allow.
+    #[allow(dead_code)]
     pub fn autonomous_reads(&self) -> &[String] {
         &self.reads
     }
 
+    #[allow(dead_code)]
     pub fn autonomous_actions(&self) -> &[String] {
         &self.actions
     }
@@ -996,9 +1012,9 @@ impl Policy {
             return false;
         }
         let normalized = words.join(" ").to_ascii_lowercase();
-        self.reads.iter().any(|prefix| {
-            normalized == *prefix || normalized.starts_with(&format!("{prefix} "))
-        })
+        self.reads
+            .iter()
+            .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
     }
 
     /// Whether an operation of this `kind()` is executed without asking. Everything else becomes a
@@ -1156,12 +1172,6 @@ pub struct Outcome {
     pub output_tail: String,
 }
 
-impl Outcome {
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == Some(0)
-    }
-}
-
 /// Why an invocation did not happen, in the vocabulary `health.rs` already has.
 ///
 /// The three that look alike are kept apart on purpose. `MissingCli` is a thing this computer cannot
@@ -1313,7 +1323,10 @@ pub async fn execute(runtime: &GithubRuntime, op: &Op) -> Result<Outcome, Failur
             let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
-            tracing::warn!(kind = op.kind(), "gh timed out; its process tree was killed");
+            tracing::warn!(
+                kind = op.kind(),
+                "gh timed out; its process tree was killed"
+            );
             return Err(Failure::TimedOut);
         }
     };
@@ -1453,29 +1466,26 @@ pub async fn submit(
     if !runtime.enabled {
         return Err(Failure::NotConfigured);
     }
-    let acting = match &op {
-        Op::Read(_) => None,
-        Op::Act(act) => Some(act.clone()),
-    };
-    let Some(act) = acting else {
-        return execute(runtime, &op).await.map(Submitted::Ran);
-    };
-    if runtime.policy.action_is_autonomous(act.kind()) {
-        return execute(runtime, &op).await.map(Submitted::Ran);
+    match &op {
+        Op::Read(_) => execute(runtime, &op).await.map(Submitted::Ran),
+        Op::Act(act) if runtime.policy.action_is_autonomous(act.kind()) => {
+            execute(runtime, &op).await.map(Submitted::Ran)
+        }
+        Op::Act(act) => {
+            let kind = act.kind();
+            let why = act.describe();
+            let payload = serde_json::to_string(&op).map_err(|error| {
+                Failure::Unknown(format!("the operation could not be recorded: {error}"))
+            })?;
+            let proposal_id = crate::proposals::create_github_action(pool, kind, &why, &payload)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(kind, %error, "filing a github action for approval failed");
+                    Failure::Unknown("the operation could not be filed for approval".to_owned())
+                })?;
+            Ok(Submitted::Filed { proposal_id, kind })
+        }
     }
-
-    let payload = serde_json::to_string(&op)
-        .map_err(|error| Failure::Unknown(format!("the operation could not be recorded: {error}")))?;
-    let proposal_id = crate::proposals::create_github_action(pool, act.kind(), &act.describe(), &payload)
-        .await
-        .map_err(|error| {
-            tracing::warn!(kind = act.kind(), %error, "filing a github action for approval failed");
-            Failure::Unknown("the operation could not be filed for approval".to_owned())
-        })?;
-    Ok(Submitted::Filed {
-        proposal_id,
-        kind: act.kind(),
-    })
 }
 
 /// Runs a `github-action` a person has just approved.
@@ -1628,7 +1638,10 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    !part.starts_with("--") || part.contains('=') || part == "--log" || part == "--",
+                    !part.starts_with("--")
+                        || part.contains('=')
+                        || part == "--log"
+                        || part == "--",
                     "{} puts {part} on the command line as a bare flag",
                     op.kind()
                 );
@@ -1736,7 +1749,10 @@ mod tests {
     fn a_missing_file_withholds_autonomy_and_not_capability() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let config = load_github_config(&directory.path().join("nothing-here.yaml"));
-        assert!(config.enabled, "an absent file may not switch the pillar off");
+        assert!(
+            config.enabled,
+            "an absent file may not switch the pillar off"
+        );
         assert!(config.autonomous_reads.is_empty());
         assert!(config.autonomous_actions.is_empty());
     }
@@ -1777,7 +1793,9 @@ mod tests {
                 "{prose} returns a stranger's words and may not be eligible for autonomy"
             );
         }
-        let policy = policy_from(Some("autonomous_reads:\n  - gh pr view\n  - gh issue view\n"));
+        let policy = policy_from(Some(
+            "autonomous_reads:\n  - gh pr view\n  - gh issue view\n",
+        ));
         assert!(policy.autonomous_reads().is_empty());
     }
 

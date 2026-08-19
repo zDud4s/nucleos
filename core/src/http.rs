@@ -2974,12 +2974,18 @@ async fn submit_github_request(
     Extension(scope): Extension<Scope>,
     Json(body): Json<GithubRequestBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    github_caller_is_allowed(&scope).map_err(|status| (status, String::new()))?;
-    let submitted = uncancellable(async move {
-        crate::github::submit(&state.pool, &state.github, body.op).await
-    })
-    .await
-    .map_err(|status| (status, "the github task did not finish".to_owned()))?;
+    github_caller_is_allowed(&scope).map_err(|status| {
+        (
+            status,
+            "reaching GitHub is the owner's, not a run's".to_owned(),
+        )
+    })?;
+    let submitted =
+        uncancellable(
+            async move { crate::github::submit(&state.pool, &state.github, body.op).await },
+        )
+        .await
+        .map_err(|status| (status, "the github task did not finish".to_owned()))?;
 
     match submitted {
         Ok(crate::github::Submitted::Ran(outcome)) => Ok(Json(serde_json::json!({
@@ -4412,7 +4418,10 @@ async fn post_proposal_approve(
                 "this proposal has already been decided".to_owned(),
             )),
             Err(crate::github::DecisionError::Malformed) => {
-                tracing::warn!(proposal_id = id, "a github proposal carried no usable operation");
+                tracing::warn!(
+                    proposal_id = id,
+                    "a github proposal carried no usable operation"
+                );
                 Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "this proposal carries no usable operation, so there is nothing to run"

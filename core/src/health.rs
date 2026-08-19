@@ -32,7 +32,6 @@ const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DAEMON_TOKEN_KEY: &str = "daemon-token";
 const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
-const GITHUB_TOKEN_KEY: &str = crate::github::TOKEN_KEY;
 /// How long an exec verdict is trusted before a refresh is kicked off behind the readout.
 const EXEC_CACHE_TTL: Duration = Duration::from_secs(60);
 /// A generous ceiling for the background exec. Nobody waits on it, so it can afford to be patient
@@ -310,17 +309,23 @@ async fn github_probe(asked_for: bool) -> SubsystemReadout {
         if !asked_for {
             return Ok(HealthState::Disabled);
         }
-        tokio::task::spawn_blocking(|| resolve_program(std::ffi::OsStr::new("gh")))
+        // The two facts `execute` needs, in the order it needs them, and the CATEGORY comes from
+        // `github::Failure` rather than being chosen again here. One vocabulary, defined where the
+        // failures are, so the readout and the refusal a caller gets cannot come to disagree.
+        let failure = if tokio::task::spawn_blocking(|| resolve_program(std::ffi::OsStr::new("gh")))
             .await
             .map_err(classify_error)?
-            .ok_or(FailureCategory::Missing)?;
-        let token = tokio::task::spawn_blocking(|| crate::secrets::load_secret(GITHUB_TOKEN_KEY))
-            .await
-            .map_err(classify_error)?
-            .map_err(classify_error)?;
-        match token {
-            Some(token) if !token.trim().is_empty() => Ok(HealthState::Ok),
-            _ => Err(FailureCategory::PermissionDenied),
+            .is_none()
+        {
+            Some(crate::github::Failure::MissingCli)
+        } else if crate::github::load_token().await.is_none() {
+            Some(crate::github::Failure::MissingToken)
+        } else {
+            None
+        };
+        match failure {
+            None => Ok(HealthState::Ok),
+            Some(failure) => Err(failure.category()),
         }
     })
     .await

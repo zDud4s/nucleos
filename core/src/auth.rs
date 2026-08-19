@@ -1707,11 +1707,7 @@ mod tests {
                 "{method} {path} must be unreachable by a run"
             );
             assert!(
-                !permits(
-                    &Scope::ApiToken(ApiTokenLevel::RunCreating),
-                    &method,
-                    path
-                ),
+                !permits(&Scope::ApiToken(ApiTokenLevel::RunCreating), &method, path),
                 "{method} {path} must be unreachable by a run-creating key"
             );
             assert!(
