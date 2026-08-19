@@ -137,16 +137,20 @@ func TestATableKeepsItsShape(t *testing.T) {
 	}
 }
 
-// TestAPageThatFetchesItsOwnContentIsReadAsAShellAndSaysSo.
+// TestAPageFetchesItsOwnContentThroughTheFence.
 //
-// The measurement and the fix in one place, because the measurement is the argument for the fix.
+// The measurement that produced this, kept because it is the argument for the whole file it led to:
+// with `connect-src 'none'` and nothing else, this dashboard rendered a shell. The fetch never left,
+// the snapshot carried the heading and the menu and none of the content, and the agent read that as
+// a page with nothing on it — a correct reading, and the wrong conclusion, with nothing anywhere to
+// contradict it.
 //
-// `connect-src 'none'` closes fetch, XHR, EventSource and beacons — and it is not there for tidiness:
-// CSP3 scheme matching makes `https:` match `wss:` too, so no source expression admits a fetch while
-// refusing a socket, and `wss:` is invisible to both other layers of the fence. The cost is this
-// page: a dashboard that arrives empty and fills itself from an API renders a shell, and a shell is
-// a CORRECT reading of an empty page. The agent used to conclude the dashboard was blank.
-func TestAPageThatFetchesItsOwnContentIsReadAsAShellAndSaysSo(t *testing.T) {
+// The channel is STILL closed. What changed is that the page can ask us, and we decide: the shim
+// hands the url to a binding, the driver checks it, and the BROWSER loads it in the profile and
+// through the fence's own interception. So `GET /content` arriving here is the point of the
+// assertion — it proves the request was really made, in the real cookie jar, rather than answered
+// from somewhere of ours.
+func TestAPageFetchesItsOwnContentThroughTheFence(t *testing.T) {
 	site := newSite(t)
 	driver, _ := fenced(t, admitting(site))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -156,11 +160,70 @@ func TestAPageThatFetchesItsOwnContentIsReadAsAShellAndSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	if !site.reached("GET /content", 20*time.Second) {
+		t.Fatal("the request was never made; the page is still a shell")
+	}
 
-	// Polled, because the fetch happens on load and the refusal that follows it is not synchronous
-	// with the snapshot that would see it.
 	var last browser.Snapshot
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if hasName(last, "Approve the write-down") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	if !hasName(last, "Approve the write-down") {
+		t.Fatalf("the content arrived and the agent still cannot see it: %+v", last.Elements)
+	}
+	var prose string
+	for _, element := range last.Elements {
+		if element.Role == "text" {
+			prose += element.Name
+		}
+	}
+	if !strings.Contains(prose, "Revenue fell by eleven percent") {
+		t.Errorf("the words the page fetched are not in the reading: %q", prose)
+	}
+	if last.Blocked != nil {
+		t.Errorf("a page that was served was also reported as refused: %+v", last.Blocked)
+	}
+}
+
+// TestAPageCannotHaveTheFenceFetchFromAnotherHost.
+//
+// The rule that makes the ferry a service and not a hole. Same-origin only: it opens no host the
+// page could not already reach, and the answer comes from a server the page already IS. The origin
+// is taken from the execution context Chromium reports, never from the page, because a restriction
+// the restricted thing describes is not one.
+func TestAPageCannotHaveTheFenceFetchFromAnotherHost(t *testing.T) {
+	site := newSite(t)
+	policy := admitting(site)
+	policy.Loopback = append(policy.Loopback, otherHost(site))
+	driver, _ := fenced(t, policy)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// The same server under a name Chromium calls a different site, and one this profile even
+	// admits — so what refuses this is the ferry's own rule and not the allowlist.
+	elsewhere := otherHost(site) + "/content"
+	session, err := driver.Open(ctx, browser.OpenRequest{
+		URL: site.origin() + "/spa?src=" + url.QueryEscape(elsewhere),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if site.reached("GET /content", 5*time.Second) {
+		t.Fatal("the fence carried a request to another host")
+	}
+
+	var last browser.Snapshot
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 		if err != nil {
@@ -171,25 +234,20 @@ func TestAPageThatFetchesItsOwnContentIsReadAsAShellAndSaysSo(t *testing.T) {
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-
-	// The measurement: the content never arrives, and the shell reads as a whole page.
-	if site.reached("GET /content", 2*time.Second) {
-		t.Fatal("the fetch left the machine; connect-src 'none' is not holding and this test is measuring nothing")
-	}
-	for _, element := range last.Elements {
-		if strings.Contains(element.Name, "Approve the write-down") {
-			t.Fatal("the content arrived after all")
-		}
-	}
-
-	// The fix: the reading says it is not the whole page.
 	if last.Blocked == nil {
-		t.Fatal("the agent reads this dashboard as empty and nothing tells it otherwise")
+		t.Fatal("the page could not get its content and the reading did not say so")
 	}
 	if last.Blocked.Consequence != browser.ConsequencePageRequest {
 		t.Errorf("named %q", last.Blocked.Consequence)
 	}
-	if !strings.Contains(last.Blocked.Detail, "/content") {
-		t.Errorf("the detail does not say what the page was reaching for: %q", last.Blocked.Detail)
+}
+
+// hasName reports whether anything in a snapshot is called this.
+func hasName(snapshot browser.Snapshot, name string) bool {
+	for _, element := range snapshot.Elements {
+		if strings.Contains(element.Name, name) {
+			return true
+		}
 	}
+	return false
 }

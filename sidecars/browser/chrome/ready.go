@@ -212,4 +212,5 @@ func (d *Driver) forgetRefs(entry *session) {
 	// answer a question about this page with evidence from the last one.
 	entry.blocked = 0
 	entry.blockedLast = browser.Refusal{}
+	entry.ferried = 0
 }

@@ -190,16 +190,21 @@ func newSite(t *testing.T) *site {
 	mux.HandleFunc("/spa", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, `<!doctype html><title>spa</title><body>
+		source := r.URL.Query().Get("src")
+		if source == "" {
+			source = "/content"
+		}
+		fmt.Fprintf(w, `<!doctype html><title>spa</title><body>
 			<h1>Dashboard</h1>
 			<div id=app></div>
 			<script>
+			const SRC = %q;
 			window.addEventListener('load', () => {
-				fetch('/content').then(r => r.text())
+				fetch(SRC).then(r => r.text())
 					.then(t => { document.getElementById('app').innerHTML = t; })
-					.catch(() => {});
+					.catch(e => { new Image().src = '/beacon?what=fetch-failed'; });
 			});
-			</script>`)
+			</script>`, source)
 	})
 	mux.HandleFunc("/content", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)

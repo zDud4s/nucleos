@@ -43,6 +43,10 @@ type Driver struct {
 	// reported against the act that caused it. Not every CDP session has an entry — see
 	// recordedRefusal.
 	cdpToSession map[cdp.SessionID]browser.SessionID
+	// contexts is where each of a page's worlds is, by the origin Chromium reports for it. The
+	// ferry's same-origin rule reads it from here and never from the page — a restriction the
+	// restricted thing gets to describe is not one.
+	contexts map[contextKey]executionContext
 
 	refusals     []recordedRefusal
 	refusalTotal int
@@ -102,6 +106,17 @@ type session struct {
 	// the whole page", and an answer carried over from the previous page does not.
 	blocked     int
 	blockedLast browser.Refusal
+	// ferried counts the requests this document has asked us to carry, so a page that polls cannot
+	// have us carrying its traffic forever.
+	ferried int
+}
+
+// contextKey names one execution context. The id is unique within a target and not across them, so
+// the session is part of the key — the same mistake, one layer up, as the backend node ids that
+// made a ref mean two things.
+type contextKey struct {
+	session cdp.SessionID
+	id      int64
 }
 
 // nodeKey identifies a node across every document a session can see.
@@ -172,6 +187,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		sessions:     map[browser.SessionID]*session{},
 		targets:      map[string]browser.SessionID{},
 		cdpToSession: map[cdp.SessionID]browser.SessionID{},
+		contexts:     map[contextKey]executionContext{},
 		swept:        make(chan struct{}),
 		readyWithin:  readyDeadline,
 		idleGrace:    idleGrace,
@@ -179,6 +195,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)
 	conn.OnEvent(driver.onLogEntry)
+	conn.OnEvent(driver.onRuntimeEvent)
 	driver.startSweep()
 	return driver, nil
 }
@@ -259,8 +276,9 @@ func (d *Driver) onEvent(event cdp.Event) {
 		}
 		d.mu.Unlock()
 		// A framed login form that cannot fetch is the case this pillar exists for, so the frame's
-		// log is listened to as well as the page's.
+		// log is listened to as well as the page's, and it gets the ferry too.
 		d.watchCSP(ctx, params.SessionID)
+		d.armFerry(ctx, params.SessionID)
 	}
 
 	// Spec §5.4: in agent mode a new target is BLOCKED, not opened and then watched. A headless
@@ -327,6 +345,9 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	// capability for a better wait.
 	_, _ = d.conn.Call(ctx, cdpSession, "Page.setLifecycleEventsEnabled", map[string]any{"enabled": true})
 	d.watchCSP(ctx, cdpSession)
+	// Before the navigation, because the shim has to be in place before the document that will use
+	// it exists. Arming after would leave the first page — the one the agent asked for — unserved.
+	d.armFerry(ctx, cdpSession)
 	mainFrame := d.mainFrameOf(ctx, cdpSession)
 
 	d.mu.Lock()
