@@ -570,6 +570,69 @@ describe("what a session would be able to do, before it is picked up", () => {
   });
 });
 
+/* ----------------------------------------- who said it, and how it reads -- */
+
+describe("reading a transcript back", () => {
+  it("says who spoke, on both halves of a turn", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "que horas sao", answer: "sao tres" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const turn = (await screen.findByText("que horas sao")).closest("li") as HTMLElement;
+    expect(within(turn).getByText("you")).toBeTruthy();
+    expect(within(turn).getByText("núcleo")).toBeTruthy();
+  });
+
+  it("draws a fenced block as code rather than as three backticks", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "como corro", answer: "assim:\n```sh\ncargo test\n```" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const code = await screen.findByText("cargo test");
+    expect(code.closest("pre")).not.toBeNull();
+    expect(screen.queryByText(/```/)).toBeNull();
+  });
+
+  it("leaves what a person typed exactly as they typed it", async () => {
+    // Their half is not markdown and is not treated as any: somebody who types two asterisks meant
+    // two asterisks, and a message re-drawn as bold is a message they did not send.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "porque **isto**", answer: "porque sim" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText("porque **isto**")).toBeTruthy();
+  });
+
+  it("scrolls to the newest turn instead of opening at the oldest", async () => {
+    // A conversation is read at its end. Opening one at the top means scrolling past an afternoon
+    // of work to reach the sentence you came back for.
+    const scrolled = vi.fn();
+    Element.prototype.scrollIntoView = scrolled;
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "primeiro", answer: "um" }), turnRow({ id: 2, asked: "ultimo", answer: "dois" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await screen.findByText("ultimo");
+
+    await waitFor(() => expect(scrolled).toHaveBeenCalled());
+  });
+});
+
 /* ------------------------------------------------- a turn as it happens -- */
 
 describe("a turn in flight", () => {

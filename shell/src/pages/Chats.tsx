@@ -23,6 +23,7 @@ import {
   type Turn,
 } from "../data/chats";
 import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
+import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import {
   Badge,
   Button,
@@ -643,8 +644,15 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
             className={said.by_owner ? "chats-said-line chats-said-owner" : "chats-said-line"}
           >
             <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
-            {/* Text, never markup — this is somebody else's file. */}
-            <p className="chats-said-text">{said.text}</p>
+            {/* Text, never markup — this is somebody else's file. `Rich` never emits either:
+                it returns data and this page decides what an element is. */}
+            {said.by_owner ? (
+              <p className="chats-said-text">{said.text}</p>
+            ) : (
+              <div className="chats-said-text">
+                <Rich text={said.text} />
+              </div>
+            )}
           </li>
         ))}
       </ul>
@@ -667,21 +675,40 @@ function Transcript({
   precededBy: boolean;
   chatId: string;
 }) {
+  const end = useRef<HTMLDivElement | null>(null);
+  const last = turns.length === 0 ? null : turns[turns.length - 1];
+
+  // A conversation is read at its end.
+  //
+  // Opening one at the top means scrolling past an afternoon of work to reach the sentence you came
+  // back for, and on a conversation picked up from the editor that is somebody else's whole day
+  // above the two turns you just had. Before the hooks below it, and above the early returns: the
+  // rules of hooks do not bend for a component that sometimes has nothing to draw.
+  //
+  // `last?.status` alongside the count, because a turn that ENDS grows the page without adding a
+  // row to it — the answer lands where "thinking…" was, and the bottom moves.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [chatId, turns.length, last?.status]);
+
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
   if (turns.length === 0 && precededBy) return null;
   if (turns.length === 0) return <p className="chats-empty">nothing has been said yet.</p>;
   return (
-    <ul className="chats-turns" aria-label="Transcript">
-      {turns.map((turn, index) => (
-        <TurnBlock
-          key={turn.id}
-          turn={turn}
-          previous={index === 0 ? null : turns[index - 1]}
-          chatId={chatId}
-        />
-      ))}
-    </ul>
+    <>
+      <ul className="chats-turns" aria-label="Transcript">
+        {turns.map((turn, index) => (
+          <TurnBlock
+            key={turn.id}
+            turn={turn}
+            previous={index === 0 ? null : turns[index - 1]}
+            chatId={chatId}
+          />
+        ))}
+      </ul>
+      <div ref={end} className="chats-turns-end" />
+    </>
   );
 }
 
@@ -702,11 +729,20 @@ function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
+      <p className="chats-turn-who">you</p>
+      {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
+          Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
+          message they did not send. */}
       <p className="chats-turn-asked">{turn.asked}</p>
+      <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
       {!live && <WhatItDid did={turn.did} />}
-      {!live && turn.answer !== null && <p className="chats-turn-answer">{turn.answer}</p>}
+      {!live && turn.answer !== null && (
+        <div className="chats-turn-answer">
+          <Rich text={turn.answer} />
+        </div>
+      )}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
       )}
@@ -716,6 +752,59 @@ function TurnBlock({
       </div>
     </li>
   );
+}
+
+/**
+ * A model's answer, drawn as the shapes it was written in.
+ *
+ * The parser is in `lib/rich.ts` and returns data, never markup; every element below is chosen
+ * here, from a closed set. So a transcript containing a script tag is a string containing a script
+ * tag at every step of this, and there is no path by which one talks this into rendering HTML.
+ *
+ * Only the model's half goes through it. What a person typed is drawn exactly as they typed it.
+ */
+function Rich({ text }: { text: string }) {
+  return (
+    <>
+      {blocks(text).map((block, index) =>
+        block.kind === "code" ? (
+          <pre key={index} className="chats-code">
+            <code>{block.text}</code>
+          </pre>
+        ) : (
+          <div key={index} className="chats-prose">
+            {lines(block.text).map((line, at) => (
+              <RichLineOut key={at} line={line} />
+            ))}
+          </div>
+        ),
+      )}
+    </>
+  );
+}
+
+function RichLineOut({ line }: { line: RichLine }) {
+  const inner = line.spans.map((span, index) =>
+    span.kind === "code" ? (
+      <code key={index}>{span.text}</code>
+    ) : span.kind === "strong" ? (
+      <strong key={index}>{span.text}</strong>
+    ) : (
+      <span key={index}>{span.text}</span>
+    ),
+  );
+  if (line.kind === "heading") {
+    return <p className={`chats-rich-heading chats-rich-heading-${line.level}`}>{inner}</p>;
+  }
+  if (line.kind === "bullet") {
+    return (
+      <p className="chats-rich-bullet">
+        <span aria-hidden="true">•</span>
+        {inner}
+      </p>
+    );
+  }
+  return <p className="chats-rich-line">{inner}</p>;
 }
 
 /**
@@ -760,12 +849,19 @@ function LiveAnswer({ turnId }: { turnId: number }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
   const doing = live.data?.doing ?? null;
+  const end = useRef<HTMLParagraphElement | null>(null);
+
+  // Follows itself down. The list above does not re-render while a turn writes -- the words arrive
+  // on this component's own poll -- so the transcript's scroll effect never fires for any of it.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [text, doing]);
 
   return (
     <>
       {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
       <WhatItDid did={live.data?.did ?? []} />
-      <p className="chats-turn-live">
+      <p className="chats-turn-live" ref={end}>
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>
