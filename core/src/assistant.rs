@@ -579,6 +579,33 @@ pub async fn send_message(
         Some(turn) => turn.prompt_for(text),
         None => text.to_string(),
     };
+    // The conversation so far, for a turn that has no session to hold it.
+    //
+    // `resume` is `None` on a first turn — where there is nothing to replay and this adds nothing —
+    // and on a ROTATED one, which is the case this exists for. The daemon refuses to resume past
+    // `CONTEXT_ROTATION_TOKENS`, and past anything that read third-party text, and then mints a
+    // fresh session; without this the model on the far side of that line begins remembering
+    // nothing while the transcript above it reads as one unbroken conversation.
+    //
+    // It bites hardest on a conversation picked up from the editor: one arrives carrying a context
+    // somebody else's session already filled, often past the ceiling on the first turn here — so
+    // continuing one could mean exactly one continued turn and then a stranger.
+    //
+    // The same answer the LOCAL path has always given, for the same reason and through the same
+    // function: no session to resume, so the exchanges are read back instead. A failure to read
+    // them is not a failure of the turn — a model answering without the history is worse than one
+    // answering with it, and better than one that refuses.
+    let prompt = match &resume {
+        Some(_) => prompt,
+        None => match recent_exchanges(&state.pool, chat_id).await {
+            Ok(history) if !history.is_empty() => replayed(&history, &prompt),
+            Ok(_) => prompt,
+            Err(error) => {
+                tracing::warn!(%error, chat_id, "could not read the conversation to replay it");
+                prompt
+            }
+        },
+    };
     // An errand's folder wins over the chat's directory, and its policy wins over `tool_policy_for`.
     //
     // The directory, because an errand's turn runs IN its folder so a relative path the model writes
@@ -671,6 +698,44 @@ const HISTORY_TURNS: i64 = 6;
 /// single exchange and thousands of characters. What overflows the window is length, so length is
 /// what is bounded.
 const HISTORY_CHARS: usize = 6_000;
+
+/// The conversation so far, in front of the message that follows it.
+///
+/// Written as plainly as it can be, because it is read by a model that has NO memory of any of it
+/// and must not mistake a replayed question for the one being asked now. The last line says which
+/// is which.
+///
+/// `you:` and `núcleo:` rather than `user`/`assistant`: the CLI has its own idea of those roles and
+/// this text is a user message, not a transcript it should adopt. Naming them after the roles would
+/// invite the model to continue the transcript rather than answer the question.
+fn replayed(history: &[(String, String)], prompt: &str) -> String {
+    let mut out = String::from(
+        "This conversation has just begun a new context, so you do not remember what is below.          These are its recent exchanges, oldest first, replayed for you:
+
+",
+    );
+    for (asked, answered) in history {
+        out.push_str("you: ");
+        out.push_str(asked);
+        out.push_str(
+            "
+núcleo: ",
+        );
+        out.push_str(answered);
+        out.push_str(
+            "
+
+",
+        );
+    }
+    out.push_str(
+        "That is the replay. The new message follows.
+
+",
+    );
+    out.push_str(prompt);
+    out
+}
 
 /// The exchanges a local turn may be shown, oldest first.
 ///
@@ -980,6 +1045,23 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
     let turn = TurnGuard { slot, mcp_path };
 
+    // The turn's stream, mirrored as the CLI writes it and published under the turn's own id — a
+    // turn IS a run, so `GET /runs/{id}/tail` already serves this and needed nothing new.
+    //
+    // Published BEFORE the task is spawned, not inside it. `send_message` answers with this id and
+    // the window starts asking immediately; registering from inside the task would leave a window
+    // in which the tail does not exist yet, and "no live tail" is the same answer the endpoint
+    // gives for a run that finished — so the first poll of every turn would read as already over.
+    //
+    // Taken out by `Registration`'s `Drop`, which `spawn_registered` builds, so completion, failure,
+    // timeout, cancel and panic all remove it without a line here.
+    let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    state
+        .run_tails
+        .lock()
+        .unwrap()
+        .insert(id, std::sync::Arc::clone(&transcript));
+
     crate::runs::spawn_registered(state, id, async move {
         // WHICH key this turn carries follows from what it can read, and the two must be decided
         // together or not at all.
@@ -1063,7 +1145,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // at all.
                     session_id: Some(session_id),
                     fork_session: false,
-                    include_partial_messages: false,
+                    // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
+                    // paragraph at a time. It costs nothing when nobody is watching: these are more
+                    // events on a stream the daemon already reads line by line, and `extract_reply`
+                    // takes the reply from the `result` event either way.
+                    include_partial_messages: true,
                     // An orchestrator turn is one message answered and closed; the next one arrives
                     // as its own turn on the resumed session, which is where a Telegram reply
                     // already goes. Nothing here needs a stdin, so it keeps a closed one.
@@ -1084,12 +1170,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     allowed_mcp_tools: None,
                 },
                 session_tx,
-                // Unread here, deliberately. An assistant turn's product is the reply that
-                // `extract_reply` pulls out of a completed run; a turn the wall clock killed has no
-                // reply to salvage, and `assistant_sessions` has nowhere to keep a partial one.
-                // `runs.rs` reads its copy because a run's trajectory is worth keeping even when
-                // the run is not — that difference is in the tables, not an oversight here.
-                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                // The published buffer, so what the window watches is what the CLI is writing.
+                //
+                // Still not the turn's PRODUCT: the reply is what `extract_reply` pulls out of the
+                // `result` event of a completed run, and a turn the wall clock killed has no reply
+                // to salvage. This is the same distinction as before — the stream is transport, the
+                // result is the answer — with the transport now visible while it moves.
+                transcript,
             ),
         )
         .await;
@@ -1114,14 +1201,26 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // shows the actual fault rather than a wall of JSON.
             Ok(Ok(o)) => match extract_reply(&o.stdout) {
                 Some(reply) => {
+                    // Read out of the same stream the reply came from, and stored beside it. The
+                    // live tail is taken away the instant this turn ends, so without this the
+                    // actions are visible while the turn runs and gone for ever afterwards.
+                    //
+                    // Serialised here rather than kept as rows: it is read only with the turn it
+                    // belongs to, and a table would be a join for something no query ever asks
+                    // about on its own. An empty list is stored as `[]`, which says "acted on
+                    // nothing" — NULL is reserved for turns nobody asked.
+                    let tools_used =
+                        serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
+                            .unwrap_or_else(|_| "[]".to_string());
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(&tools_used)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -2743,10 +2842,10 @@ mod tests {
         let (mut state, dir, _runner) = errand_state().await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         state.local_assistant = Some(capturing_local_assistant(seen.clone()));
-        let errand = open_errand(&state, "carros", "-1:12").await;
+        let errand = open_errand(&state, "carros", "-1:31").await;
         crate::errands::append_notebook(dir.path(), &errand, 1, "já vi 12 anúncios").unwrap();
 
-        let id = send_message(&state, "-1:12", "e agora?", Origin::Telegram)
+        let id = send_message(&state, "-1:31", "e agora?", Origin::Telegram)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;
@@ -2763,13 +2862,13 @@ mod tests {
     #[tokio::test]
     async fn an_errand_with_a_notebook_starts_tainted() {
         let (state, dir, _runner) = errand_state().await;
-        let errand = open_errand(&state, "carros", "-1:13").await;
+        let errand = open_errand(&state, "carros", "-1:30").await;
         crate::errands::set_brain(&state.pool, errand.id, crate::errands::Brain::Cloud)
             .await
             .unwrap();
         crate::errands::append_notebook(dir.path(), &errand, 1, "o site dizia X").unwrap();
 
-        let id = send_message(&state, "-1:13", "continua", Origin::Telegram)
+        let id = send_message(&state, "-1:30", "continua", Origin::Telegram)
             .await
             .unwrap();
 
@@ -3062,5 +3161,285 @@ mod tests {
             crate::chats::cwd_of(&state.pool, &chat_id).await.unwrap(),
             Some("C:/Projects/nucleos-canvas".to_string()),
         );
+    }
+
+    /// The one line that decides whether picking up a conversation gives you an agent or a
+    /// pen-friend — and the two halves of it, asserted together.
+    ///
+    /// A session had in a directory with no classifier hook continues on the MCP server alone: no
+    /// `Read`, no `Edit`, no `Bash`. That is not a bug, it is the barrier working — but it is also
+    /// why continuing a coding conversation could feel like nothing happened, and why the window
+    /// has to be able to fix it rather than only report it.
+    #[test]
+    fn wiring_a_project_is_what_turns_a_continued_conversation_from_talk_into_tools() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().to_str().unwrap();
+
+        assert_eq!(
+            tool_policy_for(
+                Some(dir),
+                Origin::Shell,
+                crate::autopilot::classifier_hook_is_wired(root.path())
+            ),
+            crate::runner::ToolPolicy::McpOnly,
+        );
+
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+
+        assert_eq!(
+            tool_policy_for(
+                Some(dir),
+                Origin::Shell,
+                crate::autopilot::classifier_hook_is_wired(root.path())
+            ),
+            crate::runner::ToolPolicy::Unrestricted,
+        );
+    }
+
+    /// A turn's stream is published WHILE it is being written, so the window can show the work
+    /// instead of a spinner.
+    ///
+    /// The buffer is taken out of the map while the turn is in flight and read again after it ends:
+    /// that is what proves the published handle is the one the runner writes into, rather than an
+    /// empty one registered beside it. Registering the wrong buffer would look identical from
+    /// outside — a tail that answers, and never says anything.
+    #[tokio::test]
+    async fn a_turn_in_flight_publishes_its_stream_so_the_window_can_watch() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            delay: Mutex::new(Some(Duration::from_millis(150))),
+            ..Default::default()
+        });
+
+        let id = send_message(&state, "assistant-watching-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let mut published = None;
+        for _ in 0..500 {
+            let found = state.run_tails.lock().unwrap().get(&id).cloned();
+            if let Some(buffer) = found {
+                published = Some(buffer);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let published = published.expect("a turn in flight published no stream to watch");
+
+        settled_turn(&state.pool, id).await;
+
+        // Taken out when the turn ends. A tail left behind is the run's whole output held in memory
+        // until the daemon restarts, which is why `Registration` removes it rather than this code.
+        //
+        // Waited for rather than asserted outright: the row leaves `running` from INSIDE the task,
+        // and the registration is dropped when that task ends — a moment later. Asserting on the
+        // row's timing would be asserting on a race this does not care about.
+        let mut gone = false;
+        for _ in 0..500 {
+            if state.run_tails.lock().unwrap().get(&id).is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(gone, "the tail outlived the turn");
+        let written = published.lock().unwrap().clone();
+        assert!(written.contains("fake output"), "{written:?}");
+    }
+
+    /// The turn asks the CLI to stream its message as it is written, not only when it is finished.
+    ///
+    /// Without this the stream carries whole blocks, and a conversation shows nothing for as long as
+    /// the model takes to write a paragraph — which is exactly the wait the tail above exists to
+    /// fill. The flag costs nothing when nobody is watching: it adds events to a stream the daemon
+    /// was already reading line by line.
+    #[tokio::test]
+    async fn an_assistant_turn_asks_the_cli_for_partial_messages() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+
+        let id = send_message(&state, "assistant-partials-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(
+            *runner.last_include_partial_messages.lock().unwrap(),
+            Some(true)
+        );
+    }
+
+    /// A runner whose stream carries a tool call before its result.
+    fn ran_a_tool(stdout_lines: &[&str]) -> Arc<FakeCommandRunner> {
+        Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stdout_lines.join(
+                    "
+",
+                ),
+                stderr: String::new(),
+                session_id: Some("fake-session-id".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// What a turn DID outlives the stream it did it in.
+    ///
+    /// The live tail is taken away the moment the turn ends, so without this the actions are
+    /// visible for as long as the turn runs and then gone for ever — and a conversation reopened
+    /// tomorrow shows a paragraph with nothing to say where it came from.
+    #[tokio::test]
+    async fn a_finished_turn_records_what_it_did() {
+        let mut state = test_state().await;
+        state.runner = ran_a_tool(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"core/src/parser.rs"}}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"é o parser de datas"}"#,
+        ]);
+
+        let id = send_message(&state, "assistant-did-chat", "arranja", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT tools_used FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let did: Vec<crate::runner::ToolCall> =
+            serde_json::from_str(&stored.expect("the turn recorded no actions")).unwrap();
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(did[0].name, "Read");
+        assert_eq!(did[0].detail.as_deref(), Some("core/src/parser.rs"));
+    }
+
+    /// A turn that only talked records an EMPTY list, not nothing at all.
+    ///
+    /// NULL is what a turn from before this column has, and the two are different facts: one is a
+    /// turn known to have acted on nothing, the other is a turn nobody asked. Only the first can be
+    /// said out loud.
+    #[tokio::test]
+    async fn a_turn_that_only_talked_records_an_empty_list_rather_than_nothing() {
+        let mut state = test_state().await;
+        state.runner = ran_a_tool(&[r#"{"type":"result","subtype":"success","result":"olá"}"#]);
+
+        let id = send_message(&state, "assistant-talked-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT tools_used FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.as_deref(), Some("[]"));
+    }
+
+    /// Records a finished exchange in a chat, the way a turn that completed leaves one.
+    async fn past_exchange(pool: &SqlitePool, chat_id: &str, asked: &str, answered: &str) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, stdout, created_at)
+             VALUES (?, 'completed', 'assistant', 'old-session', ?, ?, '2026-08-11T10:00:00+00:00')",
+        )
+        .bind(asked)
+        .bind(chat_id)
+        .bind(answered)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A conversation that cannot resume is READ BACK to the model instead of starting blank.
+    ///
+    /// This is the ceiling in `CONTEXT_ROTATION_TOKENS` biting, and it bites hardest on a
+    /// conversation picked up from the editor: one arrives with somebody else's context already
+    /// filling the window, so the very first turn here can push it past the ceiling and the second
+    /// one would begin remembering nothing. The local path has always replayed its history for want
+    /// of a session protocol; this is the same answer to the same problem.
+    #[tokio::test]
+    async fn a_turn_that_cannot_resume_is_replayed_the_conversation_so_far() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+        let chat_id = "assistant-rotated-chat";
+        past_exchange(&state.pool, chat_id, "arranja o parser", "está arranjado").await;
+
+        let id = send_message(&state, chat_id, "e os testes?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let launched = runner.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(launched.contains("arranja o parser"), "{launched}");
+        assert!(launched.contains("está arranjado"), "{launched}");
+        assert!(launched.contains("e os testes?"), "{launched}");
+
+        // The ROW keeps what the person typed. It is what the list shows, what the next replay
+        // reads, and what a person recognises as their own message — a row carrying the preamble
+        // would grow a copy of the conversation into every turn of it.
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "e os testes?");
+    }
+
+    /// And a turn that CAN resume is handed nothing but the message.
+    ///
+    /// The session already holds those exchanges. Replaying them into it would put the conversation
+    /// in the window twice and invite the model to answer the older question again.
+    #[tokio::test]
+    async fn a_turn_that_resumes_is_replayed_nothing() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+        let chat_id = "assistant-resuming-chat";
+        past_exchange(&state.pool, chat_id, "arranja o parser", "está arranjado").await;
+        upsert_session(
+            &state.pool,
+            chat_id,
+            "still-good",
+            "2026-08-11T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let id = send_message(&state, chat_id, "e os testes?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(
+            runner.last_prompt.lock().unwrap().clone().unwrap(),
+            "e os testes?"
+        );
+    }
+
+    /// A conversation with nothing behind it is not given an empty preamble.
+    #[tokio::test]
+    async fn a_first_turn_is_replayed_nothing_because_there_is_nothing() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+
+        let id = send_message(&state, "assistant-brand-new-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(runner.last_prompt.lock().unwrap().clone().unwrap(), "olá");
     }
 }

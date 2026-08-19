@@ -15,6 +15,18 @@ export type Brain = "cloud" | "local";
  * A turn, exactly as `GET /assistant/chats/{chat_id}` serialises one —
  * `core/src/http.rs`'s `AssistantTurn`, oldest first.
  */
+/**
+ * One tool a turn ran, as the daemon distilled it.
+ *
+ * `detail` is the single argument worth showing — a path, a command, a pattern —
+ * and never the whole input: a `Write` carries the file it is writing, and a
+ * conversation that printed that argument would print the file.
+ */
+export interface ToolCall {
+  name: string;
+  detail: string | null;
+}
+
 export interface AssistantTurnRow {
   id: number;
   asked: string;
@@ -26,6 +38,12 @@ export interface AssistantTurnRow {
   answered_by: Brain | null;
   session_id: string | null;
   created_at: string;
+  /**
+   * What the turn ran, oldest first. Empty on a turn that acted on nothing AND
+   * on a turn from before the daemon recorded this — the daemon collapses the
+   * two deliberately, because a client cannot act on the difference.
+   */
+  did: ToolCall[];
 }
 
 /**
@@ -46,6 +64,8 @@ export interface Turn {
   cost_usd: number | null;
   answeredBy: Brain | null;
   sessionId: string | null;
+  /** What the turn ran. See `AssistantTurnRow.did`. */
+  did: ToolCall[];
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -85,6 +105,9 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     cost_usd: row.cost_usd,
     answeredBy: row.answered_by,
     sessionId: row.session_id,
+    // Defaulted rather than trusted: a daemon older than the column sends no such key, and a
+    // conversation losing one line is a better answer to that than a page that will not draw.
+    did: row.did ?? [],
   };
 }
 
