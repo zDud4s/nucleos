@@ -67,7 +67,7 @@ impl Drop for TurnGuard {
 /// `input_tokens + cache_read_input_tokens` from the live assistant events, so this compares against
 /// tokens directly. 140k is ≈0.7 of the 200k window the runner assumes as its conservative floor —
 /// past there a resume mostly re-buys prior turns whose useful part was the last exchange.
-const CONTEXT_ROTATION_TOKENS: i64 = 140_000;
+pub(crate) const CONTEXT_ROTATION_TOKENS: i64 = 140_000;
 
 /// The session a chat's next turn resumes, or `None` when it must start clean.
 ///

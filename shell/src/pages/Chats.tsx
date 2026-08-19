@@ -474,7 +474,7 @@ function ChatDetail({
       {transcript.data !== undefined && (
         <Transcript
           turns={transcript.data}
-          precededBy={(pickedUp.data ?? []).length > 0}
+          precededBy={(pickedUp.data?.said ?? []).length > 0}
           chatId={chatId}
         />
       )}
@@ -626,7 +626,7 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
       </p>
     );
   }
-  if (view.data.length === 0) {
+  if (view.data.said.length === 0) {
     return (
       <p className="chats-picked-up-cut">
         this was picked up from a conversation in the editor that nobody spoke in.
@@ -635,8 +635,15 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
   }
   return (
     <>
+      {/* Said above the text, where the missing part would have been, rather than under it as a
+          footnote. A person reads down from the top; the top is exactly where the gap is. */}
+      {view.data.cut && (
+        <p className="chats-picked-up-cut">
+          older messages are not shown — this conversation was read from its recent end
+        </p>
+      )}
       <ul className="chats-said" aria-label="Said in the editor">
-        {view.data.map((said, index) => (
+        {view.data.said.map((said, index) => (
           // Keyed by position: these came from a file, in the order they are in it, and
           // nothing here reorders or removes one. A transcript has no id to key by.
           <li
@@ -748,6 +755,7 @@ function TurnBlock({
       )}
       <div className="chats-turn-foot">
         <CostLine costUsd={turn.cost_usd} inputTokens={null} outputTokens={null} cachedTokens={null} />
+        <ContextFill fill={turn.contextFill} rotatesAt={turn.rotatesAt} />
         <span className="chats-turn-id">#{turn.id}</span>
       </div>
     </li>
@@ -805,6 +813,32 @@ function RichLineOut({ line }: { line: RichLine }) {
     );
   }
   return <p className="chats-rich-line">{inner}</p>;
+}
+
+/**
+ * How full the context was, and a word before the daemon starts a new one.
+ *
+ * The rotation used to arrive without a sound. A conversation ran, crossed the ceiling, and the
+ * next turn began remembering nothing — and the first anybody heard of it was the restart mark
+ * drawn after the fact, or a model suddenly asking what they were talking about.
+ *
+ * The ceiling is the daemon's, never this file's. It arrives on every turn precisely so this side
+ * never keeps a copy of it, and a turn that arrives without one draws the count alone rather than
+ * a proportion of a number nobody sent.
+ */
+function ContextFill({ fill, rotatesAt }: { fill: number | null; rotatesAt: number | null }) {
+  if (fill === null) return null;
+  const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
+  if (rotatesAt === null) return <span className="chats-turn-fill">{k(fill)} of context</span>;
+  // Near, not past. Past is too late to be a warning: the turn that crosses the line is the last
+  // one that remembers, and this is drawn under it while the next one is still being typed.
+  const near = fill >= rotatesAt * 0.85;
+  return (
+    <span className={near ? "chats-turn-fill chats-turn-fill-near" : "chats-turn-fill"}>
+      {`${k(fill)} of ${k(rotatesAt)}`}
+      {near && " — the next turn may begin a fresh context"}
+    </span>
+  );
 }
 
 /**

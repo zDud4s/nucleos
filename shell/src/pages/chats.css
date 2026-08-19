@@ -595,3 +595,13 @@
 .chats-turns-end {
   height: 1px;
 }
+
+.chats-turn-fill {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-turn-fill-near {
+  color: var(--tone-warn-fg);
+}

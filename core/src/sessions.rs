@@ -118,9 +118,23 @@ pub fn find(root: &Path, session_id: &str) -> Option<IdeSession> {
 /// Deliberately not bound to whether the session can still be resumed. `discover` drops a session
 /// whose directory is gone because resuming is all a listed row offers; reading is not resuming,
 /// and the file still says what was said in it.
-pub fn conversation(root: &Path, session_id: &str) -> Option<Vec<Said>> {
+pub fn conversation(root: &Path, session_id: &str) -> Option<Conversation> {
     let (path, _) = path_of(root, session_id)?;
     Some(read_said(&path))
+}
+
+/// What was said in a session, and whether that is all of it.
+///
+/// `cut` exists because the alternative is a lie the window cannot detect. This is read from the
+/// recent end under two ceilings, and two hundred messages back looks exactly like a conversation
+/// that had two hundred messages -- somebody scrolls up, finds the top, and reads it as the whole
+/// thing. Nothing on screen could have told them otherwise, so the fact travels with the text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Conversation {
+    /// Oldest first, as they were said.
+    pub said: Vec<Said>,
+    /// Whether older messages exist in the file and are not here.
+    pub cut: bool,
 }
 
 /// One thing said in a conversation had in the IDE.
@@ -353,15 +367,22 @@ fn cut_to(text: String, limit: usize) -> String {
 /// A file that cannot be opened reads back as an empty conversation rather than as a failure. The
 /// session is still resumable — the CLI reads its own store — and refusing to draw the chat because
 /// its history could not be read would take away the working half along with the broken one.
-fn read_said(path: &Path) -> Vec<Said> {
+fn read_said(path: &Path) -> Conversation {
     use std::io::BufRead;
 
     let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
+        return Conversation {
+            said: Vec::new(),
+            cut: false,
+        };
     };
     let mut reader = std::io::BufReader::new(file);
     let mut kept: std::collections::VecDeque<Said> = std::collections::VecDeque::new();
     let mut line = String::new();
+    // Set where a message is DROPPED, not where one is shortened. A long message that was cut
+    // short is still on screen and still says who said it; a dropped one is a gap, and the gap is
+    // what a reader has no way of noticing.
+    let mut cut = false;
 
     loop {
         line.clear();
@@ -383,6 +404,7 @@ fn read_said(path: &Path) -> Vec<Said> {
         kept.push_back(item);
         if kept.len() > SAID_SHOWN {
             kept.pop_front();
+            cut = true;
         }
     }
 
@@ -393,10 +415,14 @@ fn read_said(path: &Path) -> Vec<Said> {
     while kept.len() > 1 && total > SAID_BYTES {
         if let Some(dropped) = kept.pop_front() {
             total -= dropped.text.len();
+            cut = true;
         }
     }
 
-    kept.into()
+    Conversation {
+        said: kept.into(),
+        cut,
+    }
 }
 
 #[cfg(test)]
@@ -544,7 +570,7 @@ mod tests {
         let found = discover(&store.root(), 10);
         assert_eq!(found[0].title.as_deref(), Some("arranja o parser de datas"));
 
-        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "arranja o parser de datas");
     }
@@ -684,7 +710,9 @@ mod tests {
             ],
         );
 
-        let read = conversation(&store.root(), "aaaa-1111").expect("the session was not found");
+        let read = conversation(&store.root(), "aaaa-1111")
+            .expect("the session was not found")
+            .said;
 
         assert_eq!(
             read,
@@ -716,10 +744,36 @@ mod tests {
             ],
         );
 
-        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// Cutting silently is the failure this reports.
+    ///
+    /// A conversation read from its recent end has a beginning that is not on screen, and until now
+    /// nothing said so: a person scrolled up, found the top, and read it as the whole thing. The
+    /// window cannot work it out for itself -- 200 messages back looks exactly like a conversation
+    /// that had 200 messages.
+    #[test]
+    fn a_conversation_that_was_cut_says_so_and_one_that_was_not_does_not() {
+        let store = Store::new();
+        let many: Vec<serde_json::Value> = (0..SAID_SHOWN + 5)
+            .map(|n| said(&format!("mensagem {n}")))
+            .collect();
+        store.session("one", "aaaa-1111", &many);
+        store.session("one", "bbbb-2222", &[said("uma so")]);
+
+        let long = conversation(&store.root(), "aaaa-1111").unwrap();
+        let short = conversation(&store.root(), "bbbb-2222").unwrap();
+
+        assert!(long.cut, "the beginning was dropped and nothing said so");
+        assert!(
+            !short.cut,
+            "nothing was dropped, so nothing should claim it was"
+        );
+        assert_eq!(long.said.len(), SAID_SHOWN);
     }
 
     /// A conversation is read from its recent end, exactly as `get_assistant_chat` reads the
@@ -732,7 +786,7 @@ mod tests {
             .collect();
         store.session("one", "aaaa-1111", &lines);
 
-        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
 
         assert_eq!(read.len(), SAID_SHOWN);
         assert_eq!(read[0].text, format!("mensagem {}", 20));
@@ -754,7 +808,7 @@ mod tests {
             &[said(&huge), said(&huge), said("a última")],
         );
 
-        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
 
         assert_eq!(read.len(), 2);
         assert_eq!(read[1].text, "a última");
@@ -767,7 +821,7 @@ mod tests {
         let store = Store::new();
         store.session("one", "aaaa-1111", &[said(&"x".repeat(SAID_BYTES * 2))]);
 
-        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
 
         assert_eq!(read.len(), 1);
         assert!(
@@ -800,7 +854,7 @@ mod tests {
             ],
         );
 
-        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
 
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].text, "procura o bug");
@@ -836,6 +890,9 @@ mod tests {
         std::fs::remove_dir_all(store.0.join("work").join("gone")).unwrap();
 
         assert!(discover(&store.root(), 10).is_empty());
-        assert_eq!(conversation(&store.root(), "aaaa-1111").unwrap().len(), 1);
+        assert_eq!(
+            conversation(&store.root(), "aaaa-1111").unwrap().said.len(),
+            1
+        );
     }
 }

@@ -22,7 +22,7 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary, IdeSession, Said } from "../data/chats";
+import type { ChatSummary, Conversation, IdeSession } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -66,6 +66,8 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     session_id: "s-1",
     created_at: "2026-08-18T09:00:00Z",
     did: [],
+    context_fill: null,
+    context_rotates_at: 140000,
     ...overrides,
   };
 }
@@ -83,7 +85,7 @@ function chatsFetch(
   opts: {
     localAvailable?: boolean;
     onMessage?: () => unknown;
-    said?: Record<string, Said[]>;
+    said?: Record<string, Conversation>;
     /** The sessions the picker offers. Mutated in place by the wiring route below. */
     ideSessions?: IdeSession[];
     /** What each turn in flight is writing right now, by turn id. */
@@ -339,10 +341,13 @@ describe("Chats - a conversation picked up from the editor", () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "and now the rest", answer: "done" })] }, {
         said: {
-          "aaaa-1111": [
-            { by_owner: true, text: "fix the date parser" },
-            { by_owner: false, text: "it is fixed" },
-          ],
+          "aaaa-1111": {
+            cut: false,
+            said: [
+              { by_owner: true, text: "fix the date parser" },
+              { by_owner: false, text: "it is fixed" },
+            ],
+          },
         },
       }),
     );
@@ -365,7 +370,7 @@ describe("Chats - a conversation picked up from the editor", () => {
 
   it("says nothing was said only when the daemon answered with an empty conversation", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([picked()], { "c-1": [] }, { said: { "aaaa-1111": [] } }),
+      chatsFetch([picked()], { "c-1": [] }, { said: { "aaaa-1111": { said: [], cut: false } } }),
     );
 
     await renderChats("/chats/c-1");
@@ -461,7 +466,7 @@ function ideSession(overrides: Partial<IdeSession> = {}): IdeSession {
  * person looking for the conversation they were having in the editor has no reason to press a
  * button labelled "New conversation" first, and everything behind it was invisible because of it.
  */
-async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, Said[]> = {}) {
+async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, Conversation> = {}) {
   daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions, said }));
   const view = await renderChats("/chats");
   fireEvent.click(await screen.findByRole("button", { name: /from the editor/i }));
@@ -479,10 +484,13 @@ describe("the editor's sessions, and the door to them", () => {
     // The whole reason this door exists. Choosing by a cut title was choosing blind: you found out
     // which conversation it was by picking it up and reading what came back.
     await openTheEditorDoor([ideSession()], {
-      "aaaa-1111": [
-        { by_owner: true, text: "arranja o parser de datas" },
-        { by_owner: false, text: "arranjado, o mes vinha antes do dia" },
-      ],
+      "aaaa-1111": {
+        cut: false,
+        said: [
+          { by_owner: true, text: "arranja o parser de datas" },
+          { by_owner: false, text: "arranjado, o mes vinha antes do dia" },
+        ],
+      },
     });
 
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
@@ -567,6 +575,54 @@ describe("what a session would be able to do, before it is picked up", () => {
       (call) => String(call[0]) === "/assistant/ide-sessions/aaaa-1111/tools",
     );
     expect(posted).toHaveLength(1);
+  });
+});
+
+/* --------------------------------------- what is not shown, and how full -- */
+
+describe("what the page is not showing", () => {
+  const fromTheEditor = () => chatSummary({ chat_id: "c-1", ide_session_id: "aaaa-1111" });
+
+  it("says the beginning of a picked-up conversation was left out", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([fromTheEditor()], { "c-1": [] }, {
+        said: { "aaaa-1111": { said: [{ by_owner: true, text: "o meio" }], cut: true } },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/older messages are not shown/i)).toBeTruthy();
+  });
+
+  it("says nothing of the sort when the whole thing is on screen", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([fromTheEditor()], { "c-1": [] }, {
+        said: { "aaaa-1111": { said: [{ by_owner: true, text: "tudo" }], cut: false } },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByText("tudo");
+    expect(screen.queryByText(/older messages are not shown/i)).toBeNull();
+  });
+
+  it("says how full the context was, and warns before the daemon rotates", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "primeiro", answer: "um", context_fill: 20000 }),
+          turnRow({ id: 2, asked: "ultimo", answer: "dois", context_fill: 132000 }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/132\.0k of 140\.0k/)).toBeTruthy();
+    // Said on the turn that is close to it, and not on the one that is nowhere near.
+    expect(screen.getAllByText(/a fresh context/i)).toHaveLength(1);
   });
 });
 
