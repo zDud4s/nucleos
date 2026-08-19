@@ -173,7 +173,7 @@ func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, r
 		return result
 	}
 	result.Navigated = true
-	result.StillLoading = d.awaitReady(ctx, moved)
+	result.StillLoading = d.awaitReady(ctx, moved, entry)
 	d.forgetRefs(entry)
 	d.readTargetInfo(ctx, entry)
 	d.mu.Lock()

@@ -46,19 +46,10 @@ func TestAFerriedRequestCarriesTheProfilesIdentity(t *testing.T) {
 		t.Fatalf("the dashboard was refused: %+v", result.Refusal)
 	}
 
-	var last browser.Snapshot
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
-		if err != nil {
-			t.Fatalf("snapshot: %v", err)
-		}
-		if hasName(last, "1") || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(300 * time.Millisecond)
+	last, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
 	}
-
 	if hasName(last, "none") {
 		t.Fatal("the ferry fetched anonymously; every page behind a login would answer with the login page")
 	}

@@ -142,8 +142,24 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	// Control: the same form, same server, fence off.
 	conn := control(t)
 	page := openIn(t, conn, site.origin()+"/form")
-	time.Sleep(500 * time.Millisecond)
-	evaluate(t, conn, page, `document.getElementById('f').submit()`)
+	// Polled, not slept. MEASURED, 2026-08-20: this half was the flaky one all along. A fixed pause
+	// is a guess about how fast the machine is, and under load the guess is wrong — the form was not
+	// there yet, getElementById returned null, submit() threw, and the POST that exists to prove the
+	// server would have accepted one never left. The failure then reads as "the control is broken",
+	// which is true and says nothing about the fence.
+	submitted := false
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.TrimSpace(string(evaluate(t, conn, page, `!!document.getElementById('f')`))) == "true" {
+			evaluate(t, conn, page, `document.getElementById('f').submit()`)
+			submitted = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !submitted {
+		t.Fatal("the control page never rendered its form")
+	}
 	if !site.reached("POST /submit", settle) {
 		t.Fatal("the POST did not arrive with the fence off either; the test proves nothing")
 	}

@@ -126,41 +126,71 @@ func (w *watcher) sawNavigation() bool {
 	return w.navigated
 }
 
+// renderGrace is how long a page gets to put a ferried answer on the screen.
+//
+// Short, because a resolved promise and a DOM write are microtasks. Not zero, because returning
+// inside that window hands back the shell the ferry exists to prevent — the same race this file was
+// written to close, reopened one layer up.
+const renderGrace = 250 * time.Millisecond
+
 // awaitReady waits for the page to finish, and reports whether it gave up waiting.
 //
 // It must only be called when something IS loading — after a navigate, or after an act that moved
 // the page. Called on a page that settled long ago it would hear nothing, wait out the deadline, and
 // then report a finished page as unfinished.
-func (d *Driver) awaitReady(ctx context.Context, w *watcher) (stillLoading bool) {
+//
+// "Finished" includes what the ferry is carrying. A ferried request does not go through the
+// browser's network stack, so `networkAlmostIdle` fires while one is still on its way — and a page
+// that asked us for its content would come back empty with the browser insisting it was done.
+func (d *Driver) awaitReady(ctx context.Context, w *watcher, entry *session) (stillLoading bool) {
 	overall := time.NewTimer(d.readyWithin)
 	defer overall.Stop()
+	// Polled as well as woken, because the ferry finishing is not one of the events the watcher
+	// hears; it happens on this side.
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
 
 	var grace *time.Timer
 	var graceC <-chan time.Time
-	defer func() {
+	stopGrace := func() {
 		if grace != nil {
 			grace.Stop()
+			grace, graceC = nil, nil
 		}
-	}()
+	}
+	defer stopGrace()
 
 	for {
 		w.mu.Lock()
 		loaded, idle := w.loaded, w.idle
 		w.mu.Unlock()
+		asked, carrying := d.ferryState(entry)
 
-		if idle {
+		switch {
+		case carrying > 0 || !(loaded || idle):
+			// Something is still on its way. Any grace already running was started on a page that
+			// has since asked for more, and letting it fire would answer about the earlier state.
+			stopGrace()
+		case idle && asked == 0:
+			// The ordinary page: quiet, and it never asked us for anything. Nothing to wait for.
 			return false
-		}
-		if loaded && grace == nil {
-			grace = time.NewTimer(d.idleGrace)
+		case grace == nil:
+			// Either it went quiet after a ferried answer — a moment to render it — or it loaded and
+			// is still talking to the network, which gets the longer window it always had.
+			within := d.idleGrace
+			if idle {
+				within = renderGrace
+			}
+			grace = time.NewTimer(within)
 			graceC = grace.C
 		}
 
 		select {
 		case <-w.wake:
+		case <-tick.C:
 		case <-graceC:
-			// Loaded, and still talking to the network. Not "still loading": the document is there
-			// and the agent can read it. A page that never goes quiet is ordinary.
+			// Loaded, nothing of ours in flight. Not "still loading": the document is there and the
+			// agent can read it. A page that never goes quiet is ordinary.
 			return false
 		case <-overall.C:
 			return true
@@ -168,6 +198,16 @@ func (d *Driver) awaitReady(ctx context.Context, w *watcher) (stillLoading bool)
 			return true
 		}
 	}
+}
+
+// ferryState is how much this session has asked the ferry for, and how much is still on its way.
+func (d *Driver) ferryState(entry *session) (asked, carrying int) {
+	if entry == nil {
+		return 0, 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return entry.ferried, entry.carrying
 }
 
 // mainFrameOf asks which frame is the top one, so the watcher can ignore everything else.
@@ -213,4 +253,5 @@ func (d *Driver) forgetRefs(entry *session) {
 	entry.blocked = 0
 	entry.blockedLast = browser.Refusal{}
 	entry.ferried = 0
+	entry.carrying = 0
 }

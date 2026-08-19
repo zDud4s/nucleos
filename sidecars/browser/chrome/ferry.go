@@ -268,12 +268,18 @@ func (d *Driver) serveFerry(on cdp.SessionID, contextID int64, payload string) {
 	owner, known := d.cdpToSession[on]
 	context, placed := d.contexts[contextKey{session: on, id: contextID}]
 	entry, live := d.sessions[owner]
-	if live {
-		entry.ferried++
-	}
 	spent := 0
 	if live {
+		entry.ferried++
+		entry.carrying++
 		spent = entry.ferried
+		// Counted down however this returns, because a wait for the page waits on this and a leak
+		// here is a session that never reports itself finished.
+		defer func() {
+			d.mu.Lock()
+			entry.carrying--
+			d.mu.Unlock()
+		}()
 	}
 	d.mu.Unlock()
 

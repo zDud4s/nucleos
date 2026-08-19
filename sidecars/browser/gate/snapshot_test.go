@@ -164,19 +164,14 @@ func TestAPageFetchesItsOwnContentThroughTheFence(t *testing.T) {
 		t.Fatal("the request was never made; the page is still a shell")
 	}
 
-	var last browser.Snapshot
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
-		if err != nil {
-			t.Fatalf("snapshot: %v", err)
-		}
-		if hasName(last, "Approve the write-down") || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(300 * time.Millisecond)
+	// ONE snapshot, taken the moment Open returns, and no polling. Polling would hide the half of
+	// this that matters: a ferried request does not go through the browser's network stack, so
+	// `networkAlmostIdle` fires while it is still on its way, and a wait that did not know about the
+	// ferry would hand back the shell with the browser insisting the page was done.
+	last, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
 	}
-
 	if !hasName(last, "Approve the write-down") {
 		t.Fatalf("the content arrived and the agent still cannot see it: %+v", last.Elements)
 	}
@@ -222,17 +217,9 @@ func TestAPageCannotHaveTheFenceFetchFromAnotherHost(t *testing.T) {
 		t.Fatal("the fence carried a request to another host")
 	}
 
-	var last browser.Snapshot
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
-		if err != nil {
-			t.Fatalf("snapshot: %v", err)
-		}
-		if last.Blocked != nil || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(300 * time.Millisecond)
+	last, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
 	}
 	if last.Blocked == nil {
 		t.Fatal("the page could not get its content and the reading did not say so")

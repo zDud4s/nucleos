@@ -107,8 +107,11 @@ type session struct {
 	blocked     int
 	blockedLast browser.Refusal
 	// ferried counts the requests this document has asked us to carry, so a page that polls cannot
-	// have us carrying its traffic forever.
-	ferried int
+	// have us carrying its traffic forever. carrying is how many are in flight right now, which is
+	// what a wait for "the page is ready" has to include: a ferried request does not go through the
+	// browser's network stack, so `networkAlmostIdle` fires while it is still on its way.
+	ferried  int
+	carrying int
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so
@@ -407,7 +410,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		return browser.Session{}, fmt.Errorf("navigating to %s: %s", req.URL, outcome.ErrorText)
 	}
 
-	stillLoading := d.awaitReady(ctx, ready)
+	stillLoading := d.awaitReady(ctx, ready, entry)
 	d.readTargetInfo(ctx, entry)
 	return browser.Session{
 		ID:           id,
