@@ -79,6 +79,11 @@ type OpenRequest struct {
 // SessionRequest names an existing session. Used by every verb after /open.
 type SessionRequest struct {
 	SessionID string `json:"session_id"`
+	// ChangesOnly asks a snapshot for what moved since the last one instead of the whole page.
+	// Absent means the whole page, which is the answer that is never wrong: an agent that has lost
+	// track of what it saw last gets a reading it can act on rather than a difference against
+	// something it no longer remembers.
+	ChangesOnly bool `json:"changes_only,omitempty"`
 }
 
 // ActRequest is one action against a session.
@@ -134,7 +139,7 @@ func snapshotHandler(driver browser.Driver) http.HandlerFunc {
 			http.Error(w, "session_id is required", http.StatusBadRequest)
 			return
 		}
-		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID))
+		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID), request.ChangesOnly)
 		if err != nil {
 			writeDriverError(w, "snapshot", err)
 			return

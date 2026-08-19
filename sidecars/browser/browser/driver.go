@@ -96,17 +96,43 @@ type Session struct {
 // on a class rename, and invite the agent to synthesise one for an element it never saw. A ref can
 // only name something that was actually in a snapshot.
 type Element struct {
-	Ref  string `json:"ref"`
+	// Ref is what an act names. Empty on prose: nothing in the action set does anything to a
+	// paragraph, and a ref per paragraph is a dozen tokens each buying a capability that does not
+	// exist. Scrolling reaches text by its nearest heading, which does have one.
+	Ref  string `json:"ref,omitempty"`
 	Role string `json:"role"`
+	// Name is what it is called, and on a `text` element it is what it SAYS. One field rather than
+	// two because a snapshot is read top to bottom: prose and controls interleave in document order,
+	// and splitting them into separate lists would lose which paragraph belongs to which button.
 	Name string `json:"name"`
+	// Value is what is IN it — the characters in a textbox, the number on a slider. Without it an
+	// agent that types cannot read back what it typed, which turns every form into an open loop.
+	Value string `json:"value,omitempty"`
+	// State is the handful of accessibility properties that change what an act would MEAN, and only
+	// those: `checked`/`unchecked`/`mixed`, `disabled`, `expanded`/`collapsed`, `selected`,
+	// `required`. Both halves of the booleans are spelled out rather than left implied, because an
+	// absent `checked` is indistinguishable from an element that has no checked state at all — and
+	// that is exactly the distinction a checkbox turns on.
+	State []string `json:"state,omitempty"`
 }
 
-// Snapshot is the accessibility view of a page: what is there and what it is called.
+// Snapshot is the accessibility view of a page: what is there, what it is called, and what it says.
 type Snapshot struct {
 	SessionID SessionID `json:"session_id"`
 	URL       string    `json:"url"`
 	Title     string    `json:"title"`
 	Elements  []Element `json:"elements"`
+	// Truncated says the text budget ran out and the page continues past the last element here.
+	// Said rather than implied: an agent that cannot tell a short page from a cut-off one will
+	// conclude the rest does not exist, which is a worse failure than being told to scroll.
+	Truncated bool `json:"truncated,omitempty"`
+	// Gone lists refs that were in the previous snapshot and are not on the page now. Only filled on
+	// a changes-only read, where it is the half that omission cannot express: a full snapshot says
+	// an element is gone by not containing it, and a partial one cannot say anything by silence.
+	Gone []string `json:"gone,omitempty"`
+	// Partial says this snapshot is the difference since the last one rather than the whole page —
+	// so an agent that skipped the previous one does not read a short list as a short page.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // ActionKind is the verb. The set is small and closed on purpose (spec §6.2, "consequence-free in
@@ -254,7 +280,9 @@ type Driver interface {
 	// the fence in place, in agent mode.
 	Open(ctx context.Context, req OpenRequest) (Session, error)
 	// Snapshot returns the accessibility view. Cheap enough to call between every action.
-	Snapshot(ctx context.Context, id SessionID) (Snapshot, error)
+	// Snapshot reads the page. `changesOnly` asks for what moved since the previous snapshot of this
+	// session instead of the whole page — the same reading, filtered, never a different one.
+	Snapshot(ctx context.Context, id SessionID, changesOnly bool) (Snapshot, error)
 	// Act performs one action. A fence refusal is a value, not an error.
 	Act(ctx context.Context, id SessionID, action Action) (ActResult, error)
 	// Screenshot returns PNG bytes, for a person to look at.

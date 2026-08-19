@@ -690,10 +690,16 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
  *
  * `reads` is not decoration and is not a guess: each `true` below is a
  * `scoped_kill_engaged(pool, "trigger", …)` call site in `core/src/`, named in
- * the comment beside it. `team` has no such call site anywhere — the scope is
- * writable, the row is stored, and **nothing consults it**. Hiding it would
- * lose a designed control; drawing it as a live switch would promise a brake
- * that does not brake. So it is drawn, disabled, and says why.
+ * the comment beside it. All four scopes are read now, `team` last —
+ * `core/src/team_trigger.rs:461` calls `scoped_kill_engaged(&state.pool,
+ * "trigger", "team")` before any rule is considered, and its test
+ * `the_scoped_kill_stops_the_rules_and_not_the_work` is what pins that.
+ *
+ * The `reads` field and both branches of the ternary below stay even though
+ * every scope now reads `true` — the mechanism is what keeps this panel from
+ * ever promising a brake that does not brake, a fifth scope is a matter of
+ * time, and deleting the check here would mean the next one arrives with
+ * nothing to catch it before it does.
  */
 const TRIGGER_SCOPES: { id: string; label: string; what: string; reads: boolean }[] = [
   {
@@ -720,8 +726,9 @@ const TRIGGER_SCOPES: { id: string; label: string; what: string; reads: boolean 
   {
     id: "team",
     label: "Team triggers",
-    what: "the rules a team would fire on",
-    reads: false,
+    what: "the rules that start a department on a clock, on another team ending, or on triaged mail",
+    // `team_trigger.rs`, before any rule is considered.
+    reads: true,
   },
 ];
 

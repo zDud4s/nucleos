@@ -46,6 +46,7 @@ mod process_tree;
 mod proposals;
 mod recurrence;
 mod redact;
+mod refine;
 mod repo_trigger;
 mod resolver;
 mod runner;

@@ -1,6 +1,14 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { anyTurnLive, merge, turnFromRow, type AssistantTurnRow, type Brain, type Turn } from "../lib/turns";
-import { apiFetch } from "./client";
+import {
+  anyTurnLive,
+  merge,
+  turnFromRow,
+  type AssistantTurnRow,
+  type Brain,
+  type ToolCall,
+  type Turn,
+} from "../lib/turns";
+import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 
@@ -16,7 +24,7 @@ import { POLL } from "./poll";
  * daemon.
  */
 
-export type { Brain, Turn };
+export type { Brain, ToolCall, Turn };
 
 /** One row of the list — `ChatSummary`, archived excluded, most recently active first. */
 export interface ChatSummary {
@@ -47,6 +55,33 @@ export interface IdeSession {
   cwd: string;
   title: string | null;
   last_activity: string;
+  /**
+   * Whether continuing this session would give the model the project's tools.
+   *
+   * False means its directory has no classifier hook, and a conversation continued there runs on
+   * the NucleOS MCP server alone — it cannot read a file, edit one, or run a command. The daemon
+   * answers this by asking the same function the turn itself asks, so it is a promise and not a
+   * guess. `useWireIdeSessionTools` is what turns a false into a true.
+   */
+  tools: boolean;
+}
+
+/**
+ * A turn part way through: what it has written, and what it is doing.
+ *
+ * Distilled by the daemon rather than by this window. The CLI's stream carries
+ * `content_block_delta`s, tool calls and transport events in a format the app
+ * does not own and which changes without asking — so `runner.rs` reads it
+ * beside the parse that pulls the final reply out, and what arrives here is
+ * words.
+ */
+export interface LiveTurn {
+  /** The answer so far. Empty means nothing has been written yet. */
+  text: string;
+  /** The tool running right now, or null when the model is writing. */
+  doing: string | null;
+  /** What it has run so far, oldest first. */
+  did: ToolCall[];
 }
 
 /** One thing said in a conversation had in the editor. */
@@ -200,6 +235,9 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
+        // the truth about it, not a placeholder — the live view replaces it as calls happen.
+        did: [],
       };
       queryClient.setQueryData<Turn[]>(keys.chats.detail(chatId), (current) =>
         merge(current ?? [], [optimistic]),
@@ -228,6 +266,75 @@ export function useCreateChat() {
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * A turn while it is still being written.
+ *
+ * `undefined` is the daemon's `204`: nothing is writing. That covers a turn
+ * that has ended and a turn this daemon never started, and it is never "the
+ * turn said nothing" — so the caller falls back to saying it is thinking,
+ * rather than drawing an answer of no words.
+ *
+ * Enabled only while the turn is live, which is also what stops the poll: a
+ * turn that has landed has its answer in the transcript, and asking after it
+ * would be asking the daemon to describe something it has already forgotten.
+ */
+export function useLiveTurn(turnId: number, alive: boolean) {
+  return useQuery({
+    queryKey: keys.chats.live(turnId),
+    queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
+    enabled: alive,
+    refetchInterval: POLL.turn,
+  });
+}
+
+/**
+ * Stop a turn that is running.
+ *
+ * `POST /runs/{id}/cancel`, because a turn IS a run and that route has always
+ * existed — what was missing was anywhere to press it from. The daemon aborts
+ * the task, which drops the guard that holds the conversation's turn slot, so
+ * the chat is answerable again immediately rather than after the run timeout.
+ *
+ * Both the transcript and the list are invalidated: the turn's row becomes
+ * `cancelled`, and the list carries the ordering and the unread count, which
+ * both move when a turn stops moving.
+ */
+export function useStopTurn(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (turnId: number) => apiText(`/runs/${turnId}/cancel`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Give a project's tools to the conversations continued out of it.
+ *
+ * Writes this daemon's classifier hook into the directory the session was had
+ * in — a real change to a folder the app does not own, which is why it is a
+ * button somebody presses rather than something that happens on pick-up.
+ *
+ * The session list is invalidated on success because that is where the answer
+ * shows: the row stops offering to fix what is now fixed.
+ */
+export function useWireIdeSessionTools() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (sessionId: string) =>
+      apiFetch<void>(`/assistant/ide-sessions/${encodeURIComponent(sessionId)}/tools`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.ideSessions });
     },
   });
 }

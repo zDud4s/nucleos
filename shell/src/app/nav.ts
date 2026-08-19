@@ -80,6 +80,13 @@ export const NAV: NavGroup[] = [
       { id: "runs", label: "Runs", path: "/runs", glyph: "Ru" },
       { id: "feed", label: "Feed", path: "/feed", glyph: "Fd" },
       { id: "projects", label: "Projects", path: "/projects", glyph: "Pj" },
+      /**
+       * Under Operate and not under Work, although it is the closest thing the
+       * app has to a document: what the agent has been told is a fact about the
+       * machine's current behaviour, not a thing you and it are doing together.
+       * It sits after Projects because a lesson is scoped to one.
+       */
+      { id: "learned", label: "Learned", path: "/learned", glyph: "Ln" },
     ],
   },
   {
@@ -88,17 +95,7 @@ export const NAV: NavGroup[] = [
     items: [
       { id: "chats", label: "Chats", path: "/chats", glyph: "Ch", badge: "chats" },
       { id: "errands", label: "Errands", path: "/errands", glyph: "Er" },
-      {
-        id: "teams",
-        label: "Teams",
-        path: "/teams",
-        glyph: "Tm",
-        // Verified against `core/src/http.rs`: the team tables exist and no
-        // `/teams`, `/team-runs`, `/team-triggers` or `/team-recruits` route is
-        // mounted. The page says so rather than offering controls that would
-        // 404.
-        disabled: "the núcleo has no team routes yet",
-      },
+      { id: "teams", label: "Teams", path: "/teams", glyph: "Tm" },
       { id: "agents", label: "Agents", path: "/agents", glyph: "Ag" },
       { id: "council", label: "Council", path: "/council", glyph: "Cn" },
     ],

@@ -177,6 +177,30 @@
   color: var(--text-faint);
 }
 
+/*
+ * What a session would NOT be able to do, said before it is picked up.
+ *
+ * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
+ * that will continue with less than you would expect, and the button beside it is the fix.
+ */
+.chats-new-notools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+}
+
+.chats-new-warning {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--tone-paused-fg);
+}
+
 /* ================================================================= detail == */
 
 .chats-detail-head {
@@ -311,6 +335,52 @@
   color: var(--text);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+/*
+ * The answer as it is being written.
+ *
+ * The same type as a finished answer, deliberately: these ARE the words, not a preview of them, and
+ * restyling them would make the turn appear to change its mind about what it said when the run
+ * lands. The line below it is what says it is not finished.
+ */
+.chats-turn-writing {
+  border-left: 2px solid var(--border);
+  padding-left: var(--space-2);
+}
+
+/*
+ * What the turn ran. Quiet on purpose: it is evidence for the answer above it, not the answer.
+ */
+.chats-turn-did {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-turn-did li {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  min-width: 0;
+}
+
+.chats-turn-did-name {
+  flex: none;
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+}
+
+.chats-turn-did-detail {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chats-turn-live {

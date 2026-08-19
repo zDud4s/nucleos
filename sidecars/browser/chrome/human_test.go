@@ -122,7 +122,7 @@ func TestThePersonsWindowAnswersNothingToTheAgent(t *testing.T) {
 	fake, conn := dial(t)
 	human := humanOn(t, fake, conn)
 
-	if _, err := human.Snapshot(context.Background(), "h1"); !errors.Is(err, browser.ErrPersonIsDriving) {
+	if _, err := human.Snapshot(context.Background(), "h1", false); !errors.Is(err, browser.ErrPersonIsDriving) {
 		t.Errorf("snapshot: %v", err)
 	}
 	if _, err := human.Act(context.Background(), "h1", browser.Action{Kind: browser.ActionClick}); !errors.Is(err, browser.ErrPersonIsDriving) {

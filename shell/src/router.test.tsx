@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen } from "@testing-library/react";
 import { NAV_PATHS } from "./app/nav";
-import { createAppRouter } from "./router";
+import { PAGES, createAppRouter } from "./router";
 import { daemonFetch, daemonState, renderApp } from "./test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -38,7 +38,7 @@ describe("the app router", () => {
     for (const path of NAV_PATHS) expect(paths).toContain(path);
   });
 
-  it("navigates between two placeholder routes with the shell intact", async () => {
+  it("navigates between two pages with the shell intact", async () => {
     const { router } = await renderApp({ initialPath: "/fleet" });
 
     expect(await screen.findByRole("heading", { level: 1, name: "Fleet" })).toBeDefined();
@@ -55,21 +55,19 @@ describe("the app router", () => {
     expect(screen.queryByRole("heading", { level: 1, name: "Fleet" })).toBeNull();
   });
 
-  it("gives an unbuilt page a Teach that names the slice it arrives with", async () => {
-    // Was "/voice", then "/files", then "/system" — each the roaming example of
-    // an unbuilt page until the slice that built it. S1 built "/system", and the
-    // example has run out of unbuilt pages to point at: everything left in the
-    // nav is "/teams", which is blocked on the núcleo having no team routes at
-    // all — not on this build not having reached it yet.
-    await renderApp({ initialPath: "/teams" });
+  it("has a real page for every navigation item, with no placeholder left", () => {
+    // The end state S1 wrote down: the roaming "unbuilt page" example ran out
+    // of pages to point at, so the example was retired and the invariant it
+    // stood in for is asserted directly instead. `/teams` was the last one.
+    for (const path of NAV_PATHS) expect(PAGES[path]).toBeDefined();
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Teams" })).toBeDefined();
-    // Not a spinner and not a 404: the route works, the page is simply not
-    // built, and saying which slice brings it is the difference between a
-    // placeholder and a dead end.
-    expect(screen.getByText(/Work slice/)).toBeDefined();
-    // And a route the núcleo itself cannot serve says so plainly.
-    expect(screen.getByText(/not yet wired/i)).toBeDefined();
+    // And the two detail routes this slice added, which no NAV_PATH covers —
+    // `/team-runs` is not a navigation item at all.
+    const router = createAppRouter();
+    const byId = router.routesById as unknown as Record<string, { fullPath?: string }>;
+    const paths = Object.values(byId).map((route) => route.fullPath);
+    expect(paths).toContain("/teams/$teamId");
+    expect(paths).toContain("/team-runs/$runId");
   });
 
   it("opens on Home", async () => {

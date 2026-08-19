@@ -390,9 +390,13 @@ impl DaemonClient {
     }
 
     /// The accessibility view of a page: what is there and what it is called.
-    pub async fn browser_snapshot(&self, session_id: i64) -> Result<Value, String> {
+    pub async fn browser_snapshot(
+        &self,
+        session_id: i64,
+        changes_only: bool,
+    ) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/browser/snapshot")
-            .json(&serde_json::json!({ "session_id": session_id }))
+            .json(&serde_json::json!({ "session_id": session_id, "changes_only": changes_only }))
             .send()
             .await
             .map_err(|e| e.to_string())?

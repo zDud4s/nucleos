@@ -22,10 +22,10 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary, Said } from "../data/chats";
+import type { ChatSummary, IdeSession, Said } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
-import type { AssistantTurnRow } from "../lib/turns";
+import type { AssistantTurnRow, ToolCall } from "../lib/turns";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 beforeEach(() => {
@@ -65,6 +65,7 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     answered_by: "cloud",
     session_id: "s-1",
     created_at: "2026-08-18T09:00:00Z",
+    did: [],
     ...overrides,
   };
 }
@@ -83,6 +84,10 @@ function chatsFetch(
     localAvailable?: boolean;
     onMessage?: () => unknown;
     said?: Record<string, Said[]>;
+    /** The sessions the picker offers. Mutated in place by the wiring route below. */
+    ideSessions?: IdeSession[];
+    /** What each turn in flight is writing right now, by turn id. */
+    live?: Record<number, { text: string; doing: string | null; did?: ToolCall[] }>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -95,7 +100,22 @@ function chatsFetch(
     }
     if (path === "/assistant/chats") return chats;
     if (path === "/assistant/local-model") return { available: opts.localAvailable ?? true };
-    if (path === "/assistant/ide-sessions") return [];
+    const live = /^\/assistant\/(\d+)\/live$/.exec(path);
+    // Undefined is the daemon's 204: nothing is writing, which is not the same as writing nothing.
+    if (live !== null) return (opts.live ?? {})[Number(live[1])];
+    const wire = /^\/assistant\/ide-sessions\/([^/]+)\/tools$/.exec(path);
+    if (wire !== null && init?.method === "POST") {
+      // What the daemon does: the hook goes into that project, and the next listing says so.
+      const row = (opts.ideSessions ?? []).find((s) => s.session_id === wire[1]);
+      if (row !== undefined) row.tools = true;
+      return undefined;
+    }
+    // Copied, not handed over. React Query keeps the cached reference when a refetch is deeply
+    // equal to it, so a mock that returned the same objects it had just mutated would report no
+    // change at all — and the page would look stuck for a reason the page has nothing to do with.
+    if (path === "/assistant/ide-sessions") {
+      return (opts.ideSessions ?? []).map((session) => ({ ...session }));
+    }
     const ideSession = /^\/assistant\/ide-sessions\/([^/]+)$/.exec(path);
     if (ideSession !== null) {
       const found = opts.said?.[decodeURIComponent(ideSession[1])];
@@ -418,5 +438,225 @@ describe("Chats - the route and the sidebar badge", () => {
     fireEvent.click(await screen.findByRole("link", { name: "hello there, cloud, 2 unread" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
     expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
+  });
+});
+
+/* -------------------------------------------- tools, before you continue -- */
+
+function ideSession(overrides: Partial<IdeSession> = {}): IdeSession {
+  return {
+    session_id: "aaaa-1111",
+    cwd: "C:/Projects/nucleos",
+    title: "arranja o parser de datas",
+    last_activity: "2026-08-18T09:00:00Z",
+    tools: true,
+    ...overrides,
+  };
+}
+
+/**
+ * Opens the picker with these sessions on offer, and hands back a `choose` that waits.
+ *
+ * The wait is load-bearing: the session list arrives from the daemon after the form is drawn, and
+ * a `change` fired at a `<select>` before its `<option>` exists is silently dropped — the value is
+ * not one React knows about, so the state never moves and the assertion below fails for a reason
+ * that has nothing to do with what it is testing.
+ */
+async function openThePicker(sessions: IdeSession[]) {
+  daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions }));
+  const view = await renderChats("/chats");
+  fireEvent.click(await screen.findByRole("button", { name: /new conversation/i }));
+  const picker = await screen.findByLabelText(/continue an ide session/i);
+  const choose = async (sessionId: string) => {
+    await waitFor(() =>
+      expect(picker.querySelector(`option[value="${sessionId}"]`)).not.toBeNull(),
+    );
+    fireEvent.change(picker, { target: { value: sessionId } });
+  };
+  return { ...view, picker, choose };
+}
+
+describe("what a session would be able to do, before it is picked up", () => {
+  it("says a session whose project has no hook would continue without tools", async () => {
+    const { choose } = await openThePicker([ideSession({ tools: false })]);
+
+    await choose("aaaa-1111");
+
+    // Said BEFORE the pick-up, which is the whole point: this used to be discoverable only by
+    // continuing a coding conversation and watching the model fail to open a file.
+    expect(await screen.findByText(/cannot read or change any file/i)).toBeTruthy();
+  });
+
+  it("says nothing about tools when the project is already wired", async () => {
+    const { choose } = await openThePicker([ideSession({ tools: true })]);
+
+    await choose("aaaa-1111");
+
+    expect(screen.queryByText(/cannot read or change any file/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /give it the tools/i })).toBeNull();
+  });
+
+  it("gives the project the tools, and stops offering once it has them", async () => {
+    const { choose } = await openThePicker([ideSession({ tools: false })]);
+    await choose("aaaa-1111");
+
+    fireEvent.click(await screen.findByRole("button", { name: /give it the tools/i }));
+
+    await waitFor(() =>
+      expect(screen.queryByText(/cannot read or change any file/i)).toBeNull(),
+    );
+    const posted = daemon.apiFetch.mock.calls.filter(
+      (call) => String(call[0]) === "/assistant/ide-sessions/aaaa-1111/tools",
+    );
+    expect(posted).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------- a turn as it happens -- */
+
+describe("a turn in flight", () => {
+  it("shows what the model is writing while it writes it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }, { live: { 1: { text: "estou a ver o parser de datas", doing: null } } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Not "thinking…" over a model that is visibly saying something.
+    expect(await screen.findByText("estou a ver o parser de datas")).toBeTruthy();
+  });
+
+  it("says which tool is running, not only that it is thinking", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }, { live: { 1: { text: "deixa ver", doing: "Read" } } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/running Read/i)).toBeTruthy();
+  });
+
+  it("still says thinking when the daemon has nothing to show yet", async () => {
+    // A turn whose CLI has not written a word, and a turn this daemon did not start, answer the
+    // same way — and neither is a turn that said nothing.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("thinking…")).toBeDefined();
+  });
+
+  it("asks nothing about a turn that has already landed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [turnRow({ id: 1 })] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    const asked = daemon.apiFetch.mock.calls.map((call) => String(call[0]));
+    expect(asked.some((path) => path.endsWith("/live"))).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------ what it did -- */
+
+describe("what a turn did", () => {
+  it("says what it ran, not only what it said", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            answer: "é o parser de datas",
+            did: [
+              { name: "Read", detail: "core/src/parser.rs" },
+              { name: "Bash", detail: "cargo test parser" },
+            ],
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText(/core\/src\/parser\.rs/)).toBeTruthy();
+    expect(within(transcript).getByText(/cargo test parser/)).toBeTruthy();
+  });
+
+  it("says nothing where a turn acted on nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, answer: "olá", did: [] })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).queryByRole("list", { name: /what it did/i })).toBeNull();
+  });
+
+  it("shows the tools piling up while the turn is still running", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+        { live: { 1: { text: "", doing: "Bash", did: [{ name: "Read", detail: "a.rs" }] } } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/a\.rs/)).toBeTruthy();
+  });
+});
+
+/* ------------------------------------------------------ stopping a turn -- */
+
+describe("stopping a turn", () => {
+  it("offers to stop a turn that is running", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /stop/i }));
+
+    // `apiText` and not `apiFetch`: cancel answers `200` with an empty body, and a JSON parse of
+    // nothing is how that route used to fail.
+    await waitFor(() =>
+      expect(
+        daemon.apiText.mock.calls.some(
+          (call) =>
+            String(call[0]) === "/runs/1/cancel" &&
+            (call[1] as RequestInit | undefined)?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("offers nothing to stop on a turn that has landed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [turnRow({ id: 1 })] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
   });
 });

@@ -25,6 +25,13 @@ describe("the nav table", () => {
       "Runs",
       "Feed",
       "Projects",
+      // **The one entry that is not a transcription of §3.1.** The refinement
+      // layer postdates the design document, and it needs a door: what the
+      // agent has been told is decided by a person and read by every later run,
+      // and until this page it was reachable only over HTTP. Recorded as an
+      // addition rather than folded in silently — the point of this file is
+      // that the sidebar does not drift without somebody saying so.
+      "Learned",
     ]);
   });
 
@@ -67,13 +74,13 @@ describe("the nav table", () => {
     ]);
   });
 
-  it("keeps Teams in the sidebar and says why it cannot work yet", () => {
-    // Verified against `core/src/http.rs`: the team tables exist and none of
-    // the team routes are mounted. Dropping the item would hide a designed
-    // feature; offering it without a note would offer controls that 404.
+  it("keeps Teams in the sidebar with nothing left holding it back", () => {
+    // It carried `disabled: "the núcleo has no team routes yet"` from the
+    // foundation until the núcleo mounted them. It has, so the entry is an
+    // ordinary one now.
     const teams = navItemForPath("/teams");
     expect(teams).toBeDefined();
-    expect(teams?.disabled).toMatch(/team routes/i);
+    expect(teams?.disabled).toBeUndefined();
   });
 
   it("gives every item a unique, rooted path", () => {

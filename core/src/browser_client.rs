@@ -128,10 +128,23 @@ pub struct Session {
 pub struct Element {
     /// A handle minted by the driver ("e5"), never a CSS selector: a ref can only name something a
     /// snapshot actually showed.
-    #[serde(rename = "ref")]
+    ///
+    /// Defaulted because prose has none. A snapshot carries the page's words as `role: "text"`
+    /// entries, and nothing in the action set does anything to a paragraph — so they arrive without
+    /// a ref, and a struct that required one would fail to decode the whole snapshot rather than the
+    /// one field.
+    #[serde(rename = "ref", default, skip_serializing_if = "String::is_empty")]
     pub element_ref: String,
     pub role: String,
     pub name: String,
+    /// What is IN it — the characters in a textbox, the number on a slider. Without it an agent that
+    /// types cannot read back what it typed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    /// The accessibility properties that change what an act would MEAN: `checked`/`unchecked`,
+    /// `disabled`, `expanded`/`collapsed`, `selected`, `required`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -142,6 +155,11 @@ pub struct Snapshot {
     pub title: String,
     #[serde(default)]
     pub elements: Vec<Element>,
+    /// The page continues past the last element here — the text budget ran out. Carried rather than
+    /// dropped: an agent that cannot tell a short page from a cut-off one concludes the rest does not
+    /// exist, which is a worse failure than being told to scroll.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// The answer to an action: done, or refused with a named consequence.
@@ -263,10 +281,16 @@ impl BrowserClient {
         .await
     }
 
-    pub async fn snapshot(&self, session_id: &str) -> Result<Snapshot, BrowserError> {
+    /// Read the page. `changes_only` asks for what moved since the previous snapshot of this
+    /// session rather than the whole page — the same reading, filtered.
+    pub async fn snapshot(
+        &self,
+        session_id: &str,
+        changes_only: bool,
+    ) -> Result<Snapshot, BrowserError> {
         self.call(
             "/snapshot",
-            &serde_json::json!({ "session_id": session_id }),
+            &serde_json::json!({ "session_id": session_id, "changes_only": changes_only }),
         )
         .await
     }
@@ -640,7 +664,7 @@ mod tests {
         assert_eq!(session.final_url, "https://jira.example.org/browse");
         assert!(session.refusal.is_none());
 
-        let snapshot = client.snapshot("s1").await.expect("snapshot");
+        let snapshot = client.snapshot("s1", false).await.expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
         let result = client.act("s1", "click", "e5", "").await.expect("act");

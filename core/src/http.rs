@@ -185,6 +185,15 @@ pub fn build_router(state: AppState) -> Router {
         // Speaking to a job that is already running. Scoped like `POST /runs/{id}/message` and
         // deliberately NOT like the `POST /jobs` one segment above it — see `post_job_note`.
         .route("/jobs/{id}/notes", post(post_job_note))
+        // What earlier work learned, and the two things a person does with it. Owner-scoped like
+        // the notes above and for a stronger reason: this is the layer that decides what every
+        // later run is told, so a token that could write here could rewrite the agent's mind for
+        // every project on the machine. **How a RUN declares one is deliberately not here** — that
+        // is an agent writing into what agents are told, which is the governance question
+        // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
+        .route("/refinements", get(list_refinements).post(post_refinement))
+        .route("/refinements/{id}", get(get_refinement))
+        .route("/refinements/{id}/revert", post(revert_refinement))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -197,6 +206,13 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/ide-sessions/{session_id}",
             get(read_ide_session),
         )
+        // Writing this daemon's classifier hook into the project a session was had in. POST
+        // because it changes that project, and under the session because the session is what says
+        // WHICH project — the request never names a directory.
+        .route(
+            "/assistant/ide-sessions/{session_id}/tools",
+            post(wire_ide_session_tools),
+        )
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -207,6 +223,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
+        // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
+        // the two cannot shadow each other whatever a turn id looks like.
+        .route("/assistant/{turn_id}/live", get(get_assistant_live))
         // An errand is standing work on a Telegram topic, and these are the four moves the chat
         // routes above already make: open one, list them, change one, end it. DELETE ends the
         // asking and removes nothing — `errands::close` says why.
@@ -3385,6 +3404,24 @@ struct AssistantTurn {
     /// looks like one unbroken conversation, which is the one thing it is not.
     session_id: Option<String>,
     created_at: String,
+    /// What the turn ran, as the JSON `tools_used` holds. Not serialized: the window is given the
+    /// parsed list below, so the shape of the column is this daemon's business and not a format
+    /// two codebases have to agree on.
+    #[serde(skip)]
+    tools_used: Option<String>,
+}
+
+/// One turn as the window receives it: the row, plus what the turn did.
+///
+/// The parse happens here rather than in the window for the reason it happens in `runner.rs` at
+/// all: the column holds a serialisation this daemon chose, and a client re-deriving it would be a
+/// second reader of a private shape. A column that will not parse reads as an empty list — the turn
+/// is real and its reply is worth showing, and one unreadable field is not worth losing it over.
+#[derive(serde::Serialize)]
+struct AssistantTurnOut {
+    #[serde(flatten)]
+    turn: AssistantTurn,
+    did: Vec<crate::runner::ToolCall>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3404,10 +3441,10 @@ const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
 async fn get_assistant_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Result<Json<Vec<AssistantTurn>>, StatusCode> {
+) -> Result<Json<Vec<AssistantTurnOut>>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, session_id, created_at
+                answered_by, session_id, created_at, tools_used
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -3422,7 +3459,42 @@ async fn get_assistant_chat(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     turns.reverse();
-    Ok(Json(turns))
+    Ok(Json(
+        turns
+            .into_iter()
+            .map(|turn| {
+                let did = turn
+                    .tools_used
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                AssistantTurnOut { turn, did }
+            })
+            .collect(),
+    ))
+}
+
+/// A turn while it is still being written: what has been said, and what is being done.
+///
+/// The distilling happens in `runner.rs` beside `extract_reply`, because knowing the CLI's stream
+/// format is that module's job — and this route exists rather than pointing the window at
+/// `/runs/{id}/tail` for the same reason: the tail is the raw stream, and a chat bubble is not the
+/// place to learn what a `content_block_delta` is.
+///
+/// Read from byte zero on every poll, not from a cursor. What comes back is not a chunk to append
+/// but the turn's whole state — text superseded by completed messages, a tool that has since
+/// returned — and that can only be recomputed from the beginning. A turn's stream is small; a job's
+/// is not, which is why `/runs/{id}/tail` keeps its cursor.
+///
+/// `204` when nothing is writing. That is the run having ended or this daemon never having started
+/// it, and it is emphatically not "the turn said nothing" — see `read_tail`.
+async fn get_assistant_live(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<crate::runner::LiveTurn>, StatusCode> {
+    let stream =
+        crate::runs::read_tail(&state.run_tails, turn_id, 0).ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(crate::runner::live_from_stream(&stream)))
 }
 
 /// Whether this machine has a model that can answer a conversation.
@@ -3470,13 +3542,32 @@ struct CreateChatRequest {
     continue_session: Option<String>,
 }
 
+/// One session as it is OFFERED: what it is, plus what continuing it would be able to do.
+///
+/// The second half is not decoration. A conversation continued in a directory with no classifier
+/// hook runs on the MCP server alone — no `Read`, no `Edit`, no `Bash` — so picking up a coding
+/// session there gets a model that cannot open the file being discussed. That was invisible until
+/// the first turn came back empty-handed, and it is the single thing that made continuing a
+/// session feel like nothing had happened.
+#[derive(serde::Serialize)]
+struct OfferedSession {
+    #[serde(flatten)]
+    session: crate::sessions::IdeSession,
+    /// Whether a turn continued here would get the project's tools.
+    ///
+    /// Answered by asking `tool_policy_for` — the same function the turn itself asks — rather than
+    /// by restating the rule here. A second opinion about this would be a window promising tools
+    /// the turn then does not get.
+    tools: bool,
+}
+
 /// The conversations already had in the IDE that this daemon could continue.
 ///
 /// Ones already continued are dropped: a second conversation resuming the same session would put
 /// two threads on one context, and the window would show them as unrelated.
 async fn list_ide_sessions(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::sessions::IdeSession>>, StatusCode> {
+) -> Result<Json<Vec<OfferedSession>>, StatusCode> {
     let Some(root) = crate::sessions::default_root() else {
         return Ok(Json(Vec::new()));
     };
@@ -3493,12 +3584,61 @@ async fn list_ide_sessions(
         crate::sessions::discover(&root, IDE_SESSIONS_SHOWN)
             .into_iter()
             .filter(|session| !taken.contains(&session.session_id))
+            .map(|session| {
+                // Read here and never cached: the hook can be wired between two openings of this
+                // list, including by the route below, and a stale `false` would go on offering to
+                // fix what is already fixed.
+                let wired =
+                    crate::autopilot::classifier_hook_is_wired(std::path::Path::new(&session.cwd));
+                let policy = crate::assistant::tool_policy_for(
+                    Some(session.cwd.as_str()),
+                    crate::assistant::Origin::Shell,
+                    wired,
+                );
+                OfferedSession {
+                    session,
+                    tools: policy == crate::runner::ToolPolicy::Unrestricted,
+                }
+            })
             .collect::<Vec<_>>()
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(found))
+}
+
+/// Puts this daemon's classifier hook into the project a session was had in.
+///
+/// The most consequential thing this daemon does to a directory it does not own: afterwards every
+/// session had there — this one, and the ones opened in the editor — has its tool calls routed
+/// through the classifier, and conversations continued there get the CLI's whole tool surface
+/// instead of the MCP server alone. So it is a POST somebody presses, never something inferred
+/// from picking a session up.
+///
+/// The directory comes from the transcript by way of `sessions::find`, exactly as `create_chat`
+/// gets it and for a sharper version of the same reason: a caller that could name the directory
+/// could have this daemon write an executable hook into any folder on the machine.
+///
+/// A 409 for a settings file this cannot parse. That is not the daemon failing — it is the project
+/// saying no — and the one thing the caller can do about it is go and look at that file.
+async fn wire_ide_session_tools(Path(session_id): Path<String>) -> Result<StatusCode, StatusCode> {
+    let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
+    let session = tokio::task::spawn_blocking(move || crate::sessions::find(&root, &session_id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let dir = std::path::PathBuf::from(&session.cwd);
+    tokio::task::spawn_blocking(move || crate::autopilot::wire_classifier_hook(&dir))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::warn!(%error, cwd = %session.cwd, "could not wire the classifier hook");
+            StatusCode::CONFLICT
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// What was said in one conversation had in the editor, oldest first.
@@ -4348,6 +4488,30 @@ async fn post_proposal_approve(
                 .map_err(|status| (status, "the merge task did not finish".to_owned()))?;
         return merge_decision_response(outcome);
     }
+    if kind == "refinement" {
+        // Fifth kind through this door, and the third that starts no run: approving activates the
+        // refinement and decides the proposal in one transaction. Uncancellable for the reason the
+        // others give — a dropped request must not leave the proposal and the layer disagreeing
+        // about whether the agent was allowed to learn something.
+        let state = state.clone();
+        let activated = uncancellable(async move { crate::refine::approve(&state.pool, id).await })
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match activated {
+            Ok(refinement_id) => Ok(Json(serde_json::json!({ "refinement_id": refinement_id }))),
+            Err(crate::refine::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::refine::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::refine::DecisionError::Malformed) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this proposal does not name a refinement".to_owned(),
+            )),
+        };
+    }
     if kind == "calendar-event" {
         // Third kind through this door, and the second that starts no run: approving writes the
         // event and the decision in one transaction. Uncancellable for the same reason as the
@@ -4743,6 +4907,22 @@ async fn post_proposal_reject(
         };
     }
 
+    if kind == "refinement" {
+        // Unlike the calendar's refusal below, this one leaves a row: `refine::reject` marks the
+        // refinement `rejected` rather than dropping it, because what the agent kept trying to
+        // learn and was told no to is the record the layer's history exists to keep.
+        let state = state.clone();
+        let refused = uncancellable(async move { crate::refine::reject(&state.pool, id).await })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return match refused {
+            Ok(_) => Ok(StatusCode::NO_CONTENT),
+            Err(crate::refine::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::refine::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::refine::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        };
+    }
+
     if kind == "calendar-event" {
         // Refusing a suggested block leaves nothing behind: it is a suggestion declined, not a
         // meeting cancelled, so the calendar never learns it was offered.
@@ -5040,6 +5220,153 @@ struct LeaveNoteRequest {
 #[derive(serde::Serialize)]
 struct LeaveNoteResponse {
     note_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct ProposeRefinementRequest {
+    project_id: Option<String>,
+    kind: String,
+    title: String,
+    body: String,
+    /// Why this is worth telling every later run. Carried onto the proposal, because a person
+    /// deciding at a glance needs the argument beside the text and not a screen away from it.
+    reasoning: Option<String>,
+    /// The refinement this one replaces, if it is a correction of something already in force.
+    ///
+    /// Optional, and the difference matters: without it the layer only grows, and the answer to
+    /// "this note is wrong now" is a second note contradicting the first with both still in force.
+    supersedes: Option<i64>,
+}
+
+/// The owner writing into the layer directly, which is the door that exists today.
+///
+/// It still goes through the proposal, rather than inserting an `active` row: the review trail is
+/// what makes the layer safe to have at all, and a second way in that skipped it would be the way
+/// everything eventually got written. The owner simply approves their own in the next call.
+async fn post_refinement(
+    State(state): State<AppState>,
+    Json(request): Json<ProposeRefinementRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "kind must be one of prompt, memory, skill, subagent".to_owned(),
+    ))?;
+    let title = request.title.trim();
+    let body = request.body.trim();
+    // A refinement with no words is an empty heading in every later prompt, for ever.
+    if title.is_empty() || body.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a refinement needs both a title and a body".to_owned(),
+        ));
+    }
+    let (refinement_id, proposal_id) = crate::refine::propose(
+        &state.pool,
+        crate::refine::Declaration {
+            project_id: request.project_id.as_deref(),
+            origin_run_id: None,
+            kind,
+            title,
+            body,
+            reasoning: request
+                .reasoning
+                .as_deref()
+                .unwrap_or("written by the owner"),
+            supersedes: request.supersedes,
+        },
+    )
+    .await
+    // Which precondition failed, rather than a bare status: a caller told only "409" has to guess
+    // between "that id is not there" and "that id is not yours", and the two have different fixes.
+    .map_err(|error| match error {
+        crate::refine::ProposeError::UnknownPredecessor(_) => {
+            (StatusCode::NOT_FOUND, error.to_string())
+        }
+        crate::refine::ProposeError::ForeignPredecessor(_) => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        crate::refine::ProposeError::Db(error) => {
+            tracing::warn!(%error, "proposing a refinement failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the refinement could not be written".to_owned(),
+            )
+        }
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "refinement_id": refinement_id,
+            "proposal_id": proposal_id,
+        })),
+    ))
+}
+
+/// Everything the layer holds, in every status.
+///
+/// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
+/// showed only what is in force could not answer "what did it try to learn that I said no to".
+async fn list_refinements(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::refine::Refinement>>, StatusCode> {
+    sqlx::query_as::<_, crate::refine::Refinement>(
+        "SELECT id, project_id, kind, title, body, status, proposal_id, supersedes, origin_run_id,
+                created_at, activated_at, ended_at
+           FROM refinements ORDER BY id DESC LIMIT 500",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%error, "listing refinements failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// One refinement, read the way a person decides about it: the text, every decision it has been
+/// through, what it replaced, and what replaced it.
+///
+/// The chain is the half `GET /refinements` cannot give you. A list answers "what is in force";
+/// this answers "what did it say before I changed it, and would I want that back" — which is the
+/// question somebody asks at the moment they are considering a revert.
+async fn get_refinement(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::refine::History>, StatusCode> {
+    match crate::refine::history(&state.pool, id).await {
+        Ok(Some(history)) => Ok(Json(history)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(refinement_id = id, %error, "reading a refinement's history failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Taking one back. The half that makes approving safe to do at all.
+async fn revert_refinement(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<RevertRefinementRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let note = request
+        .note
+        .unwrap_or_else(|| "reverted by the owner".to_owned());
+    match crate::refine::revert(&state.pool, id, &note).await {
+        // 409 and not 404: the row may well exist and simply not be active, which is a different
+        // thing for the caller to do about it.
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(refinement_id = id, %error, "reverting a refinement failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RevertRefinementRequest {
+    note: Option<String>,
 }
 
 /// `POST /jobs/{id}/notes` — leaves words for whichever of this job's nodes comes next.
@@ -8190,6 +8517,136 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Tools cannot be granted to a session this machine does not have.
+    ///
+    /// The directory the hook would be written into comes from the transcript, never from the
+    /// request — so an id that names nothing has nowhere to write, and that is a 404 rather than a
+    /// path built out of whatever was sent.
+    #[tokio::test]
+    async fn a_session_this_machine_does_not_have_cannot_be_given_tools() {
+        let state = test_state().await;
+        let refused = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere/tools")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        // The 404 above is the session's absence and not the route's — a path nothing routes
+        // answers 404 just as readily. A method this route does not serve tells them apart.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere/tools")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Writing into a project's `.claude/` is the most consequential thing this daemon offers over
+    /// HTTP: it is what opens the CLI's whole tool surface for every session had there afterwards.
+    /// It is behind the token, and this is the test that says so out loud.
+    #[tokio::test]
+    async fn granting_tools_to_a_project_is_not_possible_without_the_token() {
+        let state = test_state().await;
+        let refused = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/anything-at-all/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A turn nothing is writing has nothing to watch, and that is `204` rather than an empty
+    /// answer.
+    ///
+    /// The difference is the one `read_tail` is written around: no live tail means the turn ended,
+    /// or this daemon never started it — never that the turn produced nothing. A window told
+    /// "" would draw an answer of no words over a turn that may have written pages.
+    #[tokio::test]
+    async fn a_turn_nothing_is_writing_has_nothing_to_watch() {
+        let state = test_state().await;
+        let quiet = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/4321/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(quiet.status(), StatusCode::NO_CONTENT);
+
+        // And that is the tail's absence, not the route's — a path nothing routes answers 404, but
+        // so would a missing route asked with the right method.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/4321/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// What a turn in flight is watched with: the stream distilled, not the stream.
+    #[tokio::test]
+    async fn a_turn_in_flight_is_watched_as_words_and_not_as_a_stream() {
+        let state = test_state().await;
+        state.run_tails.lock().unwrap().insert(
+            77,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                [
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"deixa ver"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+                ]
+                .join("
+"),
+            )),
+        );
+
+        let watched = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/77/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(watched.status(), StatusCode::OK);
+        let body = json_body(watched).await;
+        assert_eq!(body["text"], "deixa ver");
+        assert_eq!(body["doing"], "Read");
     }
 
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.

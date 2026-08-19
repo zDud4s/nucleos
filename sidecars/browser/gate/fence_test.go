@@ -92,7 +92,7 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	snapshot, err := driver.Snapshot(ctx, session.ID)
+	snapshot, err := driver.Snapshot(ctx, session.ID, false)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	snapshot, err := driver.Snapshot(ctx, session.ID)
+	snapshot, err := driver.Snapshot(ctx, session.ID, false)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestTheActThatCausedARefusalIsToldAboutIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open the control page: %v", err)
 	}
-	controlSnapshot, err := driver.Snapshot(ctx, allowed.ID)
+	controlSnapshot, err := driver.Snapshot(ctx, allowed.ID, false)
 	if err != nil {
 		t.Fatalf("snapshot the control page: %v", err)
 	}
@@ -461,4 +461,88 @@ func findRef(t *testing.T, snapshot browser.Snapshot, name string) string {
 	}
 	t.Fatalf("no element named %q in the snapshot: %+v", name, snapshot.Elements)
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — what the agent actually receives.
+// ---------------------------------------------------------------------------
+
+// TestASnapshotCarriesTheProseAndTheStateOfWhatItShows.
+//
+// The unit tests around `collect` feed it accessibility nodes this repository wrote. This one feeds
+// it a page CHROMIUM read, which is the only way to know that the roles, the value and the checked
+// property arrive in the shape the filter expects — an accessibility tree is Chromium's opinion
+// about ordinary HTML, and the version of that opinion in a test author's head is not evidence.
+//
+// Until 2026-08-19 a snapshot carried controls and headings and nothing else, so the agent could
+// operate a page it could not read: `example.com` came back as one heading and one link, with the
+// paragraph absent. That gap is what the prose half of this asserts.
+func TestASnapshotCarriesTheProseAndTheStateOfWhatItShows(t *testing.T) {
+	site := newSite(t)
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: site.origin() + "/reading"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	snapshot, err := driver.Snapshot(ctx, session.ID, false)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	find := func(name string) *browser.Element {
+		for i := range snapshot.Elements {
+			if snapshot.Elements[i].Name == name {
+				return &snapshot.Elements[i]
+			}
+		}
+		return nil
+	}
+	has := func(element *browser.Element, want string) bool {
+		if element == nil {
+			return false
+		}
+		for _, state := range element.State {
+			if state == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The prose.
+	var prose string
+	for _, element := range snapshot.Elements {
+		if element.Role == "text" {
+			prose += element.Name + "\n"
+		}
+	}
+	if !strings.Contains(prose, "Revenue fell by eleven percent") {
+		t.Errorf("the page's own words are missing; the agent can operate this page but not read it.\nprose was: %q", prose)
+	}
+
+	// Not said twice. A control's name comes from its StaticText child, and emitting both is how a
+	// snapshot doubles in size on a page that is mostly links.
+	if strings.Count(prose, "Continue") > 0 {
+		t.Errorf("a button's own label came back again as prose: %q", prose)
+	}
+
+	// The state.
+	if box := find("Email"); box == nil || box.Value != "someone@example.org" {
+		t.Errorf("a textbox did not report what is in it: %+v", box)
+	}
+	if !has(find("Remember me"), "checked") {
+		t.Errorf("a ticked checkbox did not say so: %+v", find("Remember me"))
+	}
+	if !has(find("Send updates"), "unchecked") {
+		t.Errorf("an unticked checkbox did not say so, which is indistinguishable from having no state: %+v", find("Send updates"))
+	}
+	if !has(find("Not yet"), "disabled") {
+		t.Errorf("a dead button did not say so; the agent will press it forever: %+v", find("Not yet"))
+	}
+	if has(find("Continue"), "disabled") {
+		t.Errorf("a live button was reported dead: %+v", find("Continue"))
+	}
 }

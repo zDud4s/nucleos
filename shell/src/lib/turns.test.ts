@@ -22,6 +22,7 @@ function row(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     answered_by: null,
     session_id: null,
     created_at: "2026-08-18T09:00:00Z",
+    did: [],
     ...overrides,
   };
 }
@@ -35,6 +36,7 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     cost_usd: null,
     answeredBy: null,
     sessionId: null,
+    did: [],
     ...overrides,
   };
 }

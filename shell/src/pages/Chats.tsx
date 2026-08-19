@@ -8,14 +8,18 @@ import {
   useCreateChat,
   useIdeConversation,
   useIdeSessions,
+  useWireIdeSessionTools,
+  useLiveTurn,
   useLocalModel,
   usePatchChat,
   usePostChatSeen,
   usePostChatTitle,
   useSendMessage,
+  useStopTurn,
   type Brain,
   type ChatSummary,
   type IdeSession,
+  type ToolCall,
   type Turn,
 } from "../data/chats";
 import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
@@ -217,6 +221,7 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
   const ideSessions = useIdeSessions(true);
   const create = useCreateChat();
   const localUnavailable = localModel.data?.available === false;
+  const chosen = (ideSessions.data ?? []).find((session) => session.session_id === sessionId);
 
   return (
     <form
@@ -269,11 +274,61 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
         </select>
       </label>
 
+      {chosen !== undefined && !chosen.tools && <NoTools session={chosen} />}
+
       <Button type="submit" intent="go" disabled={create.isPending}>
         Start
       </Button>
       {create.isError && <CreateRefusal error={create.error} />}
     </form>
+  );
+}
+
+/**
+ * What a conversation continued in this session's project would NOT be able to do, and the one
+ * press that fixes it.
+ *
+ * The daemon hands a continued turn the project's tools only where its classifier hook is wired,
+ * and a directory without one — every fresh worktree, since `.claude/` is not committed — falls
+ * back to the MCP server alone. Continuing a coding conversation there gets a model that cannot
+ * open the file being discussed, and nothing said so until after the first turn came back.
+ *
+ * Said here rather than after the pick-up because here is where it can still change the decision:
+ * wire the project, or pick a different session, or go on knowing what you are getting.
+ */
+function NoTools({ session }: { session: IdeSession }) {
+  const wire = useWireIdeSessionTools();
+
+  return (
+    <div className="chats-new-notools">
+      <p className="chats-new-warning" role="status">
+        this session was had in a folder with no núcleo hook — continued here, it can talk about the
+        code but <b>cannot read or change any file</b>, and cannot run anything
+      </p>
+      <Button
+        type="button"
+        disabled={wire.isPending}
+        onClick={() => wire.mutate(session.session_id)}
+      >
+        Give it the tools
+      </Button>
+      {wire.isError && <WireRefusal error={wire.error} cwd={session.cwd} />}
+    </div>
+  );
+}
+
+function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — the folder was left alone</ErrorNote>;
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        conflict: `${cwd}/.claude/settings.json could not be read as JSON, so it was left exactly as it is — open it and it will say why`,
+        not_found: "that session is not on this machine any more",
+      }}
+    />
   );
 }
 
@@ -334,7 +389,11 @@ function ChatDetail({
         <p className="chats-loading">reading the conversation…</p>
       )}
       {transcript.data !== undefined && (
-        <Transcript turns={transcript.data} precededBy={(pickedUp.data ?? []).length > 0} />
+        <Transcript
+          turns={transcript.data}
+          precededBy={(pickedUp.data ?? []).length > 0}
+          chatId={chatId}
+        />
       )}
 
       <Composer chatId={chatId} />
@@ -517,7 +576,15 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
 
 /* ------------------------------------------------------------ transcript -- */
 
-function Transcript({ turns, precededBy }: { turns: Turn[]; precededBy: boolean }) {
+function Transcript({
+  turns,
+  precededBy,
+  chatId,
+}: {
+  turns: Turn[];
+  precededBy: boolean;
+  chatId: string;
+}) {
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
   if (turns.length === 0 && precededBy) return null;
@@ -525,13 +592,26 @@ function Transcript({ turns, precededBy }: { turns: Turn[]; precededBy: boolean 
   return (
     <ul className="chats-turns" aria-label="Transcript">
       {turns.map((turn, index) => (
-        <TurnBlock key={turn.id} turn={turn} previous={index === 0 ? null : turns[index - 1]} />
+        <TurnBlock
+          key={turn.id}
+          turn={turn}
+          previous={index === 0 ? null : turns[index - 1]}
+          chatId={chatId}
+        />
       ))}
     </ul>
   );
 }
 
-function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
+function TurnBlock({
+  turn,
+  previous,
+  chatId,
+}: {
+  turn: Turn;
+  previous: Turn | null;
+  chatId: string;
+}) {
   const marks = marksBetween(previous, turn);
   const live = turnIsLive(turn.status);
 
@@ -541,7 +621,9 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
         <MarkNote key={index} mark={mark} />
       ))}
       <p className="chats-turn-asked">{turn.asked}</p>
-      {live && <p className="chats-turn-live">thinking…</p>}
+      {live && <LiveAnswer turnId={turn.id} />}
+      {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      {!live && <WhatItDid did={turn.did} />}
       {!live && turn.answer !== null && <p className="chats-turn-answer">{turn.answer}</p>}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
@@ -562,12 +644,84 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
  * about where the answer comes from — the two directions are not mirror
  * images of the same fact.
  */
+/**
+ * A turn as it happens: the words so far, and what it is doing between them.
+ *
+ * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
+ * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
+ *
+ * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
+ * what this said before and is still the honest answer while the daemon has nothing to show. A tool
+ * running is named, because "thinking" over a command that is compiling something is the wrong word
+ * for the wait. And words already written are shown as they arrive.
+ */
+/**
+ * The way out of a turn that is going nowhere.
+ *
+ * Offered only while the turn is live, because that is the only time it means anything: cancelling
+ * a run that has already landed would be asking the daemon to un-bill it.
+ *
+ * It is not a refusal of the answer — the turn is a run and stays in the history, cancelled, with
+ * whatever it cost up to that point. That is the honest record and it is why this says "stop"
+ * rather than "undo".
+ */
+function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
+  const stop = useStopTurn(chatId);
+  return (
+    <Button type="button" variant="ghost" disabled={stop.isPending} onClick={() => stop.mutate(turnId)}>
+      Stop
+    </Button>
+  );
+}
+
+function LiveAnswer({ turnId }: { turnId: number }) {
+  const live = useLiveTurn(turnId, true);
+  const text = live.data?.text ?? "";
+  const doing = live.data?.doing ?? null;
+
+  return (
+    <>
+      {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
+      <WhatItDid did={live.data?.did ?? []} />
+      <p className="chats-turn-live">
+        {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
+      </p>
+    </>
+  );
+}
+
+/**
+ * What the turn ran, under what it said.
+ *
+ * A model that read four files and ran the tests, and one that answered from memory, write the same
+ * shape of reply — and on a conversation picked up from the editor, which of the two happened is
+ * most of what a person is asking. Nothing on this page said it before.
+ *
+ * Absent rather than empty when there is nothing: a heading over no rows reads as a turn whose
+ * actions failed to load, which is a different and worse claim than a turn that acted on nothing.
+ */
+function WhatItDid({ did }: { did: ToolCall[] }) {
+  if (did.length === 0) return null;
+  return (
+    <ul className="chats-turn-did" aria-label="What it did">
+      {did.map((call, index) => (
+        // Keyed by position: this is a record of what happened, in order, and nothing reorders or
+        // removes an entry. The same tool on the same file twice is two real calls, not a duplicate.
+        <li key={`${call.name}-${index}`}>
+          <span className="chats-turn-did-name">{call.name}</span>
+          {call.detail !== null && <span className="chats-turn-did-detail">{call.detail}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "restart") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
-        the model past this point does not remember anything above it — the conversation restarted
-        here
+        the conversation restarted here — the model past this point was read the last few exchanges
+        back, and remembers nothing older than those
       </p>
     );
   }

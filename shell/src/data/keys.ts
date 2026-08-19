@@ -130,6 +130,22 @@ export const keys = {
   },
 
   /**
+   * What the agent has been told, and what it asked to be told — `GET
+   * /refinements`.
+   *
+   * Its own root and not a child of `proposals`, although a refinement waiting
+   * for an answer IS a proposal: `GET /proposals` filters `kind =
+   * 'action-approval'` (`core/src/proposals.rs`), so the two lists never
+   * overlap, and a page invalidating one would refetch a list that cannot have
+   * changed. `detail` carries the chain, which is the half the listing has no
+   * room for.
+   */
+  refinements: {
+    all: ["refinements"] as const,
+    detail: (id: number) => ["refinements", "detail", id] as const,
+  },
+
+  /**
    * The Work namespace — chats, council, errands, agents — landing together
    * ahead of the pages that read most of it, for the reason at the top of this
    * file: a namespace four pages edit in sequence is a namespace where the
@@ -146,6 +162,7 @@ export const keys = {
     localModel: ["chats", "local-model"] as const,
     ideSessions: ["chats", "ide-sessions"] as const,
     ideSession: (sessionId: string) => ["chats", "ide-session", sessionId] as const,
+    live: (turnId: number) => ["chats", "live", turnId] as const,
   },
 
   council: {
@@ -158,6 +175,35 @@ export const keys = {
 
   agents: {
     all: ["agents"] as const,
+  },
+
+  /**
+   * The departments, their runs, the actions they ask for and the rules that
+   * start them.
+   *
+   * Ordered general-to-specific so prefix invalidation means something:
+   * `run(id)` is a prefix of `runActions(id)`, so invalidating a run also
+   * re-reads what it asked for, which is right — an action landing is a change
+   * to the run.
+   *
+   * Two of these are not team routes at all. `proposedActions` and `recruits`
+   * read `/proposals/team-actions` and `/proposals/recruits`, because the
+   * decision surface for both is the ordinary proposals door — there is no
+   * `/team-actions/{id}/approve`. They live here rather than under `waiting`
+   * because the domain is teams and the queue is only where they are answered.
+   */
+  teams: {
+    all: ["teams"] as const,
+    list: ["teams", "list"] as const,
+    detail: (id: string) => ["teams", "detail", id] as const,
+    runs: ["teams", "runs"] as const,
+    run: (id: string) => ["teams", "run", id] as const,
+    runActions: (id: string) => ["teams", "run", id, "actions"] as const,
+    openActions: ["teams", "actions"] as const,
+    triggers: ["teams", "triggers"] as const,
+    triggerNext: (id: number) => ["teams", "triggers", id, "next"] as const,
+    proposedActions: ["teams", "proposals", "actions"] as const,
+    recruits: ["teams", "proposals", "recruits"] as const,
   },
 
   /**

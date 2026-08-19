@@ -257,6 +257,106 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 /// slashes because it is compared against a JSON command string, where that is the spelling.
 const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
+/// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
+///
+/// `include_str!` rather than a path resolved at runtime: the daemon that ANSWERS the hook and the
+/// script that ASKS it are two halves of one protocol. A copy read off disk at install time could
+/// be any version — including one left behind by a daemon that is no longer running — and the two
+/// disagreeing is a gate that fails open or a session that cannot act, neither of which announces
+/// itself.
+const HOOK_SOURCE: &str = include_str!("../../.claude/hooks/ask_daemon.py");
+
+/// How the hook is registered, spelled exactly as `classifier_hook_is_wired` looks for it.
+///
+/// `${CLAUDE_PROJECT_DIR}` and not an absolute path: the same settings file is read from worktrees
+/// and from copies of the project, and a path baked in at install time would point at whichever one
+/// happened to be wired first.
+fn hook_entry() -> serde_json::Value {
+    serde_json::json!({
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""
+        }]
+    })
+}
+
+/// Puts this daemon's classifier hook into `dir`, so a conversation continued there may act.
+///
+/// This is what stands between continuing a coding session and continuing it with a model that
+/// cannot open a file: `tool_policy_for` hands a turn the project's tools only where this gate is
+/// satisfied, and a directory without it — every fresh worktree, since `.claude/` is not committed
+/// — falls back to the MCP server alone.
+///
+/// Idempotent, and deliberately narrow: it adds one entry and rewrites one script. Everything else
+/// in the settings file belongs to whoever wrote it and is carried across untouched.
+///
+/// Nothing is written until the existing settings have been read AND parsed. A file this cannot
+/// understand is somebody's work in progress, or a version of the CLI this daemon has never seen,
+/// and the cost of guessing at it is settings nobody asked to lose.
+pub(crate) fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
+    let claude = dir.join(".claude");
+    let settings_path = claude.join("settings.json");
+
+    let mut settings: serde_json::Value = match std::fs::read_to_string(&settings_path) {
+        Ok(text) if text.trim().is_empty() => serde_json::json!({}),
+        Ok(text) => serde_json::from_str(&text).map_err(|error| {
+            format!(
+                "{} is not JSON this daemon can read ({error}); it was left alone",
+                settings_path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => {
+            return Err(format!(
+                "could not read {}: {error}",
+                settings_path.display()
+            ));
+        }
+    };
+
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| format!("{} does not hold an object", settings_path.display()))?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("{}: `hooks` is not an object", settings_path.display()))?
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| format!("{}: `PreToolUse` is not a list", settings_path.display()))?;
+
+    // Compared the way the gate compares: against the script's path anywhere in the entry. The
+    // invocation around it is the user's business — `python`, `py -3`, a venv — and re-registering
+    // ours beside theirs would ask the daemon about every tool call twice.
+    let already = hooks
+        .iter()
+        .any(|entry| serde_json::to_string(entry).is_ok_and(|text| text.contains(HOOK_SCRIPT)));
+    if !already {
+        hooks.push(hook_entry());
+    }
+
+    let body = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("could not write the settings back: {error}"))?;
+
+    std::fs::create_dir_all(claude.join("hooks"))
+        .map_err(|error| format!("could not make {}: {error}", claude.display()))?;
+    std::fs::write(claude.join("hooks").join("ask_daemon.py"), HOOK_SOURCE)
+        .map_err(|error| format!("could not write the hook script: {error}"))?;
+    std::fs::write(
+        &settings_path,
+        format!(
+            "{body}
+"
+        ),
+    )
+    .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
+
+    Ok(())
+}
+
 /// Whether THIS daemon's classifier hook is both registered in `dir` and executable there.
 ///
 /// Two callers ask this, and they must never diverge. Activation asks it before letting a project
@@ -1054,6 +1154,90 @@ mod tests {
                     engaged: true
                 },
             ]
+        );
+    }
+
+    /// Wiring is asserted through the READER, never against the bytes it wrote.
+    ///
+    /// The gate that decides whether a session may act is `classifier_hook_is_wired`, and a writer
+    /// tested against its own output would pass just as happily while writing something that gate
+    /// rejects — which is the one failure that matters, and it fails silently: the conversation
+    /// simply continues with no tools and nobody is told why.
+    #[test]
+    fn wiring_a_project_makes_the_gate_say_it_is_wired() {
+        let root = TempDir::new().unwrap();
+        assert!(!classifier_hook_is_wired(root.path()));
+
+        wire_classifier_hook(root.path()).unwrap();
+
+        assert!(classifier_hook_is_wired(root.path()));
+        // And the script is this daemon's, not a stub: the gate checks the file exists, and a hook
+        // that cannot answer classifies nothing.
+        let written = fs::read_to_string(root.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        assert!(
+            written.contains("PreToolUse"),
+            "the hook script was not written"
+        );
+    }
+
+    #[test]
+    fn wiring_keeps_whatever_else_the_settings_already_said() {
+        let root = TempDir::new().unwrap();
+        write_settings(
+            &root,
+            r#"{"model":"opus","hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[]}]}}"#,
+        );
+
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        // Somebody else's settings file. Taking the tools is not a licence to rewrite the rest of
+        // it, and a wiring that ate a person's PostToolUse hook would be a worse bug than the one
+        // it fixes.
+        assert_eq!(settings["model"], "opus");
+        assert!(settings["hooks"]["PostToolUse"].is_array());
+        assert!(classifier_hook_is_wired(root.path()));
+    }
+
+    #[test]
+    fn wiring_a_project_twice_leaves_one_entry() {
+        let root = TempDir::new().unwrap();
+
+        wire_classifier_hook(root.path()).unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        let ours = entries
+            .iter()
+            .filter(|entry| serde_json::to_string(entry).unwrap().contains(HOOK_SCRIPT))
+            .count();
+        // Idempotent because it will be pressed twice: the button says what is true now, and
+        // pressing it on a project already wired must be a no-op rather than a second hook that
+        // asks the daemon about every tool call all over again.
+        assert_eq!(ours, 1, "{entries:?}");
+    }
+
+    #[test]
+    fn settings_that_are_not_json_are_refused_rather_than_replaced() {
+        let root = TempDir::new().unwrap();
+        write_settings(&root, "{ this is not json");
+
+        let refused = wire_classifier_hook(root.path());
+
+        assert!(refused.is_err());
+        // Untouched. A file this cannot parse is a file somebody is in the middle of editing, or
+        // one written by a version of the CLI this daemon has never seen — and replacing it would
+        // destroy settings nobody asked to lose in order to add one hook.
+        assert_eq!(
+            fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+            "{ this is not json"
         );
     }
 }

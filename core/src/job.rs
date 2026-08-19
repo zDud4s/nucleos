@@ -1997,6 +1997,24 @@ async fn spawn_node(
         prompt.push_str(&block);
     }
 
+    // What earlier work on this project learned, appended at the same seam and for the same reason:
+    // this is the one place every node kind passes through, and a lesson that only reached implement
+    // nodes would be a lesson the planner keeps rediscovering. After the notes deliberately — a note
+    // is what the owner is saying NOW about this job, and it should be the last thing read.
+    //
+    // Best-effort, like the notes above: a layer that cannot be read is a reason to say so, never a
+    // reason to refuse to start the node.
+    let learned = match crate::refine::active_for(pool, Some(job.project_id.as_str())).await {
+        Ok(learned) => learned,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read the refinement layer");
+            Vec::new()
+        }
+    };
+    if let Some(block) = crate::refine::render(&learned) {
+        prompt.push_str(&block);
+    }
+
     let created = crate::runs::create_job_node_run(
         state,
         prompt,

@@ -236,8 +236,15 @@ fn read_head(path: &Path, modified: std::time::SystemTime) -> Option<IdeSession>
 ///
 /// Three things wear `"type": "user"` in these files and only one of them was typed: a real message,
 /// a tool result being handed back, and the harness's own injections — caveats about local commands,
-/// system reminders, pasted file contents. Titling a conversation with any of the others would name
-/// it after plumbing, and putting one in the body of a conversation would attribute it to somebody.
+/// system reminders, pasted file contents, the body of a skill. Titling a conversation with any of
+/// the others would name it after plumbing, and putting one in the body of a conversation would
+/// attribute it to somebody.
+///
+/// Injections do not get a row to themselves. The editor writes `<ide_opened_file>...` into the
+/// SAME row the person typed into, and it writes first — so a row is searched block by block for
+/// the first thing a person could have said, rather than judged by whichever block came first.
+/// Reading only block zero threw away the message beside it and named the conversation after
+/// whatever it found later, which is how a session ends up titled after a skill.
 ///
 /// The full text, uncut. What a title needs and what a transcript needs are different lengths, and
 /// the one place that knows which is the caller.
@@ -245,25 +252,33 @@ fn spoken_by_the_owner(row: &serde_json::Value) -> Option<String> {
     if row.get("type").and_then(|v| v.as_str()) != Some("user") {
         return None;
     }
-    let content = row.get("message")?.get("content")?;
-    let text = match content {
-        serde_json::Value::String(text) => text.clone(),
+    // The harness marking its own writing. A skill body, a hook's context, a session-start
+    // injection: thousands of words nobody typed, opening with ordinary prose that no guard on the
+    // first character can see. This one is not a guess — the file says so.
+    if row.get("isMeta").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    match row.get("message")?.get("content")? {
+        serde_json::Value::String(text) => typed(text),
         serde_json::Value::Array(blocks) => blocks
             .iter()
-            .find(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
-            .and_then(|block| block.get("text").and_then(|v| v.as_str()))
-            .map(str::to_string)?,
-        _ => return None,
-    };
+            .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .find_map(typed),
+        _ => None,
+    }
+}
 
+/// One block of a user row, when a person could have typed it.
+///
+/// An injection opens with a tag; a person almost never does. Cheap, and it fails the safe way —
+/// the worst case is a message that opens with markup being skipped, and the next block, or the
+/// directory, standing in for it.
+fn typed(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    // An injection opens with a tag; a person almost never does. Cheap, and it fails the safe way —
-    // the worst case is a conversation that opens with markup losing its title and falling back to
-    // its directory.
     if trimmed.is_empty() || trimmed.starts_with('<') || trimmed.starts_with("Caveat:") {
         return None;
     }
-
     Some(trimmed.to_string())
 }
 
@@ -478,6 +493,60 @@ mod tests {
         let found = discover(&store.root(), 10);
 
         assert_eq!(found[0].title.as_deref(), Some("o que falta fazer"));
+    }
+
+    /// The editor writes into the SAME row the person typed into, and it writes first.
+    ///
+    /// A message sent with a file open arrives as two text blocks: `<ide_opened_file>...` and then
+    /// what was actually typed. Reading only the first block and rejecting it throws away the row
+    /// that held the real message -- and the conversation then gets named after whatever came next,
+    /// which is plumbing. The injection is skipped; the sentence beside it is not.
+    #[test]
+    fn a_message_the_editor_wrote_a_prefix_onto_is_still_the_first_thing_said() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[serde_json::json!({
+                "type": "user", "cwd": "",
+                "message": {"content": [
+                    {"type": "text", "text": "<ide_opened_file>abriu layer.py</ide_opened_file>"},
+                    {"type": "text", "text": "arranja o parser de datas"},
+                ]}
+            })],
+        );
+
+        let found = discover(&store.root(), 10);
+
+        assert_eq!(found[0].title.as_deref(), Some("arranja o parser de datas"));
+    }
+
+    /// `isMeta` is the harness saying so itself.
+    ///
+    /// A skill body, a hook's context, a session-start injection -- these are `"type": "user"` rows
+    /// carrying thousands of words nobody typed, and they open with ordinary prose, so no guard on
+    /// the first character can see them. The file already marks them, and the mark is exact.
+    #[test]
+    fn a_row_the_harness_marked_as_its_own_is_not_something_anybody_said() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                serde_json::json!({
+                    "type": "user", "cwd": "", "isMeta": true,
+                    "message": {"content": [{"type": "text", "text": "Base directory for this skill: C:/skills/debugging"}]}
+                }),
+                said("arranja o parser de datas"),
+            ],
+        );
+
+        let found = discover(&store.root(), 10);
+        assert_eq!(found[0].title.as_deref(), Some("arranja o parser de datas"));
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].text, "arranja o parser de datas");
     }
 
     /// The directory comes from inside the file, and this is the case that proves it has to: the
