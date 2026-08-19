@@ -262,7 +262,7 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
 /* ----------------------------------------- A17: the brake nobody reads -- */
 
 describe("Autopilot - the trigger brakes say which of them the núcleo reads", () => {
-  it("draws the team scope without pretending it is effective", async () => {
+  it("offers the team trigger brake as a live switch", async () => {
     const world = cockpitWorld({
       projects: [project({ project_id: "alpha" })],
       scopedKills: [{ scope_type: "trigger", scope_id: "scheduled", engaged: false }],
@@ -274,19 +274,44 @@ describe("Autopilot - the trigger brakes say which of them the núcleo reads", (
     await screen.findByRole("list", { name: "Trigger brakes" });
     const team = switchFor("Team triggers");
 
-    // Present — hiding it would lose a control the design asks for.
-    expect(within(team).getByText("not read")).toBeDefined();
-    // And inert, out loud. `scoped_kill_engaged(pool, "trigger", "team")` has no
-    // call site anywhere in `core/src/`: the row would be stored and consulted
-    // by nothing.
-    expect(within(team).queryAllByRole("button")).toEqual([]);
-    expect(within(team).getByText(/nothing in it reads the value/)).toBeDefined();
+    // Read now, so a real state rather than the fixed "not read" label — and a
+    // button, where before there was none.
+    expect(within(team).getByText("running")).toBeDefined();
+    expect(within(team).getByRole("button", { name: "Hold team triggers" })).toBeDefined();
+    // The hedge said engaging this brake would stop nothing. It is no longer
+    // true and must no longer be on screen.
+    expect(within(team).queryByText(/nothing in it reads the value/)).toBeNull();
+  });
 
-    // The ones that are read are live switches, so "not read" is a statement
-    // about that scope and not about the panel.
-    const scheduled = switchFor("Scheduled rules");
-    expect(within(scheduled).getByRole("button", { name: "Hold scheduled rules" })).toBeDefined();
-    expect(within(scheduled).getByText("running")).toBeDefined();
+  it("holds and releases the team trigger scope", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("list", { name: "Trigger brakes" });
+    const team = switchFor("Team triggers");
+    fireEvent.click(within(team).getByRole("button", { name: "Hold team triggers" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/kill/scoped", {
+        method: "POST",
+        body: JSON.stringify({ scope_type: "trigger", scope_id: "team", engaged: true }),
+      });
+    });
+
+    // An absent row means *not engaged*, so the switch had to be able to add one
+    // rather than only patch one — same as the other three scopes.
+    expect(await within(team).findByRole("button", { name: "Release team triggers" })).toBeDefined();
+
+    fireEvent.click(within(team).getByRole("button", { name: "Release team triggers" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/kill/scoped", {
+        method: "POST",
+        body: JSON.stringify({ scope_type: "trigger", scope_id: "team", engaged: false }),
+      });
+    });
   });
 
   it("engages a scope that is read, and sends the scope the núcleo checks", async () => {

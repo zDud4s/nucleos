@@ -11,7 +11,9 @@ vi.mock("../data/client", async (original) => ({
 
 import { Waiting } from "./Waiting";
 import { keys } from "../data/keys";
+import type { AgentRequest } from "../data/agents";
 import type { Proposal } from "../data/system";
+import type { TeamAction } from "../data/teams";
 import type {
   AwaitingRun,
   BrowserSession,
@@ -116,29 +118,67 @@ function parkedRun(overrides: Partial<AwaitingRun> = {}): AwaitingRun {
   };
 }
 
+function teamAction(overrides: Partial<TeamAction> = {}): TeamAction {
+  return {
+    id: 900,
+    team_run_id: "run-1",
+    ordinal: 1,
+    kind: "send_email",
+    payload: JSON.stringify({ to: "cliente@example.com" }),
+    why: "answer the open ticket",
+    proposal_id: null,
+    state: "pending",
+    error: null,
+    created_at: "2026-08-17T09:00:00Z",
+    executed_at: null,
+    ...overrides,
+  };
+}
+
+function agentRequest(overrides: Partial<AgentRequest> = {}): AgentRequest {
+  return {
+    name: "Ana",
+    speciality: "billing",
+    prompt: "handle billing questions",
+    engine: "claude-cli",
+    model: null,
+    tool_policy: "restricted",
+    ...overrides,
+  };
+}
+
 /* ------------------------------------------------------------ the daemon -- */
 
 interface WaitingWorld {
   sessions: BrowserSession[];
   approvals: Proposal[];
+  teamActions: Proposal[];
+  recruits: Proposal[];
+  openActions: TeamAction[];
   merges: MergeSuggestion[];
   exclusions: Proposal[];
   skipped: Proposal[];
   refused: Proposal[];
   vcs: VcsRequestSummary[];
   parked: AwaitingRun[];
+  /** What `POST /proposals/{id}/approve` answers — thrown if it is an `Error`. */
+  approveAnswer: unknown;
 }
 
 function waitingWorld(overrides: Partial<WaitingWorld> = {}): WaitingWorld {
   return {
     sessions: [],
     approvals: [],
+    teamActions: [],
+    recruits: [],
+    openActions: [],
     merges: [],
     exclusions: [],
     skipped: [],
     refused: [],
     vcs: [],
     parked: [],
+    approveAnswer: undefined,
     ...overrides,
   };
 }
@@ -161,12 +201,26 @@ function waitingWorld(overrides: Partial<WaitingWorld> = {}): WaitingWorld {
 function waitingFetch(state: WaitingWorld): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState());
   return async (path, init) => {
+    // Team actions and recruits are decided through the same door as every
+    // other approval (`POST /proposals/{id}/approve`); a single override
+    // here is what lets a test control that one answer without teaching the
+    // whole suite a new route.
+    if (init?.method === "POST" && /^\/proposals\/\d+\/approve$/.test(path)) {
+      if (state.approveAnswer instanceof Error) throw state.approveAnswer;
+      return state.approveAnswer;
+    }
     if (init?.method !== undefined && init.method !== "GET") return await shared(path, init);
     switch (path) {
       case "/browser/sessions":
         return state.sessions;
       case "/proposals":
         return state.approvals;
+      case "/proposals/team-actions":
+        return state.teamActions;
+      case "/proposals/recruits":
+        return state.recruits;
+      case "/team-actions":
+        return state.openActions;
       case "/contacts/merges":
         return state.merges;
       case "/fleet/exclusions/requests":
@@ -336,23 +390,149 @@ describe("Waiting - the ordering freeze", () => {
 /* ------------------------------------------- A14: what is deliberately absent -- */
 
 describe("Waiting - the sections that are not there", () => {
-  it("renders no team or recruitment section, only a note naming the Teams slice", async () => {
+  it("renders a team action's payload as readable fields, never as JSON", async () => {
+    const world = waitingWorld({
+      teamActions: [
+        proposal({
+          id: 201,
+          tool_name: "send_email",
+          reasoning: "the client asked about their invoice",
+          tool_input: JSON.stringify({
+            to: "ana@example.com",
+            subject: "Monday",
+            body: "the invoice is attached",
+          }),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Team actions" });
+    expect(within(list).getByText("ana@example.com")).toBeDefined();
+    expect(within(list).getByText("Monday")).toBeDefined();
+    // No raw JSON dump anywhere in the section — braces and quotes are exactly
+    // the punctuation this rendering exists to strip out.
+    expect(within(list).queryByText(/[{}]/)).toBeNull();
+  });
+
+  it("says an approved action is queued rather than carried out", async () => {
+    const world = waitingWorld({
+      teamActions: [
+        proposal({ id: 202, tool_name: "file_document", reasoning: "file the report" }),
+      ],
+    });
+    world.approveAnswer = { queued: "the department's action will be carried out shortly" };
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Team actions" });
+    fireEvent.click(within(list).getByRole("button", { name: "Approve #202" }));
+
+    // The 300 ms dwell is real in this control; a fast `findBy*` would resolve
+    // inside it and swallow the confirm click, so the wait has to be real too.
+    // The confirm click is its own step — a `waitFor` must not both click the
+    // confirm and assert the mutation, since disarming makes a retry throw.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(within(list).getByRole("button", { name: "Let this action happen" }));
+
+    await waitFor(() => {
+      expect(
+        within(list).getByText("the department's action will be carried out shortly"),
+      ).toBeDefined();
+    });
+    expect(within(list).queryByText(/\bdone\b/i)).toBeNull();
+    expect(within(list).queryByText(/\bsent\b/i)).toBeNull();
+  });
+
+  it("shows the execution state apart from the owner's decision", async () => {
+    const world = waitingWorld({
+      teamActions: [
+        proposal({ id: 210, tool_name: "send_email", reasoning: "notify the client" }),
+        proposal({ id: 211, tool_name: "calendar_event", reasoning: "book the follow-up" }),
+      ],
+      openActions: [teamAction({ id: 900, proposal_id: 210, state: "working" })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Team actions" });
+    const row210 = within(list).getByText("team action #210").closest("li");
+    if (row210 === null) throw new Error("no card for team action #210");
+    // The pending decision and the execution state are two facts, not one.
+    expect(within(row210 as HTMLElement).getByRole("button", { name: "Approve #210" })).toBeDefined();
+    expect(within(row210 as HTMLElement).getByText("being carried out")).toBeDefined();
+
+    const row211 = within(list).getByText("team action #211").closest("li");
+    if (row211 === null) throw new Error("no card for team action #211");
+    // `GET /team-actions` lists only pending and working, so a proposal with no
+    // matching row must say the state is unknown rather than guess one.
+    expect(within(row211 as HTMLElement).getByText(/execution state is not known yet/)).toBeDefined();
+  });
+
+  it("hires a recruit over the six fields as edited, not as proposed", async () => {
+    const proposed = agentRequest();
+    const world = waitingWorld({
+      recruits: [
+        proposal({
+          id: 301,
+          tool_name: null,
+          reasoning: "the team needs a billing specialist",
+          tool_input: JSON.stringify(proposed),
+        }),
+      ],
+    });
+    world.approveAnswer = { agent_id: "ag-9" };
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Recruitment" });
+    fireEvent.change(within(list).getByLabelText("engine"), { target: { value: "codex-cli" } });
+
+    fireEvent.click(within(list).getByRole("button", { name: "Hire #301" }));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(
+      within(list).getByRole("button", { name: "Write the agent and add them to the roster" }),
+    );
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/301/approve", {
+        method: "POST",
+        body: JSON.stringify({ hire: { ...proposed, engine: "codex-cli" } }),
+      });
+    });
+  });
+
+  it("keeps the frozen section order with the two team sections in place", async () => {
     daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
 
     await renderWaiting();
 
-    const said = await screen.findByText(/recruitment requests/);
-    expect(said.textContent).toMatch(/Teams slice/);
-
-    // A sentence, not a section: nothing to list and nothing to press. A team
-    // decision cannot be shown because the núcleo mounts no team routes at all.
-    const panel = said.closest("section");
-    expect(panel).not.toBeNull();
-    expect(within(panel as HTMLElement).queryAllByRole("button")).toEqual([]);
-    expect(within(panel as HTMLElement).queryAllByRole("list")).toEqual([]);
-
-    const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
-    expect(asked.some((path) => path.includes("team"))).toBe(false);
+    await screen.findByRole("heading", { level: 1, name: "Waiting" });
+    const headings = await waitFor(() => {
+      const found = screen.getAllByRole("heading", { level: 2 });
+      // Every section reads before the assertion is trusted — a page still
+      // loading would pass this on however many panels happened to be mounted.
+      expect(found.length).toBe(11);
+      return found.map((heading) => heading.textContent);
+    });
+    expect(headings).toEqual([
+      "Wheel requests",
+      "Action approvals",
+      "Team actions",
+      "Recruitment",
+      "Contact merges",
+      "Calendar events",
+      "Exclusion requests",
+      "Skipped items",
+      "Refused actions",
+      "Git queue",
+      "Parked runs",
+    ]);
   });
 
   it("gives the refused actions no buttons at all", async () => {
