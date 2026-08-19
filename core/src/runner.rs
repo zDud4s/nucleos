@@ -405,6 +405,112 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
     reply
 }
 
+/// A turn as it stands PART WAY THROUGH: what has been written, and what is being done.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LiveTurn {
+    /// The answer so far. Empty means nothing has been said yet, which on a live turn is not the
+    /// same claim as a turn that answered with nothing.
+    pub text: String,
+    /// The tool being run right now, or `None` when the model is writing rather than acting.
+    pub doing: Option<String>,
+}
+
+/// Distils a stream still being written into the two things worth showing while it is.
+///
+/// Beside `extract_reply`, and for the same stated reason: knowing the CLI's output format is this
+/// module's job. The alternative was to teach the window these shapes, which would put a format the
+/// app does not own — and which changes without asking — into the one place that cannot be tested
+/// against the real thing.
+///
+/// The two sources of the same words are the whole difficulty. With `--include-partial-messages`
+/// the text arrives twice: once as `text_delta`s while it is typed, and again in the completed
+/// `assistant` message. So the deltas fill a buffer, and a completed message REPLACES that buffer
+/// with what it says — which is also what makes this correct when no partials arrive at all.
+///
+/// Completed messages accumulate rather than replace each other: text, a tool call, then more text
+/// is one answer with a gap in it, and keeping only the newest message would silently drop
+/// everything the model said before it reached for anything.
+pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
+    let mut finished: Vec<String> = Vec::new();
+    let mut writing = String::new();
+    let mut doing: Option<String> = None;
+
+    for line in stream.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            // Only `text_delta` carries a `text`. A tool call's arguments stream as
+            // `input_json_delta` under `partial_json`, and reading that as speech would put a
+            // half-written JSON object in the middle of a sentence.
+            Some("stream_event") => {
+                if let Some(text) = value.pointer("/event/delta/text").and_then(|t| t.as_str()) {
+                    writing.push_str(text);
+                }
+            }
+            Some("assistant") => {
+                let blocks = value
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let text = blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+
+",
+                    );
+                if !text.trim().is_empty() {
+                    finished.push(text);
+                }
+                if let Some(name) = blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    .filter_map(|block| block.get("name").and_then(|n| n.as_str()))
+                    .next_back()
+                {
+                    doing = Some(name.to_string());
+                }
+                // The message that just completed is the one those deltas were writing.
+                writing.clear();
+            }
+            // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
+            // would show the model as writing while a command is still running.
+            Some("user") => {
+                let returned = value
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    });
+                if returned {
+                    doing = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !writing.trim().is_empty() {
+        finished.push(writing);
+    }
+
+    LiveTurn {
+        text: finished.join(
+            "
+
+",
+        ),
+        doing,
+    }
+}
+
 /// Context occupied while a Claude `stream-json` run is still alive.
 ///
 /// This is deliberately separate from `extract_usage`: assistant events describe current context
@@ -2260,6 +2366,130 @@ mod tests {
             *runner.last_mcp_config.lock().unwrap(),
             Some(std::path::PathBuf::from("C:/tmp/mcp.json"))
         );
+    }
+
+    /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.
+    fn delta(text: &str) -> String {
+        serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": text}}
+        })
+        .to_string()
+    }
+
+    /// A whole assistant message, which is what arrives with or without partials.
+    fn message(blocks: serde_json::Value) -> String {
+        serde_json::json!({"type": "assistant", "message": {"content": blocks}}).to_string()
+    }
+
+    fn said(text: &str) -> serde_json::Value {
+        serde_json::json!([{"type": "text", "text": text}])
+    }
+
+    #[test]
+    fn a_stream_in_flight_reads_back_as_what_has_been_written_so_far() {
+        let stream = [delta("está"), delta(" quase")].join(
+            "
+",
+        );
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.text, "está quase");
+        assert_eq!(live.doing, None);
+    }
+
+    /// The deltas and the completed message describe the SAME words, and a reader that took both
+    /// would show every sentence twice — which is what a naive concatenation does, and it looks like
+    /// the model stuttering rather than like a parsing bug.
+    #[test]
+    fn a_completed_message_supersedes_the_deltas_it_was_written_from() {
+        let stream = [delta("está"), delta(" quase"), message(said("está quase"))].join(
+            "
+",
+        );
+
+        assert_eq!(live_from_stream(&stream).text, "está quase");
+    }
+
+    /// Text, a tool, then more text is ONE answer with a gap in the middle. Keeping only the last
+    /// message would throw away everything said before the model reached for anything.
+    #[test]
+    fn text_written_before_and_after_a_tool_call_is_one_answer() {
+        let stream = [
+            message(said("deixa ver o ficheiro")),
+            message(serde_json::json!([{"type": "tool_use", "name": "Read", "input": {}}])),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "content": "ok"}]}
+            })
+            .to_string(),
+            message(said("é o parser de datas")),
+        ]
+        .join(
+            "
+",
+        );
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(
+            live.text,
+            "deixa ver o ficheiro
+
+é o parser de datas"
+        );
+        assert_eq!(live.doing, None);
+    }
+
+    /// What it is doing right now, which is the half a spinner cannot say.
+    #[test]
+    fn a_stream_says_which_tool_is_running_until_that_tool_returns() {
+        let calling = [
+            message(said("deixa ver")),
+            message(serde_json::json!([{"type": "tool_use", "name": "Bash", "input": {}}])),
+        ]
+        .join(
+            "
+",
+        );
+
+        assert_eq!(live_from_stream(&calling).doing.as_deref(), Some("Bash"));
+
+        let returned = [
+            calling,
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "content": "ok"}]}
+            })
+            .to_string(),
+        ]
+        .join(
+            "
+",
+        );
+
+        assert_eq!(live_from_stream(&returned).doing, None);
+    }
+
+    /// A turn that has only just started has said nothing, and that is not the same as a turn that
+    /// answered with nothing — the caller is asking about a run still in flight.
+    #[test]
+    fn a_stream_carrying_only_transport_reads_back_empty() {
+        let stream = [
+            serde_json::json!({"type": "system", "subtype": "init", "session_id": "s"}).to_string(),
+            "not json at all".to_string(),
+        ]
+        .join(
+            "
+",
+        );
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.text, "");
+        assert_eq!(live.doing, None);
     }
 
     #[test]

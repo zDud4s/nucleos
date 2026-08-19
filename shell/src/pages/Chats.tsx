@@ -9,6 +9,7 @@ import {
   useIdeConversation,
   useIdeSessions,
   useWireIdeSessionTools,
+  useLiveTurn,
   useLocalModel,
   usePatchChat,
   usePostChatSeen,
@@ -593,7 +594,7 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
         <MarkNote key={index} mark={mark} />
       ))}
       <p className="chats-turn-asked">{turn.asked}</p>
-      {live && <p className="chats-turn-live">thinking…</p>}
+      {live && <LiveAnswer turnId={turn.id} />}
       {!live && turn.answer !== null && <p className="chats-turn-answer">{turn.answer}</p>}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
@@ -614,6 +615,32 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
  * about where the answer comes from — the two directions are not mirror
  * images of the same fact.
  */
+/**
+ * A turn as it happens: the words so far, and what it is doing between them.
+ *
+ * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
+ * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
+ *
+ * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
+ * what this said before and is still the honest answer while the daemon has nothing to show. A tool
+ * running is named, because "thinking" over a command that is compiling something is the wrong word
+ * for the wait. And words already written are shown as they arrive.
+ */
+function LiveAnswer({ turnId }: { turnId: number }) {
+  const live = useLiveTurn(turnId, true);
+  const text = live.data?.text ?? "";
+  const doing = live.data?.doing ?? null;
+
+  return (
+    <>
+      {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
+      <p className="chats-turn-live">
+        {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
+      </p>
+    </>
+  );
+}
+
 function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "restart") {
     return (

@@ -980,6 +980,23 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
     let turn = TurnGuard { slot, mcp_path };
 
+    // The turn's stream, mirrored as the CLI writes it and published under the turn's own id — a
+    // turn IS a run, so `GET /runs/{id}/tail` already serves this and needed nothing new.
+    //
+    // Published BEFORE the task is spawned, not inside it. `send_message` answers with this id and
+    // the window starts asking immediately; registering from inside the task would leave a window
+    // in which the tail does not exist yet, and "no live tail" is the same answer the endpoint
+    // gives for a run that finished — so the first poll of every turn would read as already over.
+    //
+    // Taken out by `Registration`'s `Drop`, which `spawn_registered` builds, so completion, failure,
+    // timeout, cancel and panic all remove it without a line here.
+    let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    state
+        .run_tails
+        .lock()
+        .unwrap()
+        .insert(id, std::sync::Arc::clone(&transcript));
+
     crate::runs::spawn_registered(state, id, async move {
         // WHICH key this turn carries follows from what it can read, and the two must be decided
         // together or not at all.
@@ -1063,7 +1080,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // at all.
                     session_id: Some(session_id),
                     fork_session: false,
-                    include_partial_messages: false,
+                    // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
+                    // paragraph at a time. It costs nothing when nobody is watching: these are more
+                    // events on a stream the daemon already reads line by line, and `extract_reply`
+                    // takes the reply from the `result` event either way.
+                    include_partial_messages: true,
                     // An orchestrator turn is one message answered and closed; the next one arrives
                     // as its own turn on the resumed session, which is where a Telegram reply
                     // already goes. Nothing here needs a stdin, so it keeps a closed one.
@@ -1084,12 +1105,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     allowed_mcp_tools: None,
                 },
                 session_tx,
-                // Unread here, deliberately. An assistant turn's product is the reply that
-                // `extract_reply` pulls out of a completed run; a turn the wall clock killed has no
-                // reply to salvage, and `assistant_sessions` has nowhere to keep a partial one.
-                // `runs.rs` reads its copy because a run's trajectory is worth keeping even when
-                // the run is not — that difference is in the tables, not an oversight here.
-                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                // The published buffer, so what the window watches is what the CLI is writing.
+                //
+                // Still not the turn's PRODUCT: the reply is what `extract_reply` pulls out of the
+                // `result` event of a completed run, and a turn the wall clock killed has no reply
+                // to salvage. This is the same distinction as before — the stream is transport, the
+                // result is the answer — with the transport now visible while it moves.
+                transcript,
             ),
         )
         .await;
@@ -3094,6 +3116,80 @@ mod tests {
                 crate::autopilot::classifier_hook_is_wired(root.path())
             ),
             crate::runner::ToolPolicy::Unrestricted,
+        );
+    }
+
+    /// A turn's stream is published WHILE it is being written, so the window can show the work
+    /// instead of a spinner.
+    ///
+    /// The buffer is taken out of the map while the turn is in flight and read again after it ends:
+    /// that is what proves the published handle is the one the runner writes into, rather than an
+    /// empty one registered beside it. Registering the wrong buffer would look identical from
+    /// outside — a tail that answers, and never says anything.
+    #[tokio::test]
+    async fn a_turn_in_flight_publishes_its_stream_so_the_window_can_watch() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            delay: Mutex::new(Some(Duration::from_millis(150))),
+            ..Default::default()
+        });
+
+        let id = send_message(&state, "assistant-watching-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let mut published = None;
+        for _ in 0..500 {
+            let found = state.run_tails.lock().unwrap().get(&id).cloned();
+            if let Some(buffer) = found {
+                published = Some(buffer);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let published = published.expect("a turn in flight published no stream to watch");
+
+        settled_turn(&state.pool, id).await;
+
+        // Taken out when the turn ends. A tail left behind is the run's whole output held in memory
+        // until the daemon restarts, which is why `Registration` removes it rather than this code.
+        //
+        // Waited for rather than asserted outright: the row leaves `running` from INSIDE the task,
+        // and the registration is dropped when that task ends — a moment later. Asserting on the
+        // row's timing would be asserting on a race this does not care about.
+        let mut gone = false;
+        for _ in 0..500 {
+            if state.run_tails.lock().unwrap().get(&id).is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(gone, "the tail outlived the turn");
+        let written = published.lock().unwrap().clone();
+        assert!(written.contains("fake output"), "{written:?}");
+    }
+
+    /// The turn asks the CLI to stream its message as it is written, not only when it is finished.
+    ///
+    /// Without this the stream carries whole blocks, and a conversation shows nothing for as long as
+    /// the model takes to write a paragraph — which is exactly the wait the tail above exists to
+    /// fill. The flag costs nothing when nobody is watching: it adds events to a stream the daemon
+    /// was already reading line by line.
+    #[tokio::test]
+    async fn an_assistant_turn_asks_the_cli_for_partial_messages() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+
+        let id = send_message(&state, "assistant-partials-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(
+            *runner.last_include_partial_messages.lock().unwrap(),
+            Some(true)
         );
     }
 }

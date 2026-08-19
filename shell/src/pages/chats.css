@@ -337,6 +337,18 @@
   white-space: pre-wrap;
 }
 
+/*
+ * The answer as it is being written.
+ *
+ * The same type as a finished answer, deliberately: these ARE the words, not a preview of them, and
+ * restyling them would make the turn appear to change its mind about what it said when the run
+ * lands. The line below it is what says it is not finished.
+ */
+.chats-turn-writing {
+  border-left: 2px solid var(--border);
+  padding-left: var(--space-2);
+}
+
 .chats-turn-live {
   margin: 0;
   font-size: var(--text-sm);

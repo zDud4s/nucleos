@@ -85,6 +85,8 @@ function chatsFetch(
     said?: Record<string, Said[]>;
     /** The sessions the picker offers. Mutated in place by the wiring route below. */
     ideSessions?: IdeSession[];
+    /** What each turn in flight is writing right now, by turn id. */
+    live?: Record<number, { text: string; doing: string | null }>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -97,6 +99,9 @@ function chatsFetch(
     }
     if (path === "/assistant/chats") return chats;
     if (path === "/assistant/local-model") return { available: opts.localAvailable ?? true };
+    const live = /^\/assistant\/(\d+)\/live$/.exec(path);
+    // Undefined is the daemon's 204: nothing is writing, which is not the same as writing nothing.
+    if (live !== null) return (opts.live ?? {})[Number(live[1])];
     const wire = /^\/assistant\/ide-sessions\/([^/]+)\/tools$/.exec(path);
     if (wire !== null && init?.method === "POST") {
       // What the daemon does: the hook goes into that project, and the next listing says so.
@@ -503,5 +508,61 @@ describe("what a session would be able to do, before it is picked up", () => {
       (call) => String(call[0]) === "/assistant/ide-sessions/aaaa-1111/tools",
     );
     expect(posted).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------- a turn as it happens -- */
+
+describe("a turn in flight", () => {
+  it("shows what the model is writing while it writes it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }, { live: { 1: { text: "estou a ver o parser de datas", doing: null } } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Not "thinking…" over a model that is visibly saying something.
+    expect(await screen.findByText("estou a ver o parser de datas")).toBeTruthy();
+  });
+
+  it("says which tool is running, not only that it is thinking", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }, { live: { 1: { text: "deixa ver", doing: "Read" } } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/running Read/i)).toBeTruthy();
+  });
+
+  it("still says thinking when the daemon has nothing to show yet", async () => {
+    // A turn whose CLI has not written a word, and a turn this daemon did not start, answer the
+    // same way — and neither is a turn that said nothing.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("thinking…")).toBeDefined();
+  });
+
+  it("asks nothing about a turn that has already landed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [turnRow({ id: 1 })] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    const asked = daemon.apiFetch.mock.calls.map((call) => String(call[0]));
+    expect(asked.some((path) => path.endsWith("/live"))).toBe(false);
   });
 });

@@ -214,6 +214,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
+        // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
+        // the two cannot shadow each other whatever a turn id looks like.
+        .route("/assistant/{turn_id}/live", get(get_assistant_live))
         // An errand is standing work on a Telegram topic, and these are the four moves the chat
         // routes above already make: open one, list them, change one, end it. DELETE ends the
         // asking and removes nothing — `errands::close` says why.
@@ -3332,6 +3335,29 @@ async fn get_assistant_chat(
     })?;
     turns.reverse();
     Ok(Json(turns))
+}
+
+/// A turn while it is still being written: what has been said, and what is being done.
+///
+/// The distilling happens in `runner.rs` beside `extract_reply`, because knowing the CLI's stream
+/// format is that module's job — and this route exists rather than pointing the window at
+/// `/runs/{id}/tail` for the same reason: the tail is the raw stream, and a chat bubble is not the
+/// place to learn what a `content_block_delta` is.
+///
+/// Read from byte zero on every poll, not from a cursor. What comes back is not a chunk to append
+/// but the turn's whole state — text superseded by completed messages, a tool that has since
+/// returned — and that can only be recomputed from the beginning. A turn's stream is small; a job's
+/// is not, which is why `/runs/{id}/tail` keeps its cursor.
+///
+/// `204` when nothing is writing. That is the run having ended or this daemon never having started
+/// it, and it is emphatically not "the turn said nothing" — see `read_tail`.
+async fn get_assistant_live(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<crate::runner::LiveTurn>, StatusCode> {
+    let stream =
+        crate::runs::read_tail(&state.run_tails, turn_id, 0).ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(crate::runner::live_from_stream(&stream)))
 }
 
 /// Whether this machine has a model that can answer a conversation.
@@ -8168,6 +8194,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A turn nothing is writing has nothing to watch, and that is `204` rather than an empty
+    /// answer.
+    ///
+    /// The difference is the one `read_tail` is written around: no live tail means the turn ended,
+    /// or this daemon never started it — never that the turn produced nothing. A window told
+    /// "" would draw an answer of no words over a turn that may have written pages.
+    #[tokio::test]
+    async fn a_turn_nothing_is_writing_has_nothing_to_watch() {
+        let state = test_state().await;
+        let quiet = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/4321/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(quiet.status(), StatusCode::NO_CONTENT);
+
+        // And that is the tail's absence, not the route's — a path nothing routes answers 404, but
+        // so would a missing route asked with the right method.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/4321/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// What a turn in flight is watched with: the stream distilled, not the stream.
+    #[tokio::test]
+    async fn a_turn_in_flight_is_watched_as_words_and_not_as_a_stream() {
+        let state = test_state().await;
+        state.run_tails.lock().unwrap().insert(
+            77,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                [
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"deixa ver"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+                ]
+                .join("
+"),
+            )),
+        );
+
+        let watched = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/77/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(watched.status(), StatusCode::OK);
+        let body = json_body(watched).await;
+        assert_eq!(body["text"], "deixa ver");
+        assert_eq!(body["doing"], "Read");
     }
 
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.

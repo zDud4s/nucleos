@@ -58,6 +58,22 @@ export interface IdeSession {
   tools: boolean;
 }
 
+/**
+ * A turn part way through: what it has written, and what it is doing.
+ *
+ * Distilled by the daemon rather than by this window. The CLI's stream carries
+ * `content_block_delta`s, tool calls and transport events in a format the app
+ * does not own and which changes without asking — so `runner.rs` reads it
+ * beside the parse that pulls the final reply out, and what arrives here is
+ * words.
+ */
+export interface LiveTurn {
+  /** The answer so far. Empty means nothing has been written yet. */
+  text: string;
+  /** The tool running right now, or null when the model is writing. */
+  doing: string | null;
+}
+
 /** One thing said in a conversation had in the editor. */
 export interface Said {
   /** Whether the owner typed it. The model answered everything else. */
@@ -238,6 +254,27 @@ export function useCreateChat() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
     },
+  });
+}
+
+/**
+ * A turn while it is still being written.
+ *
+ * `undefined` is the daemon's `204`: nothing is writing. That covers a turn
+ * that has ended and a turn this daemon never started, and it is never "the
+ * turn said nothing" — so the caller falls back to saying it is thinking,
+ * rather than drawing an answer of no words.
+ *
+ * Enabled only while the turn is live, which is also what stops the poll: a
+ * turn that has landed has its answer in the transcript, and asking after it
+ * would be asking the daemon to describe something it has already forgotten.
+ */
+export function useLiveTurn(turnId: number, alive: boolean) {
+  return useQuery({
+    queryKey: keys.chats.live(turnId),
+    queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
+    enabled: alive,
+    refetchInterval: POLL.turn,
   });
 }
 
