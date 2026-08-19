@@ -185,6 +185,14 @@ pub fn build_router(state: AppState) -> Router {
         // Speaking to a job that is already running. Scoped like `POST /runs/{id}/message` and
         // deliberately NOT like the `POST /jobs` one segment above it — see `post_job_note`.
         .route("/jobs/{id}/notes", post(post_job_note))
+        // What earlier work learned, and the two things a person does with it. Owner-scoped like
+        // the notes above and for a stronger reason: this is the layer that decides what every
+        // later run is told, so a token that could write here could rewrite the agent's mind for
+        // every project on the machine. **How a RUN declares one is deliberately not here** — that
+        // is an agent writing into what agents are told, which is the governance question
+        // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
+        .route("/refinements", get(list_refinements).post(post_refinement))
+        .route("/refinements/{id}/revert", post(revert_refinement))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -4250,6 +4258,30 @@ async fn post_proposal_approve(
                 .map_err(|status| (status, "the merge task did not finish".to_owned()))?;
         return merge_decision_response(outcome);
     }
+    if kind == "refinement" {
+        // Fifth kind through this door, and the third that starts no run: approving activates the
+        // refinement and decides the proposal in one transaction. Uncancellable for the reason the
+        // others give — a dropped request must not leave the proposal and the layer disagreeing
+        // about whether the agent was allowed to learn something.
+        let state = state.clone();
+        let activated = uncancellable(async move { crate::refine::approve(&state.pool, id).await })
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match activated {
+            Ok(refinement_id) => Ok(Json(serde_json::json!({ "refinement_id": refinement_id }))),
+            Err(crate::refine::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::refine::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::refine::DecisionError::Malformed) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this proposal does not name a refinement".to_owned(),
+            )),
+        };
+    }
     if kind == "calendar-event" {
         // Third kind through this door, and the second that starts no run: approving writes the
         // event and the decision in one transaction. Uncancellable for the same reason as the
@@ -4887,6 +4919,106 @@ struct LeaveNoteRequest {
 #[derive(serde::Serialize)]
 struct LeaveNoteResponse {
     note_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct ProposeRefinementRequest {
+    project_id: Option<String>,
+    kind: String,
+    title: String,
+    body: String,
+    /// Why this is worth telling every later run. Carried onto the proposal, because a person
+    /// deciding at a glance needs the argument beside the text and not a screen away from it.
+    reasoning: Option<String>,
+}
+
+/// The owner writing into the layer directly, which is the door that exists today.
+///
+/// It still goes through the proposal, rather than inserting an `active` row: the review trail is
+/// what makes the layer safe to have at all, and a second way in that skipped it would be the way
+/// everything eventually got written. The owner simply approves their own in the next call.
+async fn post_refinement(
+    State(state): State<AppState>,
+    Json(request): Json<ProposeRefinementRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or(StatusCode::BAD_REQUEST)?;
+    let title = request.title.trim();
+    let body = request.body.trim();
+    // A refinement with no words is an empty heading in every later prompt, for ever.
+    if title.is_empty() || body.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (refinement_id, proposal_id) = crate::refine::propose(
+        &state.pool,
+        request.project_id.as_deref(),
+        None,
+        kind,
+        title,
+        body,
+        request
+            .reasoning
+            .as_deref()
+            .unwrap_or("written by the owner"),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "proposing a refinement failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "refinement_id": refinement_id,
+            "proposal_id": proposal_id,
+        })),
+    ))
+}
+
+/// Everything the layer holds, in every status.
+///
+/// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
+/// showed only what is in force could not answer "what did it try to learn that I said no to".
+async fn list_refinements(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::refine::Refinement>>, StatusCode> {
+    sqlx::query_as::<_, crate::refine::Refinement>(
+        "SELECT id, project_id, kind, title, body, status, proposal_id, supersedes, origin_run_id,
+                created_at, activated_at, ended_at
+           FROM refinements ORDER BY id DESC LIMIT 500",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%error, "listing refinements failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Taking one back. The half that makes approving safe to do at all.
+async fn revert_refinement(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<RevertRefinementRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let note = request
+        .note
+        .unwrap_or_else(|| "reverted by the owner".to_owned());
+    match crate::refine::revert(&state.pool, id, &note).await {
+        // 409 and not 404: the row may well exist and simply not be active, which is a different
+        // thing for the caller to do about it.
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(refinement_id = id, %error, "reverting a refinement failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RevertRefinementRequest {
+    note: Option<String>,
 }
 
 /// `POST /jobs/{id}/notes` — leaves words for whichever of this job's nodes comes next.
