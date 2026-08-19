@@ -30,14 +30,15 @@ import (
 // late rather than never, and "never" is the failure that matters — it would leave the agent
 // reasoning about a page that never changed.
 func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.Action) (browser.ActResult, error) {
-	entry, err := d.lookup(id)
-	if err != nil {
-		return browser.ActResult{}, err
+	entry, lookupErr := d.lookup(id)
+	if lookupErr != nil {
+		return browser.ActResult{}, lookupErr
 	}
 
 	d.mu.Lock()
 	mode := entry.mode
 	key, known := entry.refs[action.Ref]
+	pageSession, frameID := entry.cdp, entry.frameID
 	d.mu.Unlock()
 
 	// Spec §4.4 rule 1. Refused and not queued, and refused from the moment the wheel was ASKED for
@@ -54,24 +55,36 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		), nil
 	}
 
-	if !known {
-		// Not an error: the agent named something no snapshot showed it. That is exactly the case
-		// refs exist to make representable, so it comes back as a refusal it can act on — most
-		// often by taking a fresh snapshot, because the page moved underneath it.
+	if needsRef(action.Kind) && action.Ref == "" {
 		return browser.Refused(
-			browser.ConsequenceOffAllowlist,
-			fmt.Sprintf("ref %q is not in the current snapshot; take a new one", action.Ref),
+			browser.ConsequenceNotApplicable,
+			fmt.Sprintf("%q has to name something the last snapshot showed", action.Kind),
 		), nil
 	}
 
-	objectID, err := d.resolve(ctx, key)
-	if err != nil {
-		return browser.ActResult{}, err
+	// A ref is resolved when one was given, and three of the six verbs do not give one: back never
+	// names an element, a page scroll moves what is not in a snapshot yet, and a key goes wherever
+	// focus already is.
+	var objectID string
+	if action.Ref != "" {
+		if !known {
+			// Not an error: the agent named something no snapshot showed it. That is exactly the
+			// case refs exist to make representable, so it comes back as a refusal it can act on —
+			// most often by taking a fresh snapshot, because the page moved underneath it.
+			return browser.Refused(
+				browser.ConsequenceStaleRef,
+				fmt.Sprintf("ref %q is not in the current snapshot; take a new one", action.Ref),
+			), nil
+		}
+		resolved, err := d.resolve(ctx, key)
+		if err != nil {
+			return browser.ActResult{}, err
+		}
+		objectID = resolved
 	}
 
 	d.mu.Lock()
 	before := entry.reportedUpTo
-	pageSession, frameID := entry.cdp, entry.frameID
 	d.mu.Unlock()
 
 	// Watched from before the action. A click and the navigation it causes are not synchronous
@@ -80,21 +93,46 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	moved := d.watchPage(pageSession, frameID)
 	defer moved.stop()
 
+	// Where the act lands. An element carries its own document with it, because a cross-site frame
+	// is a separate target and a key dispatched at the page would arrive in the wrong one.
+	on := pageSession
+	if action.Ref != "" {
+		on = key.session
+	}
+
+	var refusal *browser.Refusal
+	var err error
 	switch action.Kind {
 	case browser.ActionClick:
-		err = d.callOn(ctx, key.session, objectID, "function() { this.click(); }")
+		err = d.callOn(ctx, on, objectID, "function() { this.click(); }")
 	case browser.ActionScroll:
-		err = d.callOn(ctx, key.session, objectID, "function() { this.scrollIntoView({block: 'center'}); }")
+		if objectID == "" {
+			refusal, err = d.scrollPage(ctx, on, action.Text)
+		} else {
+			err = d.callOn(ctx, on, objectID, "function() { this.scrollIntoView({block: 'center'}); }")
+		}
 	case browser.ActionType:
-		err = d.typeInto(ctx, key.session, objectID, action.Text)
+		err = d.typeInto(ctx, on, objectID, action.Text)
+	case browser.ActionSelect:
+		refusal, err = d.choose(ctx, on, objectID, action.Text)
+	case browser.ActionPress:
+		refusal, err = d.press(ctx, on, objectID, action.Text)
+	case browser.ActionBack:
+		refusal, err = d.goBack(ctx, entry)
 	default:
 		return browser.Refused(
-			browser.ConsequenceMethod,
+			browser.ConsequenceNotApplicable,
 			fmt.Sprintf("unknown action kind %q", action.Kind),
 		), nil
 	}
 	if err != nil {
 		return browser.ActResult{}, err
+	}
+	if refusal != nil {
+		// Still through afterAct: the verb declined, but a page can have moved for its own reasons
+		// while the act was in flight, and the agent's refs are stale either way.
+		return d.afterAct(ctx, entry, moved,
+			browser.Refused(refusal.Consequence, refusal.Detail)), nil
 	}
 
 	refused, consumed := d.refusalForAt(ctx, id, before)
@@ -110,6 +148,18 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	// also fires a blocked beacon is one act with two things worth saying about it, and reporting
 	// only the first would leave the agent holding refs to a document that is gone.
 	return d.afterAct(ctx, entry, moved, result), nil
+}
+
+// needsRef says which verbs have to name an element. The other three act on the page, on the
+// history, or on whatever has focus, and requiring a ref for those would mean an agent could not
+// scroll to content that is not in a snapshot yet — which is the only reason to scroll.
+func needsRef(kind browser.ActionKind) bool {
+	switch kind {
+	case browser.ActionClick, browser.ActionType, browser.ActionSelect:
+		return true
+	default:
+		return false
+	}
 }
 
 // afterAct says what the act did to the page, when it did anything.

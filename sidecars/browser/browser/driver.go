@@ -149,13 +149,36 @@ const (
 	ActionClick  ActionKind = "click"
 	ActionType   ActionKind = "type"
 	ActionScroll ActionKind = "scroll"
+	// ActionSelect chooses an option in a dropdown. Its absence was not a missing convenience: the
+	// snapshot hands out refs for `combobox` and `listbox`, so the agent was being shown a control
+	// and given no verb that operates it — an invitation to click at it and to read whatever
+	// happened next as success.
+	ActionSelect ActionKind = "select"
+	// ActionPress sends one key to whatever has focus. Typing uses Input.insertText, which is what a
+	// paste does and therefore fires no keydown at all: a search box that submits on Enter could not
+	// be submitted, and a field that watches keystrokes saw none. The key set is closed and carries
+	// no modifiers — see the driver — because Ctrl+S is a download and Ctrl+P is a dialog, and
+	// neither is consequence-free.
+	ActionPress ActionKind = "press"
+	// ActionBack returns to the previous page. Without it an agent that followed the wrong link
+	// could only re-open the url it wanted, which it may not have, and which pays the admission
+	// check again. Back can only reach a document this session already loaded, and the fence already
+	// admitted every one of those.
+	ActionBack ActionKind = "back"
 )
 
 // Action is one attempt to touch the page.
 type Action struct {
 	Kind ActionKind `json:"kind"`
-	Ref  string     `json:"ref"`
-	Text string     `json:"text,omitempty"`
+	// Ref names the element, and is required for click, type and select. Scroll takes one to bring
+	// an element into view and takes none to move the page itself; press takes one to focus before
+	// the key and takes none to send it wherever focus already is; back never takes one.
+	Ref string `json:"ref"`
+	// Text is the verb's argument: the characters for type, the option's label for select, the key's
+	// name for press, and the direction for a page scroll. One field rather than four, because a
+	// verb has at most one and naming them apart would only spread the same value over a wider
+	// shape.
+	Text string `json:"text,omitempty"`
 }
 
 // Outcome is the shape of an ActResult.
@@ -166,10 +189,13 @@ const (
 	OutcomeRefused Outcome = "refused"
 )
 
-// Consequence names WHY the fence refused. It is a closed vocabulary rather than a message because
-// the núcleo has to be able to tell these apart without reading prose, and because the agent is
-// shown the reason — a string assembled at the refusal site would drift into something a page could
-// influence.
+// Consequence names WHY an act did not happen. Mostly that is the fence; two of them are not, and
+// they are here rather than expressed as errors because they are the same KIND of answer — the act
+// did not occur, the agent is told plainly why, and it can carry on.
+//
+// It is a closed vocabulary rather than a message because the núcleo has to be able to tell these
+// apart without reading prose, and because the agent is shown the reason — a string assembled at the
+// refusal site would drift into something a page could influence.
 type Consequence string
 
 const (
@@ -204,6 +230,14 @@ const (
 	// --proxy-bypass-list=<-loopback> so that the fence sees loopback at all rather than letting the
 	// page reach it directly.
 	ConsequenceLoopback Consequence = "loopback"
+	// ConsequenceStaleRef — the ref names nothing in the current snapshot. Not a fence refusal at
+	// all, and it used to be reported as off-allowlist, which told the agent a security decision had
+	// been taken about a page when what had actually happened was that the page moved. The right
+	// next move is a fresh snapshot, and the two answers point in opposite directions.
+	ConsequenceStaleRef Consequence = "stale-ref"
+	// ConsequenceNotApplicable — the verb does not apply here: a select on something that is not a
+	// dropdown, a key outside the closed set, a back with nothing behind it. Also not the fence.
+	ConsequenceNotApplicable Consequence = "not-applicable"
 )
 
 // Refusal is a refusal by the fence: a named consequence, and a detail for the human reading a log.
