@@ -438,20 +438,89 @@ fn record_change(changed: &mut Vec<Change>, row: &serde_json::Value) {
     });
 }
 
-/// The note left where the conversation changed files.
-fn changes(changed: &[Change]) -> Said {
-    let named: Vec<String> = changed
-        .iter()
-        .take(CHANGED_NAMED)
-        .map(|change| format!("{} +{} −{}", change.name, change.added, change.removed))
-        .collect();
-    let mut text = format!("changed {}", named.join(", "));
-    if changed.len() > CHANGED_NAMED {
-        text.push_str(&format!(" and {} more", changed.len() - CHANGED_NAMED));
+/// The commands an assistant row ran, added to the run being collected.
+///
+/// `Bash` only, and its command. A conversation runs dozens of tools and almost all of them are
+/// reads: naming every one would bury the two that matter under a list of files opened. What a
+/// person wants to know is whether the tests were run, and reading a file is not that.
+fn record_commands(ran: &mut Vec<String>, row: &serde_json::Value) {
+    if row.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return;
+    }
+    let Some(blocks) = row
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+            continue;
+        }
+        if block.get("name").and_then(|v| v.as_str()) != Some("Bash") {
+            continue;
+        }
+        let Some(command) = block
+            .get("input")
+            .and_then(|i| i.get("command"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        let command = cut_to(command.to_string(), COMMAND_LIMIT);
+        // The same command twice in a stretch is one thing that was done, not two.
+        if !ran.contains(&command) {
+            ran.push(command);
+        }
+    }
+}
+
+/// The longest command kept whole. A command line can be a heredoc.
+const COMMAND_LIMIT: usize = 80;
+
+/// The most commands one note names, for the reason `CHANGED_NAMED` exists.
+const RAN_NAMED: usize = 4;
+
+/// The note left where the conversation did something rather than said something.
+///
+/// One note for both halves, not two: what was run and what changed are the same answer to the same
+/// question, and splitting them would put two lines of margin between every pair of sentences.
+fn did(ran: &[String], changed: &[Change]) -> Said {
+    let mut parts: Vec<String> = Vec::new();
+    if !ran.is_empty() {
+        let mut text = format!(
+            "ran {}",
+            ran.iter()
+                .take(RAN_NAMED)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if ran.len() > RAN_NAMED {
+            text.push_str(&format!(" and {} more", ran.len() - RAN_NAMED));
+        }
+        parts.push(text);
+    }
+    if !changed.is_empty() {
+        let named: Vec<String> = changed
+            .iter()
+            .take(CHANGED_NAMED)
+            .map(|change| format!("{} +{} −{}", change.name, change.added, change.removed))
+            .collect();
+        let mut text = format!("changed {}", named.join(", "));
+        if changed.len() > CHANGED_NAMED {
+            text.push_str(&format!(" and {} more", changed.len() - CHANGED_NAMED));
+        }
+        parts.push(text);
     }
     Said {
         by_owner: false,
-        text,
+        text: parts.join(" · "),
         aside: true,
     }
 }
@@ -526,6 +595,8 @@ fn read_said(path: &Path) -> Conversation {
     let mut aside: usize = 0;
     // The files changed since the last thing anybody said, in the order they were first touched.
     let mut changed: Vec<Change> = Vec::new();
+    // And the commands run in the same stretch, in the order they were run.
+    let mut ran: Vec<String> = Vec::new();
 
     loop {
         line.clear();
@@ -548,6 +619,11 @@ fn read_said(path: &Path) -> Conversation {
         // conversation and never becomes one, but what it did is the only record of what the
         // conversation actually changed.
         record_change(&mut changed, &row);
+        // A row that ran something and said nothing never reaches the line above, so its commands
+        // are taken here. A row that did both is handled after its sentence is kept.
+        if spoken(&row).is_none() {
+            record_commands(&mut ran, &row);
+        }
         let Some(mut item) = spoken(&row) else {
             continue;
         };
@@ -555,15 +631,19 @@ fn read_said(path: &Path) -> Conversation {
             keep(&mut kept, &mut cut, note(aside));
             aside = 0;
         }
-        if !changed.is_empty() {
-            keep(&mut kept, &mut cut, changes(&changed));
+        if !changed.is_empty() || !ran.is_empty() {
+            keep(&mut kept, &mut cut, did(&ran, &changed));
             changed.clear();
+            ran.clear();
         }
         // Cut before it is kept, so one pasted log cannot be carried around whole only to be
         // thrown away by the byte ceiling below — and so that a message bigger than that ceiling
         // is shown cut rather than dropped, which would leave a gap nothing on screen explains.
         item.text = cut_to(item.text, SAID_BYTES);
         keep(&mut kept, &mut cut, item);
+        // AFTER the line, not before it: a model says what it is about to do and then does it, and
+        // a margin written the other way round describes work that had not happened yet.
+        record_commands(&mut ran, &row);
     }
 
     // An excursion, or an edit, that the file ends inside. Both happened, and a note is the whole
@@ -571,8 +651,8 @@ fn read_said(path: &Path) -> Conversation {
     if aside > 0 {
         keep(&mut kept, &mut cut, note(aside));
     }
-    if !changed.is_empty() {
-        keep(&mut kept, &mut cut, changes(&changed));
+    if !changed.is_empty() || !ran.is_empty() {
+        keep(&mut kept, &mut cut, did(&ran, &changed));
     }
 
     // The byte ceiling, taken off the oldest end. The last message is never dropped: a conversation
@@ -841,6 +921,16 @@ mod tests {
         assert!(find(&store.root(), "..\\elsewhere\\secret").is_none());
     }
 
+    /// An assistant row that ran one command and said nothing.
+    fn ran(command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+            ]}
+        })
+    }
+
     /// A tool result as the CLI records one for an edit: the file, and the hunk that moved it.
     fn edited(path: &str, lines: &[&str]) -> serde_json::Value {
         let patch = if lines.is_empty() {
@@ -932,6 +1022,68 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// What the conversation RAN, which is the other half of what it did.
+    ///
+    /// A model that ran the tests and one that did not write the same shape of sentence afterwards.
+    /// The commands are in the file, in the `tool_use` blocks, and the note that already names the
+    /// files carries them too rather than starting a second column of margin.
+    #[test]
+    fn a_conversation_says_what_it_ran_beside_what_it_changed() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("corre os testes"),
+                ran("cargo test"),
+                edited("C:/proj/a.rs", &["+um"]),
+                replied("passaram"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.len(), 3, "{read:?}");
+        let note = &read[1];
+        assert!(note.aside);
+        assert!(note.text.contains("cargo test"), "{}", note.text);
+        assert!(note.text.contains("a.rs"), "{}", note.text);
+    }
+
+    /// A command runs AFTER the sentence in the row that launched it, and the note lands after that
+    /// sentence rather than before it. A model says what it is about to do and then does it; the
+    /// margin has to read in that order or it describes work that had not happened yet.
+    #[test]
+    fn what_a_message_ran_is_noted_under_it_and_not_above_it() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("corre os testes"),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [
+                        {"type": "text", "text": "vou correr"},
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}},
+                    ]}
+                }),
+                replied("passaram"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.len(), 4, "{read:?}");
+        assert_eq!(read[1].text, "vou correr");
+        assert!(
+            read[2].aside && read[2].text.contains("cargo test"),
+            "{}",
+            read[2].text
+        );
+        assert_eq!(read[3].text, "passaram");
     }
 
     /// What the conversation CHANGED, which was the one thing it never said.
