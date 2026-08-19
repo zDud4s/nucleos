@@ -599,7 +599,13 @@ pub async fn send_message(
         Some(_) => prompt,
         None => match recent_exchanges(&state.pool, chat_id).await {
             Ok(history) if !history.is_empty() => replayed(&history, &prompt),
-            Ok(_) => prompt,
+            // Nothing of our own to replay. On an ordinary new conversation that is the truth and
+            // the prompt stands alone — but a chat picked up from the editor has a past that simply
+            // is not in our runs, and beginning it blank is the complaint this feature answers.
+            Ok(_) => match handed_over(&state.pool, chat_id).await {
+                history if !history.is_empty() => replayed(&history, &prompt),
+                _ => prompt,
+            },
             Err(error) => {
                 tracing::warn!(%error, chat_id, "could not read the conversation to replay it");
                 prompt
@@ -735,6 +741,33 @@ núcleo: ",
     );
     out.push_str(prompt);
     out
+}
+
+/// The tail an editor session was picked up with, as exchanges, or empty.
+///
+/// Read from the chat rather than from the transcript: the file can be tens of megabytes and the
+/// turn path must not go near it. It was taken once, at pick-up, when the file was already being
+/// read to measure the session — and storing it means the compaction is a row somebody can read
+/// afterwards, which is the whole of `handoff.rs`'s argument against rewriting history invisibly.
+///
+/// A failure to read or parse it is empty, not an error. A turn answering without its predecessor's
+/// tail is worse than one answering with it, and better than one that refuses.
+async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
+    let stored = match crate::chats::handover_of(pool, chat_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read what this conversation was handed");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<Vec<(String, String)>>(&stored) {
+        Ok(history) => history,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "the stored handover could not be read");
+            Vec::new()
+        }
+    }
 }
 
 /// The exchanges a local turn may be shown, oldest first.
@@ -2036,6 +2069,55 @@ mod tests {
             "a chat with room left is still one conversation, and an unreported fill is not an \
              overflow"
         );
+    }
+
+    /// A conversation too large to resume is still continued, from what it was handed.
+    ///
+    /// The rotation's answer to a lost context has always been a verbatim tail. Its source was the
+    /// turns of the chat itself — and a chat picked up from the editor has none, so a session too
+    /// large to resume began knowing nothing at all. That is the original complaint with a new hat:
+    /// the sessions appear, you continue one, and it has never heard of you.
+    ///
+    /// The tail is read from the transcript once, when the session is picked up, and stored on the
+    /// chat. This asserts the far end of that: what the model is actually handed.
+    #[tokio::test]
+    async fn a_picked_up_conversation_is_replayed_from_what_it_was_handed() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+        let chat_id = "handover-chat";
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, ide_session_id, handover)
+             VALUES (?, 'cloud', '2026-08-19T10:00:00Z', 'aaaa-1111', ?)",
+        )
+        .bind(chat_id)
+        .bind(r#"[["arranja o parser","arranjado, o mes vinha antes do dia"]]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let id = send_message(&state, chat_id, "e agora os testes", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let prompt = runner
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no prompt reached the runner");
+
+        assert!(
+            prompt.contains("arranjado, o mes vinha antes do dia"),
+            "the editor's tail was not replayed: {prompt}"
+        );
+        assert!(
+            prompt.contains("e agora os testes"),
+            "the new message was lost: {prompt}"
+        );
+        // Framed as a replay, not as the conversation itself — the same frame the rotation uses.
+        assert!(prompt.contains("replay"), "{prompt}");
     }
 
     /// A finished turn records how full its context was.

@@ -1,0 +1,21 @@
+-- What a conversation picked up from the editor was told, when it could not be resumed.
+--
+-- The daemon has never compacted anything, and this does not start. `handoff.rs` states the
+-- position: `/compact` rewrites history invisibly, so context pressure must leave an auditable
+-- record instead of erasing how work continued. The rotation's answer has always been a VERBATIM
+-- tail -- the last few exchanges, copied, in front of a fresh session -- and not a summary.
+--
+-- What was missing was a source. `recent_exchanges` reads the turns of the chat it belongs to, and
+-- a chat just picked up from the editor has none: a session too large to resume would have begun
+-- knowing nothing at all, which is the complaint this whole feature exists to answer.
+--
+-- So the tail is taken from the transcript ONCE, at the moment the session is picked up and the
+-- file is already being read to measure it, and stored here. Written at pick-up rather than read on
+-- the turn because the file can be tens of megabytes and the turn path must not go near it -- and
+-- because a compaction that lives in a row is one a person can read afterwards, which is the whole
+-- argument.
+--
+-- JSON: an array of two-element arrays, `[[asked, answered], ...]`, oldest first. NULL means this
+-- conversation was not picked up from the editor, or was small enough to resume outright -- both of
+-- which are the absence of a handover rather than an empty one.
+ALTER TABLE chats ADD COLUMN handover TEXT;

@@ -3701,6 +3701,14 @@ struct IdeConversationOut {
     context_rotates_at: i64,
 }
 
+/// How many exchanges a conversation too large to resume is handed.
+///
+/// The same count `recent_exchanges` replays for a rotated conversation, and deliberately: this is
+/// the rotation's mechanism reaching a conversation whose past happens to live in somebody else's
+/// file rather than in our runs. A different number here would be a second policy about the same
+/// question.
+const HANDOVER_EXCHANGES: usize = 6;
+
 /// How many past sessions the list offers.
 ///
 /// There are hundreds on this machine and they are ordered by recency, so this is a question about
@@ -3739,25 +3747,65 @@ async fn create_chat(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Written after the chat exists, because it is what `get_session` reads to decide the first
-    // turn resumes rather than starts clean. A failure here is not a failed request: the
-    // conversation is real and usable, it simply begins a context of its own — so it is logged as
-    // the thing it is rather than rolled back into a 500 the caller cannot act on.
-    if let Some(session) = &continued
-        && let Err(error) = crate::assistant::upsert_session(
-            &state.pool,
-            &chat_id,
-            &session.session_id,
-            &chrono::Utc::now().to_rfc3339(),
-        )
-        .await
-    {
-        tracing::warn!(
-            %error,
-            chat_id = %chat_id,
-            session_id = %session.session_id,
-            "the conversation was opened but could not be attached to its session; it will start clean"
-        );
+    // Measured once, here, where the file is read anyway and where the answer can still change
+    // what happens. The ceiling `get_session` enforces reads `runs.context_fill` — the daemon's OWN
+    // prior turns — and a session picked up from the editor has none, so until this every pick-up
+    // resumed whatever it found however large. One did: about 180k of context, re-sent uncached as
+    // fresh input, $1.72 for a one-word answer.
+    if let Some(session) = &continued {
+        let read = {
+            let session_id = session.session_id.clone();
+            match crate::sessions::default_root() {
+                Some(root) => tokio::task::spawn_blocking(move || {
+                    crate::sessions::conversation(&root, &session_id)
+                })
+                .await
+                .ok()
+                .flatten(),
+                None => None,
+            }
+        };
+        let carries = read.as_ref().and_then(|read| read.context_estimate);
+        let resumable =
+            carries.is_none_or(|carries| carries <= crate::assistant::CONTEXT_ROTATION_TOKENS);
+
+        if resumable {
+            // Written after the chat exists, because it is what `get_session` reads to decide the
+            // first turn resumes rather than starts clean. A failure here is not a failed request:
+            // the conversation is real and usable, it simply begins a context of its own — so it is
+            // logged as the thing it is rather than rolled back into a 500 nobody can act on.
+            if let Err(error) = crate::assistant::upsert_session(
+                &state.pool,
+                &chat_id,
+                &session.session_id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id = %chat_id,
+                    session_id = %session.session_id,
+                    "the conversation was opened but could not be attached to its session; it will start clean"
+                );
+            }
+        } else if let Some(read) = &read {
+            // Too large to resume, so it is handed the tail instead — the rotation's own answer,
+            // and never a summary. Stored rather than re-read: the file can be tens of megabytes,
+            // the turn path must not go near it, and a compaction that lives in a row is one
+            // somebody can read afterwards.
+            let tail = crate::sessions::exchanges(&read.said, HANDOVER_EXCHANGES);
+            if !tail.is_empty()
+                && let Ok(stored) = serde_json::to_string(&tail)
+                && let Err(error) = crate::chats::set_handover(&state.pool, &chat_id, &stored).await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id = %chat_id,
+                    "the conversation was opened but could not be handed its predecessor's tail"
+                );
+            }
+        }
     }
 
     Ok(Json(serde_json::json!({ "chat_id": chat_id })))

@@ -103,6 +103,30 @@ pub async fn create(
     Ok(chat_id)
 }
 
+/// Records what a conversation was handed in place of the session it could not resume.
+pub async fn set_handover(pool: &SqlitePool, chat_id: &str, handover: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET handover = ? WHERE chat_id = ?")
+        .bind(handover)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// What this conversation was handed when it could not be resumed, or `None`.
+///
+/// The verbatim tail of the editor session it was picked up from, taken once at pick-up and stored
+/// as JSON pairs. Its own query rather than a field off `get`, for the reason `cwd_of` is: it is
+/// read on the turn path, and `get` walks the whole list to answer.
+pub async fn handover_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
+    let handover: Option<Option<String>> =
+        sqlx::query_scalar("SELECT handover FROM chats WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(handover.flatten())
+}
+
 /// Where this conversation's turns run, or `None` for the daemon's own directory.
 ///
 /// Its own query rather than a field off `get`, matching `brain_of`: this is read on the hot path of

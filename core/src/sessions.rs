@@ -150,6 +150,40 @@ pub struct Conversation {
     pub context_estimate: Option<i64>,
 }
 
+/// The last `limit` exchanges of a conversation, oldest first.
+///
+/// For the rotation's replay, and shaped exactly like `assistant::recent_exchanges` because it
+/// feeds the same function. That one reads the turns of a chat; a chat just picked up from the
+/// editor has none, and a rotated pick-up would otherwise begin knowing nothing at all — which is
+/// the complaint this whole feature exists to answer, wearing a different hat.
+///
+/// Pairs, and only complete ones. The replay frames each as `you:` and `núcleo:`, so a question
+/// nobody answered would arrive as an instruction the model appears to have ignored, and a note —
+/// said by neither — would put words on somebody. The rule that keeps the harness's injections out
+/// of the transcript keeps our own margin out of the model's memory.
+pub fn exchanges(said: &[Said], limit: usize) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut asked: Option<&str> = None;
+    for line in said.iter().filter(|line| !line.aside) {
+        match (line.by_owner, asked) {
+            // A second question with no answer between them replaces the first: what is being
+            // replayed is what was answered, and the older one never was.
+            (true, _) => asked = Some(&line.text),
+            (false, Some(question)) => {
+                pairs.push((question.to_string(), line.text.clone()));
+                asked = None;
+            }
+            // The model speaking with nothing asked before it: the opening of a session the daemon
+            // itself launched, and not an exchange.
+            (false, None) => {}
+        }
+    }
+    if pairs.len() > limit {
+        pairs.drain(..pairs.len() - limit);
+    }
+    pairs
+}
+
 /// One thing said in a conversation had in the IDE.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Said {
@@ -1118,6 +1152,134 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// The tail of an editor conversation, as exchanges the replay already knows how to frame.
+    ///
+    /// The rotation has always had an answer for a conversation whose context is gone: mint a fresh
+    /// session and put the last few exchanges VERBATIM in front of the new turn. What it lacked was
+    /// a source. `recent_exchanges` reads the turns of THIS chat, and a chat just picked up from the
+    /// editor has none — so a rotated pick-up would begin knowing nothing at all, which is the
+    /// original complaint wearing a different hat.
+    ///
+    /// The same mechanism, the same frame, a different place to read the tail from.
+    #[test]
+    fn the_tail_of_a_session_reads_back_as_exchanges() {
+        let said = vec![
+            Said {
+                by_owner: true,
+                text: "arranja o parser".into(),
+                aside: false,
+            },
+            Said {
+                by_owner: false,
+                text: "arranjado".into(),
+                aside: false,
+            },
+            Said {
+                by_owner: true,
+                text: "e os testes".into(),
+                aside: false,
+            },
+            Said {
+                by_owner: false,
+                text: "passam".into(),
+                aside: false,
+            },
+        ];
+
+        assert_eq!(
+            exchanges(&said, 10),
+            vec![
+                ("arranja o parser".to_string(), "arranjado".to_string()),
+                ("e os testes".to_string(), "passam".to_string()),
+            ]
+        );
+    }
+
+    /// The LAST few, because a rotation happens at the end of a long conversation and the end is
+    /// what the next turn is continuing.
+    #[test]
+    fn only_the_last_exchanges_are_taken() {
+        let mut said = Vec::new();
+        for n in 0..10 {
+            said.push(Said {
+                by_owner: true,
+                text: format!("pergunta {n}"),
+                aside: false,
+            });
+            said.push(Said {
+                by_owner: false,
+                text: format!("resposta {n}"),
+                aside: false,
+            });
+        }
+
+        let tail = exchanges(&said, 2);
+
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1].0, "pergunta 9");
+    }
+
+    /// A note is not a line of the conversation and is not replayed as one.
+    ///
+    /// The replay frames every pair as `you:` and `núcleo:`. A note was said by neither, and giving
+    /// it to either would put words on somebody — the same rule that keeps the harness's own
+    /// injections out of the transcript keeps our own margin out of the model's memory.
+    #[test]
+    fn a_note_is_never_replayed_as_something_somebody_said() {
+        let said = vec![
+            Said {
+                by_owner: true,
+                text: "corre os testes".into(),
+                aside: false,
+            },
+            Said {
+                by_owner: false,
+                text: "ran cargo test".into(),
+                aside: true,
+            },
+            Said {
+                by_owner: false,
+                text: "passam".into(),
+                aside: false,
+            },
+        ];
+
+        let tail = exchanges(&said, 10);
+
+        assert_eq!(
+            tail,
+            vec![("corre os testes".to_string(), "passam".to_string())]
+        );
+    }
+
+    /// A question nobody answered is not half an exchange. The model is being handed a record of
+    /// what was said and answered; a dangling prompt reads as an instruction it failed to carry out.
+    #[test]
+    fn a_question_with_no_answer_is_not_replayed() {
+        let said = vec![
+            Said {
+                by_owner: true,
+                text: "primeira".into(),
+                aside: false,
+            },
+            Said {
+                by_owner: false,
+                text: "respondida".into(),
+                aside: false,
+            },
+            Said {
+                by_owner: true,
+                text: "por responder".into(),
+                aside: false,
+            },
+        ];
+
+        assert_eq!(
+            exchanges(&said, 10),
+            vec![("primeira".to_string(), "respondida".to_string())]
+        );
     }
 
     /// What continuing a session would cost, measured before anybody commits to it.
