@@ -142,6 +142,17 @@ type SnapshotRequest struct {
 	ControlsFrom int
 }
 
+// Blocked is what the page tried to do for itself and the fence stopped, since this document loaded.
+//
+// A count and the most recent one, rather than the list. The list is unbounded — a page that polls
+// produces one every second — and after the first the agent has learned everything it can act on:
+// that what it is reading may be less than the page.
+type Blocked struct {
+	Count       int         `json:"count"`
+	Consequence Consequence `json:"consequence"`
+	Detail      string      `json:"detail,omitempty"`
+}
+
 // Snapshot is the accessibility view of a page: what is there, what it is called, and what it says.
 type Snapshot struct {
 	SessionID SessionID `json:"session_id"`
@@ -170,6 +181,10 @@ type Snapshot struct {
 	// Partial says this snapshot is the difference since the last one rather than the whole page —
 	// so an agent that skipped the previous one does not read a short list as a short page.
 	Partial bool `json:"partial,omitempty"`
+	// Blocked is the fence's third layer speaking. The CSP stops things inside the renderer, where
+	// no request is ever made and there is nothing for the other two layers to report, so a page
+	// that could not fetch its own content used to read as a page that had none.
+	Blocked *Blocked `json:"blocked,omitempty"`
 }
 
 // ActionKind is the verb. The set is small and closed on purpose (spec §6.2, "consequence-free in
@@ -279,6 +294,15 @@ const (
 	// ConsequenceNotApplicable — the verb does not apply here: a select on something that is not a
 	// dropdown, a key outside the closed set, a back with nothing behind it. Also not the fence.
 	ConsequenceNotApplicable Consequence = "not-applicable"
+	// ConsequencePageRequest — the page tried to make a request of its OWN, without navigating:
+	// fetch, XHR, EventSource, a beacon. The fence allows none of them (`connect-src 'none'`), and
+	// this is the name for having been stopped by that.
+	//
+	// It arrives on a snapshot rather than on an act, because the failure it describes is one of
+	// READING. A page that renders empty and fills itself from an API produces a shell, and a shell
+	// is a correct reading of an empty page — so without this the agent concludes there is nothing
+	// there, and nothing anywhere contradicts it.
+	ConsequencePageRequest Consequence = "page-request"
 )
 
 // Refusal is a refusal by the fence: a named consequence, and a detail for the human reading a log.

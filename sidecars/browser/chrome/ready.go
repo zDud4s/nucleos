@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
 )
 
@@ -207,4 +208,8 @@ func (d *Driver) forgetRefs(entry *session) {
 	entry.refs = map[string]nodeKey{}
 	entry.refByNode = map[nodeKey]string{}
 	entry.frames = map[cdp.SessionID]frameRef{}
+	// What the CSP stopped belonged to the document that is gone. Carrying the count forward would
+	// answer a question about this page with evidence from the last one.
+	entry.blocked = 0
+	entry.blockedLast = browser.Refusal{}
 }

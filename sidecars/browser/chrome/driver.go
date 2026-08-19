@@ -97,6 +97,11 @@ type session struct {
 	// what was actually sent: comparing against something the agent never saw would report changes
 	// it cannot reconcile.
 	lastReported map[string]browser.Element
+	// blocked counts what the injected CSP stopped in THIS document, and blockedLast is the most
+	// recent one. Per document, and reset when it changes: the count answers "is what I am reading
+	// the whole page", and an answer carried over from the previous page does not.
+	blocked     int
+	blockedLast browser.Refusal
 }
 
 // nodeKey identifies a node across every document a session can see.
@@ -173,6 +178,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)
+	conn.OnEvent(driver.onLogEntry)
 	driver.startSweep()
 	return driver, nil
 }
@@ -252,6 +258,9 @@ func (d *Driver) onEvent(event cdp.Event) {
 			}
 		}
 		d.mu.Unlock()
+		// A framed login form that cannot fetch is the case this pillar exists for, so the frame's
+		// log is listened to as well as the page's.
+		d.watchCSP(ctx, params.SessionID)
 	}
 
 	// Spec §5.4: in agent mode a new target is BLOCKED, not opened and then watched. A headless
@@ -317,6 +326,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	// is earlier than it should be but is not wrong; refusing to open over it would trade a real
 	// capability for a better wait.
 	_, _ = d.conn.Call(ctx, cdpSession, "Page.setLifecycleEventsEnabled", map[string]any{"enabled": true})
+	d.watchCSP(ctx, cdpSession)
 	mainFrame := d.mainFrameOf(ctx, cdpSession)
 
 	d.mu.Lock()

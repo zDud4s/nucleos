@@ -98,22 +98,46 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	}
 	button := findRef(t, snapshot, "Send")
 
-	if _, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: button}); err != nil {
+	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: button})
+	if err != nil {
 		t.Fatalf("act: %v", err)
 	}
 	if site.reached("POST /submit", settle) {
 		t.Fatal("the POST left the machine")
 	}
-	// There is deliberately NO assertion here about what the agent was told, and the absence is a
-	// measurement rather than a gap. This test used to require the refusal to arrive on the click or
-	// the act after it, and failed about one run in three; the comment blamed the settle window.
-	// MEASURED, 2026-08-16, against the pinned build: twelve consecutive acts over 16.5s never
-	// produced one either, so the window was never the reason. A form POST is stopped TWICE — by the
-	// method rule here, and by `form-action 'none'` in the CSP `fence.Directives` injects — and the
-	// two race inside Chrome. When the CSP wins, the renderer abandons the submission before a
-	// request exists, so Fetch never pauses and the fence has nothing to report. That is the
-	// STRONGER of the two outcomes, and demanding a message would have been demanding the weaker one
-	// win. The reporting half of §6.2 is proved next door, on a channel only the fence stops.
+
+	// This assertion was REMOVED once, and the reason is worth keeping.
+	//
+	// It used to fail about one run in three, and the comment blamed the settle window. MEASURED,
+	// 2026-08-16, against the pinned build: twelve consecutive acts over 16.5s never produced a
+	// refusal either, so the window was never the reason. A form POST is stopped TWICE — by the
+	// method rule, and by `form-action 'none'` in the CSP the fence injects — and the two race
+	// inside Chrome. When the CSP won, the renderer abandoned the submission before a request
+	// existed, so Fetch never paused and the fence had nothing to say. The stronger outcome wore
+	// the weaker report, and the assertion was dropped rather than the silence fixed.
+	//
+	// It is back because the silence is fixed: the CSP layer now speaks too (chrome/csp.go), and
+	// both racers answer under the same name. Which one wins no longer changes what the agent hears,
+	// which is what made this flaky in the first place.
+	//
+	// It asks for "this act or the next", which is the contract §6.2 actually offers and not a
+	// weaker reading of it. A click and the thing it causes are not synchronous, so the settle window
+	// is a window; a refusal that lands after it is carried on the session's cursor and reported by
+	// the following act. MEASURED, 2026-08-19: one run in eleven missed the window under load, on a
+	// machine where the same test took 37s instead of 11. Demanding the first act would be demanding
+	// that the window always win, which is the promise the code deliberately does not make.
+	if result.Outcome != browser.OutcomeRefused {
+		result, err = driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionScroll})
+		if err != nil {
+			t.Fatalf("second act: %v", err)
+		}
+	}
+	if result.Outcome != browser.OutcomeRefused {
+		t.Fatalf("the submission was stopped and neither act told the agent so: %+v", result)
+	}
+	if result.Refusal.Consequence != browser.ConsequenceForm {
+		t.Errorf("a stopped form submission came back as %q", result.Refusal.Consequence)
+	}
 
 	// Control: the same form, same server, fence off.
 	conn := control(t)

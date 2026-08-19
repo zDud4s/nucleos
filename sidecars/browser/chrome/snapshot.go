@@ -58,6 +58,7 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		ControlsNext: read.controlsNext,
 		Gone:         gone,
 		Partial:      req.ChangesOnly,
+		Blocked:      d.blockedSoFar(entry),
 	}, nil
 }
 

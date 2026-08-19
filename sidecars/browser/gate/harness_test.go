@@ -184,6 +184,30 @@ func newSite(t *testing.T) *site {
 			r.URL.Query().Get("href"))
 	})
 
+	// A page that arrives empty and fills itself from an API, which is most of the web this pillar
+	// exists to reach. `connect-src 'none'` closes the fetch, so what renders is a shell — and a
+	// shell is a correct reading of an empty page, which is why nothing used to contradict it.
+	mux.HandleFunc("/spa", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>spa</title><body>
+			<h1>Dashboard</h1>
+			<div id=app></div>
+			<script>
+			window.addEventListener('load', () => {
+				fetch('/content').then(r => r.text())
+					.then(t => { document.getElementById('app').innerHTML = t; })
+					.catch(() => {});
+			});
+			</script>`)
+	})
+	mux.HandleFunc("/content", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<p>Revenue fell by eleven percent, which nobody had forecast.</p>
+			<button id=ok>Approve the write-down</button>`)
+	})
+
 	// A table, because the accessibility tree HAS the grid and the question is only what Chromium
 	// calls its parts. Three roles are assumed by the snapshot — row, cell, columnheader — and an
 	// assumption about role names is exactly the kind this repository has got wrong three times

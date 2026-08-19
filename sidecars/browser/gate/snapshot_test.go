@@ -136,3 +136,60 @@ func TestATableKeepsItsShape(t *testing.T) {
 		t.Error("the link inside a cell has no ref, so the table can be read and not used")
 	}
 }
+
+// TestAPageThatFetchesItsOwnContentIsReadAsAShellAndSaysSo.
+//
+// The measurement and the fix in one place, because the measurement is the argument for the fix.
+//
+// `connect-src 'none'` closes fetch, XHR, EventSource and beacons — and it is not there for tidiness:
+// CSP3 scheme matching makes `https:` match `wss:` too, so no source expression admits a fetch while
+// refusing a socket, and `wss:` is invisible to both other layers of the fence. The cost is this
+// page: a dashboard that arrives empty and fills itself from an API renders a shell, and a shell is
+// a CORRECT reading of an empty page. The agent used to conclude the dashboard was blank.
+func TestAPageThatFetchesItsOwnContentIsReadAsAShellAndSaysSo(t *testing.T) {
+	site := newSite(t)
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: site.origin() + "/spa"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Polled, because the fetch happens on load and the refusal that follows it is not synchronous
+	// with the snapshot that would see it.
+	var last browser.Snapshot
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		last, err = driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if last.Blocked != nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	// The measurement: the content never arrives, and the shell reads as a whole page.
+	if site.reached("GET /content", 2*time.Second) {
+		t.Fatal("the fetch left the machine; connect-src 'none' is not holding and this test is measuring nothing")
+	}
+	for _, element := range last.Elements {
+		if strings.Contains(element.Name, "Approve the write-down") {
+			t.Fatal("the content arrived after all")
+		}
+	}
+
+	// The fix: the reading says it is not the whole page.
+	if last.Blocked == nil {
+		t.Fatal("the agent reads this dashboard as empty and nothing tells it otherwise")
+	}
+	if last.Blocked.Consequence != browser.ConsequencePageRequest {
+		t.Errorf("named %q", last.Blocked.Consequence)
+	}
+	if !strings.Contains(last.Blocked.Detail, "/content") {
+		t.Errorf("the detail does not say what the page was reaching for: %q", last.Blocked.Detail)
+	}
+}
