@@ -1140,6 +1140,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // an allowlist only grants.
                     tool_policy,
                     progress_timeout: None,
+                    // No ceiling, and the only production `None`. A chat turn is
+                    // watched by the person who asked for it, who can stop it — and a turn cut off
+                    // mid-answer by a limit nobody set reads as the app breaking rather than as a
+                    // brake working. The wall clock around this call is the guard here.
+                    max_turns: None,
                     // Always set. `cli_args` reads this only when there is no `--resume`, which is
                     // exactly the first turn — the one that used to be launched with no session id
                     // at all.

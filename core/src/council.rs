@@ -1404,6 +1404,7 @@ impl Driver {
                 crate::runner::ToolPolicy::None
             },
             progress_timeout: None,
+            max_turns: Some(crate::runner::DEFAULT_MAX_TURNS),
             session_id: Some(session_id),
             fork_session: false,
             include_partial_messages: false,

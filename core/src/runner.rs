@@ -16,6 +16,58 @@ pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// from an ordinary CLI failure without treating already-started work as a retryable launch error.
 pub const PROGRESS_TIMEOUT_EXIT_CODE: i32 = i32::MIN;
 
+/// Internal outcome code for a process terminated for taking more turns than it was allowed.
+///
+/// Its own value beside the deadline above, and for the same reason that one exists: the two are
+/// different diagnoses. A run that went silent stopped producing; a run that hit this was producing
+/// the whole time and getting nowhere, which is the failure a wall clock is worst at catching —
+/// a fast model in a tight loop reaches neither the clock nor the job's money check.
+pub const TURN_CEILING_EXIT_CODE: i32 = i32::MIN + 1;
+
+/// How many model responses one run may take before the daemon stops it.
+///
+/// **Generous on purpose, and the number has a basis.** The ablation in `.ai/eval/ABLATION.md`
+/// measured 19 real cells of this repository's own work; the largest legitimate run took 94 turns
+/// (T3xH1). A ceiling below that would stop work that was going to finish, which is the way a brake
+/// like this gets switched off for good. Twice the largest thing ever measured is a limit only a
+/// run that is not converging can reach.
+///
+/// A ceiling, not a target: nothing is expected to approach it, and a run that does is a result
+/// worth reading rather than a quota to spend.
+pub const DEFAULT_MAX_TURNS: i64 = 200;
+
+/// PURE: how many model responses this stream has carried, folded one line at a time.
+///
+/// One function for both CLIs. Claude says `assistant` once per completed model message; `codex
+/// exec` says `turn.completed`. Neither name appears in the other's stream, so a single fold cannot
+/// double-count — and the alternative, a counter per CLI, is how a ceiling ends up enforced on one
+/// path and quietly absent on the other, which is worse than no ceiling because somebody will
+/// believe it is there.
+///
+/// Counted from the transcript rather than asked of the CLI: measured against CLI 2.1.198, there is
+/// no `--max-turns` flag to delegate this to. `--max-budget-usd` exists and is a different brake —
+/// money, which the job already has, rather than motion, which nothing had.
+pub(crate) fn turns_from_line(line: &str, current: i64) -> i64 {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return current;
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") | Some("turn.completed") => current.saturating_add(1),
+        _ => current,
+    }
+}
+
+/// PURE: whether a run has used up the turns it was given.
+///
+/// `None` is no ceiling and stays no ceiling — every caller that has not chosen one keeps exactly
+/// today's behaviour. A ceiling of zero or less is read as no ceiling too, and that is a decision
+/// rather than an oversight: a misconfiguration that silently stops every run before its first
+/// answer is worse than one that silently disables the brake, because the first looks like the
+/// daemon being broken and the second looks like the daemon it already was.
+pub(crate) fn over_turn_ceiling(turns: i64, ceiling: Option<i64>) -> bool {
+    matches!(ceiling, Some(ceiling) if ceiling > 0 && turns >= ceiling)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunUsage {
     pub input_tokens: Option<i64>,
@@ -80,6 +132,16 @@ pub struct RunRequest {
     pub mcp_config: Option<PathBuf>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
+    /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
+    ///
+    /// The brake the daemon did not have. A run had a wall clock and its job had a money ceiling
+    /// checked BETWEEN nodes — so a single node looping quickly reached neither: fast turns cost
+    /// little each and the clock is generous precisely because real work is slow. This counts the
+    /// thing that actually runs away.
+    ///
+    /// Enforced by counting the transcript, in both runner bodies, because the CLI has no flag for
+    /// it (2.1.198).
+    pub max_turns: Option<i64>,
     pub session_id: Option<String>,
     pub fork_session: bool,
     pub include_partial_messages: bool,
@@ -1343,6 +1405,8 @@ impl CommandRunner for ClaudeCliRunner {
         let mut policy_violation: Option<String> = None;
         let mut init_seen = false;
         let mut progress_timeout_elapsed: Option<Duration> = None;
+        let mut turns: i64 = 0;
+        let mut turns_exceeded: Option<i64> = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -1375,6 +1439,14 @@ impl CommandRunner for ClaudeCliRunner {
             running_context_fill = context_fill_from_line(&line, running_context_fill);
             if let Ok(mut shared) = context_fill.lock() {
                 *shared = running_context_fill;
+            }
+            // After the line is accumulated and mirrored, never before: a run stopped here still has
+            // to leave the transcript of the turn that stopped it, or the evidence for why it was
+            // stopped is the one thing missing from the record.
+            turns = turns_from_line(&line, turns);
+            if over_turn_ceiling(turns, request.max_turns) {
+                turns_exceeded = Some(turns);
+                break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if !cli_session_seen && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
@@ -1420,7 +1492,10 @@ impl CommandRunner for ClaudeCliRunner {
             policy_violation = policy_unverified_after_stream(request.tool_policy, init_seen);
         }
 
-        if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
+        if policy_violation.is_some()
+            || progress_timeout_elapsed.is_some()
+            || turns_exceeded.is_some()
+        {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -1460,20 +1535,36 @@ impl CommandRunner for ClaudeCliRunner {
                 "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
             ));
         }
+        if let Some(reached) = turns_exceeded {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            // Says what was reached AND what the limit was. "stopped at 200" alone leaves the reader
+            // unable to tell a ceiling that is too low from a run that was never going to finish.
+            stderr_str.push_str(&format!(
+                "nucleos: stopped after {reached} turns; this run's ceiling was {}\n",
+                request.max_turns.unwrap_or_default()
+            ));
+        }
         let exit_code = match (
             progress_timeout_elapsed,
+            turns_exceeded,
             &policy_violation,
             &post_launch_error,
         ) {
-            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
-            (None, Some(_), _) => -1,
+            (Some(_), _, _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            // After the deadline and before the rest: a run killed for looping may well also be a
+            // run whose stream then stopped, and the ceiling is the diagnosis that explains the
+            // other rather than the other way round.
+            (None, Some(_), _, _) => TURN_CEILING_EXIT_CODE,
+            (None, None, Some(_), _) => -1,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, None, Some(error)) => {
+            (None, None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         Ok(RunOutcome {
@@ -1719,6 +1810,8 @@ impl CommandRunner for CodexCliRunner {
         let mut stdout_acc = String::new();
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut progress_timeout_elapsed: Option<Duration> = None;
+        let mut turns: i64 = 0;
+        let mut turns_exceeded: Option<i64> = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -1747,9 +1840,17 @@ impl CommandRunner for CodexCliRunner {
                 shared.push_str(&line);
                 shared.push('\n');
             }
+            // The same brake as the Claude body above, counting `turn.completed` instead of
+            // `assistant` — `turns_from_line` knows both, so this path cannot drift out of step
+            // with the other by being edited on its own.
+            turns = turns_from_line(&line, turns);
+            if over_turn_ceiling(turns, request.max_turns) {
+                turns_exceeded = Some(turns);
+                break;
+            }
         }
 
-        if progress_timeout_elapsed.is_some() {
+        if progress_timeout_elapsed.is_some() || turns_exceeded.is_some() {
             // Kill the whole tree first, so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -1776,15 +1877,25 @@ impl CommandRunner for CodexCliRunner {
                 "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
             ));
         }
-        let exit_code = match (progress_timeout_elapsed, &post_launch_error) {
-            (Some(_), _) => PROGRESS_TIMEOUT_EXIT_CODE,
+        if let Some(reached) = turns_exceeded {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: stopped after {reached} turns; this run's ceiling was {}\n",
+                request.max_turns.unwrap_or_default()
+            ));
+        }
+        let exit_code = match (progress_timeout_elapsed, turns_exceeded, &post_launch_error) {
+            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            (None, Some(_), _) => TURN_CEILING_EXIT_CODE,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, Some(error)) => {
+            (None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         let usage = codex_extract_usage(&stdout_acc);
@@ -2259,6 +2370,7 @@ mod tests {
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
+            max_turns: None,
             session_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
             fork_session: false,
             include_partial_messages: false,
@@ -2281,6 +2393,7 @@ mod tests {
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
+            max_turns: None,
             session_id: None,
             fork_session: false,
             include_partial_messages: false,
@@ -2652,6 +2765,64 @@ mod tests {
         // Not `Some(0)`. A transcript that never mentioned cache creation has not reported writing
         // nothing — it has reported nothing, and a detector must be able to tell those apart.
         assert_eq!(usage.cache_creation_tokens, None);
+    }
+
+    /// One fold for both CLIs, because their per-turn events cannot appear in the same stream.
+    ///
+    /// Claude says `assistant` once per completed model message; `codex exec` says `turn.completed`.
+    /// Counting both in one function is what keeps the ceiling from being a Claude-only brake — a
+    /// limit that silently does not apply on one of the two paths is worse than no limit, because
+    /// somebody will believe it is there.
+    #[test]
+    fn a_turn_is_counted_once_per_model_response_on_either_cli() {
+        let claude = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let codex = r#"{"type":"turn.completed","usage":{"input_tokens":10}}"#;
+
+        assert_eq!(turns_from_line(claude, 0), 1);
+        assert_eq!(turns_from_line(codex, 4), 5);
+
+        // Everything else in either stream is not a turn. `stream_event` in particular arrives by
+        // the hundred for a single message — counting it would trip a ceiling of 200 inside one
+        // paragraph of the model's first answer.
+        for quiet in [
+            r#"{"type":"stream_event","event":{"delta":{"text":"tok"}}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","num_turns":9}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(turns_from_line(quiet, 7), 7, "counted a turn for: {quiet}");
+        }
+    }
+
+    /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
+    #[test]
+    fn the_ceiling_trips_at_the_number_it_names_and_never_without_one() {
+        assert!(!over_turn_ceiling(199, Some(200)));
+        assert!(over_turn_ceiling(200, Some(200)));
+        assert!(over_turn_ceiling(201, Some(200)));
+
+        // `None` is no ceiling, and it must stay no ceiling however long the run goes. Every caller
+        // that has not chosen a limit keeps exactly today's behaviour.
+        assert!(!over_turn_ceiling(1, None));
+        assert!(!over_turn_ceiling(1_000_000, None));
+
+        // A ceiling of zero or less would stop a run before its first answer. Refused as "no
+        // ceiling" rather than honoured, because a misconfiguration that silently disables every
+        // run is worse than one that disables the brake.
+        assert!(!over_turn_ceiling(1, Some(0)));
+        assert!(!over_turn_ceiling(5, Some(-3)));
+    }
+
+    /// A run the daemon stopped has not succeeded, and must not be readable as either of the other
+    /// two ways a run can end without doing its work.
+    #[test]
+    fn a_run_stopped_by_the_ceiling_cannot_be_read_as_a_success_or_as_a_timeout() {
+        assert_ne!(TURN_CEILING_EXIT_CODE, 0);
+        assert_ne!(TURN_CEILING_EXIT_CODE, -1);
+        assert_ne!(TURN_CEILING_EXIT_CODE, PROGRESS_TIMEOUT_EXIT_CODE);
     }
 
     #[test]

@@ -1109,6 +1109,11 @@ fn spawn_run(
                 mcp_config: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
+                // The brake that was missing. These are the runs nobody is watching, and the
+                // wall clock above is a poor guard against the failure that matters here: a run
+                // looping quickly costs little per turn and reaches neither the clock nor the job's
+                // money ceiling, which is only checked between nodes.
+                max_turns: Some(crate::runner::DEFAULT_MAX_TURNS),
                 session_id: Some(session_id.clone()),
                 fork_session,
                 include_partial_messages: false,
