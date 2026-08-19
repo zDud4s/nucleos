@@ -1,7 +1,15 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
+import type { AgentRequest } from "../data/agents";
 import type { Proposal } from "../data/system";
+import {
+  parseActionPayload,
+  teamActionState,
+  useApproveTeamAction,
+  useHireRecruit,
+  type TeamAction,
+} from "../data/teams";
 import {
   VCS_LIST_LIMIT,
   useActionApprovals,
@@ -11,9 +19,12 @@ import {
   useDecideContactMerge,
   useDismissProposal,
   useExclusionRequests,
+  useOpenTeamActions,
+  useRecruitProposals,
   useRefusedActions,
   useRejectProposal,
   useSkippedItems,
+  useTeamActionProposals,
   useVcsRequests,
   useWheelRequests,
   type ApprovalOutcome,
@@ -24,6 +35,7 @@ import {
   type WheelRequest,
 } from "../data/waiting";
 import {
+  Button,
   ConfirmButton,
   ErrorNote,
   PageHeader,
@@ -98,6 +110,9 @@ function reading<T>(query: {
 export function Waiting() {
   const wheel = reading(useWheelRequests());
   const approvals = reading(useActionApprovals());
+  const teamActions = reading(useTeamActionProposals());
+  const recruits = reading(useRecruitProposals());
+  const openActions = useOpenTeamActions();
   const merges = reading(useContactMerges());
   const exclusions = reading(useExclusionRequests());
   const skipped = reading(useSkippedItems());
@@ -105,7 +120,14 @@ export function Waiting() {
   const vcs = reading(useVcsRequests());
   const parked = reading(useAwaitingRuns());
 
-  const decisions = countOf(wheel.rows, approvals.rows, merges.rows, exclusions.rows);
+  const decisions = countOf(
+    wheel.rows,
+    approvals.rows,
+    teamActions.rows,
+    recruits.rows,
+    merges.rows,
+    exclusions.rows,
+  );
   const records = countOf(skipped.rows, refused.rows);
 
   return (
@@ -115,7 +137,8 @@ export function Waiting() {
       <div className="waiting-sections">
         <WheelRequestSection view={wheel} />
         <ActionApprovalSection view={approvals} />
-        <TeamSectionsAbsence />
+        <TeamActionSection view={teamActions} executing={openActions.data} />
+        <RecruitmentSection view={recruits} />
         <ContactMergeSection view={merges} />
         <CalendarEventAbsence />
         <ExclusionRequestSection view={exclusions} />
@@ -272,12 +295,15 @@ function DecisionRefusal({ error, trustProse }: { error: unknown; trustProse: bo
 /**
  * What an approval did, said afterwards.
  *
- * `closed` first, and deliberately: it is a **success** that changed nothing,
- * and the sentence the daemon sends with it is better than anything derivable
- * from the other fields. Reading it as a failure would send somebody hunting for
- * a rule that was right not to be written.
+ * `queued` first: a team action's approval is not a result at all, it is a
+ * promise the núcleo keeps on its next tick, and it must never be mistaken for
+ * one of the outcomes below. `closed` follows and is a **success** that
+ * changed nothing, and the sentence the daemon sends with it is better than
+ * anything derivable from the other fields. Reading it as a failure would send
+ * somebody hunting for a rule that was right not to be written.
  */
 function outcomeSentence(outcome: ApprovalOutcome): string {
+  if (typeof outcome.queued === "string" && outcome.queued !== "") return outcome.queued;
   if (typeof outcome.closed === "string" && outcome.closed !== "") return outcome.closed;
   if (typeof outcome.resume_run_id === "number") return `run ${outcome.resume_run_id} is going again`;
   if (typeof outcome.exclusion_id === "number") return `rule ${outcome.exclusion_id} is in force`;
@@ -539,28 +565,356 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
   );
 }
 
-/* --------------------------------------------- 3 & 4. teams and recruitment -- */
+/* --------------------------------------------------------- 3. team actions -- */
 
 /**
- * The design's sections three and four, absent and saying so.
+ * What a department has asked the núcleo to carry out under a `propose` grant.
  *
- * A team's own action approvals and its recruitment requests belong in this
- * queue and are not in it, because the núcleo mounts no team routes at all — the
- * tables exist, the doors do not. Rendering an empty section for them would
- * claim they are quiet; rendering nothing at all would lose the fact that the
- * design asks for them. So the absence is a sentence, and it names what it is
- * waiting on.
+ * Approving is not the action itself — the núcleo carries it out on its next
+ * tick, about ten seconds later — so the card shows two facts side by side
+ * rather than collapsing them: the human decision, and separately, whether the
+ * núcleo has gotten to it yet.
  */
-function TeamSectionsAbsence() {
+function TeamActionSection({
+  view,
+  executing,
+}: {
+  view: Reading<Proposal>;
+  executing: TeamAction[] | undefined;
+}) {
+  const rows = view.rows ?? [];
+  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+
   return (
-    <Panel title="Team decisions" variant="dim">
-      <p className="waiting-absence">
-        Two sections are missing here by design, not by oversight: a team&apos;s own action approvals
-        and its recruitment requests. The núcleo mounts no team routes, so there is nothing to read
-        and nothing to answer — these arrive with the Teams slice, which is what the sidebar&apos;s
-        Teams entry is held on too.
+    <Panel title="Team actions" aside={<Count n={view.rows?.length} />}>
+      <p className="waiting-note">
+        An action a department asked the núcleo to carry out under a propose grant. Approving does
+        not do the thing — it lets the núcleo do it on its next tick, about ten seconds later.
       </p>
+      <ReadingNotes view={view} what="the team's action requests" />
+      {view.rows !== undefined && items.length === 0 && (
+        <p className="waiting-empty">no department is waiting on an action.</p>
+      )}
+      {items.length > 0 && (
+        <ul className={listClass(items.length)} aria-label="Team actions">
+          {items.map((proposal) => (
+            <TeamActionCard
+              key={proposal.id}
+              proposal={proposal}
+              executing={executing}
+              onArmedChange={onArmedChange}
+            />
+          ))}
+        </ul>
+      )}
     </Panel>
+  );
+}
+
+/** One team action's payload, per `tool_name` — the three kinds a grant can ever name. */
+function payloadFields(kind: string | null, parsed: Record<string, unknown>): InputField[] {
+  const field = (value: unknown): string => (value === undefined ? "not given" : plainValue(value));
+  switch (kind) {
+    case "send_email":
+      return [
+        { name: "to", value: field(parsed.to) },
+        { name: "subject", value: field(parsed.subject) },
+        { name: "body", value: field(parsed.body) },
+      ];
+    case "file_document":
+      return [
+        { name: "path", value: field(parsed.path) },
+        { name: "title", value: field(parsed.title) },
+      ];
+    case "calendar_event":
+      return [
+        { name: "title", value: field(parsed.title) },
+        { name: "start", value: field(parsed.start) },
+        { name: "duration", value: field(parsed.duration) },
+      ];
+    default:
+      return Object.entries(parsed).map(([name, value]) => ({ name, value: plainValue(value) }));
+  }
+}
+
+/**
+ * A team action's payload, as fields a person can actually decide on.
+ *
+ * `tool_input` is the daemon's canonical re-serialisation, so parsing it a
+ * second time can fail on data that is not ours to fix — the raw string is the
+ * fallback, never a blank card.
+ */
+function TeamActionPayload({ kind, raw }: { kind: string | null; raw: string | null }) {
+  if (raw === null || raw.trim() === "") return null;
+  const parsed = parseActionPayload(raw);
+  if (parsed === null) {
+    return <p className="waiting-payload-raw">{raw}</p>;
+  }
+  const fields = payloadFields(kind, parsed);
+  if (fields.length === 0) return null;
+  return (
+    <dl className="waiting-input">
+      {fields.map((line) => (
+        <div className="waiting-input-line" key={line.name}>
+          <dt className="waiting-input-name">{line.name}</dt>
+          <dd className="waiting-input-value">{line.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function TeamActionCard({
+  proposal,
+  executing,
+  onArmedChange,
+}: {
+  proposal: Proposal;
+  executing: TeamAction[] | undefined;
+  onArmedChange: (armed: boolean) => void;
+}) {
+  const approve = useApproveTeamAction();
+  const reject = useRejectProposal();
+  // `GET /team-actions` lists only `pending` and `working`, so an action that
+  // moved on between polls simply is not in this list — absent is not a state.
+  const action = executing?.find((row) => row.proposal_id === proposal.id);
+
+  return (
+    <li className="waiting-card">
+      <div className="waiting-card-head">
+        <span className="waiting-card-id">team action #{proposal.id}</span>
+        <span className="waiting-card-title">
+          {proposal.tool_name ?? "an action that names no tool"}
+        </span>
+        <RelativeTime at={proposal.created_at} />
+      </div>
+      <dl className="waiting-facts">
+        <div className="waiting-fact">
+          <dt>project</dt>
+          <dd>{proposal.project_id ?? "no project"}</dd>
+        </div>
+        <div className="waiting-fact">
+          <dt>execution</dt>
+          <dd>
+            {action === undefined ? (
+              <span className="waiting-meta">the execution state is not known yet</span>
+            ) : (
+              <StateBadge domain="team_action" state={teamActionState(action)} />
+            )}
+          </dd>
+        </div>
+      </dl>
+      <p className="waiting-reasoning">
+        {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+      </p>
+      <TeamActionPayload kind={proposal.tool_name} raw={proposal.tool_input} />
+      <div className="waiting-actions">
+        <ConfirmButton
+          label={`Approve #${proposal.id}`}
+          confirmLabel="Let this action happen"
+          variant="approve"
+          disabled={approve.isPending}
+          onArmedChange={onArmedChange}
+          onConfirm={() => approve.mutate(proposal.id)}
+        />
+        <ConfirmButton
+          label={`Reject #${proposal.id}`}
+          confirmLabel="Refuse and close the action"
+          disabled={reject.isPending}
+          onArmedChange={onArmedChange}
+          onConfirm={() => reject.mutate(proposal.id)}
+        />
+      </div>
+      <DecisionNotes
+        outcome={approve.data}
+        approveError={approve.isError ? approve.error : null}
+        refuseError={reject.isError ? reject.error : null}
+      />
+    </li>
+  );
+}
+
+/* ---------------------------------------------------------- 4. recruitment -- */
+
+/**
+ * The specialists directors ask for, editable at the moment of decision.
+ *
+ * Unlike everything else in this queue, this is the one approval a person may
+ * correct before granting it — `agent::validate` runs over what was approved,
+ * not over what was proposed.
+ */
+function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
+  const rows = view.rows ?? [];
+  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+
+  return (
+    <Panel title="Recruitment" aside={<Count n={view.rows?.length} />}>
+      <p className="waiting-note">
+        A director asked for a specialist by name. The request is editable here before it is
+        granted; saying not now leaves nothing behind — the department may ask again.
+      </p>
+      <ReadingNotes view={view} what="the recruitment requests" />
+      {view.rows !== undefined && items.length === 0 && (
+        <p className="waiting-empty">no department has asked for a specialist.</p>
+      )}
+      {items.length > 0 && (
+        <ul className={listClass(items.length)} aria-label="Recruitment">
+          {items.map((proposal) => (
+            <RecruitmentCard key={proposal.id} proposal={proposal} onArmedChange={onArmedChange} />
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+/** Every editable field of a recruitment, seeded once from the proposed `AgentRequest`. */
+function seedRecruitForm(raw: string | null): AgentRequest | null {
+  if (raw === null) return null;
+  const parsed = parseActionPayload(raw);
+  if (parsed === null) return null;
+  const text = (value: unknown): string => (typeof value === "string" ? value : "");
+  return {
+    name: text(parsed.name),
+    speciality: text(parsed.speciality),
+    prompt: text(parsed.prompt),
+    engine: text(parsed.engine),
+    model: typeof parsed.model === "string" ? parsed.model : null,
+    tool_policy: text(parsed.tool_policy),
+  };
+}
+
+function RecruitmentCard({
+  proposal,
+  onArmedChange,
+}: {
+  proposal: Proposal;
+  onArmedChange: (armed: boolean) => void;
+}) {
+  const hire = useHireRecruit();
+  const reject = useRejectProposal();
+  // Seed once: a poll tick landing mid-edit must not overwrite what the person
+  // has already typed, so the effect only ever sets the form while it is null.
+  const [form, setForm] = useState<AgentRequest | null>(null);
+  useEffect(() => {
+    if (form !== null) return;
+    setForm(seedRecruitForm(proposal.tool_input));
+  }, [form, proposal.tool_input]);
+
+  function field<K extends keyof AgentRequest>(key: K, value: AgentRequest[K]) {
+    setForm((current) => (current === null ? current : { ...current, [key]: value }));
+  }
+
+  const idFor = (name: string) => `recruit-${proposal.id}-${name}`;
+
+  return (
+    <li className="waiting-card">
+      <div className="waiting-card-head">
+        <span className="waiting-card-id">recruit #{proposal.id}</span>
+        <RelativeTime at={proposal.created_at} />
+      </div>
+      <p className="waiting-reasoning">
+        {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+      </p>
+      {form === null ? (
+        <p className="waiting-payload-raw">{proposal.tool_input ?? "nothing was proposed"}</p>
+      ) : (
+        <div className="waiting-recruit-form">
+          <div className="waiting-recruit-field">
+            <label className="waiting-recruit-label" htmlFor={idFor("name")}>
+              name
+            </label>
+            <input
+              className="waiting-recruit-input"
+              id={idFor("name")}
+              value={form.name}
+              onChange={(event) => field("name", event.target.value)}
+            />
+          </div>
+          <div className="waiting-recruit-field">
+            <label className="waiting-recruit-label" htmlFor={idFor("speciality")}>
+              speciality
+            </label>
+            <input
+              className="waiting-recruit-input"
+              id={idFor("speciality")}
+              value={form.speciality}
+              onChange={(event) => field("speciality", event.target.value)}
+            />
+          </div>
+          <div className="waiting-recruit-field">
+            <label className="waiting-recruit-label" htmlFor={idFor("prompt")}>
+              prompt
+            </label>
+            <textarea
+              className="waiting-recruit-textarea"
+              id={idFor("prompt")}
+              value={form.prompt}
+              onChange={(event) => field("prompt", event.target.value)}
+            />
+          </div>
+          <p className="waiting-recruit-hint">
+            Engine and tool policy are the two fields a director gets wrong most often — they are
+            also what costs money per turn and what widens what this agent can reach.
+          </p>
+          <div className="waiting-recruit-field">
+            <label className="waiting-recruit-label" htmlFor={idFor("engine")}>
+              engine
+            </label>
+            <input
+              className="waiting-recruit-input"
+              id={idFor("engine")}
+              value={form.engine}
+              onChange={(event) => field("engine", event.target.value)}
+            />
+          </div>
+          <div className="waiting-recruit-field">
+            <label className="waiting-recruit-label" htmlFor={idFor("model")}>
+              model
+            </label>
+            <input
+              className="waiting-recruit-input"
+              id={idFor("model")}
+              value={form.model ?? ""}
+              onChange={(event) => field("model", event.target.value === "" ? null : event.target.value)}
+            />
+          </div>
+          <div className="waiting-recruit-field">
+            <label className="waiting-recruit-label" htmlFor={idFor("tool_policy")}>
+              tool policy
+            </label>
+            <input
+              className="waiting-recruit-input"
+              id={idFor("tool_policy")}
+              value={form.tool_policy}
+              onChange={(event) => field("tool_policy", event.target.value)}
+            />
+          </div>
+        </div>
+      )}
+      <div className="waiting-actions">
+        <ConfirmButton
+          label={`Hire #${proposal.id}`}
+          confirmLabel="Write the agent and add them to the roster"
+          variant="approve"
+          disabled={hire.isPending || form === null}
+          onArmedChange={onArmedChange}
+          onConfirm={() => {
+            if (form !== null) hire.mutate({ proposalId: proposal.id, hire: form });
+          }}
+        />
+        <Button disabled={reject.isPending} onClick={() => reject.mutate(proposal.id)}>
+          Not now
+        </Button>
+      </div>
+      {hire.isSuccess && hire.data !== undefined && (
+        <p className="waiting-outcome" role="status">
+          agent {hire.data.agent_id} is hired and on the roster
+        </p>
+      )}
+      {hire.isError && <DecisionRefusal error={hire.error} trustProse />}
+      {reject.isError && <DecisionRefusal error={reject.error} trustProse={false} />}
+    </li>
   );
 }
 

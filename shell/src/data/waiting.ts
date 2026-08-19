@@ -84,6 +84,13 @@ export interface ApprovalOutcome {
   exclusion_id?: number | null;
   merged?: boolean;
   event_id?: number;
+  /**
+   * `POST /proposals/{id}/approve` on a team action, and the only arm of that
+   * door where approving DOES NOTHING but say yes: the núcleo carries the
+   * action out on its next tick, about ten seconds later. The sentence is the
+   * daemon's — "the department's action will be carried out shortly".
+   */
+  queued?: string;
 }
 
 /* ------------------------------------------------------------------ reads -- */
@@ -128,6 +135,16 @@ export { useWheelRequests, isWheelRequest, type BrowserSession, type WheelReques
  * which door it imports these through.
  */
 export { useContactMerges, type MergeSide, type MergeSuggestion } from "./contacts";
+
+/**
+ * §3 & §4 — a department's own action approvals and its recruitment requests,
+ * plus the join table §3 reads its execution state from.
+ *
+ * Re-exported for the reason above: `data/teams.ts` is where the Teams pages
+ * read these same routes, and one query key is what keeps a decision made
+ * here from leaving a stale row there.
+ */
+export { useOpenTeamActions, useRecruitProposals, useTeamActionProposals } from "./teams";
 
 /** §8 — what the night put down without doing. A record to read, not a queue to work. */
 export function useSkippedItems() {

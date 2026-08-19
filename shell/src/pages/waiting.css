@@ -251,6 +251,26 @@
   overflow-wrap: anywhere;
 }
 
+/**
+ * A payload that could not be parsed a second time, shown rather than hidden.
+ *
+ * The daemon's own re-serialisation should always parse; this is the fallback
+ * for the case where it does not, so it is deliberately plain — no attempt to
+ * make unreadable data look structured.
+ */
+.waiting-payload-raw {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* The files an exclusion request named. Recorded by the núcleo, not acted on. */
 .waiting-paths {
   display: flex;
@@ -354,6 +374,56 @@
   margin: 0;
   font-size: var(--text-sm);
   color: var(--tone-active-fg);
+}
+
+/* ========================================================= recruitment form == */
+
+/**
+ * The one card in this queue that is a form, because the recruitment approval
+ * is editable at the moment of decision — the corrections travel with it.
+ */
+.waiting-recruit-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.waiting-recruit-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.waiting-recruit-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.waiting-recruit-input,
+.waiting-recruit-textarea {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+}
+
+.waiting-recruit-textarea {
+  min-height: 4rem;
+  resize: vertical;
+}
+
+/* The two fields a director gets wrong most often — said once, above them. */
+.waiting-recruit-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-faint);
 }
 
 /* ==================================================================== rows == */

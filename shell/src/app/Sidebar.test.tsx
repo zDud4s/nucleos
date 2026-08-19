@@ -82,22 +82,6 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "Mail" })).toBeDefined();
   });
 
-  it("keeps a disabled item present, dimmed, and still reachable", async () => {
-    const { router } = await renderWithRouter(<Sidebar />);
-
-    const teams = screen.getByRole("link", { name: "Teams" });
-    // Present and dimmed — `disabled` is not `down`, and neither is a reason to
-    // pretend the feature was never designed.
-    expect(teams.className).toContain("nav-item-disabled");
-    expect(teams.getAttribute("title")).toMatch(/team routes/i);
-
-    // Still a link: the page it leads to is where the explanation lives.
-    fireEvent.click(teams);
-    await waitFor(() => {
-      expect(router.state.location.pathname).toBe("/teams");
-    });
-  });
-
   it("pins the footer outside the scrolling list", async () => {
     const { container } = await renderWithRouter(<Sidebar>{<span>kill switch slot</span>}</Sidebar>);
 

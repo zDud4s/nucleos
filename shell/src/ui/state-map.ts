@@ -15,13 +15,12 @@ import type { BadgeTone } from "./Badge";
  * makes those distinctions testable without rendering anything, and what stops
  * the fourteenth page from quietly picking a different colour for `expired`.
  *
- * **This table covers only the domains whose states have been verified against
- * the núcleo.** It is deliberately incomplete: the remaining §7 rows (council,
- * team run, browser, e-mail, voice, web) arrive with the slices that build
- * those pages, each with its literals checked against the core rather than
- * guessed. An unmapped state is rendered as itself — see `StateBadge` — because
- * showing the literal admits ignorance, while assigning it a tone would be a
- * claim.
+ * **This table covers every domain whose states have been verified against
+ * the núcleo.** Every §7 row landed across the slices that built each page,
+ * each with its literals checked against the core rather than guessed — team
+ * run, the last of them, lands with this slice, and the table is complete. An
+ * unmapped state is rendered as itself — see `StateBadge` — because showing
+ * the literal admits ignorance, while assigning it a tone would be a claim.
  */
 export type StateDomain =
   | "run"
@@ -39,7 +38,10 @@ export type StateDomain =
   | "voice_cleanup"
   | "web_trust"
   | "web_extract"
-  | "browser_refusal";
+  | "browser_refusal"
+  | "team_run"
+  | "team_item"
+  | "team_action";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -313,6 +315,54 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     "no-one-present": { tone: "pending", label: "open the shell to continue" },
     "pillar-disabled": { tone: "off", label: "the browser pillar is not enabled" },
     "unparseable-url": { tone: "danger", label: "that url could not be read" },
+  },
+
+  /**
+   * A department's run — `core/src/team.rs:38` and `:45`, asserted exhaustive
+   * by `every_state_of_the_machine_is_live_or_terminal_and_never_both`.
+   *
+   * §7's row, and the daemon wrote the argument for it in the same place it
+   * wrote the states: `stopped` and `expired` are not failures. One is a money
+   * ceiling reached, the other the run's four-hour one, and "an owner shown
+   * `failed` goes looking for an error that does not exist". Neither takes the
+   * danger tone, and neither says the word.
+   */
+  team_run: {
+    planning: { tone: "pending", label: "planning" },
+    working: { tone: "active", label: "working" },
+    delivering: { tone: "active", label: "delivering" },
+    done: { tone: "active", label: "delivered" },
+    stopped: { tone: "paused", label: "stopped at a ceiling" },
+    expired: { tone: "paused", label: "ran out of time" },
+    failed: { tone: "danger", label: "failed" },
+    cancelled: { tone: "off", label: "cancelled" },
+  },
+
+  /** One item of one round — the four states `team.rs` writes for `team_items`. */
+  team_item: {
+    pending: { tone: "pending", label: "not started" },
+    running: { tone: "active", label: "running" },
+    done: { tone: "active", label: "done" },
+    failed: { tone: "danger", label: "failed" },
+  },
+
+  /**
+   * What became of something a department asked the core to do.
+   *
+   * `rejected` is not a state the daemon stores. A refused action is written
+   * `state = 'failed', error = 'rejected'`, and `teamActionState` in
+   * `data/teams.ts` is what turns that pair back into this key — the second
+   * half of §7's team row, that a human decision is not an execution result.
+   * `pending` is deliberately neutral: an action may be pending because
+   * somebody has not answered, or because the grant was `allow` and nobody has
+   * to. Which of the two it is comes from `proposal_id`, not from here.
+   */
+  team_action: {
+    pending: { tone: "pending", label: "not carried out yet" },
+    working: { tone: "active", label: "being carried out" },
+    done: { tone: "active", label: "carried out" },
+    failed: { tone: "danger", label: "failed" },
+    rejected: { tone: "off", label: "refused by you" },
   },
 };
 

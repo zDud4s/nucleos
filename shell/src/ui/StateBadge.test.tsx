@@ -309,6 +309,58 @@ describe("StateBadge — browser_refusal", () => {
   });
 });
 
+describe("StateBadge — team_run", () => {
+  it("keeps planning, working, delivering, done, stopped, expired, failed and cancelled apart", () => {
+    assertAllDistinct("team_run", [
+      "planning",
+      "working",
+      "delivering",
+      "done",
+      "stopped",
+      "expired",
+      "failed",
+      "cancelled",
+    ]);
+  });
+
+  it("never renders stopped or expired with the tone or the word of a failed run", () => {
+    // §7, and `core/src/team.rs:40` wrote the reason: a ceiling reached is not
+    // a breakage, and an owner shown "failed" goes looking for an error that
+    // does not exist.
+    const failed = badge("team_run", "failed");
+    for (const ending of ["stopped", "expired"]) {
+      const reading = badge("team_run", ending);
+      expect(reading?.className).not.toContain("ui-badge-danger");
+      expect(reading?.text).not.toMatch(/fail/i);
+      expect(reading?.text).not.toBe(failed?.text);
+      expect(reading?.className).not.toBe(failed?.className);
+    }
+  });
+});
+
+describe("StateBadge — team_item", () => {
+  it("keeps pending, running, done and failed apart", () => {
+    assertAllDistinct("team_item", ["pending", "running", "done", "failed"]);
+  });
+});
+
+describe("StateBadge — team_action", () => {
+  it("keeps pending, working, done, failed and refused apart", () => {
+    assertAllDistinct("team_action", ["pending", "working", "done", "failed", "rejected"]);
+  });
+
+  it("does not read an action the owner refused as one that failed", () => {
+    // The daemon stores a refusal as `state = 'failed', error = 'rejected'`, so
+    // the two arrive at this map as one string unless somebody separates them.
+    // A person who said no must not be told something broke.
+    const refused = badge("team_action", "rejected");
+    const failed = badge("team_action", "failed");
+    expect(refused?.className).not.toContain("ui-badge-danger");
+    expect(refused?.text).not.toMatch(/fail/i);
+    expect(refused?.text).not.toBe(failed?.text);
+  });
+});
+
 describe("StateBadge — states with no reading", () => {
   it("shows an unmapped state as itself rather than guessing a tone", () => {
     const unknown = badge("run", "hibernating");
