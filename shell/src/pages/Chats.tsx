@@ -290,6 +290,34 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
 }
 
 /**
+ * What continuing this session would carry, and whether that is more than the daemon will resume.
+ *
+ * The question a person is actually asking at this button is "what happens if I press it", and
+ * until now nothing answered it. A real pick-up of a session sitting around 180k of context resumed
+ * blindly and billed $1.72 for a one-word answer: a resume re-sends the whole window as fresh
+ * input, and a session last touched days ago has nothing cached to make that cheap.
+ *
+ * Two different futures, said plainly rather than as a number to interpret. Under the ceiling it is
+ * continued where it left off, and costs what its context costs. Over it, the daemon refuses to
+ * resume and starts fresh with a short replay — cheap, and forgetful, and better known in advance.
+ */
+function WhatItCarries({ view }: { view: ReturnType<typeof useIdeConversation> }) {
+  const carries = view.data?.context_estimate ?? null;
+  if (carries === null) return null;
+  const ceiling = view.data?.context_rotates_at ?? null;
+  const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
+  const over = ceiling !== null && carries > ceiling;
+  return (
+    <p className={over ? "chats-carries chats-carries-over" : "chats-carries"}>
+      {`about ${k(carries)} of context`}
+      {over
+        ? " — past what this daemon resumes, so picking it up starts a fresh conversation with a short replay"
+        : " — picked up where it left off, and its context is re-sent on the first turn"}
+    </p>
+  );
+}
+
+/**
  * The tail of a conversation, enough to recognise it by.
  *
  * NOT `PickedUp`, which draws the whole thing. This is a 20rem column beside the conversation list,
@@ -401,6 +429,7 @@ function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
 
       {chosen !== undefined && (
         <div className="chats-editor-chosen">
+          <WhatItCarries view={said} />
           <Sample view={said} />
           {!chosen.tools && <NoTools session={chosen} />}
           <Button

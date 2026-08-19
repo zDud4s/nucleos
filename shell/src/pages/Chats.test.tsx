@@ -79,13 +79,21 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
  * the object a test hands it, and a test that mutates it between two reads
  * (A5 below) sees the new value on the next fetch without rebuilding the mock.
  */
+/**
+ * A conversation as a test writes one: what it is about, with the daemon's readings defaulted.
+ *
+ * Defaulted rather than spelled out at every call: only the two tests that are ABOUT the context
+ * reading care what it says, and making the other seven state it would bury what each is testing.
+ */
+type ConversationFixture = Pick<Conversation, "said" | "cut"> & Partial<Conversation>;
+
 function chatsFetch(
   chats: ChatSummary[],
   transcripts: Record<string, AssistantTurnRow[]>,
   opts: {
     localAvailable?: boolean;
     onMessage?: () => unknown;
-    said?: Record<string, Conversation>;
+    said?: Record<string, ConversationFixture>;
     /** The sessions the picker offers. Mutated in place by the wiring route below. */
     ideSessions?: IdeSession[];
     /** What each turn in flight is writing right now, by turn id. */
@@ -120,7 +128,11 @@ function chatsFetch(
     }
     const ideSession = /^\/assistant\/ide-sessions\/([^/]+)$/.exec(path);
     if (ideSession !== null) {
-      const found = opts.said?.[decodeURIComponent(ideSession[1])];
+      const fixture = opts.said?.[decodeURIComponent(ideSession[1])];
+      const found =
+        fixture === undefined
+          ? undefined
+          : { context_estimate: null, context_rotates_at: 140000, ...fixture };
       // A transcript this machine does not have is a 404, exactly as the daemon answers.
       if (found === undefined) throw new ApiRefusal(404, "not_found", "Not Found");
       return found;
@@ -466,7 +478,7 @@ function ideSession(overrides: Partial<IdeSession> = {}): IdeSession {
  * person looking for the conversation they were having in the editor has no reason to press a
  * button labelled "New conversation" first, and everything behind it was invisible because of it.
  */
-async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, Conversation> = {}) {
+async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, ConversationFixture> = {}) {
   daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions, said }));
   const view = await renderChats("/chats");
   fireEvent.click(await screen.findByRole("button", { name: /from the editor/i }));
@@ -515,6 +527,41 @@ describe("the editor's sessions, and the door to them", () => {
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
     expect(await screen.findByText(/o mes vinha antes do dia/)).toBeTruthy();
+  });
+
+  it("says what continuing one would carry, and warns when it is past the ceiling", async () => {
+    // The $1.72 case. A session carrying more than the daemon resumes will NOT be resumed — it
+    // starts fresh with a short replay — and knowing that before pressing the button is the whole
+    // point of measuring it.
+    await openTheEditorDoor([ideSession()], {
+      "aaaa-1111": {
+        cut: false,
+        said: [{ by_owner: true, text: "olá", aside: false }],
+        context_estimate: 180000,
+        context_rotates_at: 140000,
+      },
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+
+    expect(await screen.findByText(/180\.0k/)).toBeTruthy();
+    expect(screen.getByText(/starts a fresh conversation/i)).toBeTruthy();
+  });
+
+  it("says a small session will be continued where it left off", async () => {
+    await openTheEditorDoor([ideSession()], {
+      "aaaa-1111": {
+        cut: false,
+        said: [{ by_owner: true, text: "olá", aside: false }],
+        context_estimate: 20000,
+        context_rotates_at: 140000,
+      },
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+
+    expect(await screen.findByText(/20\.0k/)).toBeTruthy();
+    expect(screen.queryByText(/starts a fresh conversation/i)).toBeNull();
   });
 
   it("says nothing was found rather than showing an empty list", async () => {

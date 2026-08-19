@@ -3671,14 +3671,34 @@ async fn wire_ide_session_tools(Path(session_id): Path<String>) -> Result<Status
 /// it must not be made about a file that was never found.
 async fn read_ide_session(
     Path(session_id): Path<String>,
-) -> Result<Json<crate::sessions::Conversation>, StatusCode> {
+) -> Result<Json<IdeConversationOut>, StatusCode> {
     let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
     let found =
         tokio::task::spawn_blocking(move || crate::sessions::conversation(&root, &session_id))
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    found.map(Json).ok_or(StatusCode::NOT_FOUND)
+    found
+        .map(|conversation| {
+            Json(IdeConversationOut {
+                conversation,
+                context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+            })
+        })
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// A conversation had in the editor, and the line past which this daemon will not resume one.
+///
+/// The ceiling rides with it for the reason it rides with a turn: it is a property of this daemon
+/// and not of the session, and the window keeping its own copy of a rule this side owns is a second
+/// source of truth that drifts silently the day the constant changes. Here it also answers the
+/// question the estimate is being asked for — whether picking this up resumes it or starts fresh.
+#[derive(serde::Serialize)]
+struct IdeConversationOut {
+    #[serde(flatten)]
+    conversation: crate::sessions::Conversation,
+    context_rotates_at: i64,
 }
 
 /// How many past sessions the list offers.

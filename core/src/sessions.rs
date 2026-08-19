@@ -135,6 +135,19 @@ pub struct Conversation {
     pub said: Vec<Said>,
     /// Whether older messages exist in the file and are not here.
     pub cut: bool,
+    /// Roughly how many tokens continuing this session would carry, or `None` for a file that
+    /// could not be read.
+    ///
+    /// The ceiling that refuses to resume past `CONTEXT_ROTATION_TOKENS` reads its number off the
+    /// daemon's OWN prior runs, and a session just picked up from the editor has none — so the
+    /// first turn resumed whatever it found, however large. One did: a real pick-up carrying about
+    /// 180k of live context resumed blindly and billed $1.72 for a one-word answer, uncached,
+    /// because a resume re-sends the whole window as fresh input.
+    ///
+    /// Rough on purpose, and named so. Four characters to the token is wrong in both directions and
+    /// wrong by tens of percent; what it has to be right about is the order of magnitude, because
+    /// what it decides is whether somebody is told this will be expensive.
+    pub context_estimate: Option<i64>,
 }
 
 /// One thing said in a conversation had in the IDE.
@@ -619,6 +632,7 @@ fn read_said(path: &Path) -> Conversation {
         return Conversation {
             said: Vec::new(),
             cut: false,
+            context_estimate: None,
         };
     };
     let mut reader = std::io::BufReader::new(file);
@@ -632,6 +646,10 @@ fn read_said(path: &Path) -> Conversation {
     let mut spoken_kept: usize = 0;
     // How many rows of the subagent excursion currently open have gone past.
     let mut aside: usize = 0;
+    // Characters of message content still inside the model's window. Reset at a compaction: what
+    // is above one is gone from its memory, and counting it would report a session as unresumable
+    // when it is nearly empty — which is the difference between offering to continue and refusing.
+    let mut context_chars: usize = 0;
     // The files changed since the last thing anybody said, in the order they were first touched.
     let mut changed: Vec<Change> = Vec::new();
     // And the commands run in the same stretch, in the order they were run.
@@ -653,6 +671,13 @@ fn read_said(path: &Path) -> Conversation {
         if row.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
             aside += 1;
             continue;
+        }
+        // Every row counts toward the window, said or not: a tool result the model read is
+        // context it is carrying, and the reason a coding session fills up is mostly them.
+        if is_compaction(&row) {
+            context_chars = 0;
+        } else {
+            context_chars += content_size(&row);
         }
         // Counted before the row is judged as speech: a tool result is not a line of the
         // conversation and never becomes one, but what it did is the only record of what the
@@ -718,6 +743,28 @@ fn read_said(path: &Path) -> Conversation {
     Conversation {
         said: kept.into(),
         cut,
+        // Four characters to the token, which is the usual rough rule and is stated as rough
+        // wherever this is read.
+        context_estimate: Some((context_chars / 4) as i64),
+    }
+}
+
+/// How much of the model's window one row occupies, in characters.
+///
+/// The whole content and not just its text: a tool result is thousands of characters of file the
+/// model is carrying, and it is where a coding session's context actually goes. Counting only what
+/// was SAID would report a session that read forty files as being nearly empty.
+fn content_size(row: &serde_json::Value) -> usize {
+    match row
+        .get("message")
+        .and_then(|message| message.get("content"))
+    {
+        Some(serde_json::Value::String(text)) => text.len(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .map(|block| block.to_string().len())
+            .sum::<usize>(),
+        _ => 0,
     }
 }
 
@@ -1071,6 +1118,59 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// What continuing a session would cost, measured before anybody commits to it.
+    ///
+    /// The ceiling that refuses to resume past 140k reads its number off the daemon's OWN prior
+    /// runs, and a session just picked up from the editor has none — so the first turn resumed
+    /// whatever it found, however large. One did: a real pick-up of a session carrying roughly
+    /// 180k of live context resumed blindly and billed $1.72 for a one-word answer.
+    ///
+    /// The number is on disk and free to compute: this already reads the whole file.
+    #[test]
+    fn a_conversation_says_how_much_context_continuing_it_would_carry() {
+        let store = Store::new();
+        let long = "x".repeat(4000);
+        store.session("one", "aaaa-1111", &[said(&long), replied(&long)]);
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        // Roughly four characters to the token, and 8000 characters were said.
+        let estimate = read.context_estimate.expect("no estimate at all");
+        assert!(
+            (1_500..=2_500).contains(&estimate),
+            "estimate was {estimate}"
+        );
+    }
+
+    /// Only what is still in the window. Everything above a compaction is gone from the model's
+    /// memory, and counting it would report a session as unresumable when it is nearly empty --
+    /// which is the difference between offering to continue a conversation and refusing to.
+    #[test]
+    fn only_the_context_since_the_last_compaction_is_counted() {
+        let store = Store::new();
+        let long = "x".repeat(40_000);
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said(&long),
+                serde_json::json!({
+                    "type": "user", "cwd": "", "isCompactSummary": true,
+                    "message": {"content": "resumo curto"}
+                }),
+                said("e agora isto"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        let estimate = read.context_estimate.expect("no estimate at all");
+        assert!(
+            estimate < 1_000,
+            "the compacted half was counted: {estimate}"
+        );
     }
 
     /// A command is one line, whatever it was.

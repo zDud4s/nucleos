@@ -110,6 +110,14 @@ export interface Said {
 export interface Conversation {
   said: Said[];
   cut: boolean;
+  /**
+   * Roughly how many tokens continuing this session would carry, or null when
+   * the file could not be read. Rough by tens of percent and named so — what it
+   * has to be right about is the order of magnitude.
+   */
+  context_estimate: number | null;
+  /** The count past which the daemon stops resuming and starts a fresh context. */
+  context_rotates_at: number;
 }
 
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */

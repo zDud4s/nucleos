@@ -691,3 +691,14 @@
   color: var(--text-faint);
   font-size: var(--text-xs);
 }
+
+.chats-carries {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-faint);
+}
+
+.chats-carries-over {
+  color: var(--tone-warn-fg);
+}
