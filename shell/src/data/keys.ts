@@ -161,6 +161,35 @@ export const keys = {
   },
 
   /**
+   * The departments, their runs, the actions they ask for and the rules that
+   * start them.
+   *
+   * Ordered general-to-specific so prefix invalidation means something:
+   * `run(id)` is a prefix of `runActions(id)`, so invalidating a run also
+   * re-reads what it asked for, which is right — an action landing is a change
+   * to the run.
+   *
+   * Two of these are not team routes at all. `proposedActions` and `recruits`
+   * read `/proposals/team-actions` and `/proposals/recruits`, because the
+   * decision surface for both is the ordinary proposals door — there is no
+   * `/team-actions/{id}/approve`. They live here rather than under `waiting`
+   * because the domain is teams and the queue is only where they are answered.
+   */
+  teams: {
+    all: ["teams"] as const,
+    list: ["teams", "list"] as const,
+    detail: (id: string) => ["teams", "detail", id] as const,
+    runs: ["teams", "runs"] as const,
+    run: (id: string) => ["teams", "run", id] as const,
+    runActions: (id: string) => ["teams", "run", id, "actions"] as const,
+    openActions: ["teams", "actions"] as const,
+    triggers: ["teams", "triggers"] as const,
+    triggerNext: (id: number) => ["teams", "triggers", id, "next"] as const,
+    proposedActions: ["teams", "proposals", "actions"] as const,
+    recruits: ["teams", "proposals", "recruits"] as const,
+  },
+
+  /**
    * The Pillars namespace — mail, contacts, calendar, voice, web, browser,
    * files — landing together for the reason the top of this file gives: seven
    * pillars arrive across seven slices, and a namespace built one page at a
