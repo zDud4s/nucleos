@@ -1,5 +1,5 @@
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
+use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Serialize;
 
 pub struct NucleosTools {
@@ -511,7 +511,11 @@ impl NucleosTools {
                        `text_from`. A page can also run out of CONTROLS, separately, and \
                        then hands you a `controls_next` for `controls_from`. A table comes \
                        back as `row` entries, cells separated by a vertical bar, headers \
-                       first, and a link inside a cell still has its own ref. \
+                       first, and a link inside a cell still has its own ref. If `blocked` \
+                       is there, the page tried to fetch its own content and the fence \
+                       refused: what you are reading may be a shell rather than the page, \
+                       so do not conclude the thing you were sent for is absent - say the \
+                       page needs a person, or try another route to the same information. \
                        Cheap enough to call between actions, and you \
                        should: a ref only names something a snapshot actually showed you."
     )]

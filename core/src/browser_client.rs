@@ -173,6 +173,23 @@ pub struct Snapshot {
     /// two thousand links used to come back whole and unannounced, because the prose had fit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub controls_next: i64,
+    /// What the page tried to do for itself and the fence stopped, since this document loaded.
+    ///
+    /// The fence's third layer, the injected CSP, is enforced inside the renderer: no request is
+    /// ever made, so the interception has nothing to pause and nothing to report. A page whose
+    /// content arrives by fetch renders a shell, and a shell is a correct reading of an empty page.
+    /// This is what stops the agent concluding the page is blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<Blocked>,
+}
+
+/// What the injected CSP stopped: how many, and the most recent one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Blocked {
+    pub count: i64,
+    pub consequence: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -643,6 +660,31 @@ mod tests {
                 .expect("a whole snapshot");
         assert!(!whole.truncated);
         assert_eq!(whole.text_next, 0);
+    }
+
+    /// A page the fence left able to render nothing says so on the reading.
+    ///
+    /// Absent on the ordinary page, so the field has to survive both ways: a struct that defaulted
+    /// it to a zero count would report every page as fine, which is the answer this whole path
+    /// exists to stop being given silently.
+    #[test]
+    fn a_page_the_fence_left_empty_says_so() {
+        let shell: Snapshot = serde_json::from_str(
+            r#"{"session_id":"s1","url":"https://example.org/","blocked":{"count":3,"consequence":"page-request","detail":"the page tried to reach https://example.org/content on its own"}}"#,
+        )
+        .expect("a blocked reading");
+        let blocked = shell.blocked.expect("carried");
+        assert_eq!(blocked.count, 3);
+        assert_eq!(blocked.consequence, "page-request");
+        assert!(blocked.detail.contains("/content"));
+
+        let ordinary: Snapshot =
+            serde_json::from_str(r#"{"session_id":"s1","url":"https://example.org/"}"#)
+                .expect("an ordinary reading");
+        assert!(
+            ordinary.blocked.is_none(),
+            "a page nothing was refused on must not look refused"
+        );
     }
 
     /// A sidecar that answers the six routes the way the Go one does, so the client can be driven
