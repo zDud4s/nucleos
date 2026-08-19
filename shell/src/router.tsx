@@ -19,6 +19,7 @@ import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Files } from "./pages/Files";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
+import { Learned } from "./pages/Learned";
 import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
@@ -62,6 +63,7 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/runs": Runs,
   "/feed": Feed,
   "/projects": Projects,
+  "/learned": Learned,
   "/chats": Chats,
   "/errands": Errands,
   "/teams": Teams,

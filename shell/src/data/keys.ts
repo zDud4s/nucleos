@@ -130,6 +130,22 @@ export const keys = {
   },
 
   /**
+   * What the agent has been told, and what it asked to be told — `GET
+   * /refinements`.
+   *
+   * Its own root and not a child of `proposals`, although a refinement waiting
+   * for an answer IS a proposal: `GET /proposals` filters `kind =
+   * 'action-approval'` (`core/src/proposals.rs`), so the two lists never
+   * overlap, and a page invalidating one would refetch a list that cannot have
+   * changed. `detail` carries the chain, which is the half the listing has no
+   * room for.
+   */
+  refinements: {
+    all: ["refinements"] as const,
+    detail: (id: number) => ["refinements", "detail", id] as const,
+  },
+
+  /**
    * The Work namespace — chats, council, errands, agents — landing together
    * ahead of the pages that read most of it, for the reason at the top of this
    * file: a namespace four pages edit in sequence is a namespace where the

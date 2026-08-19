@@ -25,6 +25,13 @@ describe("the nav table", () => {
       "Runs",
       "Feed",
       "Projects",
+      // **The one entry that is not a transcription of §3.1.** The refinement
+      // layer postdates the design document, and it needs a door: what the
+      // agent has been told is decided by a person and read by every later run,
+      // and until this page it was reachable only over HTTP. Recorded as an
+      // addition rather than folded in silently — the point of this file is
+      // that the sidebar does not drift without somebody saying so.
+      "Learned",
     ]);
   });
 

@@ -1,0 +1,342 @@
+import { useState, type ReactNode } from "react";
+import { isApiRefusal } from "../data/client";
+import {
+  useApproveRefinement,
+  useRefinementHistory,
+  useRefinements,
+  useRejectRefinement,
+  useRevertRefinement,
+  type Refinement,
+  type RefinementKind,
+  type RefinementStatus,
+} from "../data/refinements";
+import {
+  Badge,
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  PageHeader,
+  Panel,
+  RefusalNote,
+  RelativeTime,
+  Teach,
+  type BadgeTone,
+} from "../ui";
+import "./learned.css";
+
+/**
+ * Learned — what the agent has been told, and what it asked to be told.
+ *
+ * The page exists because the layer behind it was, until this slice, invisible.
+ * A refinement waiting for an answer is a `kind = 'refinement'` proposal, and
+ * `proposals::list_pending` filters `kind = 'action-approval'` — so the Waiting
+ * queue, which is the page for everything that stopped to ask you something,
+ * structurally could not show one. A decision queue nobody can see is a queue
+ * where nothing is ever decided, and what was waiting to be decided here is
+ * what every later run gets told.
+ *
+ * **Three lists and not one, in this order.** What is waiting on you comes
+ * first because it is the only part that is a task. What is in force comes
+ * second because it is the answer to "why did the agent do that". What is over
+ * comes last and is read rarely — but it is never deleted, because "what did it
+ * say before I changed it" is the question a person asks at the exact moment
+ * they are considering changing it again.
+ *
+ * The chain behind a row is fetched only when somebody opens it. Forty rows
+ * would otherwise be forty-one requests to answer a question nobody asked.
+ */
+export function Learned() {
+  const refinements = useRefinements();
+  const approve = useApproveRefinement();
+  const reject = useRejectRefinement();
+  const revert = useRevertRefinement();
+
+  const rows = refinements.data;
+  const waiting = rows?.filter((row) => row.status === "proposed") ?? [];
+  const inForce = rows?.filter((row) => row.status === "active") ?? [];
+  const over = rows?.filter((row) => OVER.has(row.status)) ?? [];
+
+  // The three mutations share one error slot on purpose: they are three answers
+  // to the same question, only one is ever in flight, and a refusal from any of
+  // them is about the row the person just touched.
+  const refusal = approve.error ?? reject.error ?? revert.error;
+
+  return (
+    <>
+      <PageHeader title="Learned" headline={headline(rows)} />
+
+      {refinements.isError && (
+        <ErrorNote>the núcleo did not answer — nothing is known about what it has learned</ErrorNote>
+      )}
+      {refusal !== null && <DecisionRefusal error={refusal} />}
+
+      {rows !== undefined && rows.length === 0 && (
+        <Panel>
+          <Teach title="Nothing has been learned yet">
+            This is where supplemental instructions, facts about a project, and reusable ways of
+            working are kept once you have approved them — and where you take one back. Nothing
+            reaches a prompt until you say so, so an empty layer means the agent is running on its
+            standing brief alone.
+          </Teach>
+        </Panel>
+      )}
+
+      {waiting.length > 0 && (
+        <Panel title="Waiting for you" aside={`${waiting.length}`}>
+          <p className="learned-lede">
+            Declared, and reaching nothing until you answer. Approving adds it to every later run in
+            its scope; refusing keeps the refusal on the record rather than erasing the question.
+          </p>
+          <ul className="learned-list">
+            {[...waiting]
+              .sort((left, right) => left.id - right.id)
+              .map((row) => (
+                <Row
+                  key={row.id}
+                  row={row}
+                  decisions={
+                    row.proposal_id === null ? (
+                      // A proposed row whose question is gone cannot be decided from here, and a
+                      // button that 404s is worse than none: it invites a click that teaches the
+                      // person the app is broken when the daemon is merely inconsistent.
+                      <span className="learned-orphan">no question to answer — decide in the daemon</span>
+                    ) : (
+                      <>
+                        <Button
+                          variant="approve"
+                          onClick={() => approve.mutate(row.proposal_id as number)}
+                          disabled={approve.isPending}
+                        >
+                          Approve
+                        </Button>
+                        <Button
+                          onClick={() => reject.mutate(row.proposal_id as number)}
+                          disabled={reject.isPending}
+                        >
+                          Refuse
+                        </Button>
+                      </>
+                    )
+                  }
+                />
+              ))}
+          </ul>
+        </Panel>
+      )}
+
+      {inForce.length > 0 && (
+        <Panel title="In force" aside={`${inForce.length}`}>
+          <p className="learned-lede">
+            Appended to the brief of every node in scope — never replacing it. A machine-wide note
+            reaches every project; a project's note reaches only that project.
+          </p>
+          <ul className="learned-list">
+            {[...inForce]
+              .sort(byKindThenId)
+              .map((row) => (
+                <Row
+                  key={row.id}
+                  row={row}
+                  decisions={
+                    <ConfirmButton
+                      label="Revert"
+                      confirmLabel="It no longer applies"
+                      onConfirm={() => revert.mutate(row.id)}
+                      disabled={revert.isPending}
+                    />
+                  }
+                />
+              ))}
+          </ul>
+        </Panel>
+      )}
+
+      {over.length > 0 && (
+        <Panel title="No longer in force" aside={`${over.length}`}>
+          <p className="learned-lede">
+            Kept, not deleted. What was refused, what was taken back, and what a later text replaced.
+          </p>
+          <ul className="learned-list">
+            {[...over]
+              .sort((left, right) => right.id - left.id)
+              .map((row) => (
+                <Row key={row.id} row={row} />
+              ))}
+          </ul>
+        </Panel>
+      )}
+    </>
+  );
+}
+
+/** The three statuses that mean "was decided, and is not applying now". */
+const OVER: ReadonlySet<RefinementStatus> = new Set<RefinementStatus>([
+  "rejected",
+  "reverted",
+  "superseded",
+]);
+
+/**
+ * One refinement, with whatever can be done to it.
+ *
+ * `decisions` is a slot rather than a status check inside the row: what a person
+ * may do to a refinement is a property of the list it is in — you approve what
+ * is waiting, revert what is in force, and do nothing at all to what is over.
+ */
+function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <li className="learned-row">
+      <div className="learned-head">
+        <Badge tone={KIND_TONE[row.kind]}>{KIND_LABEL[row.kind]}</Badge>
+        <span className="learned-scope">{row.project_id ?? "this machine"}</span>
+        <span className="learned-when">
+          <RelativeTime at={row.activated_at ?? row.created_at} />
+        </span>
+      </div>
+
+      <p className="learned-title">{row.title}</p>
+      <p className="learned-body">{row.body}</p>
+
+      <div className="learned-foot">
+        <Button variant="ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {row.supersedes === null ? "History" : "What it replaced"}
+        </Button>
+        {decisions}
+      </div>
+
+      {open && <Chain id={row.id} />}
+    </li>
+  );
+}
+
+/**
+ * What a row replaced, what replaced it, and every decision it has been through.
+ *
+ * A component of its own so the query lives and dies with the disclosure: an
+ * `enabled: false` query on a closed row would still occupy a cache entry per
+ * row, and the point of not fetching is that nothing is asked for.
+ */
+function Chain({ id }: { id: number }) {
+  const history = useRefinementHistory(id);
+
+  if (history.isError) {
+    return <ErrorNote>the núcleo did not answer — this one&apos;s history is not known</ErrorNote>;
+  }
+  if (history.data === undefined) return <p className="learned-chain-loading">reading…</p>;
+
+  const { events, replaced, replaced_by: replacedBy } = history.data;
+
+  return (
+    <div className="learned-chain">
+      {replacedBy !== null && (
+        <p className="learned-chain-line">
+          Replaced by <strong>{replacedBy.title}</strong>.
+        </p>
+      )}
+      {replaced.length > 0 && (
+        <>
+          <p className="learned-chain-line">What it replaced, most recent first:</p>
+          <ul className="learned-chain-list">
+            {replaced.map((older) => (
+              <li key={older.id}>
+                <span className="learned-title">{older.title}</span>
+                <span className="learned-body">{older.body}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {replaced.length === 0 && replacedBy === null && (
+        <p className="learned-chain-line">This one replaced nothing and nothing has replaced it.</p>
+      )}
+      {events.length > 0 && (
+        <ul className="learned-events">
+          {events.map((event) => (
+            <li key={event.id}>
+              <span className="learned-event-status">{event.to_status}</span>
+              <span className="learned-event-note">{event.note ?? ""}</span>
+              <RelativeTime at={event.at} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Kind first, then id — the order a node reads them, so the screen matches the prompt. */
+function byKindThenId(left: Refinement, right: Refinement): number {
+  const order = KIND_ORDER[left.kind] - KIND_ORDER[right.kind];
+  return order !== 0 ? order : left.id - right.id;
+}
+
+/** `refine::Kind`'s own order: an instruction changes what a node does, a fact what it believes. */
+const KIND_ORDER: Record<RefinementKind, number> = {
+  prompt: 0,
+  memory: 1,
+  skill: 2,
+  subagent: 3,
+};
+
+const KIND_LABEL: Record<RefinementKind, string> = {
+  prompt: "instruction",
+  memory: "fact",
+  skill: "how-to",
+  subagent: "delegation",
+};
+
+/**
+ * A tone per kind, and none of them `danger`.
+ *
+ * Nothing on this page is an alarm: every row here was either approved by a
+ * person or is waiting for one. The tones separate kinds at a glance, which is
+ * the only thing colour is doing here.
+ */
+const KIND_TONE: Record<RefinementKind, BadgeTone> = {
+  prompt: "active",
+  memory: "info",
+  skill: "shadow",
+  subagent: "off",
+};
+
+/**
+ * What the decision doors say when they say no.
+ *
+ * The 409 is the one worth writing copy for: it almost always means the row was
+ * answered while it sat on screen — by the other window, or by a later text
+ * superseding this one — and the list clears itself on the next read.
+ */
+const DECISION_SENTENCES: Record<string, string> = {
+  conflict:
+    "this one was already decided, or is no longer in force — the list clears it on the next read",
+  not_found: "that one is gone; there is nothing left to decide",
+  unprocessable: "the núcleo found nothing usable inside the proposal to act on",
+  internal: "the núcleo failed while carrying the decision out — nothing was changed",
+};
+
+function DecisionRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>;
+  }
+  return <RefusalNote refusal={error} sentences={DECISION_SENTENCES} />;
+}
+
+/**
+ * One derived sentence about the layer.
+ *
+ * What is *waiting* leads, because it is the only part of this page that is a
+ * task. A count of what is in force follows, because "the agent has been told
+ * eleven things" is the fact a person wants before they read any of them.
+ */
+function headline(rows: Refinement[] | undefined): string | undefined {
+  if (rows === undefined) return undefined;
+  const waiting = rows.filter((row) => row.status === "proposed").length;
+  const inForce = rows.filter((row) => row.status === "active").length;
+
+  if (rows.length === 0) return "the agent is running on its standing brief alone";
+  const held = inForce === 1 ? "one note is in force" : `${inForce} notes are in force`;
+  if (waiting === 0) return `${held}; nothing waiting on you`;
+  return `${held}; ${waiting} waiting on you`;
+}

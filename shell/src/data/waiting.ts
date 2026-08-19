@@ -259,10 +259,10 @@ export function useApproveProposal() {
  * Refuse it.
  *
  * `reject_proposal` guards on `kind = 'action-approval'` and answers 409 for
- * anything else (`core/src/proposals.rs`), except for the four kinds
+ * anything else (`core/src/proposals.rs`), except for the five kinds
  * `post_proposal_reject` dispatches by hand — browser-wheel, contact-merge,
- * calendar-event and fleet-exclusion. Every arm answers **204**, so `void` is
- * the honest type: there is no body to read.
+ * refinement, calendar-event and fleet-exclusion. Every arm answers **204**, so
+ * `void` is the honest type: there is no body to read.
  */
 export function useRejectProposal() {
   return useDecision((id: number) =>

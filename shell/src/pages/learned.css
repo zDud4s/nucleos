@@ -1,0 +1,168 @@
+/**
+ * The Learned slice: the three lists of the refinement layer, the row they are
+ * all made of, and the chain that unfolds under one. `learned-` throughout, as
+ * `waiting-` is for the decision queue and `runs-` for the run index.
+ *
+ * The rule this file lives under: **no class appears in the component that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing.
+ *
+ * The `ui-` rules the rows lean on — the badge, the buttons, the relative time
+ * — are the design system's and are not repeated here.
+ */
+
+/**
+ * The sentence under each panel heading.
+ *
+ * Every list on this page needs one, and they are not decoration: "waiting",
+ * "in force" and "no longer in force" are three states of the same row, and
+ * which one a person is looking at decides what the buttons beside it mean.
+ */
+.learned-lede {
+  margin: 0 0 var(--space-4);
+  max-width: 70ch;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.learned-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.learned-row {
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+/* Kind, scope and age on one line: the three facts that decide whether the text
+   below is worth reading now. */
+.learned-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.learned-scope {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+/* Pushed to the far end, so the eye finds the age in the same place in every row. */
+.learned-when {
+  margin-left: auto;
+}
+
+.learned-title {
+  margin: var(--space-2) 0 var(--space-1);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.learned-body {
+  margin: 0;
+  max-width: 80ch;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  /* The body is free text somebody wrote, and a long one is the normal case —
+     it is the whole of what a later run will be told. Wrapped, never clipped. */
+  white-space: pre-wrap;
+}
+
+.learned-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* A proposed row whose question is gone. Said in the row rather than left as a
+   button that would 404. */
+.learned-orphan {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ----------------------------------------------------------------- chain -- */
+
+/**
+ * What unfolds under a row: what it replaced, what replaced it, and every
+ * decision it went through.
+ *
+ * Sunken and indented rather than another card. It is the same row seen further
+ * back in time, not a second thing on the page.
+ */
+.learned-chain {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-sunken);
+}
+
+.learned-chain-loading {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.learned-chain-line {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.learned-chain-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.learned-chain-list li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* The decisions, oldest first — proposed, active, superseded — as one line each. */
+.learned-events {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.learned-events li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.learned-event-status {
+  min-width: 6rem;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.learned-event-note {
+  flex: 1;
+}
