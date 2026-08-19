@@ -26,6 +26,7 @@ mod feed;
 mod files;
 mod gate;
 mod git_exec;
+mod github;
 mod handoff;
 mod health;
 mod hooks;
