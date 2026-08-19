@@ -32,6 +32,7 @@ const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DAEMON_TOKEN_KEY: &str = "daemon-token";
 const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
+const GITHUB_TOKEN_KEY: &str = crate::github::TOKEN_KEY;
 /// How long an exec verdict is trusted before a refresh is kicked off behind the readout.
 const EXEC_CACHE_TTL: Duration = Duration::from_secs(60);
 /// A generous ceiling for the background exec. Nobody waits on it, so it can afford to be patient
@@ -137,9 +138,10 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     let email_enabled = state.email.enabled;
     let web_enabled = state.web.enabled;
     let browser_enabled = state.browser.enabled;
+    let github_asked_for = state.github.enabled && state.github.configured;
     let voice_armed = state.voice.armed;
     let stt_command = state.voice.stt_command.clone();
-    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice) = tokio::join!(
+    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, github) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
@@ -168,6 +170,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             sidecar_probe("browser_sidecar", crate::sidecar::BROWSER, browser_enabled),
         ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
+        run_subsystem("github", github_probe(github_asked_for)),
     );
     let subsystems = vec![
         pool,
@@ -180,6 +183,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         web,
         browser,
         voice,
+        github,
     ];
 
     HealthReadout {
@@ -278,6 +282,46 @@ async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
                 .map_err(classify_error)?
                 .ok_or(FailureCategory::Missing)?;
         exec_probe(resolved.to_string_lossy().into_owned(), "--help").await
+    })
+    .await
+}
+
+/// Whether the GitHub pillar could act if it were asked to.
+///
+/// **`asked_for` is `enabled` AND the file existing, and both halves are load-bearing.**
+/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `.ai/github.yaml` is capable
+/// of everything and autonomous in nothing — which means `enabled` alone can no longer distinguish
+/// "the owner wants this" from "the owner has never heard of it". Grading on `enabled` alone would
+/// put a red row on every installation that has never touched GitHub, and this module's own header
+/// says what that costs: it teaches readers to ignore the readout when it matters.
+///
+/// Once it HAS been asked for, the two failures are kept apart, because they send a person to two
+/// different places:
+///
+/// - no `gh` on PATH is `Missing` — a thing this computer cannot do;
+/// - no token is `PermissionDenied` — a thing it could do if somebody pasted a credential. Reported
+///   any other way it reads like a broken repository, and somebody loses an hour.
+///
+/// It probes the TOKEN and never `gh auth status`, and that is the whole point of asking this
+/// question here: the CLI's own login lives in the interactive session's keyring, so a green
+/// `gh auth status` would say healthy while the daemon — a scheduled task — could not act.
+async fn github_probe(asked_for: bool) -> SubsystemReadout {
+    run_probe("github", async move {
+        if !asked_for {
+            return Ok(HealthState::Disabled);
+        }
+        tokio::task::spawn_blocking(|| resolve_program(std::ffi::OsStr::new("gh")))
+            .await
+            .map_err(classify_error)?
+            .ok_or(FailureCategory::Missing)?;
+        let token = tokio::task::spawn_blocking(|| crate::secrets::load_secret(GITHUB_TOKEN_KEY))
+            .await
+            .map_err(classify_error)?
+            .map_err(classify_error)?;
+        match token {
+            Some(token) if !token.trim().is_empty() => Ok(HealthState::Ok),
+            _ => Err(FailureCategory::PermissionDenied),
+        }
     })
     .await
 }

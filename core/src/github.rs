@@ -22,6 +22,8 @@
 
 use crate::mcp_tools::ToolEffect;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A read of GitHub. Never acts, whatever the arguments say — which is what lets `github_read` be
 /// `ReadsOwn` by name and still be honest.
@@ -841,6 +843,17 @@ impl Default for Policy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubRuntime {
     pub enabled: bool,
+    /// Whether `.ai/github.yaml` EXISTS. Not whether it says anything useful.
+    ///
+    /// It is here because `enabled` defaults to true, so `enabled` alone can no longer answer "did
+    /// anybody ask for this pillar" — and `health.rs` needs that answer or every machine that has
+    /// never heard of GitHub reports a fault. **Writing the file is the opt-in; its contents are the
+    /// autonomy**, and those are two different decisions the owner makes at two different times.
+    ///
+    /// The inverse of the distinction `config.rs` draws about a working capability "as opposed to a
+    /// file that merely exists": there a file that exists proves nothing, and here it is the only
+    /// thing that proves anything.
+    pub configured: bool,
     pub policy: Policy,
 }
 
@@ -848,15 +861,20 @@ impl Default for GithubRuntime {
     fn default() -> Self {
         Self {
             enabled: true,
+            configured: false,
             policy: Policy::empty(),
         }
     }
 }
 
 impl GithubRuntime {
-    pub fn from_config(config: &crate::config::GithubConfig) -> Self {
+    /// `configured` is passed in rather than derived, because whether the file exists is a fact
+    /// about the disk and this module does no I/O to find out. `main.rs` knows the path it just
+    /// read and is the one place that should.
+    pub fn from_config(config: &crate::config::GithubConfig, configured: bool) -> Self {
         Self {
             enabled: config.enabled,
+            configured,
             policy: Policy::from_config(config),
         }
     }
@@ -911,6 +929,293 @@ fn digest_of(reads: &[String], actions: &[String]) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// How long one `gh` invocation may take before its whole process tree goes down.
+///
+/// Shorter than `git_exec::OPERATION_TIMEOUT`'s five minutes, and the difference is what the two
+/// wait for: a git operation can be pushing objects over a slow link, and every operation here is
+/// one HTTP request to GitHub with a CLI wrapped around it. Two minutes is generous for that and
+/// short enough that a wedged call does not hold a caller for the length of a coffee break.
+pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The Credential Manager key the token lives under (`secrets.rs`).
+///
+/// **`gh auth login` is not an alternative and the two are not equivalent.** That login writes the
+/// credential into a keyring belonging to the interactive session of whoever ran it, and this daemon
+/// runs as a scheduled task. Worse, a green `gh auth status` would then read "healthy" while the
+/// module could not act — so the health probe asks about the token the module will USE, never about
+/// the CLI's own opinion of itself.
+pub const TOKEN_KEY: &str = "github-token";
+
+/// What comes back with the answer, before any of it reaches a caller's context.
+///
+/// A workflow log is unbounded and a run's context is not, so `stdout` is capped and says when the
+/// cap bit. Truncation is at the START rather than the end: the tail of a failing log is where the
+/// error is, and clipping that to keep the setup lines would keep the half nobody needs.
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// The result of one `gh` invocation.
+///
+/// There is no `github_requests` table for this to be written to, and that is deliberate: `vcs.rs`
+/// has one because its queue is asynchronous and somebody has to be able to read the ticket later,
+/// while here the answer is synchronous and the caller already holds it. A `github-action` proposal
+/// records its own outcome on its own row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub kind: &'static str,
+    pub exit_code: Option<i32>,
+    /// Standard output, capped and already through `redact.rs`.
+    pub stdout: String,
+    /// stdout then stderr, for the caller that wants to see why a non-zero exit happened.
+    pub output_tail: String,
+}
+
+impl Outcome {
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+}
+
+/// Why an invocation did not happen, in the vocabulary `health.rs` already has.
+///
+/// The three that look alike are kept apart on purpose. `MissingCli` is a thing this computer cannot
+/// do; `MissingToken` is a thing it could do if somebody pasted a credential; `NotConfigured` is a
+/// pillar nobody asked for. Collapsing them costs an hour of looking in the wrong place, which is
+/// exactly what `health.rs`'s own doc says about `NotRunning` versus `Missing`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// `enabled: false`. Not a fault.
+    NotConfigured,
+    /// No `gh` on PATH.
+    MissingCli,
+    /// No `github-token` in the Credential Manager, or it could not be read.
+    MissingToken,
+    /// The command outlived `OPERATION_TIMEOUT` and its tree was killed.
+    TimedOut,
+    Unknown(String),
+}
+
+impl Failure {
+    pub fn category(&self) -> crate::health::FailureCategory {
+        match self {
+            Failure::NotConfigured => crate::health::FailureCategory::NotConfigured,
+            Failure::MissingCli => crate::health::FailureCategory::Missing,
+            Failure::MissingToken => crate::health::FailureCategory::PermissionDenied,
+            Failure::TimedOut => crate::health::FailureCategory::Timeout,
+            Failure::Unknown(_) => crate::health::FailureCategory::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::NotConfigured => write!(formatter, "the github pillar is switched off"),
+            Failure::MissingCli => write!(formatter, "gh is not on this machine's PATH"),
+            Failure::MissingToken => write!(
+                formatter,
+                "no github token is stored; run the daemon with --set-github-token"
+            ),
+            Failure::TimedOut => {
+                write!(formatter, "gh did not finish within {OPERATION_TIMEOUT:?}")
+            }
+            Failure::Unknown(reason) => write!(formatter, "{reason}"),
+        }
+    }
+}
+
+/// Reads the token out of the Credential Manager.
+///
+/// `spawn_blocking` because `keyring` is a blocking OS call and this runs on the async runtime.
+/// An error reading the store and an empty store are the same answer here — neither yields a token,
+/// and the distinction would only ever be repeated back as a message.
+pub async fn load_token() -> Option<String> {
+    tokio::task::spawn_blocking(|| crate::secrets::load_secret(TOKEN_KEY))
+        .await
+        .ok()?
+        .ok()?
+        .filter(|token| !token.trim().is_empty())
+}
+
+/// Runs one operation and returns what `gh` said.
+///
+/// **It decides HOW, never WHETHER.** `Policy` answers whether it runs without asking and `auth.rs`
+/// answers whether the actor could ask at all; nothing in here consults either. That separation is
+/// `vcs.rs`'s between when an operation runs and whether the actor was allowed to request it, and
+/// keeping it means a second caller cannot acquire permission by calling this instead.
+///
+/// Four things it does that are each somebody's past bug:
+///
+/// 1. **The argv is built and never interpreted.** `op.argv()` produces a list, `Command` takes a
+///    list, and no shell is anywhere on the path — so a `;` inside a PR body is one more character
+///    in an argument.
+/// 2. **The token goes in by ENVIRONMENT and never as an argument**, because a process's argv is
+///    readable by any process on the machine. `GITHUB_TOKEN` is removed rather than left alone: `gh`
+///    prefers `GH_TOKEN` so it would not win, and an inherited variable that cannot win is one
+///    somebody will later assume is being used.
+/// 3. **The whole process tree goes down on a deadline.** It is the obligation `vcs.rs` records,
+///    born of `run_git` saying "nothing here hands git a shell" and that ceasing to be true without
+///    anybody editing the comment. `gh` spawns a credential helper and an editor given the chance,
+///    so the direct child is not the whole of what was started.
+/// 4. **A non-zero exit is returned and never retried.** Retrying a `PrComment` that failed halfway
+///    posts it twice, and this module cannot tell halfway from not-at-all.
+pub async fn execute(runtime: &GithubRuntime, op: &Op) -> Result<Outcome, Failure> {
+    if !runtime.enabled {
+        return Err(Failure::NotConfigured);
+    }
+    let token = load_token().await.ok_or(Failure::MissingToken)?;
+    let argv = op.argv();
+
+    let mut command = tokio::process::Command::new("gh");
+    command
+        .args(&argv)
+        .env("GH_TOKEN", &token)
+        .env_remove("GITHUB_TOKEN")
+        // `gh` opens a prompt or a pager given half a chance, and there is nobody here to answer one.
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_PAGER", "cat")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        // Otherwise every answer arrives wrapped in escape sequences, and `Body::new` would refuse
+        // its own module's output if it ever came back round.
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    crate::process_tree::spawn_in_own_group(&mut command);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        // The one spawn error worth its own variant. Everything else is a real failure to start a
+        // program that exists; this is a machine that does not have `gh` on it, which is not a fault.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Failure::MissingCli);
+        }
+        Err(error) => return Err(Failure::Unknown(format!("could not run gh: {error}"))),
+    };
+
+    // Declared AFTER the child so it drops FIRST, while tokio's handle still pins the pid — the
+    // invariant `TreeKiller` documents, and the only thing keeping the pid it names ours.
+    let mut killer = child.id().map(crate::process_tree::TreeKiller::new);
+
+    let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stdout_task = tokio::spawn(drain(
+        child.stdout.take().expect("stdout was piped"),
+        Arc::clone(&stdout_bytes),
+    ));
+    let stderr_task = tokio::spawn(drain(
+        child.stderr.take().expect("stderr was piped"),
+        Arc::clone(&stderr_bytes),
+    ));
+
+    let status = match tokio::time::timeout(OPERATION_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            if let Some(killer) = killer.as_mut() {
+                killer.kill_now();
+            }
+            return Err(Failure::Unknown(format!("could not wait for gh: {error}")));
+        }
+        Err(_) => {
+            // The tree goes down HERE and not at drop, because `child` is still alive at this point
+            // and its handle is what stops the pid being reused under the killer.
+            if let Some(killer) = killer.as_mut() {
+                killer.kill_now();
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            tracing::warn!(kind = op.kind(), "gh timed out; its process tree was killed");
+            return Err(Failure::TimedOut);
+        }
+    };
+
+    let drained = async {
+        for task in [stdout_task, stderr_task] {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(DRAIN_GRACE, drained).await.is_ok() {
+        if let Some(killer) = killer.as_mut() {
+            killer.disarm();
+        }
+    } else {
+        // The exit code survives a stuck drain: `gh` ran and said how it ended, and only the tail is
+        // short. The killer stays ARMED, so dropping it takes whatever still holds the pipe down.
+        tracing::warn!(
+            kind = op.kind(),
+            "gh's output did not finish draining; reporting the result with a truncated tail"
+        );
+    }
+
+    let stdout = std::mem::take(&mut *stdout_bytes.lock().expect("the buffer is not poisoned"));
+    let stderr = std::mem::take(&mut *stderr_bytes.lock().expect("the buffer is not poisoned"));
+    let stdout = clip(&String::from_utf8_lossy(&stdout));
+    let stderr = clip(&String::from_utf8_lossy(&stderr));
+
+    let exit_code = status.code();
+    if exit_code != Some(0) {
+        // A line, and never a row: see `Outcome`. The kind and the code, and deliberately not the
+        // output — the caller has that, and a log file is a worse place for a stranger's prose than
+        // a turn's context is.
+        tracing::warn!(kind = op.kind(), ?exit_code, "a gh operation failed");
+    }
+
+    Ok(Outcome {
+        kind: op.kind(),
+        exit_code,
+        // Through `redact.rs`, which already knows the five `gh*_` prefixes and `github_pat_`. A
+        // token can come back out of `gh`'s own diagnostics, and the shortest path from there to a
+        // third party is a caller pasting the answer somewhere.
+        stdout: crate::redact::redact_secrets(&stdout),
+        output_tail: crate::redact::redact_secrets(&format!("{stdout}{stderr}")),
+    })
+}
+
+/// How long the pipes get to finish after the process has exited.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Reads one pipe to EOF into a buffer the caller keeps, so a drain that has to be abandoned still
+/// leaves behind what it managed to read.
+///
+/// A `std::sync::Mutex` and never held across an `await`: the lock is taken per chunk and released
+/// before the next read, which is what keeps a blocking lock correct inside an async task.
+async fn drain<R: tokio::io::AsyncRead + Unpin>(mut reader: R, into: Arc<Mutex<Vec<u8>>>) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => {
+                let mut buffer = into.lock().expect("the buffer is not poisoned");
+                if buffer.len() < MAX_OUTPUT_BYTES + chunk.len() {
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+            }
+        }
+    }
+}
+
+/// PURE: keeps the LAST `MAX_OUTPUT_BYTES` and says so when that clipped anything.
+///
+/// The tail rather than the head, because the tail of a failing workflow log is where the error is.
+/// Reading is done on characters and not bytes so the cut never lands mid-codepoint.
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_OUTPUT_BYTES {
+        return text.to_owned();
+    }
+    let kept: String = text
+        .chars()
+        .rev()
+        .take(MAX_OUTPUT_BYTES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("[... clipped to the last {MAX_OUTPUT_BYTES} characters ...]\n{kept}")
 }
 
 #[cfg(test)]
@@ -1254,6 +1559,61 @@ mod tests {
         assert_ne!(base.digest(), different.digest());
         assert_ne!(base.digest(), Policy::empty().digest());
         assert_eq!(base.digest().len(), 16);
+    }
+
+    /// Four failures, four different places to go looking. Collapsing any two of them costs
+    /// somebody an hour in the wrong one, which is the argument `health.rs` already makes about
+    /// `NotRunning` versus `Missing`.
+    #[test]
+    fn every_failure_has_a_category_of_its_own() {
+        use crate::health::FailureCategory;
+        assert_eq!(
+            Failure::NotConfigured.category(),
+            FailureCategory::NotConfigured
+        );
+        assert_eq!(Failure::MissingCli.category(), FailureCategory::Missing);
+        assert_eq!(
+            Failure::MissingToken.category(),
+            FailureCategory::PermissionDenied,
+            "a missing credential may not read like a broken repository"
+        );
+        assert_eq!(Failure::TimedOut.category(), FailureCategory::Timeout);
+        for failure in [
+            Failure::NotConfigured,
+            Failure::MissingCli,
+            Failure::MissingToken,
+            Failure::TimedOut,
+        ] {
+            assert!(!failure.to_string().is_empty());
+        }
+    }
+
+    /// A pillar the owner switched off is refused before anything is spawned and before the
+    /// Credential Manager is touched.
+    #[tokio::test]
+    async fn a_switched_off_pillar_executes_nothing() {
+        let runtime = GithubRuntime {
+            enabled: false,
+            configured: true,
+            policy: Policy::empty(),
+        };
+        let op = Op::Read(ReadOp::PrList { repo: repo() });
+        assert_eq!(execute(&runtime, &op).await, Err(Failure::NotConfigured));
+    }
+
+    /// The tail survives and the head is what goes, because the tail of a failing workflow log is
+    /// where the error is. And the cut lands on a character boundary, which a byte-wise slice of a
+    /// log full of accented commit messages would not.
+    #[test]
+    fn clipping_keeps_the_tail_and_never_splits_a_character() {
+        let short = "a short answer";
+        assert_eq!(clip(short), short);
+
+        let long = "\u{e1}".repeat(MAX_OUTPUT_BYTES);
+        let clipped = clip(&long);
+        assert!(clipped.starts_with("[... clipped"));
+        assert!(clipped.ends_with('\u{e1}'));
+        assert!(!clipped.contains('\u{fffd}'));
     }
 
     /// The ceilings hold to the operations. An `ACTION_CEILING` entry naming a kind no `ActOp` has
