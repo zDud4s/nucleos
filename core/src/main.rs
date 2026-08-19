@@ -450,6 +450,7 @@ async fn main() {
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
     let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
+    let github_config = config::load_github_config(std::path::Path::new(".ai/github.yaml"));
     // The web sidecar's own shared secret, minted per boot and never persisted.
     //
     // NOT the control token, and not for the reason the email sidecar has its own: this traffic
@@ -653,6 +654,7 @@ async fn main() {
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
+        github: Arc::new(github::GithubRuntime::from_config(&github_config)),
         browser: Arc::new(browser::BrowserRuntime {
             enabled: browser_config.enabled,
             client: browser_client::BrowserClient::new(

@@ -821,6 +821,47 @@ impl Policy {
     }
 }
 
+impl Default for Policy {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// The pillar as the daemon holds it: whether the owner switched it on, and what runs without
+/// asking. Resolved once at startup and read-only afterwards, like `WebRuntime` and
+/// `BrowserRuntime` beside it in `AppState`.
+///
+/// `enabled` is kept even though `Policy` already collapses to empty when it is false, and the
+/// reason is `health.rs`: a pillar the owner switched off is `NotConfigured` and a pillar with an
+/// empty list is working as intended. Those are different sentences to read at two in the morning,
+/// and only one of them is a problem.
+///
+/// `Default` is what an ABSENT `.ai/github.yaml` produces — on, and autonomous in nothing — so a
+/// test that does not care about GitHub gets the shipped state rather than an invented one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRuntime {
+    pub enabled: bool,
+    pub policy: Policy,
+}
+
+impl Default for GithubRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            policy: Policy::empty(),
+        }
+    }
+}
+
+impl GithubRuntime {
+    pub fn from_config(config: &crate::config::GithubConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            policy: Policy::from_config(config),
+        }
+    }
+}
+
 /// PURE: one list intersected with its ceiling, sorted and deduplicated, warning about each entry it
 /// had to drop.
 fn narrow(asked: &[String], ceiling: &[&str], what: &str) -> Vec<String> {

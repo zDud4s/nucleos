@@ -2192,6 +2192,11 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // attempts the action — the same inputs, so the same answer, with nothing to keep in step.
     // Absent or unparseable input yields no class, and a classless grant authorizes nothing.
     //
+    // The policy comes off the STATE for that same reason. It is one of `classify`'s three
+    // production callers and all three must be handed the same one: a resume classifying under
+    // an empty policy while the hook classified under the owner's would answer differently about
+    // the identical command line, which is exactly the drift the paragraph above rules out.
+    //
     // Derived even when the action was queued instead of authorized. The row is excluded from
     // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
     // no class would be a row that could not say what was taken over.
@@ -2200,8 +2205,13 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .as_deref()
         .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
         .map(|input| {
-            crate::classifier::classify(&tool_name, &input, Some(std::path::Path::new(&wt_path)))
-                .action_class
+            crate::classifier::classify(
+                &tool_name,
+                &input,
+                Some(std::path::Path::new(&wt_path)),
+                &state.github.policy,
+            )
+            .action_class
         });
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -3289,6 +3299,7 @@ mod tests {
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
