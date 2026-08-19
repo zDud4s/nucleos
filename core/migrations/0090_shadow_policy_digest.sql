@@ -16,8 +16,16 @@
 -- counting toward review and agreement exactly as they always did and form no group of their own.
 -- Grouping would have made them an orphan pocket that never reaches ten reviews and never promotes.
 --
--- 0089 and not 0088, deliberately. Master's last migration is 0087, so 0088 was free on paper — but
--- an uncommitted `0088_refinements.sql` exists in a sibling checkout, and this repository has
--- already lost reserved numbers four times. A gap costs nothing and a collision costs a daemon that
--- will not start.
+-- 0090, on the second attempt, and the second attempt is the lesson.
+--
+-- This was cut as 0089: master's last migration was 0087, and an uncommitted
+-- `0088_refinements.sql` sat in a sibling checkout, so 0089 was the first number nobody could
+-- be seen to hold. By the time the branch caught up, master had landed BOTH 0088 and an 0089 of
+-- its own -- whose commit message reads "move tools_used to 0089, 0088 is taken on master": the
+-- same accident, one number along, to somebody who had also checked.
+--
+-- So the rule is not "look harder before cutting". A number claimed on a branch is claimed
+-- nowhere anybody else can see, and checking at cut time cannot see a branch that has not
+-- merged yet. **Re-read the ceiling at MERGE time**, which is the only moment the other claims
+-- are visible. That is what caught this one.
 ALTER TABLE shadow_decisions ADD COLUMN policy_digest TEXT;
