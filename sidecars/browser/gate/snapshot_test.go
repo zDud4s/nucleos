@@ -87,3 +87,52 @@ func inFrame(snapshot browser.Snapshot) bool {
 	}
 	return false
 }
+
+// TestATableKeepsItsShape.
+//
+// The roles this rests on — row, cell, columnheader — are an assumption about what Chromium calls
+// things, and this repository has had three of those turn out wrong against a hand-built tree. The
+// grid was being dropped at the door: an agent could read every figure in a table and could not say
+// which column any of them was in, which for a table is the whole of the information.
+func TestATableKeepsItsShape(t *testing.T) {
+	site := newSite(t)
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: site.origin() + "/table"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	var rows []string
+	linked := ""
+	for _, element := range snapshot.Elements {
+		if element.Role == "row" {
+			rows = append(rows, element.Name)
+		}
+		if element.Role == "link" && element.Name == "Q2" {
+			linked = element.Ref
+		}
+	}
+
+	if len(rows) != 3 {
+		t.Fatalf("expected three rows, got %d: %+v\nthe whole snapshot was: %+v", len(rows), rows, snapshot.Elements)
+	}
+	if rows[0] != "Quarter | Revenue" {
+		t.Errorf("the headers lost their shape: %q", rows[0])
+	}
+	if rows[1] != "Q1 | -11%" {
+		t.Errorf("a row lost its shape: %q", rows[1])
+	}
+	if rows[2] != "Q2 | +4%" {
+		t.Errorf("a row with a link in it lost its shape: %q", rows[2])
+	}
+	if linked == "" {
+		t.Error("the link inside a cell has no ref, so the table can be read and not used")
+	}
+}

@@ -135,6 +135,11 @@ type SnapshotRequest struct {
 	// something is there and has no verb that reaches it, because the budget is not about the
 	// viewport and no amount of scrolling moves it. Pass back the TextNext of the previous snapshot.
 	TextFrom int
+	// ControlsFrom resumes the actionable elements, counted rather than measured. The same idea as
+	// TextFrom and a separate cursor on purpose: prose and controls fail differently, and bounding
+	// them together would mean a long article costing a page its buttons — which is the rule this
+	// whole design started from.
+	ControlsFrom int
 }
 
 // Snapshot is the accessibility view of a page: what is there, what it is called, and what it says.
@@ -150,6 +155,14 @@ type Snapshot struct {
 	// TextNext is where the prose stopped, and is what to pass as TextFrom to read on. Set only when
 	// Truncated is, so its presence is the offer and its absence means there is nothing left.
 	TextNext int `json:"text_next,omitempty"`
+	// ControlsNext is the same offer for the actionable elements.
+	//
+	// It exists because "controls are never dropped" stopped being a kindness at some size. The rule
+	// was written against prose crowding out a button, and it is right for that; on a directory
+	// listing with two thousand links it meant a snapshot with no bound at all, reported as
+	// untruncated because the prose had fit. The failure did not surface as an error — it surfaced
+	// as a turn with no room left to think in.
+	ControlsNext int `json:"controls_next,omitempty"`
 	// Gone lists refs that were in the previous snapshot and are not on the page now. Only filled on
 	// a changes-only read, where it is the half that omission cannot express: a full snapshot says
 	// an element is gone by not containing it, and a partial one cannot say anything by silence.
@@ -184,6 +197,15 @@ const (
 	// check again. Back can only reach a document this session already loaded, and the fence already
 	// admitted every one of those.
 	ActionBack ActionKind = "back"
+	// ActionGoto follows a url in the session that is already open. Its absence was visible only
+	// once back existed: there was a way home and no way onward, so an agent that read an address in
+	// the page's own words — not a link, an address — had to open a SECOND session for it, paying a
+	// fresh profile decision and losing the history it would need to come back.
+	//
+	// It grants nothing a link does not. The url is a navigation like any other, so the fence's
+	// allowlist answers for it exactly as it answers for a link the page itself offers, and the
+	// scheme is checked here as well because file: and data: are not requests the interception sees.
+	ActionGoto ActionKind = "goto"
 )
 
 // Action is one attempt to touch the page.
@@ -194,9 +216,9 @@ type Action struct {
 	// the key and takes none to send it wherever focus already is; back never takes one.
 	Ref string `json:"ref"`
 	// Text is the verb's argument: the characters for type, the option's label for select, the key's
-	// name for press, and the direction for a page scroll. One field rather than four, because a
-	// verb has at most one and naming them apart would only spread the same value over a wider
-	// shape.
+	// name for press, the direction for a page scroll, and the url for goto. One field rather than
+	// five, because a verb has at most one and naming them apart would only spread the same value
+	// over a wider shape.
 	Text string `json:"text,omitempty"`
 }
 

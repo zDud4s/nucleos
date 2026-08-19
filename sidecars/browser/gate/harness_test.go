@@ -184,6 +184,21 @@ func newSite(t *testing.T) *site {
 			r.URL.Query().Get("href"))
 	})
 
+	// A table, because the accessibility tree HAS the grid and the question is only what Chromium
+	// calls its parts. Three roles are assumed by the snapshot — row, cell, columnheader — and an
+	// assumption about role names is exactly the kind this repository has got wrong three times
+	// against a hand-built tree and only ever settled here.
+	mux.HandleFunc("/table", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>table</title><table>
+			<caption>Quarterly</caption>
+			<tr><th>Quarter</th><th>Revenue</th></tr>
+			<tr><td>Q1</td><td>-11%</td></tr>
+			<tr><td><a href="/reading">Q2</a></td><td>+4%</td></tr>
+			</table>`)
+	})
+
 	// The page the verb group works on.
 	//
 	// It says out loud what reached it, which is the only way to tell "the key arrived" from "the
