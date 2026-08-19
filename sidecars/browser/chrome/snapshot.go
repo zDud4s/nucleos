@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -25,7 +26,7 @@ import (
 // A ref can only name something a snapshot actually showed. A CSS selector can be synthesised by the
 // agent for an element it never saw — including one a page's text talked it into. Refs make "act on
 // something that was not in the snapshot" unrepresentable rather than merely discouraged.
-func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID) (browser.Snapshot, error) {
+func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly bool) (browser.Snapshot, error) {
 	entry, err := d.lookup(id)
 	if err != nil {
 		return browser.Snapshot{}, err
@@ -46,11 +47,8 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID) (browser.Sn
 		return browser.Snapshot{}, err
 	}
 
-	elements, refs, truncated := collect(payload.Nodes)
-
-	d.mu.Lock()
-	entry.refs = refs
-	d.mu.Unlock()
+	collected, truncated := collect(payload.Nodes)
+	elements, gone := d.name(entry, collected, changesOnly)
 
 	url, title := d.locate(ctx, entry.cdp)
 	if url != "" {
@@ -66,7 +64,86 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID) (browser.Sn
 		Title:     entry.title,
 		Elements:  elements,
 		Truncated: truncated,
+		Gone:      gone,
+		Partial:   changesOnly,
 	}, nil
+}
+
+// name gives each control the ref it had last time, or a new one, and remembers what it reported.
+//
+// This is where "e5" becomes a promise. Everything else about a snapshot is a fresh reading of the
+// page; this is the one part that is allowed to remember, because the agent remembers too — it holds
+// refs from the previous snapshot and acts on them. Minting by position instead, which is what this
+// did until 2026-08-19, meant a click that inserted one row silently renamed everything below it.
+func (d *Driver) name(entry *session, collected []found, changesOnly bool) ([]browser.Element, []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	previous := entry.lastReported
+	elements := make([]browser.Element, 0, len(collected))
+	refs := make(map[string]int64, len(collected))
+	reported := make(map[string]browser.Element, len(collected))
+
+	for _, one := range collected {
+		element := one.element
+		if !one.control {
+			// Prose has no ref, so nothing can be said about whether THIS paragraph is the one from
+			// last time. On a changes-only read it is dropped rather than guessed at: an agent asked
+			// for what moved and repeating the article would be the opposite of the answer.
+			if !changesOnly {
+				elements = append(elements, element)
+			}
+			continue
+		}
+
+		ref, known := entry.refByNode[one.backend]
+		if !known {
+			entry.mintedRefs++
+			ref = fmt.Sprintf("e%d", entry.mintedRefs)
+			entry.refByNode[one.backend] = ref
+		}
+		element.Ref = ref
+		refs[ref] = one.backend
+		reported[ref] = element
+
+		if changesOnly {
+			if before, seen := previous[ref]; seen && sameElement(before, element) {
+				continue
+			}
+		}
+		elements = append(elements, element)
+	}
+
+	// What left the page. This is the half omission cannot express: a full snapshot says an element
+	// is gone by not containing it, and a partial one says nothing at all by not containing it.
+	var gone []string
+	if changesOnly {
+		for ref := range previous {
+			if _, still := reported[ref]; !still {
+				gone = append(gone, ref)
+			}
+		}
+		sort.Strings(gone)
+	}
+
+	entry.refs = refs
+	entry.lastReported = reported
+	return elements, gone
+}
+
+// sameElement is equality as the AGENT would see it: everything that is reported, and nothing that
+// is not. Two elements that differ only in something a snapshot never carries are the same element
+// as far as "what changed" can mean.
+func sameElement(a, b browser.Element) bool {
+	if a.Role != b.Role || a.Name != b.Name || a.Value != b.Value || len(a.State) != len(b.State) {
+		return false
+	}
+	for i := range a.State {
+		if a.State[i] != b.State[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // textBudget bounds how much prose one snapshot carries, in characters.
@@ -85,7 +162,16 @@ const textBudget = 20000
 // whose markup runs heading, paragraph, label, checkbox came back as heading, checkbox, checkbox,
 // button, button, paragraph, label. Prose is only worth carrying if the agent can tell which control
 // it belongs to, and a paragraph filed after the button it describes has lost exactly that.
-func collect(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
+// found is one line of a snapshot together with the node it came from. Refs are NOT minted here:
+// they belong to the session, because a ref has to mean the same element on the next snapshot too,
+// and this function sees one page at one instant.
+type found struct {
+	element browser.Element
+	backend int64
+	control bool
+}
+
+func collect(nodes []axNode) ([]found, bool) {
 	byID := make(map[string]axNode, len(nodes))
 	hasParent := make(map[string]bool, len(nodes))
 	for _, node := range nodes {
@@ -110,8 +196,7 @@ func collect(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 		}
 	}
 
-	elements := make([]browser.Element, 0, len(nodes))
-	refs := make(map[string]int64, len(nodes))
+	elements := make([]found, 0, len(nodes))
 	spent, truncated := 0, false
 	seen := make(map[string]bool, len(nodes))
 
@@ -132,14 +217,15 @@ func collect(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 		if !node.Ignored {
 			switch {
 			case isControl:
-				ref := fmt.Sprintf("e%d", len(refs)+1)
-				refs[ref] = node.BackendDOMNodeID
-				elements = append(elements, browser.Element{
-					Ref:   ref,
-					Role:  node.Role.Value,
-					Name:  strings.TrimSpace(node.Name.Value),
-					Value: strings.TrimSpace(node.Value.Value),
-					State: stateOf(node),
+				elements = append(elements, found{
+					element: browser.Element{
+						Role:  node.Role.Value,
+						Name:  strings.TrimSpace(node.Name.Value),
+						Value: strings.TrimSpace(node.Value.Value),
+						State: stateOf(node),
+					},
+					backend: node.BackendDOMNodeID,
+					control: true,
 				})
 			case node.Role.Value == "StaticText" && !insideControl:
 				name := strings.TrimSpace(node.Name.Value)
@@ -151,7 +237,9 @@ func collect(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 						truncated = true
 					} else {
 						spent += len(name)
-						elements = append(elements, browser.Element{Role: "text", Name: name})
+						elements = append(elements, found{
+							element: browser.Element{Role: "text", Name: name},
+						})
 					}
 				}
 			}
@@ -175,7 +263,7 @@ func collect(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 	for _, node := range nodes {
 		walk(node.NodeID, false)
 	}
-	return elements, refs, truncated
+	return elements, truncated
 }
 
 // stateOf reports the accessibility properties that change what an act would mean.

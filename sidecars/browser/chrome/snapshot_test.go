@@ -7,6 +7,17 @@ import (
 	"nucleosbrowser/browser"
 )
 
+// snapshotFrom runs the two halves the driver runs: read the tree, then name what it found. The
+// split exists because refs belong to a session and the tree does not, so a test that wants to see
+// refs has to have a session too.
+func snapshotFrom(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
+	driver := &Driver{}
+	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	collected, truncated := collect(nodes)
+	elements, _ := driver.name(entry, collected, false)
+	return elements, entry.refs, truncated
+}
+
 func text(id, parent, value string) axNode {
 	return axNode{NodeID: id, Role: axValue{Value: "StaticText"}, Name: axValue{Value: value}}
 }
@@ -24,7 +35,7 @@ func TestAButtonsOwnTextIsNotRepeatedBesideIt(t *testing.T) {
 		text("3", "", "You need an account to continue."),
 	}
 
-	elements, refs, truncated := collect(nodes)
+	elements, refs, truncated := snapshotFrom(nodes)
 
 	if truncated {
 		t.Error("nothing was near the budget")
@@ -60,7 +71,7 @@ func TestBothHalvesOfACheckboxAreSpelledOut(t *testing.T) {
 			Properties: []axProperty{{Name: "disabled", Value: axValue{Value: "true"}}}},
 	}
 
-	elements, _, _ := collect(nodes)
+	elements, _, _ := snapshotFrom(nodes)
 
 	if len(elements) != 3 {
 		t.Fatalf("got %d: %+v", len(elements), elements)
@@ -84,7 +95,7 @@ func TestATextboxReportsWhatIsInIt(t *testing.T) {
 			Value: axValue{Value: "  someone@example.org "}},
 	}
 
-	elements, _, _ := collect(nodes)
+	elements, _, _ := snapshotFrom(nodes)
 
 	if len(elements) != 1 || elements[0].Value != "someone@example.org" {
 		t.Fatalf("the box's contents did not come back trimmed: %+v", elements)
@@ -105,7 +116,7 @@ func TestTheTextBudgetDropsProseAndNeverControls(t *testing.T) {
 		NodeID: "end", Role: axValue{Value: "button"}, Name: axValue{Value: "Buried"},
 	})
 
-	elements, _, truncated := collect(nodes)
+	elements, _, truncated := snapshotFrom(nodes)
 
 	if !truncated {
 		t.Fatal("40000 characters of prose against a 20000 budget must report truncation")
@@ -137,7 +148,7 @@ func TestProseInsideAControlIsSkippedHoweverDeep(t *testing.T) {
 		text("3", "2", "Read more"),
 	}
 
-	elements, _, _ := collect(nodes)
+	elements, _, _ := snapshotFrom(nodes)
 
 	if len(elements) != 1 || elements[0].Role != "link" {
 		t.Fatalf("the nested text was emitted beside its own link: %+v", elements)
@@ -145,3 +156,104 @@ func TestProseInsideAControlIsSkippedHoweverDeep(t *testing.T) {
 }
 
 var _ = browser.Element{}
+
+// TestARefMeansTheSameElementOnTheNextSnapshot.
+//
+// The promise the agent already assumed and did not have. Refs were minted by position — first
+// interesting node is e1 — so a click that inserted one row above renamed everything below it, and
+// an agent holding "e2" from the previous snapshot was holding a name for something else. It acted
+// on the wrong thing and nothing anywhere reported an error, because both snapshots were correct
+// readings of their own instant.
+//
+// Keying on the backend node id, which Chromium keeps stable for the life of the node, makes a ref a
+// handle on an ELEMENT rather than on a position.
+func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
+	driver := &Driver{}
+	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	take := func(nodes []axNode) map[string]string {
+		collected, _ := collect(nodes)
+		elements, _ := driver.name(entry, collected, false)
+		byName := map[string]string{}
+		for _, element := range elements {
+			if element.Ref != "" {
+				byName[element.Name] = element.Ref
+			}
+		}
+		return byName
+	}
+
+	before := take([]axNode{
+		{NodeID: "a", Role: axValue{Value: "button"}, Name: axValue{Value: "Save"}, BackendDOMNodeID: 10},
+		{NodeID: "b", Role: axValue{Value: "button"}, Name: axValue{Value: "Cancel"}, BackendDOMNodeID: 20},
+	})
+
+	// A row appears ABOVE both. By position everything below would shift by one.
+	after := take([]axNode{
+		{NodeID: "new", Role: axValue{Value: "button"}, Name: axValue{Value: "Undo"}, BackendDOMNodeID: 5},
+		{NodeID: "a", Role: axValue{Value: "button"}, Name: axValue{Value: "Save"}, BackendDOMNodeID: 10},
+		{NodeID: "b", Role: axValue{Value: "button"}, Name: axValue{Value: "Cancel"}, BackendDOMNodeID: 20},
+	})
+
+	if after["Save"] != before["Save"] || after["Cancel"] != before["Cancel"] {
+		t.Fatalf("refs moved under the agent: %v then %v", before, after)
+	}
+	if after["Undo"] == before["Save"] || after["Undo"] == before["Cancel"] {
+		t.Fatalf("a new element took a ref that already meant something: %v", after)
+	}
+	if entry.refs[after["Save"]] != 10 {
+		t.Errorf("the ref no longer resolves to its node: %v", entry.refs)
+	}
+}
+
+// TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft.
+//
+// The saving this exists for is real: an agent's loop is act, snapshot, act, and paying for the
+// whole page after every click is most of what a browsing turn costs. What makes it safe rather than
+// merely cheap is `gone`. A full snapshot says an element has disappeared by not containing it; a
+// partial one says nothing at all by not containing it, so disappearance has to be stated or the
+// agent goes on believing in a button that is no longer there.
+func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
+	driver := &Driver{}
+	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	take := func(nodes []axNode, changesOnly bool) ([]browser.Element, []string) {
+		collected, _ := collect(nodes)
+		return driver.name(entry, collected, changesOnly)
+	}
+
+	page := []axNode{
+		{NodeID: "t", Role: axValue{Value: "StaticText"}, Name: axValue{Value: "A paragraph nobody edited."}},
+		{NodeID: "a", Role: axValue{Value: "button"}, Name: axValue{Value: "Save"}, BackendDOMNodeID: 10},
+		{NodeID: "b", Role: axValue{Value: "checkbox"}, Name: axValue{Value: "Agree"}, BackendDOMNodeID: 20,
+			Properties: []axProperty{{Name: "checked", Value: axValue{Value: "false"}}}},
+		{NodeID: "c", Role: axValue{Value: "button"}, Name: axValue{Value: "Cancel"}, BackendDOMNodeID: 30},
+	}
+	if full, _ := take(page, false); len(full) != 4 {
+		t.Fatalf("the first read is the whole page: %+v", full)
+	}
+
+	// The box gets ticked and Cancel disappears. Nothing else moves.
+	changed := []axNode{
+		{NodeID: "t", Role: axValue{Value: "StaticText"}, Name: axValue{Value: "A paragraph nobody edited."}},
+		{NodeID: "a", Role: axValue{Value: "button"}, Name: axValue{Value: "Save"}, BackendDOMNodeID: 10},
+		{NodeID: "b", Role: axValue{Value: "checkbox"}, Name: axValue{Value: "Agree"}, BackendDOMNodeID: 20,
+			Properties: []axProperty{{Name: "checked", Value: axValue{Value: "true"}}}},
+	}
+	elements, gone := take(changed, true)
+
+	if len(elements) != 1 || elements[0].Name != "Agree" {
+		t.Fatalf("only the checkbox moved; got %+v", elements)
+	}
+	if len(elements[0].State) != 1 || elements[0].State[0] != "checked" {
+		t.Errorf("the change itself is missing: %+v", elements[0])
+	}
+	if len(gone) != 1 {
+		t.Fatalf("Cancel left the page and was not reported: %v", gone)
+	}
+
+	// A changes-only read that follows a changes-only read compares against what was ACTUALLY sent,
+	// not against the last full page — otherwise the same change would be reported for ever.
+	again, goneAgain := take(changed, true)
+	if len(again) != 0 || len(goneAgain) != 0 {
+		t.Errorf("nothing moved and something was reported: %+v %v", again, goneAgain)
+	}
+}

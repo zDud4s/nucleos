@@ -118,6 +118,16 @@ struct BrowserSessionParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct BrowserSnapshotParams {
+    /// The session id browser_open gave back.
+    session_id: i64,
+    /// Ask for what changed since your last snapshot of this session instead of the whole page.
+    /// Refs stay the same across snapshots, so what you already know stays true.
+    #[serde(default)]
+    changes_only: Option<bool>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct BrowserActParams {
     /// The session id browser_open gave back.
     session_id: i64,
@@ -429,15 +439,25 @@ impl NucleosTools {
                        expanded/collapsed, selected, required). Read those before acting rather \
                        than assuming: a disabled button stays disabled however many times you press \
                        it, and typing into a box you never read back is an open loop. `truncated` \
-                       means the page continues past the last entry. Cheap enough to call between \
-                       actions, and you should: a ref only names something a snapshot actually \
-                       showed you, and the page moves underneath you."
+                       means the page continues past the last entry. A ref keeps meaning the same \
+                       element across snapshots of a session, so what you learned stays true — and \
+                       `changes_only` gives you only what moved since your last one, plus `gone` \
+                       listing refs that left the page. Use it after an action; take a whole one \
+                       when you have lost track. Cheap enough to call between actions, and you \
+                       should: a ref only names something a snapshot actually showed you."
     )]
     async fn browser_snapshot(
         &self,
-        Parameters(BrowserSessionParams { session_id }): Parameters<BrowserSessionParams>,
+        Parameters(BrowserSnapshotParams {
+            session_id,
+            changes_only,
+        }): Parameters<BrowserSnapshotParams>,
     ) -> String {
-        json_result(self.client.browser_snapshot(session_id).await)
+        json_result(
+            self.client
+                .browser_snapshot(session_id, changes_only.unwrap_or(false))
+                .await,
+        )
     }
 
     #[tool(

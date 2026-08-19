@@ -281,10 +281,16 @@ impl BrowserClient {
         .await
     }
 
-    pub async fn snapshot(&self, session_id: &str) -> Result<Snapshot, BrowserError> {
+    /// Read the page. `changes_only` asks for what moved since the previous snapshot of this
+    /// session rather than the whole page — the same reading, filtered.
+    pub async fn snapshot(
+        &self,
+        session_id: &str,
+        changes_only: bool,
+    ) -> Result<Snapshot, BrowserError> {
         self.call(
             "/snapshot",
-            &serde_json::json!({ "session_id": session_id }),
+            &serde_json::json!({ "session_id": session_id, "changes_only": changes_only }),
         )
         .await
     }
@@ -658,7 +664,7 @@ mod tests {
         assert_eq!(session.final_url, "https://jira.example.org/browse");
         assert!(session.refusal.is_none());
 
-        let snapshot = client.snapshot("s1").await.expect("snapshot");
+        let snapshot = client.snapshot("s1", false).await.expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
         let result = client.act("s1", "click", "e5", "").await.expect("act");

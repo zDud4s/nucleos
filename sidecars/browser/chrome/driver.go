@@ -69,6 +69,20 @@ type session struct {
 	// refs maps a snapshot ref ("e5") to the node it named. The agent may only act on something a
 	// snapshot actually showed it — see Act.
 	refs map[string]int64
+	// refByNode is what makes a ref MEAN the same thing twice, and it is the reason the two fields
+	// are not one. Refs used to be minted by position — first interesting node is e1 — so a snapshot
+	// taken after a click renumbered the page, and an agent holding "e5" from the previous one was
+	// holding a name for something else. Keying on the backend node id, which Chromium keeps stable
+	// for the life of the node, makes a ref a handle on an ELEMENT rather than on a position, which
+	// is what the agent already assumed it was.
+	refByNode map[int64]string
+	// mintedRefs counts how many have ever been handed out for this session, so a ref is never
+	// reused for a different node after the first one leaves the page.
+	mintedRefs int
+	// lastReported is the previous snapshot by ref, kept so the next one can say what changed. Only
+	// what was actually sent: comparing against something the agent never saw would report changes
+	// it cannot reconcile.
+	lastReported map[string]browser.Element
 }
 
 // Connect attaches the fence and returns a Driver.
@@ -222,12 +236,14 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	d.counter++
 	id := browser.SessionID(fmt.Sprintf("s%d", d.counter))
 	entry := &session{
-		id:        id,
-		target:    target.TargetID,
-		cdp:       cdpSession,
-		mode:      browser.ModeAgent,
-		requested: req.URL,
-		refs:      map[string]int64{},
+		id:           id,
+		target:       target.TargetID,
+		cdp:          cdpSession,
+		mode:         browser.ModeAgent,
+		requested:    req.URL,
+		refs:         map[string]int64{},
+		refByNode:    map[int64]string{},
+		lastReported: map[string]browser.Element{},
 		// Anything refused before this session existed belongs to the sweep or to another session.
 		reportedUpTo: d.refusalTotal,
 	}

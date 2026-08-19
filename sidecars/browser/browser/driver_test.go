@@ -70,7 +70,7 @@ func TestUnavailableRefusesEverything(t *testing.T) {
 	if _, err := driver.Open(ctx, OpenRequest{URL: "https://example.org/"}); err == nil {
 		t.Error("Open answered nil")
 	}
-	if _, err := driver.Snapshot(ctx, "s1"); err == nil {
+	if _, err := driver.Snapshot(ctx, "s1", false); err == nil {
 		t.Error("Snapshot answered nil")
 	}
 	if _, err := driver.Act(ctx, "s1", Action{Kind: ActionClick, Ref: "e1"}); err == nil {
@@ -164,7 +164,7 @@ func TestSessionReportsBothUrls(t *testing.T) {
 func TestUnknownSessionIsNamed(t *testing.T) {
 	driver := &Fake{FenceAttached: true}
 	ctx := context.Background()
-	if _, err := driver.Snapshot(ctx, "nope"); !errors.Is(err, ErrNoSuchSession) {
+	if _, err := driver.Snapshot(ctx, "nope", false); !errors.Is(err, ErrNoSuchSession) {
 		t.Errorf("snapshot: got %v", err)
 	}
 	if err := driver.Close(ctx, "nope"); !errors.Is(err, ErrNoSuchSession) {
@@ -182,7 +182,7 @@ func TestCloseReleasesTheSession(t *testing.T) {
 	if err := driver.Close(ctx, session.ID); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if _, err := driver.Snapshot(ctx, session.ID); !errors.Is(err, ErrNoSuchSession) {
+	if _, err := driver.Snapshot(ctx, session.ID, false); !errors.Is(err, ErrNoSuchSession) {
 		t.Fatalf("a closed session must be gone, got %v", err)
 	}
 }

@@ -771,6 +771,10 @@ pub struct OpenBody {
 #[derive(Debug, Deserialize)]
 pub struct SessionBody {
     pub session_id: i64,
+    /// Only meaningful to `/browser/snapshot`; harmless on the others, which is why they share a
+    /// body rather than growing a second one that differs by a single optional field.
+    #[serde(default)]
+    pub changes_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -825,7 +829,12 @@ pub async fn post_snapshot(
     let Some(row) = live_session(&state, body.session_id).await else {
         return gone();
     };
-    match state.browser.client.snapshot(&row.sidecar_id).await {
+    match state
+        .browser
+        .client
+        .snapshot(&row.sidecar_id, body.changes_only)
+        .await
+    {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(error) => browser_error(error),
     }

@@ -291,7 +291,7 @@ func TestUnknownSessionsAreNamed(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	ctx := context.Background()
-	if _, err := driver.Snapshot(ctx, "nope"); !errors.Is(err, browser.ErrNoSuchSession) {
+	if _, err := driver.Snapshot(ctx, "nope", false); !errors.Is(err, browser.ErrNoSuchSession) {
 		t.Errorf("snapshot: %v", err)
 	}
 	if _, err := driver.Screenshot(ctx, "nope"); !errors.Is(err, browser.ErrNoSuchSession) {

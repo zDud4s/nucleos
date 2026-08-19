@@ -87,8 +87,8 @@ func (d *deferredDriver) Open(ctx context.Context, req browser.OpenRequest) (bro
 	return d.get().Open(ctx, req)
 }
 
-func (d *deferredDriver) Snapshot(ctx context.Context, id browser.SessionID) (browser.Snapshot, error) {
-	return d.get().Snapshot(ctx, id)
+func (d *deferredDriver) Snapshot(ctx context.Context, id browser.SessionID, changesOnly bool) (browser.Snapshot, error) {
+	return d.get().Snapshot(ctx, id, changesOnly)
 }
 
 func (d *deferredDriver) Act(ctx context.Context, id browser.SessionID, action browser.Action) (browser.ActResult, error) {
