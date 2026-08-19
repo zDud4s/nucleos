@@ -350,6 +350,7 @@ pub async fn pretooluse_decision(
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
+                state.github.policy.digest(),
             )
             .await
         {
@@ -383,6 +384,7 @@ pub async fn pretooluse_decision(
             &payload.tool_name,
             &payload.tool_input,
             &classification,
+            state.github.policy.digest(),
         )
         .await
     {

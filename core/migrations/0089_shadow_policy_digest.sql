@@ -1,0 +1,23 @@
+-- The configuration a shadow decision was taken under, beside the code version already there.
+--
+-- `classifier_version` says WHICH CODE decided; from version 10 that stopped being enough on its
+-- own, because part of the policy now lives in `.ai/github.yaml` — a gitignored, per-developer file.
+-- Two machines both on version 10 can classify the same `gh` line differently, and a scoreboard
+-- that could not tell them apart would be comparing decisions that are not comparable.
+--
+-- The value is a short hash of the EFFECTIVE policy: already narrowed by the compiled ceilings,
+-- sorted and deduplicated. Normalised before hashed, so editing a comment or reordering two lines
+-- does not break the scoreboard — which is the whole reason it is a digest of the policy rather
+-- than of the file.
+--
+-- NULL for every row written before this column existed, and for every row written between the
+-- classifier change and this migration. That gap is harmless BY THE CHOICE OF READER: the
+-- readiness query counts distinct digests and does not group by them, so null-digest rows go on
+-- counting toward review and agreement exactly as they always did and form no group of their own.
+-- Grouping would have made them an orphan pocket that never reaches ten reviews and never promotes.
+--
+-- 0089 and not 0088, deliberately. Master's last migration is 0087, so 0088 was free on paper — but
+-- an uncommitted `0088_refinements.sql` exists in a sibling checkout, and this repository has
+-- already lost reserved numbers four times. A gap costs nothing and a collision costs a daemon that
+-- will not start.
+ALTER TABLE shadow_decisions ADD COLUMN policy_digest TEXT;
