@@ -373,7 +373,7 @@ func TestActReportsWhatTheFenceStopped(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	driver.mu.Lock()
-	driver.sessions[session.ID].refs["e1"] = 42
+	driver.sessions[session.ID].refs["e1"] = nodeKey{backend: 42}
 	driver.mu.Unlock()
 
 	result, err := driver.Act(context.Background(), session.ID, browser.Action{
@@ -409,7 +409,7 @@ func TestAnActThatCausesNothingIsDone(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	driver.mu.Lock()
-	driver.sessions[session.ID].refs["e1"] = 42
+	driver.sessions[session.ID].refs["e1"] = nodeKey{backend: 42}
 	driver.mu.Unlock()
 
 	result, err := driver.Act(context.Background(), session.ID, browser.Action{

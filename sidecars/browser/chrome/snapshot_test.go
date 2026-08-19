@@ -12,10 +12,30 @@ import (
 // refs has to have a session too.
 func snapshotFrom(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 	driver := &Driver{}
-	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
-	collected, truncated := collect(nodes)
+	entry := newTestSession()
+	collected, truncated := collect(oneDocument(nodes))
 	elements, _ := driver.name(entry, collected, false)
-	return elements, entry.refs, truncated
+	return elements, backends(entry.refs), truncated
+}
+
+// oneDocument wraps a node list as a page with nothing framed in it, which is what every test in
+// this file is about — the framing is measured against real Chromium in the gate, because a fake
+// tree cannot have a process boundary in it.
+func oneDocument(nodes []axNode) *tree {
+	return &tree{nodes: nodes, inner: map[int64]*tree{}}
+}
+
+func newTestSession() *session {
+	return &session{refByNode: map[nodeKey]string{}, lastReported: map[string]browser.Element{}}
+}
+
+// backends drops the document a ref belongs to, so these tests can keep saying "e1 is node 11".
+func backends(refs map[string]nodeKey) map[string]int64 {
+	flat := make(map[string]int64, len(refs))
+	for ref, key := range refs {
+		flat[ref] = key.backend
+	}
+	return flat
 }
 
 func text(id, parent, value string) axNode {
@@ -169,9 +189,9 @@ var _ = browser.Element{}
 // handle on an ELEMENT rather than on a position.
 func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 	driver := &Driver{}
-	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	entry := newTestSession()
 	take := func(nodes []axNode) map[string]string {
-		collected, _ := collect(nodes)
+		collected, _ := collect(oneDocument(nodes))
 		elements, _ := driver.name(entry, collected, false)
 		byName := map[string]string{}
 		for _, element := range elements {
@@ -200,7 +220,7 @@ func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 	if after["Undo"] == before["Save"] || after["Undo"] == before["Cancel"] {
 		t.Fatalf("a new element took a ref that already meant something: %v", after)
 	}
-	if entry.refs[after["Save"]] != 10 {
+	if entry.refs[after["Save"]].backend != 10 {
 		t.Errorf("the ref no longer resolves to its node: %v", entry.refs)
 	}
 }
@@ -214,9 +234,9 @@ func TestARefMeansTheSameElementOnTheNextSnapshot(t *testing.T) {
 // agent goes on believing in a button that is no longer there.
 func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 	driver := &Driver{}
-	entry := &session{refByNode: map[int64]string{}, lastReported: map[string]browser.Element{}}
+	entry := newTestSession()
 	take := func(nodes []axNode, changesOnly bool) ([]browser.Element, []string) {
-		collected, _ := collect(nodes)
+		collected, _ := collect(oneDocument(nodes))
 		return driver.name(entry, collected, changesOnly)
 	}
 

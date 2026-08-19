@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"nucleosbrowser/browser"
+	"nucleosbrowser/cdp"
 )
 
 // Act performs one action against a ref from the last snapshot.
@@ -36,7 +37,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 
 	d.mu.Lock()
 	mode := entry.mode
-	backendNodeID, known := entry.refs[action.Ref]
+	key, known := entry.refs[action.Ref]
 	d.mu.Unlock()
 
 	// Spec §4.4 rule 1. Refused and not queued, and refused from the moment the wheel was ASKED for
@@ -63,7 +64,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		), nil
 	}
 
-	objectID, err := d.resolve(ctx, entry, backendNodeID)
+	objectID, err := d.resolve(ctx, key)
 	if err != nil {
 		return browser.ActResult{}, err
 	}
@@ -74,11 +75,11 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 
 	switch action.Kind {
 	case browser.ActionClick:
-		err = d.callOn(ctx, entry, objectID, "function() { this.click(); }")
+		err = d.callOn(ctx, key.session, objectID, "function() { this.click(); }")
 	case browser.ActionScroll:
-		err = d.callOn(ctx, entry, objectID, "function() { this.scrollIntoView({block: 'center'}); }")
+		err = d.callOn(ctx, key.session, objectID, "function() { this.scrollIntoView({block: 'center'}); }")
 	case browser.ActionType:
-		err = d.typeInto(ctx, entry, objectID, action.Text)
+		err = d.typeInto(ctx, key.session, objectID, action.Text)
 	default:
 		return browser.Refused(
 			browser.ConsequenceMethod,
@@ -99,19 +100,19 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	return browser.Done(), nil
 }
 
-func (d *Driver) typeInto(ctx context.Context, entry *session, objectID, text string) error {
-	if err := d.callOn(ctx, entry, objectID, "function() { this.focus(); }"); err != nil {
+func (d *Driver) typeInto(ctx context.Context, on cdp.SessionID, objectID, text string) error {
+	if err := d.callOn(ctx, on, objectID, "function() { this.focus(); }"); err != nil {
 		return err
 	}
 	// Input.insertText rather than synthesising key events: it is what a paste does, it does not
 	// need a keymap, and it cannot accidentally send a modifier combination.
-	_, err := d.conn.Call(ctx, entry.cdp, "Input.insertText", map[string]any{"text": text})
+	_, err := d.conn.Call(ctx, on, "Input.insertText", map[string]any{"text": text})
 	return err
 }
 
-func (d *Driver) resolve(ctx context.Context, entry *session, backendNodeID int64) (string, error) {
-	result, err := d.conn.Call(ctx, entry.cdp, "DOM.resolveNode", map[string]any{
-		"backendNodeId": backendNodeID,
+func (d *Driver) resolve(ctx context.Context, key nodeKey) (string, error) {
+	result, err := d.conn.Call(ctx, key.session, "DOM.resolveNode", map[string]any{
+		"backendNodeId": key.backend,
 	})
 	if err != nil {
 		return "", fmt.Errorf("resolving the node behind the ref: %w", err)
@@ -130,8 +131,8 @@ func (d *Driver) resolve(ctx context.Context, entry *session, backendNodeID int6
 	return payload.Object.ObjectID, nil
 }
 
-func (d *Driver) callOn(ctx context.Context, entry *session, objectID, function string) error {
-	_, err := d.conn.Call(ctx, entry.cdp, "Runtime.callFunctionOn", map[string]any{
+func (d *Driver) callOn(ctx context.Context, on cdp.SessionID, objectID, function string) error {
+	_, err := d.conn.Call(ctx, on, "Runtime.callFunctionOn", map[string]any{
 		"objectId":            objectID,
 		"functionDeclaration": function,
 		"awaitPromise":        true,
