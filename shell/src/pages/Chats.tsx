@@ -23,6 +23,7 @@ import {
   type Turn,
 } from "../data/chats";
 import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
+import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import {
   Badge,
   Button,
@@ -128,25 +129,45 @@ function ChatListPanel({
   selectedLive: boolean;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
   const navigate = useNavigate();
+
+  const opened = (chatId: string) => {
+    setComposerOpen(false);
+    setEditorOpen(false);
+    void navigate({ to: `/chats/${chatId}` });
+  };
 
   return (
     <Panel
       title="Conversations"
       aside={
-        <Button variant="approve" aria-pressed={composerOpen} onClick={() => setComposerOpen((v) => !v)}>
-          {composerOpen ? "Cancel" : "New conversation"}
-        </Button>
+        <>
+          <Button
+            variant="ghost"
+            aria-pressed={editorOpen}
+            onClick={() => {
+              setEditorOpen((v) => !v);
+              setComposerOpen(false);
+            }}
+          >
+            {editorOpen ? "Close" : "From the editor"}
+          </Button>
+          <Button
+            variant="approve"
+            aria-pressed={composerOpen}
+            onClick={() => {
+              setComposerOpen((v) => !v);
+              setEditorOpen(false);
+            }}
+          >
+            {composerOpen ? "Cancel" : "New conversation"}
+          </Button>
+        </>
       }
     >
-      {composerOpen && (
-        <NewChatForm
-          onOpened={(chatId) => {
-            setComposerOpen(false);
-            void navigate({ to: `/chats/${chatId}` });
-          }}
-        />
-      )}
+      {composerOpen && <NewChatForm onOpened={opened} />}
+      {editorOpen && <FromTheEditor onOpened={opened} />}
 
       {!answered && <p className="chats-loading">reading your conversations…</p>}
       {answered && rows.length === 0 && (
@@ -216,12 +237,9 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
 
 function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
   const [brain, setBrain] = useState<Brain>("cloud");
-  const [sessionId, setSessionId] = useState("");
   const localModel = useLocalModel();
-  const ideSessions = useIdeSessions(true);
   const create = useCreateChat();
   const localUnavailable = localModel.data?.available === false;
-  const chosen = (ideSessions.data ?? []).find((session) => session.session_id === sessionId);
 
   return (
     <form
@@ -229,10 +247,7 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
       onSubmit={(event) => {
         event.preventDefault();
         if (create.isPending) return;
-        create.mutate(
-          { brain, continueSession: sessionId === "" ? undefined : sessionId },
-          { onSuccess: (result) => onOpened(result.chat_id) },
-        );
+        create.mutate({ brain }, { onSuccess: (result) => onOpened(result.chat_id) });
       }}
     >
       <fieldset className="chats-new-brain">
@@ -258,29 +273,97 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
         </label>
       </fieldset>
 
-      <label className="chats-field">
-        <span>Continue an IDE session (optional)</span>
-        <select
-          aria-label="Continue an IDE session"
-          value={sessionId}
-          onChange={(event) => setSessionId(event.target.value)}
-        >
-          <option value="">none — start fresh</option>
-          {(ideSessions.data ?? []).map((session: IdeSession) => (
-            <option key={session.session_id} value={session.session_id}>
-              {(session.title ?? session.session_id) + " — " + session.cwd}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      {chosen !== undefined && !chosen.tools && <NoTools session={chosen} />}
-
       <Button type="submit" intent="go" disabled={create.isPending}>
         Start
       </Button>
       {create.isError && <CreateRefusal error={create.error} />}
     </form>
+  );
+}
+
+/**
+ * The conversations you were having in the editor, and the one press that continues one here.
+ *
+ * A door of its own. Everything this page could already do with an editor session sat inside the
+ * new-conversation form, in a field marked optional, below two radio buttons — reachable only by
+ * somebody who had pressed a button labelled "New conversation" while looking for an old one. The
+ * feature was complete and invisible, which from the outside is indistinguishable from missing.
+ *
+ * What was said is shown BEFORE the pick-up, not after. A cut title and a directory is not enough
+ * to tell two afternoons of work apart, and the only way to find out which one this was used to be
+ * to pick it up and read what came back.
+ *
+ * Cloud, and no choice offered. Continuing one of these means resuming a Claude Code session by its
+ * id, which is a thing only the cloud brain can do; a Local option here would be a button that
+ * quietly starts a fresh conversation instead of the one you chose.
+ */
+function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
+  const sessions = useIdeSessions(true);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const said = useIdeConversation(sessionId);
+  const create = useCreateChat();
+  const chosen = (sessions.data ?? []).find((session) => session.session_id === sessionId);
+
+  return (
+    <div className="chats-editor">
+      {sessions.data === undefined && !sessions.isError && (
+        <p className="chats-loading">reading your editor sessions…</p>
+      )}
+      {sessions.isError && <ErrorNote>your editor sessions could not be read</ErrorNote>}
+      {sessions.data?.length === 0 && (
+        <Teach title="No conversations from the editor">
+          <p>
+            Nothing on this machine has a transcript the daemon can read. These are the sessions the
+            CLI writes as you work in a project — have one there and it shows up here.
+          </p>
+        </Teach>
+      )}
+
+      {(sessions.data ?? []).length > 0 && (
+        <ul className="chats-editor-list" aria-label="Conversations in the editor">
+          {(sessions.data ?? []).map((session: IdeSession) => (
+            <li key={session.session_id}>
+              <button
+                type="button"
+                className={
+                  session.session_id === sessionId
+                    ? "chats-editor-row chats-editor-row-open"
+                    : "chats-editor-row"
+                }
+                aria-pressed={session.session_id === sessionId}
+                onClick={() =>
+                  setSessionId((open) => (open === session.session_id ? null : session.session_id))
+                }
+              >
+                <span className="chats-editor-title">{session.title ?? session.session_id}</span>
+                <span className="chats-editor-where">{session.cwd}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {chosen !== undefined && (
+        <div className="chats-editor-chosen">
+          <PickedUp view={said} />
+          {!chosen.tools && <NoTools session={chosen} />}
+          <Button
+            type="button"
+            intent="go"
+            disabled={create.isPending}
+            onClick={() =>
+              create.mutate(
+                { brain: "cloud", continueSession: chosen.session_id },
+                { onSuccess: (result) => onOpened(result.chat_id) },
+              )
+            }
+          >
+            Pick it up
+          </Button>
+          {create.isError && <CreateRefusal error={create.error} />}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -561,8 +644,15 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
             className={said.by_owner ? "chats-said-line chats-said-owner" : "chats-said-line"}
           >
             <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
-            {/* Text, never markup — this is somebody else's file. */}
-            <p className="chats-said-text">{said.text}</p>
+            {/* Text, never markup — this is somebody else's file. `Rich` never emits either:
+                it returns data and this page decides what an element is. */}
+            {said.by_owner ? (
+              <p className="chats-said-text">{said.text}</p>
+            ) : (
+              <div className="chats-said-text">
+                <Rich text={said.text} />
+              </div>
+            )}
           </li>
         ))}
       </ul>
@@ -585,21 +675,40 @@ function Transcript({
   precededBy: boolean;
   chatId: string;
 }) {
+  const end = useRef<HTMLDivElement | null>(null);
+  const last = turns.length === 0 ? null : turns[turns.length - 1];
+
+  // A conversation is read at its end.
+  //
+  // Opening one at the top means scrolling past an afternoon of work to reach the sentence you came
+  // back for, and on a conversation picked up from the editor that is somebody else's whole day
+  // above the two turns you just had. Before the hooks below it, and above the early returns: the
+  // rules of hooks do not bend for a component that sometimes has nothing to draw.
+  //
+  // `last?.status` alongside the count, because a turn that ENDS grows the page without adding a
+  // row to it — the answer lands where "thinking…" was, and the bottom moves.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [chatId, turns.length, last?.status]);
+
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
   if (turns.length === 0 && precededBy) return null;
   if (turns.length === 0) return <p className="chats-empty">nothing has been said yet.</p>;
   return (
-    <ul className="chats-turns" aria-label="Transcript">
-      {turns.map((turn, index) => (
-        <TurnBlock
-          key={turn.id}
-          turn={turn}
-          previous={index === 0 ? null : turns[index - 1]}
-          chatId={chatId}
-        />
-      ))}
-    </ul>
+    <>
+      <ul className="chats-turns" aria-label="Transcript">
+        {turns.map((turn, index) => (
+          <TurnBlock
+            key={turn.id}
+            turn={turn}
+            previous={index === 0 ? null : turns[index - 1]}
+            chatId={chatId}
+          />
+        ))}
+      </ul>
+      <div ref={end} className="chats-turns-end" />
+    </>
   );
 }
 
@@ -620,11 +729,20 @@ function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
+      <p className="chats-turn-who">you</p>
+      {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
+          Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
+          message they did not send. */}
       <p className="chats-turn-asked">{turn.asked}</p>
+      <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
       {!live && <WhatItDid did={turn.did} />}
-      {!live && turn.answer !== null && <p className="chats-turn-answer">{turn.answer}</p>}
+      {!live && turn.answer !== null && (
+        <div className="chats-turn-answer">
+          <Rich text={turn.answer} />
+        </div>
+      )}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
       )}
@@ -634,6 +752,59 @@ function TurnBlock({
       </div>
     </li>
   );
+}
+
+/**
+ * A model's answer, drawn as the shapes it was written in.
+ *
+ * The parser is in `lib/rich.ts` and returns data, never markup; every element below is chosen
+ * here, from a closed set. So a transcript containing a script tag is a string containing a script
+ * tag at every step of this, and there is no path by which one talks this into rendering HTML.
+ *
+ * Only the model's half goes through it. What a person typed is drawn exactly as they typed it.
+ */
+function Rich({ text }: { text: string }) {
+  return (
+    <>
+      {blocks(text).map((block, index) =>
+        block.kind === "code" ? (
+          <pre key={index} className="chats-code">
+            <code>{block.text}</code>
+          </pre>
+        ) : (
+          <div key={index} className="chats-prose">
+            {lines(block.text).map((line, at) => (
+              <RichLineOut key={at} line={line} />
+            ))}
+          </div>
+        ),
+      )}
+    </>
+  );
+}
+
+function RichLineOut({ line }: { line: RichLine }) {
+  const inner = line.spans.map((span, index) =>
+    span.kind === "code" ? (
+      <code key={index}>{span.text}</code>
+    ) : span.kind === "strong" ? (
+      <strong key={index}>{span.text}</strong>
+    ) : (
+      <span key={index}>{span.text}</span>
+    ),
+  );
+  if (line.kind === "heading") {
+    return <p className={`chats-rich-heading chats-rich-heading-${line.level}`}>{inner}</p>;
+  }
+  if (line.kind === "bullet") {
+    return (
+      <p className="chats-rich-bullet">
+        <span aria-hidden="true">•</span>
+        {inner}
+      </p>
+    );
+  }
+  return <p className="chats-rich-line">{inner}</p>;
 }
 
 /**
@@ -678,12 +849,19 @@ function LiveAnswer({ turnId }: { turnId: number }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
   const doing = live.data?.doing ?? null;
+  const end = useRef<HTMLParagraphElement | null>(null);
+
+  // Follows itself down. The list above does not re-render while a turn writes -- the words arrive
+  // on this component's own poll -- so the transcript's scroll effect never fires for any of it.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [text, doing]);
 
   return (
     <>
       {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
       <WhatItDid did={live.data?.did ?? []} />
-      <p className="chats-turn-live">
+      <p className="chats-turn-live" ref={end}>
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>

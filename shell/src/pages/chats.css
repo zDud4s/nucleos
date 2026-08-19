@@ -398,7 +398,6 @@
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
 }
 
 .chats-turn-answer-empty {
@@ -453,4 +452,146 @@
 .chats-composer-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+/* ----------------------------------------------- picked up from the editor -- */
+
+.chats-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.chats-editor-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  max-height: 18rem;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.chats-editor-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chats-editor-row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.chats-editor-row-open {
+  border-color: var(--accent);
+  background: var(--accent-quiet);
+}
+
+.chats-editor-title {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chats-editor-where {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.chats-editor-chosen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+/* ------------------------------------------ who said it, and how it reads -- */
+
+.chats-turn-who {
+  margin: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.chats-prose {
+  display: flex;
+  flex-direction: column;
+}
+
+.chats-rich-line,
+.chats-rich-bullet,
+.chats-rich-heading {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chats-rich-heading {
+  margin-top: var(--space-2);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.chats-rich-heading-1 {
+  font-size: var(--text-md);
+}
+
+.chats-rich-bullet {
+  display: flex;
+  gap: var(--space-2);
+  padding-left: var(--space-2);
+}
+
+.chats-prose code,
+.chats-said-text code {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* A block of code keeps its own lines: this is the one place on the page where wrapping would
+   change what is written, so it scrolls sideways instead of folding. */
+.chats-code {
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  white-space: pre;
+}
+
+.chats-code code {
+  padding: 0;
+  background: none;
+}
+
+/* The anchor the transcript scrolls to. Nothing to see: it is the bottom. */
+.chats-turns-end {
+  height: 1px;
 }
