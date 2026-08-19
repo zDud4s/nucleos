@@ -379,6 +379,95 @@ fn spoken(row: &serde_json::Value) -> Option<Said> {
     }
 }
 
+/// A file the conversation moved, and by how much.
+struct Change {
+    name: String,
+    added: usize,
+    removed: usize,
+}
+
+/// The longest list of files a single note names. Past this it says how many more there were: a
+/// note that is longer than the messages around it stops being a note.
+const CHANGED_NAMED: usize = 6;
+
+/// Adds a row's edit to the run being collected, if the row is one.
+///
+/// By file NAME and not by path. The conversation happened inside one project and the note is a
+/// summary, not a record — two files with the same name in different folders is a cost worth
+/// paying to avoid three absolute Windows paths in a line meant to be glanced at.
+///
+/// A patch that moved nothing is not an edit. A `Read` carries a result too, and a note saying a
+/// file moved by zero lines claims something happened when nothing did.
+fn record_change(changed: &mut Vec<Change>, row: &serde_json::Value) {
+    let Some(result) = row.get("toolUseResult") else {
+        return;
+    };
+    let Some(path) = result.get("filePath").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(hunks) = result.get("structuredPatch").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let (mut added, mut removed) = (0usize, 0usize);
+    for line in hunks
+        .iter()
+        .filter_map(|hunk| hunk.get("lines").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|line| line.as_str())
+    {
+        match line.chars().next() {
+            Some('+') => added += 1,
+            Some('-') => removed += 1,
+            _ => {}
+        }
+    }
+    if added == 0 && removed == 0 {
+        return;
+    }
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+    // The same file worked in several passes is one file that moved, not one note per pass.
+    if let Some(seen) = changed.iter_mut().find(|change| change.name == name) {
+        seen.added += added;
+        seen.removed += removed;
+        return;
+    }
+    changed.push(Change {
+        name,
+        added,
+        removed,
+    });
+}
+
+/// The note left where the conversation changed files.
+fn changes(changed: &[Change]) -> Said {
+    let named: Vec<String> = changed
+        .iter()
+        .take(CHANGED_NAMED)
+        .map(|change| format!("{} +{} −{}", change.name, change.added, change.removed))
+        .collect();
+    let mut text = format!("changed {}", named.join(", "));
+    if changed.len() > CHANGED_NAMED {
+        text.push_str(&format!(" and {} more", changed.len() - CHANGED_NAMED));
+    }
+    Said {
+        by_owner: false,
+        text,
+        aside: true,
+    }
+}
+
+/// Keeps one line, under the ceiling that governs every line.
+///
+/// One way in, because the ceiling is the thing that must not differ between them: a note kept
+/// without it would grow the conversation past the limit the messages are held to.
+fn keep(kept: &mut std::collections::VecDeque<Said>, cut: &mut bool, item: Said) {
+    kept.push_back(item);
+    if kept.len() > SAID_SHOWN {
+        kept.pop_front();
+        *cut = true;
+    }
+}
+
 /// Whether a row is the editor's own summary of a conversation that ran out of context.
 fn is_compaction(row: &serde_json::Value) -> bool {
     row.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
@@ -435,6 +524,8 @@ fn read_said(path: &Path) -> Conversation {
     let mut cut = false;
     // How many rows of the subagent excursion currently open have gone past.
     let mut aside: usize = 0;
+    // The files changed since the last thing anybody said, in the order they were first touched.
+    let mut changed: Vec<Change> = Vec::new();
 
     loop {
         line.clear();
@@ -453,35 +544,35 @@ fn read_said(path: &Path) -> Conversation {
             aside += 1;
             continue;
         }
+        // Counted before the row is judged as speech: a tool result is not a line of the
+        // conversation and never becomes one, but what it did is the only record of what the
+        // conversation actually changed.
+        record_change(&mut changed, &row);
         let Some(mut item) = spoken(&row) else {
             continue;
         };
         if aside > 0 {
-            kept.push_back(note(aside));
+            keep(&mut kept, &mut cut, note(aside));
             aside = 0;
-            if kept.len() > SAID_SHOWN {
-                kept.pop_front();
-                cut = true;
-            }
+        }
+        if !changed.is_empty() {
+            keep(&mut kept, &mut cut, changes(&changed));
+            changed.clear();
         }
         // Cut before it is kept, so one pasted log cannot be carried around whole only to be
         // thrown away by the byte ceiling below — and so that a message bigger than that ceiling
         // is shown cut rather than dropped, which would leave a gap nothing on screen explains.
         item.text = cut_to(item.text, SAID_BYTES);
-        kept.push_back(item);
-        if kept.len() > SAID_SHOWN {
-            kept.pop_front();
-            cut = true;
-        }
+        keep(&mut kept, &mut cut, item);
     }
 
-    // An excursion the file ends inside. It happened, and a note is the whole point.
+    // An excursion, or an edit, that the file ends inside. Both happened, and a note is the whole
+    // point of noticing them.
     if aside > 0 {
-        kept.push_back(note(aside));
-        if kept.len() > SAID_SHOWN {
-            kept.pop_front();
-            cut = true;
-        }
+        keep(&mut kept, &mut cut, note(aside));
+    }
+    if !changed.is_empty() {
+        keep(&mut kept, &mut cut, changes(&changed));
     }
 
     // The byte ceiling, taken off the oldest end. The last message is never dropped: a conversation
@@ -750,6 +841,21 @@ mod tests {
         assert!(find(&store.root(), "..\\elsewhere\\secret").is_none());
     }
 
+    /// A tool result as the CLI records one for an edit: the file, and the hunk that moved it.
+    fn edited(path: &str, lines: &[&str]) -> serde_json::Value {
+        let patch = if lines.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                                "lines": lines}])
+        };
+        serde_json::json!({
+            "type": "user", "cwd": "",
+            "message": {"content": [{"type": "tool_result", "content": "ok"}]},
+            "toolUseResult": {"filePath": path, "structuredPatch": patch}
+        })
+    }
+
     fn replied(text: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "assistant",
@@ -826,6 +932,81 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// What the conversation CHANGED, which was the one thing it never said.
+    ///
+    /// A transcript reads as talk: the model says it will fix something, and the next line is it
+    /// saying the thing is fixed. The edit in between is on disk -- the CLI writes the whole diff
+    /// into `toolUseResult` as a `structuredPatch`, 1721 of them in eight real files on this
+    /// machine -- and none of it reached the page.
+    ///
+    /// A summary and NOT the diff: a note says which files moved and by how much. The hunks
+    /// themselves are megabytes across a long session, and this is read on every open.
+    #[test]
+    fn the_files_a_conversation_changed_are_named_where_it_changed_them() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("arranja o parser"),
+                edited("C:/proj/core/src/parser.rs", &[" a", "-b", "-c", "+d"]),
+                edited("C:/proj/core/src/http.rs", &["+x", " y"]),
+                replied("arranjado"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert!(read[1].aside, "the edits left no note");
+        assert!(read[1].text.contains("parser.rs"), "{}", read[1].text);
+        assert!(read[1].text.contains("http.rs"), "{}", read[1].text);
+        // Two removed and one added in the first, one added in the second.
+        assert!(read[1].text.contains("+1"), "{}", read[1].text);
+        assert!(read[1].text.contains("2"), "{}", read[1].text);
+    }
+
+    /// The same file edited four times in a row is one file that moved, not four notes. A model
+    /// works a file in passes, and a note per pass would bury the conversation it happened inside.
+    #[test]
+    fn the_same_file_touched_twice_is_counted_once_and_added_up() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("arranja"),
+                edited("C:/proj/a.rs", &["+um"]),
+                edited("C:/proj/a.rs", &["+dois", "-tres"]),
+                replied("feito"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        let note = &read[1];
+        assert!(note.aside);
+        assert_eq!(note.text.matches("a.rs").count(), 1, "{}", note.text);
+        assert!(note.text.contains("+2"), "{}", note.text);
+    }
+
+    /// A tool that changed nothing leaves nothing. A `Read` carries a result too, and a note saying
+    /// a file moved by zero lines is a claim that something happened when nothing did.
+    #[test]
+    fn a_result_that_changed_no_file_leaves_no_note() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[said("olha"), edited("C:/proj/a.rs", &[]), replied("olhei")],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        assert_eq!(read.len(), 2, "{read:?}");
+        assert!(read.iter().all(|line| !line.aside));
     }
 
     /// The editor's own context ran out, and the summary of it is not something anybody said.
