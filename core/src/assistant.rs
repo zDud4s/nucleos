@@ -1136,14 +1136,26 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // shows the actual fault rather than a wall of JSON.
             Ok(Ok(o)) => match extract_reply(&o.stdout) {
                 Some(reply) => {
+                    // Read out of the same stream the reply came from, and stored beside it. The
+                    // live tail is taken away the instant this turn ends, so without this the
+                    // actions are visible while the turn runs and gone for ever afterwards.
+                    //
+                    // Serialised here rather than kept as rows: it is read only with the turn it
+                    // belongs to, and a table would be a join for something no query ever asks
+                    // about on its own. An empty list is stored as `[]`, which says "acted on
+                    // nothing" — NULL is reserved for turns nobody asked.
+                    let tools_used =
+                        serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
+                            .unwrap_or_else(|_| "[]".to_string());
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(&tools_used)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -3191,5 +3203,82 @@ mod tests {
             *runner.last_include_partial_messages.lock().unwrap(),
             Some(true)
         );
+    }
+
+    /// A runner whose stream carries a tool call before its result.
+    fn ran_a_tool(stdout_lines: &[&str]) -> Arc<FakeCommandRunner> {
+        Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stdout_lines.join(
+                    "
+",
+                ),
+                stderr: String::new(),
+                session_id: Some("fake-session-id".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// What a turn DID outlives the stream it did it in.
+    ///
+    /// The live tail is taken away the moment the turn ends, so without this the actions are
+    /// visible for as long as the turn runs and then gone for ever — and a conversation reopened
+    /// tomorrow shows a paragraph with nothing to say where it came from.
+    #[tokio::test]
+    async fn a_finished_turn_records_what_it_did() {
+        let mut state = test_state().await;
+        state.runner = ran_a_tool(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"core/src/parser.rs"}}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"é o parser de datas"}"#,
+        ]);
+
+        let id = send_message(&state, "assistant-did-chat", "arranja", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT tools_used FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let did: Vec<crate::runner::ToolCall> =
+            serde_json::from_str(&stored.expect("the turn recorded no actions")).unwrap();
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(did[0].name, "Read");
+        assert_eq!(did[0].detail.as_deref(), Some("core/src/parser.rs"));
+    }
+
+    /// A turn that only talked records an EMPTY list, not nothing at all.
+    ///
+    /// NULL is what a turn from before this column has, and the two are different facts: one is a
+    /// turn known to have acted on nothing, the other is a turn nobody asked. Only the first can be
+    /// said out loud.
+    #[tokio::test]
+    async fn a_turn_that_only_talked_records_an_empty_list_rather_than_nothing() {
+        let mut state = test_state().await;
+        state.runner = ran_a_tool(&[r#"{"type":"result","subtype":"success","result":"olá"}"#]);
+
+        let id = send_message(&state, "assistant-talked-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT tools_used FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.as_deref(), Some("[]"));
     }
 }

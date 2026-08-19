@@ -413,6 +413,48 @@ pub struct LiveTurn {
     pub text: String,
     /// The tool being run right now, or `None` when the model is writing rather than acting.
     pub doing: Option<String>,
+    /// Every tool the turn ran, oldest first.
+    ///
+    /// Beside the text and not folded into it: a turn that read four files and ran the tests
+    /// answered with more than its last paragraph, and the paragraph on its own reads as an opinion
+    /// rather than as work. It is also the only place a turn's actions are visible at all — the
+    /// window shows the reply, and nothing else ever said what produced it.
+    pub did: Vec<ToolCall>,
+}
+
+/// One tool call, as much of it as is worth showing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    /// The one argument that says what this call was about, or `None` when none of them does.
+    ///
+    /// A path, a command, a pattern, a URL — deliberately not the whole input. A `Write` carries
+    /// the file it is writing, and a chat that printed that argument would print the file.
+    pub detail: Option<String>,
+}
+
+/// The longest detail kept. A command line can be a heredoc.
+const DETAIL_LIMIT: usize = 120;
+
+/// The argument of a tool call worth showing beside its name.
+///
+/// A fixed list of keys tried in order, rather than "the first string in the object": the input
+/// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
+/// happened to be ordered first — a different answer between two runs of the same call.
+fn detail_of(input: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 6] = ["file_path", "path", "command", "pattern", "url", "query"];
+    let found = KEYS
+        .iter()
+        .find_map(|key| input.get(key).and_then(|value| value.as_str()))?;
+    let trimmed = found.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut detail: String = trimmed.chars().take(DETAIL_LIMIT).collect();
+    if trimmed.chars().count() > DETAIL_LIMIT {
+        detail.push('…');
+    }
+    Some(detail)
 }
 
 /// Distils a stream still being written into the two things worth showing while it is.
@@ -434,6 +476,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     let mut finished: Vec<String> = Vec::new();
     let mut writing = String::new();
     let mut doing: Option<String> = None;
+    let mut did: Vec<ToolCall> = Vec::new();
 
     for line in stream.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -467,12 +510,17 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                 if !text.trim().is_empty() {
                     finished.push(text);
                 }
-                if let Some(name) = blocks
+                for block in blocks
                     .iter()
                     .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-                    .filter_map(|block| block.get("name").and_then(|n| n.as_str()))
-                    .next_back()
                 {
+                    let Some(name) = block.get("name").and_then(|n| n.as_str()) else {
+                        continue;
+                    };
+                    did.push(ToolCall {
+                        name: name.to_string(),
+                        detail: block.get("input").and_then(detail_of),
+                    });
                     doing = Some(name.to_string());
                 }
                 // The message that just completed is the one those deltas were writing.
@@ -508,6 +556,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
 ",
         ),
         doing,
+        did,
     }
 }
 
@@ -2444,6 +2493,47 @@ mod tests {
     }
 
     /// What it is doing right now, which is the half a spinner cannot say.
+    /// What the turn DID, kept beside what it said. A turn that read four files and ran the tests
+    /// answered with more than its last paragraph, and the paragraph alone reads as an opinion.
+    #[test]
+    fn a_stream_reads_back_the_tools_it_ran_in_the_order_it_ran_them() {
+        let stream = [
+            message(serde_json::json!([
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "core/src/parser.rs"}}
+            ])),
+            message(serde_json::json!([
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test parser"}}
+            ])),
+        ]
+        .join(
+            "
+",
+        );
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 2);
+        assert_eq!(did[0].name, "Read");
+        assert_eq!(did[0].detail.as_deref(), Some("core/src/parser.rs"));
+        assert_eq!(did[1].name, "Bash");
+        assert_eq!(did[1].detail.as_deref(), Some("cargo test parser"));
+    }
+
+    /// A tool whose arguments this does not recognise is still a tool that ran. Naming it with no
+    /// detail says less than the truth; leaving it out says something false.
+    #[test]
+    fn a_tool_with_no_argument_worth_showing_is_still_recorded() {
+        let stream = message(serde_json::json!([
+            {"type": "tool_use", "name": "TodoWrite", "input": {"todos": []}}
+        ]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(did[0].name, "TodoWrite");
+        assert_eq!(did[0].detail, None);
+    }
+
     #[test]
     fn a_stream_says_which_tool_is_running_until_that_tool_returns() {
         let calling = [

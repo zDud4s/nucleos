@@ -25,7 +25,7 @@ import { ApiRefusal } from "../data/client";
 import type { ChatSummary, IdeSession, Said } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
-import type { AssistantTurnRow } from "../lib/turns";
+import type { AssistantTurnRow, ToolCall } from "../lib/turns";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 beforeEach(() => {
@@ -65,6 +65,7 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     answered_by: "cloud",
     session_id: "s-1",
     created_at: "2026-08-18T09:00:00Z",
+    did: [],
     ...overrides,
   };
 }
@@ -86,7 +87,7 @@ function chatsFetch(
     /** The sessions the picker offers. Mutated in place by the wiring route below. */
     ideSessions?: IdeSession[];
     /** What each turn in flight is writing right now, by turn id. */
-    live?: Record<number, { text: string; doing: string | null }>;
+    live?: Record<number, { text: string; doing: string | null; did?: ToolCall[] }>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -564,5 +565,59 @@ describe("a turn in flight", () => {
     await screen.findByRole("list", { name: "Transcript" });
     const asked = daemon.apiFetch.mock.calls.map((call) => String(call[0]));
     expect(asked.some((path) => path.endsWith("/live"))).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------ what it did -- */
+
+describe("what a turn did", () => {
+  it("says what it ran, not only what it said", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            answer: "é o parser de datas",
+            did: [
+              { name: "Read", detail: "core/src/parser.rs" },
+              { name: "Bash", detail: "cargo test parser" },
+            ],
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText(/core\/src\/parser\.rs/)).toBeTruthy();
+    expect(within(transcript).getByText(/cargo test parser/)).toBeTruthy();
+  });
+
+  it("says nothing where a turn acted on nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, answer: "olá", did: [] })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).queryByRole("list", { name: /what it did/i })).toBeNull();
+  });
+
+  it("shows the tools piling up while the turn is still running", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+        { live: { 1: { text: "", doing: "Bash", did: [{ name: "Read", detail: "a.rs" }] } } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/a\.rs/)).toBeTruthy();
   });
 });

@@ -3297,6 +3297,24 @@ struct AssistantTurn {
     /// looks like one unbroken conversation, which is the one thing it is not.
     session_id: Option<String>,
     created_at: String,
+    /// What the turn ran, as the JSON `tools_used` holds. Not serialized: the window is given the
+    /// parsed list below, so the shape of the column is this daemon's business and not a format
+    /// two codebases have to agree on.
+    #[serde(skip)]
+    tools_used: Option<String>,
+}
+
+/// One turn as the window receives it: the row, plus what the turn did.
+///
+/// The parse happens here rather than in the window for the reason it happens in `runner.rs` at
+/// all: the column holds a serialisation this daemon chose, and a client re-deriving it would be a
+/// second reader of a private shape. A column that will not parse reads as an empty list — the turn
+/// is real and its reply is worth showing, and one unreadable field is not worth losing it over.
+#[derive(serde::Serialize)]
+struct AssistantTurnOut {
+    #[serde(flatten)]
+    turn: AssistantTurn,
+    did: Vec<crate::runner::ToolCall>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3316,10 +3334,10 @@ const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
 async fn get_assistant_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Result<Json<Vec<AssistantTurn>>, StatusCode> {
+) -> Result<Json<Vec<AssistantTurnOut>>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, session_id, created_at
+                answered_by, session_id, created_at, tools_used
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -3334,7 +3352,19 @@ async fn get_assistant_chat(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     turns.reverse();
-    Ok(Json(turns))
+    Ok(Json(
+        turns
+            .into_iter()
+            .map(|turn| {
+                let did = turn
+                    .tools_used
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                AssistantTurnOut { turn, did }
+            })
+            .collect(),
+    ))
 }
 
 /// A turn while it is still being written: what has been said, and what is being done.

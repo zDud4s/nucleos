@@ -1,0 +1,19 @@
+-- What a run DID, beside what it said.
+--
+-- A turn's answer has always been its last paragraph, and nothing anywhere said what produced it.
+-- A model that read four files and ran the tests, and one that answered from memory, wrote the same
+-- shape of reply -- and on a conversation picked up from the editor that difference is the whole
+-- question a person is asking.
+--
+-- A compact list and NOT the stream. `run_events` already stores every line a run emitted, and for
+-- a chat turn that is megabytes of tool results per message: the reply is a fraction of a percent
+-- of it, and so is this. What goes here is one name and at most one argument per call.
+--
+-- NULL and '[]' are different facts and both are used. NULL is a turn from before this column --
+-- nobody asked what it did. '[]' is a turn that was asked and acted on nothing, which is a thing
+-- the window can say out loud.
+--
+-- Written only where a turn COMPLETES. A turn that failed, timed out or was cancelled leaves NULL:
+-- its stream is whatever had arrived when it died, and a partial list read as a complete one would
+-- say a run stopped after the file it happened to be reading.
+ALTER TABLE runs ADD COLUMN tools_used TEXT;

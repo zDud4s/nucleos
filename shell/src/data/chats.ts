@@ -1,5 +1,13 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { anyTurnLive, merge, turnFromRow, type AssistantTurnRow, type Brain, type Turn } from "../lib/turns";
+import {
+  anyTurnLive,
+  merge,
+  turnFromRow,
+  type AssistantTurnRow,
+  type Brain,
+  type ToolCall,
+  type Turn,
+} from "../lib/turns";
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
@@ -16,7 +24,7 @@ import { POLL } from "./poll";
  * daemon.
  */
 
-export type { Brain, Turn };
+export type { Brain, ToolCall, Turn };
 
 /** One row of the list — `ChatSummary`, archived excluded, most recently active first. */
 export interface ChatSummary {
@@ -72,6 +80,8 @@ export interface LiveTurn {
   text: string;
   /** The tool running right now, or null when the model is writing. */
   doing: string | null;
+  /** What it has run so far, oldest first. */
+  did: ToolCall[];
 }
 
 /** One thing said in a conversation had in the editor. */
@@ -225,6 +235,9 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
+        // the truth about it, not a placeholder — the live view replaces it as calls happen.
+        did: [],
       };
       queryClient.setQueryData<Turn[]>(keys.chats.detail(chatId), (current) =>
         merge(current ?? [], [optimistic]),

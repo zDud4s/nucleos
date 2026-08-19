@@ -18,6 +18,7 @@ import {
   type Brain,
   type ChatSummary,
   type IdeSession,
+  type ToolCall,
   type Turn,
 } from "../data/chats";
 import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
@@ -595,6 +596,7 @@ function TurnBlock({ turn, previous }: { turn: Turn; previous: Turn | null }) {
       ))}
       <p className="chats-turn-asked">{turn.asked}</p>
       {live && <LiveAnswer turnId={turn.id} />}
+      {!live && <WhatItDid did={turn.did} />}
       {!live && turn.answer !== null && <p className="chats-turn-answer">{turn.answer}</p>}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
@@ -634,10 +636,37 @@ function LiveAnswer({ turnId }: { turnId: number }) {
   return (
     <>
       {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
+      <WhatItDid did={live.data?.did ?? []} />
       <p className="chats-turn-live">
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>
+  );
+}
+
+/**
+ * What the turn ran, under what it said.
+ *
+ * A model that read four files and ran the tests, and one that answered from memory, write the same
+ * shape of reply — and on a conversation picked up from the editor, which of the two happened is
+ * most of what a person is asking. Nothing on this page said it before.
+ *
+ * Absent rather than empty when there is nothing: a heading over no rows reads as a turn whose
+ * actions failed to load, which is a different and worse claim than a turn that acted on nothing.
+ */
+function WhatItDid({ did }: { did: ToolCall[] }) {
+  if (did.length === 0) return null;
+  return (
+    <ul className="chats-turn-did" aria-label="What it did">
+      {did.map((call, index) => (
+        // Keyed by position: this is a record of what happened, in order, and nothing reorders or
+        // removes an entry. The same tool on the same file twice is two real calls, not a duplicate.
+        <li key={`${call.name}-${index}`}>
+          <span className="chats-turn-did-name">{call.name}</span>
+          {call.detail !== null && <span className="chats-turn-did-detail">{call.detail}</span>}
+        </li>
+      ))}
+    </ul>
   );
 }
 
