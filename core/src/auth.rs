@@ -248,6 +248,16 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// on, and like a sent message it is the one thing in its pillar its owner cannot undo. That it is
 /// spelled `POST` and mentions a repository makes it look like a sibling of `/runs`; it is a sibling
 /// of `/email/send`. Queueing is Admin's.
+///
+/// `POST /github/requests` inherits that question and its answer without alteration, and it is the
+/// clearer instance of the two: a queued merge at least leaves the machine only at the end, and this
+/// route IS the leaving. It is absent from both tables, so a read-only key cannot reach it and a run
+/// that tried to speak to the API directly cannot either.
+///
+/// **That absence is what makes ONE route safe for two tools.** The reading half and the acting half
+/// share this door, and the partition between them is held by the parameter TYPES at the tool
+/// boundary rather than by the transport. A transport-level partition would be worth having if this
+/// were reachable by the agent the tools serve; it is not, because of the line above.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     // A job is several runs over one worktree, so it belongs to the scope that buys runs rather
@@ -1504,6 +1514,7 @@ mod tests {
             ("POST", "/proposals/7/approve"),
             ("POST", "/autopilot/kill"),
             ("POST", "/vcs/requests"),
+            ("POST", "/github/requests"),
             ("POST", "/email/send"),
             ("POST", "/email/triage"),
             ("POST", "/web/read"),
@@ -1646,6 +1657,7 @@ mod tests {
             ("POST", "/jobs"),
             ("POST", "/email/send"),
             ("POST", "/vcs/requests"),
+            ("POST", "/github/requests"),
             // The reason `TEAM_ROUTES` is a list of PAIRS. `/files` is registered with both a GET
             // and a DELETE on the same path, so a table of paths alone would have handed a
             // department the deleting of the owner's folder along with the listing of it.
@@ -1666,6 +1678,45 @@ mod tests {
                 status_of(&app, method, path, &token).await,
                 StatusCode::FORBIDDEN,
                 "{method} {path} must be out of a department's reach"
+            );
+        }
+    }
+
+    /// The route that leaves the machine is in NEITHER table, asserted as membership rather than
+    /// through a request, so that adding it to one of them fails here instead of in production.
+    ///
+    /// Its sibling `POST /vcs/requests` is asserted beside it, because the argument is one argument
+    /// and a test that made it about only the new route would let somebody "fix" the old one.
+    #[test]
+    fn the_routes_that_leave_the_machine_are_in_no_scope_table() {
+        for (method, path) in [
+            (Method::POST, "/github/requests"),
+            (Method::POST, "/vcs/requests"),
+            (Method::POST, "/email/send"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, path)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, path)
+                    && !route_is_listed(TEAM_ROUTES, &method, path)
+                    && !route_is_listed(EMAIL_ROUTES, &method, path)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, path),
+                "{method} {path} must stay out of every scope table"
+            );
+            assert!(
+                !permits(&Scope::Run(7), &method, path),
+                "{method} {path} must be unreachable by a run"
+            );
+            assert!(
+                !permits(
+                    &Scope::ApiToken(ApiTokenLevel::RunCreating),
+                    &method,
+                    path
+                ),
+                "{method} {path} must be unreachable by a run-creating key"
+            );
+            assert!(
+                permits(&Scope::Control, &method, path),
+                "{method} {path} must stay reachable by the control token"
             );
         }
     }

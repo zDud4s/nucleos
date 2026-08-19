@@ -237,6 +237,33 @@ impl ActOp {
         ToolEffect::Acts
     }
 
+    /// The repository this touches, for the sentence a person reads before approving.
+    ///
+    /// `None` for `Raw`, and that is the honest answer rather than a gap: `gh api` names a REST path
+    /// and a path is not a repository, however often it happens to contain one.
+    pub fn repo(&self) -> Option<&Repo> {
+        match self {
+            ActOp::WorkflowRun { repo, .. }
+            | ActOp::RunRerun { repo, .. }
+            | ActOp::PrCreate { repo, .. }
+            | ActOp::PrComment { repo, .. }
+            | ActOp::IssueClose { repo, .. } => Some(repo),
+            ActOp::Raw { .. } => None,
+        }
+    }
+
+    /// One line naming what is being asked for, which is what the approvals list renders.
+    ///
+    /// A queue whose every row said "github-action" would make a person open each one to find out
+    /// what they were agreeing to — the failure `create_team_action_in_transaction` already names
+    /// about its own `tool_name` column.
+    pub fn describe(&self) -> String {
+        match self.repo() {
+            Some(repo) => format!("a run asked GitHub for {} on {}", self.kind(), repo.as_str()),
+            None => format!("a run asked GitHub for {}", self.kind()),
+        }
+    }
+
     pub fn argv(&self) -> Vec<String> {
         match self {
             // The workflow name goes AFTER `--`, so the `--ref` flag has to be built in the
@@ -364,6 +391,164 @@ impl Op {
             .map(Op::Read)
             .chain(ActOp::all().into_iter().map(Op::Act))
             .collect()
+    }
+}
+
+/// The flat parameters a `github_read` tool call carries.
+///
+/// Flat rather than the tagged union `ReadOp` serialises to, for the reason `vcs::Op::from_request`
+/// gives about its own: the caller on the other side is a language model reading a tool description,
+/// and the union is the right wire shape and the wrong prompt. It is a convenience over the node
+/// types, never a boundary — the boundary is the type, and it is still `Repo::new` that decides.
+#[derive(Debug, Clone, Default)]
+pub struct ReadRequest {
+    pub operation: String,
+    pub repo: String,
+    /// A run id for `run_status` and `run_logs`, a number for `pr_view` and `issue_view`, and
+    /// nothing at all for the two listings. One field rather than three, because the model reading
+    /// this has to fill in one thing and choosing which name it is called by is not that thing.
+    pub id: Option<String>,
+}
+
+/// The flat parameters a `github_act` call carries. Wider than its reading sibling because the
+/// operations are.
+#[derive(Debug, Clone, Default)]
+pub struct ActRequest {
+    pub operation: String,
+    pub repo: Option<String>,
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub base: Option<String>,
+    pub head: Option<String>,
+    pub workflow: Option<String>,
+    pub git_ref: Option<String>,
+    pub args: Option<Vec<String>>,
+}
+
+/// PURE: names the field a caller left out, in the words the caller used for it.
+fn required(value: Option<String>, operation: &str, field: &str) -> Result<String, String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{operation} needs a {field}"))
+}
+
+impl ReadOp {
+    /// Builds a read from the flat parameters, or says exactly which field is wrong.
+    ///
+    /// An operation this module does not know is refused differently from a field that is missing,
+    /// and the difference is what the caller does next: told "unknown operation" it goes looking
+    /// for a typo in its own request, told "pr_view needs an id" it sends the id.
+    pub fn from_request(request: ReadRequest) -> Result<Self, String> {
+        let ReadRequest {
+            operation,
+            repo,
+            id,
+        } = request;
+        let operation = operation.trim().to_ascii_lowercase();
+        let repo = Repo::new(&repo)?;
+        match operation.as_str() {
+            "run_list" => Ok(ReadOp::RunList { repo }),
+            "pr_list" => Ok(ReadOp::PrList { repo }),
+            "run_status" => Ok(ReadOp::RunStatus {
+                repo,
+                id: RunId::new(&required(id, "run_status", "run id")?)?,
+            }),
+            "run_logs" => Ok(ReadOp::RunLogs {
+                repo,
+                id: RunId::new(&required(id, "run_logs", "run id")?)?,
+            }),
+            "pr_view" => Ok(ReadOp::PrView {
+                repo,
+                number: PrNumber::new(&required(id, "pr_view", "pull request number")?)?,
+            }),
+            "issue_view" => Ok(ReadOp::IssueView {
+                repo,
+                number: IssueNumber::new(&required(id, "issue_view", "issue number")?)?,
+            }),
+            // Every acting operation is named here rather than falling into the unknown arm, because
+            // a caller told "unknown operation: pr_comment" would think it had misspelled something.
+            // What is actually true is that it asked the wrong tool, and that is what it is told —
+            // the type system already made this unreachable in Rust, and this is the same refusal
+            // said in words on the wire.
+            other if ActOp::all().iter().any(|op| op.kind() == other) => Err(format!(
+                "{other} acts, so it belongs to github_act and not to github_read"
+            )),
+            other => Err(format!("unknown read operation: {other}")),
+        }
+    }
+
+    /// The effect of a read named only by its `kind()`, for `mcp_tools::effect_of_call`, which has
+    /// arguments rather than an operation.
+    ///
+    /// Derived from `all()` rather than written out a second time, so the answer here and the answer
+    /// from `effect()` cannot drift. `None` is an operation this module does not know, and the
+    /// caller turns that into `ReadsUntrusted` — "I could not tell" is not "no".
+    pub fn effect_of_kind(kind: &str) -> Option<ToolEffect> {
+        ReadOp::all()
+            .into_iter()
+            .find(|op| op.kind() == kind)
+            .map(|op| op.effect())
+    }
+}
+
+impl ActOp {
+    /// Builds an action from the flat parameters. Same refusal discipline as its reading sibling.
+    pub fn from_request(request: ActRequest) -> Result<Self, String> {
+        let ActRequest {
+            operation,
+            repo,
+            id,
+            title,
+            body,
+            base,
+            head,
+            workflow,
+            git_ref,
+            args,
+        } = request;
+        let operation = operation.trim().to_ascii_lowercase();
+        // `raw` is settled before the repository is, because it is the one operation that names no
+        // repository — asking for one first would refuse it for a field it does not have.
+        if operation == "raw" {
+            let args = args.unwrap_or_default();
+            if args.is_empty() {
+                return Err("raw needs at least an endpoint in args".to_owned());
+            }
+            return Ok(ActOp::Raw { args });
+        }
+        let repo = Repo::new(&required(repo, &operation, "repository")?)?;
+        match operation.as_str() {
+            "workflow_run" => Ok(ActOp::WorkflowRun {
+                repo,
+                workflow: WorkflowName::new(&required(workflow, "workflow_run", "workflow")?)?,
+                r#ref: Branch::new(&required(git_ref, "workflow_run", "ref")?)?,
+            }),
+            "run_rerun" => Ok(ActOp::RunRerun {
+                repo,
+                id: RunId::new(&required(id, "run_rerun", "run id")?)?,
+            }),
+            "pr_create" => Ok(ActOp::PrCreate {
+                repo,
+                title: Title::new(&required(title, "pr_create", "title")?)?,
+                body: Body::new(&required(body, "pr_create", "body")?)?,
+                base: Branch::new(&required(base, "pr_create", "base branch")?)?,
+                head: Branch::new(&required(head, "pr_create", "head branch")?)?,
+            }),
+            "pr_comment" => Ok(ActOp::PrComment {
+                repo,
+                number: PrNumber::new(&required(id, "pr_comment", "pull request number")?)?,
+                body: Body::new(&required(body, "pr_comment", "body")?)?,
+            }),
+            "issue_close" => Ok(ActOp::IssueClose {
+                repo,
+                number: IssueNumber::new(&required(id, "issue_close", "issue number")?)?,
+            }),
+            other if ReadOp::all().iter().any(|op| op.kind() == other) => Err(format!(
+                "{other} only reads, so it belongs to github_read and not to github_act"
+            )),
+            other => Err(format!("unknown operation: {other}")),
+        }
     }
 }
 
@@ -1218,6 +1403,135 @@ fn clip(text: &str) -> String {
     format!("[... clipped to the last {MAX_OUTPUT_BYTES} characters ...]\n{kept}")
 }
 
+/// What a door gets back: the operation ran, or it is waiting for a person.
+///
+/// **Neither outcome blocks the caller**, and that is the decision rather than a convenience. An
+/// item waiting on a human would be a run sitting in `working` for days, holding a concurrency slot
+/// and counting against the ceiling — so filing answers immediately and the turn carries on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submitted {
+    Ran(Outcome),
+    Filed {
+        proposal_id: i64,
+        kind: &'static str,
+    },
+}
+
+/// Something went wrong deciding what to do, as opposed to doing it.
+#[derive(Debug)]
+pub enum DecisionError {
+    NotFound,
+    NotPending,
+    /// The proposal carries nothing this module can read as an operation.
+    Malformed,
+    /// It was claimed and then `gh` would not run it.
+    Failed(Failure),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for DecisionError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+/// The single place that answers "does this run now, or does it wait for a person".
+///
+/// Shared by the HTTP route and by whatever internal trigger comes later, because two copies of this
+/// decision is how the tool and the trigger would come to disagree about the same `.ai/github.yaml`.
+///
+/// **A READ never files a proposal, and that is not an omission.** What limits reads is the EFFECT
+/// (`ReadOp::effect`) and not the autonomy list: a read that returns a stranger's prose marks the
+/// turn and burns its right to act, which is a stronger and more precise brake than an approval
+/// prompt would be. `autonomous_actions` governs the acting half alone, and the acting half is the
+/// only half whose refusal has anywhere to go.
+pub async fn submit(
+    pool: &sqlx::SqlitePool,
+    runtime: &GithubRuntime,
+    op: Op,
+) -> Result<Submitted, Failure> {
+    if !runtime.enabled {
+        return Err(Failure::NotConfigured);
+    }
+    let acting = match &op {
+        Op::Read(_) => None,
+        Op::Act(act) => Some(act.clone()),
+    };
+    let Some(act) = acting else {
+        return execute(runtime, &op).await.map(Submitted::Ran);
+    };
+    if runtime.policy.action_is_autonomous(act.kind()) {
+        return execute(runtime, &op).await.map(Submitted::Ran);
+    }
+
+    let payload = serde_json::to_string(&op)
+        .map_err(|error| Failure::Unknown(format!("the operation could not be recorded: {error}")))?;
+    let proposal_id = crate::proposals::create_github_action(pool, act.kind(), &act.describe(), &payload)
+        .await
+        .map_err(|error| {
+            tracing::warn!(kind = act.kind(), %error, "filing a github action for approval failed");
+            Failure::Unknown("the operation could not be filed for approval".to_owned())
+        })?;
+    Ok(Submitted::Filed {
+        proposal_id,
+        kind: act.kind(),
+    })
+}
+
+/// Runs a `github-action` a person has just approved.
+///
+/// **The claim comes BEFORE the run, and the order is the safety argument.** Marking first means a
+/// second approval racing this one loses at the compare-and-set and cannot post the same comment
+/// twice; the cost is that a `gh` failure leaves a row reading `approved` with nothing published,
+/// which the note beneath it says in words. The other order trades a readable row for a double post,
+/// and `execute` deliberately never retries for the same reason.
+///
+/// The outcome goes on the proposal's own row rather than into a table of its own — see `Outcome`.
+pub async fn approve_proposed_operation(
+    pool: &sqlx::SqlitePool,
+    runtime: &GithubRuntime,
+    proposal_id: i64,
+) -> Result<Outcome, DecisionError> {
+    let proposal = crate::proposals::get(pool, proposal_id)
+        .await?
+        .ok_or(DecisionError::NotFound)?;
+    if proposal.kind != "github-action" || proposal.status != "pending" {
+        return Err(DecisionError::NotPending);
+    }
+    let op: Op = proposal
+        .tool_input
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .ok_or(DecisionError::Malformed)?;
+    // Read back through the same validating `Deserialize` every other route in, so a row edited by
+    // hand in the database cannot put a dashed string on a command line months later.
+
+    if !crate::proposals::transition(pool, proposal_id, "approved", "approved by user").await? {
+        return Err(DecisionError::NotPending);
+    }
+
+    match execute(runtime, &op).await {
+        Ok(outcome) => {
+            let note = match outcome.exit_code {
+                Some(0) => format!("gh {} ran and succeeded", outcome.kind),
+                Some(code) => format!("gh {} ran and exited {code}", outcome.kind),
+                None => format!("gh {} was terminated by a signal", outcome.kind),
+            };
+            crate::proposals::note(pool, proposal_id, &note).await?;
+            Ok(outcome)
+        }
+        Err(failure) => {
+            crate::proposals::note(
+                pool,
+                proposal_id,
+                &format!("gh {} did not run: {failure}", op.kind()),
+            )
+            .await?;
+            Err(DecisionError::Failed(failure))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1928,228 @@ mod tests {
         assert!(clipped.starts_with("[... clipped"));
         assert!(clipped.ends_with('\u{e1}'));
         assert!(!clipped.contains('\u{fffd}'));
+    }
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn runtime_with(actions: &[&str]) -> GithubRuntime {
+        GithubRuntime::from_config(
+            &GithubConfig {
+                enabled: true,
+                autonomous_reads: Vec::new(),
+                autonomous_actions: actions.iter().map(|entry| (*entry).to_owned()).collect(),
+            },
+            true,
+        )
+    }
+
+    /// A caller that asks the wrong tool is told SO, rather than being told it invented a word.
+    /// Told "unknown operation: pr_comment" it would go looking for a typo in its own request; told
+    /// where the operation lives it sends it there.
+    #[test]
+    fn from_request_says_which_tool_an_operation_belongs_to() {
+        let asked_read_for_an_action = ReadOp::from_request(ReadRequest {
+            operation: "pr_comment".to_owned(),
+            repo: "owner/name".to_owned(),
+            id: Some("1".to_owned()),
+        });
+        assert!(
+            asked_read_for_an_action
+                .unwrap_err()
+                .contains("belongs to github_act")
+        );
+
+        let asked_act_for_a_read = ActOp::from_request(ActRequest {
+            operation: "pr_view".to_owned(),
+            repo: Some("owner/name".to_owned()),
+            id: Some("1".to_owned()),
+            ..ActRequest::default()
+        });
+        assert!(
+            asked_act_for_a_read
+                .unwrap_err()
+                .contains("belongs to github_read")
+        );
+
+        let nonsense = ReadOp::from_request(ReadRequest {
+            operation: "frobnicate".to_owned(),
+            repo: "owner/name".to_owned(),
+            id: None,
+        });
+        assert!(nonsense.unwrap_err().contains("unknown read operation"));
+    }
+
+    /// A missing field names itself, and `raw` is settled before the repository is — otherwise the
+    /// one operation that names no repository would be refused for not having one.
+    #[test]
+    fn from_request_names_the_field_it_is_missing() {
+        let missing = ActOp::from_request(ActRequest {
+            operation: "pr_comment".to_owned(),
+            repo: Some("owner/name".to_owned()),
+            id: Some("1".to_owned()),
+            ..ActRequest::default()
+        });
+        assert!(missing.unwrap_err().contains("body"));
+
+        let raw = ActOp::from_request(ActRequest {
+            operation: "raw".to_owned(),
+            args: Some(vec!["repos/o/r".to_owned()]),
+            ..ActRequest::default()
+        });
+        assert_eq!(raw.expect("raw needs no repository").kind(), "raw");
+    }
+
+    /// `effect_of_kind` and `effect()` are one answer, because the first is derived from the same
+    /// list the second is exhaustive over.
+    #[test]
+    fn the_effect_of_a_kind_is_the_effect_of_the_operation() {
+        for op in ReadOp::all() {
+            assert_eq!(ReadOp::effect_of_kind(op.kind()), Some(op.effect()));
+        }
+        assert_eq!(ReadOp::effect_of_kind("pr_comment"), None);
+        assert_eq!(ReadOp::effect_of_kind(""), None);
+    }
+
+    /// **Off the list is not refused — it is filed, and the turn carries on.** That is the whole
+    /// reading of this pillar, and a version that answered "denied" would be a different product.
+    #[tokio::test]
+    async fn an_action_off_the_list_is_filed_and_never_refused() {
+        let pool = test_pool().await;
+        let runtime = runtime_with(&["run_rerun"]);
+        let op = Op::Act(ActOp::PrComment {
+            repo: repo(),
+            number: PrNumber::new("42").expect("42 is a number"),
+            body: Body::new("a comment").expect("a body"),
+        });
+
+        let submitted = submit(&pool, &runtime, op).await.expect("filing succeeds");
+        let Submitted::Filed { proposal_id, kind } = submitted else {
+            panic!("an operation off the list must be filed, never run");
+        };
+        assert_eq!(kind, "pr_comment");
+
+        let proposal = crate::proposals::get(&pool, proposal_id)
+            .await
+            .expect("the proposal is readable")
+            .expect("the proposal exists");
+        assert_eq!(proposal.kind, "github-action");
+        assert_eq!(proposal.status, "pending");
+        assert_eq!(
+            proposal.tool_name.as_deref(),
+            Some("pr_comment"),
+            "the column the approvals list renders has to say what is being agreed to"
+        );
+    }
+
+    /// A read never files, whatever the action list says. What limits reads is the effect and not
+    /// the autonomy, and a read that queued for approval would be the two mixed up.
+    #[tokio::test]
+    async fn a_read_never_becomes_a_proposal() {
+        let pool = test_pool().await;
+        // Switched off, so `execute` refuses before spawning anything and the test needs no `gh`.
+        // What is under test is which BRANCH a read takes, and the refusal proves it took the one
+        // that executes rather than the one that files.
+        let runtime = GithubRuntime {
+            enabled: false,
+            configured: true,
+            policy: Policy::empty(),
+        };
+        let op = Op::Read(ReadOp::PrView {
+            repo: repo(),
+            number: PrNumber::new("42").expect("42 is a number"),
+        });
+        assert_eq!(
+            submit(&pool, &runtime, op).await,
+            Err(Failure::NotConfigured)
+        );
+        // Counted straight out of the table and not through `list_pending`, which filters
+        // `kind = 'action-approval'` — asking it would have passed whether or not a row was written.
+        let filed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'github-action'")
+                .fetch_one(&pool)
+                .await
+                .expect("the table is readable");
+        assert_eq!(filed, 0, "a read may never become a proposal");
+    }
+
+    /// **The claim comes before the run.** A second approval racing the first loses at the
+    /// compare-and-set, which is what stops one comment being posted twice — and `execute` never
+    /// retrying is the same argument from the other end.
+    ///
+    /// The pillar is switched off so `gh` is never spawned: what is under test is the ORDER of the
+    /// two writes, and a failure to run is the sharpest way to see it. The row is `approved` with
+    /// nothing published, and the note beneath it says so in words.
+    #[tokio::test]
+    async fn approving_claims_the_proposal_before_running_it() {
+        let pool = test_pool().await;
+        let op = Op::Act(ActOp::PrComment {
+            repo: repo(),
+            number: PrNumber::new("42").expect("42 is a number"),
+            body: Body::new("a comment").expect("a body"),
+        });
+        let Submitted::Filed { proposal_id, .. } = submit(&pool, &runtime_with(&[]), op)
+            .await
+            .expect("filing succeeds")
+        else {
+            panic!("it should have been filed");
+        };
+
+        let off = GithubRuntime {
+            enabled: false,
+            configured: true,
+            policy: Policy::empty(),
+        };
+        let ran = approve_proposed_operation(&pool, &off, proposal_id).await;
+        assert!(
+            matches!(ran, Err(DecisionError::Failed(Failure::NotConfigured))),
+            "the operation could not run, and that is what the caller is told"
+        );
+
+        let proposal = crate::proposals::get(&pool, proposal_id)
+            .await
+            .expect("the proposal is readable")
+            .expect("the proposal exists");
+        assert_eq!(
+            proposal.status, "approved",
+            "the claim is what stops a second approval posting the same comment again"
+        );
+
+        assert!(
+            matches!(
+                approve_proposed_operation(&pool, &off, proposal_id).await,
+                Err(DecisionError::NotPending)
+            ),
+            "a second approval must lose at the status check"
+        );
+    }
+
+    /// A proposal whose payload is not an operation is refused rather than guessed at, and it is
+    /// refused by the same validating `Deserialize` every other road in uses — so a row edited by
+    /// hand in the database months later cannot put a dashed string on a command line.
+    #[tokio::test]
+    async fn a_proposal_carrying_no_usable_operation_is_refused() {
+        let pool = test_pool().await;
+        for payload in [
+            "not json at all",
+            r#"{"op":"pr_comment","repo":"--upload-pack=x","number":"1","body":"hi"}"#,
+            r#"{"op":"no_such_operation"}"#,
+        ] {
+            let proposal_id =
+                crate::proposals::create_github_action(&pool, "pr_comment", "why", payload)
+                    .await
+                    .expect("the proposal is written");
+            assert!(
+                matches!(
+                    approve_proposed_operation(&pool, &runtime_with(&[]), proposal_id).await,
+                    Err(DecisionError::Malformed)
+                ),
+                "{payload}"
+            );
+        }
     }
 
     /// The ceilings hold to the operations. An `ACTION_CEILING` entry naming a kind no `ActOp` has

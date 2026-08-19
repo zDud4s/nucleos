@@ -527,6 +527,61 @@ impl DaemonClient {
         }
     }
 
+    /// Reads something from GitHub, through the daemon that holds the credential.
+    ///
+    /// The flat parameters become a typed `ReadOp` HERE, before anything is sent, so a bad
+    /// repository comes back as a sentence naming the field rather than as a bare 400. The route
+    /// validates again on the way in — the same check on every road, which is what
+    /// `github`'s validating `Deserialize` exists for.
+    pub async fn github_read(
+        &self,
+        operation: String,
+        repo: String,
+        id: Option<String>,
+    ) -> Result<Value, String> {
+        let op = crate::github::ReadOp::from_request(crate::github::ReadRequest {
+            operation,
+            repo,
+            id,
+        })?;
+        self.github_request(&crate::github::Op::Read(op)).await
+    }
+
+    /// Asks GitHub for something that changes it.
+    ///
+    /// The answer says which of two things happened — `ran`, or `filed_for_approval` with the number
+    /// a person will see beside it. **Neither blocks**, and the caller is meant to read the status
+    /// rather than assume the first.
+    pub async fn github_act(&self, request: crate::github::ActRequest) -> Result<Value, String> {
+        let op = crate::github::ActOp::from_request(request)?;
+        self.github_request(&crate::github::Op::Act(op)).await
+    }
+
+    /// The one request both halves make.
+    ///
+    /// A refusal here carries a message in its body (`submit_github_request` answers
+    /// `(StatusCode, String)`), unlike `/vcs/requests` where the status IS the message — so the body
+    /// is read first and the status is only the fallback. Told "no github token is stored", a caller
+    /// knows what to do; told "403", it guesses.
+    async fn github_request(&self, op: &crate::github::Op) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/github/requests")
+            .json(&serde_json::json!({ "op": op }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(if body.trim().is_empty() {
+                format!("the daemon refused the request: {status}")
+            } else {
+                body
+            });
+        }
+        serde_json::from_str(&body).map_err(|error| error.to_string())
+    }
+
     /// One queued operation's ticket: what was asked for and how it ended. `wait` spends up to the
     /// daemon's ceiling waiting for it to finish; without it the answer is whatever the row says now.
     pub async fn vcs_ticket(&self, id: i64, wait: bool) -> Result<Value, String> {

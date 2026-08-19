@@ -139,6 +139,49 @@ struct BrowserHandoffParams {
     reason: String,
 }
 
+/// A read of GitHub, flat.
+///
+/// Flat rather than the tagged union `github::ReadOp` serialises to, for the reason
+/// `vcs::Op::from_request` gives: the caller is a model reading a description, and the union is the
+/// right wire shape and the wrong prompt.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct GithubReadParams {
+    /// One of: run_list, pr_list, run_status, run_logs, pr_view, issue_view.
+    operation: String,
+    /// The repository, as owner/name.
+    repo: String,
+    /// A run id for run_status and run_logs, a number for pr_view and issue_view. The two listings
+    /// take none.
+    id: Option<String>,
+}
+
+/// An action on GitHub, flat. Wider than its reading sibling because the operations are.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct GithubActParams {
+    /// One of: workflow_run, run_rerun, pr_create, pr_comment, issue_close, raw.
+    operation: String,
+    /// The repository, as owner/name. Every operation but raw needs one.
+    repo: Option<String>,
+    /// A run id for run_rerun, a number for pr_comment and issue_close.
+    id: Option<String>,
+    /// pr_create only.
+    title: Option<String>,
+    /// The text of a comment, or a pull request's description.
+    body: Option<String>,
+    /// pr_create: the branch being merged INTO.
+    base: Option<String>,
+    /// pr_create: the branch being merged FROM.
+    head: Option<String>,
+    /// workflow_run: the workflow's display name, file name or id.
+    workflow: Option<String>,
+    /// workflow_run: the branch or tag to run it on.
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
+    /// raw only: the arguments to `gh api`, already separated. Never a command line — this module
+    /// splits nothing.
+    args: Option<Vec<String>>,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct VcsRequestParams {
     /// Which project's repository. Call list_projects if you do not know it.
@@ -542,6 +585,65 @@ impl NucleosTools {
                     source.as_deref(),
                     target.as_deref(),
                 )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read something from GitHub through NucleOS. Structural reads — run_list, \
+                       pr_list, run_status — cost the turn nothing. The three that return text \
+                       somebody else wrote — pr_view, issue_view, run_logs — MARK the turn, and \
+                       every acting tool is refused for the rest of it, this one included. That is \
+                       deliberate: read the prose when you need the prose, and do the acting first."
+    )]
+    async fn github_read(
+        &self,
+        Parameters(GithubReadParams {
+            operation,
+            repo,
+            id,
+        }): Parameters<GithubReadParams>,
+    ) -> String {
+        json_result(self.client.github_read(operation, repo, id).await)
+    }
+
+    #[tool(
+        description = "Do something on GitHub through NucleOS: workflow_run, run_rerun, pr_create, \
+                       pr_comment, issue_close, or raw for anything else via the REST API. The \
+                       núcleo runs it, never you. Whether it happens straight away or waits for a \
+                       person is the owner\'s to decide in .ai/github.yaml — an operation off that \
+                       list is FILED for approval and answers with a number, and your turn carries \
+                       on either way. Nothing here is ever refused outright for being off the list."
+    )]
+    async fn github_act(
+        &self,
+        Parameters(GithubActParams {
+            operation,
+            repo,
+            id,
+            title,
+            body,
+            base,
+            head,
+            workflow,
+            git_ref,
+            args,
+        }): Parameters<GithubActParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .github_act(crate::github::ActRequest {
+                    operation,
+                    repo,
+                    id,
+                    title,
+                    body,
+                    base,
+                    head,
+                    workflow,
+                    git_ref,
+                    args,
+                })
                 .await,
         )
     }
@@ -1034,6 +1136,21 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("get_email_queue", ToolEffect::ReadsUntrusted),
     ("get_kill", ToolEffect::ReadsOwn),
     ("get_run", ToolEffect::ReadsOwn),
+    // The GitHub pair, and their being TWO is a security boundary rather than an arrangement.
+    // `permitted_after_untrusted` reads this table by NAME and never calls `effect_of_call`, so a
+    // single tool would have had to be `ReadsOwn` for the argument-aware arm to run at all — and
+    // `ReadsOwn` passes that barrier. A turn that had read a stranger's PR body could then have
+    // written to GitHub. Split in two, `github_act` meets the barrier by name on both paths and
+    // `github_read` never acts, whatever its arguments say.
+    //
+    // `github_read` is `ReadsOwn` BY NAME ONLY: three of its six operations return prose somebody
+    // wrote, so `effect_of_call` asks the operation before it settles that one — exactly as it
+    // already does for `get_run` and `errand_files_read`.
+    //
+    // Both are deliberately outside `LOCAL_TOOLS`: the loop in `local_agent.rs` answers a person's
+    // chat, and nothing there has a repository in mind.
+    ("github_act", ToolEffect::Acts),
+    ("github_read", ToolEffect::ReadsOwn),
     ("list_files", ToolEffect::ReadsUntrusted),
     ("list_projects", ToolEffect::ReadsOwn),
     ("list_proposals", ToolEffect::ReadsOwn),
@@ -1422,8 +1539,33 @@ pub(crate) async fn effect_of_call(
     match tool {
         "get_run" => run_read_effect(pool, arguments).await,
         "errand_files_read" => errand_file_read_effect(pool, arguments, errand).await,
+        "github_read" => github_read_effect(arguments),
         _ => effect,
     }
+}
+
+/// `github_read`, resolved by which operation was named.
+///
+/// The only arm here that needs no database: which GitHub reads carry a stranger's prose is a
+/// property of the operation and not of any row, so `github::ReadOp::effect_of_kind` answers it
+/// outright.
+///
+/// **`github_act` deliberately has no arm.** It is `Acts` in the table, so `effect_of_call`
+/// short-circuits before reaching this match and its arguments are never read — which is correct,
+/// because every operation it accepts acts. An arm here would be unreachable code implying a
+/// question that has already been settled.
+///
+/// Unreadable arguments resolve to `ReadsUntrusted` and never to an error, and the direction is
+/// `errand_file_read_effect`'s: this runs before the `parsed!` macro that refuses malformed
+/// arguments, it returns a `ToolEffect` rather than a `Result`, and the question being asked is
+/// whether a stranger's words are about to enter the turn — where "I could not tell" is not "no".
+/// The malformed call is refused a moment later by `parsed!`, like any other.
+fn github_read_effect(arguments: &serde_json::Value) -> ToolEffect {
+    arguments
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::github::ReadOp::effect_of_kind)
+        .unwrap_or(ToolEffect::ReadsUntrusted)
 }
 
 /// `get_run`, resolved by which run was named.
@@ -2413,6 +2555,107 @@ mod tests {
             "a file a clean turn wrote is the errand's own work; if this is untrusted too the mark \
              carries no information"
         );
+    }
+
+    /// **The test that would have caught the regression.** With ONE GitHub tool, the half that
+    /// writes had to be `ReadsOwn` for the argument-aware arm to run at all — and `ReadsOwn` walks
+    /// straight through this barrier, so a turn that had read a stranger's PR body could go on to
+    /// comment on it.
+    ///
+    /// Asked of `permitted_after_untrusted`, which is where the mistake would have lived: it reads
+    /// `tool_effect` BY NAME and never consults `effect_of_call`, so no amount of care in the
+    /// arguments could have saved a single tool.
+    #[tokio::test]
+    async fn a_marked_turn_may_read_github_and_may_not_act_on_it() {
+        use crate::local_agent::ToolBox;
+
+        let pool = test_pool().await;
+        let toolbox =
+            LocalToolBox::new("http://127.0.0.1:1".to_string(), "unused".to_string(), pool);
+
+        assert!(
+            !toolbox.permitted_after_untrusted("github_act"),
+            "a turn holding a stranger\'s words must not be able to write to GitHub"
+        );
+        assert!(
+            toolbox.permitted_after_untrusted("github_read"),
+            "reading never acts, so the barrier has nothing to refuse it for"
+        );
+    }
+
+    /// The effect is per OPERATION, and it is `effect_of_call` that says so — never `tool_effect`,
+    /// which is the whole of the distinction.
+    ///
+    /// A PR body and an issue body are prose somebody wrote; a run's status and a list of numbers
+    /// are not. Getting this backwards in either direction is a failure: one way a turn keeps acting
+    /// with a stranger's words in it, the other way reading a status burns the turn for nothing.
+    #[tokio::test]
+    async fn pr_view_marks_the_turn_and_run_status_does_not() {
+        let pool = test_pool().await;
+
+        for operation in ["pr_view", "issue_view", "run_logs"] {
+            assert_eq!(
+                effect_of_call(
+                    &pool,
+                    "github_read",
+                    &serde_json::json!({"operation": operation, "repo": "o/r", "id": "1"}),
+                    None,
+                )
+                .await,
+                ToolEffect::ReadsUntrusted,
+                "{operation} returns text somebody else wrote"
+            );
+        }
+
+        for operation in ["run_status", "run_list", "pr_list"] {
+            assert_eq!(
+                effect_of_call(
+                    &pool,
+                    "github_read",
+                    &serde_json::json!({"operation": operation, "repo": "o/r", "id": "1"}),
+                    None,
+                )
+                .await,
+                ToolEffect::ReadsOwn,
+                "{operation} returns structure, and marking it would burn the turn for nothing"
+            );
+        }
+
+        // And the acting half never reaches the arm at all: it is `Acts` in the table, so
+        // `effect_of_call` short-circuits before any argument is read. Asserted with arguments that
+        // NAME A READ, because that is the shape of the mistake — an act that could be graded down
+        // by what it claims to be doing would be the barrier undone from the other side.
+        assert_eq!(
+            effect_of_call(
+                &pool,
+                "github_act",
+                &serde_json::json!({"operation": "run_status", "repo": "o/r"}),
+                None,
+            )
+            .await,
+            ToolEffect::Acts,
+        );
+    }
+
+    /// "I could not tell" is not "no". The direction is `errand_file_read_effect`'s, and the reason
+    /// it cannot be an error instead is structural: this runs before the `parsed!` macro that
+    /// refuses malformed arguments, and it returns a `ToolEffect` rather than a `Result`.
+    #[tokio::test]
+    async fn an_unreadable_github_operation_resolves_to_reads_untrusted() {
+        let pool = test_pool().await;
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"operation": 7}),
+            serde_json::json!({"operation": "no_such_operation"}),
+            serde_json::json!({"operation": "pr_comment"}),
+            serde_json::json!({"repo": "o/r"}),
+        ] {
+            assert_eq!(
+                effect_of_call(&pool, "github_read", &arguments, None).await,
+                ToolEffect::ReadsUntrusted,
+                "{arguments}"
+            );
+        }
     }
 
     /// The same rule from the side where it has to fail closed.
