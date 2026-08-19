@@ -192,6 +192,7 @@ pub fn build_router(state: AppState) -> Router {
         // is an agent writing into what agents are told, which is the governance question
         // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
         .route("/refinements", get(list_refinements).post(post_refinement))
+        .route("/refinements/{id}", get(get_refinement))
         .route("/refinements/{id}/revert", post(revert_refinement))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
@@ -4622,6 +4623,22 @@ async fn post_proposal_reject(
         };
     }
 
+    if kind == "refinement" {
+        // Unlike the calendar's refusal below, this one leaves a row: `refine::reject` marks the
+        // refinement `rejected` rather than dropping it, because what the agent kept trying to
+        // learn and was told no to is the record the layer's history exists to keep.
+        let state = state.clone();
+        let refused = uncancellable(async move { crate::refine::reject(&state.pool, id).await })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return match refused {
+            Ok(_) => Ok(StatusCode::NO_CONTENT),
+            Err(crate::refine::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::refine::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::refine::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        };
+    }
+
     if kind == "calendar-event" {
         // Refusing a suggested block leaves nothing behind: it is a suggestion declined, not a
         // meeting cancelled, so the calendar never learns it was offered.
@@ -4930,6 +4947,11 @@ struct ProposeRefinementRequest {
     /// Why this is worth telling every later run. Carried onto the proposal, because a person
     /// deciding at a glance needs the argument beside the text and not a screen away from it.
     reasoning: Option<String>,
+    /// The refinement this one replaces, if it is a correction of something already in force.
+    ///
+    /// Optional, and the difference matters: without it the layer only grows, and the answer to
+    /// "this note is wrong now" is a second note contradicting the first with both still in force.
+    supersedes: Option<i64>,
 }
 
 /// The owner writing into the layer directly, which is the door that exists today.
@@ -4940,30 +4962,52 @@ struct ProposeRefinementRequest {
 async fn post_refinement(
     State(state): State<AppState>,
     Json(request): Json<ProposeRefinementRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or(StatusCode::BAD_REQUEST)?;
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "kind must be one of prompt, memory, skill, subagent".to_owned(),
+    ))?;
     let title = request.title.trim();
     let body = request.body.trim();
     // A refinement with no words is an empty heading in every later prompt, for ever.
     if title.is_empty() || body.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a refinement needs both a title and a body".to_owned(),
+        ));
     }
     let (refinement_id, proposal_id) = crate::refine::propose(
         &state.pool,
-        request.project_id.as_deref(),
-        None,
-        kind,
-        title,
-        body,
-        request
-            .reasoning
-            .as_deref()
-            .unwrap_or("written by the owner"),
+        crate::refine::Declaration {
+            project_id: request.project_id.as_deref(),
+            origin_run_id: None,
+            kind,
+            title,
+            body,
+            reasoning: request
+                .reasoning
+                .as_deref()
+                .unwrap_or("written by the owner"),
+            supersedes: request.supersedes,
+        },
     )
     .await
-    .map_err(|error| {
-        tracing::warn!(%error, "proposing a refinement failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+    // Which precondition failed, rather than a bare status: a caller told only "409" has to guess
+    // between "that id is not there" and "that id is not yours", and the two have different fixes.
+    .map_err(|error| match error {
+        crate::refine::ProposeError::UnknownPredecessor(_) => {
+            (StatusCode::NOT_FOUND, error.to_string())
+        }
+        crate::refine::ProposeError::ForeignPredecessor(_) => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        crate::refine::ProposeError::Db(error) => {
+            tracing::warn!(%error, "proposing a refinement failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the refinement could not be written".to_owned(),
+            )
+        }
     })?;
     Ok((
         StatusCode::CREATED,
@@ -4993,6 +5037,26 @@ async fn list_refinements(
         tracing::warn!(%error, "listing refinements failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// One refinement, read the way a person decides about it: the text, every decision it has been
+/// through, what it replaced, and what replaced it.
+///
+/// The chain is the half `GET /refinements` cannot give you. A list answers "what is in force";
+/// this answers "what did it say before I changed it, and would I want that back" — which is the
+/// question somebody asks at the moment they are considering a revert.
+async fn get_refinement(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::refine::History>, StatusCode> {
+    match crate::refine::history(&state.pool, id).await {
+        Ok(Some(history)) => Ok(Json(history)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(refinement_id = id, %error, "reading a refinement's history failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Taking one back. The half that makes approving safe to do at all.

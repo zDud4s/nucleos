@@ -185,6 +185,55 @@ pub async fn active_for(
 /// How many approved refinements are read before rendering ever begins.
 const MAX_READ: usize = 200;
 
+/// What somebody is asking the layer to learn.
+///
+/// A struct and not eight positional arguments: the call site of the earlier shape was four string
+/// literals in a row, where swapping `title` and `body` compiles, passes, and is found by a person
+/// reading a strange prompt a week later.
+pub struct Declaration<'a> {
+    pub project_id: Option<&'a str>,
+    pub origin_run_id: Option<i64>,
+    pub kind: Kind,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub reasoning: &'a str,
+    /// The refinement this one replaces — ended if and when THIS one is approved, never before.
+    pub supersedes: Option<i64>,
+}
+
+/// The two things a declaration can say that the layer must refuse.
+#[derive(Debug)]
+pub enum ProposeError {
+    Db(sqlx::Error),
+    /// `supersedes` names a refinement that is not there — a chain nobody could read back.
+    UnknownPredecessor(i64),
+    /// `supersedes` names a refinement in another scope. Refused because it is the one column that
+    /// writes across the project boundary the rest of this module exists to hold.
+    ForeignPredecessor(i64),
+}
+
+impl std::fmt::Display for ProposeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProposeError::Db(error) => write!(formatter, "{error}"),
+            ProposeError::UnknownPredecessor(id) => {
+                write!(formatter, "there is no refinement {id} to replace")
+            }
+            ProposeError::ForeignPredecessor(id) => {
+                write!(formatter, "refinement {id} belongs to another project")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProposeError {}
+
+impl From<sqlx::Error> for ProposeError {
+    fn from(error: sqlx::Error) -> Self {
+        ProposeError::Db(error)
+    }
+}
+
 /// A run declaring something it thinks the next run should know.
 ///
 /// Writes the refinement `proposed` AND the proposal that asks about it, in one transaction — the
@@ -196,24 +245,46 @@ const MAX_READ: usize = 200;
 /// keeping — it is how somebody later sees what the agent kept trying to learn and was told no to.
 pub async fn propose(
     pool: &SqlitePool,
-    project_id: Option<&str>,
-    origin_run_id: Option<i64>,
-    kind: Kind,
-    title: &str,
-    body: &str,
-    reasoning: &str,
-) -> sqlx::Result<(i64, i64)> {
+    declaration: Declaration<'_>,
+) -> Result<(i64, i64), ProposeError> {
+    let Declaration {
+        project_id,
+        origin_run_id,
+        kind,
+        title,
+        body,
+        reasoning,
+        supersedes,
+    } = declaration;
+
+    // Checked before anything is written, and checked here rather than left to the foreign key:
+    // SQLite would accept a link to another project's row without a word, and the failure would
+    // surface as one repository's history quietly containing another's.
+    if let Some(predecessor) = supersedes {
+        let owner: Option<Option<String>> =
+            sqlx::query_scalar("SELECT project_id FROM refinements WHERE id = ?")
+                .bind(predecessor)
+                .fetch_optional(pool)
+                .await?;
+        let owner = owner.ok_or(ProposeError::UnknownPredecessor(predecessor))?;
+        if owner.as_deref() != project_id {
+            return Err(ProposeError::ForeignPredecessor(predecessor));
+        }
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
     let refinement_id = sqlx::query(
-        "INSERT INTO refinements (project_id, kind, title, body, status, origin_run_id, created_at)
-         VALUES (?, ?, ?, ?, 'proposed', ?, ?)",
+        "INSERT INTO refinements
+           (project_id, kind, title, body, status, supersedes, origin_run_id, created_at)
+         VALUES (?, ?, ?, ?, 'proposed', ?, ?, ?)",
     )
     .bind(project_id)
     .bind(kind.as_str())
     .bind(title)
     .bind(body)
+    .bind(supersedes)
     .bind(origin_run_id)
     .bind(&now)
     .execute(&mut *tx)
@@ -237,6 +308,10 @@ pub async fn propose(
         "kind": kind.as_str(),
         "title": title,
         "body": body,
+        // Carried so the question reads as what it is. "Approve this note" and "approve this note
+        // INSTEAD of the one you approved in March" are different decisions, and only one of them
+        // costs you something you already have.
+        "supersedes": supersedes,
     })
     .to_string();
 
@@ -281,11 +356,12 @@ pub enum DecisionError {
     Malformed,
 }
 
-/// A person said yes, and only now does anything reach a prompt.
+/// Which refinement a pending proposal is asking about, or why it is not answerable.
 ///
-/// One transaction, like the calendar's: a dropped request must not leave the proposal and the
-/// layer disagreeing about whether the agent was allowed to learn something.
-pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, DecisionError> {
+/// Shared by both answers deliberately: a yes and a no must agree about what counts as a question,
+/// or the pair drifts into a proposal that can be approved and not refused — which is exactly what
+/// this layer shipped with, `proposals::reject_proposal` taking `action-approval` alone.
+async fn pending_refinement(pool: &SqlitePool, proposal_id: i64) -> Result<i64, DecisionError> {
     let row: Option<(String, String, Option<String>)> =
         sqlx::query_as("SELECT kind, status, tool_input FROM proposals WHERE id = ?")
             .bind(proposal_id)
@@ -299,7 +375,7 @@ pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, Decisio
     if status != "pending" {
         return Err(DecisionError::NotPending);
     }
-    let refinement_id = tool_input
+    tool_input
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .and_then(|value| {
@@ -307,7 +383,15 @@ pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, Decisio
                 .get("refinement_id")
                 .and_then(serde_json::Value::as_i64)
         })
-        .ok_or(DecisionError::Malformed)?;
+        .ok_or(DecisionError::Malformed)
+}
+
+/// A person said yes, and only now does anything reach a prompt.
+///
+/// One transaction, like the calendar's: a dropped request must not leave the proposal and the
+/// layer disagreeing about whether the agent was allowed to learn something.
+pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, DecisionError> {
+    let refinement_id = pending_refinement(pool, proposal_id).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await.map_err(|_| DecisionError::NotFound)?;
@@ -337,6 +421,41 @@ pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, Decisio
     .await
     .map_err(|_| DecisionError::NotFound)?;
 
+    // The chain moves here and nowhere else. A successor that ended its predecessor when it was
+    // merely *declared* would let a question nobody answered delete the answer already in force,
+    // so the old text stands until the moment somebody chooses the new one over it.
+    let predecessor: Option<i64> =
+        sqlx::query_scalar("SELECT supersedes FROM refinements WHERE id = ?")
+            .bind(refinement_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| DecisionError::NotFound)?;
+    if let Some(predecessor) = predecessor {
+        let ended = sqlx::query(
+            "UPDATE refinements SET status = 'superseded', ended_at = ?
+              WHERE id = ? AND status = 'active'",
+        )
+        .bind(&now)
+        .bind(predecessor)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| DecisionError::NotFound)?;
+        // Not an error when it matches nothing: the predecessor may have been reverted while this
+        // successor waited for an answer, and what the person just approved is still approved.
+        if ended.rows_affected() == 1 {
+            sqlx::query(
+                "INSERT INTO refinement_events (refinement_id, from_status, to_status, note, at)
+                 VALUES (?, 'active', 'superseded', ?, ?)",
+            )
+            .bind(predecessor)
+            .bind(format!("replaced by refinement {refinement_id}"))
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| DecisionError::NotFound)?;
+        }
+    }
+
     sqlx::query("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?")
         .bind(&now)
         .bind(proposal_id)
@@ -347,6 +466,65 @@ pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, Decisio
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
          VALUES (?, 'pending', 'approved', 'refinement activated', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| DecisionError::NotFound)?;
+
+    tx.commit().await.map_err(|_| DecisionError::NotFound)?;
+    Ok(refinement_id)
+}
+
+/// A person said no, and the refusal is kept.
+///
+/// The layer shipped without this and it was not a missing nicety: `proposals::reject_proposal`
+/// answers `action-approval` alone, so a refinement proposal had one button. A queue you can only
+/// say yes to is a queue where everything is eventually approved — and the thing being approved
+/// here is what every later run is told.
+///
+/// `rejected` and not deleted, for the reason the module's own doc gives: what the agent kept
+/// trying to learn and was told no to is a record worth having.
+pub async fn reject(pool: &SqlitePool, proposal_id: i64) -> Result<i64, DecisionError> {
+    let refinement_id = pending_refinement(pool, proposal_id).await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await.map_err(|_| DecisionError::NotFound)?;
+
+    let refused = sqlx::query(
+        "UPDATE refinements SET status = 'rejected', ended_at = ?
+          WHERE id = ? AND status = 'proposed'",
+    )
+    .bind(&now)
+    .bind(refinement_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| DecisionError::NotFound)?;
+    if refused.rows_affected() != 1 {
+        return Err(DecisionError::NotPending);
+    }
+
+    sqlx::query(
+        "INSERT INTO refinement_events (refinement_id, from_status, to_status, note, at)
+         VALUES (?, 'proposed', 'rejected', 'refused by the owner', ?)",
+    )
+    .bind(refinement_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| DecisionError::NotFound)?;
+
+    sqlx::query("UPDATE proposals SET status = 'rejected', decided_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(proposal_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| DecisionError::NotFound)?;
+
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, 'pending', 'rejected', 'refinement refused', ?)",
     )
     .bind(proposal_id)
     .bind(&now)
@@ -387,6 +565,97 @@ pub async fn revert(pool: &SqlitePool, refinement_id: i64, note: &str) -> sqlx::
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// One decision in a refinement's life, as a person reads it back.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct Event {
+    pub id: i64,
+    pub from_status: Option<String>,
+    pub to_status: String,
+    pub note: Option<String>,
+    pub at: String,
+}
+
+/// What this says, what it said before, and what replaced it — the reviewable history the whole
+/// layer is for, in one answer.
+///
+/// One call and not three, because the three are only useful together: "revert this" is a decision
+/// a person makes by reading the text that would come back, and a screen that made them fetch it
+/// separately is a screen where they revert without having read it.
+#[derive(Debug, Serialize)]
+pub struct History {
+    pub refinement: Refinement,
+    pub events: Vec<Event>,
+    /// Newest first: what this one replaced, then what THAT replaced, back to the first text.
+    pub replaced: Vec<Refinement>,
+    /// What replaced this one, if a person has approved a successor.
+    pub replaced_by: Option<Refinement>,
+}
+
+/// How far back a chain is read before the walk stops and says no more.
+const MAX_CHAIN: usize = 50;
+
+/// Read one refinement, its own decisions, and the chain on both sides of it.
+pub async fn history(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<History>> {
+    let Some(refinement) = fetch(pool, id).await? else {
+        return Ok(None);
+    };
+
+    let events = sqlx::query_as::<_, Event>(
+        "SELECT id, from_status, to_status, note, at
+           FROM refinement_events WHERE refinement_id = ? ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut replaced: Vec<Refinement> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::from([id]);
+    let mut next = refinement.supersedes;
+    while let Some(previous) = next {
+        // No path through this module can write a cycle — a predecessor must already exist, so
+        // links only ever point backwards — but this is a loop over data, and a loop over data that
+        // trusts it terminates until the day the data is wrong, and then it hangs the daemon
+        // holding the connection instead of returning a poor answer.
+        if !seen.insert(previous) || replaced.len() >= MAX_CHAIN {
+            break;
+        }
+        let Some(row) = fetch(pool, previous).await? else {
+            break;
+        };
+        next = row.supersedes;
+        replaced.push(row);
+    }
+
+    // The newest successor, because a chain forked by two proposals approved out of order is a
+    // thing SQLite will happily store and a person should still be able to read.
+    let replaced_by = sqlx::query_as::<_, Refinement>(
+        "SELECT id, project_id, kind, title, body, status, proposal_id, supersedes, origin_run_id,
+                created_at, activated_at, ended_at
+           FROM refinements WHERE supersedes = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(Some(History {
+        refinement,
+        events,
+        replaced,
+        replaced_by,
+    }))
+}
+
+async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Refinement>> {
+    sqlx::query_as::<_, Refinement>(
+        "SELECT id, project_id, kind, title, body, status, proposal_id, supersedes, origin_run_id,
+                created_at, activated_at, ended_at
+           FROM refinements WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 #[cfg(test)]
@@ -460,12 +729,16 @@ mod tests {
         let pool = test_pool().await;
         let (refinement_id, proposal_id) = propose(
             &pool,
-            Some("mine"),
-            Some(900_001),
-            Kind::Memory,
-            "The suite needs Git's usr/bin on PATH",
-            "Nine tests spawn echo as a program and Windows has no real echo.exe but Git's.",
-            "learned it the hard way in this run",
+            Declaration {
+                project_id: Some("mine"),
+                origin_run_id: Some(900_001),
+                kind: Kind::Memory,
+                title: "The suite needs Git's usr/bin on PATH",
+                body: "Nine tests spawn echo as a program and Windows has no real echo.exe but \
+                       Git's.",
+                reasoning: "learned it the hard way in this run",
+                supersedes: None,
+            },
         )
         .await
         .unwrap();
@@ -618,6 +891,239 @@ mod tests {
         assert!(
             render(&[waiting, taken_back]).is_none(),
             "a refinement nobody approved reached a node's prompt"
+        );
+    }
+
+    /// A short way to say "somebody declared this", so the tests below read as the sequence they
+    /// assert rather than as seven fields of noise repeated four times.
+    async fn declare(
+        pool: &sqlx::SqlitePool,
+        project: Option<&str>,
+        title: &str,
+        replaces: Option<i64>,
+    ) -> Result<(i64, i64), ProposeError> {
+        propose(
+            pool,
+            Declaration {
+                project_id: project,
+                origin_run_id: None,
+                kind: Kind::Prompt,
+                title,
+                body: "body",
+                reasoning: "because",
+                supersedes: replaces,
+            },
+        )
+        .await
+    }
+
+    /// The column the migration argued for, asserted at the moment it means anything: **approving
+    /// the successor** is what ends the predecessor, and nothing before that does.
+    ///
+    /// The middle assertion is the one worth the test. A successor that ended the old text the
+    /// moment it was *declared* would let a rejected proposal delete what it failed to replace —
+    /// the layer would lose a lesson by way of a question nobody said yes to.
+    #[tokio::test]
+    async fn approving_a_successor_is_what_ends_the_one_it_replaces() {
+        let pool = test_pool().await;
+        let (first, first_proposal) = declare(&pool, Some("mine"), "old text", None)
+            .await
+            .unwrap();
+        approve(&pool, first_proposal).await.unwrap();
+
+        let (second, second_proposal) = declare(&pool, Some("mine"), "new text", Some(first))
+            .await
+            .unwrap();
+        let live: Vec<i64> = active_for(&pool, Some("mine"))
+            .await
+            .unwrap()
+            .iter()
+            .map(|refinement| refinement.id)
+            .collect();
+        assert_eq!(
+            live,
+            vec![first],
+            "an unapproved successor already ended the text it wants to replace"
+        );
+
+        approve(&pool, second_proposal).await.unwrap();
+        let live: Vec<i64> = active_for(&pool, Some("mine"))
+            .await
+            .unwrap()
+            .iter()
+            .map(|refinement| refinement.id)
+            .collect();
+        assert_eq!(
+            live,
+            vec![second],
+            "both texts are in force at once, which is the pile the chain exists to prevent"
+        );
+
+        let (status, ended): (String, Option<String>) =
+            sqlx::query_as("SELECT status, ended_at FROM refinements WHERE id = ?")
+                .bind(first)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "superseded", "the predecessor kept a wrong status");
+        assert!(ended.is_some(), "the predecessor ended at no time at all");
+
+        // Named, not merely ended: "this stopped applying" and "this was replaced by that" are
+        // different things to read six months later, and only one of them can be acted on.
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM refinement_events WHERE refinement_id = ? AND to_status = 'superseded'",
+        )
+        .bind(first)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains(&second.to_string()),
+            "the history does not say what replaced it: {note}"
+        );
+    }
+
+    /// Two refusals that protect the same rule the scoping does. A successor naming nothing would
+    /// leave a dangling chain nobody can read back; a successor naming ANOTHER project's lesson
+    /// would let one repository end another's — the exact poisoning `project_id` exists to stop,
+    /// arriving through the one column that writes across the boundary.
+    #[tokio::test]
+    async fn a_successor_may_not_name_nothing_nor_another_projects_lesson() {
+        let pool = test_pool().await;
+        let (theirs, _) = declare(&pool, Some("theirs"), "their lesson", None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                declare(&pool, Some("mine"), "replaces a ghost", Some(4242)).await,
+                Err(ProposeError::UnknownPredecessor(4242))
+            ),
+            "a refinement was allowed to replace something that does not exist"
+        );
+        assert!(
+            matches!(
+                declare(&pool, Some("mine"), "reaches across", Some(theirs)).await,
+                Err(ProposeError::ForeignPredecessor(_))
+            ),
+            "one project was allowed to end another project's lesson"
+        );
+    }
+
+    /// Saying no, kept as a refusal rather than as an absence.
+    ///
+    /// Written after finding the layer shipped able to approve and unable to refuse — a queue with
+    /// one button is a queue where everything is eventually approved, and what is being approved
+    /// here is what every later run is told.
+    #[tokio::test]
+    async fn a_refused_lesson_is_kept_as_a_refusal_rather_than_deleted() {
+        let pool = test_pool().await;
+        let (refinement_id, proposal_id) = declare(&pool, Some("mine"), "not this one", None)
+            .await
+            .unwrap();
+
+        assert_eq!(reject(&pool, proposal_id).await.unwrap(), refinement_id);
+        let refused = fetch(&pool, refinement_id)
+            .await
+            .unwrap()
+            .expect("the refusal was deleted rather than recorded");
+        assert_eq!(refused.status, "rejected");
+        assert!(refused.ended_at.is_some(), "a refusal with no time on it");
+        assert!(
+            active_for(&pool, Some("mine")).await.unwrap().is_empty(),
+            "a refused lesson is reaching prompts"
+        );
+
+        // Answered once: a second refusal is a conflict, not a second decision written over the
+        // first. Same guard the approval carries, and asserted here because the two must agree.
+        assert_eq!(
+            reject(&pool, proposal_id).await,
+            Err(DecisionError::NotPending)
+        );
+        assert_eq!(
+            approve(&pool, proposal_id).await,
+            Err(DecisionError::NotPending),
+            "a refused proposal could still be approved afterwards"
+        );
+
+        let decided: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(decided, "rejected", "the question is still in the queue");
+    }
+
+    /// What the history screen reads: the chain back through every text this one replaced, and the
+    /// successor that replaced it, oldest question first — "what did this say before I changed it".
+    ///
+    /// The cycle at the end is forced with a raw UPDATE because no path in this module can create
+    /// one (a predecessor must already exist, so links only ever point backwards). It is asserted
+    /// anyway: a walk that trusts its data terminates until the day the data is wrong, and then it
+    /// hangs the daemon instead of returning a bad answer.
+    #[tokio::test]
+    async fn the_history_reads_back_through_everything_a_refinement_replaced() {
+        let pool = test_pool().await;
+        let (first, first_proposal) = declare(&pool, Some("mine"), "first text", None)
+            .await
+            .unwrap();
+        approve(&pool, first_proposal).await.unwrap();
+        let (second, second_proposal) = declare(&pool, Some("mine"), "second text", Some(first))
+            .await
+            .unwrap();
+        approve(&pool, second_proposal).await.unwrap();
+        let (third, third_proposal) = declare(&pool, Some("mine"), "third text", Some(second))
+            .await
+            .unwrap();
+        approve(&pool, third_proposal).await.unwrap();
+
+        // `middle` and not `history`: a local of the same name shadows the function, and the next
+        // call in this test reads as calling a struct.
+        let middle = history(&pool, second)
+            .await
+            .unwrap()
+            .expect("a refinement that exists has a history");
+        assert_eq!(middle.refinement.id, second);
+        assert_eq!(
+            middle.replaced.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first],
+            "the text this one replaced is not readable from it"
+        );
+        assert_eq!(
+            middle.replaced_by.as_ref().map(|r| r.id),
+            Some(third),
+            "the text that replaced this one is not readable from it"
+        );
+        // proposed → active → superseded, all three still there.
+        assert_eq!(
+            middle.events.len(),
+            3,
+            "the row's own history is incomplete: {:?}",
+            middle.events
+        );
+
+        assert!(
+            history(&pool, 4242).await.unwrap().is_none(),
+            "a refinement that does not exist reported a history"
+        );
+
+        sqlx::query("UPDATE refinements SET supersedes = ? WHERE id = ?")
+            .bind(third)
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let looped = history(&pool, third)
+            .await
+            .unwrap()
+            .expect("the walk returned rather than hanging");
+        let mut ids: Vec<i64> = looped.replaced.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            looped.replaced.len(),
+            "the walk went round the cycle and read a row twice"
         );
     }
 }
