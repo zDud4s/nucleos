@@ -177,6 +177,30 @@
   color: var(--text-faint);
 }
 
+/*
+ * What a session would NOT be able to do, said before it is picked up.
+ *
+ * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
+ * that will continue with less than you would expect, and the button beside it is the fix.
+ */
+.chats-new-notools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+}
+
+.chats-new-warning {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--tone-paused-fg);
+}
+
 /* ================================================================= detail == */
 
 .chats-detail-head {

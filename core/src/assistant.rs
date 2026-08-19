@@ -3063,4 +3063,37 @@ mod tests {
             Some("C:/Projects/nucleos-canvas".to_string()),
         );
     }
+
+    /// The one line that decides whether picking up a conversation gives you an agent or a
+    /// pen-friend — and the two halves of it, asserted together.
+    ///
+    /// A session had in a directory with no classifier hook continues on the MCP server alone: no
+    /// `Read`, no `Edit`, no `Bash`. That is not a bug, it is the barrier working — but it is also
+    /// why continuing a coding conversation could feel like nothing happened, and why the window
+    /// has to be able to fix it rather than only report it.
+    #[test]
+    fn wiring_a_project_is_what_turns_a_continued_conversation_from_talk_into_tools() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().to_str().unwrap();
+
+        assert_eq!(
+            tool_policy_for(
+                Some(dir),
+                Origin::Shell,
+                crate::autopilot::classifier_hook_is_wired(root.path())
+            ),
+            crate::runner::ToolPolicy::McpOnly,
+        );
+
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+
+        assert_eq!(
+            tool_policy_for(
+                Some(dir),
+                Origin::Shell,
+                crate::autopilot::classifier_hook_is_wired(root.path())
+            ),
+            crate::runner::ToolPolicy::Unrestricted,
+        );
+    }
 }

@@ -8,6 +8,7 @@ import {
   useCreateChat,
   useIdeConversation,
   useIdeSessions,
+  useWireIdeSessionTools,
   useLocalModel,
   usePatchChat,
   usePostChatSeen,
@@ -217,6 +218,7 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
   const ideSessions = useIdeSessions(true);
   const create = useCreateChat();
   const localUnavailable = localModel.data?.available === false;
+  const chosen = (ideSessions.data ?? []).find((session) => session.session_id === sessionId);
 
   return (
     <form
@@ -269,11 +271,61 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
         </select>
       </label>
 
+      {chosen !== undefined && !chosen.tools && <NoTools session={chosen} />}
+
       <Button type="submit" intent="go" disabled={create.isPending}>
         Start
       </Button>
       {create.isError && <CreateRefusal error={create.error} />}
     </form>
+  );
+}
+
+/**
+ * What a conversation continued in this session's project would NOT be able to do, and the one
+ * press that fixes it.
+ *
+ * The daemon hands a continued turn the project's tools only where its classifier hook is wired,
+ * and a directory without one — every fresh worktree, since `.claude/` is not committed — falls
+ * back to the MCP server alone. Continuing a coding conversation there gets a model that cannot
+ * open the file being discussed, and nothing said so until after the first turn came back.
+ *
+ * Said here rather than after the pick-up because here is where it can still change the decision:
+ * wire the project, or pick a different session, or go on knowing what you are getting.
+ */
+function NoTools({ session }: { session: IdeSession }) {
+  const wire = useWireIdeSessionTools();
+
+  return (
+    <div className="chats-new-notools">
+      <p className="chats-new-warning" role="status">
+        this session was had in a folder with no núcleo hook — continued here, it can talk about the
+        code but <b>cannot read or change any file</b>, and cannot run anything
+      </p>
+      <Button
+        type="button"
+        disabled={wire.isPending}
+        onClick={() => wire.mutate(session.session_id)}
+      >
+        Give it the tools
+      </Button>
+      {wire.isError && <WireRefusal error={wire.error} cwd={session.cwd} />}
+    </div>
+  );
+}
+
+function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — the folder was left alone</ErrorNote>;
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        conflict: `${cwd}/.claude/settings.json could not be read as JSON, so it was left exactly as it is — open it and it will say why`,
+        not_found: "that session is not on this machine any more",
+      }}
+    />
   );
 }
 

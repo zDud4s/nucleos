@@ -197,6 +197,13 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/ide-sessions/{session_id}",
             get(read_ide_session),
         )
+        // Writing this daemon's classifier hook into the project a session was had in. POST
+        // because it changes that project, and under the session because the session is what says
+        // WHICH project — the request never names a directory.
+        .route(
+            "/assistant/ide-sessions/{session_id}/tools",
+            post(wire_ide_session_tools),
+        )
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -3372,13 +3379,32 @@ struct CreateChatRequest {
     continue_session: Option<String>,
 }
 
+/// One session as it is OFFERED: what it is, plus what continuing it would be able to do.
+///
+/// The second half is not decoration. A conversation continued in a directory with no classifier
+/// hook runs on the MCP server alone — no `Read`, no `Edit`, no `Bash` — so picking up a coding
+/// session there gets a model that cannot open the file being discussed. That was invisible until
+/// the first turn came back empty-handed, and it is the single thing that made continuing a
+/// session feel like nothing had happened.
+#[derive(serde::Serialize)]
+struct OfferedSession {
+    #[serde(flatten)]
+    session: crate::sessions::IdeSession,
+    /// Whether a turn continued here would get the project's tools.
+    ///
+    /// Answered by asking `tool_policy_for` — the same function the turn itself asks — rather than
+    /// by restating the rule here. A second opinion about this would be a window promising tools
+    /// the turn then does not get.
+    tools: bool,
+}
+
 /// The conversations already had in the IDE that this daemon could continue.
 ///
 /// Ones already continued are dropped: a second conversation resuming the same session would put
 /// two threads on one context, and the window would show them as unrelated.
 async fn list_ide_sessions(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::sessions::IdeSession>>, StatusCode> {
+) -> Result<Json<Vec<OfferedSession>>, StatusCode> {
     let Some(root) = crate::sessions::default_root() else {
         return Ok(Json(Vec::new()));
     };
@@ -3395,12 +3421,61 @@ async fn list_ide_sessions(
         crate::sessions::discover(&root, IDE_SESSIONS_SHOWN)
             .into_iter()
             .filter(|session| !taken.contains(&session.session_id))
+            .map(|session| {
+                // Read here and never cached: the hook can be wired between two openings of this
+                // list, including by the route below, and a stale `false` would go on offering to
+                // fix what is already fixed.
+                let wired =
+                    crate::autopilot::classifier_hook_is_wired(std::path::Path::new(&session.cwd));
+                let policy = crate::assistant::tool_policy_for(
+                    Some(session.cwd.as_str()),
+                    crate::assistant::Origin::Shell,
+                    wired,
+                );
+                OfferedSession {
+                    session,
+                    tools: policy == crate::runner::ToolPolicy::Unrestricted,
+                }
+            })
             .collect::<Vec<_>>()
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(found))
+}
+
+/// Puts this daemon's classifier hook into the project a session was had in.
+///
+/// The most consequential thing this daemon does to a directory it does not own: afterwards every
+/// session had there — this one, and the ones opened in the editor — has its tool calls routed
+/// through the classifier, and conversations continued there get the CLI's whole tool surface
+/// instead of the MCP server alone. So it is a POST somebody presses, never something inferred
+/// from picking a session up.
+///
+/// The directory comes from the transcript by way of `sessions::find`, exactly as `create_chat`
+/// gets it and for a sharper version of the same reason: a caller that could name the directory
+/// could have this daemon write an executable hook into any folder on the machine.
+///
+/// A 409 for a settings file this cannot parse. That is not the daemon failing — it is the project
+/// saying no — and the one thing the caller can do about it is go and look at that file.
+async fn wire_ide_session_tools(Path(session_id): Path<String>) -> Result<StatusCode, StatusCode> {
+    let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
+    let session = tokio::task::spawn_blocking(move || crate::sessions::find(&root, &session_id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let dir = std::path::PathBuf::from(&session.cwd);
+    tokio::task::spawn_blocking(move || crate::autopilot::wire_classifier_hook(&dir))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::warn!(%error, cwd = %session.cwd, "could not wire the classifier hook");
+            StatusCode::CONFLICT
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// What was said in one conversation had in the editor, oldest first.
@@ -8035,6 +8110,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Tools cannot be granted to a session this machine does not have.
+    ///
+    /// The directory the hook would be written into comes from the transcript, never from the
+    /// request — so an id that names nothing has nowhere to write, and that is a 404 rather than a
+    /// path built out of whatever was sent.
+    #[tokio::test]
+    async fn a_session_this_machine_does_not_have_cannot_be_given_tools() {
+        let state = test_state().await;
+        let refused = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere/tools")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        // The 404 above is the session's absence and not the route's — a path nothing routes
+        // answers 404 just as readily. A method this route does not serve tells them apart.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere/tools")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Writing into a project's `.claude/` is the most consequential thing this daemon offers over
+    /// HTTP: it is what opens the CLI's whole tool surface for every session had there afterwards.
+    /// It is behind the token, and this is the test that says so out loud.
+    #[tokio::test]
+    async fn granting_tools_to_a_project_is_not_possible_without_the_token() {
+        let state = test_state().await;
+        let refused = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/anything-at-all/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.

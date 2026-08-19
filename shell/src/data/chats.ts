@@ -47,6 +47,15 @@ export interface IdeSession {
   cwd: string;
   title: string | null;
   last_activity: string;
+  /**
+   * Whether continuing this session would give the model the project's tools.
+   *
+   * False means its directory has no classifier hook, and a conversation continued there runs on
+   * the NucleOS MCP server alone — it cannot read a file, edit one, or run a command. The daemon
+   * answers this by asking the same function the turn itself asks, so it is a promise and not a
+   * guess. `useWireIdeSessionTools` is what turns a false into a true.
+   */
+  tools: boolean;
 }
 
 /** One thing said in a conversation had in the editor. */
@@ -228,6 +237,30 @@ export function useCreateChat() {
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Give a project's tools to the conversations continued out of it.
+ *
+ * Writes this daemon's classifier hook into the directory the session was had
+ * in — a real change to a folder the app does not own, which is why it is a
+ * button somebody presses rather than something that happens on pick-up.
+ *
+ * The session list is invalidated on success because that is where the answer
+ * shows: the row stops offering to fix what is now fixed.
+ */
+export function useWireIdeSessionTools() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (sessionId: string) =>
+      apiFetch<void>(`/assistant/ide-sessions/${encodeURIComponent(sessionId)}/tools`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.ideSessions });
     },
   });
 }
