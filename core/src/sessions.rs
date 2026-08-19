@@ -468,7 +468,10 @@ fn record_commands(ran: &mut Vec<String>, row: &serde_json::Value) {
         else {
             continue;
         };
-        let command = command.trim();
+        // The FIRST line, and short. Measured against real transcripts rather than imagined: a
+        // coding session runs heredocs, and eighty characters of one is four lines of shell with a
+        // `<<PY` in the middle. A margin has to be glanceable or it is worse than nothing.
+        let command = command.lines().next().unwrap_or("").trim();
         if command.is_empty() {
             continue;
         }
@@ -480,11 +483,11 @@ fn record_commands(ran: &mut Vec<String>, row: &serde_json::Value) {
     }
 }
 
-/// The longest command kept whole. A command line can be a heredoc.
-const COMMAND_LIMIT: usize = 80;
+/// The longest command kept whole, on one line.
+const COMMAND_LIMIT: usize = 60;
 
 /// The most commands one note names, for the reason `CHANGED_NAMED` exists.
-const RAN_NAMED: usize = 4;
+const RAN_NAMED: usize = 3;
 
 /// The note left where the conversation did something rather than said something.
 ///
@@ -525,15 +528,49 @@ fn did(ran: &[String], changed: &[Change]) -> Said {
     }
 }
 
-/// Keeps one line, under the ceiling that governs every line.
+/// Keeps one line, under the ceiling that governs how much CONVERSATION is read back.
 ///
-/// One way in, because the ceiling is the thing that must not differ between them: a note kept
-/// without it would grow the conversation past the limit the messages are held to.
-fn keep(kept: &mut std::collections::VecDeque<Said>, cut: &mut bool, item: Said) {
+/// Notes ride along and are not counted. The ceiling exists to bound how much of a conversation
+/// comes back, and a note is not conversation — counting them against the same limit cost one real
+/// message for every note added, which on a real session was eighty-nine of them out of two
+/// hundred lines. The margin is not allowed to eat the thing it is a margin to.
+///
+/// A note left at the front once its neighbours are gone goes with them: it describes work that
+/// happened between two messages nobody can see any more. Only when something was actually dropped,
+/// though — a conversation that legitimately OPENS on a note (a compaction, most often) keeps it.
+fn keep(
+    kept: &mut std::collections::VecDeque<Said>,
+    cut: &mut bool,
+    spoken_kept: &mut usize,
+    item: Said,
+) {
+    if !item.aside {
+        *spoken_kept += 1;
+    }
     kept.push_back(item);
-    if kept.len() > SAID_SHOWN {
+
+    let mut dropped_any = false;
+    while *spoken_kept > SAID_SHOWN {
+        match kept.pop_front() {
+            Some(dropped) => {
+                dropped_any = true;
+                if !dropped.aside {
+                    *spoken_kept -= 1;
+                    *cut = true;
+                }
+            }
+            None => break,
+        }
+    }
+    if dropped_any {
+        trim_leading_notes(kept);
+    }
+}
+
+/// Drops notes left stranded at the front by a trim.
+fn trim_leading_notes(kept: &mut std::collections::VecDeque<Said>) {
+    while kept.front().is_some_and(|line| line.aside) {
         kept.pop_front();
-        *cut = true;
     }
 }
 
@@ -591,6 +628,8 @@ fn read_said(path: &Path) -> Conversation {
     // short is still on screen and still says who said it; a dropped one is a gap, and the gap is
     // what a reader has no way of noticing.
     let mut cut = false;
+    // How many of the kept lines are conversation rather than margin. The ceiling is on these.
+    let mut spoken_kept: usize = 0;
     // How many rows of the subagent excursion currently open have gone past.
     let mut aside: usize = 0;
     // The files changed since the last thing anybody said, in the order they were first touched.
@@ -628,11 +667,11 @@ fn read_said(path: &Path) -> Conversation {
             continue;
         };
         if aside > 0 {
-            keep(&mut kept, &mut cut, note(aside));
+            keep(&mut kept, &mut cut, &mut spoken_kept, note(aside));
             aside = 0;
         }
         if !changed.is_empty() || !ran.is_empty() {
-            keep(&mut kept, &mut cut, did(&ran, &changed));
+            keep(&mut kept, &mut cut, &mut spoken_kept, did(&ran, &changed));
             changed.clear();
             ran.clear();
         }
@@ -640,7 +679,7 @@ fn read_said(path: &Path) -> Conversation {
         // thrown away by the byte ceiling below — and so that a message bigger than that ceiling
         // is shown cut rather than dropped, which would leave a gap nothing on screen explains.
         item.text = cut_to(item.text, SAID_BYTES);
-        keep(&mut kept, &mut cut, item);
+        keep(&mut kept, &mut cut, &mut spoken_kept, item);
         // AFTER the line, not before it: a model says what it is about to do and then does it, and
         // a margin written the other way round describes work that had not happened yet.
         record_commands(&mut ran, &row);
@@ -649,21 +688,31 @@ fn read_said(path: &Path) -> Conversation {
     // An excursion, or an edit, that the file ends inside. Both happened, and a note is the whole
     // point of noticing them.
     if aside > 0 {
-        keep(&mut kept, &mut cut, note(aside));
+        keep(&mut kept, &mut cut, &mut spoken_kept, note(aside));
     }
     if !changed.is_empty() || !ran.is_empty() {
-        keep(&mut kept, &mut cut, did(&ran, &changed));
+        keep(&mut kept, &mut cut, &mut spoken_kept, did(&ran, &changed));
     }
 
     // The byte ceiling, taken off the oldest end. The last message is never dropped: a conversation
     // that came back empty because its final message was enormous would look like one nobody spoke
     // in.
     let mut total: usize = kept.iter().map(|said| said.text.len()).sum();
+    let mut trimmed = false;
     while kept.len() > 1 && total > SAID_BYTES {
         if let Some(dropped) = kept.pop_front() {
             total -= dropped.text.len();
-            cut = true;
+            trimmed = true;
+            if !dropped.aside {
+                cut = true;
+            }
         }
+    }
+    // Only where something was actually dropped. A conversation legitimately OPENS on a note when
+    // the editor compacted it before the first thing anybody said, and trimming that unconditionally
+    // threw away the one line explaining why the conversation starts mid-thought.
+    if trimmed {
+        trim_leading_notes(&mut kept);
     }
 
     Conversation {
@@ -1022,6 +1071,61 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "o que falta fazer");
+    }
+
+    /// A command is one line, whatever it was.
+    ///
+    /// Measured on real transcripts and not imagined: a coding session runs heredocs, and eighty
+    /// characters of one is four lines of shell with a `<<PY` in the middle. The margin has to be
+    /// glanceable or it is worse than nothing -- so what is kept is the first line, short.
+    #[test]
+    fn a_command_is_shown_as_one_short_line() {
+        let store = Store::new();
+        store.session(
+            "one",
+            "aaaa-1111",
+            &[
+                said("corre"),
+                ran("python - <<'PY'\nimport json\nprint(json.dumps({}))\nPY"),
+                replied("corri"),
+            ],
+        );
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap().said;
+
+        let note = &read[1];
+        assert!(
+            !note.text.contains('\n'),
+            "the note is several lines: {}",
+            note.text
+        );
+        assert!(note.text.contains("python"), "{}", note.text);
+        assert!(!note.text.contains("import json"), "{}", note.text);
+    }
+
+    /// The margin does not cost the conversation its messages.
+    ///
+    /// The ceiling is on how much CONVERSATION is read back, and a note is not conversation. On a
+    /// real session the notes outnumbered the sentences: counting them against the same limit
+    /// pushed out one real message for every note added, so the fix made the page emptier.
+    #[test]
+    fn a_note_never_pushes_a_message_off_the_end() {
+        let store = Store::new();
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for n in 0..SAID_SHOWN {
+            rows.push(said(&format!("mensagem {n}")));
+            rows.push(ran(&format!("echo {n}")));
+        }
+        store.session("one", "aaaa-1111", &rows);
+
+        let read = conversation(&store.root(), "aaaa-1111").unwrap();
+
+        let messages = read.said.iter().filter(|line| !line.aside).count();
+        assert_eq!(messages, SAID_SHOWN, "notes ate the conversation");
+        assert!(
+            !read.cut,
+            "nothing was dropped, so nothing should claim it was"
+        );
     }
 
     /// What the conversation RAN, which is the other half of what it did.
