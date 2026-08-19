@@ -455,25 +455,83 @@ function ideSession(overrides: Partial<IdeSession> = {}): IdeSession {
 }
 
 /**
- * Opens the picker with these sessions on offer, and hands back a `choose` that waits.
+ * Opens the editor door with these sessions on offer.
  *
- * The wait is load-bearing: the session list arrives from the daemon after the form is drawn, and
- * a `change` fired at a `<select>` before its `<option>` exists is silently dropped — the value is
- * not one React knows about, so the state never moves and the assertion below fails for a reason
- * that has nothing to do with what it is testing.
+ * A door of its own, and not the optional field at the bottom of the new-conversation form: a
+ * person looking for the conversation they were having in the editor has no reason to press a
+ * button labelled "New conversation" first, and everything behind it was invisible because of it.
+ */
+async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, Said[]> = {}) {
+  daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions, said }));
+  const view = await renderChats("/chats");
+  fireEvent.click(await screen.findByRole("button", { name: /from the editor/i }));
+  return view;
+}
+
+describe("the editor's sessions, and the door to them", () => {
+  it("lists them behind a door that names what is behind it", async () => {
+    await openTheEditorDoor([ideSession()]);
+
+    expect(await screen.findByRole("button", { name: /arranja o parser de datas/i })).toBeTruthy();
+  });
+
+  it("shows what was said in one before it is picked up, not after", async () => {
+    // The whole reason this door exists. Choosing by a cut title was choosing blind: you found out
+    // which conversation it was by picking it up and reading what came back.
+    await openTheEditorDoor([ideSession()], {
+      "aaaa-1111": [
+        { by_owner: true, text: "arranja o parser de datas" },
+        { by_owner: false, text: "arranjado, o mes vinha antes do dia" },
+      ],
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+
+    expect(await screen.findByText(/o mes vinha antes do dia/)).toBeTruthy();
+  });
+
+  it("says nothing was found rather than showing an empty list", async () => {
+    await openTheEditorDoor([]);
+
+    expect(await screen.findByText(/no conversations from the editor/i)).toBeTruthy();
+  });
+
+  it("picks one up, and the conversation it opens continues it", async () => {
+    await openTheEditorDoor([ideSession()]);
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+
+    fireEvent.click(await screen.findByRole("button", { name: /pick it up/i }));
+
+    await waitFor(() => {
+      const posted = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats" && call[1]?.method === "POST",
+      );
+      expect(posted).toBeDefined();
+      expect(JSON.parse(String(posted?.[1]?.body))).toMatchObject({
+        continue_session: "aaaa-1111",
+      });
+    });
+  });
+});
+
+/**
+ * Opens the editor door with these sessions on offer, and hands back a `choose` that waits.
+ *
+ * The wait is load-bearing: the session list arrives from the daemon after the door is drawn, so
+ * the row being clicked does not exist yet at the moment the door opens.
  */
 async function openThePicker(sessions: IdeSession[]) {
-  daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions }));
-  const view = await renderChats("/chats");
-  fireEvent.click(await screen.findByRole("button", { name: /new conversation/i }));
-  const picker = await screen.findByLabelText(/continue an ide session/i);
+  const view = await openTheEditorDoor(sessions);
   const choose = async (sessionId: string) => {
-    await waitFor(() =>
-      expect(picker.querySelector(`option[value="${sessionId}"]`)).not.toBeNull(),
-    );
-    fireEvent.change(picker, { target: { value: sessionId } });
+    const label = sessions.find((session) => session.session_id === sessionId)?.title ?? sessionId;
+    const list = await screen.findByRole("list", { name: /conversations in the editor/i });
+    const row = within(list)
+      .getAllByRole("button")
+      .find((button) => button.textContent?.includes(label));
+    expect(row).toBeDefined();
+    fireEvent.click(row as HTMLElement);
   };
-  return { ...view, picker, choose };
+  return { ...view, choose };
 }
 
 describe("what a session would be able to do, before it is picked up", () => {

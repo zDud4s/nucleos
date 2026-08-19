@@ -128,25 +128,45 @@ function ChatListPanel({
   selectedLive: boolean;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
   const navigate = useNavigate();
+
+  const opened = (chatId: string) => {
+    setComposerOpen(false);
+    setEditorOpen(false);
+    void navigate({ to: `/chats/${chatId}` });
+  };
 
   return (
     <Panel
       title="Conversations"
       aside={
-        <Button variant="approve" aria-pressed={composerOpen} onClick={() => setComposerOpen((v) => !v)}>
-          {composerOpen ? "Cancel" : "New conversation"}
-        </Button>
+        <>
+          <Button
+            variant="ghost"
+            aria-pressed={editorOpen}
+            onClick={() => {
+              setEditorOpen((v) => !v);
+              setComposerOpen(false);
+            }}
+          >
+            {editorOpen ? "Close" : "From the editor"}
+          </Button>
+          <Button
+            variant="approve"
+            aria-pressed={composerOpen}
+            onClick={() => {
+              setComposerOpen((v) => !v);
+              setEditorOpen(false);
+            }}
+          >
+            {composerOpen ? "Cancel" : "New conversation"}
+          </Button>
+        </>
       }
     >
-      {composerOpen && (
-        <NewChatForm
-          onOpened={(chatId) => {
-            setComposerOpen(false);
-            void navigate({ to: `/chats/${chatId}` });
-          }}
-        />
-      )}
+      {composerOpen && <NewChatForm onOpened={opened} />}
+      {editorOpen && <FromTheEditor onOpened={opened} />}
 
       {!answered && <p className="chats-loading">reading your conversations…</p>}
       {answered && rows.length === 0 && (
@@ -216,12 +236,9 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
 
 function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
   const [brain, setBrain] = useState<Brain>("cloud");
-  const [sessionId, setSessionId] = useState("");
   const localModel = useLocalModel();
-  const ideSessions = useIdeSessions(true);
   const create = useCreateChat();
   const localUnavailable = localModel.data?.available === false;
-  const chosen = (ideSessions.data ?? []).find((session) => session.session_id === sessionId);
 
   return (
     <form
@@ -229,10 +246,7 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
       onSubmit={(event) => {
         event.preventDefault();
         if (create.isPending) return;
-        create.mutate(
-          { brain, continueSession: sessionId === "" ? undefined : sessionId },
-          { onSuccess: (result) => onOpened(result.chat_id) },
-        );
+        create.mutate({ brain }, { onSuccess: (result) => onOpened(result.chat_id) });
       }}
     >
       <fieldset className="chats-new-brain">
@@ -258,29 +272,97 @@ function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
         </label>
       </fieldset>
 
-      <label className="chats-field">
-        <span>Continue an IDE session (optional)</span>
-        <select
-          aria-label="Continue an IDE session"
-          value={sessionId}
-          onChange={(event) => setSessionId(event.target.value)}
-        >
-          <option value="">none — start fresh</option>
-          {(ideSessions.data ?? []).map((session: IdeSession) => (
-            <option key={session.session_id} value={session.session_id}>
-              {(session.title ?? session.session_id) + " — " + session.cwd}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      {chosen !== undefined && !chosen.tools && <NoTools session={chosen} />}
-
       <Button type="submit" intent="go" disabled={create.isPending}>
         Start
       </Button>
       {create.isError && <CreateRefusal error={create.error} />}
     </form>
+  );
+}
+
+/**
+ * The conversations you were having in the editor, and the one press that continues one here.
+ *
+ * A door of its own. Everything this page could already do with an editor session sat inside the
+ * new-conversation form, in a field marked optional, below two radio buttons — reachable only by
+ * somebody who had pressed a button labelled "New conversation" while looking for an old one. The
+ * feature was complete and invisible, which from the outside is indistinguishable from missing.
+ *
+ * What was said is shown BEFORE the pick-up, not after. A cut title and a directory is not enough
+ * to tell two afternoons of work apart, and the only way to find out which one this was used to be
+ * to pick it up and read what came back.
+ *
+ * Cloud, and no choice offered. Continuing one of these means resuming a Claude Code session by its
+ * id, which is a thing only the cloud brain can do; a Local option here would be a button that
+ * quietly starts a fresh conversation instead of the one you chose.
+ */
+function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
+  const sessions = useIdeSessions(true);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const said = useIdeConversation(sessionId);
+  const create = useCreateChat();
+  const chosen = (sessions.data ?? []).find((session) => session.session_id === sessionId);
+
+  return (
+    <div className="chats-editor">
+      {sessions.data === undefined && !sessions.isError && (
+        <p className="chats-loading">reading your editor sessions…</p>
+      )}
+      {sessions.isError && <ErrorNote>your editor sessions could not be read</ErrorNote>}
+      {sessions.data?.length === 0 && (
+        <Teach title="No conversations from the editor">
+          <p>
+            Nothing on this machine has a transcript the daemon can read. These are the sessions the
+            CLI writes as you work in a project — have one there and it shows up here.
+          </p>
+        </Teach>
+      )}
+
+      {(sessions.data ?? []).length > 0 && (
+        <ul className="chats-editor-list" aria-label="Conversations in the editor">
+          {(sessions.data ?? []).map((session: IdeSession) => (
+            <li key={session.session_id}>
+              <button
+                type="button"
+                className={
+                  session.session_id === sessionId
+                    ? "chats-editor-row chats-editor-row-open"
+                    : "chats-editor-row"
+                }
+                aria-pressed={session.session_id === sessionId}
+                onClick={() =>
+                  setSessionId((open) => (open === session.session_id ? null : session.session_id))
+                }
+              >
+                <span className="chats-editor-title">{session.title ?? session.session_id}</span>
+                <span className="chats-editor-where">{session.cwd}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {chosen !== undefined && (
+        <div className="chats-editor-chosen">
+          <PickedUp view={said} />
+          {!chosen.tools && <NoTools session={chosen} />}
+          <Button
+            type="button"
+            intent="go"
+            disabled={create.isPending}
+            onClick={() =>
+              create.mutate(
+                { brain: "cloud", continueSession: chosen.session_id },
+                { onSuccess: (result) => onOpened(result.chat_id) },
+              )
+            }
+          >
+            Pick it up
+          </Button>
+          {create.isError && <CreateRefusal error={create.error} />}
+        </div>
+      )}
+    </div>
   );
 }
 
