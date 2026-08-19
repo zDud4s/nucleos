@@ -25,6 +25,33 @@ export type Brain = "cloud" | "local";
 export interface ToolCall {
   name: string;
   detail: string | null;
+  /**
+   * The plan this call wrote, when it was one that writes plans. Empty for every
+   * other tool, and empty on any turn recorded before the daemon carried them.
+   */
+  todos: Todo[];
+}
+
+/** One line of a plan, as the daemon read it out of a `TodoWrite`. */
+export interface Todo {
+  text: string;
+  /** The CLI's own words: `pending`, `in_progress`, `completed`. */
+  status: string;
+}
+
+/**
+ * The plan a turn ended with, or nothing.
+ *
+ * The LAST one, because a plan is rewritten as it is worked through: every `TodoWrite` in a turn is
+ * the same list at a different moment, and drawing all of them would be the same three items four
+ * times over with only the ticks moving.
+ */
+export function planOf(did: ToolCall[]): Todo[] {
+  for (let at = did.length - 1; at >= 0; at -= 1) {
+    const call = did[at];
+    if (call.todos !== undefined && call.todos.length > 0) return call.todos;
+  }
+  return [];
 }
 
 export interface AssistantTurnRow {

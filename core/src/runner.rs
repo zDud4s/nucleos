@@ -493,6 +493,61 @@ pub struct ToolCall {
     /// A path, a command, a pattern, a URL — deliberately not the whole input. A `Write` carries
     /// the file it is writing, and a chat that printed that argument would print the file.
     pub detail: Option<String>,
+    /// The plan this call wrote, when the call was one that writes plans. Empty for every other.
+    ///
+    /// The exception to "the one argument": a `TodoWrite` carries no path and no command, so
+    /// `detail_of` finds nothing and the call used to arrive as a bare name with nothing beside it
+    /// — while what it actually carried was the whole plan. A model working through a list is the
+    /// shape of most real work, and none of it reached the page.
+    ///
+    /// Defaulted on the way in. `tools_used` is stored JSON and every turn already recorded is a
+    /// row without this field; a row that predates the plan reads as a call that wrote none, which
+    /// is exactly what it was.
+    #[serde(default)]
+    pub todos: Vec<Todo>,
+}
+
+/// One line of a plan.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Todo {
+    pub text: String,
+    /// As the CLI words it: `pending`, `in_progress`, `completed`. Kept as it arrives rather than
+    /// mapped to something of this daemon's own — a fourth state invented upstream would otherwise
+    /// silently become one of the three here.
+    pub status: String,
+}
+
+/// The plan inside a `TodoWrite` input, or nothing at all for every other tool.
+///
+/// Anything shaped wrong is skipped rather than guessed at: a plan drawn from a half-understood
+/// input is a list of work nobody planned.
+fn plan_of(name: &str, input: Option<&serde_json::Value>) -> Vec<Todo> {
+    if name != "TodoWrite" {
+        return Vec::new();
+    }
+    let Some(items) = input
+        .and_then(|input| input.get("todos"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("content").and_then(|v| v.as_str())?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(Todo {
+                text: cut_detail(text),
+                status: item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending")
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The longest detail kept. A command line can be a heredoc.
@@ -512,11 +567,17 @@ fn detail_of(input: &serde_json::Value) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let mut detail: String = trimmed.chars().take(DETAIL_LIMIT).collect();
-    if trimmed.chars().count() > DETAIL_LIMIT {
-        detail.push('…');
+    Some(cut_detail(trimmed))
+}
+
+/// The same ceiling for a detail and for a line of a plan: both are one line beside a tool's name,
+/// and a plan item can be a paragraph somebody pasted.
+fn cut_detail(text: &str) -> String {
+    let mut out: String = text.chars().take(DETAIL_LIMIT).collect();
+    if text.chars().count() > DETAIL_LIMIT {
+        out.push('…');
     }
-    Some(detail)
+    out
 }
 
 /// Distils a stream still being written into the two things worth showing while it is.
@@ -582,6 +643,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                     did.push(ToolCall {
                         name: name.to_string(),
                         detail: block.get("input").and_then(detail_of),
+                        todos: plan_of(name, block.get("input")),
                     });
                     doing = Some(name.to_string());
                 }
@@ -2528,6 +2590,71 @@ mod tests {
             *runner.last_mcp_config.lock().unwrap(),
             Some(std::path::PathBuf::from("C:/tmp/mcp.json"))
         );
+    }
+
+    /// The plan, which the window had as the word `TodoWrite` and nothing else.
+    ///
+    /// A turn that writes a plan and then works through it is the shape of most real work, and none
+    /// of it reached the page: `detail_of` looks for a path or a command, a `TodoWrite` carries
+    /// neither, so the call arrived as a bare name. Watching a model tick items off is half of what
+    /// a person is looking at when they look at the editor.
+    #[test]
+    fn a_plan_is_carried_beside_the_call_that_wrote_it() {
+        let stream = [message(serde_json::json!([{
+            "type": "tool_use", "name": "TodoWrite",
+            "input": {"todos": [
+                {"content": "ler o parser", "status": "completed"},
+                {"content": "arranjar as datas", "status": "in_progress"},
+                {"content": "correr os testes", "status": "pending"},
+            ]}
+        }]))]
+        .join("\n");
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(
+            did[0].todos,
+            vec![
+                Todo {
+                    text: "ler o parser".into(),
+                    status: "completed".into()
+                },
+                Todo {
+                    text: "arranjar as datas".into(),
+                    status: "in_progress".into()
+                },
+                Todo {
+                    text: "correr os testes".into(),
+                    status: "pending".into()
+                },
+            ]
+        );
+    }
+
+    /// Every other tool carries no plan, and says so with an empty list rather than with a shape
+    /// the window has to test for.
+    #[test]
+    fn a_call_that_is_not_a_plan_carries_no_plan() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Read", "input": {"file_path": "C:/x.rs"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert!(did[0].todos.is_empty());
+        assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
+    }
+
+    /// A row written before this existed deserialises, and reads as a call that wrote no plan.
+    /// `tools_used` is stored JSON: every turn already recorded is a row without the field.
+    #[test]
+    fn a_call_stored_before_plans_existed_still_reads() {
+        let old: ToolCall =
+            serde_json::from_str(r#"{"name":"Bash","detail":"cargo test"}"#).unwrap();
+
+        assert_eq!(old.name, "Bash");
+        assert!(old.todos.is_empty());
     }
 
     /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.

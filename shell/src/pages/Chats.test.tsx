@@ -578,6 +578,58 @@ describe("what a session would be able to do, before it is picked up", () => {
   });
 });
 
+/* -------------------------------------------------------------- the plan -- */
+
+describe("the plan a turn worked through", () => {
+  const withPlan = (did: ToolCall[]) => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "arranja isso", answer: "feito", did })],
+      }),
+    );
+    return renderChats("/chats/c-1");
+  };
+
+  it("draws it as a plan rather than as the word TodoWrite", async () => {
+    await withPlan([
+      {
+        name: "TodoWrite",
+        detail: null,
+        todos: [
+          { text: "ler o parser", status: "completed" },
+          { text: "arranjar as datas", status: "in_progress" },
+          { text: "correr os testes", status: "pending" },
+        ],
+      },
+    ]);
+
+    const plan = await screen.findByRole("list", { name: /the plan/i });
+    expect(within(plan).getByText("arranjar as datas")).toBeTruthy();
+    expect(within(plan).getAllByRole("listitem")).toHaveLength(3);
+  });
+
+  it("shows the last one, because a plan is rewritten as it is worked through", async () => {
+    // Every `TodoWrite` in a turn is the same list at a different moment. Drawing all of them would
+    // be the same three items four times over, with only the ticks moving.
+    await withPlan([
+      { name: "TodoWrite", detail: null, todos: [{ text: "primeiro rascunho", status: "pending" }] },
+      { name: "Read", detail: "C:/x.rs", todos: [] },
+      { name: "TodoWrite", detail: null, todos: [{ text: "plano final", status: "completed" }] },
+    ]);
+
+    const plan = await screen.findByRole("list", { name: /the plan/i });
+    expect(within(plan).getByText("plano final")).toBeTruthy();
+    expect(screen.queryByText("primeiro rascunho")).toBeNull();
+  });
+
+  it("draws no plan at all for a turn that wrote none", async () => {
+    await withPlan([{ name: "Read", detail: "C:/x.rs", todos: [] }]);
+
+    await screen.findByText("C:/x.rs");
+    expect(screen.queryByRole("list", { name: /the plan/i })).toBeNull();
+  });
+});
+
 /* -------------------------------------------------------- the composer -- */
 
 describe("saying something", () => {
@@ -805,8 +857,8 @@ describe("what a turn did", () => {
             id: 1,
             answer: "é o parser de datas",
             did: [
-              { name: "Read", detail: "core/src/parser.rs" },
-              { name: "Bash", detail: "cargo test parser" },
+              { name: "Read", detail: "core/src/parser.rs", todos: [] },
+              { name: "Bash", detail: "cargo test parser", todos: [] },
             ],
           }),
         ],
@@ -838,7 +890,7 @@ describe("what a turn did", () => {
       chatsFetch(
         [chatSummary({ chat_id: "c-1" })],
         { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
-        { live: { 1: { text: "", doing: "Bash", did: [{ name: "Read", detail: "a.rs" }] } } },
+        { live: { 1: { text: "", doing: "Bash", did: [{ name: "Read", detail: "a.rs", todos: [] }] } } },
       ),
     );
 

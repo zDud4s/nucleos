@@ -22,7 +22,15 @@ import {
   type ToolCall,
   type Turn,
 } from "../data/chats";
-import { anyTurnLive, marksBetween, turnIsLive, unreadTotal, type Mark } from "../lib/turns";
+import {
+  anyTurnLive,
+  marksBetween,
+  planOf,
+  turnIsLive,
+  unreadTotal,
+  type Mark,
+  type Todo,
+} from "../lib/turns";
 import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import {
   Badge,
@@ -744,6 +752,7 @@ function TurnBlock({
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} />}
       {!live && turn.answer !== null && (
         <div className="chats-turn-answer">
@@ -894,11 +903,42 @@ function LiveAnswer({ turnId }: { turnId: number }) {
   return (
     <>
       {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
+      <Plan todos={planOf(live.data?.did ?? [])} />
       <WhatItDid did={live.data?.did ?? []} />
       <p className="chats-turn-live" ref={end}>
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>
+  );
+}
+
+/**
+ * The plan a turn worked through, which the page had as the word `TodoWrite`.
+ *
+ * A model that writes a list and then works down it is the shape of most real work, and none of it
+ * reached here: the call carries no path and no command, so it arrived as a bare name beside the
+ * others. Watching the ticks move is a good half of what a person is looking at when they look at
+ * the editor, and it was the one thing this page could not show.
+ *
+ * Absent rather than empty when there is none, for the same reason `WhatItDid` is: a heading over
+ * no rows reads as a plan that failed to load, which is a different and worse claim than a turn
+ * that planned nothing.
+ */
+function Plan({ todos }: { todos: Todo[] }) {
+  if (todos.length === 0) return null;
+  return (
+    <ul className="chats-plan" aria-label="The plan">
+      {todos.map((todo, index) => (
+        // Keyed by position: a plan is a list in an order somebody chose, and the same line can
+        // legitimately appear twice.
+        <li key={`todo-${index}`} className={`chats-plan-item chats-plan-${todo.status}`}>
+          <span className="chats-plan-mark" aria-hidden="true">
+            {todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "→" : "·"}
+          </span>
+          <span className="chats-plan-text">{todo.text}</span>
+        </li>
+      ))}
+    </ul>
   );
 }
 
