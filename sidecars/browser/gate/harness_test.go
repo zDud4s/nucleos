@@ -161,6 +161,22 @@ func newSite(t *testing.T) *site {
 	// stopped twice over and the two stops race. Nothing in `fence.Directives` bounds a top-level
 	// navigation — there is no `navigate-to` in it — so a click here leaves exactly one mechanism
 	// standing, which is the only way an assertion about WHAT THE AGENT IS TOLD can be deterministic.
+	// A page with prose, a filled box and a ticked control, for the snapshot group. It is deliberately
+	// ordinary HTML with no ARIA: what matters is what Chromium's own accessibility tree makes of a
+	// page nobody wrote for a machine, which is every page the agent will actually meet.
+	mux.HandleFunc("/reading", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>reading</title>
+			<h1>Quarterly report</h1>
+			<p>Revenue fell by eleven percent, which nobody had forecast.</p>
+			<label>Email <input id=email type=text value="someone@example.org"></label>
+			<label><input id=tick type=checkbox checked> Remember me</label>
+			<label><input id=untick type=checkbox> Send updates</label>
+			<button id=go>Continue</button>
+			<button id=dead disabled>Not yet</button>`)
+	})
+
 	mux.HandleFunc("/link", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
