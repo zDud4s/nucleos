@@ -4644,6 +4644,66 @@ mod tests {
         }
     }
 
+    /// What waited is answered by the process that was busy when it was typed.
+    ///
+    /// The two halves of this branch meet here and nowhere else. A message typed while a
+    /// conversation is working is kept rather than refused; a conversation keeps its process between
+    /// turns. The drain runs at the very end of the finished turn's task — after the guard falls, so
+    /// the slot is free — with the process that turn just finished with standing right there.
+    ///
+    /// Both were tested apart and neither was tested against the other, and the queue's own test
+    /// cannot reach this: its chat has no directory and no hook, so it is `McpOnly` and keeps no
+    /// process at all. If the two stopped composing the symptom would be a queued message answered
+    /// slowly, which looks exactly like a queued message answered.
+    #[tokio::test]
+    async fn what_waited_is_answered_by_the_process_that_was_busy_when_it_was_typed() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "warm-drain").await;
+
+        let first = send_message(&state, "warm-drain", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        send_or_queue(&state, "warm-drain", "segundo", &[], Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        // The drain runs at the very end of the finished turn's task, so the second turn appears a
+        // moment later rather than in the same breath.
+        let mut ids: Vec<i64> = Vec::new();
+        for _ in 0..200 {
+            ids = sqlx::query_scalar(
+                "SELECT id FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
+            )
+            .bind("warm-drain")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+            if ids.len() > 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(ids.len(), 2, "what waited was never sent");
+        settled_turn(&state.pool, ids[1]).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            1,
+            "the drained turn started a process of its own instead of using the one that was there"
+        );
+        for id in &ids {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(status, "completed", "turn {id} did not complete");
+        }
+    }
+
     /// A conversation that has rotated onto a fresh context must not be answered by the process
     /// holding the old one.
     ///
