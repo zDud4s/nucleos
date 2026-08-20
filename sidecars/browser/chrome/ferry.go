@@ -120,12 +120,15 @@ var ferryShim = `(() => {
   // The page telling us it changed. Debounced hard and budgeted, because a MutationObserver on a
   // whole document fires per node on a render and this crosses a socket: undebounced, a page that
   // draws a list would send thousands of these to say one thing.
-  let reported = 0, waiting = false;
+  // Named queued rather than waiting, because the ferry below already uses that word for the
+  // promise it is holding, and two things called the same in one script is how a later edit joins
+  // two scopes by accident. No backtick in here either: this whole script is a Go raw string.
+  let reported = 0, queued = false;
   const changed = () => {
-    if (waiting || reported >= ` + changeBudgetJS + `) { return; }
-    waiting = true;
+    if (queued || reported >= ` + changeBudgetJS + `) { return; }
+    queued = true;
     setTimeout(() => {
-      waiting = false;
+      queued = false;
       reported++;
       try { ` + changeBinding + `(''); } catch (e) {}
       if (reported >= ` + changeBudgetJS + `) { watcher.disconnect(); }
