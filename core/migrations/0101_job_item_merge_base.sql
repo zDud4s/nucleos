@@ -17,7 +17,12 @@
 -- merge, merging the same branch again brings nothing back, because the merge-base already contains
 -- those commits. The retry would produce an empty diff and a green gate over work that is not there.
 --
--- 0098 and not 0097: another branch has an uncommitted `0097_chat_queue.sql`, and two branches
--- taking the same free number is the registry collision that merges cleanly and kills the gate. A
--- gap costs nothing -- sqlx orders by version and does not require them to be contiguous.
+-- 0101 and not 0098, which is what this was called first. Two branches taking the same free number
+-- is the registry collision that merges cleanly and kills the gate, and skipping 0097 to dodge one
+-- branch's `0097_chat_queue.sql` was not enough: that branch went on to 0098, 0099 and 0100 while
+-- this one was being written. The ceiling is read from every live worktree at the moment of taking
+-- a number, and taken ABOVE all of them. Renumbering was free here because the live database is at
+-- 96 -- neither of these had ever been applied to it. It would not have been free a day later.
+--
+-- A gap costs nothing: sqlx orders by version and does not require them to be contiguous.
 ALTER TABLE job_items ADD COLUMN merge_base_sha TEXT;
