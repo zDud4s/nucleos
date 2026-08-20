@@ -93,6 +93,19 @@ type Session struct {
 	// script-rendered page as an empty one — but the wait is bounded, and when the bound is reached
 	// the agent is TOLD rather than handed a silence that looks like readiness.
 	StillLoading bool `json:"still_loading,omitempty"`
+	// Status is the HTTP status the PAGE came back with, and 0 when nothing said.
+	//
+	// Its absence was the quietest hole in this contract. A 404 IS a page: it has a heading, prose,
+	// usually a search box, and it reads as a perfectly ordinary document with words on it. A 500
+	// with an empty body reads as an empty page. A 429 reads as whatever the site serves. So an agent
+	// sent to find something got a correct reading of a page that was not the one it asked for, and
+	// concluded the thing is not there rather than that the request failed — with no `blocked`, no
+	// `truncated`, no `still_loading`, and nothing anywhere to contradict it.
+	//
+	// Zero means NOTHING SAID, and never "fine". A document restored from the back-forward cache, or
+	// an about: url, produces no response for the fence to see, and inventing a 200 for those would
+	// rebuild the same trap with the sign flipped.
+	Status int `json:"status,omitempty"`
 }
 
 // Element is one thing on the page the agent may refer to.
@@ -238,6 +251,10 @@ type Snapshot struct {
 	//
 	// On the reading rather than on the act, for the same reason Blocked is: the act did happen.
 	Dialogs []Dialog `json:"dialogs,omitempty"`
+	// Status has the same meaning as on Session, and is here because a click or a goto replaces the
+	// document without producing a new Session — so a reading is the only place the status of the
+	// page actually in front of the agent can arrive.
+	Status int `json:"status,omitempty"`
 }
 
 // Unread is one kind of thing on the page that the accessibility tree does not carry.

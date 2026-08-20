@@ -126,6 +126,14 @@ pub struct Session {
     /// and a page that had not got there yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still_loading: bool,
+    /// The HTTP status the page came back with, and 0 when nothing said.
+    ///
+    /// A 404 is a page: heading, sentence, search box, and every other signal saying it is fine. An
+    /// agent sent to find something reads it correctly and concludes the thing is not there, when
+    /// what happened is that the request failed. 0 means nothing said — a document from the
+    /// back-forward cache never produces a response — and never "fine".
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub status: i64,
 }
 
 /// One thing on the page the agent may refer to.
@@ -217,6 +225,11 @@ pub struct Snapshot {
     /// reads a page where its click did nothing and concludes the button is broken.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dialogs: Vec<Dialog>,
+    /// The HTTP status of the page being read, and 0 when nothing said. Same meaning as on
+    /// `Session`, and here because a click or a goto replaces the document without producing a new
+    /// session — so the reading is the only place the current page's status can arrive.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub status: i64,
 }
 
 /// One question the page asked a person, and the answer given on their behalf.

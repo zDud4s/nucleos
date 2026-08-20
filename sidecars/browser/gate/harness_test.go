@@ -103,6 +103,19 @@ func newSite(t *testing.T) *site {
 		s.note(r)
 		fmt.Fprint(w, "ok")
 	})
+	// A 404 that looks like a page, because that is what a 404 IS. A heading, a sentence, a search
+	// box — nothing about the reading of it says the request failed, which is the entire reason the
+	// status has to be carried separately.
+	mux.HandleFunc("/missing", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `<!doctype html><title>Not found</title><body>
+			<h1>We could not find that</h1>
+			<p>Try searching for it instead.</p>
+			<label>Search <input id=q name=q></label>`)
+	})
+
 	// A page that asks the PERSON a question, which is a thing the agent is not. confirm() blocks the
 	// renderer until somebody answers the dialog, and with Page.enable on (chrome/driver.go) that
 	// somebody has to be this driver: Chromium hands the dialog to the attached client and waits.

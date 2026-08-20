@@ -105,6 +105,14 @@ func (d *Driver) answerResponse(ctx context.Context, session cdp.SessionID, paus
 		return
 	}
 
+	// Before the CSP branch and on a condition of its own, because the two ask different questions:
+	// the header goes on a document that has not got one yet, and the status is worth keeping from
+	// EVERY document response — including one already carrying the fence, which is the same page
+	// coming through a second time.
+	if isDocumentType(paused.ResourceType) && paused.ResponseStatusCode != nil {
+		d.recordStatus(paused.FrameID, *paused.ResponseStatusCode)
+	}
+
 	params := map[string]any{"requestId": paused.RequestID}
 	if isDocumentType(paused.ResourceType) && !fence.CarriesFence(paused.ResponseHeaders) && paused.ResponseStatusCode != nil {
 		// The CSP goes on every document, in a frame or not. Spec §5.4's earlier version said "top
@@ -169,6 +177,47 @@ type recordedRefusal struct {
 // refusalCap bounds the record for the same reason the proxy's does: a page in a loop generates
 // refusals faster than anything reads them.
 const refusalCap = 256
+
+// recordStatus keeps the HTTP status of the PAGE.
+//
+// # Why the frame id and not the session
+//
+// Every other recorder here resolves cdpToSession[event.Session] and this one cannot: Fetch.enable
+// is on the BROWSER session (Connect, and spec §5.8 for why it has to be), so every paused request
+// in the whole browser arrives under that one id. It names no page. A first version looked the
+// session up anyway, found nothing, and quietly recorded no status at all — which the gate caught
+// only because it asserted a number rather than the absence of one.
+//
+// The frame id does name a page, and it is the only thing in the event that does. It is minted per
+// frame across the browser, and a session's main frame is fixed when the session is created and
+// never reassigned, so matching on it keeps meaning the same thing for the life of the session and
+// across every navigation in it.
+//
+// # Why no match is the right answer for a frame
+//
+// The status is the PAGE's. An advertisement, a widget or a tracker that 404s inside an iframe says
+// nothing about whether the article loaded, and reporting it as the page's status would be worse
+// than reporting nothing: the agent would abandon a page that is perfectly fine, with the reading
+// agreeing. A subframe's id matches no session's main frame, so it falls out of this loop unrecorded
+// — the exclusion is the loop's ordinary behaviour rather than a rule that could be forgotten.
+func (d *Driver) recordStatus(frame string, status int) {
+	if frame == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, entry := range d.sessions {
+		if entry.frameID != frame {
+			continue
+		}
+		// Overwritten rather than accumulated, and deliberately NOT cleared when the document
+		// changes: a redirect is two document responses on one frame and the last one is what
+		// arrived, and the response reaches here BEFORE the navigation finishes — so clearing on
+		// navigation would throw away the status of the page being navigated to.
+		entry.status = status
+		return
+	}
+}
 
 func (d *Driver) recordRefusal(session cdp.SessionID, verdict fence.Verdict) {
 	d.mu.Lock()

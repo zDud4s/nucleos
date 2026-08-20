@@ -126,6 +126,9 @@ type session struct {
 	// place. Per document and reset with the rest: "the page asked me to confirm something" is a fact
 	// about the page being read, not about the one before it.
 	dialogs []browser.Dialog
+	// status is the HTTP status of the last main-frame document response, or 0 for a page that never
+	// produced one. See recordStatus for why it is not reset with the rest of this struct.
+	status int
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so
@@ -439,7 +442,15 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		FinalURL:     entry.final,
 		Title:        entry.title,
 		StillLoading: stillLoading,
+		Status:       d.statusOf(entry),
 	}, nil
+}
+
+// statusOf is the page's HTTP status under the lock, or 0 when nothing said it.
+func (d *Driver) statusOf(entry *session) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return entry.status
 }
 
 // readTargetInfo asks the browser where the target actually ended up.

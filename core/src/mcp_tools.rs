@@ -536,6 +536,12 @@ impl NucleosTools {
                        If `still_loading` is there the page had not finished arriving \
                        when this was read: take another snapshot rather than concluding \
                        anything from what is missing. \
+                       `status` is the page's HTTP status. Check it before you conclude \
+                       anything is absent: a 404 is a PAGE, with a heading and prose and a \
+                       search box, and it reads exactly like a real one. 404 means the address \
+                       was wrong, not that the thing does not exist; 429 or 5xx means the site \
+                       refused or broke, so wait or go another way rather than believing what \
+                       you just read. No `status` means nothing said it - never that it is fine. \
                        If `dialogs` is there the page asked a person a question - a confirm, \
                        an alert - and it was answered NO on their behalf, so whatever was \
                        behind that confirmation did not happen. The button is not broken: it \
