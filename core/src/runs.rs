@@ -3914,6 +3914,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -4230,6 +4231,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -4369,6 +4371,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -4955,6 +4958,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await

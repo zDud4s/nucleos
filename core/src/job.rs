@@ -1677,6 +1677,8 @@ pub struct NewJob<'a> {
     pub max_rounds: Option<i64>,
     /// What the job may spend on itself. `None` leaves only the house limit.
     pub budget_usd: Option<f64>,
+    /// The team directing it, already checked to exist. `None` is the job of today.
+    pub team_id: Option<&'a str>,
 }
 
 /// Starts a job and returns its id.
@@ -1693,8 +1695,8 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     let result = sqlx::query(
         "INSERT INTO jobs
            (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
-            gate_retries, head_sha, max_rounds, budget_usd, created_at)
-         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?)",
+            gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
+         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.project_id)
     .bind(job.project_root)
@@ -1710,6 +1712,10 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .bind(crate::config::rounds_allowed(job.max_rounds))
     .bind(job.budget_usd)
     .bind(chrono::Utc::now().to_rfc3339())
+    // Checked by `start` before this is called, because `foreign_keys` is on and an id that names
+    // nothing arrives here as a raw constraint failure — which the caller turns into "the job was
+    // created and could not be provisioned", a sentence that is wrong in both halves.
+    .bind(job.team_id)
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
@@ -1731,6 +1737,16 @@ pub struct CreateJobRequest {
     /// this number comes from a model filling in a tool call, and a ceiling applied at read time is
     /// a ceiling one forgetful caller can walk past. `None` is one round.
     pub max_rounds: Option<i64>,
+    /// The team to direct this job, by id. `None` is the sequential job in one shared checkout,
+    /// which is what every job before this existed was and what every caller that says nothing gets.
+    ///
+    /// A field the caller fills in, unlike `max_items` — and the asymmetry is the same one
+    /// `max_rounds` and `budget_usd` already have. `max_items` has a ceiling nobody may raise
+    /// because it is fan-out the daemon pays for; a team is a choice about WHO does the work, and
+    /// the ceiling that bounds what it costs is the project's slot count, applied on the way in by
+    /// `room_for` and again by every item that asks for a checkout.
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 /// Why a job cannot be started for a project.
@@ -1811,6 +1827,17 @@ pub fn resolve_start(
 pub enum JobStart {
     Started(i64),
     NoRoom(String),
+    /// The request named a team the catalogue does not have.
+    ///
+    /// Its own answer and not `Failed`, because it is the caller's mistake and a fixable one: a
+    /// mistyped id, or a team deleted since the rule that names it was written. `Failed` would tell
+    /// them the daemon broke.
+    ///
+    /// **Refused rather than run without one**, and that is the decision worth writing down.
+    /// Starting the job with no team would do the work sequentially and report `completed`, and the
+    /// only symptom would be that the parallelism somebody configured never seemed to happen — the
+    /// exact failure this design has already walked into twice.
+    NoTeam(String),
     Failed,
 }
 
@@ -1836,6 +1863,12 @@ pub struct StartRequest<'a> {
     /// round under the house limit — exactly what it did before rounds existed.
     pub max_rounds: Option<i64>,
     pub budget_usd: Option<f64>,
+    /// The team that will direct this job, or `None` for the job of today.
+    ///
+    /// `None` is not a lesser job: it is the sequential queue in one shared checkout that every
+    /// job in this repository has been until now, and it stays the default in both callers. A team
+    /// is asked for, per request and per rule, and never acquired.
+    pub team_id: Option<&'a str>,
 }
 
 /// Creates a job and provisions the worktree it will live in.
@@ -1849,6 +1882,34 @@ pub struct StartRequest<'a> {
 /// never defining them", and the same applies to jobs. It moved here when a second caller appeared:
 /// two copies of this sequence would mean one of them learning a fix the other never learns.
 pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
+    // Before the row, and before the slot, because it is the one refusal here that costs nothing to
+    // discover and everything to discover late. `foreign_keys` is on, so an id naming no team would
+    // fail the INSERT below with a raw constraint error, and the caller would report "the job was
+    // created and could not be provisioned" — a sentence whose two halves are both untrue.
+    //
+    // Read rather than trusted even for a rule, because the file that names the team and the table
+    // that holds it are edited in different places at different times: a team deleted this morning
+    // leaves a `graph:` rule from last month naming it, and nothing anywhere would have complained.
+    if let Some(team_id) = request.team_id {
+        let known: Option<i64> = match sqlx::query_scalar("SELECT 1 FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(known) => known,
+            Err(error) => {
+                tracing::warn!(team_id, %error, "could not read the team a job asked for");
+                return JobStart::Failed;
+            }
+        };
+        if known.is_none() {
+            return JobStart::NoTeam(format!(
+                "no team named `{team_id}` is in the catalogue, and a job that asked for one is not \
+                 started without it"
+            ));
+        }
+    }
+
     // Asked before the row exists, and it is not the decision — `claim` below is. A job cannot claim
     // until it has an id, so the authoritative answer costs a row, and a scheduler firing at a full
     // project every half hour would leave a retired job behind every time. This turns that into the
@@ -1880,6 +1941,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             head_sha: request.head_sha,
             max_rounds: request.max_rounds,
             budget_usd: request.budget_usd,
+            team_id: request.team_id,
         },
     )
     .await
@@ -5267,6 +5329,7 @@ mod tests {
                 head_sha,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await?;
@@ -7938,6 +8001,7 @@ mod tests {
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await;
@@ -8058,6 +8122,7 @@ mod tests {
                 head_sha: head_sha.as_deref(),
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -9196,6 +9261,7 @@ mod tests {
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await

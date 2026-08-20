@@ -296,6 +296,14 @@ async fn start_job(
             // loosen: a number there raises how much the daemon will do, which is exactly the kind
             // of decision an unreviewed file does not get to make.
             budget_usd: graph.budget_usd,
+            // The file's again, and safe for the same reason the budget is: a team raises no
+            // ceiling the daemon enforces. What it changes is who does the work and how much of it
+            // happens at once, and the second is still bounded by the project's slot count and by
+            // the free-disk floor, both applied per checkout.
+            //
+            // Absent from every rule written so far, which is what keeps every night already
+            // scheduled running exactly as it ran yesterday.
+            team_id: graph.team.as_deref(),
         },
     )
     .await
@@ -738,6 +746,22 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                         )
                         .await;
                     }
+                    // The rule names a team the catalogue does not have. Nothing was created, and
+                    // the window stays spent anyway — unlike `NoRoom`, retrying next tick would
+                    // fail identically for as long as the file and the catalogue disagree, which
+                    // is every tick until somebody edits one of them. Waiting for this rule's next
+                    // window is the right noise level for a misconfiguration.
+                    //
+                    // Said out loud, because it is the only place it CAN be said. There is no job
+                    // row for `fail_early` to retire and no feed entry for anybody to read, so a
+                    // rule that silently never fires again is the exact shape of failure a team is
+                    // supposed to make visible.
+                    crate::job::JobStart::NoTeam(reason) => tracing::warn!(
+                        project_id = %project_id,
+                        rule_name = %rule.name,
+                        %reason,
+                        "a scheduled job asked for a team that does not exist and was not started"
+                    ),
                     // Past the INSERT: the job row exists and this cannot tell how far provisioning
                     // got. The window stays spent, because re-firing on a maybe is the duplicate
                     // the whole claim-first ordering exists to prevent.
@@ -1391,9 +1415,35 @@ mod tests {
     fn write_budgeted_graph_schedule(project_root: &FsPath) {
         std::fs::write(
             project_root.join(".ai").join("autopilot.yaml"),
-            "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n      budget_usd: 2.5\n",
+            "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n      budget_usd: 2.5\n      team: crew\n",
         )
-        .expect("write autopilot schedule with a budgeted graph block");
+        .expect("write autopilot schedule with a budgeted, directed graph block");
+    }
+
+    /// A team the schedule above can name. `foreign_keys` is on, so the agent comes first.
+    async fn seed_team(state: &AppState, team_id: &str) {
+        let now = "2026-07-18T09:00:00Z";
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES (?, 'Crew', 'ship it', 'dir', 3, 2, ?, ?)",
+        )
+        .bind(team_id)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .unwrap();
     }
 
     async fn job_count(state: &AppState) -> i64 {
@@ -1490,6 +1540,7 @@ mod tests {
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -1617,12 +1668,13 @@ mod tests {
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, &repo, "active", &old).await;
+        seed_team(&state, "crew").await;
         write_budgeted_graph_schedule(&repo);
 
         scheduler_tick(&state, now).await;
 
-        let (job_id, budget_usd): (i64, Option<f64>) =
-            sqlx::query_as("SELECT id, budget_usd FROM jobs")
+        let (job_id, budget_usd, team_id): (i64, Option<f64>, Option<String>) =
+            sqlx::query_as("SELECT id, budget_usd, team_id FROM jobs")
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
@@ -1630,6 +1682,14 @@ mod tests {
             budget_usd,
             Some(2.5),
             "the ceiling the rule asked for must be on the row the brakes read"
+        );
+        // The other half of what a rule may now ask for, and the one with no symptom when it goes
+        // missing: a night that runs sequentially looks exactly like a night that was never asked
+        // to do anything else.
+        assert_eq!(
+            team_id.as_deref(),
+            Some("crew"),
+            "the team the rule asked for must be on the row `load_view` reads"
         );
 
         let worktree_path: String = sqlx::query_scalar(
