@@ -63,6 +63,10 @@ type Driver struct {
 	// fifteen seconds to learn nothing it could not learn in fifty milliseconds.
 	readyWithin time.Duration
 	idleGrace   time.Duration
+	// settleWithin is how long an act that did not navigate waits to see whether it started
+	// anything. Paid once per such act, so a test that asserts the negative case asserts it against
+	// a short one rather than adding a third of a second to every click in the suite.
+	settleWithin time.Duration
 }
 
 type session struct {
@@ -194,6 +198,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		swept:        make(chan struct{}),
 		readyWithin:  readyDeadline,
 		idleGrace:    idleGrace,
+		settleWithin: settleGrace,
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)

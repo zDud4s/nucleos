@@ -210,6 +210,74 @@ func (d *Driver) ferryState(entry *session) (asked, carrying int) {
 	return entry.ferried, entry.carrying
 }
 
+// settleGrace is how long an act that ran the page's own code is given to start something.
+//
+// It is a REACTION window and not a wait: it is spent only when the act set nothing in motion, and
+// the moment the page asks the ferry for anything the wait switches to draining that instead. So a
+// click on a link that does nothing costs this once, and a click that fetches costs what the fetch
+// costs.
+const settleGrace = 300 * time.Millisecond
+
+// awaitSettled waits for what an act set in motion WITHOUT replacing the document.
+//
+// This is the load race again, one layer in, and it was reopened by the thing that closed it. The
+// ferry exists for pages that render themselves from an API; on such a page the ordinary
+// interaction — a click — does not navigate, so [Driver.afterAct] returned immediately, and the
+// agent's next snapshot read the page before the answer it had just asked for arrived. Open was
+// covered, goto and back were covered, and the single most common case on the single class of page
+// the ferry was built for was not.
+//
+// A page that goes on asking is not waited on forever: the overall bound is the same one Open uses,
+// and reaching it is reported as still loading rather than passed off as finished.
+func (d *Driver) awaitSettled(ctx context.Context, entry *session) (stillLoading bool) {
+	overall := time.NewTimer(d.readyWithin)
+	defer overall.Stop()
+	reaction := time.NewTimer(d.settleWithin)
+	defer reaction.Stop()
+	reactionC := reaction.C
+	// Polled, because nothing the watcher hears fires when a ferried request starts or finishes:
+	// that happens on this side of the connection.
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	asked := false
+	var render *time.Timer
+	var renderC <-chan time.Time
+	stopRender := func() {
+		if render != nil {
+			render.Stop()
+			render, renderC = nil, nil
+		}
+	}
+	defer stopRender()
+
+	for {
+		if _, carrying := d.ferryState(entry); carrying > 0 {
+			// It asked. The reaction window has served its purpose and must not fire — it would
+			// answer "nothing started" about a page that is mid-request.
+			asked, reactionC = true, nil
+			stopRender()
+		} else if asked && render == nil {
+			render = time.NewTimer(renderGrace)
+			renderC = render.C
+		}
+
+		select {
+		case <-tick.C:
+		case <-renderC:
+			return false
+		case <-reactionC:
+			// The act touched the page and the page asked for nothing. There is nothing to wait for,
+			// and waiting anyway is how a cheap verb stops being cheap.
+			return false
+		case <-overall.C:
+			return true
+		case <-ctx.Done():
+			return true
+		}
+	}
+}
+
 // mainFrameOf asks which frame is the top one, so the watcher can ignore everything else.
 //
 // Best effort. An empty answer means the watcher accepts any frame's events, which is the behaviour

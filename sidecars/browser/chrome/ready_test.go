@@ -31,6 +31,7 @@ func connected(t *testing.T) (*cdptest.Browser, *Driver) {
 	// how long the bound is.
 	driver.readyWithin = 150 * time.Millisecond
 	driver.idleGrace = 30 * time.Millisecond
+	driver.settleWithin = 30 * time.Millisecond
 	return fake, driver
 }
 

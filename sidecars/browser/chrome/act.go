@@ -132,8 +132,9 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	}
 	if refusal != nil {
 		// Still through afterAct: the verb declined, but a page can have moved for its own reasons
-		// while the act was in flight, and the agent's refs are stale either way.
-		return d.afterAct(ctx, entry, moved,
+		// while the act was in flight, and the agent's refs are stale either way. A verb that
+		// declined ran no page code, so there is nothing for it to have started.
+		return d.afterAct(ctx, entry, moved, false,
 			browser.Refused(refusal.Consequence, refusal.Detail)), nil
 	}
 
@@ -149,7 +150,22 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	// Both, and in this order: an act can be refused AND move the page. A click that navigates and
 	// also fires a blocked beacon is one act with two things worth saying about it, and reporting
 	// only the first would leave the agent holding refs to a document that is gone.
-	return d.afterAct(ctx, entry, moved, result), nil
+	return d.afterAct(ctx, entry, moved, ranPageCode(action.Kind), result), nil
+}
+
+// ranPageCode says whether this verb handed control to the page's own scripts.
+//
+// Scroll and back do not: one moves the viewport and the other unwinds history, and neither runs a
+// handler that could ask the ferry for anything. The rest do, which is why they are the ones that
+// get a moment to show what they started. Goto and the navigating half of everything else are
+// covered by the other branch of afterAct, which waits on the load.
+func ranPageCode(kind browser.ActionKind) bool {
+	switch kind {
+	case browser.ActionClick, browser.ActionType, browser.ActionSelect, browser.ActionPress:
+		return true
+	default:
+		return false
+	}
 }
 
 // needsRef says which verbs have to name an element. The other three act on the page, on the
@@ -166,10 +182,17 @@ func needsRef(kind browser.ActionKind) bool {
 
 // afterAct says what the act did to the page, when it did anything.
 //
-// The expensive half — waiting for the new page, re-reading where it landed — runs only when the
-// document actually changed, so the ordinary click that opens a menu still costs one round trip.
-func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, result browser.ActResult) browser.ActResult {
+// Two ways a page can change under an act, and for a long time only one of them was waited for. A
+// navigation replaces the document, and that is handled below. An act that runs the page's own code
+// and does NOT navigate is the SPA case — the click that fetches and re-renders — and it used to
+// return the instant the CDP call came back, which is before the page had anything to show. See
+// [Driver.awaitSettled]: the wait is a short reaction window that costs nothing when nothing
+// started, and turns into a real wait when something did.
+func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, ranCode bool, result browser.ActResult) browser.ActResult {
 	if !moved.sawNavigation() {
+		if ranCode {
+			result.StillLoading = d.awaitSettled(ctx, entry)
+		}
 		return result
 	}
 	result.Navigated = true

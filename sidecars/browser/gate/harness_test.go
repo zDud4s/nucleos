@@ -206,6 +206,29 @@ func newSite(t *testing.T) *site {
 			});
 			</script>`, source)
 	})
+	// The SPA's other half, and the one the ferry is actually used through: a page that fetches when
+	// somebody presses something rather than when it loads. This does not navigate, so nothing in the
+	// load path is watching, and the fetch is started from a timeout rather than straight out of the
+	// handler because that is what a framework does — a version of this that called fetch inline
+	// would pass on the ordering of one CDP round trip and prove nothing about the wait.
+	mux.HandleFunc("/click-spa", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>click-spa</title><body>
+			<h1>Reports</h1>
+			<button id=load>Load the report</button>
+			<button id=inert>Do nothing</button>
+			<div id=app></div>
+			<script>
+			document.getElementById('load').addEventListener('click', () => {
+				setTimeout(() => {
+					fetch('/content').then(r => r.text())
+						.then(t => { document.getElementById('app').innerHTML = t; })
+						.catch(e => { new Image().src = '/beacon?what=click-fetch-failed'; });
+				}, 30);
+			});
+			</script>`)
+	})
 	mux.HandleFunc("/content", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
