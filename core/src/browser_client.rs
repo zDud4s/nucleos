@@ -49,10 +49,26 @@ pub struct Placement {
     /// control that does nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origins: Vec<String>,
+    /// Which of those origins this profile may also SUBMIT A FORM to.
+    ///
+    /// A second list rather than a flag on the first, and the separation is the same argument the
+    /// fence makes: reading a site and acting as the person on it are different permissions, wanted
+    /// in different combinations — read the Jira and open no tickets, read the inbox and answer
+    /// nothing. A person grants the second at the login, next to the first and separately from it.
+    ///
+    /// Empty for an ephemeral profile for a reason narrower than `origins`': a throwaway has no
+    /// login in it, so there is nobody for a form to be submitted AS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<String>,
 }
 
 impl Placement {
-    /// The placement for a project profile and the sites it admits.
+    /// The placement for a project profile and the sites it admits, none of which it may write to.
+    ///
+    /// Read-only by default, and every caller that means otherwise says so with
+    /// [`Placement::writing_to`]. The permissive spelling is the one that has to be typed out: a
+    /// constructor whose default granted writing would put the whole of this permission behind
+    /// somebody remembering to pass an empty vector.
     pub fn project(project_id: &str, origins: Vec<String>) -> Self {
         Self {
             profile: ProfileRef {
@@ -60,7 +76,14 @@ impl Placement {
                 id: slug(project_id),
             },
             origins,
+            writable: Vec::new(),
         }
+    }
+
+    /// The same placement, naming which of its origins may be submitted to.
+    pub fn writing_to(mut self, writable: Vec<String>) -> Self {
+        self.writable = writable;
+        self
     }
 
     /// The placement for a throwaway. No origin list, by construction rather than by discipline.
@@ -73,6 +96,7 @@ impl Placement {
                 id: slug(run_id),
             },
             origins: Vec::new(),
+            writable: Vec::new(),
         }
     }
 }
@@ -269,6 +293,42 @@ pub struct ActResult {
     /// The page it moved to had not finished arriving. Same meaning as on [`Session`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still_loading: bool,
+    /// The form submissions this act actually SENT — the ones the fence let through.
+    ///
+    /// Only what left. A submission the fence stopped is a refusal and not a write, and conflating
+    /// the two would make the record of what an agent did as the person contain things it did not
+    /// do. `browser::post_act` files these in `browser_writes` before answering the caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<Write>,
+}
+
+/// One form submission that left this machine, as much of it as is safe to keep.
+///
+/// The names of the fields and how many there were. Never the values — see the sidecar's
+/// `browser.Write` and migration 0097 for the argument, which is the same one in both places: a form
+/// carries passwords, tokens and private text, and a record of what was submitted would turn this
+/// database into where every credential an agent ever types comes to rest.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Write {
+    /// Where it went, in the shape `browser_sites.origin` is written in — so the join a person makes
+    /// by eye is the join the database would make.
+    pub origin: String,
+    /// The form's action with its query removed, and the method it went with.
+    pub action: String,
+    pub method: String,
+    /// The NAMES of the fields submitted, in document order, and how many there were in total. Two
+    /// numbers on purpose: a long form is truncated to a readable list of names while the count
+    /// stays true.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub field_count: i64,
+    /// The act that caused it — the ref from the snapshot and the verb. The write rule's fifth
+    /// condition written down rather than asserted.
+    #[serde(default)]
+    pub r#ref: String,
+    #[serde(default)]
+    pub verb: String,
 }
 
 impl ActResult {

@@ -374,6 +374,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/screenshot", post(crate::browser::post_screenshot))
         .route("/browser/close", post(crate::browser::post_close))
         .route("/browser/revoke", post(crate::browser::post_revoke))
+        .route("/browser/readonly", post(crate::browser::post_readonly))
         .route("/browser/forget", post(crate::browser::post_forget))
         // The wheel (spec §4.4). `/handoff` is the agent asking; there is deliberately no route that
         // ACCEPTS — accepting is `POST /proposals/{id}/approve`, the same door every other decision
@@ -394,6 +395,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/browser/sites/{project_id}",
             get(crate::browser::get_sites),
+        )
+        .route(
+            "/browser/writes/{project_id}",
+            get(crate::browser::get_writes),
         )
         .route("/voice/config", get(crate::voice::get_config))
         .route("/voice/memos", get(crate::voice::list_memos))

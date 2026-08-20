@@ -763,7 +763,9 @@ mod tests {
             .route("/browser/return", post(|| async {}))
             .route("/browser/keep", post(|| async {}))
             .route("/browser/sessions", get(|| async {}))
+            .route("/browser/readonly", post(|| async {}))
             .route("/browser/sites/{project_id}", get(|| async {}))
+            .route("/browser/writes/{project_id}", get(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -1338,6 +1340,11 @@ mod tests {
             ("POST", "/browser/keep"),
             ("GET", "/browser/sessions"),
             ("GET", "/browser/sites/demo"),
+            // Withdrawing a write grant, and the record of what was written with it. The
+            // record is the sharper of the two: the site list says which hosts a person has
+            // accounts on, and this says which forms their own identity was used to submit.
+            ("POST", "/browser/readonly"),
+            ("GET", "/browser/writes/demo"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,

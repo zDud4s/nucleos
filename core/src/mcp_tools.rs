@@ -590,14 +590,20 @@ impl NucleosTools {
                        something has to open it first. \
                        If the answer carries `navigated`, the page changed underneath you and \
                        EVERY ref you hold is dead: take a fresh snapshot before acting again. \
-                       Actions with a consequence outside this machine - any non-GET request, a \
-                       download, a new window - are REFUSED, and a refusal \
+                       Actions with a consequence outside this machine - a download, a new \
+                       window, anything that is not a GET or a form - are REFUSED, and a refusal \
                        is a normal answer carrying the reason, not an error: read it and go a \
                        different way rather than retrying. A form is not refused for being a \
-                       form: a search, a filter or a pager submits and you read the results, \
-                       while a form that sends, buys or saves is a non-GET and comes back \
-                       refused as form-submission. If you need to do one of those \
-                       things, ask a person with browser_handoff. The refusal may also arrive \
+                       form: a search, a filter or a pager submits and you read the results. \
+                       A form that SENDS - a reply, a ticket, a saved setting - goes out only \
+                       where a person has granted this profile permission to submit forms, and \
+                       only when your own click or key press on something the reading showed is \
+                       what caused it. Where that permission is missing the refusal says so and \
+                       names the site: ask for it with browser_handoff, do not retry. Where it \
+                       exists you need ask nobody, and every submission is recorded and shown to \
+                       the owner, so send what you would be willing to have read back. \
+                       Two forms on one click is one form: the second is refused. \
+                       The refusal may also arrive \
                        on the NEXT action rather than this one, because a click and the request \
                        it causes are not simultaneous."
     )]
@@ -1227,6 +1233,25 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // admits, so the two rules that have always bounded a link — the method and the allowlist —
     // bound it unchanged, and it can carry nothing a link with a query string could not. What this
     // line never claimed is that no bytes travel: clicking a link has always sent a GET.
+    //
+    // # The second loosening, which is a real one, and the weakest line on this page
+    //
+    // A POST can now leave. Five things have to hold at once — it produces a document, it goes back
+    // to the origin the page is on, a PERSON granted that origin permission to be written to, an act
+    // on something the reading showed caused it, and it is written down — but the sentence above has
+    // changed. "Nothing it does leaves the machine with a consequence" is no longer true; what is
+    // true is that a consequence is bounded to an origin a person chose and is recorded when it
+    // happens. Those are not the same claim, and this classification now rests on the second.
+    //
+    // Splitting the tool was considered and does not work. A `browser_submit` classified `Acts`
+    // would be shut off by the rule that closes acting tools in a turn that has read a stranger's
+    // words — and reading the page is how an agent knows where to press. The result would be a verb
+    // that can never be used, which is not a safer arrangement but a broken one.
+    //
+    // So the honest statement is: this line is the weakest thing on this page, it is held up by the
+    // grant being per-origin and human-given, by the act having to cause the submission, and by
+    // `browser_writes` recording every one that leaves. Whoever attacks this design should attack
+    // here. See `.ai/specs` for the argument in full and `fence/policy.go` for the rule.
     //
     // `browser_handoff` is here rather than `ReadsOwn`, and that is a correction worth keeping: it
     // spends a person's attention and proposes a host chosen by an agent whose context is full of
